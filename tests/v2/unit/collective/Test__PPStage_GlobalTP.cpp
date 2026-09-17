@@ -3,20 +3,20 @@
  * @brief Unit tests for PPStage GLOBAL_TP_DOMAIN support
  *
  * Tests the PPStage class's handling of global (cross-MPI-rank) TP domains.
- * These tests use GlobalTPContext::createForTest() with MPI_COMM_SELF for single-rank testing.
- *
- * Note: Requires MPI initialization (uses mpi_gtest_main.cpp).
+ * A strict metadata-only context supplies an explicit nonzero CPU endpoint.
+ * Wrapper queries must neither fabricate locality nor perform communication.
+ * Real communicator construction and allreduce are Integration responsibilities;
+ * this suite initializes no MPI session, device, or physical-memory authority.
  *
  * @author David Sanftenberg
  * @date February 2026
  */
 
 #include <gtest/gtest.h>
-#include <mpi.h>
+#include <gmock/gmock.h>
 #include <memory>
 
 #include "collective/PPStage.h"
-#include "collective/GlobalTPContext.h"
 #include "collective/IGlobalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 
@@ -27,25 +27,57 @@ namespace llaminar2::test
 // Test Fixture
 // =========================================================================
 
+/** @brief Query-only test double; any unexpected collective fails the test. */
+class MetadataGlobalTPContext : public IGlobalTPContext
+{
+public:
+    /** @copydoc ITPContext::degree */
+    MOCK_METHOD(int, degree, (), (const, override));
+    /** @copydoc ITPContext::myIndex */
+    MOCK_METHOD(int, myIndex, (), (const, override));
+    /** @copydoc ITPContext::backend */
+    MOCK_METHOD(CollectiveBackendType, backend, (), (const, override));
+    /** @copydoc IGlobalTPContext::communicator */
+    MOCK_METHOD(MPI_Comm, communicator, (), (const, override));
+    /** @copydoc IGlobalTPContext::domainId */
+    MOCK_METHOD(int, domainId, (), (const, override));
+    /** @copydoc IGlobalTPContext::worldRanks */
+    MOCK_METHOD(const std::vector<int> &, worldRanks, (), (const, override));
+    /** @copydoc IGlobalTPContext::localDevice */
+    MOCK_METHOD(GlobalDeviceAddress, localDevice, (), (const, override));
+    /** @copydoc IGlobalTPContext::barrier */
+    MOCK_METHOD(void, barrier, (), (const, override));
+    /** @copydoc ITPContext::allreduce */
+    MOCK_METHOD(bool, allreduce, (TensorBase *), (override));
+    /** @copydoc ITPContext::broadcast */
+    MOCK_METHOD(bool, broadcast, (TensorBase *, int), (override));
+    /** @copydoc ITPContext::allgather */
+    MOCK_METHOD(bool, allgather, (const TensorBase *, TensorBase *), (override));
+    /** @copydoc IGlobalTPContext::gatherVariableFloatRecordsToRoot */
+    MOCK_METHOD(bool, gatherVariableFloatRecordsToRoot,
+        (const float *, size_t, float *, size_t, size_t, int, size_t &, const std::string &), (override));
+    /** @copydoc IGlobalTPContext::broadcastFloatElements */
+    MOCK_METHOD(bool, broadcastFloatElements, (TensorBase *, size_t, int, const std::string &), (override));
+    /** @copydoc IGlobalTPContext::send */
+    MOCK_METHOD(bool, send, (const TensorBase *, int), (override));
+    /** @copydoc IGlobalTPContext::recv */
+    MOCK_METHOD(bool, recv, (TensorBase *, int), (override));
+};
+
+/** @brief Bind only the metadata that PPStage is allowed to query. */
 class Test__PPStage_GlobalTP : public ::testing::Test
 {
 protected:
+    /** @brief Install an exact endpoint unrelated to rank-zero conventions. */
     void SetUp() override
     {
-        // Ensure MPI is initialized (mpi_gtest_main.cpp handles this)
-        int initialized;
-        MPI_Initialized(&initialized);
-        ASSERT_TRUE(initialized) << "MPI must be initialized for GlobalTPContext tests";
-
-        // Create a test GlobalTPContext with domain_id=0, simulating 2-rank domain
-        // This uses MPI_COMM_SELF internally for testing without real MPI
-        global_tp_ctx_ = GlobalTPContext::createForTest(
-            MPI_COMM_SELF,  // Use SELF for single-process testing
-            0,              // domain_id
-            {0, 1}          // Simulated world ranks (would be 2 ranks in real setup)
-        );
+        auto context = std::make_shared<::testing::StrictMock<MetadataGlobalTPContext>>();
+        EXPECT_CALL(*context, degree()).WillRepeatedly(::testing::Return(2));
+        EXPECT_CALL(*context, localDevice()).WillRepeatedly(::testing::Return(local_cpu_));
+        global_tp_ctx_ = std::move(context);
     }
 
+    const GlobalDeviceAddress local_cpu_ = GlobalDeviceAddress::cpu(7, "observed-host");
     std::shared_ptr<IGlobalTPContext> global_tp_ctx_;
 };
 
@@ -147,6 +179,7 @@ TEST_F(Test__PPStage_GlobalTP, RepresentativeDevice_ReturnsLocalCPU)
     
     // Global TP is CPU-only, so representative should be CPU
     EXPECT_EQ(rep.device_type, DeviceType::CPU);
+    EXPECT_EQ(rep, local_cpu_);
 }
 
 TEST_F(Test__PPStage_GlobalTP, RepresentativeDevice_MatchesContextLocalDevice)
@@ -225,6 +258,7 @@ TEST_F(Test__PPStage_GlobalTP, ContainsDevice_FalseForOtherDevice)
     // A CUDA device should not be contained in a CPU-only global TP
     EXPECT_FALSE(stage.containsDevice(GlobalDeviceAddress::cuda(0)));
     EXPECT_FALSE(stage.containsDevice(GlobalDeviceAddress::rocm(0)));
+    EXPECT_FALSE(stage.containsDevice(GlobalDeviceAddress::cpu(0, "observed-host")));
 }
 
 // =========================================================================

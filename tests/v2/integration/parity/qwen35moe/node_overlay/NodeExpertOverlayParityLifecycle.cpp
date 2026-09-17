@@ -673,7 +673,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
 
         try
         {
-            cluster_inventory_ = gatherClusterInventory(
+            cluster_inventory_ = *gatherClusterInventory(
                 parityCoordinationMPIContext());
         }
         catch (const std::exception &e)

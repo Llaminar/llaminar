@@ -6,14 +6,18 @@ images for both AVX512 and AVX2, not a devcontainer or independently rebuilt
 executables. Administrative enablement of GitHub
 Actions is separate from installing/changing this workflow.
 
+The shared [Llaminar testing workflow](../.agents/llaminar-testing/SKILL.md)
+routes local development checks, model diagnostics, and this full image gate.
+
 ```mermaid
 flowchart TD
     S[One immutable source snapshot] --> B[AVX512 and AVX2 Docker builders and Release images]
     B --> U[Complete Unit gate in each ISA image]
     U --> P[Complete ProductionParityPreflight in each ISA image]
-    P --> M[Complete numerical parity matrix and CSV evidence per ISA]
-    M --> E[Both full canonical E2E server suites]
-    E --> T[Same tagged cells: independent Release benchmarks per ISA]
+    P --> G[HTTP token regression: MTP off and dynamic, reviewed 384-token controls]
+    G --> E[Both full canonical E2E HTTP needle suites]
+    E --> X[Canonical cross-host MPI E2E; Azure lease retired]
+    X --> T[Same tagged cells: independent Release benchmarks per ISA]
     T --> R{All gates and ratchet pass?}
     R -- no --> F[Keep diagnostic evidence; no certificate or publication]
     R -- yes --> C[Separate image-bound certificate layers]
@@ -27,11 +31,24 @@ The node needs Docker/Buildx, Python 3, Git, `lscpu`, `lspci`, the complete
 canonical model inventory, and sufficient CPU/CUDA/ROCm hardware. Missing
 models or devices fail; they do not silently reduce certification coverage.
 The Dockerfile installs the test/reference dependencies. Corpus submodules
-are neither initialized nor included in the image.
-The full-backend shared core requires the host NVIDIA driver loader even for
-CPU/ROCm-selected cells. Both HTTP and benchmark launchers inspect the image's
-CUDA linkage label and supply its driver dependencies without changing the
-canonical request topology. Driver stubs are never shipped as a substitute.
+are neither initialized nor included in the image. Explicitly materialize the
+approved token corpus in `corpora/` (or pass `--corpus-root`); the host driver
+loads only the ISA payload approved by the frozen source's catalog. Missing
+answers fail rather than being generated during certification.
+The devcontainer sets `DOCKER_HOST=unix:///var/run/docker-host.sock` to use
+the mounted daemon socket directly. Its socket proxy can truncate Docker's
+half-closed exec/attach connection, returning success while the child is still
+running. HTTP and remote certification check delayed child output and exact
+exit status before admission. A failed check is fatal; fix socket access
+instead of retrying inference or trusting the detached client's exit code.
+For a container created before this setting was installed, explicitly export
+that `DOCKER_HOST` value in the invoking shell.
+The full-backend shared core defers NVIDIA Driver API binding until CUDA
+preparation. CPU-only cluster ranks and ROCm-selected cells use the same image
+without a host NVIDIA driver. HTTP and benchmark launchers inject NVIDIA
+drivers/devices only for CUDA request intent. Missing required CUDA driver
+symbols fail before capture; toolkit stubs are never used for test discovery
+or shipped as a substitute.
 
 `--reference-cache-root` names the parent of authenticated Hugging Face packs.
 Locally it defaults to the existing workspace packs; official CI uses a
@@ -61,14 +78,39 @@ python3 scripts/ci/run_production_pipeline.py \
   --output parity-results/production-ci
 ```
 
-Use `--through build`, `--through parity`, `--through e2e`, or
+Use `--through build`, `--through prerequisites`, `--through generation`, `--through e2e`, or
 `--through benchmarks` to exercise a prefix. Continue with the same arguments
 and `--resume`. A source change, changed evidence, missing image, or changed
 model-file identity invalidates reuse. Partial runs never issue a certificate.
-The parity phase already runs Unit and preflight once per ISA; the outer driver
-does not repeat them for each model cell. ISA runs are sequential on the same
+Both the test builder and runtime must match the requested source tree and ISA,
+declare their distinct image roles, and include CUDA and ROCm. The builder must
+also attest that its Integration build was not skipped. These checks reject a
+wrong image before expensive gates; they do not replace executing the installed
+tests. Resume re-inspects each immutable image and checks its recorded labels
+and layer ancestry as well as its ID. Certification uses the requested ISA slot,
+never an ISA inferred from the candidate's own label.
+The prerequisites phase runs Unit and preflight once per ISA; the generation
+phase consumes that builder-bound receipt rather than repeating gates for each
+model cell. ISA runs are sequential on the same
 node. Both E2E suites must finish successfully before either benchmark suite
 starts. A passing AVX512 report never certifies AVX2 (or vice versa).
+
+For a model-free prerequisite transaction only:
+
+```bash
+python3 scripts/ci/run_production_prerequisites.py \
+  --build-dir build_v2_integration \
+  --output parity-results/prerequisite-check
+```
+
+Inside a matching installed builder, add `--installed-build-receipt
+/src/installed-tests.json`. The command delegates to the same canonical
+Unit/preflight authority and writes its receipt, CTest logs and JUnit files.
+The installed receipt replaces incremental build preparation, not either test
+gate. There are no model, backend or cell selectors, and an existing output
+directory is rejected. This command never stages models or launches a runtime
+container. Its receipt alone is not image certification; the outer pipeline
+must bind it to the exact builder/source/ISA before admitting runtime tests.
 
 Evidence lives in `avx512/` and `avx2/` beneath the output directory, with one
 collection receipt at the root. A local piecewise run may specify `--cpu-isa
@@ -82,9 +124,16 @@ records whether that tree differs from HEAD. Official publication requires a
 clean protected-branch source revision. Output directories must remain outside
 tracked source (the default examples use ignored `parity-results/`).
 
-The existing per-cell watchdogs and numerical economy target remain owned by
-the parity/E2E drivers. The parity runtime target is not a kill deadline. A
-target miss remains red for official certification even if numerically green.
+The existing per-cell watchdogs remain owned by the generation/E2E drivers.
+Routine generation selects only serial controls and dynamic-depth MTP from the
+full canonical inventory; both must match reviewed serial answers exactly,
+including token 384, and still prove prefix restore, movement and graph capture.
+Fixed-depth MTP and mathematical HF parity are diagnostic-only. Explicit
+`--diagnostic-mathematical-parity` adds the full mathematical matrix and its CSV
+and economy checks; `--through parity` requires that flag. For token drift or
+suspected accuracy errors, run the matching individual HF cell first and use
+its checkpoint CSVs to identify the earliest divergence. Never regenerate a
+golden stream to hide drift.
 
 ### Devcontainer model staging
 
@@ -106,11 +155,95 @@ node-local device-certification workflow.
 ## One cell inventory
 
 C++ `ModelParityDefinition::e2e_certifiable` remains the eligibility authority.
-The builder exports its existing GoogleTest/CTest inventory. The manifest
-includes each complete model-file declaration, including split GGUF shards.
+Its optional `remote_cpu_overlays` declarations expand into distinct cross-host
+E2E cases, each with both default-auto plan/apply and direct default-auto serve.
+The source cell still owns the model, precision, MTP, prefix and economics;
+remote scenarios declare one continuation GPU plus CPU hosts, not local CPU
+socket indices. Fine-tunes must opt in independently. Discover these declarations
+without provisioning resources or running inference:
+
+```bash
+python3 scripts/ci/model_parity_inventory.py \
+  --build-dir build_v2_integration --scope cross-host-e2e
+```
+
+Rebuild the canonical matrix executables before discovery. A remote-only export
+cannot substitute for the full inventory. These are eligibility declarations,
+not completed certificates. The production driver runs full HTTP needle suites,
+then remote MPI E2E plus verified resource retirement, and only then benchmarks.
+Passing the existing HTTP suite does not prove the new cross-host obligations.
+The long-context helper atomically publishes progress before and after each
+check, including monotonic elapsed time and the active check. Interrupted
+reports preserve completed evidence but remain incomplete; only normal
+completion of all eight successful checks passes certificate admission.
+The public MPI bootstrap propagates explicitly requested diagnostic settings
+to remote ranks. Use rank-qualified PerfStats output paths (`{rank}`) available
+on each host; plain output paths remain authority-rank-only. This propagation
+does not export provider credentials or launcher-local device/CPU placement.
+Model and image staging uses an atomic SSH/rsync upload to one owned
+CPU peer, then distributes it concurrently to other peers over the leased
+private network. A short-lived, SSH-owned source serves only that artifact to
+the declared peer addresses with a lease capability; it closes before model
+admission. No SSH private key is copied to a VM and no public listener rule is
+added. Receivers publish only complete files, and every Docker import still
+checks the exact image configuration and ordered filesystem layers. Image
+imports on independent Docker stores launch concurrently under one shared
+deadline. Every SSH import client is joined on success, failure or cancellation;
+an unretired client is a hard error, not permission to admit an image. Import
+logs survive staging cleanup. Remote daemon retirement remains owned by the
+Azure lease rather than being inferred from an SSH exit. Model
+staging uses byte counts and preserved source timestamps, not another
+whole-GGUF hash gate. Unchanged owned replicas require no transfer. Changed
+archives reuse matching blocks over the WAN; private receivers replace only
+their explicitly observed cache file, and only after complete transfer. Every
+run authenticates the full runtime image on each peer. An exact already-imported
+configuration/layer match reuses the daemon's immutable image ID and avoids
+export, transfer and import entirely; a transport tag alone is never sufficient.
+Archive transfer caches live under the owned user's persistent cache directory,
+not `/tmp` (which Ubuntu may clear at boot), and outside the model mount.
+Remote declarations emit the public `--auto-hosts all` hard constraint so a
+cheaper all-local or partial-host proposal cannot satisfy the fixture. This
+does not bypass automatic placement or prove computation by itself: the HTTP
+observer still requires completed expert work on every declared remote host.
+
+The builder exports its **full** existing GoogleTest/CTest inventory through
+`model_parity_inventory.py --scope all`, with no selectors. The retained
+`container-all-cells.json` uses the image's paths; `all-cells.json` carries the
+same records at the host's model mount. `manifest.json` is only the exact tagged
+projection for E2E and benchmarks, not a second discovered matrix.
+`cross-host-manifest.json` preserves the remote-tagged source records from that
+same export, including their already-expanded frontend scenarios. Missing
+remote eligibility and duplicated scenario IDs fail discovery rather than
+silently removing cloud coverage. All four documents belong to the build
+receipt. Final certification checks the installed HTTP/benchmark projection and
+the remote report against their full-inventory parent. A pipeline-owned remote
+manifest always requires `cross-host-e2e.json`; an empty projection produces an
+explicit not-applicable report, never an implicit skip.
+
+Model identity pins cover the full inventory, including models used only by
+untagged numerical/generation cells. A change to any declared shard invalidates
+resume. Numerical evidence must name every exact campaign/cell pair in that
+inventory; a positive count or a passing E2E subset is insufficient. The final
+certificate binds both full-inventory and tagged-projection metadata identities.
+The manifests include complete model-file declarations, including split GGUF shards.
 Path translation across the container boundary does not change the typed
-execution arguments. Benchmarks reuse those arguments verbatim; no model,
+execution arguments. Source paths must be canonical shard paths inside the
+installed `/src/models` mount; traversal, ambiguous aliases and mount-only
+declarations fail before model admission. Translation uses the caller's
+resolved absolute mount and does not resolve container paths against the host
+filesystem or replace shard identity checks. Benchmarks reuse those arguments verbatim; no model,
 topology, precision, placement, movement or MTP matrix lives in Python/YAML.
+
+For read-only native acquisition progress, use
+`scripts/ci/audit_generation_acquisition.py --manifest <all-cell-manifest>
+--reports <oldest-report> <next-report> ...`. It uses the existing canonical
+reader, revalidates original HTTP responses and exact Off-control tokens, and
+reports unseen cells and unresolved failed attempts. Supply original reports,
+not the convenience symlink index of controls. Duplicate passes are rejected;
+a later failed attempt cannot be hidden by an older green result. Different
+source revisions remain explicit acquisition provenance when their complete
+configurations agree. This audit neither approves a corpus nor certifies the
+current build or either shipping image; it performs no inference or downloads.
 
 For a diagnostic benchmark selection after exporting a manifest:
 
@@ -132,6 +265,152 @@ never interleaves benchmarks with unfinished E2E tests. Diagnostic benchmark
 reports cannot certify an image even if they happen to cover every cell.
 The certifying pipeline deliberately has no cell/backend skip switches.
 
+### Azure resources for cross-host E2E
+
+The cross-host runner is `scripts/ci/run_production_cross_host_e2e.py` and its
+cloud resource helper is `scripts/ci/azure_cross_host_resources.py`. The runner
+consumes only `cross-host-manifest.json`, stages the immutable runtime image and
+complete model shards, provisions one fresh CPU pool per image, and
+invokes the existing HTTP/long-context harness through the public frontend.
+The frontend consumes the hostfile and owns MPI bootstrap. Controller, remote
+MPI daemons and inference children all run inside the same immutable image;
+native host MPI processes never launch isolated container ranks. Each pinned
+Ubuntu peer receives a secret-free Docker/SSH/TUN bootstrap. The runner waits
+for it over a fresh SSH connection before transferring image/model bytes.
+No pre-baked mutable VM image or host-side MPI installation is assumed.
+The helper does not select models, execute inference or issue certificates;
+only a complete public-frontend E2E run can provide that evidence.
+Pool size is the maximum canonical remote-host requirement. Each case gets
+only its declared subset in a fresh container fleet and hostfile; unused VMs
+cannot join discovery or satisfy remote execution evidence. Image/model upload
+and cloud startup/retirement are amortized across both frontend routes and
+host counts.
+
+The normal pipeline forwards `--azure-subscription`, `--azure-location`,
+`--azure-vm-size`, `--azure-image`, `--azure-ssh-source`,
+`--azure-ssh-public-key`, `--ssh-private-key`, `--azure-private-subnet`,
+`--azure-tunnel-subnet`, and
+`--azure-disposal` to this runner. The subscription is checked through the
+already-authenticated `az` process before a lease is prepared. The standalone
+runner is useful for an explicitly selected projection, but it still requires
+the complete manifest and never accepts a hand-written host count.
+Its repeatable `--first-case <canonical-scenario-id>` option prioritizes failing
+or unseen scenarios without removing any required cases. Remaining scenarios
+keep their canonical order; unknown and repeated IDs fail before provisioning.
+The report records this scheduling order, and progress includes each case's
+start, outcome and elapsed time. Peer evidence downloads run concurrently with
+SSH compression; all original JSON records and collision checks are preserved.
+Plan/apply first runs the public `plan` command and distributes its completed
+document, then starts `serve --config`. Only serving spends the cell's
+server-readiness window; planning and the complete HTTP phase share one
+immutable fifteen-minute frontend budget. Planning failure or cancellation never
+starts the server, and changing phases cannot reset that budget. Direct
+auto-serve keeps its ordinary in-process planning inside server readiness.
+
+The existing HTTP harness accepts `--cross-host-configuration` and
+`--cross-host-case` for an exact emitted scenario. They add post-shutdown checks;
+they neither launch Azure resources nor replace the usual HTTP, graph, MTP,
+prefix or movement checks. The runner requires canonical server arguments and
+PerfStats, and rejects an absent or incomplete frontend selection before server
+startup. Its compact `*.cross-host.json` report is diagnostic evidence; the
+outer runner additionally requires the long-context report, exact image/revision
+binding and verified Azure retirement before the phase can pass.
+
+Server membership records project physical node/local-rank identity from the
+execution context's canonical cluster inventory. Hostnames remain diagnostic
+labels: two different labels on one MPI physical group do not prove two hosts.
+The remote observer requires positive **completed CPU expert work in both
+prefill and decode/verifier phases on every remote rank**, and pairs the actual
+MPI source/target counters, bytes and ordered transaction digests. A rank that
+only joined MPI or executed only empty routes cannot pass. An authenticated
+empty numerical outcome has its own paired sequence and counts as no physical
+MPI return traffic. Every dispatch must reconcile with a real return or an
+explicit empty outcome, and graph-completion receipts must independently match
+between continuation and follower before retirement is certified. Main prefill
+and serial decode use depth marker `-1`; grouped-verifier depths are nonnegative.
+Missing outcomes/receipts and node-local shared activation traffic across hosts
+fail. No inference decision or placement state
+is reconstructed from PerfStats. Exact image/ISA, resolved frontend policy and
+cloud-retirement binding remain obligations of the outer remote runner.
+
+Use the existing Azure CLI login locally. CI should establish an
+[Azure federated login](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect)
+before invoking the same driver. Do not put tokens, private SSH keys or the
+Azure CLI credential directory in Docker images or result artifacts. Keep
+cloud credentials unavailable to untrusted pull-request code; provision only
+from an explicitly trusted certification environment. GitHub Actions remains
+disabled until explicitly enabled.
+
+Every campaign owns a fresh, uniquely named resource group and a durable
+`lease.json`. Infrastructure inputs select the subscription, region, pinned OS
+image, VM size, disk size, private subnet and one allowed public SSH source.
+They must not become a second model/topology matrix. VM size is not CPU ISA
+attestation: each shipping image must execute on compatible, observed remote
+hardware. MPI traffic must use private connectivity or authenticated tunnels,
+never publicly exposed MPI ports. Before preparing a lease, the runner checks
+TUN permissions and rejects conflicting local routes. It owns an authenticated
+SSH tunnel to the first CPU peer and a specific route to the new private VNet.
+That peer forwards to the other CPU peers; an Azure return route points the
+tunnel subnet back through its forwarding-enabled NIC. No pre-existing VPN or
+controller-wide forwarding change is required. Containers on the controller
+share its actual network namespace, including when CI runs in a devcontainer.
+Narrow guest forwarding rules admit only the owned tunnel/VNet edges through
+Docker's default forwarding policy. Readiness probes every private CPU peer,
+not only the tunnel gateway.
+
+Before launching containers, the runner resolves each admitted MPI address to
+exactly one active interface in that host's network namespace. Per-host MCA
+files select that interface by name for control and payload traffic. Missing or
+ambiguous addresses are fatal. Do not replace this with a global subnet union
+or `/32` filter: the installed OpenMPI 4.1 mask calculation can turn `/32` into
+a zero mask and accidentally advertise loopback/unreachable interfaces.
+
+Each frontend invocation owns its containers until MPI shutdown and collection
+of every remote rank's PerfStats. Plans, HTTP logs, transport evidence and
+cleanup receipts persist beside the report; only staged weights and image
+archives are temporary. The SSH key is copied only into the ephemeral
+controller container, outside all output mounts; cloud credentials never enter
+any test container.
+
+Docker's classic and containerd stores may assign different local image IDs to
+the same runnable content. The transfer uses an owned named archive, verifies
+the entire runtime configuration and ordered filesystem-layer digests against
+the controller image, and records each peer's immutable image ID in
+`runtime-import.json`. Containers use those verified IDs, never a mutable
+transport tag. Differing runtime bytes/configuration fail admission.
+
+The lease seals its disposal policy before creating resources. Disposable
+campaign groups are deleted only after their exact subscription, group ID and
+ownership tags are checked. A retained debugging lease deallocates its own
+VMs and preserves disks. Existing development VMs cannot be adopted by this
+helper. The standalone runner accepts `--reuse-azure-lease <original-receipt>`
+for explicit local iteration on that same retired retain-disks pool. All
+capacity, network, SSH-key and disposal arguments must match its original
+deployment. It verifies exact live VM ownership and deallocation, renews every
+shutdown schedule, submits starts together, and retires the pool again on
+success or failure. The original receipt remains the sole mutable owner; an
+exclusive local lock prevents concurrent reuse or cleanup. Do not copy a
+receipt to another controller to run concurrent campaigns. The guest tunnel
+endpoint belongs to each network lease, not first-boot initialization, so VM
+restarts cannot strand readiness. Reports preserve a retirement snapshot and
+reference the original receipt; cached infrastructure never reuses test results.
+Provider-side daily shutdown is a crash backstop, not a precise TTL;
+cleanup still must run on normal exit and CI cancellation. Retire MPI workers
+and tunnels before the enclosing cloud-resource scope exits.
+
+After an interrupted run, use its exact recorded receipt:
+
+```bash
+python3 scripts/ci/azure_cross_host_resources.py \
+  --cleanup-receipt parity-results/<campaign>/lease.json
+```
+
+Cleanup cannot override the recorded target or disposal policy. It verifies
+Azure deletion or actual `PowerState/deallocated`, not merely guest shutdown
+or acceptance of an asynchronous stop request. Failure leaves a recoverable
+non-retired receipt and must prevent certification. Never bulk-delete resources
+by a loose prefix or apply campaign cleanup to an unrelated resource group.
+
 ## Repair feedback before another full run
 
 Preserve the first failing exact cell and its fresh CSVs. Reproduce it through
@@ -149,6 +428,56 @@ iterating; rerun the complete Unit/preflight gates for the finished code slice,
 not before every unchanged cell. Only then launch a new source-frozen pipeline
 for both ISAs. Do not treat a fixed-source diagnostic pass as reusable evidence
 for an older image, or resume an old image's certification after source changes.
+
+## Reviewed generation corpus boundary
+
+`scripts/ci/generation_corpus.py` provides read-only admission for explicitly
+reviewed serial-token baselines. `ApprovedGenerationCorpus.load_reviewed`
+selects the requested shipping ISA from `scripts/ci/approved_generation_corpora.json`
+in the admitted source snapshot. Each catalog entry contains only a
+corpus-relative `path` and reviewed `document_digest`, under
+`{"schema": 1, "corpora": {"AVX512": {...}, "AVX2": {...}}}`; it does not
+define another test matrix. The corpus root may be mounted elsewhere, but a
+candidate-side catalog or digest cannot select its own expected answers.
+The typed `ApprovedCorpusPin` binds the corpus document and expected CPU ISA.
+Missing approvals, payloads and unmaterialized LFS pointers fail, as do paths
+escaping their admitted roots. Only the requested ISA's payload needs to be
+materialized. The reader neither downloads corpora nor creates, approves or
+repairs expected answers. The real catalog is installed only after explicit
+acquisition review, not automatically during a candidate run.
+
+`scripts/ci/export_generation_controls.py --manifest ALL_CELLS --cpu-isa ISA
+--reports REPORT... --output NEW_PAYLOAD` archives previously acquired controls
+after revalidating their full original acquisition. It preserves exact prompts,
+seeds, mappings and tokens in an explicitly unapproved document, without running
+inference or changing the catalog. Publish payloads through `Llaminar/corpora`
+and its source gitlink; do not commit local result directories. Review the
+original configuration and independent numerical/ISA provenance before approving
+a baseline. Missing approval is a hard error, never an invitation to acquire
+new answers during CI.
+
+Compatibility covers the full canonical inventory, every declared model shard,
+runtime arguments and request bytes. Mount paths and the tested source revision
+are not compatibility keys: changing a source implementation must still compare
+against its existing regression baseline. Shard filename/length descriptors
+consume the pipeline's existing stat pins without rereading model payloads.
+Those descriptors are not a content hash; the reviewed independent HF proof
+establishes numerical weight equivalence during baseline acquisition.
+
+Only canonical MTP-off controls supply expected token streams. Each speculative
+cell selects its declared serial control; it cannot carry a depth-specific
+expected answer. `expected(record)` authenticates the complete current
+configuration retained at admission, not just a cell ID. Mount translation is
+an inventory-admission operation, never an implicit per-request alias.
+Admission checks complete ordered requests, continuous token
+horizons, repeated-request identity and exact prompt prefixes. Stored token
+traces are immutable and contain no substitute for the candidate's own graph,
+MTP, prefix, movement or shutdown proof. Acquisition-time numerical, serial and
+MTP evidence references remain part of the explicitly reviewed document.
+The routine generation phase uses this reader; its report binds the complete
+Off/dynamic selection, source inventory, corpus pin, prerequisite receipt and
+immutable Release image. Final certification reauthenticates those bindings.
+Neither control acquisition nor a one-off comparison can certify an image.
 
 ## Benchmark workload and ratchet
 

@@ -300,6 +300,37 @@ TEST(Test__KVCacheMemoryEstimator, CPUSequencePayloadScalesExactly)
     EXPECT_EQ(bytes_4k, bytes_2k * 2);
 }
 
+TEST(Test__KVCacheMemoryEstimator, LogicalPayloadIsCodecExactOnAllBackendsWithoutScratch)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto family : {KVCacheFamily::AttentionOnly, KVCacheFamily::Hybrid})
+    for (const auto format : {"fp32", "fp16", "bf16", "q8_1", "q16_1", "tq4", "tq"})
+    for (const int head_dim : {64, 128, 256})
+    {
+        const bool unsupported = (std::string(format) == "q16_1" && device.is_gpu()) ||
+            (family == KVCacheFamily::Hybrid && std::string(format).starts_with("tq"));
+        if (unsupported)
+        {
+            EXPECT_THROW(KVCacheMemoryEstimator::logicalPayload(family, 8, 2, head_dim, format, device), std::invalid_argument);
+            continue;
+        }
+        const auto one = KVCacheMemoryEstimator::logicalPayload(family, 1, 2, head_dim, format, device);
+        const auto two = KVCacheMemoryEstimator::logicalPayload(family, 2, 2, head_dim, format, device);
+        const auto many = KVCacheMemoryEstimator::logicalPayload(family, 8192, 2, head_dim, format, device);
+        EXPECT_GT(two.totalBytes(), one.totalBytes());
+        EXPECT_EQ(many.totalBytes(), one.totalBytes() + 8191 * (two.totalBytes() - one.totalBytes()));
+        if (device.is_cpu())
+            EXPECT_EQ(many.totalBytes(), KVCacheMemoryEstimator::estimate(family, 1, 1, 8192, 2, head_dim, format, device));
+        else
+        {
+            EXPECT_LT(many.totalBytes(), KVCacheMemoryEstimator::estimate(family, 1, 1, 8192, 2, head_dim, format, device));
+            EXPECT_EQ(many.totalBytes(), KVCacheMemoryEstimator::estimateGPULogicalBlock(family, 8192, 2, head_dim, format, device).totalBytes());
+        }
+    }
+    EXPECT_THROW(KVCacheMemoryEstimator::logicalPayload(KVCacheFamily::AttentionOnly, 0, 1, 64, "fp16", DeviceId::cpu()), std::invalid_argument);
+    EXPECT_THROW(KVCacheMemoryEstimator::logicalPayload(KVCacheFamily::AttentionOnly, 1, 1, 64, "fp16", DeviceId::invalid()), std::invalid_argument);
+}
+
 TEST(Test__KVCacheMemoryEstimator, UnsupportedInputsFailClosed)
 {
     EXPECT_THROW(

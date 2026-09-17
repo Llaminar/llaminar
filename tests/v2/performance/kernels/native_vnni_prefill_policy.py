@@ -50,11 +50,11 @@ def _resolve_bucket_definition(policy_header: Path, include_path: str) -> Path:
 def _parse_prefill_buckets(text: str, path: Path) -> list[int]:
     """Read literal buckets or expand the canonical X-macro definition."""
 
-    pattern = r"kDefaultPrefillGraphBucketSizes[^=]*=\s*\{([^}]*)\}"
+    pattern = r"kSupportedPrefillGraphBucketSizes[^=]*=\s*\{([^}]*)\}"
     match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
     if not match:
         raise SystemExit(
-            f"{path}: could not find kDefaultPrefillGraphBucketSizes"
+            f"{path}: could not find kSupportedPrefillGraphBucketSizes"
         )
 
     literal_values = [
@@ -69,7 +69,7 @@ def _parse_prefill_buckets(text: str, path: Path) -> list[int]:
     )
     if not include:
         raise SystemExit(
-            f"{path}: kDefaultPrefillGraphBucketSizes was empty"
+            f"{path}: kSupportedPrefillGraphBucketSizes was empty"
         )
 
     definition = _resolve_bucket_definition(path, include.group(1))

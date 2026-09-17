@@ -103,7 +103,7 @@ namespace llaminar2::test::parity::qwen35moe
      * The speed witness runs only after graph materialization, transport
      * profiling, and live economy certification have already exercised the
      * exact production graph family. A further discarded 122B request would
-     * warm no new state and would consume part of the ten-minute parity-cell
+     * warm no new state and would consume part of the fifteen-minute parity-cell
      * budget without contributing evidence.
      */
     inline constexpr int kQwen35MoEConvergenceTimingWarmupRequests = 0;

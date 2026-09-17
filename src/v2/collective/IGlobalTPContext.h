@@ -88,8 +88,9 @@ namespace llaminar2
         /**
          * @brief Get all MPI world ranks participating in this domain
          *
-         * These are ranks in MPI_COMM_WORLD, not ranks in the domain communicator.
-         * Useful for logging and debugging.
+         * These are ranks in the exact parent communicator supplied at admission,
+         * not domain ranks and not necessarily MPI_COMM_WORLD ranks. The execution
+         * context owns any further mapping back to cluster discovery.
          *
          * @return Vector of world ranks (size == degree())
          */
@@ -106,10 +107,10 @@ namespace llaminar2
          * in the global TP domain. This is used by HierarchicalPP to identify
          * the "representative device" for PP transfers.
          *
-         * The returned address uses the world rank as the rank component,
-         * NUMA node 0, and CPU device type.
+         * The returned address is the exact resolved endpoint supplied at
+         * construction. Rank numbers never establish a NUMA ID or hostname.
          *
-         * @return GlobalDeviceAddress for local CPU (e.g., "rank0:0:cpu:0")
+         * @return Bound GlobalDeviceAddress for this participant's CPU.
          */
         virtual GlobalDeviceAddress localDevice() const = 0;
 

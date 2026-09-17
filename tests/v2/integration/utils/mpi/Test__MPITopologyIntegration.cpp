@@ -7,6 +7,10 @@
  *   - Consistent work distribution calculations
  *   - Deterministic placement plan computation
  *
+ * The ordinary invocation discovers actual hardware. CPU-only selection runs
+ * as a separately registered startup policy: absence of a legacy environment
+ * hint is never evidence that a physical accelerator does not exist.
+ *
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -36,6 +40,7 @@ protected:
     int rank_ = 0;
     int world_size_ = 1;
 
+    /** @brief Join real MPI membership and construct its canonical inventory view. */
     void SetUp() override
     {
         MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
@@ -46,6 +51,7 @@ protected:
         topology_ = std::make_unique<MPITopology>(MPI_COMM_WORLD);
     }
 
+    /** @brief Retire topology resources before all ranks enter the next case. */
     void TearDown() override
     {
         topology_.reset();
@@ -110,6 +116,20 @@ TEST_F(Test__MPITopologyIntegration, CapabilityExchangeCompletesSuccessfully)
         EXPECT_EQ(placement.rank, r) << "Placement for rank " << r << " has wrong rank ID";
         EXPECT_GE(placement.node_id, 0) << "Rank " << r << " has invalid node_id";
         EXPECT_GE(placement.local_rank, 0) << "Rank " << r << " has invalid local_rank";
+        const auto &observed = topology_->clusterInventory().getRank(r);
+        EXPECT_EQ(placement.node_id, observed.node_id);
+        EXPECT_EQ(placement.numa_node, observed.cpu.numa_node);
+        ASSERT_EQ(placement.devices.size(), observed.gpus.size() + 1u);
+        for (const auto &gpu : observed.gpus)
+        {
+            const auto type = gpu.type == DeviceType::CUDA ? DeviceCapability::Type::CUDA :
+                gpu.type == DeviceType::ROCm ? DeviceCapability::Type::ROCm : DeviceCapability::Type::Unknown;
+            const auto view = std::find_if(placement.devices.begin(), placement.devices.end(),
+                [&](const auto &device) { return device.type == type && device.device_id == gpu.local_device_id; });
+            ASSERT_NE(view, placement.devices.end());
+            EXPECT_EQ(view->memory_bytes, gpu.memory_bytes);
+            EXPECT_EQ(view->compute_units, gpu.compute_units);
+        }
     }
 }
 
@@ -297,7 +317,12 @@ TEST_F(Test__MPITopologyIntegration, PlacementPlanIsDeterministicAcrossRanks)
 
 TEST_F(Test__MPITopologyIntegration, CPUOnlyStrategySelectedWithoutGPU)
 {
-    // Without GPUs, CPUOnlyStrategy should be auto-selected
+    // CTest selects CPU-only startup before either rank enters discovery.
+    // Authenticate that precondition rather than silently assuming this host
+    // has no GPUs (the unrestricted topology case must observe real devices).
+    ASSERT_FALSE(topology_->clusterInventory().hasAnyGPU());
+    for (const auto &rank : topology_->clusterInventory().ranks)
+        ASSERT_TRUE(rank.gpus.empty());
     PlacementPlan plan = topology_->computePlacement(
         "qwen2", 24, 896, 4864, 151936, 14, 2, "Q4_0",
         500 * 1024 * 1024, "");

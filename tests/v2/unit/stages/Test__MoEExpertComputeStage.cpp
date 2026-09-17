@@ -31,6 +31,7 @@
 #include "utils/OpenMPUtils.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/PreparedWeightTestHarness.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 #include "utils/VerifierRowTestInventory.h"
 
 #include <cstdlib>
@@ -766,7 +767,11 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_OutputNonZero)
     params.prepared_ref_down = prepared.down_ref;
     params.prepared_store = prepared.store.get();
 
+    // Direct-stage units own the same invocation tile normally bound by the
+    // graph allocator. Declare it before the stage so retirement stays ordered.
+    CPUProjectionTestWorkspace workspace(SEQ_LEN, INTERMEDIATE);
     SharedExpertFFNStage stage(params);
+    stage.bindWorkspace(workspace.get());
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Output should be non-zero
@@ -840,7 +845,9 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_MatchesReference)
     params.prepared_ref_down = prepared.down_ref;
     params.prepared_store = prepared.store.get();
 
+    CPUProjectionTestWorkspace workspace(seq, inter);
     SharedExpertFFNStage stage(params);
+    stage.bindWorkspace(workspace.get());
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Compute reference
@@ -1275,6 +1282,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
+    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Output should be non-zero
@@ -1356,6 +1364,7 @@ TEST_F(MoEExpertComputeStageTest,
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(router_params));
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(router_params));
     MoEExpertComputeStage router_stage(std::move(router_params));
+    test::CPUStageTestWorkspace router_workspace(router_stage, 1);
     ASSERT_TRUE(router_stage.execute(cpu_ctx_.get()));
 
     auto transported_output = TestTensorFactory::createFP32({1, d});
@@ -1366,6 +1375,7 @@ TEST_F(MoEExpertComputeStageTest,
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(transported_params));
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(transported_params));
     MoEExpertComputeStage transported_stage(std::move(transported_params));
+    test::CPUStageTestWorkspace transported_workspace(transported_stage, 1);
     ASSERT_TRUE(transported_stage.execute(cpu_ctx_.get()));
 
     expectRowsByteEqual(
@@ -1434,6 +1444,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
+    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     const float *out = output->data();
@@ -1491,6 +1502,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
+    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Each token should get a non-zero output
@@ -1555,7 +1567,9 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsM
             params.prepared_store = prepared.store.get();
             params.force_decode_equivalent_verifier_prefill = run_seq > 1;
 
+            CPUProjectionTestWorkspace workspace(run_seq, inter);
             SharedExpertFFNStage stage(params);
+            stage.bindWorkspace(workspace.get());
             if (run_seq > 1)
                 EXPECT_TRUE(stage.usesCPUDecodeEquivalentVerifierPrefillForTesting());
             return stage.execute(cpu_ctx_.get());
@@ -1719,6 +1733,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 return false;
             }
             MoEExpertComputeStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, params.seq_len);
             return stage.execute(cpu_ctx_.get());
         };
 
@@ -2532,6 +2547,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
         MoEExpertComputeStage stage(params);
+        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
         return stage.execute(cpu_ctx_.get());
     };
 
@@ -2637,6 +2653,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
         MoEExpertComputeStage stage(params);
+        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
         return stage.execute(cpu_ctx_.get());
     };
 
@@ -2883,6 +2900,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
     MoEExpertComputeStage stage(params);
+    test::CPUStageTestWorkspace workspace(stage, params.seq_len);
     ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
 
     // Token 0 and Token 1 should produce different outputs
@@ -2939,6 +2957,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
+        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 
@@ -2966,6 +2985,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
 
         MoEExpertComputeStage stage(params);
+        test::CPUStageTestWorkspace workspace(stage, params.seq_len);
         ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
     }
 

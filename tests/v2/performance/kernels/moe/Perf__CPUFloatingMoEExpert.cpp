@@ -24,6 +24,7 @@
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "utils/CPUFeatures.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 
 #include <algorithm>
 #include <array>
@@ -267,6 +268,7 @@ namespace
             if (!ok)
                 throw std::runtime_error("Floating gate/up projection failed");
         };
+        llaminar2::test::CPUProjectionTestWorkspace down_workspace(m, intermediate);
         const auto run_down = [&](PreparedExpert &expert)
         {
             const bool ok = m == 1
@@ -276,7 +278,7 @@ namespace
                                       &output,
                                       m,
                                       d_model,
-                                      intermediate)
+                                      intermediate, 1.0f, 0.0f, down_workspace.get())
                                 : expert.down->
                                       multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                                           &gate_output,
@@ -284,7 +286,7 @@ namespace
                                           &output,
                                           m,
                                           d_model,
-                                          intermediate);
+                                          intermediate, 1.0f, 0.0f, down_workspace.get());
             if (!ok)
                 throw std::runtime_error("Floating SwiGLU/down failed");
         };

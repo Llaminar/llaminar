@@ -6,6 +6,7 @@
 #pragma once
 
 #include "kernels/common/DeviceRowRange.h"
+#include "tensors/TensorKernels.h"
 
 #include "../IComputeStage.h"
 #include "../IWorkspaceConsumerStage.h"
@@ -177,6 +178,14 @@ namespace llaminar2
         ITensorGemm *cached_gemm_ = nullptr;
 
         ITensorGemm *resolvePreparedKernel(const char *caller);
+        /**
+         * @brief Select the same serial TP tree for declaration and execution.
+         * @param kernel Prepared terminal engine with the physical vocabulary width.
+         * @return Scoped arithmetic geometry, or no scope for an ordinary head.
+         * @throws std::logic_error for an absent engine or invalid mirrored width.
+         */
+        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+        beginOutputPartitionScope(ITensorGemm *kernel) const;
         bool executeDecodeEquivalentVerifierPrefill(
             const TensorBase *hidden_states,
             TensorBase *logits,

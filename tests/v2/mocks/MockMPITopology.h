@@ -1006,6 +1006,8 @@ namespace llaminar2::test
                         gpu.type = DeviceType::ROCm;
                     }
                     gpu.local_device_id = dev.device_id;
+                    gpu.uuid = "fixture-" + std::to_string(r) + "-" +
+                               std::to_string(static_cast<int>(gpu.type)) + "-" + std::to_string(dev.device_id);
                     gpu.memory_bytes = dev.memory_bytes;
                     gpu.compute_units = static_cast<int>(dev.compute_units);
                     gpu.name = dev.name;

@@ -23,6 +23,42 @@
 
 using namespace llaminar2;
 
+/** @brief Raw precision changes preserve destination pointers and capacity. */
+TEST(DeviceMoETransferFormats, FloatingPrecisionReuseIsIndependentOfLastOccupant)
+{
+    std::array<float, 32 * 64> source_storage{}, destination_storage{};
+    DeviceMoEExpertDirectoryEntry source, destination;
+    source.descriptor.floating_gate = {source_storage.data(), 32, 64};
+    source.descriptor.floating_up = source.descriptor.floating_gate;
+    source.descriptor.floating_down = source.descriptor.floating_gate;
+    destination.descriptor.floating_gate = {destination_storage.data(), 32, 64};
+    destination.descriptor.floating_up = destination.descriptor.floating_gate;
+    destination.descriptor.floating_down = destination.descriptor.floating_gate;
+    destination.descriptor.floating_allocation_format = DeviceMoEWeightFormat::FP32;
+    for (const auto format : {DeviceMoEWeightFormat::FP32, DeviceMoEWeightFormat::FP16,
+                              DeviceMoEWeightFormat::BF16, DeviceMoEWeightFormat::FP32})
+    {
+        source.descriptor.weight_format = format;
+        EXPECT_TRUE(deviceMoEDirectoryCopyReady(source));
+        EXPECT_TRUE(deviceMoEDirectoryFitsTransferCapacity(source, destination));
+        deviceMoERetargetTransferDirectoryFormats(destination, source);
+        EXPECT_EQ(destination.descriptor.weight_format, format);
+        EXPECT_EQ(destination.descriptor.floating_allocation_format, DeviceMoEWeightFormat::FP32);
+        EXPECT_EQ(destination.descriptor.floating_gate.data, destination_storage.data());
+        EXPECT_TRUE(deviceMoEDirectoryCopyReady(destination));
+    }
+    destination.descriptor.floating_allocation_format = DeviceMoEWeightFormat::FP16;
+    EXPECT_FALSE(deviceMoEDirectoryFitsTransferCapacity(source, destination));
+    source.descriptor.weight_format = DeviceMoEWeightFormat::BF16;
+    EXPECT_TRUE(deviceMoEDirectoryFitsTransferCapacity(source, destination));
+    ++destination.descriptor.floating_down.n;
+    EXPECT_FALSE(deviceMoEDirectoryFitsTransferCapacity(source, destination));
+    source.descriptor.floating_down.data = nullptr;
+    EXPECT_FALSE(deviceMoEDirectoryCopyReady(source));
+    source.descriptor.weight_format = static_cast<DeviceMoEWeightFormat>(99);
+    EXPECT_FALSE(deviceMoEDirectoryCopyReady(source));
+}
+
 /** @brief Replace a controller fixture's complete ownership with one static row. */
 static void setUniformOwnership(
     MoERebalanceController::Config &config,
@@ -273,7 +309,7 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 14u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 15u);
     EXPECT_NE(DeviceMoERebalanceWaveLifecycle::PreparedForPublication,
               DeviceMoERebalanceWaveLifecycle::Applied);
     EXPECT_EQ(

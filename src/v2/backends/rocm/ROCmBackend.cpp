@@ -1061,14 +1061,11 @@ namespace llaminar2
             stream);
     }
 
-    bool ROCmBackend::enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+    bool ROCmBackend::enqueueArgmaxF32RowsWithHistoryDevice(
         const void *data_device,
         int rows,
         int cols,
-        const void *verifier_input_tokens_device,
-        const void *generated_token_counts_device,
-        const void *penalty_policy_device,
-        const void *active_rows_device,
+        const GenerationPenaltyHistory &history,
         int device_id,
         void *stream,
         void *out_values_device,
@@ -1080,9 +1077,7 @@ namespace llaminar2
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 ||
-            !verifier_input_tokens_device ||
-            !generated_token_counts_device || !penalty_policy_device ||
-            !active_rows_device ||
+            !history.admitsRows(rows) ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -1100,11 +1095,11 @@ namespace llaminar2
             rows,
             cols,
             cols,
-            static_cast<const int *>(verifier_input_tokens_device),
-            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const int *>(history.branchTokens()),
+            static_cast<const int *>(history.counts()),
             static_cast<const MTPGreedyPenaltyPolicy *>(
-                penalty_policy_device),
-            static_cast<const int *>(active_rows_device),
+                history.policy()),
+            static_cast<const int *>(history.activeRows()),
             static_cast<float *>(out_values_device),
             static_cast<int *>(out_indices_device),
             static_cast<float *>(partial_vals),
@@ -1276,7 +1271,7 @@ namespace llaminar2
         unsigned long long threshold_seed,
         const int *threshold_position,
         int threshold_position_offset,
-        int device_idx, void *stream);
+        int device_idx, void *stream, const uint64_t *threshold_seed_device);
     extern "C" bool rocmOps_sample_processed_logits_f32(
         const float *logits,
         int vocab_size,
@@ -1782,19 +1777,8 @@ namespace llaminar2
         int32_t *out_base_position_snapshot,
         int device_idx,
         void *stream);
-    extern "C" bool rocmOps_initialize_mtp_device_logical_state(
-        const int32_t *sampled_tokens,
-        const int32_t *target_positions_device,
-        int request_count,
-        int32_t *out_base_cached_tokens,
-        int32_t *out_target_positions,
-        int32_t *out_accepted_state_counts,
-        int32_t *out_next_condition_tokens,
-        int32_t *out_all_drafts_accepted_flags,
-        int32_t *out_stopped_flags,
-        int32_t *out_publication_ok_flags,
-        int device_idx,
-        void *stream);
+    extern "C" bool rocmOps_initialize_generation_logical_state(
+        const GenerationLogicalStateInitialization &initialization, int device_idx, void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
                               float *out_values, int *out_indices, void *stream)
@@ -2156,12 +2140,14 @@ namespace llaminar2
         void *out_probability_device,
         uint64_t threshold_seed,
         const void *threshold_position_device,
-        int threshold_position_offset)
+        int threshold_position_offset,
+        const uint64_t *threshold_seed_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !token_ids_device || !probs_device ||
             top_k <= 0 || top_k > 256 || !stream || !out_token_device ||
-            (threshold_position_device && threshold_seed == 0))
+            (threshold_position_device && threshold_seed == 0 && !threshold_seed_device) ||
+            (threshold_seed_device && (!threshold_position_device || threshold_seed != 0)))
         {
             return false;
         }
@@ -2178,7 +2164,8 @@ namespace llaminar2
             static_cast<const int *>(threshold_position_device),
             threshold_position_offset,
             device_id,
-            stream);
+            stream,
+            threshold_seed_device);
     }
 
     bool ROCmBackend::enqueueSampleProcessedLogitsF32Device(
@@ -3860,50 +3847,14 @@ namespace llaminar2
             stream);
     }
 
-    bool ROCmBackend::enqueueInitializeMTPDeviceLogicalState(
-        const void *sampled_tokens_device,
-        const void *target_positions_device,
-        int request_count,
-        int device_id,
-        void *stream,
-        void *out_base_cached_tokens_device,
-        void *out_target_positions_device,
-        void *out_accepted_state_counts_device,
-        void *out_next_condition_tokens_device,
-        void *out_all_drafts_accepted_flags_device,
-        void *out_stopped_flags_device,
-        void *out_publication_ok_flags_device)
+    bool ROCmBackend::enqueueInitializeGenerationLogicalState(
+        const GenerationLogicalStateInitialization &initialization,
+        int device_id, void *stream)
     {
-        if (device_id < 0 || device_id >= device_count_ ||
-            !sampled_tokens_device ||
-            !target_positions_device ||
-            request_count <= 0 ||
-            !stream ||
-            !out_base_cached_tokens_device ||
-            !out_target_positions_device ||
-            !out_accepted_state_counts_device ||
-            !out_next_condition_tokens_device ||
-            !out_all_drafts_accepted_flags_device ||
-            !out_stopped_flags_device ||
-            !out_publication_ok_flags_device)
-        {
+        if (device_id < 0 || device_id >= device_count_ || !stream || !initialization.valid())
             return false;
-        }
-
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
-        return rocmOps_initialize_mtp_device_logical_state(
-            static_cast<const int32_t *>(sampled_tokens_device),
-            static_cast<const int32_t *>(target_positions_device),
-            request_count,
-            static_cast<int32_t *>(out_base_cached_tokens_device),
-            static_cast<int32_t *>(out_target_positions_device),
-            static_cast<int32_t *>(out_accepted_state_counts_device),
-            static_cast<int32_t *>(out_next_condition_tokens_device),
-            static_cast<int32_t *>(out_all_drafts_accepted_flags_device),
-            static_cast<int32_t *>(out_stopped_flags_device),
-            static_cast<int32_t *>(out_publication_ok_flags_device),
-            device_id,
-            stream);
+        return rocmOps_initialize_generation_logical_state(initialization, device_id, stream);
     }
 
     // Forward declaration for HIP penalty kernel (implemented in ROCmSamplingKernels.hip)

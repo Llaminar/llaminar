@@ -282,12 +282,15 @@ __global__ void rocm_argmax_partial_f32_batched_rows_kernel(
 }
 
 /**
- * @brief HIP grouped verifier argmax with serial-row penalty semantics.
+ * @brief HIP fused history-aware argmax with serial-row penalty semantics.
  *
  * The persistent histogram owns prior emitted tokens.  Verifier input tokens
  * up to the current row complete that row's speculative branch history, so one
  * grouped launch observes exactly the same counts as serial decode.
+ * Ordinary sampling compiles out speculative-prefix reads and retains this
+ * exact reducer, so it needs neither dummy branch state nor a separate pass.
  */
+template <bool SPECULATIVE_HISTORY>
 __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
     const float *__restrict__ data,
     int rows,
@@ -307,7 +310,7 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
         shared_mem + blockDim.x * sizeof(float));
 
     const int row = blockIdx.y;
-    const int active_rows = *active_rows_device;
+    const int active_rows = SPECULATIVE_HISTORY ? *active_rows_device : rows;
     if (active_rows <= 0 || active_rows > rows || row >= active_rows)
         return;
 
@@ -328,11 +331,15 @@ __global__ void rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel(
         if (request_policy.enabled != 0)
         {
             int count = generated_token_counts[token];
-            for (int history_index = prefix_begin;
-                 history_index <= row;
-                 ++history_index)
+            if constexpr (SPECULATIVE_HISTORY)
             {
-                count += verifier_input_tokens[history_index] == token ? 1 : 0;
+                // Ordinary sampling consumes only the committed histogram.
+                // Compile out branch reads instead of fabricating a verifier
+                // row or adding a separate logit transformation pass.
+                for (int history_index = prefix_begin;
+                     history_index <= row;
+                     ++history_index)
+                    count += verifier_input_tokens[history_index] == token ? 1 : 0;
             }
 
             if (count > 0)
@@ -1267,8 +1274,10 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
     int output_stride)
 {
     if (rows <= 0 || cols <= 0 || row_stride < cols ||
-        !data || !verifier_input_tokens || !generated_token_counts ||
-        !policy || !active_rows || !out_values || !out_indices ||
+        !data || !generated_token_counts ||
+        !policy || !out_values || !out_indices ||
+        ((verifier_input_tokens != nullptr) != (active_rows != nullptr)) ||
+        (!verifier_input_tokens && rows != 1) ||
         !partial_vals || !partial_idxs || partial_capacity < rows ||
         !stream || output_stride <= 0)
     {
@@ -1292,42 +1301,51 @@ bool rocmOps_argmax_f32_batched_rows_mtp_penalties(
     const int num_blocks = static_cast<int>(blocks);
     const size_t shared_bytes =
         static_cast<size_t>(threads) * (sizeof(float) + sizeof(int));
-    hipLaunchKernelGGL(
-        rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel,
-        dim3(num_blocks, rows),
-        dim3(threads),
-        shared_bytes,
-        static_cast<hipStream_t>(stream),
-        data,
-        rows,
-        cols,
-        row_stride,
-        verifier_input_tokens,
-        generated_token_counts,
-        policy,
-        active_rows,
-        partial_vals,
-        partial_idxs,
-        row_partial_capacity);
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(
-            rocm_argmax_finalize_f32_batched_rows_kernel<false, true>),
-        dim3(rows),
-        dim3(ARGMAX_FINALIZE_THREADS),
-        static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
-            (sizeof(float) + sizeof(int)),
-        static_cast<hipStream_t>(stream),
-        partial_vals,
-        partial_idxs,
-        num_blocks,
-        row_partial_capacity,
-        out_values,
-        out_indices,
-        output_stride,
-        nullptr,
-        nullptr,
-        0,
-        active_rows);
+    // Instantiate ordinary and verifier histories from the same arithmetic.
+    // The ordinary specialization contains no branch or active-width loads.
+    const auto launch = [&]<bool SpeculativeHistory>()
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(rocm_argmax_partial_f32_batched_rows_mtp_penalty_kernel<SpeculativeHistory>),
+            dim3(num_blocks, rows),
+            dim3(threads),
+            shared_bytes,
+            static_cast<hipStream_t>(stream),
+            data,
+            rows,
+            cols,
+            row_stride,
+            verifier_input_tokens,
+            generated_token_counts,
+            policy,
+            active_rows,
+            partial_vals,
+            partial_idxs,
+            row_partial_capacity);
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                rocm_argmax_finalize_f32_batched_rows_kernel<false, SpeculativeHistory>),
+            dim3(rows),
+            dim3(ARGMAX_FINALIZE_THREADS),
+            static_cast<size_t>(ARGMAX_FINALIZE_THREADS) *
+                (sizeof(float) + sizeof(int)),
+            static_cast<hipStream_t>(stream),
+            partial_vals,
+            partial_idxs,
+            num_blocks,
+            row_partial_capacity,
+            out_values,
+            out_indices,
+            output_stride,
+            nullptr,
+            nullptr,
+            0,
+            active_rows);
+    };
+    if (verifier_input_tokens)
+        launch.template operator()<true>();
+    else
+        launch.template operator()<false>();
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {

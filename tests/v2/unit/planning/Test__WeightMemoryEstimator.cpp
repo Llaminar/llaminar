@@ -1,12 +1,18 @@
 #include <gtest/gtest.h>
 #include "planning/WeightMemoryEstimator.h"
+#include "planning/WeightShardGeometry.h"
 #include "planning/ModelMemoryProfile.h"
+#include "loaders/WeightSlicer.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/EmbedQ8Block.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
 #include <stdexcept>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -60,8 +66,8 @@ namespace
         };
 
         // Non-layer tensors
-        addTensor("token_embd.weight", 896, 151936, "Q8_0");
-        addTensor("output.weight", 896, 151936, "Q8_0");
+        addTensor("token_embd.weight", 151936, 896, "Q8_0");
+        addTensor("output.weight", 151936, 896, "Q8_0");
         addTensor("output_norm.weight", 1, 896, "F32");
 
         // Layer 0
@@ -224,6 +230,230 @@ namespace
     }
 
 } // anonymous namespace
+
+/**
+ * @brief Input shards must retain every output row, across every format and TP1..8.
+ *
+ * N=65 is deliberate: flattening the shard's elements and dividing by the
+ * original K truncates rows for every degree except one. This was an actual
+ * under-admission, not just inaccurate performance metadata. No device or
+ * tensor allocation is needed to prove the packing contract.
+ */
+TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = 1;
+    profile.n_heads = 16;
+    profile.n_kv_heads = 8;
+    profile.head_dim = 32;
+    profile.d_model = 65;
+    // Every TP degree up to eight has native-superblock-aligned K.
+    profile.d_ff = 256 * 840;
+    const auto align = [](size_t bytes) { return (bytes + 255u) & ~size_t(255u); };
+    for (const auto &format : nativeFormats())
+    {
+        SCOPED_TRACE(format.quant_type);
+        TensorSizeInfo down{"blk.0.ffn_down.weight",
+            static_cast<size_t>(65u * profile.d_ff * format.bytes_per_weight),
+            format.quant_type, 65u * profile.d_ff, static_cast<size_t>(profile.d_ff), 0};
+        TensorSizeInfo gate = down;
+        gate.name = "blk.0.ffn_gate.weight";
+        gate.K = 65;
+        for (int degree = 1; degree <= 8; ++degree)
+        {
+            SCOPED_TRACE(degree);
+            for (int shard = 0; shard < degree; ++shard)
+            {
+                for (const DeviceId device : {DeviceId::cpu(), DeviceId::cuda(shard), DeviceId::rocm(shard)})
+                {
+                    const size_t local_k = static_cast<size_t>(profile.d_ff / degree);
+                    const auto d = WeightShardGeometryResolver(profile, device, shard, degree).resolve(down);
+                    const auto g = WeightShardGeometryResolver(profile, device, shard, degree).resolve(gate);
+                    ASSERT_TRUE(d.matrix());
+                    ASSERT_TRUE(g.matrix());
+                    EXPECT_EQ(*d.matrix(), (WeightShardMatrix{65, local_k, 1}));
+                    EXPECT_EQ(*g.matrix(), (WeightShardMatrix{local_k, 65, 1}));
+                    EXPECT_EQ(d.elements(), g.elements());
+                    EXPECT_EQ(d.elements(), 65u * local_k);
+                    profile.tensors = {down};
+                    const auto bytes = WeightMemoryEstimator::estimate(profile, device, shard, degree);
+                    EXPECT_EQ(bytes.native_bytes, down.native_bytes / static_cast<size_t>(degree));
+                    if (device.is_gpu())
+                    {
+                        if (const auto *native = native_vnni_formats::forQuantType(format.quant_type))
+                        {
+                            const auto pool = nativeVnniPackedRegionSizes(65, local_k, *native);
+                            const size_t expected = align(pool.payload_bytes) + align(pool.scales_bytes) +
+                                align(pool.mins_bytes) + align(pool.emins_bytes);
+                            EXPECT_EQ(bytes.device_bytes, expected) << device.to_string();
+                            if (degree == 2)
+                            {
+                                const auto truncated = nativeVnniPackedRegionSizes(
+                                    d.elements() / down.K, down.K, *native);
+                                EXPECT_GT(expected, align(truncated.payload_bytes) + align(truncated.scales_bytes) +
+                                    align(truncated.mins_bytes) + align(truncated.emins_bytes));
+                            }
+                        }
+                        else
+                            EXPECT_EQ(bytes.device_bytes,
+                                static_cast<size_t>(d.elements() * format.bytes_per_weight));
+                    }
+                    else
+                        EXPECT_EQ(bytes.device_bytes, static_cast<size_t>(d.elements() *
+                            WeightMemoryEstimator::getCPUPackedBytesPerWeight(format.quant_type)));
+                }
+            }
+        }
+    }
+}
+
+/** @brief Exact runtime GQA assignments, including replicated KV, own local geometry. */
+TEST(Test__WeightMemoryEstimator, ShardGeometryMatchesProductionSlicerGQAAndUnevenAssignments)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_heads = 14;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 64;
+    profile.d_ff = 4864;
+    profile.vocab_size = 151936;
+    auto tp = std::make_shared<TensorParallelConfig>(TensorParallelConfig::proportionalSplit(
+        std::vector{DeviceId::cuda(0), DeviceId::cuda(1), DeviceId::cuda(2), DeviceId::cuda(3)},
+        std::vector<float>(4, 1.0f), 14, 2, 4864, 151936));
+    WeightSlicer slicer({.n_heads = 14, .n_kv_heads = 2, .head_dim = 64},
+        SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture), tp);
+    for (const auto &assignment : tp->assignments())
+    {
+        for (const std::string name : {"blk.0.attn_q.weight", "blk.0.attn_k.weight",
+                "blk.0.ffn_gate.weight", "output.weight"})
+        {
+            const size_t n = name == "output.weight" ? 151936u :
+                name == "blk.0.ffn_gate.weight" ? 4864u : name == "blk.0.attn_k.weight" ? 128u : 896u;
+            const TensorSizeInfo tensor{name, n * 896 * 4, "F32", n * 896, 896, 0};
+            const auto geometry = WeightShardGeometryResolver(profile, assignment.device, assignment.local_rank, 4, assignment).resolve(tensor);
+            ASSERT_TRUE(geometry.matrix());
+            EXPECT_EQ(geometry.matrix()->rows,
+                slicer.computeSliceForAssignment(name, n, assignment).count);
+            EXPECT_EQ(geometry.matrix()->columns, 896);
+        }
+    }
+}
+
+/** @brief Fused modulo-linked GDN keeps all selected Q/K/V spans, not one flat fraction. */
+TEST(Test__WeightMemoryEstimator, ShardGeometryMatchesProductionFusedGDN)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_heads = 16;
+    profile.n_kv_heads = 8;
+    profile.head_dim = 64;
+    profile.d_ff = 4096;
+    profile.vocab_size = 1024;
+    profile.gdn_group_count = 8;
+    profile.gdn_time_step_rank = 16;
+    profile.gdn_state_size = 128;
+    const size_t n = (2 * 8 + 16) * 128;
+    const TensorSizeInfo tensor{"blk.0.attn_qkv.weight", n * 512 * 4, "F32", n * 512, 512, 0};
+    for (int degree : {2, 4, 8})
+    {
+        std::vector<DeviceId> devices;
+        for (int index = 0; index < degree; ++index) devices.push_back(DeviceId::rocm(index));
+        auto tp = std::make_shared<TensorParallelConfig>(TensorParallelConfig::proportionalSplit(
+            devices, std::vector<float>(degree, 1.0f), 16, 8, 4096, 1024));
+        WeightSlicer slicer({.n_heads = 16, .n_kv_heads = 8, .head_dim = 64,
+                .gdn_n_k_heads = 8, .gdn_n_v_heads = 16, .gdn_d_state = 128},
+            SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture), tp);
+        for (const auto &assignment : tp->assignments())
+        {
+            const auto geometry = WeightShardGeometryResolver(profile, assignment.device, assignment.local_rank, degree, assignment).resolve(tensor);
+            const auto slices = slicer.computeFusedQKVSliceForAssignment(tensor.name, n, assignment);
+            ASSERT_TRUE(slices);
+            ASSERT_TRUE(geometry.matrix());
+            size_t rows = slices->q.count + slices->k.count;
+            for (const auto &v : slices->v) rows += v.count;
+            EXPECT_EQ(*geometry.matrix(), (WeightShardMatrix{rows, 512, 1}));
+        }
+    }
+}
+
+/** @brief Residency is an independent whole-expert axis, never another TP N/K split. */
+TEST(Test__WeightMemoryEstimator, ExpertGeometryRetainsIndependentAxisAndExplicitEmptyResidency)
+{
+    const auto profile = createMoEResidencyProfile();
+    const auto &expert = profile.tensors[4];
+    ASSERT_EQ(expert.name, "blk.0.ffn_gate_exps.weight");
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        size_t copies = 0;
+        for (int shard = 0; shard < degree; ++shard)
+        {
+            const auto apportioned = WeightShardGeometryResolver(profile, DeviceId::cpu(), shard, degree).resolve(expert);
+            ASSERT_TRUE(apportioned.matrix());
+            copies += apportioned.matrix()->instances;
+            EXPECT_EQ(apportioned.matrix()->rows, 64);
+            EXPECT_EQ(apportioned.matrix()->columns, 32);
+            for (size_t resident : {0u, 1u, 3u, 8u})
+            {
+                const auto overlay = WeightShardGeometryResolver(profile, DeviceId::cpu(), shard, degree, {}).resolve(expert, resident);
+                ASSERT_TRUE(overlay.matrix());
+                EXPECT_EQ(*overlay.matrix(), (WeightShardMatrix{64, 32, resident}));
+                EXPECT_EQ(overlay.elements(), resident * 64 * 32);
+            }
+        }
+        EXPECT_EQ(copies, 8);
+    }
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 1, {}).resolve(expert, 9),
+        std::invalid_argument);
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 1, {}).resolve(profile.tensors[0], 1),
+        std::invalid_argument);
+}
+
+/** @brief Vector inventory never masquerades as GEMM work; malformed shapes fail before pricing. */
+TEST(Test__WeightMemoryEstimator, ShardGeometryRejectsInvalidIdentityAndPreservesVectorIdentity)
+{
+    auto profile = createSimpleProfile();
+    TensorSizeInfo vector{"blk.0.ssm_dt.bias", 64, "F32", 16, 16, 0};
+    profile.architecture = "qwen35";
+    profile.n_heads = 16;
+    const auto slice = WeightShardGeometryResolver(profile, DeviceId::cpu(), 1, 2).resolve(vector);
+    EXPECT_EQ(slice.elements(), 8);
+    EXPECT_FALSE(slice.matrix());
+    auto malformed = profile.tensors[0];
+    malformed.elements += 1;
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu()).resolve(malformed), std::invalid_argument);
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 2, 2).resolve(vector), std::invalid_argument);
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 0).resolve(vector), std::invalid_argument);
+    DeviceShardingAssignment wrong;
+    wrong.device = DeviceId::cuda(0);
+    wrong.local_rank = 0;
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::rocm(0), 0, 2, wrong).resolve(vector),
+        std::invalid_argument);
+    const TensorSizeInfo marker{"blk.0.attn_q.weight", 0, "F32", 0, 0, 0};
+    EXPECT_EQ(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 2).resolve(marker).elements(), 0);
+    profile.n_heads = -1;
+    EXPECT_THROW(WeightShardGeometryResolver(profile, DeviceId::cpu(), 0, 2).resolve(vector),
+        std::invalid_argument);
+}
+
+/** @brief Valid huge metadata does not overflow the intermediate axis-coordinate product. */
+TEST(Test__WeightMemoryEstimator, ShardGeometryUsesOverflowSafeAxisCoordinates)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen2";
+    profile.n_heads = 8;
+    const size_t rows = std::numeric_limits<size_t>::max() / 32;
+    const TensorSizeInfo tensor{"blk.0.attn_q.weight", 0, "F32", rows * 32, 32, 0};
+    size_t total = 0;
+    for (int shard = 0; shard < 8; ++shard)
+    {
+        const auto shape = WeightShardGeometryResolver(profile, DeviceId::cpu(), shard, 8).resolve(tensor);
+        ASSERT_TRUE(shape.matrix());
+        total += shape.elements();
+    }
+    EXPECT_EQ(total, tensor.elements);
+}
+
 
 TEST(Test__WeightMemoryEstimator, NativeBytesPerWeight_AllSupportedFormats)
 {
@@ -456,6 +686,62 @@ TEST(Test__WeightMemoryEstimator, ExplicitLMHeadPreventsSyntheticTiedCopy)
     EXPECT_EQ(
         estimate.prepared_embedding_bytes,
         1000ULL * 2ULL * 36ULL);
+}
+
+/**
+ * @brief Native embedding views remain physical allocations, not zero-cost preparation sources.
+ *
+ * A mirrored table lives beside the vocabulary shard. Its component estimate
+ * must therefore include FP32/FP16/BF16 just as it includes prepared EmbedQ8.
+ * Odd vocabulary counts expose rounding losses through every supported TP
+ * degree. Device identifiers here are metadata only; no backend is initialized.
+ */
+TEST(Test__WeightMemoryEstimator, NativeEmbeddingComponentsCoverEveryVocabularyShard)
+{
+    for (const auto &format : {"F32", "F16", "BF16"})
+    {
+        const size_t element_bytes = std::string_view(format) == "F32" ? 4u : 2u;
+        for (const DeviceType backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            ModelMemoryProfile profile;
+            profile.architecture = "qwen35";
+            profile.n_layers = 1;
+            profile.d_model = 64;
+            profile.vocab_size = 1003;
+            for (const auto &name : {"token_embd.weight", "output.weight"})
+            {
+                TensorSizeInfo tensor;
+                tensor.name = name;
+                tensor.elements = static_cast<size_t>(profile.vocab_size) * profile.d_model;
+                tensor.K = profile.d_model;
+                tensor.quant_type = format;
+                tensor.native_bytes = tensor.elements * element_bytes;
+                profile.total_native_bytes += tensor.native_bytes;
+                profile.tensors.push_back(tensor);
+            }
+            const auto full = WeightMemoryEstimator::estimate(profile, DeviceId(backend, 0));
+            const size_t full_table_bytes = profile.tensors.front().native_bytes;
+            EXPECT_EQ(full.prepared_embedding_bytes, full_table_bytes);
+            EXPECT_EQ(full.device_bytes, 2u * full_table_bytes);
+            for (int degree = 1; degree <= 8; ++degree)
+            {
+                size_t component_sum = 0u;
+                for (int shard = 0; shard < degree; ++shard)
+                {
+                    SCOPED_TRACE(std::string(format) + " " + DeviceId(backend, shard).toString() +
+                                 " degree=" + std::to_string(degree));
+                    const auto estimate = WeightMemoryEstimator::estimate(
+                        profile, DeviceId(backend, shard), shard, degree);
+                    const size_t rows = profile.vocab_size / degree +
+                        (shard < profile.vocab_size % degree ? 1u : 0u);
+                    EXPECT_EQ(estimate.prepared_embedding_bytes, rows * profile.d_model * element_bytes);
+                    EXPECT_EQ(estimate.device_bytes, 2u * rows * profile.d_model * element_bytes);
+                    component_sum += estimate.prepared_embedding_bytes;
+                }
+                EXPECT_EQ(component_sum, full_table_bytes);
+            }
+        }
+    }
 }
 
 TEST(Test__WeightMemoryEstimator,
@@ -854,6 +1140,75 @@ TEST(Test__WeightMemoryEstimator, PPSlice_OnlyCountsAssignedLayers)
     // Layer slices should be less than full (they miss the other layer's weights)
     EXPECT_LT(est_layer0.native_bytes, est_all.native_bytes);
     EXPECT_LT(est_layer1.native_bytes, est_all.native_bytes);
+}
+
+/** @brief Pipeline endpoints partition global uses across all source formats. */
+TEST(Test__WeightMemoryEstimator, PipelineGlobalComponentsAreNotReplicatedByLayerSlicing)
+{
+    for (const auto &format : nativeFormats())
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+            for (const bool tied : {false, true})
+            {
+                SCOPED_TRACE(format.quant_type + ":" + std::to_string(static_cast<int>(backend)) +
+                             ":tied=" + std::to_string(tied));
+                auto profile = createSimpleProfile();
+                profile.d_model = profile.vocab_size = 256;
+                profile.tensors.clear();
+                for (const auto &name : {"token_embd.weight", "output.weight", "output_norm.weight",
+                                        "blk.0.attn_q.weight", "blk.1.attn_q.weight"})
+                {
+                    if (tied && std::string_view(name) == "output.weight") continue;
+                    const bool norm = std::string_view(name) == "output_norm.weight";
+                    const size_t elements = norm ? 256u : 256u * 256u;
+                    profile.tensors.push_back({name,
+                        static_cast<size_t>(elements * format.bytes_per_weight),
+                        format.quant_type, elements, 256u,
+                        std::string_view(name).starts_with("blk.0.") ? 0 :
+                        std::string_view(name).starts_with("blk.1.") ? 1 : -1});
+                }
+                const DeviceId device(backend, 0);
+                const auto full = WeightMemoryEstimator::estimate(profile, device);
+                const auto entry = WeightMemoryEstimator::estimate(profile, device, 0, 1, 0, 0,
+                    {}, {}, WeightComponentScope::Embedding);
+                const auto terminal = WeightMemoryEstimator::estimate(profile, device, 0, 1, 1, 1,
+                    {}, {}, WeightComponentScope::Terminal);
+                const auto middle = WeightMemoryEstimator::estimate(profile, device, 0, 1, 0, 1,
+                    {}, {}, WeightComponentScope::Intermediate);
+                EXPECT_EQ(entry.lm_head_bytes, 0u);
+                EXPECT_EQ(entry.tied_lm_head_bytes, 0u);
+                EXPECT_EQ(terminal.prepared_embedding_bytes, 0u);
+                EXPECT_EQ(middle.lm_head_bytes, 0u);
+                EXPECT_EQ(middle.prepared_embedding_bytes, 0u);
+                EXPECT_GT(terminal.lm_head_bytes, 0u);
+                if (!tied || device.is_gpu())
+                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes, full.device_bytes);
+                else
+                    // Distinct CPU stages cannot share the full model's tied source.
+                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes,
+                              full.device_bytes + terminal.tied_lm_head_bytes);
+            }
+}
+
+/** @brief A predictor-only weight set excludes globals without subtractive accounting. */
+TEST(Test__WeightMemoryEstimator, LayerOnlyScopeDoesNotInventGlobalBindings)
+{
+    auto profile = createSimpleProfile();
+    profile.tensors.push_back({"shared_constant.weight", 64, "F32", 16, 16, -1});
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const DeviceId device(backend, 0);
+        const auto exact = WeightMemoryEstimator::estimate(profile, device, 0, 1, 1, 1,
+            {}, {}, WeightComponentScope::LayersOnly);
+        auto layers = profile;
+        std::erase_if(layers.tensors, [](const auto &tensor) { return tensor.layer_index < 0; });
+        const auto oracle = WeightMemoryEstimator::estimate(layers, device, 0, 1, 1, 1);
+        EXPECT_EQ(exact.native_bytes, oracle.native_bytes);
+        EXPECT_EQ(exact.device_bytes, oracle.device_bytes);
+        EXPECT_EQ(exact.prepared_embedding_bytes, 0u);
+        EXPECT_EQ(exact.lm_head_bytes, 0u);
+    }
+    EXPECT_THROW(WeightMemoryEstimator::estimate(profile, DeviceId::cpu(), 0, 1, 0, -1,
+        {}, {}, static_cast<WeightComponentScope>(99)), std::invalid_argument);
 }
 
 TEST(Test__WeightMemoryEstimator, CPUPackedBytes)

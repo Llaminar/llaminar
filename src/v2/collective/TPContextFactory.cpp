@@ -2,6 +2,11 @@
  * @file TPContextFactory.cpp
  * @brief Implementation of factory for creating ITPContext instances
  *
+ * Cross-rank contexts inherit the caller's admitted communicator and resolved
+ * CPU endpoint. There is no implicit WORLD membership or fabricated locality.
+ * Domain construction consumes the resolved execution scope, not a guess from
+ * hostname spelling or the desired transport's name.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -46,6 +51,7 @@ namespace llaminar2
 
     std::unique_ptr<ITPContext> TPContextFactory::createFromDomain(
         const TPDomainParticipation &domain,
+        ExecutionDomainScope resolved_scope,
         MPI_Comm base_comm)
     {
         if (domain.devices.empty())
@@ -54,33 +60,16 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Check if this is a global domain by:
-        // 1. Backend type (UPI/MPI implies cross-rank)
-        // 2. Multiple devices with different hostnames
-        bool is_global = false;
+        if (resolved_scope == ExecutionDomainScope::AUTO ||
+            (resolved_scope != ExecutionDomainScope::SINGLE && resolved_scope != ExecutionDomainScope::RANK_LOCAL &&
+             resolved_scope != ExecutionDomainScope::NODE_LOCAL && resolved_scope != ExecutionDomainScope::GLOBAL))
+            throw std::invalid_argument("TP domain creation requires canonical resolved execution scope");
+        if (resolved_scope == ExecutionDomainScope::SINGLE && domain.devices.size() != 1)
+            throw std::invalid_argument("Single-device TP scope cannot name multiple participants");
 
-        // Check if backend suggests cross-rank communication
-        if (domain.backend == CollectiveBackendType::UPI ||
-            domain.backend == CollectiveBackendType::MPI)
-        {
-            is_global = true;
-        }
-
-        // Check if devices span multiple hostnames (indicates cross-rank)
-        if (!is_global && domain.devices.size() > 1)
-        {
-            const std::string &first_hostname = domain.devices[0].hostname;
-            for (size_t i = 1; i < domain.devices.size(); ++i)
-            {
-                if (domain.devices[i].hostname != first_hostname)
-                {
-                    is_global = true;
-                    break;
-                }
-            }
-        }
-
-        if (is_global)
+        // Cross-rank does not imply cross-node. GlobalTPContext authenticates
+        // the physical relationship from its actual admitted communicator.
+        if (resolved_scope == ExecutionDomainScope::NODE_LOCAL || resolved_scope == ExecutionDomainScope::GLOBAL)
         {
             LOG_DEBUG("TPContextFactory::createFromDomain - Domain '" << domain.domain_name
                                                                       << "' is GLOBAL, creating GlobalTPContext");
@@ -92,6 +81,7 @@ namespace llaminar2
                 domain.domain_id,
                 domain.domain_id,         // color = domain_id
                 domain.my_index_in_domain, // key = my index
+                domain.devices.at(domain.my_index_in_domain),
                 "",
                 domain.backend
             );
@@ -165,6 +155,7 @@ namespace llaminar2
         int domain_id,
         int color,
         int key,
+        std::optional<GlobalDeviceAddress> local_device,
         const std::string &hostfile_path,
         CollectiveBackendType backend)
     {
@@ -177,7 +168,8 @@ namespace llaminar2
         LOG_DEBUG("TPContextFactory::createGlobal - Creating GlobalTPContext with domain_id="
                   << domain_id << ", color=" << color << ", key=" << key);
 
-        return GlobalTPContext::createWithSplit(base_comm, domain_id, color, key, hostfile_path, backend);
+        return GlobalTPContext::createWithSplit(base_comm, domain_id, color, key,
+                                               std::move(local_device), hostfile_path, backend);
     }
 
     std::unique_ptr<IGlobalTPContext> TPContextFactory::createGlobalFromPlan(
@@ -211,6 +203,7 @@ namespace llaminar2
             domain_id,
             domain_id,                     // color
             plan.global_tp_rank_in_domain, // key
+            plan.primary_device,
             hostfile_path);
     }
 

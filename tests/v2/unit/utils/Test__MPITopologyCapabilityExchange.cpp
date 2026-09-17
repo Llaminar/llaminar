@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "utils/MPITopology.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 
 using namespace llaminar2;
@@ -33,11 +34,14 @@ protected:
         int num_rocm_gpus)
     {
         RankInventory inv;
+        inv.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+        inv.cpu_execution.maximum_native_row_tile = rank % 2 ? 2 : 4;
         inv.rank = rank;
         inv.node_id = rank / 2; // 2 ranks per node
         inv.local_rank = rank % 2;
         inv.hostname = hostname;
         inv.cpu_cores = 32;
+        inv.cpu_worker_threads = rank + 1; // Rank workshares need not match physical capacity or each other.
         inv.cpu_sockets = 2;
         inv.numa_nodes = 2;
         inv.cpu_memory_bytes = 128ULL * 1024 * 1024 * 1024; // 128GB
@@ -130,9 +134,11 @@ protected:
         EXPECT_EQ(a.local_rank, b.local_rank) << "local_rank mismatch";
         EXPECT_EQ(a.hostname, b.hostname) << "hostname mismatch";
         EXPECT_EQ(a.cpu_cores, b.cpu_cores) << "cpu_cores mismatch";
+        EXPECT_EQ(a.cpu_worker_threads, b.cpu_worker_threads) << "CPU worker budget mismatch";
         EXPECT_EQ(a.cpu_sockets, b.cpu_sockets) << "cpu_sockets mismatch";
         EXPECT_EQ(a.numa_nodes, b.numa_nodes) << "numa_nodes mismatch";
         EXPECT_EQ(a.cpu_memory_bytes, b.cpu_memory_bytes) << "cpu_memory_bytes mismatch";
+        EXPECT_EQ(a.cpu_execution, b.cpu_execution) << "CPU execution geometry mismatch";
 
         expectDeviceInfoEqual(a.cpu, b.cpu, "CPU");
 
@@ -299,13 +305,26 @@ TEST_F(Test__MPITopologyCapabilityExchange, Deserialize_TruncatedData)
     RankInventory original = createTestInventory(0, "test-node", 1, 0);
     std::vector<uint8_t> data = MPITopology::serializeRankInventory(original);
 
-    // Truncate the data
-    data.resize(data.size() / 2);
+    // Every field and mandatory tail must survive publication, not merely
+    // the rank header. An older short record cannot invent CPU geometry.
+    for (size_t length = 0; length < data.size(); ++length)
+        EXPECT_THROW(MPITopology::deserializeRankInventory(data.data(), length),
+            std::runtime_error) << length;
+}
 
-    // Should throw on truncated data
-    EXPECT_THROW(
-        MPITopology::deserializeRankInventory(data.data(), data.size()),
-        std::runtime_error);
+/** @test Mixed artifacts and extra unparsed fields fail before admission. */
+TEST_F(Test__MPITopologyCapabilityExchange, Deserialize_RejectsIncompatibleVersionAndTrailingBytes)
+{
+    const auto original = MPITopology::serializeRankInventory(createTestInventory(1, "peer", 0, 1));
+    for (const size_t offset : {0u, 4u})
+    {
+        auto data = original;
+        data[offset] ^= 0xff;
+        EXPECT_THROW(MPITopology::deserializeRankInventory(data.data(), data.size()), std::runtime_error);
+    }
+    auto extended = original;
+    extended.push_back(0);
+    EXPECT_THROW(MPITopology::deserializeRankInventory(extended.data(), extended.size()), std::runtime_error);
 }
 
 TEST_F(Test__MPITopologyCapabilityExchange, Deserialize_EmptyData)

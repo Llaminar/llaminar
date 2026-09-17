@@ -13,6 +13,7 @@
  * via the ISAPath runtime dispatch enum.
  */
 
+#include "../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <immintrin.h>
 #include <omp.h>
@@ -991,14 +992,14 @@ TEST(CPUNativeVNNIThreadTotality, ProductionDecodeAndGroupedVerifierExecute)
                     packed,
                     activations.data() +
                         static_cast<size_t>(row) * packed.blocks_per_row,
-                    serial.data() + static_cast<size_t>(row) * geometry.n,
+                    serial.data() + static_cast<size_t>(row) * geometry.n, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                     ISAPath::AUTO,
                     DecodeSchedulePolicy::Auto);
             }
             gemm_native_vnni_preq_decode_equivalent_rows(
                 packed,
                 activations.data(),
-                grouped.data(),
+                grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                 M,
                 geometry.n);
 
@@ -1036,7 +1037,7 @@ TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
         gemv_native_vnni_preq(
             packed,
             activation.data(),
-            output.data(),
+            output.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
             ISAPath::SCALAR,
             DecodeSchedulePolicy::Auto),
         std::runtime_error);
@@ -1044,7 +1045,7 @@ TEST(CPUNativeVNNIDecodePolicy, RejectsScalarProductionSchedules)
         gemv_native_vnni_preq(
             packed,
             activation.data(),
-            output.data(),
+            output.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
             ISAPath::SCALAR,
             DecodeSchedulePolicy::Nbc1),
         std::runtime_error);
@@ -1333,10 +1334,10 @@ CHUNK_PARITY_TEST(IQ1_M, createIQ1_MRandom, 64, 256)
         std::vector<float> result_512(N, 0.0f);                                            \
         std::vector<float> result_256(N, 0.0f);                                            \
                                                                                            \
-        gemv_native_vnni_preq(packed, A_q8.data(), result_512.data(),                      \
+        gemv_native_vnni_preq(packed, A_q8.data(), result_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),                      \
                               ISAPath::AVX512,                                             \
                               DecodeSchedulePolicy::FrozenSerialOracle);                  \
-        gemv_native_vnni_preq(packed, A_q8.data(), result_256.data(),                      \
+        gemv_native_vnni_preq(packed, A_q8.data(), result_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),                      \
                               ISAPath::AVX2,                                               \
                               DecodeSchedulePolicy::FrozenSerialOracle);                  \
                                                                                            \
@@ -1428,9 +1429,9 @@ FULL_GEMV_PARITY_TEST(IQ3_S, createIQ3_SRandom, 200, 512, 96)
         std::vector<float> result_512(static_cast<size_t>(M) * N, 0.0f);                   \
         std::vector<float> result_256(static_cast<size_t>(M) * N, 0.0f);                   \
                                                                                            \
-        gemm_native_vnni_preq(packed, A_q8_all.data(), result_512.data(),                  \
+        gemm_native_vnni_preq(packed, A_q8_all.data(), result_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),                  \
                               M, ldc, ISAPath::AVX512);                                    \
-        gemm_native_vnni_preq(packed, A_q8_all.data(), result_256.data(),                  \
+        gemm_native_vnni_preq(packed, A_q8_all.data(), result_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),                  \
                               M, ldc, ISAPath::AVX2);                                      \
                                                                                            \
         assertExactEqual(result_512.data(), result_256.data(),                              \
@@ -1568,13 +1569,13 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
         gemv_native_vnni_preq(
             packed,
             row_activations,
-            serial_avx512.data() + static_cast<size_t>(row) * N,
+            serial_avx512.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
             ISAPath::AVX512,
             DecodeSchedulePolicy::FrozenSerialOracle);
         gemv_native_vnni_preq(
             packed,
             row_activations,
-            serial_avx2.data() + static_cast<size_t>(row) * N,
+            serial_avx2.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
             ISAPath::AVX2,
             DecodeSchedulePolicy::FrozenSerialOracle);
     }
@@ -1598,7 +1599,7 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed,
             activations.data(),
-            grouped_avx512.data(),
+            grouped_avx512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
             M,
             N,
             ISAPath::AVX512,
@@ -1606,7 +1607,7 @@ TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed,
             activations.data(),
-            grouped_avx2.data(),
+            grouped_avx2.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
             M,
             N,
             ISAPath::AVX2,
@@ -1665,16 +1666,16 @@ TEST_F(AVX2VNNIParity, RuntimeISADispatch_AVX2AVX512_ScalarM1OracleOnly)
         std::vector<float> gemv_256(N, 0.0f);
         std::vector<float> gemv_scalar(N, 0.0f);
         gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_512.data(), ISAPath::AVX512,
+            packed, A_q8_all.data(), gemv_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::AVX512,
             DecodeSchedulePolicy::FrozenSerialOracle);
         gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_256.data(), ISAPath::AVX2,
+            packed, A_q8_all.data(), gemv_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::AVX2,
             DecodeSchedulePolicy::FrozenSerialOracle);
 
         assertExactEqual(gemv_512.data(), gemv_256.data(), N,
                          test_case.name + " M=1 AVX512 vs AVX2");
         gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR,
+            packed, A_q8_all.data(), gemv_scalar.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), ISAPath::SCALAR,
             DecodeSchedulePolicy::FrozenSerialOracle);
         assertStrictMetricClose(gemv_512.data(), gemv_scalar.data(), N,
                                 test_case.name + " M=1 AVX512 vs scalar oracle");
@@ -1682,15 +1683,15 @@ TEST_F(AVX2VNNIParity, RuntimeISADispatch_AVX2AVX512_ScalarM1OracleOnly)
         std::vector<float> rows_512(static_cast<size_t>(M) * N, 0.0f);
         std::vector<float> rows_256(static_cast<size_t>(M) * N, 0.0f);
         gemm_native_vnni_preq_decode_equivalent_rows(
-            packed, A_q8_all.data(), rows_512.data(), M, N, ISAPath::AVX512);
+            packed, A_q8_all.data(), rows_512.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N, ISAPath::AVX512);
         gemm_native_vnni_preq_decode_equivalent_rows(
-            packed, A_q8_all.data(), rows_256.data(), M, N, ISAPath::AVX2);
+            packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N, ISAPath::AVX2);
 
         assertExactEqual(rows_512.data(), rows_256.data(), M * N,
                          test_case.name + " verifier rows AVX512 vs AVX2");
         EXPECT_THROW(
             gemm_native_vnni_preq_decode_equivalent_rows(
-                packed, A_q8_all.data(), rows_256.data(), M, N,
+                packed, A_q8_all.data(), rows_256.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(), M, N,
                 ISAPath::SCALAR),
             std::runtime_error)
             << test_case.name

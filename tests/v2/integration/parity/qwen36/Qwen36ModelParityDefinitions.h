@@ -295,7 +295,15 @@ namespace llaminar2::test::parity::qwen36
         if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
             definition.topology.participants.size() == 1 &&
             !definition.topology.participants.front().address.isCPU())
+        {
             definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
+            // Remote certification is model-owned and provider-independent.
+            // The source cell keeps its existing single-device numerical test;
+            // the E2E exporter adds both public routes for each remote pool.
+            if (definition.topology.participants.front().address.isROCm())
+                definition.e2e_certifiable.front().remote_cpu_overlays = {
+                    ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}};
+        }
         return definition;
     }
     /** @return Full CPU two-socket matrix with one Dynamic/adaptive HTTP tag. */

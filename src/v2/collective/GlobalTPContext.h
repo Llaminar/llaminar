@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <optional>
 #include <mpi.h>
 
 namespace llaminar2
@@ -88,8 +89,8 @@ namespace llaminar2
      * over UPI interconnect.
      *
      * Creation patterns:
-     * - From TPDomain (has pre-created MPI communicator)
-     * - From explicit parameters (creates communicator via MPI_Comm_split)
+     * - From explicit admitted membership and its resolved local endpoint.
+     * - From fixture-owned communicator data for isolated tests.
      *
      * Thread safety: Single thread should use this context. Multiple contexts
      * (different domains) can be used concurrently from different threads.
@@ -98,26 +99,17 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Create from TPDomain
-         *
-         * The TPDomain already contains the domain-specific MPI communicator
-         * created by TPDomainBuilder::createCPUCrossRankDomain().
-         *
-         * @param domain Pre-configured TP domain with valid communicator
-         * @return Unique pointer to GlobalTPContext, or nullptr on error
-         */
-        static std::unique_ptr<GlobalTPContext> create(const TPDomain &domain);
-
-        /**
          * @brief Create from explicit parameters
          *
          * Creates a new domain communicator via MPI_Comm_split.
          *
-         * @param base_comm Base communicator (typically MPI_COMM_WORLD)
+         * @param base_comm Exact admitted parent communicator, never inferred.
          * @param domain_id Identifier for this global TP domain
          * @param color MPI_Comm_split color (ranks with same color form domain)
          * @param key MPI_Comm_split key (determines ordering within domain)
-         * @param hostfile_path Optional MPI hostfile for node detection ordering
+         * @param local_device Resolved CPU endpoint; absent only on excluded ranks.
+         * @param hostfile_path Launch provenance, not a physical-node authority.
+         * @param backend_type Explicit collective policy for this domain.
          * @return Unique pointer to GlobalTPContext, or nullptr on error
          */
         static std::unique_ptr<GlobalTPContext> createWithSplit(
@@ -125,6 +117,7 @@ namespace llaminar2
             int domain_id,
             int color,
             int key,
+            std::optional<GlobalDeviceAddress> local_device,
             const std::string &hostfile_path = "",
             CollectiveBackendType backend_type = CollectiveBackendType::UPI);
 
@@ -270,7 +263,8 @@ namespace llaminar2
             std::vector<int> world_ranks,
             bool owns_communicator,
             CollectiveBackendType backend_type = CollectiveBackendType::UPI,
-            std::vector<int> node_ids = {});
+            std::vector<int> node_ids = {},
+            std::optional<GlobalDeviceAddress> local_device = std::nullopt);
 
         /// Auto-detect node IDs by gathering hostnames over domain_comm_
         void detectNodeIds();
@@ -291,6 +285,7 @@ namespace llaminar2
         int my_rank_in_domain_;                       ///< Our rank within domain (0 to size-1)
         int domain_size_;                             ///< Number of participants
         std::vector<int> world_ranks_;                ///< World ranks of all domain members
+        std::optional<GlobalDeviceAddress> local_device_; ///< Bound endpoint; only test contexts may omit it.
         std::vector<int> node_ids_;                   ///< Per-rank node ID (same ID = same physical node)
         bool all_same_node_;                          ///< Cached: all ranks on same node?
         int node_count_;                              ///< Cached: number of distinct nodes

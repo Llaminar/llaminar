@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+#include <limits>
 
 /**
  * @file ModelMemoryProfile.cpp
@@ -14,6 +15,8 @@
  * It records GGUF tensor names, element counts, native byte sizes, quantization
  * type strings, and inferred layer ownership so higher-level placement code can
  * estimate per-device weight pressure before constructing the execution graph.
+ * Wire decoding bounds all extents before allocating and consumes the complete
+ * payload, so a stale or malformed directory cannot become an admitted model.
  */
 
 namespace llaminar2
@@ -352,6 +355,7 @@ namespace llaminar2
     namespace
     {
 
+        /** @brief Append one native profile scalar without introducing alignment padding. */
         template <typename T>
         void writeVal(std::vector<uint8_t> &buf, T value)
         {
@@ -359,16 +363,20 @@ namespace llaminar2
             buf.insert(buf.end(), p, p + sizeof(T));
         }
 
+        /** @brief Append a length-prefixed string, rejecting unrepresentable lengths. */
         void writeStr(std::vector<uint8_t> &buf, const std::string &s)
         {
+            if (s.size() > std::numeric_limits<uint32_t>::max())
+                throw std::length_error("ModelMemoryProfile string exceeds wire capacity");
             writeVal<uint32_t>(buf, static_cast<uint32_t>(s.size()));
             buf.insert(buf.end(), s.begin(), s.end());
         }
 
+        /** @brief Read a scalar without forming a pointer outside the supplied extent. */
         template <typename T>
         T readVal(const uint8_t *&ptr, const uint8_t *end)
         {
-            if (ptr + sizeof(T) > end)
+            if (static_cast<size_t>(end - ptr) < sizeof(T))
                 throw std::runtime_error("ModelMemoryProfile deserialization: buffer underflow");
             T v;
             std::memcpy(&v, ptr, sizeof(T));
@@ -376,10 +384,11 @@ namespace llaminar2
             return v;
         }
 
+        /** @brief Validate the complete string extent before constructing its storage. */
         std::string readStr(const uint8_t *&ptr, const uint8_t *end)
         {
             uint32_t len = readVal<uint32_t>(ptr, end);
-            if (ptr + len > end)
+            if (static_cast<size_t>(end - ptr) < len)
                 throw std::runtime_error("ModelMemoryProfile deserialization: string buffer underflow");
             std::string s(reinterpret_cast<const char *>(ptr), len);
             ptr += len;
@@ -394,6 +403,8 @@ namespace llaminar2
 
     std::vector<uint8_t> ModelMemoryProfile::serialize() const
     {
+        if (tensors.size() > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("ModelMemoryProfile tensor inventory exceeds wire capacity");
         std::vector<uint8_t> buf;
         buf.reserve(4096);
 
@@ -441,6 +452,8 @@ namespace llaminar2
 
     ModelMemoryProfile ModelMemoryProfile::deserialize(const uint8_t *data, size_t size)
     {
+        if (!data || size < 2 * sizeof(uint32_t))
+            throw std::runtime_error("ModelMemoryProfile deserialization: missing header");
         ModelMemoryProfile p;
         const uint8_t *ptr = data;
         const uint8_t *end = data + size;
@@ -482,6 +495,13 @@ namespace llaminar2
         p.total_native_bytes = readVal<uint64_t>(ptr, end);
 
         uint32_t n_tensors = readVal<uint32_t>(ptr, end);
+        // Even an empty-name tensor needs both string lengths, three 64-bit
+        // extents and a layer index. Check this lower bound before reserve:
+        // a corrupt count must not trigger a multi-gigabyte allocation first.
+        constexpr size_t minimum_tensor_record_bytes =
+            2 * sizeof(uint32_t) + 3 * sizeof(uint64_t) + sizeof(int32_t);
+        if (n_tensors > static_cast<size_t>(end - ptr) / minimum_tensor_record_bytes)
+            throw std::runtime_error("ModelMemoryProfile deserialization: impossible tensor count");
         p.tensors.reserve(n_tensors);
         for (uint32_t i = 0; i < n_tensors; ++i)
         {
@@ -495,6 +515,8 @@ namespace llaminar2
             p.tensors.push_back(std::move(t));
         }
 
+        if (ptr != end)
+            throw std::runtime_error("ModelMemoryProfile deserialization: trailing payload bytes");
         return p;
     }
 

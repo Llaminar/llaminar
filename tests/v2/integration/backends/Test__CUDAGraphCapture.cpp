@@ -25,6 +25,7 @@
 #include "MTPTerminalScratchCaptureProof.h"
 #include "MTPMainForwardReadRetirementProof.h"
 #include "GPUGraphMemoryContractProof.h"
+#include "NativeTimelineImportProof.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 
 #include <cuda_runtime.h>
@@ -63,6 +64,14 @@ protected:
     }
 };
 
+/** @test Complete retained imports coexist with in-place local recording fragments. */
+TEST_F(Test__CUDAGraphCapture, OrderedTimelineImportsRetainedNativeWork)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveNativeTimelineImports(ctx(), *backend); });
+}
+
 /** @test Scratch invalidation preserves in-flight readers and accepted bytes. */
 TEST_F(Test__CUDAGraphCapture, MTPCatchupScratchRetiresBeforeAcceptedPublication)
 {
@@ -77,6 +86,15 @@ TEST_F(Test__CUDAGraphCapture, MTPMainForwardWaitsForSidecarReadRetirement)
     auto *backend = getCUDABackend();
     ASSERT_NE(backend, nullptr);
     ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend, DeviceId::cuda(0)); });
+}
+
+/** @test Metadata observers cannot steal a later mailbox writer's sidecar edge. */
+TEST_F(Test__CUDAGraphCapture, MTPShiftedMetadataPreservesMailboxWriterDependency)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend,
+        DeviceId::cuda(0), test::MTPReadRetirementBoundary::MetadataThenMailbox); });
 }
 
 /** @test Forced tokens retain the current forward's completion boundary. */
@@ -612,9 +630,17 @@ TEST_F(Test__CUDAGraphCapture, OrderedTimelineOwnsConditionalFragments)
             record(*first, 0x12u);
             ASSERT_GT(first->nodeCount(), 0u);
             ASSERT_GT(final->nodeCount(), 0u);
-            const std::array<GPUOrderedTimelineStep, 4> steps{{
+            // A reusable, independently captured operation must coexist with
+            // these non-clonable conditional handles in their original owner.
+            auto imported = ctx().createGraphCapture(stream);
+            ASSERT_TRUE(imported->beginCapture());
+            ASSERT_EQ(cudaMemsetAsync(bytes + 43u, 0x36, 1u, stream), cudaSuccess);
+            ASSERT_TRUE(imported->endCapture());
+            ASSERT_TRUE(imported->instantiate());
+            const std::array<GPUOrderedTimelineStep, 5> steps{{
                 {.name = "first", .kind = GPUOrderedTimelineStepKind::CapturedFragment,
                  .capture = first.get()},
+                {.name = "independent import", .capture = imported.get()},
                 {.name = "publish", .kind = GPUOrderedTimelineStepKind::PublishValue64,
                  .signal = bytes + 32u, .value = 1u},
                 {.name = "wait", .kind = GPUOrderedTimelineStepKind::WaitValue64,
@@ -647,6 +673,7 @@ TEST_F(Test__CUDAGraphCapture, OrderedTimelineOwnsConditionalFragments)
             EXPECT_EQ(parent->tryUpdate(), GraphUpdateResult::Failed);
             first.reset();
             final.reset();
+            imported.reset();
             for (auto &fragment : parallel_fragments) fragment.reset();
             for (int replay = 0; replay < 5; ++replay)
             {
@@ -662,6 +689,9 @@ TEST_F(Test__CUDAGraphCapture, OrderedTimelineOwnsConditionalFragments)
                 ASSERT_EQ(cudaMemcpy(&published, bytes + 32u, sizeof(published),
                     cudaMemcpyDeviceToHost), cudaSuccess);
                 EXPECT_EQ(published, 1u);
+                unsigned char imported_marker = 0u;
+                ASSERT_EQ(cudaMemcpy(&imported_marker, bytes + 43u, 1u, cudaMemcpyDeviceToHost), cudaSuccess);
+                EXPECT_EQ(imported_marker, 0x36u);
                 if (auxiliary)
                 {
                     std::array<unsigned char, 3> markers{};
@@ -673,7 +703,7 @@ TEST_F(Test__CUDAGraphCapture, OrderedTimelineOwnsConditionalFragments)
                 {
                     const auto timing = parent->consumeOrderedTimelineTiming();
                     EXPECT_EQ(timing.state, GPUOrderedTimelineTimingState::Complete);
-                    EXPECT_EQ(timing.samples.size(), 4u);
+                    EXPECT_EQ(timing.samples.size(), 5u);
                 }
             }
         }

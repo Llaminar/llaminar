@@ -183,7 +183,14 @@ namespace llaminar2
                        });
         }
 
-        bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
+        /**
+         * @brief Existing dense continuation shapes admitted by the graph factory.
+         *
+         * This is not a routed-domain capability catalog. Sparse execution
+         * routes to each participant's owning rank independently and does not
+         * need to instantiate one of these dense continuation helpers.
+         */
+        bool hasContinuationCollectiveRuntime(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
                    isAcceleratorLocalTPTensorShardedDomain(domain) ||
@@ -226,6 +233,13 @@ namespace llaminar2
             throw std::runtime_error(message.str());
         }
 
+        /**
+         * @brief Project one configured domain into exact rank-local addresses.
+         * @param domain Validated policy and participant ownership bindings.
+         * @param current_world_rank Observer whose local DeviceIds are resolved.
+         * @return Complete geometry without allocating or asserting readiness
+         *         of any collective/executor; graph admission owns that work.
+         */
         MoEOverlayRuntimeDomain resolveDomain(
             const RoutedExpertDomain &domain,
             int current_world_rank)
@@ -285,28 +299,24 @@ namespace llaminar2
                 resolved.local_reachable_for_mvp = resolved.primary_is_local && resolved.primary_owned_by_current_rank;
             }
 
-            resolved.requires_domain_scoped_collective_context = domain.hasMultipleParticipants();
-            resolved.domain_scoped_collective_context_ready =
-                resolved.requires_domain_scoped_collective_context && hasDomainScopedRuntimeSupport(resolved);
-            resolved.multi_participant_execution_pending =
-                domain.hasMultipleParticipants() && !resolved.domain_scoped_collective_context_ready;
-            if (resolved.multi_participant_execution_pending)
-            {
-                const bool tensor_sharded =
-                    domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded;
-                std::ostringstream reason;
-                reason << "Domain-scoped runtime support is not available for this "
-                       << (tensor_sharded ? "tensor-sharded" : "multi-participant")
-                       << " domain shape. Bridge Phase 5C covers accelerator LocalTP "
-                       << "tensor-sharded and CPU NodeTP fallback helpers; Bridge Phase 5D "
-                       << "still wires the accelerator LocalTP executor into the Qwen graph. "
-                       << "Primary-only lowering to " << resolved.primary_device.to_string()
-                       << " is no longer used for routed tier work";
-                resolved.pending_reason = reason.str();
-            }
             return resolved;
         }
     } // namespace
+
+    void MoEOverlayRuntimeDomain::validateContinuationCollectiveRuntime() const
+    {
+        // Keep the previous continuation admission restriction, but evaluate
+        // it only for that role. Descriptor resolution cannot announce that a
+        // sparse expert follower lacks a dense TP implementation it never uses.
+        if (participants.size() > 1 && !hasContinuationCollectiveRuntime(*this))
+        {
+            throw std::runtime_error(
+                "MoE expert overlay continuation domain '" + name +
+                "' has multiple participants but no graph-native collective runtime: scope=" +
+                executionDomainScopeToString(scope) + ", routed_compute=" +
+                routedExpertComputePolicyToString(routed_compute_policy));
+        }
+    }
 
     MoEExpertOverlayRuntimePlan::MoEExpertOverlayRuntimePlan(
         std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan,
@@ -448,13 +458,7 @@ namespace llaminar2
                 out << "current";
             out << " local_reachable_for_mvp=" << (domain.local_reachable_for_mvp ? "true" : "false")
                 << " routed_rebalance="
-                << (domain.routed_rebalance_controller_eligible ? domain.rebalance_domain_id : "not_applicable")
-                << " multi_participant_execution_pending="
-                << (domain.multi_participant_execution_pending ? "true" : "false")
-                << " collective_context="
-                << (domain.domain_scoped_collective_context_ready ? "ready" : (domain.requires_domain_scoped_collective_context ? "pending" : "not_required"));
-            if (!domain.pending_reason.empty())
-                out << " pending_reason=\"" << domain.pending_reason << "\"";
+                << (domain.routed_rebalance_controller_eligible ? domain.rebalance_domain_id : "not_applicable");
         }
 
         for (const auto &tier : routed_tiers_)
@@ -462,9 +466,7 @@ namespace llaminar2
             out << "\n  tier[" << tier.tier_index << "] " << tier.tier.name
                 << ": domain=" << tier.domain_name
                 << " primary_device=" << tier.primary_device.to_string()
-                << " fallback=" << (tier.tier.fallback ? "true" : "false")
-                << " multi_participant_execution_pending="
-                << (tier.multi_participant_execution_pending ? "true" : "false");
+                << " fallback=" << (tier.tier.fallback ? "true" : "false");
         }
         return out.str();
     }
@@ -528,7 +530,6 @@ namespace llaminar2
             resolved_tier.domain_name = tier.domain;
             resolved_tier.primary_device = domain.primary_device;
             resolved_tier.local_reachable_for_mvp = domain.local_reachable_for_mvp;
-            resolved_tier.multi_participant_execution_pending = domain.multi_participant_execution_pending;
             routed_tiers.push_back(std::move(resolved_tier));
 
             auto domain_it = std::find_if(domains.begin(), domains.end(),
@@ -553,18 +554,6 @@ namespace llaminar2
                  << " domains=" << runtime_plan->domains().size()
                  << " routed_tiers=" << runtime_plan->routedTiers().size());
         LOG_DEBUG("[MoEExpertOverlayRuntimePlan] " << runtime_plan->diagnostics());
-        for (const auto &domain : runtime_plan->domains())
-        {
-            if (domain.multi_participant_execution_pending)
-            {
-                LOG_WARN("[MoEExpertOverlayRuntimePlan] Domain '" << domain.name
-                                                                  << "' requests "
-                                                                  << routedExpertComputePolicyToString(domain.routed_compute_policy)
-                                                                  << " over " << domain.participants.size()
-                                                                  << " participants; " << domain.pending_reason);
-            }
-        }
-
         return runtime_plan;
     }
 

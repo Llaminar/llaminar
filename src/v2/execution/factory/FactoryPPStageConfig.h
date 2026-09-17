@@ -3,13 +3,18 @@
  * @brief PP stage configuration for inference runner factory
  *
  * This header is separate from InferenceRunnerFactory.h to avoid circular
- * dependencies with RankOrchestrator.h
+ * dependencies with RankOrchestrator.h. The factory validates this scope
+ * against the main model before any arena or weight materialization; MTP
+ * sidecar blocks are not ordinary pipeline layers.
  */
 
 #pragma once
 
+#include <stdexcept>
+
 namespace llaminar2
 {
+    class IModelContext;
 
     /**
      * @brief Configuration for a single PP (Pipeline Parallel) stage
@@ -54,6 +59,21 @@ namespace llaminar2
             // validates that exactly one stage has each flag across all stages.
             return true;
         }
+
+        /**
+         * @brief Reject a stage whose coordinates or terminal roles escape its model.
+         * @param model Model owning the complete loader metadata, not a caller-
+         *        supplied layer count that might include MTP or be stage-local.
+         * @throws std::invalid_argument for an empty/out-of-bounds range or a
+         *         global component assigned to a non-boundary stage.
+         *
+         * Local validity alone cannot prevent accidentally treating an MTP
+         * block as a main layer. The canonical MTP manifest helper resolves
+         * the global main-forward boundary from total model metadata. Run this
+         * check before allocating the stage, so graph geometry and prepared
+         * weights use the same scope even when blockCount() is stage-local.
+         */
+        void requireValidForModel(IModelContext &model) const;
 
         /**
          * @brief Get the number of layers this stage executes

@@ -1,17 +1,23 @@
 /**
  * @file CommandMPI.cpp
- * @brief Shared MPI lifecycle helper — implementation.
+ * @brief Shared command MPI lifecycle and canonical inventory handoff.
+ *
+ * Bootstrap resolves process membership before device discovery. Each child
+ * observes its own hardware through ClusterInventoryGatherer; the initiating
+ * host never manufactures remote participants or filters them by its NUMA map.
  */
 
 #include "app/commands/CommandMPI.h"
 #include "app/MPIBootstrapPhase.h"
-#include "app/MPIShutdown.h"
+#include "app/RuntimeInitPhase.h"
 #include "backends/ComputeBackend.h"
 #include "config/OrchestrationConfig.h"
+#include "execution/runner/RankInitializationLifecycle.h"
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
 
 #include <mpi.h>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,42 +28,20 @@ namespace llaminar2
     // CommandMPISession — RAII MPI lifecycle
     // ================================================================
 
-    CommandMPISession::~CommandMPISession()
-    {
-        if (mpi_initialized_)
-        {
-            mpiShutdown();
-        }
-    }
-
     MPI_Comm CommandMPISession::communicator() const
     {
-        return mpi_initialized_ ? mpi_ctx_->communicator() : MPI_COMM_NULL;
+        return is_mpi() ? mpi_ctx_->communicator() : MPI_COMM_NULL;
     }
 
-    CommandMPISession::CommandMPISession(CommandMPISession &&other) noexcept
-        : inventory(std::move(other.inventory)),
-          is_output_rank(other.is_output_rank),
-          mpi_initialized_(other.mpi_initialized_),
-          mpi_ctx_(std::move(other.mpi_ctx_))
+    std::shared_ptr<IMPIContext> CommandMPISession::context() const
     {
-        other.mpi_initialized_ = false;
+        return is_mpi() ? mpi_ctx_ : nullptr;
     }
 
-    CommandMPISession &CommandMPISession::operator=(CommandMPISession &&other) noexcept
+    const ClusterInventory &CommandMPISession::inventory() const
     {
-        if (this != &other)
-        {
-            if (mpi_initialized_)
-                mpiShutdown();
-
-            inventory = std::move(other.inventory);
-            is_output_rank = other.is_output_rank;
-            mpi_initialized_ = other.mpi_initialized_;
-            mpi_ctx_ = std::move(other.mpi_ctx_);
-            other.mpi_initialized_ = false;
-        }
-        return *this;
+        if (!inventory_) throw std::logic_error("Command inventory is unavailable before discovery completes");
+        return *inventory_;
     }
 
     // ================================================================
@@ -69,15 +53,20 @@ namespace llaminar2
     {
         CommandMPISession session;
 
-        // Initialize DeviceManager with no NUMA filter so we see all devices
-        DeviceManager::instance().initialize(-1, false);
-
         if (params.no_mpi_bootstrap)
         {
+            if (!params.hostfile.empty())
+                throw std::invalid_argument(
+                    "A cluster hostfile requires MPI bootstrap; local-only inventory cannot certify it");
             // ==========================================================
             // Local-only path: skip MPI entirely, enumerate local devices
             // ==========================================================
-            session.inventory = gatherClusterInventory(nullptr, {}, params.hostfile);
+            const OrchestrationConfig &request = params.request ? *params.request : OrchestrationConfig{};
+            // Local planning still materializes backend-owned projection
+            // workspaces. Keep its pre-inventory transition identical to the
+            // MPI command path rather than silently measuring raw host memory.
+            RuntimeInitPhase::initializeDiscoveryRuntime(request, 0, 1);
+            session.inventory_ = gatherClusterInventory(nullptr, params.hostfile);
             session.is_output_rank = true;
             return {std::move(session), std::nullopt};
         }
@@ -89,7 +78,10 @@ namespace llaminar2
         // the command, so we re-inject it so the self-launched mpirun
         // child process routes back to the correct command.
         // ==============================================================
-        OrchestrationConfig orch_config;
+        // Planning supplies serving's parsed policy so bootstrap preserves its
+        // hard backend constraints and launch geometry. Describe has no model
+        // request and deliberately inventories the unrestricted cluster.
+        OrchestrationConfig orch_config = params.request ? *params.request : OrchestrationConfig{};
         orch_config.mpi_no_bootstrap = false;
         orch_config.hostfile = params.hostfile;
 
@@ -108,19 +100,30 @@ namespace llaminar2
         if (bs_result.action == BootstrapResult::Action::EXIT)
             return {std::move(session), bs_result.exit_code};
 
-        // MPI_Init_thread — session destructor will call MPI_Finalize
-        int provided;
+        // The same owner used by serving retires MPI after all command owners.
         int argc_copy = params.argc;
         char **argv_copy = params.argv;
-        MPI_Init_thread(&argc_copy, &argv_copy, MPI_THREAD_MULTIPLE, &provided);
-        session.mpi_initialized_ = true;
+        session.mpi_session_.emplace(MPIProcessSession::initialize(argc_copy, argv_copy));
 
         session.mpi_ctx_ = MPIContextFactory::global();
         Logger::getInstance().setRank(session.mpi_ctx_->rank());
         session.is_output_rank = (session.mpi_ctx_->rank() == 0);
 
-        // Gather full cluster inventory via MPI_Allgatherv
-        session.inventory = gatherClusterInventory(session.mpi_ctx_, {}, params.hostfile);
+        // Plan and serve share this exact rank-local backend/inventory setup.
+        // Publish every local failure before the inventory all-gather so a
+        // missing CPU backend cannot strand a peer in planning samples.
+        const auto prepared = RankInitializationLifecycle::execute({0, "command_discovery_runtime"}, [&] {
+            RuntimeInitPhase::initializeDiscoveryRuntime(
+                orch_config, session.mpi_ctx_->rank(), session.mpi_ctx_->world_size());
+            return true;
+        }, [&](auto identity, auto outcome) {
+            return MPIRankInitializationConsensus::reach(session.communicator(), identity, outcome);
+        });
+        if (!prepared.succeeded())
+            throw std::runtime_error(prepared.diagnostic("Command initialization"));
+
+        // Retain the publication, not a detached copy of the same hardware facts.
+        session.inventory_ = gatherClusterInventory(session.mpi_ctx_, params.hostfile);
 
         return {std::move(session), std::nullopt};
     }

@@ -15,6 +15,28 @@ from pathlib import Path
 import subprocess
 
 
+def model_identities(manifest: dict) -> dict:
+    """Pin every declared source shard by stat identity, never payload hashing."""
+    result = {}
+    for filename in sorted({path for row in manifest["cells"] for path in row["model_files"]}):
+        stat = Path(filename).stat()
+        result[filename] = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+    return result
+
+
+def validate_prerequisites(report: dict) -> None:
+    """Require the canonical completed model-free receipt, not a cell pass flag."""
+    tests = report.get("preflight_tests")
+    if (type(report.get("preflight_return_code")) is not int or report["preflight_return_code"] != 0
+            or not isinstance(tests, list)
+            or not tests or any(not isinstance(name, str) for name in tests)
+            or len(set(tests)) != len(tests) or type(report.get("preflight_test_count")) is not int
+            or report["preflight_test_count"] != len(tests)
+            or not any(name.startswith("V2_Unit_") for name in tests)
+            or not any(name.startswith("V2_Integration_") for name in tests)):
+        raise ValueError("canonical Unit/production-preflight receipt is incomplete or failed")
+
+
 def digest(value: object) -> str:
     """Authenticate small structured metadata using a deterministic encoding."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
@@ -43,6 +65,36 @@ def image_identity(image: str) -> dict:
     if not data["Id"].startswith("sha256:"):
         raise ValueError("Docker did not return an immutable image identity")
     return {"id": data["Id"], "layers": data["RootFS"]["Layers"], "labels": labels}
+
+
+def runtime_image_content(inspection: dict) -> dict:
+    """Identify runnable bytes and configuration independently of Docker's store.
+
+    Classic Docker identifies a config blob; the containerd store can identify
+    its manifest instead. Neither daemon-local ID is a portable comparison.
+    Ordered uncompressed layer digests authenticate the entire filesystem, and
+    the complete runtime config authenticates entrypoint, environment, user,
+    labels and other launch defaults. Import history and storage-driver paths
+    are not runtime content. Missing/null optional config fields are equivalent
+    in Docker's API; non-null values (including empty strings/lists) stay exact.
+    """
+    def without_nulls(value):
+        """Normalize only API-omitted optional fields, never runtime values."""
+        if isinstance(value, dict):
+            return {key: without_nulls(item) for key, item in value.items() if item is not None}
+        if isinstance(value, list):
+            return [without_nulls(item) for item in value]
+        return value
+
+    if (not isinstance(inspection.get("Config"), dict)
+            or not isinstance(inspection.get("RootFS"), dict)
+            or inspection["RootFS"].get("Type") != "layers"
+            or not isinstance(inspection["RootFS"].get("Layers"), list)
+            or not inspection.get("Architecture") or not inspection.get("Os")):
+        raise ValueError("Docker inspection omitted its complete runtime content")
+    return {"config": without_nulls(inspection["Config"]), "rootfs": inspection["RootFS"],
+            "architecture": inspection["Architecture"], "os": inspection["Os"],
+            "variant": inspection.get("Variant") or "", "os_version": inspection.get("OsVersion") or ""}
 
 
 def validate_manifest(manifest: dict, revision: str) -> list[dict]:

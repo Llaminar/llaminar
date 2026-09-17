@@ -2,8 +2,8 @@
 """Export canonical model cells without executing numerical or generation tests.
 
 CTest owns exact membership; GoogleTest's typed JSON owns each configuration.
-Generation regression consumes the entire inventory, while HTTP certification
-and benchmarks consume only its explicitly tagged subset. Neither consumer
+Routine generation regression projects MTP-off and dynamic MTP, while HTTP certification,
+remote MPI certification and benchmarks consume their explicitly tagged subsets. No consumer
 may reconstruct a topology from a test name or maintain another axis expander.
 Discovery never loads model tensors, stages weights, or initializes devices.
 """
@@ -25,10 +25,121 @@ from production_artifacts import write_json
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def cross_host_scenarios(record: dict) -> list[dict]:
+    """Validate emitted remote cases without generating a second topology matrix.
+
+    Missing metadata is stale, not an empty successful cloud campaign. Every
+    declared topology must carry both public frontend routes. Model path and
+    HTTP workload remain in the parent record so remounting cannot create a
+    second, stale model identity. This is discovery validation, not live proof.
+    """
+    scenarios = record.get("cross_host_e2e")
+    if not isinstance(scenarios, list):
+        raise ValueError("canonical cell omitted its explicit cross-host E2E eligibility; rebuild/export stale metadata")
+    if scenarios and not isinstance(record.get("e2e"), dict):
+        raise ValueError("cross-host E2E eligibility requires an HTTP-tagged source cell")
+    seen, routes = set(), {}
+    for scenario in scenarios:
+        if (not isinstance(scenario, dict) or type(scenario.get("schema")) is not int
+                or scenario["schema"] != 1 or "model" in scenario
+                or not isinstance(scenario.get("id"), str) or not scenario["id"]
+                or any(ch in scenario["id"] for ch in "\x00\r\n")
+                or scenario["id"] in seen):
+            raise ValueError("invalid or duplicate cross-host E2E identity")
+        seen.add(scenario["id"])
+        topology = scenario.get("topology")
+        if (not isinstance(topology, dict) or topology.get("kind") != "cross-host-expert-overlay"
+                or topology.get("continuation_backend") not in ("cuda", "rocm")
+                or type(topology.get("continuation_devices")) is not int or topology["continuation_devices"] != 1
+                or type(topology.get("remote_cpu_hosts")) is not int or not 0 < topology["remote_cpu_hosts"] < 2**31 - 1
+                or type(topology.get("cpu_ranks_per_host")) is not int or topology["cpu_ranks_per_host"] != 1
+                or type(topology.get("execution_ranks")) is not int
+                or topology["execution_ranks"] != topology["remote_cpu_hosts"] + 1
+                or type(topology.get("continuation_priority")) is not int
+                or type(topology.get("remote_priority")) is not int
+                or topology["continuation_priority"] >= topology["remote_priority"]):
+            raise ValueError("invalid cross-host E2E topology")
+        frontend = scenario.get("frontend")
+        arguments = scenario.get("server_policy_args")
+        if (frontend not in ("plan-apply", "auto-serve")
+                or scenario.get("movement_evidence") != "required" or scenario.get("owner_order") != "ordinal"
+                or not isinstance(arguments, list) or not arguments
+                or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in arguments)):
+            raise ValueError("invalid cross-host E2E frontend/policy")
+        key = json.dumps(topology, sort_keys=True)
+        selected = routes.setdefault(key, {})
+        if frontend in selected:
+            raise ValueError("duplicate cross-host E2E frontend route")
+        selected[frontend] = arguments
+    for selected in routes.values():
+        if set(selected) != {"plan-apply", "auto-serve"}:
+            raise ValueError("cross-host E2E topology must prove both public frontend routes")
+        if selected["plan-apply"] != selected["auto-serve"]:
+            raise ValueError("cross-host E2E routes must preserve identical inference policy")
+    return scenarios
+
+
+def select_cross_host_scenario(record: dict, exact: str) -> dict:
+    """Select an existing typed remote case; never construct a topology from its name.
+
+    Both frontend routes are validated before narrowing. A diagnostic harness
+    cannot admit a hand-edited single-route profile as canonical eligibility.
+    The caller must keep the selected immutable record and bind its actual
+    resolved runtime/image separately; discovery is not execution evidence.
+    """
+    if (not isinstance(record, dict) or type(record.get("model_parity_schema")) is not int
+            or record["model_parity_schema"] != 1 or not isinstance(record.get("id"), str)
+            or not record["id"] or not isinstance(record.get("model"), str) or not record["model"]
+            or not isinstance(exact, str) or not exact):
+        raise ValueError("cross-host harness requires a canonical configuration and exact case")
+    matches = [row for row in cross_host_scenarios(record) if row["id"] == exact]
+    if len(matches) != 1:
+        raise ValueError("requested cross-host case is absent from canonical eligibility")
+    return matches[0]
+
+
+def select_cross_host_scenario_from_manifest(document: dict, exact: str) -> dict:
+    """Select one remote case from the revision-bound manifest projection.
+
+    The HTTP harness receives the exported document, not an individual source
+    configuration. Keep that distinction explicit so callers cannot
+    accidentally pass a manifest to :func:`select_cross_host_scenario` and
+    bypass the per-row schema checks. Exactly one parent row must own the
+    requested scenario; duplicate ownership is a malformed projection.
+    """
+    if (not isinstance(document, dict) or type(document.get("schema")) is not int
+            or document["schema"] != 1
+            or document.get("scope") != InventoryScope.CROSS_HOST_E2E.value
+            or not isinstance(document.get("source_revision"), str) or not document["source_revision"]
+            or not isinstance(document.get("cells"), list)
+            or not isinstance(exact, str) or not exact):
+        raise ValueError("cross-host manifest must contain schema 1, cross-host scope, cells and an exact case")
+    matches = []
+    for parent in document["cells"]:
+        if not isinstance(parent, dict) or not isinstance(parent.get("configuration"), dict):
+            raise ValueError("cross-host manifest contains a malformed parent cell")
+        # Validate the complete source row even when this exact case is absent;
+        # malformed siblings must not disappear merely because the harness
+        # narrowed the requested scenario.
+        config = parent["configuration"]
+        if (type(config.get("model_parity_schema")) is not int or config["model_parity_schema"] != 1
+                or not isinstance(config.get("id"), str) or not config["id"]
+                or not isinstance(config.get("model"), str) or not config["model"]):
+            raise ValueError("cross-host manifest contains an invalid source configuration")
+        for scenario in cross_host_scenarios(config):
+            if scenario["id"] == exact:
+                matches.append(scenario)
+    if len(matches) != 1:
+        raise ValueError("requested cross-host case is absent or duplicated in the canonical manifest")
+    return matches[0]
+
+
 class InventoryScope(str, Enum):
     """Select a projection of existing cells, never a different configuration."""
     ALL = "all"
+    GENERATION = "generation"
     E2E = "e2e"
+    CROSS_HOST_E2E = "cross-host-e2e"
 
     def accepts(self, record: dict) -> bool:
         """Require an explicit eligibility field even for an untagged cell."""
@@ -36,6 +147,13 @@ class InventoryScope(str, Enum):
             raise ValueError("canonical cell omitted its explicit E2E eligibility")
         if record["e2e"] is not None and not isinstance(record["e2e"], dict):
             raise ValueError("canonical E2E eligibility must be a profile or null")
+        if self == InventoryScope.CROSS_HOST_E2E:
+            return bool(cross_host_scenarios(record))
+        if self == InventoryScope.GENERATION:
+            # Project producer-owned policy; never parse names/argv or create
+            # another topology. Fixed depths remain mathematical diagnostics.
+            from generation_regression_http import MTPPolicy, generation_profile
+            return MTPPolicy(generation_profile(record)["mtp_policy"]) in (MTPPolicy.OFF, MTPPolicy.DYNAMIC)
         return self == InventoryScope.ALL or record["e2e"] is not None
 
 
@@ -92,6 +210,8 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
         declared = InventoryScope(manifest.get("scope", "e2e"))
         if scope == InventoryScope.ALL and declared != InventoryScope.ALL:
             raise ValueError("the full matrix requires an all-cell manifest")
+        if scope == InventoryScope.GENERATION and declared not in (InventoryScope.ALL, InventoryScope.GENERATION):
+            raise ValueError("generation requires the full inventory or its explicit generation projection")
         seen = set()
         for row in manifest["cells"]:
             exact = row["case"]
@@ -203,9 +323,17 @@ def main(argv: list[str] | None = None) -> int:
     selected = discover(args, args.scope)
     if args.export_manifest:
         write_json(args.export_manifest, export_manifest(selected, source_revision(args), args.scope))
-    for _, exact, _ in selected:
-        print(exact)
-    print(f"[model-parity-inventory] scope={args.scope.value} cells={len(selected)}")
+    for _, exact, record in selected:
+        if args.scope == InventoryScope.CROSS_HOST_E2E:
+            for remote in record["cross_host_e2e"]:
+                print(remote["id"])
+        else:
+            print(exact)
+    if args.scope == InventoryScope.CROSS_HOST_E2E:
+        count = sum(len(record["cross_host_e2e"]) for _, _, record in selected)
+        print(f"[model-parity-inventory] scope={args.scope.value} cells={count} source_cells={len(selected)}")
+    else:
+        print(f"[model-parity-inventory] scope={args.scope.value} cells={len(selected)}")
     return 0
 
 

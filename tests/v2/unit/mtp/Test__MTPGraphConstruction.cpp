@@ -28,6 +28,7 @@
 #include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/mtp/HostedDeviceGenerationLifecycle.h"
@@ -4748,8 +4749,12 @@ TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
     auto input = fixture.input();
     auto output = fixture.output();
     ASSERT_FALSE(bindings.mtp.depths.empty());
+    // These direct graph tests bypass the orchestrator, so explicitly perform
+    // its workspace preparation and keep the owner alive beyond the graph.
+    WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
 
     CPUDeviceContext ctx(DeviceId::cpu());
     DeviceGraphExecutor executor;
@@ -4780,8 +4785,10 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     auto input = fixture.input();
     auto output = fixture.output();
     ASSERT_FALSE(bindings.mtp.depths.empty());
+    WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
 
     CPUDeviceContext ctx(DeviceId::cpu());
     DeviceGraphExecutor executor;
@@ -4816,8 +4823,10 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     auto input = fixture.input();
     auto output = fixture.output();
     ASSERT_FALSE(bindings.mtp.depths.empty());
+    WorkspaceAllocator workspace;
     ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
     ASSERT_GT(graph.size(), 0u);
+    ASSERT_TRUE(workspace.allocateForGraph(graph, {.max_seq_len = 1}));
     ASSERT_NE(firstStageOfType<MoESparseDispatchStage>(graph), nullptr);
     ASSERT_NE(firstStageOfType<MoESparseReturnReduceStage>(graph), nullptr);
 

@@ -9,6 +9,7 @@
  */
 
 #include "planning/ActivationMemoryEstimator.h"
+#include "execution/mtp/GenerationRequestSeeds.h"
 
 #include <algorithm>
 #include <limits>
@@ -199,7 +200,7 @@ size_t ActivationMemoryEstimator::estimate(
         geometry.local_d_ff < 0 || geometry.local_n_heads < 0 ||
         geometry.local_n_kv_heads < 0 || geometry.local_vocab < 0 ||
         geometry.total_shards <= 0 ||
-        geometry.mtp_target_query_rows <= 0)
+        geometry.mtp_target_query_rows <= 0 || geometry.generation_request_capacity <= 0)
     {
         throw std::invalid_argument(
             "Activation graph memory geometry requires positive rows, batch, "
@@ -218,6 +219,13 @@ size_t ActivationMemoryEstimator::estimate(
         device);
     if (bytes == 0)
         return 0;
+
+    // This request input exists on GPU even with no predictor. Use the same
+    // geometry as arena registration; CPU draws do not retain device seeds.
+    if (device.is_gpu())
+        bytes = checkedAdd(bytes, GenerationRequestSeedGeometry(
+            geometry.batch_size, geometry.generation_request_capacity).bytes(),
+            "resident generation request seeds");
 
     const size_t rows = static_cast<size_t>(geometry.resident_graph_rows);
     const size_t target_rows =

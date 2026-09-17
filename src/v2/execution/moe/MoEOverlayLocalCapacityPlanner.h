@@ -22,6 +22,7 @@
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/MemoryPlan.h"
+#include "planning/MemoryPlanner.h"
 #include "planning/ModelMemoryProfile.h"
 
 #include <cstddef>
@@ -138,6 +139,8 @@ namespace llaminar2
     /** @brief Rank-local fixed BOM plus the exact graph-row shape it priced. */
     struct MoEOverlayLocalCapacityPlannerResult
     {
+        /** Exact compiler/BOM inputs; routed counts remain owned by global capacity resolution. */
+        std::vector<DevicePlanConfig> device_inputs;
         int resident_graph_rows = 0;
         /** Exact ingress geometry priced by this rank, retained with its BOM. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;

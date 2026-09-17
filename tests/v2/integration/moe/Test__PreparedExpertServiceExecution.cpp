@@ -23,6 +23,7 @@
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "transfer/TransferEngine.h"
 #include "../../utils/QuantizedVerifierFormats.h"
 
@@ -195,13 +196,12 @@ namespace llaminar2::test
                     TransferEngine::prepareDeviceOutput(&output_, device, stream);
                 }
                 stage_ = std::make_unique<MoEExpertComputeStage>(std::move(p));
-                if (!device.is_gpu()) return;
-
                 const auto requirements = stage_->getWorkspaceRequirements(rows);
                 workspace_ = std::make_unique<DeviceWorkspaceManager>(
                     device, requirements.total_bytes_with_alignment());
                 require(workspace_->allocate(requirements), "private stage workspace allocation");
                 stage_->bindWorkspace(workspace_.get());
+                if (!device.is_gpu()) return;
                 require(stage_->prepareGraphLaunch(context_.get(), stream), "private stage capture preparation");
                 // Preparation publishes H2D events. Admit those external
                 // producer edges before recording this graph, as the ordinary
@@ -313,7 +313,13 @@ namespace llaminar2::test
                     {.projection = ExpertTierWeightProjection::Down, .N = kWidth, .K = kWidth, .format = descriptor.format}}}}});
             const auto topology = ExpertHistogramProductionTopology::uniform(1, kAllExpertHistogramProductionSources);
             const MoEOverlayCPUServiceMeasurement::Geometry geometry{kWidth, kWidth};
-            const size_t bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(geometry);
+            constexpr int sample_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
+            auto invocation = cpuSwiGLUWorkspaceRequirements(sample_rows, kWidth);
+            for (const auto &engine : {source.gate, source.up, source.down})
+                if (const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(engine.get()))
+                    invocation.merge(consumer->getWorkspaceRequirements(sample_rows, kWidth, kWidth));
+            const size_t bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
+                geometry, invocation.total_bytes_with_alignment());
             const auto make_memory = [](size_t admitted)
             {
                 PhysicalMemoryBOMBuilder bom({.world_rank = 0, .device = DeviceId::cpu(),
@@ -358,6 +364,7 @@ namespace llaminar2::test
         /** @brief Sweep exact formats and phases, retaining the original serving graph. */
         void prove(DeviceId device)
         {
+            if (device.is_cpu() && !hasCPUBackend()) initCPUBackend(-1);
             const auto body = [&]
             {
                 void *serving_stream = nullptr;

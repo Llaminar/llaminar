@@ -1,6 +1,13 @@
 /**
  * @file MoEOverlayResidencyMaintenanceService.cpp
  * @brief Event-polled background scheduling for ExpertOverlay residency waves.
+ *
+ * The worker retains each immutable proposal through distributed admission and
+ * physical publication. Shutdown closes new proposal admission; it does not
+ * revoke an active wave's ownership. Only ReadyToStage may discard an unstarted
+ * local proposal. Active work, asynchronous aborts and old-reader retirement
+ * continue through the same authority polls used during inference, without an
+ * extra transfer, stream wait or device synchronization.
  */
 
 #include "MoEOverlayResidencyMaintenanceService.h"
@@ -624,20 +631,9 @@ namespace llaminar2
                     MoEOverlayMaintenanceState::Draining,
                     std::memory_order_release);
 
-                /*
-                 * A process-local deferred proposal owns no externally visible
-                 * state and may be discarded. A distributed proposal cannot:
-                 * once its frozen histogram publication began, a peer may
-                 * already have derived or staged the same generation. The
-                 * coordinator must finish that exact generation before the
-                 * runner releases remote worker loops.
-                 */
-                if (!config_.proposal_publisher)
-                {
-                    retained_transaction_ = {};
-                    retained_transaction_state_ =
-                        MoEOverlayRetainedTransactionState::Empty;
-                }
+                /* Closing admission does not erase admitted ownership. The
+                 * normal poll path drains Active, and ReadyToStage alone owns
+                 * cancellation of an unstarted local proposal. */
                 if (config_.economy_certification)
                     config_.economy_certification->requestStop();
                 if (config_.device_service_telemetry_publisher)
@@ -947,14 +943,6 @@ namespace llaminar2
         proposals_.fetch_add(1, std::memory_order_relaxed);
         recordPerfCounter("maintenance_proposals");
 
-        /* Do not launch new process-local work after a concurrent shutdown. */
-        if (shutdown_requested_.load(std::memory_order_acquire))
-        {
-            retained_transaction_ = {};
-            retained_transaction_state_ =
-                MoEOverlayRetainedTransactionState::Empty;
-            return;
-        }
         tryBeginRetainedTransaction();
     }
 
@@ -1246,6 +1234,20 @@ namespace llaminar2
         {
             fail(
                 "ExpertOverlay maintenance attempted to stage a missing transaction");
+            return;
+        }
+
+        /* This is the single local proposal admission/cancellation boundary,
+         * for both newly planned and deferred attempts. ReadyToStage owns no
+         * active physical wave; any prior attempt's abort is separately held
+         * by the authority. A distributed proposal is already visible to peers
+         * and must complete even after this process observes shutdown. */
+        if (!config_.proposal_publisher &&
+            shutdown_requested_.load(std::memory_order_acquire))
+        {
+            retained_transaction_ = {};
+            retained_transaction_state_ =
+                MoEOverlayRetainedTransactionState::Empty;
             return;
         }
 

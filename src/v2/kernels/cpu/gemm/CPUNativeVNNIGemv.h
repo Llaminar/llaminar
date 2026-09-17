@@ -46,8 +46,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <omp.h>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -56,6 +58,7 @@
 #include "CPUNativeVNNIFP16.h"
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNITileConfig.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "tensors/AlignedVector.h"
@@ -388,30 +391,9 @@ namespace llaminar2::cpu::native_vnni
         int K,
         int num_threads)
     {
-        NativeVNNITileConfig config = computeTileConfig(
-            policy_n, K, 1, packed.preparedFootprint(), num_threads);
-        if (packed.numerical_policy !=
-            CPUProjectionNumericalPolicy::GPUAlignedExpert)
-        {
-            return config;
-        }
-        if (!MoEProjectionNumericalContract::ownsOrderedKPartitionTree(
-                packed.codebook_id))
-        {
-            throw std::invalid_argument(
-                "GPU-aligned CPU NativeVNNI expert has no certified K tree for "
-                "its source arithmetic codebook");
-        }
-        const int partitions =
-            MoEProjectionNumericalContract::orderedKPartitionsForWidth(K);
-        if (partitions <= 0)
-        {
-            throw std::invalid_argument(
-                "GPU-aligned CPU NativeVNNI expert requires a positive, "
-                "32-element-aligned K width");
-        }
-        config.k_tiles = partitions;
-        return config;
+        return serialTileConfigForPreparedProjection(packed.preparedFootprint(),
+            packed.codebook_id, packed.numerical_policy, policy_n, K, num_threads,
+            CPUExecutionGeometry::local().cache);
     }
 
     /** @brief Physical grouped-verifier implementation selected for execution. */
@@ -835,6 +817,47 @@ namespace llaminar2::cpu::native_vnni
         return serial_partition_n;
     }
 
+    /**
+     * @brief Worker geometry shared by declaration, dispatch and diagnostics.
+     * @return Active workshare team size, or the budget for a new standalone team.
+     *
+     * OpenMP's max-thread query describes a future nested team, not necessarily
+     * the workers entering this invocation. Using it inside a retained team can
+     * change the ordered K tree and demand a different partial bank. Follow the
+     * same active-team decision as OMP_WORKSHARE_REGION, without a new barrier.
+     */
+    inline int nativeVNNIInvocationWorkerCount() noexcept
+    {
+        return omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
+    }
+
+    /**
+     * @brief Exact ordered-partial bank for the current participant geometry.
+     * @param packed Immutable prepared matrix and its arithmetic policy.
+     * @param rows Maximum simultaneously live rows.
+     * @return Physical partial extent; worker count and logical TP width select
+     * the same serial tree used by execution, while physical N sizes storage.
+     */
+    inline size_t nativeVNNIProjectionPartialFloats(
+        const CPUNativeVNNIPackedWeights &packed, int rows)
+    {
+        const int workers = nativeVNNIInvocationWorkerCount();
+        const auto config = serialTileConfigForPackedMatrix(
+            packed, cpuNativeVNNISerialEquivalentPolicyN(packed.N), packed.K, workers);
+        return cpuProjectionPartialFloats(rows, packed.N, config.k_tiles);
+    }
+
+    /** @return This prepared member's contribution to the admitted serial/fused slab. */
+    inline size_t nativeVNNIProjectionPartialEnvelopeFloats(
+        const CPUNativeVNNIPackedWeights &packed, int rows)
+    {
+        const int workers = nativeVNNIInvocationWorkerCount();
+        const auto config = serialTileConfigForPackedMatrix(
+            packed, cpuNativeVNNISerialEquivalentPolicyN(packed.N), packed.K, workers);
+        return cpuProjectionPartialEnvelopeFloats(rows, packed.N, config.k_tiles, workers,
+            activeISALevel() >= ISALevel::AVX512 ? 4 : 2);
+    }
+
     /** Return the requested N-chunk count for one explicit decode policy. */
     inline int decodeScheduleNBlockChunks(DecodeSchedulePolicy policy)
     {
@@ -1137,7 +1160,7 @@ namespace llaminar2::cpu::native_vnni
         if (generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
                 build_isa,
                 runtime_isa,
-                omp_get_max_threads(),
+                nativeVNNIInvocationWorkerCount(),
                 packed.codebook_id,
                 N,
                 K,
@@ -1151,14 +1174,14 @@ namespace llaminar2::cpu::native_vnni
                     .n = N,
                     .k = K,
                     .k_tiles = serial_k_tiles,
-                    .threads = omp_get_max_threads(),
+                    .threads = nativeVNNIInvocationWorkerCount(),
                 });
         }
         throw std::runtime_error(
             std::string("No certified CPU NativeVNNI M=1 decode policy for build=") +
             compiledNativeVNNIBuildISAName() +
             " runtime=" + (use_avx512 ? "AVX512" : "AVX2") +
-            " threads=" + std::to_string(omp_get_max_threads()) +
+            " threads=" + std::to_string(nativeVNNIInvocationWorkerCount()) +
             " codebook=" + std::to_string(packed.codebook_id) +
             " N=" + std::to_string(N) +
             " K=" + std::to_string(K) +
@@ -1421,7 +1444,7 @@ namespace llaminar2::cpu::native_vnni
         int K)
     {
         const int policy_n = cpuNativeVNNISerialEquivalentPolicyN(N);
-        const int threads = omp_get_max_threads();
+        const int threads = nativeVNNIInvocationWorkerCount();
         const NativeVNNITileConfig serial_geometry =
             serialTileConfigForPackedMatrix(
                 packed, policy_n, K, threads);
@@ -1707,23 +1730,21 @@ namespace llaminar2::cpu::native_vnni
     /**
      * @brief Pack four signed Q8_1 activation bytes exactly like M=1 GEMV.
      *
-     * The VNNI dot instruction consumes unsigned activation bytes.  The decode
-     * GEMV path converts each signed Q8_1 byte with `int16(q) + 128` before
-     * broadcasting the four-byte word.  Multi-row verifier kernels must use the
-     * same helper instead of clever bit tricks: even mathematically equivalent
-     * shortcuts make it harder to reason about strict decode equivalence when
-     * a verifier row later publishes KV/GDN state.
+     * The VNNI dot instruction consumes unsigned activation bytes. Adding 128
+     * modulo 256 is exactly a sign-bit flip for every signed byte, including
+     * -128. Reuse the AVX2 word-packing primitive so both ISA paths share this
+     * integer representation. Four separate byte expressions invite SLP to
+     * consume XMM registers beside the live ZMM dot-product accumulators;
+     * loading one integer word and XORing its sign bits avoids that pressure.
+     * The existing per-block weight-sum compensation remains unchanged.
+     *
+     * @param block Signed quantized activations and their unchanged scale.
+     * @param base_idx First of four valid consecutive bytes within the block.
+     * @return Bit-exact unsigned activation lanes in one broadcastable word.
      */
     inline int32_t pack_q8_1_unsigned_word(const Q8_1Block &block, int base_idx)
     {
-        uint8_t vals[4];
-        vals[0] = static_cast<uint8_t>(static_cast<int16_t>(block.qs[base_idx + 0]) + 128);
-        vals[1] = static_cast<uint8_t>(static_cast<int16_t>(block.qs[base_idx + 1]) + 128);
-        vals[2] = static_cast<uint8_t>(static_cast<int16_t>(block.qs[base_idx + 2]) + 128);
-        vals[3] = static_cast<uint8_t>(static_cast<int16_t>(block.qs[base_idx + 3]) + 128);
-        int32_t packed_word;
-        std::memcpy(&packed_word, vals, sizeof(packed_word));
-        return packed_word;
+        return pack_q8_1_unsigned_word_avx2(block, base_idx);
     }
 
     /**
@@ -3088,6 +3109,7 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
+        std::span<float> partial_storage,
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
@@ -3110,7 +3132,7 @@ namespace llaminar2::cpu::native_vnni
              isa_path == ISAPath::AVX2);
 
         // Compute tile configuration
-        int num_threads = omp_get_max_threads();
+        int num_threads = nativeVNNIInvocationWorkerCount();
         NativeVNNITileConfig cfg = serialTileConfigForPackedMatrix(
             packed, policy_n, K, num_threads);
 
@@ -3210,12 +3232,13 @@ namespace llaminar2::cpu::native_vnni
              * reduction pass.  Use default-initialized storage so long-K decode
              * verifier rows do not pay a redundant memset on every GEMV call.
              */
-            const size_t partial_sum_floats =
-                static_cast<size_t>(N_chunks) * k_tiles * 64;
-            thread_local AlignedVector<float> partial_sums_tls;
-            if (partial_sums_tls.size() < partial_sum_floats)
-                partial_sums_tls.resize_uninitialized(partial_sum_floats);
-            float *partial_sums = partial_sums_tls.data();
+            const size_t partial_sum_floats = cpuProjectionPartialFloats(1, N, k_tiles);
+            if (partial_storage.size() < partial_sum_floats)
+                throw std::runtime_error("CPU NativeVNNI GEMV requires admitted ordered-partial storage");
+            // All retained-team workers receive the same invocation address.
+            // The producer workshare barrier publishes every disjoint partial
+            // before the reduction workshare reads the common bank.
+            float *partial_sums = partial_storage.data();
 
             auto do_gemv_kpar = [&]()
             {
@@ -3402,51 +3425,65 @@ namespace llaminar2::cpu::native_vnni
      * @param packed Immutable weight layout and numerical policy.
      * @param A_fp32 One row of K FP32 activation values.
      * @param C Destination for N FP32 projection values.
+     * @param activation_storage Invocation-owned Q8 bank; never retained or grown here.
      *
      * Serial and grouped callers share block publication helpers. Selecting
      * backend-native quantization here for a GPU-aligned expert would change
      * its input bytes solely because M became one. Quantization stays serial
-     * and reuses caller-local storage; this adds no team launch or row replay.
+     * and uses caller-owned storage; this adds no team launch or row replay.
      */
     inline void gemv_native_vnni(
         const CPUNativeVNNIPackedWeights &packed,
         const float *A_fp32,
-        float *C)
+        float *C,
+        std::span<float> partial_storage,
+        std::span<Q8_1Block> activation_storage)
     {
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
-        // Step 1: Quantize activations to Q8_1 (thread-local buffer avoids heap alloc per call)
-        thread_local std::vector<Q8_1Block> A_q8_tls;
-        if (static_cast<int>(A_q8_tls.size()) < K_blocks)
-            A_q8_tls.resize(K_blocks);
-        Q8_1Block *A_q8 = A_q8_tls.data();
+        // Validate the invocation's bank before publishing any activation bytes.
+        if (activation_storage.size() < static_cast<size_t>(K_blocks))
+            throw std::runtime_error("CPU NativeVNNI GEMV requires admitted Q8 input storage");
+        Q8_1Block *A_q8 = activation_storage.data();
 
-        // Process blocks in pairs for 2-way ILP (AVX-512)
-        const bool k_aligned = (K % 32 == 0);
-        int kb = 0;
+        // A retained team has one shared input bank. Publish it once before
+        // any worker consumes it; standalone decode pays no extra team launch.
+        auto quantize_input = [&]() {
+            // Process blocks in pairs for 2-way ILP (AVX-512)
+            const bool k_aligned = (K % 32 == 0);
+            int kb = 0;
 #if defined(__AVX512F__)
-        if (k_aligned)
-        {
-            for (; kb + 1 < K_blocks; kb += 2)
+            if (k_aligned)
             {
-                quantizeTwoActivationBlocks(
-                    A_fp32 + kb * 32, A_q8[kb], A_q8[kb + 1],
+                for (; kb + 1 < K_blocks; kb += 2)
+                {
+                    quantizeTwoActivationBlocks(
+                        A_fp32 + kb * 32, A_q8[kb], A_q8[kb + 1],
+                        packed.numerical_policy);
+                }
+            }
+#endif
+            for (; kb < K_blocks; ++kb)
+            {
+                int block_start = kb * 32;
+                int block_len = std::min(32, K - block_start);
+                quantizeActivationBlock(
+                    A_fp32 + block_start, A_q8[kb], block_len,
                     packed.numerical_policy);
             }
-        }
-#endif
-        for (; kb < K_blocks; ++kb)
+
+        };
+        if (omp_in_parallel())
         {
-            int block_start = kb * 32;
-            int block_len = std::min(32, K - block_start);
-            quantizeActivationBlock(
-                A_fp32 + block_start, A_q8[kb], block_len,
-                packed.numerical_policy);
+#pragma omp single
+            { quantize_input(); }
         }
+        else
+            quantize_input();
 
         // Step 2+: Delegate to pre-quantized compute path
-        gemv_native_vnni_preq(packed, A_q8, C);
+        gemv_native_vnni_preq(packed, A_q8, C, partial_storage);
     }
 
     // =========================================================================
@@ -5139,6 +5176,7 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_all,
         float *C,
+        std::span<float> partial_storage,
         int M,
         int ldc,
         ISAPath isa_path,
@@ -5150,6 +5188,7 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_all,
         float *C,
+        std::span<float> partial_storage,
         int M,
         int ldc,
         ISAPath isa_path = ISAPath::AUTO,
@@ -5174,7 +5213,7 @@ namespace llaminar2::cpu::native_vnni
             ((isa_path == ISAPath::AUTO && active_isa >= ISALevel::AVX2) ||
              isa_path == ISAPath::AVX2);
 
-        int num_threads = omp_get_max_threads();
+        int num_threads = nativeVNNIInvocationWorkerCount();
         NativeVNNITileConfig cfg = computeTileConfig(
             policy_n, packed.K, M, packed.preparedFootprint(), num_threads);
         int k_tile_blocks = cfg.k_tile_blocks > 0 ? cfg.k_tile_blocks : K_blocks;
@@ -5343,6 +5382,7 @@ namespace llaminar2::cpu::native_vnni
                 packed,
                 A_q8_all,
                 C,
+                partial_storage,
                 M,
                 ldc,
                 isa_path,
@@ -5364,6 +5404,7 @@ namespace llaminar2::cpu::native_vnni
                 packed,
                 A_q8_all,
                 C,
+                partial_storage,
                 M,
                 ldc,
                 isa_path,
@@ -5639,6 +5680,7 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_all,
         float *C,
+        std::span<float> partial_storage,
         int M,
         int ldc,
         ISAPath isa_path = ISAPath::AUTO,
@@ -5666,7 +5708,7 @@ namespace llaminar2::cpu::native_vnni
             use_avx512
                 ? ISALevel::AVX512
                 : (use_avx2 ? ISALevel::AVX2 : ISALevel::Scalar);
-        const int num_threads = omp_get_max_threads();
+        const int num_threads = nativeVNNIInvocationWorkerCount();
         NativeVNNITileConfig cfg = serialTileConfigForPackedMatrix(
             packed, policy_n, K, num_threads);
         const VerifierRowsPolicy selected_policy =
@@ -5800,6 +5842,7 @@ namespace llaminar2::cpu::native_vnni
                 packed,
                 A_q8_all,
                 C,
+                partial_storage,
                 M,
                 ldc,
                 isa_path,
@@ -5817,18 +5860,15 @@ namespace llaminar2::cpu::native_vnni
             const int k_tiles = cfg.k_tiles;
             const int k_blocks_per_tile = (K_blocks + k_tiles - 1) / k_tiles;
 
-            const size_t partial_sum_floats =
-                static_cast<size_t>(M) * static_cast<size_t>(N_chunks) *
-                static_cast<size_t>(k_tiles) * 64;
+            const size_t partial_sum_floats = cpuProjectionPartialFloats(M, N, k_tiles);
             /*
              * Tile kernels write every partial slot before reduction. Reuse
-             * thread-local aligned storage so tiny verifier rows do not pay
-             * malloc/free or zero-fill cost on every decode step.
+             * participant-owned aligned storage so tiny verifier rows do not
+             * allocate, zero-fill or privately split their reduction bank.
              */
-            thread_local AlignedVector<float> partial_sums_tls;
-            if (partial_sums_tls.size() < partial_sum_floats)
-                partial_sums_tls.resize_uninitialized(partial_sum_floats);
-            float *partial_sums = partial_sums_tls.data();
+            if (partial_storage.size() < partial_sum_floats)
+                throw std::runtime_error("CPU NativeVNNI GEMM requires admitted ordered-partial storage");
+            float *partial_sums = partial_storage.data();
 
             auto do_kpar_partial_rows = [&]()
             {
@@ -6314,64 +6354,93 @@ namespace llaminar2::cpu::native_vnni
         VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
     };
 
-    /**
-     * @brief Fused multi-projection runtime-M verifier rows.
-     *
-     * This is the projection-bundle analogue of
-     * gemm_native_vnni_preq_decode_equivalent_rows(). Full-K projections use
-     * two-row physical tiles, while long-K projections use two-row AVX2 or
-     * four-row AVX512 tiles. Each tile shares packed-weight decode work across
-     * independent row accumulators without changing any row's K traversal.
-     * K-parallel partials are reduced through
-     * reduceNativeVNNIKTilePartialsExact(), so grouped and serial decode add
-     * tile partials in identical order.
-     *
-     * All descriptors execute under one OpenMP team. This avoids per-projection
-     * fork/join overhead while preserving each projection's own codebook,
-     * output stride, bias, and tail-column handling.
-     */
-    inline bool gemm_native_vnni_fused_verifier_rows_preq(
-        const Q8_1Block *A_q8_all,
-        const FusedVerifierRowsDesc *descs,
-        int num_descs,
-        int M,
-        int K_blocks,
-        ISAPath isa_path = ISAPath::AUTO)
+    /** @brief One projection's unchanged serial arithmetic and fused task geometry. */
+    struct FusedVerifierRowsPlan
     {
-        constexpr int kMaxFusedVerifierProjections = 512;
-        if (!descs || num_descs <= 0 ||
-            num_descs > kMaxFusedVerifierProjections ||
-            M <= 0 || K_blocks <= 0)
-            return false;
+        int rows = 0;
+        int policy_n = 0;
+        int n_chunks = 0;
+        int n_block_chunks = 1;
+        int total_blocks = 0;
+        int k_tiles = 0;
+        /** K extent of one arithmetic partition or full-K continuation panel. */
+        int k_blocks_per_tile = 0;
+        size_t partial_sums_offset = 0;
+        size_t partial_sums_size = 0;
+        DecodeSchedulePolicy requested_decode_schedule =
+            DecodeSchedulePolicy::Auto;
+        DecodeSchedulePolicy effective_decode_schedule =
+            DecodeSchedulePolicy::Auto;
+        VerifierRowsPolicy requested_verifier_schedule =
+            VerifierRowsPolicy::Auto;
+        VerifierRowsPolicy effective_verifier_schedule =
+            VerifierRowsPolicy::Pairwise;
+        VerifierRowsScheduleResolution verifier_resolution{};
+    };
 
-        const int num_threads = omp_get_max_threads();
-        for (int p = 0; p < num_descs; ++p)
+
+    /** @brief Physical ownership of ordered partials for one fused invocation. */
+    enum class NativeVNNIFusedPartialRoute
+    {
+        FullK, ///< No ordered partials: every output owner traverses all K.
+        OutputTileLocal, ///< Each output owner keeps its fixed tree on its stack.
+        SharedBank, ///< Independent K producers require one admitted shared bank.
+        OutputTileWorkspace, ///< Larger trees use exclusive worker-owned slab tiles.
+    };
+
+    /**
+     * @brief Allocation-free bundle plan shared by execution and scratch declaration.
+     *
+     * All geometry is invocation-local. No tensor payload, workspace pointer or
+     * prepared engine is mutated, and no heap/TLS storage is retained.
+     */
+    struct NativeVNNIFusedRowsPlan
+    {
+        static constexpr int capacity = 512; ///< Production descriptor capacity.
+        std::array<FusedVerifierRowsPlan, capacity> projections{}; ///< Ordered per-member plans.
+        NativeVNNIFusedPartialRoute partial_route = NativeVNNIFusedPartialRoute::FullK;
+        size_t partial_floats = 0; ///< Exact bank extent for the selected ownership route.
+        size_t worker_partial_stride = 0; ///< Exclusive FP32 tile for one worker, when required.
+        bool use_avx512 = false; ///< Resolved hardware ISA, not a lifecycle flag.
+        bool use_avx2 = false; ///< Resolved hardware ISA, not a lifecycle flag.
+        bool all_k_partitioned = false; ///< Every member owns an ordered reduction tree.
+
+        /** @return Exact shared arena demand; private/full-K routes allocate none. */
+        size_t sharedPartialFloats() const noexcept
         {
-            const auto &d = descs[p];
-            const int projection_rows = d.rows > 0 ? d.rows : M;
-            if (!d.packed || !d.output || (!A_q8_all && !d.input) ||
-                d.N <= 0 || d.ldc < d.N ||
-                d.packed->blocks_per_row != K_blocks ||
-                projection_rows <= 0)
-            {
-                return false;
-            }
-            if (projection_rows > 1 &&
-                d.decode_schedule != DecodeSchedulePolicy::Auto)
-            {
-                throw std::invalid_argument(
-                    "CPU NativeVNNI grouped verifier bundles cannot override "
-                    "the M=1 decode schedule");
-            }
-            if (projection_rows == 1 &&
-                d.verifier_schedule != VerifierRowsPolicy::Auto)
-            {
-                throw std::invalid_argument(
-                    "CPU NativeVNNI fused M=1 bundles cannot override the "
-                    "grouped verifier schedule");
-            }
+            return partial_route == NativeVNNIFusedPartialRoute::SharedBank ||
+                partial_route == NativeVNNIFusedPartialRoute::OutputTileWorkspace ? partial_floats : 0;
         }
+    };
 
+    /**
+     * @brief Resolve a fused bundle without requiring tensor payloads or scratch.
+     * @param descriptors Each member's real prepared format, shape and schedule.
+     *        Output, input and bias pointers are ignored; planning never reads data.
+     * @param M Default positive row count when a descriptor inherits its rows.
+     * @param num_threads Actual workers that will execute this invocation.
+     * @param isa_path Runtime ISA policy; shared with execution and diagnostics.
+     * @return Complete task geometry and exact simultaneous partial-bank demand.
+     * @throws std::invalid_argument for incomplete or inconsistent geometry.
+     * @throws std::overflow_error when the physical partial bank cannot be represented.
+     *
+     * Cache-derived arithmetic and schedule selection are the existing kernel
+     * policy. This extraction makes their storage decision reusable; it does
+     * not invent another estimator, change K order, or charge stack-local trees
+     * as heap arenas. Remote planning must supply participant geometry rather
+     * than invoke this local prepared-weight boundary on the discovery root.
+     */
+    inline NativeVNNIFusedRowsPlan planNativeVNNIFusedRows(
+        std::span<const FusedVerifierRowsDesc> descriptors,
+        int M, int num_threads, ISAPath isa_path = ISAPath::AUTO)
+    {
+        if (descriptors.empty() || descriptors.size() > NativeVNNIFusedRowsPlan::capacity ||
+            M <= 0 || num_threads <= 0 || !descriptors.front().packed ||
+            descriptors.front().packed->blocks_per_row <= 0)
+            throw std::invalid_argument("CPU fused plan requires positive rows, workers and matrix descriptors");
+        const auto *descs = descriptors.data();
+        const int num_descs = static_cast<int>(descriptors.size());
+        const int K_blocks = descriptors.front().packed->blocks_per_row;
         const ISALevel active_isa = activeISALevel();
         bool use_avx512 = false;
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -6389,33 +6458,19 @@ namespace llaminar2::cpu::native_vnni
                 "AVX2 or AVX512 grouped implementation");
         }
 
-        struct FusedVerifierRowsPlan
-        {
-            int rows = 0;
-            int policy_n = 0;
-            int n_chunks = 0;
-            int n_block_chunks = 1;
-            int total_blocks = 0;
-            int k_tiles = 0;
-            int k_blocks_per_tile = 0;
-            size_t partial_sums_offset = 0;
-            size_t partial_sums_size = 0;
-            DecodeSchedulePolicy requested_decode_schedule =
-                DecodeSchedulePolicy::Auto;
-            DecodeSchedulePolicy effective_decode_schedule =
-                DecodeSchedulePolicy::Auto;
-            VerifierRowsPolicy requested_verifier_schedule =
-                VerifierRowsPolicy::Auto;
-            VerifierRowsPolicy effective_verifier_schedule =
-                VerifierRowsPolicy::Pairwise;
-            VerifierRowsScheduleResolution verifier_resolution{};
-        };
-
-        std::array<FusedVerifierRowsPlan, kMaxFusedVerifierProjections> plans = {};
+        NativeVNNIFusedRowsPlan result;
+        auto &plans = result.projections;
         size_t fused_partial_sum_floats = 0;
         for (int p = 0; p < num_descs; ++p)
         {
             const auto &d = descs[p];
+            const int projection_rows = d.rows > 0 ? d.rows : M;
+            if (!d.packed || d.packed->N <= 0 || d.packed->K <= 0 ||
+                d.packed->blocks_per_row != K_blocks || d.rows < 0)
+                throw std::invalid_argument("CPU fused plan requires complete, common-K matrix geometry");
+            if ((projection_rows > 1 && d.decode_schedule != DecodeSchedulePolicy::Auto) ||
+                (projection_rows == 1 && d.verifier_schedule != VerifierRowsPolicy::Auto))
+                throw std::invalid_argument("CPU fused schedule must match its decode/verifier row regime");
             const int policy_n =
                 cpuNativeVNNISerialEquivalentPolicyN(d.packed->N);
             const NativeVNNITileConfig cfg =
@@ -6499,19 +6554,32 @@ namespace llaminar2::cpu::native_vnni
                 nativeVNNIUsesKPartitions(plan.k_tiles)
                     ? (K_blocks + plan.k_tiles - 1) / plan.k_tiles
                     : K_blocks;
+            if (plan.rows > 1 && plan.verifier_resolution.route ==
+                    VerifierRowsExecutionRoute::GroupedFullKTwoRowNMajor)
+            {
+                // The standalone N-major entry point uses this same cache
+                // authority. Fusion must retain its K panels as well as its
+                // row/N grid: streaming all K for every row pair discards the
+                // private-L2 reuse that made the selected route economical.
+                // These are continuation segments, NOT arithmetic partitions:
+                // later segments load the exact preceding FP32 accumulator.
+                const auto cache_plan = computeTileConfig(
+                    policy_n, d.packed->K, plan.rows,
+                    d.packed->preparedFootprint(), num_threads);
+                if (cache_plan.k_tile_blocks > 0)
+                    plan.k_blocks_per_tile = cache_plan.k_tile_blocks;
+            }
             if (nativeVNNIUsesKPartitions(plan.k_tiles))
             {
-                /*
-                 * CPU-only verifier workspace.  GPU stages must use the graph
-                 * workspace binding contract instead; this helper never runs on
-                 * device backends.  The layout mirrors the single-projection
-                 * exact verifier path: [row][N chunk][K tile][64 columns].
-                 */
+                // Independent projection producers coexist until their reducers
+                // finish. Each member contributes its own codebook-selected tree,
+                // physical N tail and actual row count, never the anchor's shape.
                 plan.partial_sums_offset = fused_partial_sum_floats;
-                plan.partial_sums_size =
-                    static_cast<size_t>(plan.rows) *
-                    static_cast<size_t>(plan.n_chunks) *
-                    static_cast<size_t>(plan.k_tiles) * 64;
+                plan.partial_sums_size = cpuProjectionPartialFloats(
+                    plan.rows, d.packed->N, plan.k_tiles);
+                if (plan.partial_sums_size > std::numeric_limits<size_t>::max() / sizeof(float) -
+                        fused_partial_sum_floats)
+                    throw std::overflow_error("CPU fused partial bank extent overflow");
                 fused_partial_sum_floats += plan.partial_sums_size;
             }
 
@@ -6532,19 +6600,13 @@ namespace llaminar2::cpu::native_vnni
                 return nativeVNNIUsesKPartitions(plan.k_tiles);
             });
         size_t layer_local_ordered_tree_tasks = 0;
+        int maximum_partitions = 0;
         if (all_k_partitioned)
         {
-            constexpr int kMaximumOrderedKPartitions =
-                MoEProjectionNumericalContract::ordered_k_partitions;
             for (int projection = 0; projection < num_descs; ++projection)
             {
                 const auto &plan = plans[static_cast<size_t>(projection)];
-                if (plan.k_tiles > kMaximumOrderedKPartitions)
-                {
-                    throw std::logic_error(
-                        "GPU-aligned CPU expert exceeds its fixed ordered "
-                        "K-partition capacity");
-                }
+                maximum_partitions = std::max(maximum_partitions, plan.k_tiles);
                 const int row_tile_width =
                     plan.rows == 1
                         ? 1
@@ -6558,12 +6620,128 @@ namespace llaminar2::cpu::native_vnni
                         (plan.rows + row_tile_width - 1) /
                         row_tile_width) *
                     static_cast<size_t>(plan.n_chunks);
+                result.worker_partial_stride = std::max(result.worker_partial_stride,
+                    cpuProjectionPartialFloats(std::min(plan.rows, row_tile_width), 64, plan.k_tiles));
             }
         }
         const bool use_layer_local_ordered_tree =
             all_k_partitioned &&
             layer_local_ordered_tree_tasks >=
                 static_cast<size_t>(std::max(1, num_threads));
+
+
+        result.partial_route = all_full_k ? NativeVNNIFusedPartialRoute::FullK :
+            (use_layer_local_ordered_tree ? NativeVNNIFusedPartialRoute::OutputTileLocal :
+                NativeVNNIFusedPartialRoute::SharedBank);
+        result.partial_floats = fused_partial_sum_floats;
+        if (!all_k_partitioned)
+        {
+            // Mixed modes already finish each partial reduction before advancing.
+            // Reuse its bank without adding a barrier or serializing full-K work.
+            result.partial_floats = 0;
+            for (int p = 0; p < num_descs; ++p)
+            {
+                auto &plan = plans[static_cast<size_t>(p)];
+                plan.partial_sums_offset = 0;
+                result.partial_floats = std::max(result.partial_floats, plan.partial_sums_size);
+            }
+        }
+        else if (use_layer_local_ordered_tree &&
+                 maximum_partitions > MoEProjectionNumericalContract::ordered_k_partitions)
+        {
+            result.partial_route = NativeVNNIFusedPartialRoute::OutputTileWorkspace;
+            result.partial_floats = CPUInvocationWorkspace::multiply(
+                result.worker_partial_stride, static_cast<size_t>(num_threads));
+            if (result.partial_floats > std::numeric_limits<size_t>::max() / sizeof(float))
+                throw std::overflow_error("CPU worker-private partial bank extent overflow");
+        }
+        result.use_avx512 = use_avx512;
+        result.use_avx2 = use_avx2;
+        result.all_k_partitioned = all_k_partitioned;
+        return result;
+    }
+
+    /**
+     * @brief Fused multi-projection runtime-M verifier rows.
+     * @param A_q8_all Common immutable activation rows, unless a descriptor supplies its own.
+     * @param descs Complete output/weight descriptors, shared by the invoking team.
+     * @param partial_storage Invocation-owned admitted bank, shared by every team member.
+     * @param num_descs Number of populated descriptors, at most the bundle capacity.
+     * @param M Default row count for descriptors without an explicit count.
+     * @param K_blocks Common activation/weight width in 32-element blocks.
+     * @param isa_path Explicit or automatically resolved physical microkernel ISA.
+     * @return False for incomplete descriptors; true after every output is published.
+     * @throws std::runtime_error Before any output write if the declared bank is undersized.
+     *
+     * This is the projection-bundle analogue of
+     * gemm_native_vnni_preq_decode_equivalent_rows(). Full-K projections use
+     * two-row physical tiles, while long-K projections use two-row AVX2 or
+     * four-row AVX512 tiles. Each tile shares packed-weight decode work across
+     * independent row accumulators without changing any row's K traversal.
+     * K-parallel partials are reduced through
+     * reduceNativeVNNIKTilePartialsExact(), so grouped and serial decode add
+     * tile partials in identical order.
+     *
+     * All descriptors execute under one OpenMP team. This avoids per-projection
+     * fork/join overhead while preserving each projection's own codebook,
+     * output stride, bias, and tail-column handling.
+     */
+    inline bool gemm_native_vnni_fused_verifier_rows_preq(
+        const Q8_1Block *A_q8_all,
+        const FusedVerifierRowsDesc *descs,
+        std::span<float> partial_storage,
+        int num_descs,
+        int M,
+        int K_blocks,
+        ISAPath isa_path = ISAPath::AUTO)
+    {
+        constexpr int kMaxFusedVerifierProjections = NativeVNNIFusedRowsPlan::capacity;
+        if (!descs || num_descs <= 0 ||
+            num_descs > kMaxFusedVerifierProjections ||
+            M <= 0 || K_blocks <= 0)
+            return false;
+
+        const int num_threads = nativeVNNIInvocationWorkerCount();
+        for (int p = 0; p < num_descs; ++p)
+        {
+            const auto &d = descs[p];
+            const int projection_rows = d.rows > 0 ? d.rows : M;
+            if (!d.packed || !d.output || (!A_q8_all && !d.input) ||
+                d.N <= 0 || d.ldc < d.N ||
+                d.packed->blocks_per_row != K_blocks ||
+                projection_rows <= 0)
+            {
+                return false;
+            }
+            if (projection_rows > 1 &&
+                d.decode_schedule != DecodeSchedulePolicy::Auto)
+            {
+                throw std::invalid_argument(
+                    "CPU NativeVNNI grouped verifier bundles cannot override "
+                    "the M=1 decode schedule");
+            }
+            if (projection_rows == 1 &&
+                d.verifier_schedule != VerifierRowsPolicy::Auto)
+            {
+                throw std::invalid_argument(
+                    "CPU NativeVNNI fused M=1 bundles cannot override the "
+                    "grouped verifier schedule");
+            }
+        }
+
+        const auto bundle = planNativeVNNIFusedRows(
+            {descs, static_cast<size_t>(num_descs)}, M, num_threads, isa_path);
+        const auto &plans = bundle.projections;
+        const bool use_avx512 = bundle.use_avx512;
+        const bool use_avx2 = bundle.use_avx2;
+        const bool all_full_k = bundle.partial_route == NativeVNNIFusedPartialRoute::FullK;
+        const bool all_k_partitioned = bundle.all_k_partitioned;
+        const bool use_layer_local_ordered_tree =
+            bundle.partial_route == NativeVNNIFusedPartialRoute::OutputTileLocal ||
+            bundle.partial_route == NativeVNNIFusedPartialRoute::OutputTileWorkspace;
+        const size_t fused_partial_sum_floats = bundle.sharedPartialFloats();
+        if (partial_storage.size() < fused_partial_sum_floats)
+            throw std::runtime_error("CPU fused projection requires admitted ordered-partial storage");
 
         if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
             PerfStatsCollector::isDomainEnabled("kernel"))
@@ -6611,6 +6789,7 @@ namespace llaminar2::cpu::native_vnni
                         {"projection", std::to_string(p)},
                         {"isa", effective_isa},
                         {"k_tiles", std::to_string(plan.k_tiles)},
+                        {"k_tile_blocks", std::to_string(plan.k_blocks_per_tile)},
                         {"ambient_n_block_chunks",
                          std::to_string(
                              plan.rows == 1
@@ -6652,6 +6831,7 @@ namespace llaminar2::cpu::native_vnni
          */
         size_t total_full_k_tasks = 0;
         size_t total_output_rows = 0;
+        size_t shared_weight_task_run = std::numeric_limits<size_t>::max();
         std::array<size_t, kMaxFusedVerifierProjections>
             full_k_task_ends = {};
         std::array<size_t, kMaxFusedVerifierProjections>
@@ -6665,6 +6845,16 @@ namespace llaminar2::cpu::native_vnni
                 ? 1
                 : plan.verifier_resolution.physical_row_tile;
             physical_row_widths[static_cast<size_t>(projection)] = row_width;
+            // Pair/wide-row grids put the row tiles of one N block next to
+            // each other. Preserve that locality when distributing a bundle:
+            // cyclic single-task assignment otherwise makes every core fetch
+            // the same B panel and loses reuse between successive row tiles.
+            // Other grids already own all rows or have no shared row tiles.
+            const size_t adjacent_weight_users = plan.rows > 1 &&
+                    plan.verifier_resolution.task_grid == VerifierRowsTaskGrid::RowTileNBlock
+                ? static_cast<size_t>((plan.rows + row_width - 1) / row_width)
+                : 1u;
+            shared_weight_task_run = std::min(shared_weight_task_run, adjacent_weight_users);
             total_full_k_tasks += static_cast<size_t>(
                 plan.rows == 1
                     ? plan.total_blocks
@@ -6678,6 +6868,22 @@ namespace llaminar2::cpu::native_vnni
 
         if (all_full_k)
         {
+            // Keep at least one workshare chunk per available worker. Sparse
+            // mixed-M expert bundles retain one-task cyclic load balancing;
+            // dense row bundles keep cache-sharing tiles on the same core.
+            // This changes only ownership of disjoint outputs, never their
+            // arithmetic policy, physical kernels, or increasing-K order.
+            const size_t workshare_chunk = std::max<size_t>(1,
+                std::min(shared_weight_task_run,
+                         total_full_k_tasks / static_cast<size_t>(num_threads)));
+            if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
+                PerfStatsCollector::isDomainEnabled("kernel"))
+                PerfStatsCollector::addCounter("kernel",
+                    "cpu_native_vnni_fused_full_k_workshare", 1.0, "gemm", "cpu",
+                    {{"task_chunk", std::to_string(workshare_chunk)},
+                     {"shared_weight_tasks", std::to_string(shared_weight_task_run)},
+                     {"parallel_tasks", std::to_string(total_full_k_tasks)},
+                     {"threads", std::to_string(num_threads)}});
             /*
              * Reject a planner/scheduler contract mismatch before entering
              * OpenMP. A worker-thread terminate would obscure which policy
@@ -6750,9 +6956,10 @@ namespace llaminar2::cpu::native_vnni
                  * cores while retaining deterministic ownership and avoiding
                  * the queue/locking cost of OpenMP dynamic scheduling.  Task
                  * order cannot affect arithmetic because every task owns a
-                 * disjoint output row and N chunk.
+                 * disjoint output row and N chunk. Dense row bundles use the
+                 * cache-sharing chunk computed above, not one-task striping.
                  */
-#pragma omp for schedule(static, 1)
+#pragma omp for schedule(static, workshare_chunk)
                 for (long long global_task = 0;
                      global_task <
                          static_cast<long long>(total_full_k_tasks);
@@ -6783,7 +6990,9 @@ namespace llaminar2::cpu::native_vnni
                         [&](int first_row,
                             int tile_rows,
                             int chunk_start,
-                            int chunk_count)
+                            int chunk_count,
+                            int kb_start,
+                            int kb_end)
                     {
                         const Q8_1Block *row_input[4] = {};
                         float *row_output[4] = {};
@@ -6812,6 +7021,16 @@ namespace llaminar2::cpu::native_vnni
                                 destination[row] = valid_columns == 64
                                     ? row_output[row] + n_start
                                     : tails[row];
+                                if (valid_columns < 64)
+                                {
+                                    // A later cache segment continues the same
+                                    // row. Only its logical columns are public;
+                                    // padding stays initialized private scratch.
+                                    std::fill_n(tails[row], 64, 0.0f);
+                                    if (kb_start > 0)
+                                        std::copy_n(row_output[row] + n_start,
+                                                    valid_columns, tails[row]);
+                                }
                             }
 
                             if (use_avx512)
@@ -6829,8 +7048,8 @@ namespace llaminar2::cpu::native_vnni
                                             row_input[2], row_input[3],
                                             destination[0], destination[1],
                                             destination[2], destination[3],
-                                            chunk, 0, K_blocks, decode_lut,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end, decode_lut,
+                                            /*accumulate=*/kb_start > 0);
                                     else
                                         gemm_4row_non_nibble_2z_chunk(
                                             packed,
@@ -6838,8 +7057,8 @@ namespace llaminar2::cpu::native_vnni
                                             row_input[2], row_input[3],
                                             destination[0], destination[1],
                                             destination[2], destination[3],
-                                            chunk, 0, K_blocks,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end,
+                                            /*accumulate=*/kb_start > 0);
                                 }
                                 else if (tile_rows == 3)
                                 {
@@ -6850,8 +7069,8 @@ namespace llaminar2::cpu::native_vnni
                                             row_input[2],
                                             destination[0], destination[1],
                                             destination[2],
-                                            chunk, 0, K_blocks, decode_lut,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end, decode_lut,
+                                            /*accumulate=*/kb_start > 0);
                                     else
                                         gemm_3row_non_nibble_2z_chunk(
                                             packed,
@@ -6859,8 +7078,8 @@ namespace llaminar2::cpu::native_vnni
                                             row_input[2],
                                             destination[0], destination[1],
                                             destination[2],
-                                            chunk, 0, K_blocks,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end,
+                                            /*accumulate=*/kb_start > 0);
                                 }
                                 else if (tile_rows == 2)
                                 {
@@ -6869,15 +7088,15 @@ namespace llaminar2::cpu::native_vnni
                                             packed,
                                             row_input[0], row_input[1],
                                             destination[0], destination[1],
-                                            chunk, 0, K_blocks, decode_lut,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end, decode_lut,
+                                            /*accumulate=*/kb_start > 0);
                                     else
                                         gemm_2row_non_nibble_chunk(
                                             packed,
                                             row_input[0], row_input[1],
                                             destination[0], destination[1],
-                                            chunk, 0, K_blocks,
-                                            /*accumulate=*/false);
+                                            chunk, kb_start, kb_end,
+                                            /*accumulate=*/kb_start > 0);
                                 }
                                 else if (packed.usesNibbleLUT())
                                 {
@@ -6886,9 +7105,10 @@ namespace llaminar2::cpu::native_vnni
                                         row_input[0],
                                         destination[0],
                                         chunk,
-                                        0,
-                                        K_blocks,
-                                        decode_lut);
+                                        kb_start,
+                                        kb_end,
+                                        decode_lut,
+                                        /*accumulate=*/kb_start > 0);
                                 }
                                 else
                                 {
@@ -6897,8 +7117,9 @@ namespace llaminar2::cpu::native_vnni
                                         row_input[0],
                                         destination[0],
                                         chunk,
-                                        0,
-                                        K_blocks);
+                                        kb_start,
+                                        kb_end,
+                                        /*accumulate=*/kb_start > 0);
                                 }
 #endif
                             }
@@ -6912,15 +7133,15 @@ namespace llaminar2::cpu::native_vnni
                                         packed,
                                         row_input[0], row_input[1],
                                         destination[0], destination[1],
-                                        chunk, 0, K_blocks, decode_lut,
-                                        /*accumulate=*/false);
+                                        chunk, kb_start, kb_end, decode_lut,
+                                        /*accumulate=*/kb_start > 0);
                                 else
                                     gemm_2row_non_nibble_chunk_avx2(
                                         packed,
                                         row_input[0], row_input[1],
                                         destination[0], destination[1],
-                                        chunk, 0, K_blocks,
-                                        /*accumulate=*/false);
+                                        chunk, kb_start, kb_end,
+                                        /*accumulate=*/kb_start > 0);
                             }
                             else
                             {
@@ -6933,17 +7154,19 @@ namespace llaminar2::cpu::native_vnni
                                         row_input[0],
                                         destination[0],
                                         chunk,
-                                        0,
-                                        K_blocks,
-                                        decode_lut);
+                                        kb_start,
+                                        kb_end,
+                                        decode_lut,
+                                        /*accumulate=*/kb_start > 0);
                                 else
                                     gemv_avx2_chunk_non_nibble(
                                         packed,
                                         row_input[0],
                                         destination[0],
                                         chunk,
-                                        0,
-                                        K_blocks);
+                                        kb_start,
+                                        kb_end,
+                                        /*accumulate=*/kb_start > 0);
                             }
 
                             if (valid_columns < 64)
@@ -6974,7 +7197,8 @@ namespace llaminar2::cpu::native_vnni
                             chunk_start,
                             std::min(
                                 plan.n_block_chunks,
-                                plan.n_chunks - chunk_start));
+                                plan.n_chunks - chunk_start),
+                            0, K_blocks);
                         continue;
                     }
 
@@ -6986,7 +7210,7 @@ namespace llaminar2::cpu::native_vnni
                             local_task / static_cast<size_t>(plan.rows));
                         const int row = static_cast<int>(
                             local_task % static_cast<size_t>(plan.rows));
-                        execute_row_tile(row, 1, chunk, 1);
+                        execute_row_tile(row, 1, chunk, 1, 0, K_blocks);
                         break;
                     }
                     case VerifierRowsTaskGrid::NBlockAllRows:
@@ -6998,15 +7222,23 @@ namespace llaminar2::cpu::native_vnni
                         const int chunk_count = std::min(
                             plan.n_block_chunks,
                             plan.n_chunks - chunk_start);
-                        for (int first_row = 0;
-                             first_row < plan.rows;
-                             first_row += row_width)
+                        for (int kb_start = 0; kb_start < K_blocks;
+                             kb_start += plan.k_blocks_per_tile)
                         {
-                            execute_row_tile(
-                                first_row,
-                                std::min(row_width, plan.rows - first_row),
-                                chunk_start,
-                                chunk_count);
+                            const int kb_end = std::min(
+                                kb_start + plan.k_blocks_per_tile, K_blocks);
+                            // Complete this cache-resident panel for every row
+                            // before advancing K. Each row keeps increasing-K
+                            // arithmetic and one N-block owner throughout.
+                            for (int first_row = 0;
+                                 first_row < plan.rows;
+                                 first_row += row_width)
+                            {
+                                execute_row_tile(
+                                    first_row,
+                                    std::min(row_width, plan.rows - first_row),
+                                    chunk_start, chunk_count, kb_start, kb_end);
+                            }
                         }
                         break;
                     }
@@ -7027,7 +7259,8 @@ namespace llaminar2::cpu::native_vnni
                             chunk_start,
                             std::min(
                                 plan.n_block_chunks,
-                                plan.n_chunks - chunk_start));
+                                plan.n_chunks - chunk_start),
+                            0, K_blocks);
                         break;
                     }
                     case VerifierRowsTaskGrid::NBlockKTile:
@@ -7072,48 +7305,9 @@ namespace llaminar2::cpu::native_vnni
             return true;
         }
 
-        /*
-         * Every K-tile partial is overwritten before reduction.  A single
-         * thread-local arena avoids repeated per-projection allocations while
-         * keeping the layout explicit and easy to audit.
-         */
-        thread_local AlignedVector<float> fused_partial_sums_tls;
-        float *fused_partial_sums_base = nullptr;
-        if (use_layer_local_ordered_tree)
-        {
-            /* Each output-tile owner uses private stack partials below. */
-        }
-        else if (omp_in_parallel())
-        {
-            /*
-             * A complete CPU MoE transaction deliberately calls this function
-             * from every worker in one retained team. A raw thread_local arena
-             * would give each producer and reducer a different address: K-tile
-             * tasks would populate disjoint buffers and the reduction would read
-             * uninitialized partials. One OpenMP single owner therefore grows
-             * its reusable arena and copyprivate publishes that exact pointer to
-             * every participant before any worksharing task can begin.
-             */
-#pragma omp single copyprivate(fused_partial_sums_base)
-            {
-                if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
-                {
-                    fused_partial_sums_tls.resize_uninitialized(
-                        fused_partial_sum_floats);
-                }
-                fused_partial_sums_base = fused_partial_sums_tls.data();
-            }
-        }
-        else
-        {
-            /*
-             * Standalone projection calls create their OpenMP team below, so
-             * the initiating thread can publish its persistent arena directly.
-             */
-            if (fused_partial_sums_tls.size() < fused_partial_sum_floats)
-                fused_partial_sums_tls.resize_uninitialized(fused_partial_sum_floats);
-            fused_partial_sums_base = fused_partial_sums_tls.data();
-        }
+        // The caller publishes one already-admitted bank to every worker.
+        // No allocation, TLS owner election, or pointer-publication barrier.
+        float *fused_partial_sums_base = partial_storage.data();
 
         if (all_k_partitioned)
         {
@@ -7781,10 +7975,15 @@ namespace llaminar2::cpu::native_vnni
                             continue;
                         }
 
-                        alignas(64) float local_partial_sums[
+                        alignas(64) float stack_partial_sums[
                             4 * MoEProjectionNumericalContract::
                                     ordered_k_partitions *
                             64];
+                        float *local_partial_sums =
+                            bundle.partial_route == NativeVNNIFusedPartialRoute::OutputTileWorkspace
+                            ? partial_storage.data() + static_cast<size_t>(omp_get_thread_num()) *
+                                bundle.worker_partial_stride
+                            : stack_partial_sums;
 
                         for (int k_tile = 0;
                              k_tile < plan.k_tiles;
@@ -8800,25 +8999,31 @@ namespace llaminar2::cpu::native_vnni
     // Full GEMM dispatcher (M>1) — quantizes then delegates to preq path
     // =========================================================================
 
+    /**
+     * @brief Quantize complete rows into admitted storage and run ordinary grouped GEMM.
+     * @param activation_storage Reusable bank for M complete Q8 rows, including K tails.
+     * Other geometry and arithmetic contracts are identical to the prequantized entrypoint.
+     */
     inline void gemm_native_vnni(
         const CPUNativeVNNIPackedWeights &packed,
         const float *A_fp32,
         float *C,
+        std::span<float> partial_storage,
         int M,
-        int ldc)
+        int ldc,
+        std::span<Q8_1Block> activation_storage)
     {
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
-        // Pre-quantize all M rows into grow-only per-caller storage.
+        // Pre-quantize all M rows into the caller's admitted, reusable bank.
         const size_t required_blocks =
             static_cast<size_t>(M) * static_cast<size_t>(K_blocks);
-        thread_local AlignedVector<Q8_1Block> all_A_q8_tls;
-        if (all_A_q8_tls.size() < required_blocks)
-            all_A_q8_tls.resize_uninitialized(required_blocks);
+        if (activation_storage.size() < required_blocks)
+            throw std::runtime_error("CPU NativeVNNI GEMM requires admitted Q8 input storage");
         quantize_activations_to_q8_1(
             A_fp32,
-            all_A_q8_tls.data(),
+            activation_storage.data(),
             M,
             K,
             K_blocks,
@@ -8827,8 +9032,9 @@ namespace llaminar2::cpu::native_vnni
         // Delegate to pre-quantized compute path
         gemm_native_vnni_preq(
             packed,
-            all_A_q8_tls.data(),
+            activation_storage.data(),
             C,
+            partial_storage,
             M,
             ldc);
     }
@@ -8839,7 +9045,7 @@ namespace llaminar2::cpu::native_vnni
      * The canonical inference contract (`alpha=1`, `beta=0`) writes directly to
      * @p C and has no auxiliary output traffic. A non-zero beta must preserve
      * the prior destination, so that uncommon contract computes the complete
-     * matrix product once into grow-only caller-thread storage and applies one
+     * matrix product once into admitted invocation storage and applies one
      * vectorizable epilogue. It never replays individual rows through GEMV.
      *
      * @param packed Permanently prepared native-format weights.
@@ -8849,6 +9055,9 @@ namespace llaminar2::cpu::native_vnni
      * @param N Logical output width and destination row stride.
      * @param alpha Product scale.
      * @param beta Prior-destination scale.
+     * @param activation_storage Invocation-owned Q8 bank shared by this one projection.
+     * @param product_storage Independent FP32 product bank; unused when beta is zero.
+     * @param partial_storage Invocation-owned shared bank for ordered K reductions.
      */
     inline void multiply_native_vnni_with_epilogue(
         const CPUNativeVNNIPackedWeights &packed,
@@ -8857,14 +9066,17 @@ namespace llaminar2::cpu::native_vnni
         int M,
         int N,
         float alpha,
-        float beta)
+        float beta,
+        std::span<Q8_1Block> activation_storage,
+        std::span<float> product_storage,
+        std::span<float> partial_storage)
     {
         auto multiply_into = [&](float *destination)
         {
             if (M == 1)
-                gemv_native_vnni(packed, A_fp32, destination);
+                gemv_native_vnni(packed, A_fp32, destination, partial_storage, activation_storage);
             else
-                gemm_native_vnni(packed, A_fp32, destination, M, N);
+                gemm_native_vnni(packed, A_fp32, destination, partial_storage, M, N, activation_storage);
         };
 
         if (beta == 0.0f)
@@ -8875,22 +9087,40 @@ namespace llaminar2::cpu::native_vnni
 
             const size_t elements =
                 static_cast<size_t>(M) * static_cast<size_t>(N);
+            auto scale = [&]() {
+#pragma omp for simd schedule(static)
+                for (size_t i = 0; i < elements; ++i)
+                    C[i] *= alpha;
+            };
+            // Ordinary direct calls need no new team just for an epilogue.
+            // An existing workshare must update each destination exactly once.
+            if (omp_in_parallel()) scale();
+            else
+            {
 #pragma omp simd
-            for (size_t i = 0; i < elements; ++i)
-                C[i] *= alpha;
+                for (size_t i = 0; i < elements; ++i) C[i] *= alpha;
+            }
             return;
         }
 
         const size_t elements =
             static_cast<size_t>(M) * static_cast<size_t>(N);
-        thread_local AlignedVector<float> product_scratch_tls;
-        if (product_scratch_tls.size() < elements)
-            product_scratch_tls.resize_uninitialized(elements);
-        multiply_into(product_scratch_tls.data());
+        if (product_storage.size() < elements)
+            throw std::runtime_error("CPU beta epilogue requires admitted product storage");
+        multiply_into(product_storage.data());
 
+        auto accumulate = [&]() {
+#pragma omp for simd schedule(static)
+            for (size_t i = 0; i < elements; ++i)
+                C[i] = alpha * product_storage[i] + beta * C[i];
+        };
+        if (omp_in_parallel()) accumulate();
+        else
+        {
 #pragma omp simd
-        for (size_t i = 0; i < elements; ++i)
-            C[i] = alpha * product_scratch_tls[i] + beta * C[i];
+            for (size_t i = 0; i < elements; ++i)
+                C[i] = alpha * product_storage[i] + beta * C[i];
+        }
     }
 
     // =========================================================================
@@ -8946,6 +9176,7 @@ namespace llaminar2::cpu::native_vnni
      *
      * @param A_q8              Pre-quantized Q8_1 activations [K_blocks]
      * @param descs             Array of projection descriptors
+     * @param partial_storage   Admitted bank shared by all invocation workers
      * @param num_descs         Number of projections
      * @param isa_path          Runtime ISA selection used by every projection
      * @param schedule_override Forceable M=1 ownership policy for training
@@ -8957,6 +9188,7 @@ namespace llaminar2::cpu::native_vnni
     inline void gemv_native_vnni_fused_preq(
         const Q8_1Block *__restrict A_q8,
         const FusedGemvDesc *descs,
+        std::span<float> partial_storage,
         int num_descs,
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
@@ -9000,6 +9232,7 @@ namespace llaminar2::cpu::native_vnni
         if (!gemm_native_vnni_fused_verifier_rows_preq(
                 A_q8,
                 fused_rows.data(),
+                partial_storage,
                 num_descs,
                 1,
                 K_blocks,
@@ -9032,6 +9265,13 @@ namespace llaminar2::cpu::native_vnni
 
     /**
      * @brief Fused multi-input GEMV: multiple projections with different inputs.
+     * @param descs Independent input/weight/output projections sharing one K width.
+     * @param partial_storage Invocation-owned bank, reused after all partial readers finish.
+     * @param num_descs Number of populated descriptors.
+     * @param isa_path Explicit or automatically resolved vector implementation.
+     * @param schedule_override Optional diagnostic decode ownership schedule.
+     * @throws std::invalid_argument For incomplete or incompatible descriptors.
+     * @throws std::runtime_error For missing storage or unavailable implementation.
      *
      * Saves OMP fork/join overhead (3×~8µs per MoE layer for 4 experts)
      * and improves load balance via nowait between projections
@@ -9039,6 +9279,7 @@ namespace llaminar2::cpu::native_vnni
      */
     inline void gemv_fused_multi_input_preq(
         const FusedGemvMultiInputDesc *descs,
+        std::span<float> partial_storage,
         int num_descs,
         ISAPath isa_path = ISAPath::AUTO,
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
@@ -9083,6 +9324,7 @@ namespace llaminar2::cpu::native_vnni
         if (!gemm_native_vnni_fused_verifier_rows_preq(
                 nullptr,
                 fused_rows.data(),
+                partial_storage,
                 num_descs,
                 1,
                 K_blocks,

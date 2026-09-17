@@ -705,10 +705,11 @@ namespace
      * @brief Every production device-graph factory receives workspace authority.
      *
      * A prepared model can execute through the ordinary rank-local graph,
-     * unified pipeline graph, explicit PP stage, or interface-testable graph.
+     * explicit PP stage, or interface-testable graph.
      * Missing the authority in even one construction path makes that runner
      * free model-lifetime backing and causes the next MTP family to allocate a
-     * second workspace. Guard all four typed dependency sites together.
+     * second workspace. Compare all dependency sites with all authority
+     * bindings so adding or retiring a factory cannot silently weaken coverage.
      */
     TEST(Test__InferenceRunnerFactory_SourceContract,
          ProductionGraphFactoriesPropagateReusableWorkspaceAuthority)
@@ -719,12 +720,17 @@ namespace
         ASSERT_FALSE(source.empty());
         const std::string compact = withoutFactorySourceWhitespace(source);
 
-        EXPECT_GE(
+        const auto dependency_sites = countFactorySourceOccurrences(
+            compact, "DeviceGraphOrchestrator::Dependenciesdeps;");
+        ASSERT_GT(dependency_sites, 0u);
+        EXPECT_EQ(
             countFactorySourceOccurrences(
                 compact,
                 "deps.reusable_execution_workspaces=config.reusable_execution_workspaces;"),
-            4u)
+            dependency_sites)
             << "every device-graph construction path must share model-lifetime workspace ownership";
+        EXPECT_EQ(compact.find("createUnifiedPipelineRunner("), std::string::npos)
+            << "An embedded multi-device pipeline is not a production DGO factory";
         EXPECT_NE(
             compact.find("deps.mpi_ctx=mpi_ctx;"),
             std::string::npos)
@@ -1238,7 +1244,7 @@ namespace
         ASSERT_NE(graph_config.moe.expert_overlay_runtime_plan, nullptr);
         const auto &continuation_domain =
             graph_config.moe.expert_overlay_runtime_plan->continuationDomain();
-        EXPECT_TRUE(continuation_domain.domain_scoped_collective_context_ready);
+        EXPECT_NO_THROW(continuation_domain.validateContinuationCollectiveRuntime());
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,

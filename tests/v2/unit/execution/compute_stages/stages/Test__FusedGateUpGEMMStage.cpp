@@ -33,6 +33,7 @@
 #include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
+#include "../../../../utils/CPUProjectionTestWorkspace.h"
 
 namespace llaminar2
 {
@@ -314,6 +315,7 @@ namespace llaminar2
         FusedGateUpGEMMStage stage(params);
 
         // Execute
+        test::CPUStageTestWorkspace workspace(stage, m_);
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         // Verify outputs are non-zero (GEMM was actually computed)
@@ -372,6 +374,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             // Save results
@@ -404,6 +407,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             // Save results
@@ -470,6 +474,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             std::copy(output_gate_->data(), output_gate_->data() + m_ * n_gate_, output_gate_no_bias.begin());
@@ -500,6 +505,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedGateUpGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             std::copy(output_gate_->data(), output_gate_->data() + m_ * n_gate_, output_gate_with_bias.begin());

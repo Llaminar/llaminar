@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -13,6 +14,91 @@ sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
 import run_model_parity_e2e as e2e
 import model_parity_inventory as cell_inventory
 import long_context_checks as long_context
+
+
+class LongContextProgressTests(unittest.TestCase):
+    """A killed HTTP check must preserve progress without manufacturing a pass."""
+
+    PROFILE = {"tier": "full", "context_length": 8192,
+               "minimum_prompt_tokens": 4096, "generation_tokens": 2048}
+
+    def test_active_check_survives_cancellation_with_previous_results(self):
+        """The START record must reach disk before a cancellable HTTP call."""
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "long_context_results.json"
+            runner = long_context.CheckRunner("probe", artifact, self.PROFILE)
+            for index in range(4):
+                runner.run(f"recall-{index}", lambda: "correct")
+
+            def cancelled_request():
+                snapshot = json.loads(artifact.read_text())
+                self.assertFalse(snapshot["complete"])
+                self.assertEqual(len(snapshot["results"]), 4)
+                self.assertEqual(snapshot["active_check"]["name"], "structured generation")
+                self.assertGreater(snapshot["active_check"]["started_unix_seconds"], 0)
+                raise KeyboardInterrupt("watchdog")
+
+            with self.assertRaises(KeyboardInterrupt):
+                runner.run("structured generation", cancelled_request)
+            with self.assertRaisesRegex(ValueError, "missing or failed"):
+                e2e.validate_long_context_evidence(Path(directory), self.PROFILE)
+            self.assertEqual(len(json.loads(artifact.read_text())["results"]), 4)
+
+    def test_completion_requires_all_eight_checks_and_normal_finish(self):
+        """Neither eight interim records nor a short finished run certify."""
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "long_context_results.json"
+            runner = long_context.CheckRunner("probe", artifact, self.PROFILE)
+            runner.run("first", lambda: "correct")
+            runner.finish()
+            self.assertFalse(json.loads(artifact.read_text())["complete"])
+            for index in range(7):
+                runner.run(f"remaining-{index}", lambda: "correct")
+            self.assertFalse(json.loads(artifact.read_text())["complete"])
+            runner.finish()
+            e2e.validate_long_context_evidence(Path(directory), self.PROFILE)
+            self.assertIsNone(json.loads(artifact.read_text())["active_check"])
+            snapshot = json.loads(artifact.read_text())
+            snapshot["active_check"] = {"name": "unfinished"}
+            artifact.write_text(json.dumps(snapshot))
+            with self.assertRaisesRegex(ValueError, "missing or failed"):
+                e2e.validate_long_context_evidence(Path(directory), self.PROFILE)
+
+    def test_failed_checks_remain_failed_while_later_checks_continue(self):
+        """Completeness and correctness are independent certificate obligations."""
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "long_context_results.json"
+            runner = long_context.CheckRunner("probe", artifact, self.PROFILE)
+            for index, error in enumerate((long_context.CheckError("bad recall"), ValueError("bad JSON"))):
+                def fail(error=error):
+                    raise error
+                runner.run(f"failure-{index}", fail)
+            for index in range(6):
+                runner.run(f"success-{index}", lambda: "correct")
+            runner.finish()
+            self.assertEqual(len(runner.failures), 2)
+            self.assertTrue(json.loads(artifact.read_text())["complete"])
+            with self.assertRaisesRegex(ValueError, "missing or failed"):
+                e2e.validate_long_context_evidence(Path(directory), self.PROFILE)
+
+    def test_check_duration_is_monotonic_request_wall_time(self):
+        """Artifact mtimes are not timing evidence; measure around the call."""
+        runner = long_context.CheckRunner("probe")
+        with patch.object(long_context.time, "monotonic", side_effect=(10.0, 12.75)):
+            runner.run("timed", lambda: "correct")
+        self.assertEqual(runner.results[0]["elapsed_seconds"], 2.75)
+
+    def test_failed_atomic_publication_preserves_previous_json_and_cleans_temp(self):
+        """Publication failure is fatal and cannot erase the last complete JSON."""
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "long_context_results.json"
+            runner = long_context.CheckRunner("probe", artifact, self.PROFILE)
+            original = artifact.read_bytes()
+            with patch.object(long_context.os, "replace", side_effect=OSError("disk failure")):
+                with self.assertRaisesRegex(OSError, "disk failure"):
+                    runner.run("not entered", lambda: self.fail("request ran before publication"))
+            self.assertEqual(artifact.read_bytes(), original)
+            self.assertEqual(list(Path(directory).iterdir()), [artifact])
 
 
 def inventory(records):
@@ -32,12 +118,13 @@ class E2EDiscoveryTests(unittest.TestCase):
     def test_exact_cell_timeout_retires_the_whole_server_group(self):
         process = MagicMock()
         process.__enter__.return_value = process
-        process.wait.side_effect = e2e.subprocess.TimeoutExpired("harness", 600)
+        process.wait.side_effect = e2e.subprocess.TimeoutExpired("harness", 900)
         with patch.object(e2e.subprocess, "Popen", return_value=process) as launch, \
-             patch.object(e2e.parity, "_terminate_process_group") as retire:
-            self.assertEqual(e2e.run_server_harness(["harness"], {}, None), 124)
+             patch.object(e2e.parity, "_terminate_process_group") as retire, \
+             patch.object(e2e.time, "monotonic", return_value=100):
+            self.assertEqual(e2e.run_e2e_process(["harness"], {}, None), 124)
         self.assertTrue(launch.call_args.kwargs["start_new_session"])
-        process.wait.assert_called_once_with(timeout=600)
+        process.wait.assert_called_once_with(timeout=900)
         retire.assert_called_once_with(process)
 
     def test_successful_cell_does_not_retire_an_already_completed_server(self):
@@ -46,8 +133,38 @@ class E2EDiscoveryTests(unittest.TestCase):
         process.wait.return_value = 0
         with patch.object(e2e.subprocess, "Popen", return_value=process), \
              patch.object(e2e.parity, "_terminate_process_group") as retire:
-            self.assertEqual(e2e.run_server_harness(["harness"], {}, None), 0)
+            self.assertEqual(e2e.run_e2e_process(["harness"], {}, None), 0)
         retire.assert_not_called()
+
+    def test_plan_and_http_share_one_immutable_cell_deadline(self):
+        """Separate readiness does not grant a second fifteen-minute cell budget."""
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.wait.return_value = 0
+        with patch.object(e2e.time, "monotonic", side_effect=[100, 100, 100, 140, 145]), \
+             patch.object(e2e.subprocess, "Popen", return_value=process):
+            budget = e2e.E2ECellBudget()
+            self.assertEqual(e2e.run_e2e_process(["plan"], {}, None, budget=budget), 0)
+            self.assertEqual(e2e.run_e2e_process(["http"], {}, None, budget=budget), 0)
+        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [900, 855])
+
+    def test_expired_cell_never_launches_another_phase(self):
+        with patch.object(e2e.time, "monotonic", side_effect=[100, 1000]), \
+             patch.object(e2e.subprocess, "Popen") as launch:
+            budget = e2e.E2ECellBudget()
+            self.assertEqual(e2e.run_e2e_process(["http"], {}, None, budget=budget), 124)
+        launch.assert_not_called()
+
+    def test_process_creation_cannot_extend_the_cell_deadline(self):
+        process = MagicMock()
+        process.__enter__.return_value = process
+        with patch.object(e2e.time, "monotonic", side_effect=[100, 999, 1000]), \
+             patch.object(e2e.subprocess, "Popen", return_value=process), \
+             patch.object(e2e.parity, "_terminate_process_group") as retire:
+            budget = e2e.E2ECellBudget()
+            self.assertEqual(e2e.run_e2e_process(["http"], {}, None, budget=budget), 124)
+        retire.assert_called_once_with(process)
+        process.wait.assert_not_called()
 
     def test_full_parameter_survives_large_domain_arguments_and_escaping(self):
         record = {"model_parity_schema": 1, "id": "cell", "model": "/models/a model.gguf",
@@ -92,11 +209,11 @@ class E2EDiscoveryTests(unittest.TestCase):
     def test_readiness_is_per_cell_and_cannot_extend_the_exact_cell_watchdog(self):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
                    "generation_tokens": 2048, "request_timeout_seconds": 600, "thinking_modes": "both", "movement_evidence": "not_applicable"}
-        for seconds in (60, 180, 600):
+        for seconds in (60, 180, 900):
             env = e2e.certification_environment(profile | {"readiness_timeout_seconds": seconds}, Path("/tmp/e2e"))
             self.assertEqual(env["LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS"], str(seconds))
             self.assertEqual(env["LLAMINAR_E2E_LONG_REQUEST_TIMEOUT"], "600")
-        for seconds in (None, 0, -1, 601, True, "180"):
+        for seconds in (None, 0, -1, 901, True, "180"):
             with self.subTest(seconds=seconds), self.assertRaises(ValueError):
                 e2e.certification_environment(profile | {"readiness_timeout_seconds": seconds}, Path("/tmp/e2e"))
 

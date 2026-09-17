@@ -10,6 +10,7 @@
  */
 
 #include "HardwareInventory.h"
+#include "CPUCacheInventory.h"
 #include "GPUEnumeration.h"
 #include "HostMemoryCapacity.h"
 #include "../utils/DebugEnv.h"
@@ -18,9 +19,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 
 #include <sys/stat.h>
 #include <unistd.h>
@@ -200,6 +203,41 @@ namespace llaminar2
     // HardwareInventory::detect()
     // =========================================================================
 
+    ComputeDevice HardwareInventory::cpuDevice(int numa_node) const
+    {
+        ComputeDevice cpu{};
+        cpu.type = ComputeBackendType::CPU;
+        cpu.numa_node = numa_node;
+        cpu.supports_bf16 = true;
+        cpu.supports_int8 = true;
+        bool found = false;
+        bool complete_cache = true;
+        for (const auto &socket : cpu_sockets)
+        {
+            if (numa_node >= 0 && socket.numa_node != numa_node) continue;
+            found = true;
+            if (socket.available_memory_bytes > socket.memory_bytes)
+                throw std::invalid_argument("CPU free memory exceeds observed physical capacity");
+            cpu.total_memory_bytes += socket.memory_bytes;
+            cpu.free_memory_bytes += socket.available_memory_bytes;
+            cpu.compute_units += socket.num_threads();
+            if (cpu.name.empty()) cpu.name = socket.model_name;
+            const auto cache = cpu_last_level_cache_bytes.find(socket.socket_id);
+            if (cache == cpu_last_level_cache_bytes.end() || !cache->second) complete_cache = false;
+            else
+            {
+                if (cache->second > std::numeric_limits<size_t>::max() - cpu.last_level_cache_bytes)
+                    throw std::overflow_error("CPU endpoint aggregate cache overflow");
+                cpu.last_level_cache_bytes += cache->second;
+            }
+        }
+        if (!found || numa_node < -1)
+            throw std::invalid_argument("CPU NUMA locality absent from hardware observation");
+        // A partial sum would let a probe fit into an unobserved chiplet's cache.
+        if (!complete_cache) cpu.last_level_cache_bytes = 0;
+        return cpu;
+    }
+
     HardwareInventory HardwareInventory::detect()
     {
         HardwareInventory hw;
@@ -207,6 +245,9 @@ namespace llaminar2
 
         // --- CPU sockets ---
         hw.cpu_sockets = detect_cpu_sockets();
+        hw.cpu_execution = CPUExecutionGeometry::local();
+        for (const auto &socket : hw.cpu_sockets)
+            hw.cpu_last_level_cache_bytes.emplace(socket.socket_id, observeCPUSharedCacheBytes(socket.physical_cores));
 
         // --- GPU devices ---
 #ifdef HAVE_CUDA

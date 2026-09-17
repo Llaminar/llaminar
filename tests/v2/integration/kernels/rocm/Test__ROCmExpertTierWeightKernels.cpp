@@ -10,6 +10,7 @@
  * separated destination array with the device-free reference.
  */
 
+#include "../../../utils/NativeVNNITestPartialStorage.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -1232,7 +1233,7 @@ namespace llaminar2
                 cpu::native_vnni::gemv_native_vnni_preq(
                     cpu_packed,
                     activation_blocks.data(),
-                    cpu_output.data(),
+                    cpu_output.data(), llaminar2::test::NativeVNNITestPartialStorage(cpu_packed, 1).span(),
                     cpu::native_vnni::ISAPath::AUTO);
 
                 TestHIPBuffer<std::uint8_t> payload(

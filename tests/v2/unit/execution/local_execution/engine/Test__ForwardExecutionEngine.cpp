@@ -333,7 +333,6 @@ namespace
         int auxiliary_factory_queries = 0;
         DeviceId auxiliary_factory_device = DeviceId::invalid();
         int resolve_pp_copy_calls = 0;
-        int get_pipeline_contexts_calls = 0;
         bool has_last_forward_input = false;
         ForwardInput last_forward_input{};
         const int *last_token_ids_pointer = nullptr;
@@ -469,15 +468,6 @@ namespace
         }
 
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
-
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
-        {
-            get_pipeline_contexts_calls++;
-            std::unordered_map<DeviceId, IDeviceContext *> result;
-            if (ctx_)
-                result[ctx_->deviceId()] = ctx_;
-            return result;
-        }
 
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
@@ -1025,7 +1015,6 @@ protected:
     {
         ForwardExecutionEngine::Config config;
         config.cache_config.enabled = cache_enabled;
-        config.has_unified_pp = false;
         return ForwardExecutionEngine(std::move(config), executor_);
     }
 };
@@ -2153,7 +2142,6 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     ForwardExecutionEngine::Config config;
     config.cache_config.enabled = true;
     config.cache_config.decode_seq_len = 1;
-    config.has_unified_pp = false;
     ForwardExecutionEngine engine(std::move(config), executor_);
     llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
     MockForwardExecutionHost host(&gpu_ctx);
@@ -2804,6 +2792,143 @@ TEST_F(
         capture_count_before + 1);
 }
 
+/**
+ * @brief A sealed child is composable before transaction zero, without fake inference.
+ *
+ * Readiness belongs to the native cache's materialization state. The unrelated
+ * phase-three shortcut only avoids resetting already-executed semantic nodes;
+ * requiring it here forces callers to launch a child before building its parent.
+ */
+TEST_F(Test__ForwardExecutionEngine, SetupOnlyDecodeExportsWithoutAnyInferenceLaunch)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto role : {ForwardExecutionRole::MainInference,
+                           ForwardExecutionRole::GroupedMTPVerifier,
+                           ForwardExecutionRole::MTPCondition})
+    {
+        SCOPED_TRACE(device.toString() + " role=" + std::to_string(static_cast<int>(role)));
+        auto engine = makeEngine(/*cache_enabled=*/true);
+        llaminar2::testing::MockDeviceContext gpu_ctx(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&gpu_ctx);
+        host.graph_stage_count = 1;
+        host.mock_compute_all_position_logits = role == ForwardExecutionRole::GroupedMTPVerifier;
+        host.mock_live_mtp_request_batch_condition = role == ForwardExecutionRole::MTPCondition;
+        host.mock_capture_policy.allow_fast_decode = true;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
+        std::array<int, 2> tokens{42, 43}, positions{1, 2};
+        auto input = makeTestInput(host.mock_compute_all_position_logits ? 2 : 1,
+            1, device, tokens.data(), positions.data());
+        input.token_ids_device = tokens.data();
+        input.position_ids_device = positions.data();
+        input.execution_role = role;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output{};
+        const IGPUGraphCapture *identity = nullptr;
+        for (int repeat = 0; repeat < 20; ++repeat)
+        {
+            SCOPED_TRACE(repeat);
+            std::optional<ForwardGraphSignature> signature;
+            ASSERT_TRUE(engine.execute(input, output, host, &signature));
+            ASSERT_TRUE(signature.has_value());
+            EXPECT_FALSE(engine.lastExecutedForwardGraph().has_value());
+            std::string error;
+            const auto child = engine.deviceLoopGraphTemplate(*signature, &error);
+            ASSERT_TRUE(child.has_value()) << error;
+            EXPECT_TRUE(engine.retainedDecodeGraph(*signature, &error)) << error;
+            const auto *capture = dynamic_cast<const llaminar2::testing::MockGPUGraphCapture *>(child->capture);
+            ASSERT_NE(capture, nullptr);
+            EXPECT_EQ(capture->launchCount(), 0);
+            if (identity) EXPECT_EQ(child->capture, identity);
+            identity = child->capture;
+            EXPECT_EQ(host.committed_forward_output_calls, 0);
+            EXPECT_EQ(host.sync_logits_calls, 0);
+            engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+    }
+}
+
+/**
+ * @brief Different resident input owners retain different captured children.
+ *
+ * Identical shapes and device residency do not make embedded addresses equal.
+ * Alternate both input banks independently, then change only their contents
+ * across resets. The latter must reuse each exact child without recapture.
+ * Mock contexts prove the cache contract without allocating on an accelerator.
+ */
+TEST_F(Test__ForwardExecutionEngine, ResidentInputOwnersHaveExactCaptureIdentity)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool change_positions : {false, true})
+    {
+        SCOPED_TRACE(device.toString() + " positions=" + std::to_string(change_positions));
+        auto engine = makeEngine(true);
+        llaminar2::testing::MockDeviceContext gpu_ctx(device,
+            device.is_cuda() ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        MockForwardExecutionHost host(&gpu_ctx);
+        host.graph_stage_count = 1;
+        host.mock_capture_policy.allow_fast_decode = true;
+        host.mock_capture_policy.allow_cached_graph_replay = true;
+        std::array<int, 2> tokens{42, 43}, positions{1, 2};
+        auto input = makeTestInput(1, 1, device, nullptr, nullptr);
+        input.position_offset = 1;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output;
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            const int owner = replay % 2;
+            SCOPED_TRACE(replay);
+            input.token_ids_device = &tokens[change_positions ? 0 : owner];
+            input.position_ids_device = &positions[change_positions ? owner : 0];
+            ASSERT_TRUE(engine.execute(input, output, host));
+            ASSERT_EQ(host.build_forward_graph_calls, std::min(replay + 1, 2))
+                << "A native graph cannot change an embedded address merely because both inputs live on device.";
+            EXPECT_EQ(engine.replayCacheObservations(1).size(), static_cast<size_t>(std::min(replay + 1, 2)));
+            EXPECT_EQ(host.committed_forward_output_calls, 0);
+            tokens[owner] += 1;
+            positions[owner] += 1;
+            engine.resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+    }
+}
+
+/** @brief Reject malformed position roots before cache access or backend preparation. */
+TEST_F(Test__ForwardExecutionEngine, DecodePositionBindingRejectsAmbiguousInputOwnership)
+{
+    int32_t rows[3]{};
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (int invalid = 0; invalid < 9; ++invalid)
+    {
+        SCOPED_TRACE(device.toString() + ":invalid=" + std::to_string(invalid));
+        auto engine = makeEngine(true);
+        MockForwardExecutionHost host(&mock_ctx_);
+        ForwardInput input;
+        input.device = device;
+        input.seq_len = input.batch_size = 1;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.position_ids_device = &rows[1];
+        input.device_decode_position = DeviceDecodePositionBinding{
+            reinterpret_cast<IBackend *>(&rows[2]), &rows[0], &rows[1]};
+        if (invalid == 0) input.device_decode_position->cached_tokens = nullptr;
+        if (invalid == 1) input.device_decode_position->position = &rows[0];
+        if (invalid == 2) input.device = DeviceId::cpu();
+        if (invalid == 3) input.execution_phase = ForwardExecutionPhase::Prefill;
+        if (invalid == 4) input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+        if (invalid == 5) input.batch_size = 2;
+        if (invalid == 6) input.seq_len = 2;
+        if (invalid == 7) input.position_ids = &rows[1];
+        if (invalid == 8) input.position_policy = ForwardPositionPolicy::ContiguousOffset;
+        ForwardOutput output;
+        EXPECT_FALSE(engine.execute(input, output, host));
+        EXPECT_FALSE(engine.lastExecutedForwardGraph().has_value());
+        EXPECT_EQ(host.build_forward_graph_calls, 0);
+        EXPECT_EQ(host.ensure_workspace_calls, 0);
+        EXPECT_EQ(host.get_worker_gpu_context_calls, 0);
+    }
+}
+
 /** @brief Setup and replay preserve decode, verifier and request-condition identities. */
 TEST_F(Test__ForwardExecutionEngine, SetupAndReplayPreserveGraphIdentity)
 {
@@ -3035,6 +3160,17 @@ TEST_F(
         ASSERT_TRUE(exact.has_value()) << error;
         EXPECT_EQ(exact->capture, captures[bucket_index]);
         EXPECT_EQ(exact->signature, signatures[bucket_index]);
+        // Parent terminal observation may count an exported child's work, but
+        // never a different bucket/owner, a negative count or a missing graph.
+        EXPECT_TRUE(engine.observeComposedForwardCompletion(signatures[bucket_index],
+            captures[bucket_index], 0, &error)) << error;
+        EXPECT_TRUE(engine.observeComposedForwardCompletion(signatures[bucket_index],
+            captures[bucket_index], 17, &error)) << error;
+        EXPECT_FALSE(engine.observeComposedForwardCompletion(signatures[bucket_index],
+            captures[(bucket_index + 1) % captures.size()], 1, &error));
+        EXPECT_FALSE(engine.observeComposedForwardCompletion(signatures[bucket_index],
+            captures[bucket_index], -1, &error));
+        EXPECT_FALSE(engine.observeComposedForwardCompletion(signatures[bucket_index], nullptr, 1, &error));
     }
 
     ForwardGraphSignature absent = signatures.front();
@@ -3043,6 +3179,7 @@ TEST_F(
     std::string absent_error;
     EXPECT_FALSE(engine.deviceLoopGraphTemplate(absent, &absent_error));
     EXPECT_NE(absent_error.find("exact signature"), std::string::npos);
+    EXPECT_FALSE(engine.observeComposedForwardCompletion(absent, captures.front(), 1, &absent_error));
 }
 
 /**
@@ -3963,26 +4100,6 @@ TEST_F(Test__ForwardExecutionEngine, MoEPlacementEpochChangeMissesDecodeCache)
 // =========================================================================
 // execute() — PP Configuration
 // =========================================================================
-
-TEST_F(Test__ForwardExecutionEngine, UnifiedPP_ClearsCacheOnMiss)
-{
-    ForwardExecutionEngine::Config config;
-    config.cache_config.enabled = true;
-    config.has_unified_pp = true;
-    ForwardExecutionEngine engine(std::move(config), executor_);
-
-    MockForwardExecutionHost host(&mock_ctx_);
-
-    int token = 42;
-    int pos = 0;
-    auto input = makeTestInput(1, 1, DeviceId::cpu(), &token, &pos);
-    ForwardOutput output{};
-
-    engine.execute(input, output, host);
-
-    // Unified PP path clears cache and uses multi-device execution
-    EXPECT_TRUE(engine.cacheEmpty());
-}
 
 // =========================================================================
 // execute() — Prefill (non-decode) path classification

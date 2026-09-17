@@ -255,21 +255,77 @@ namespace llaminar2
     };
 
     /**
-     * @brief Authenticated hosted replay view of one device-controlled iteration.
+     * @brief Unconditional participant arrival before deciding to enter the loop.
      *
-     * Native conditional graphs preserve the source fragment order themselves.
-     * A backend without conditional graph nodes publishes the two immutable
-     * decisions needed to reproduce that selection: whether another loop
-     * iteration is admitted and whether its conditional tail is due.  This
-     * helper applies those decisions while retaining the original fragment
-     * order; it must never move a conditional maintenance tail ahead of the
-     * transaction that produces and releases its inference state.
+     * A pipeline follower must receive its authority's current command even if
+     * its previous command says terminal. This phase therefore has no optional
+     * predicate or selector: putting the receive behind either would deadlock
+     * the authority. It may import a captured device collective, never a host
+     * reset or a second controller. Capture ownership is borrowed during build.
+     */
+    struct DeviceControlledLoopEntryFragment
+    {
+        const char *name = nullptr;                ///< Stable producer role.
+        const IGPUGraphCapture *capture = nullptr; ///< Participant-local recording.
+
+        /** @return Whether both diagnostic identity and graph owner are present. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return name != nullptr && name[0] != '\0' && capture != nullptr;
+        }
+    };
+
+    /**
+     * @brief Borrowed local initialization, collective arrival and repeated phases.
+     *
+     * Initialization runs once behind its local admission predicate. A pipeline
+     * tail uses this for initial sampling; its followers have no initialization
+     * because they do not own an admission decision. Entry then executes once,
+     * unconditionally, even if initialization just terminated the request. This
+     * broadcasts the command before any follower reads its loop predicate and
+     * also lets a terminal tail release its peers. Iteration begins only after
+     * that exchange and the common continuation check. Empty entry retains the
+     * single-device path with no extra nodes or submissions.
+     * This makes prefill sampling followed by zero or more decode transactions
+     * expressible without a host submission or a per-iteration first-token test.
+     * Initialization may test an existing device word (for example whether a
+     * token was already emitted), but has no loop-depth selector and must not
+     * reset a live request controller. Admission remains outside this executable.
+     * All spans are borrowed only during construction, like their captures.
+     */
+    struct DeviceControlledLoopProgram
+    {
+        std::span<const DeviceControlledLoopEntryFragment> entry;
+        std::span<const DeviceControlledLoopFragment> initialization;
+        std::span<const DeviceControlledLoopFragment> iteration;
+    };
+
+    /**
+     * @brief Authenticated continuation after a completed device iteration.
+     *
+     * Native graphs evaluate their conditional tail after the current body.
+     * A hosted ticket is published at that exact boundary: its word predicate
+     * belongs to the body that ALREADY completed, whereas its selector and
+     * admission decision belong to the NEXT body. Therefore a continuation
+     * retires the selected prior tail before submitting the next body. A final
+     * ticket still retires its tail even though no next iteration is admitted.
+     * Filtering the original body-then-tail order would postpone maintenance
+     * by one transaction and admit a verifier with an exhausted row budget.
      */
     struct DeviceControlledLoopTicketSelection
     {
-        bool iteration_admitted = false;       ///< Whether the native loop body would run.
-        bool conditional_word_nonzero = false; ///< Authenticated value for the conditional tail.
-        int selector = -1; ///< Authenticated selector for a depth-gated fragment.
+        bool next_iteration_admitted = false; ///< Device admission for the next body.
+        bool completed_iteration_word_nonzero = false; ///< Prior body's tail predicate.
+        int selector = -1; ///< Device-selected depth for the next body.
+
+        /** @brief Identify a tail governed by the completed iteration's word. */
+        template <typename Fragment>
+        [[nodiscard]] static constexpr bool isCompletedIterationTail(
+            const Fragment &fragment) noexcept
+        {
+            return fragment.execution == DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero ||
+                   fragment.execution == DeviceControlledLoopFragmentExecution::IfDeviceWordZero;
+        }
 
         /**
          * @brief Decide whether one execution policy participates in this iteration.
@@ -281,19 +337,17 @@ namespace llaminar2
         [[nodiscard]] constexpr bool selects(
             const Fragment &fragment) const noexcept
         {
-            if (!iteration_admitted)
-                return false;
             switch (fragment.execution)
             {
             case DeviceControlledLoopFragmentExecution::Always:
-                return true;
+                return next_iteration_admitted;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
-                return conditional_word_nonzero;
+                return completed_iteration_word_nonzero;
             case DeviceControlledLoopFragmentExecution::IfDeviceWordZero:
-                return !conditional_word_nonzero;
+                return !completed_iteration_word_nonzero;
             case DeviceControlledLoopFragmentExecution::
                 IfDeviceSelectorAtLeast:
-                return selector >= fragment.minimum_selector;
+                return next_iteration_admitted && selector >= fragment.minimum_selector;
             }
             return false;
         }
@@ -318,7 +372,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Resolve a selected ordinal while preserving producer order.
+         * @brief Retire the completed tail, then preserve next-body producer order.
          * @tparam Fragment A fragment type exposing an `execution` member.
          * @param ordered_fragments Producer-ordered retained branch.
          * @param selected_ordinal Zero-based ordinal in the filtered view.
@@ -330,9 +384,12 @@ namespace llaminar2
             size_t selected_ordinal) const noexcept
         {
             size_t current_ordinal = 0;
+            // These two scopes straddle ticket publication. Ordering is stable
+            // within each scope and requires neither allocation nor device I/O.
+            for (const bool completed_tail : {true, false})
             for (const Fragment &fragment : ordered_fragments)
             {
-                if (!selects(fragment))
+                if (isCompletedIterationTail(fragment) != completed_tail || !selects(fragment))
                     continue;
                 if (current_ordinal == selected_ordinal)
                     return &fragment;
@@ -621,6 +678,10 @@ namespace llaminar2
          * nodes, never to a host callback, host polling thread, scalar stream
          * capture, or replay-time graph mutation. The result is built but
          * uninstantiated.
+         * Owned recording fragments may be mixed with complete independent
+         * captures. A foreign or incomplete recording view is never a complete
+         * import. Backend-native restrictions on cloning conditional graphs
+         * remain fatal; this API does not recapture an incompatible source.
          *
          * @param ordered_steps Non-empty exact producer-to-consumer sequence.
          * @return true when this capture owns the complete parent graph.
@@ -672,18 +733,21 @@ namespace llaminar2
         /**
          * @brief Replace this graph with a device-controlled repetition of captured fragments.
          *
-         * The implementation clones every element of @p ordered_body_fragments
+         * The implementation guards program.initialization with local admission,
+         * executes program.entry unconditionally, then evaluates continuation.
+         * A follower declares no local initializer and therefore receives its
+         * authority's command before reading a predicate. It clones program.iteration
          * into one conditional WHILE body, adds an explicit dependency from each
          * fragment to its successor, lowers any IfDeviceWordNonZero fragment
          * to a native device conditional, and appends the device predicate
-         * update after the final fragment. Backend-native composers may lower internal
-         * multi-stream event handoffs to equivalent direct dependency edges when
-         * conditional bodies do not admit event nodes. A root wait or terminal
-         * record crosses the fragment boundary and must remain a hard error. The
+         * update after the final fragment. Producers must publish conditional-body
+         * compatible fragments; the composer rejects event nodes instead of
+         * repairing or deleting lifecycle edges after capture. The
          * first and subsequent iterations are controlled exclusively by
-         * @p predicate. First-sample work belongs inside this same guarded body:
-         * a device-word conditional can select its initial frontier, and later
-         * fragments can test completion after sampling exhausts the budget. No
+         * @p predicate. Initialization may finish the response (budget one or
+         * EOS), in which case no model iteration runs. A terminal or unhealthy
+         * controller executes neither initialization nor repeated work, but
+         * still participates in entry so its peers cannot be stranded. No
          * D2H copy, host callback,
          * allocation, or stream synchronization is permitted in the generated
          * graph.
@@ -691,8 +755,8 @@ namespace llaminar2
          * On success the graph is built but not instantiated.  The caller must
          * call instantiate() exactly as it would after endCapture().
          *
-         * @param ordered_body_fragments Named, captured, non-empty transaction
-         *        fragments in producer-to-consumer order. Every capture pointer
+         * @param program Optional admitted initialization, mandatory arrival if
+         *        declared, and a non-empty repeated transaction, each in producer order. Every capture pointer
          *        must remain valid through this call and identify the same
          *        backend/device context as this graph owner. Source captures may
          *        own different streams: child-graph cloning discards launch-stream
@@ -701,10 +765,10 @@ namespace llaminar2
          * @return true when this object owns a complete loop graph.
          */
         virtual bool buildDeviceControlledWhileLoop(
-            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+            const DeviceControlledLoopProgram &program,
             const DeviceControlledLoopPredicate &predicate)
         {
-            (void)ordered_body_fragments;
+            (void)program;
             (void)predicate;
             return false;
         }
@@ -725,16 +789,17 @@ namespace llaminar2
                 .capture = &body,
             }};
             return buildDeviceControlledWhileLoop(
-                fragments, predicate);
+                DeviceControlledLoopProgram{.iteration = fragments}, predicate);
         }
 
         /**
          * @brief Replace this graph with a selector-gated linear transaction in WHILE.
          *
-         * The implementation first evaluates @p predicate to decide whether the
+         * After health-guarded initialization, the implementation evaluates
+         * @p predicate to decide whether the
          * loop may begin. Each iteration validates @p selector_policy on device,
          * executes one producer-ordered transaction, then reevaluates @p predicate.
-         * Invalid or divergent selectors execute no fragment and make the request
+         * Invalid or divergent selectors execute no iteration fragment and make the request
          * terminally unhealthy. Selector-gated fragments must form one monotonic
          * region: their thresholds increase with transaction width, after which
          * the shared verifier/publication tail appears exactly once. Ordinary
@@ -745,17 +810,17 @@ namespace llaminar2
          * and no greater than the configured maximum. This canonical shape keeps
          * executable storage O(maximum selector) instead of O(sum of selectors).
          *
-         * @param ordered_body_fragments One complete maximum-width transaction.
+         * @param program Unconditional arrival, admitted initialization and a complete maximum-width iteration.
          * @param predicate Device-owned loop continuation policy.
          * @param selector_policy Device-owned selector and fatal validation policy.
          * @return true when this object owns a built, uninstantiated parent graph.
          */
         virtual bool buildDeviceControlledSelectorWhileLoop(
-            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+            const DeviceControlledLoopProgram &program,
             const DeviceControlledLoopPredicate &predicate,
             const DeviceControlledLoopSelector &selector_policy)
         {
-            (void)ordered_body_fragments;
+            (void)program;
             (void)predicate;
             (void)selector_policy;
             return false;

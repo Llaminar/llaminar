@@ -17,8 +17,25 @@
 #include "config/ConfigValidator.h"
 #include "config/OrchestrationConfig.h"
 #include "backends/GlobalDeviceAddress.h"
+#include <algorithm>
 
 using namespace llaminar2;
+
+TEST(Test__ConfigValidator, TypedContextCapacityRejectsNonpositiveValues)
+{
+    const auto validator = ConfigValidator::createStandard();
+    for (int capacity : {-1, 0, 1, 4096})
+    {
+        OrchestrationConfig config;
+        config.max_seq_len = capacity;
+        const auto errors = validator.validate(config);
+        const bool rejected = std::any_of(errors.begin(), errors.end(), [](const auto &error) {
+            return error.rule_id == "context-length-positive";
+        });
+        EXPECT_EQ(rejected, capacity <= 0);
+        EXPECT_EQ(config.validate().empty(), capacity > 0);
+    }
+}
 
 // ============================================================================
 // Helper: check that a specific rule fires for a given config

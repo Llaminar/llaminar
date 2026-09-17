@@ -1319,21 +1319,50 @@ namespace llaminar2::test
             << "Independent CPU participants must not alias execution scratch";
     }
 
+    /** @brief Physical CPU placement determines transport, never GPU ticket ownership. */
+    enum class CpuTicketPlacement
+    {
+        RankLocal, ///< CPU service shares the continuation process.
+        RemoteMPI, ///< CPU service belongs to another physical host and rank.
+        RemoteMPIPair, ///< One CPU tier spans two distinct remote hosts.
+    };
+
     /**
-     * @brief A colocated CPU return cannot replace the local GPU producer edge.
+     * @brief Expose production transaction sealing for a standalone FFN component.
+     *
+     * A complete model adds attention and vocabulary stages around this FFN.
+     * The component test uses the very same base-class sealing operation on
+     * its existing terminal, without substituting graph wiring or execution.
+     */
+    class SealedFFNGraphBuilder : public Qwen35MoEGraph
+    {
+    public:
+        using Qwen35MoEGraph::Qwen35MoEGraph;
+        using Qwen35MoEGraph::sealInferenceTransactionGraph;
+    };
+
+    /**
+     * @brief Lower the same GPU/CPU ticket lifecycle for local and remote service.
      *
      * CPU and GPU computation may overlap, but their final writes are not
      * disjoint: GPU canonical publication also zeroes non-local route slots.
      * Ticket ingress must follow that publication before replacing the remote
      * slots. A fold that merely joins both writers leaves a write/write race.
-     * Inspect the actual production lowering for serial decode and prefill;
-     * no model file or test-owned execution path is needed.
+     * Remote MPI service uses its own return buffer, but still needs the same
+     * typed captured/manual/captured envelope. Otherwise setup can materialize
+     * an ordinary segmented graph that rejects the first request's launch
+     * dependency. Inspect serial, prefill and depth-15 verifier row geometries
+     * without loading a model or replacing production graph lowering.
      * @param device GPU endpoint whose native graph owns the final reduction.
+     * @param placement Whether the CPU endpoint is colocated or on a distinct host.
      */
-    static void assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(
-        DeviceId device)
+    static void assertCanonicalTicketGraphLowering(
+        DeviceId device, CpuTicketPlacement placement)
     {
         SCOPED_TRACE(device.to_string());
+        const int cpu_rank = placement == CpuTicketPlacement::RankLocal ? 0 : 1;
+        const int cpu_participants = placement == CpuTicketPlacement::RemoteMPIPair ? 2 : 1;
+        SCOPED_TRACE(cpu_participants);
         auto plan = makeDistributedSingleGPUContinuationPlan();
         plan->domains[0] = domain(
             "continuation_domain",
@@ -1344,14 +1373,28 @@ namespace llaminar2::test
         plan->domains[0].owner_rank = 0;
         plan->domains[1] = domain(
             "remote_domain", GlobalDeviceAddress::cpu(0));
-        plan->domains[1].owner_rank = 0;
+        plan->domains[1].owner_rank = cpu_rank;
+        if (cpu_participants == 2)
+        {
+            // Both hosts call their socket CPU:0. The participant-indexed MPI
+            // owner map, not a launcher-local CPU ordinal, distinguishes them.
+            plan->domains[1].scope = ExecutionDomainScope::GLOBAL;
+            plan->domains[1].backend = CollectiveBackendType::MPI;
+            plan->domains[1].participants = {
+                GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(0)};
+            plan->domains[1].world_ranks = {1, 2};
+        }
         validateMoERoutedExpertPlacementPlanOrThrow(
             *plan, {.layer_count = 1, .routed_expert_count = kNumExperts});
         const auto owner_map = MoEExpertOwnerMap::build(*plan);
         GraphConfig config = makeConfig(plan, /*layer_count=*/1);
         config.default_device = device;
-        config.max_activation_rows = kSeqLen;
-        config.moe.overlay_mpi_ctx = std::make_shared<MockMPIContext>(0, 1);
+        config.max_activation_rows = 16;
+        const int world_size = cpu_rank == 0 ? 1 : cpu_participants + 1;
+        auto mpi = std::make_shared<MockMPIContext>(0, world_size);
+        mpi->set_topology(MockMPITopology::createSimple(
+            /*rank=*/0, world_size, /*ranks_per_node=*/1));
+        config.moe.overlay_mpi_ctx = mpi;
         config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(
                 plan, {.current_world_rank = 0});
@@ -1377,7 +1420,8 @@ namespace llaminar2::test
             std::make_shared<MoEOverlayParticipantResidencyRegistry>(
                 MoEOverlayParticipantResidencyRegistry::Config{
                     .owner_map = snapshot->owner_map,
-                    .local_participant_ids = {0, 1},
+                    .local_participant_ids = cpu_rank == 0
+                        ? std::vector<int>{0, 1} : std::vector<int>{0},
                     .num_layers = 1,
                     .num_experts = kNumExperts,
                     .initial_epoch = snapshot->epoch,
@@ -1395,8 +1439,8 @@ namespace llaminar2::test
         TensorArena weights;
         auto layer = makeLayerWeights(weights);
         ScopedDevicePublicationStream stream(device);
-        Qwen35MoEGraph builder(model, nullptr, config);
-        for (const int rows : {1, kSeqLen})
+        SealedFFNGraphBuilder builder(model, nullptr, config);
+        for (const int rows : {1, kSeqLen, 16})
         {
             SCOPED_TRACE(rows);
             TensorArena activations;
@@ -1409,9 +1453,82 @@ namespace llaminar2::test
                 "layer0_moe_overlay_continuation_routes_ordered_reduce";
             ASSERT_NE(graph.getNode(local), nullptr);
             ASSERT_NE(graph.getNode(fold), nullptr);
+            EXPECT_EQ(graph.nativeCaptureEnvelope(),
+                      GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction)
+                << "Remote MPI service must retain the same explicit launch-owner contract";
+            ASSERT_TRUE(graph.getNode(local)->heterogeneous_ticket_unit_contract.has_value());
+            EXPECT_EQ(graph.getNode(local)->heterogeneous_ticket_unit_contract->disposition,
+                      GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary);
+
+            // Exercise the production planner, not just the envelope metadata:
+            // it rejects misplaced cutpoints and missing terminal ownership.
+            builder.sealInferenceTransactionGraph(graph, graph.terminalNode());
+            DeviceGraphExecutor::GraphSegmentCache capture_plan;
+            const auto collectives = graph.collectiveNodeNames();
+            ASSERT_NO_THROW(DeviceGraphCaptureController::buildCapturePlan(
+                graph, capture_plan, &collectives, !collectives.empty(),
+                /*collectives_graph_capturable=*/true,
+                DeviceGraphExecutor::GraphReplayPlanPolicy::
+                    AllowHeterogeneousBoundarySegmentation));
+            ASSERT_EQ(capture_plan.segments.size(), 3u)
+                << "One CPU service boundary needs one producer and one suffix, "
+                   "not extra serial GPU launches";
+            EXPECT_TRUE(capture_plan.segments[0].capturable);
+            EXPECT_FALSE(capture_plan.segments[1].capturable);
+            EXPECT_TRUE(capture_plan.segments[2].capturable);
+
             const auto consumers = stageNamesOfType(
                 graph, ComputeStageType::MOE_OVERLAY_TICKET_CONSUME);
             ASSERT_EQ(consumers.size(), 1u);
+            if (cpu_rank != 0)
+            {
+                const auto dispatches = stageNamesOfType(
+                    graph, ComputeStageType::MOE_RANK_BATCH_DISPATCH);
+                const auto returns = stageNamesOfType(
+                    graph, ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE);
+                ASSERT_EQ(dispatches.size(), static_cast<size_t>(cpu_participants));
+                ASSERT_EQ(returns.size(), static_cast<size_t>(cpu_participants));
+                // Rank-pair MPI lanes have independent receive/send storage.
+                // Submit every peer before the first blocking return: an edge
+                // from return A to dispatch B serializes remote CPU execution.
+                const auto &order = graph.getExecutionOrder();
+                for (const auto &dispatch_name : dispatches)
+                {
+                    for (const auto &return_name : returns)
+                    {
+                        EXPECT_LT(std::find(order.begin(), order.end(), dispatch_name),
+                                  std::find(order.begin(), order.end(), return_name))
+                            << "Independent rank dispatch must precede every return: "
+                            << dispatch_name << " / " << return_name;
+                    }
+                }
+                for (size_t index = 1; index < returns.size(); ++index)
+                {
+                    EXPECT_TRUE(hasDependency(graph, returns[index], returns[index - 1]))
+                        << "Concurrent transport must preserve ordered FP32 return accumulation";
+                }
+                for (const auto &dispatch_name : dispatches)
+                {
+                    const auto *dispatch = dynamic_cast<const MoERankBatchDispatchStage *>(
+                        graph.getNode(dispatch_name)->stage.get());
+                    ASSERT_NE(dispatch, nullptr);
+                    ASSERT_NE(dispatch->params().transport, nullptr);
+                    EXPECT_FALSE(dispatch->params().transport->hasSharedRowStorage())
+                        << "A distinct physical host cannot use mapped activation rows";
+                    EXPECT_NE(std::find(capture_plan.segments[1].stage_names.begin(),
+                                        capture_plan.segments[1].stage_names.end(), dispatch_name),
+                              capture_plan.segments[1].stage_names.end());
+                }
+                EXPECT_TRUE(std::any_of(returns.begin(), returns.end(),
+                    [&](const auto &name) {
+                        return hasDependency(graph, consumers.front(), name);
+                    }));
+                const std::string merge = "layer0_moe_overlay_remote_routes_merge";
+                ASSERT_NE(graph.getNode(merge), nullptr);
+                EXPECT_TRUE(hasDependency(graph, merge, fold));
+                EXPECT_TRUE(hasDependency(graph, merge, consumers.front()));
+                continue;
+            }
             EXPECT_TRUE(hasDependency(graph, fold, local))
                 << "CPU ticket readiness does not publish GPU-local route slots";
             EXPECT_TRUE(hasDependency(graph, fold, consumers.front()))
@@ -1427,7 +1544,15 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          RankLocalCanonicalTicketFoldJoinsBothExpertProducersCUDA)
     {
-        assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(DeviceId::cuda(0));
+        assertCanonicalTicketGraphLowering(DeviceId::cuda(0), CpuTicketPlacement::RankLocal);
+    }
+
+    /** @test CUDA remote CPU service declares the executable launch owner for every row geometry. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         CrossHostCPUTicketUsesTypedCaptureLifecycleCUDA)
+    {
+        assertCanonicalTicketGraphLowering(DeviceId::cuda(0), CpuTicketPlacement::RemoteMPI);
+        assertCanonicalTicketGraphLowering(DeviceId::cuda(0), CpuTicketPlacement::RemoteMPIPair);
     }
 #endif
 
@@ -1436,7 +1561,15 @@ namespace llaminar2::test
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          RankLocalCanonicalTicketFoldJoinsBothExpertProducersROCm)
     {
-        assertRankLocalCanonicalTicketFoldJoinsBothExpertProducers(DeviceId::rocm(0));
+        assertCanonicalTicketGraphLowering(DeviceId::rocm(0), CpuTicketPlacement::RankLocal);
+    }
+
+    /** @test ROCm remote CPU service declares the executable launch owner for every row geometry. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         CrossHostCPUTicketUsesTypedCaptureLifecycleROCm)
+    {
+        assertCanonicalTicketGraphLowering(DeviceId::rocm(0), CpuTicketPlacement::RemoteMPI);
+        assertCanonicalTicketGraphLowering(DeviceId::rocm(0), CpuTicketPlacement::RemoteMPIPair);
     }
 #endif
 

@@ -147,8 +147,8 @@ namespace llaminar2::test::parity
             if (minimum_tokens < kMinimumCompletionTokens || maximum_tokens < minimum_tokens)
                 throw std::invalid_argument(
                     "generation regression requires at least 384 continuous committed tokens within its response budget");
-            if (readiness_seconds <= 0 || readiness_seconds > 600)
-                throw std::invalid_argument("generation readiness must fit the 600-second exact-cell watchdog");
+            if (readiness_seconds <= 0 || readiness_seconds > 900)
+                throw std::invalid_argument("generation readiness must fit the 900-second exact-cell watchdog");
         }
 
         /** @return Response limit, not evidence that this many tokens were generated. */

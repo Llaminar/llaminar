@@ -2,7 +2,8 @@
  * @file OrchestrationConfigParser.h
  * @brief Implementation of IOrchestrationConfigParser
  *
- * Parses orchestration configuration from CLI arguments and YAML files.
+ * Parses orchestration configuration from CLI arguments, authored YAML, and
+ * exact versioned JSON documents emitted by the shared configuration writer.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -41,12 +42,34 @@ namespace llaminar2
         OrchestrationConfig parseArgs(int argc, char **argv) override;
 
         /**
-         * @brief Parse from YAML file
+         * @brief Parse shared runtime policy plus command-local presentation.
+         * @param argc Argument count including the executable, not a subcommand.
+         * @param argv Arguments with lifetime covering the call.
+         * @param options Additional named options; shared names cannot be replaced.
+         * @return The same normalized/published config as ordinary parseArgs.
+         *
+         * Command setters may capture their own output settings. They do not
+         * require another model, MTP, KV, topology or economy option table.
+         */
+        OrchestrationConfig parseCommandArgs(int argc, char **argv,
+                                             const CliSpec<OrchestrationConfig> &options);
+
+        /**
+         * @brief Render the exact shared-plus-command parser contract.
+         * @param options Same additional specification used for parsing.
+         * @param header Subcommand-specific usage and purpose.
+         * @return Generated help; duplicate option ownership throws.
+         */
+        static std::string getCommandHelpText(const CliSpec<OrchestrationConfig> &options,
+                                               const std::string &header);
+
+        /**
+         * @brief Parse an authored YAML file or a versioned JSON config document.
          */
         OrchestrationConfig parseYamlFile(const std::string &path) override;
 
         /**
-         * @brief Parse from YAML string
+         * @brief Parse authored YAML or a versioned JSON config document.
          */
         OrchestrationConfig parseYamlString(const std::string &yaml) override;
 

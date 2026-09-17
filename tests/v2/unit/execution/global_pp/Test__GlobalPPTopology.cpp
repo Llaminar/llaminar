@@ -911,279 +911,170 @@ TEST_F(Test__GlobalPPRankPlanBuilder, AllGlobalTP)
 }
 
 // =============================================================================
-// Rank Locality Tests
+// Canonical physical membership tests
 // =============================================================================
 
-/**
- * @test Two ranks on the same node → all transfers are INTRA_NODE
- */
-TEST_F(Test__GlobalPPTopology, BuildWithLocalities_SameNode)
+namespace
 {
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = false;
-    s0.owning_rank = 0;
-
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = false;
-    s1.owning_rank = 1;
-
-    std::vector<RankLocality> localities = {
-        {0, "node-alpha", 0},
-        {1, "node-alpha", 0},
-    };
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
-
-    ASSERT_EQ(topo.rank_localities.size(), 2u);
-    EXPECT_TRUE(topo.areColocated(0, 1));
-    EXPECT_EQ(topo.nodeCount(), 1);
-
-    ASSERT_EQ(topo.transfers.size(), 1u);
-    EXPECT_EQ(topo.transfers[0].locality, TransferLocality::INTRA_NODE);
-}
-
-/**
- * @test Two ranks on different nodes → transfers are INTER_NODE
- */
-TEST_F(Test__GlobalPPTopology, BuildWithLocalities_DifferentNodes)
+/** @brief Build device-free discovery membership; hostnames are deliberately untrusted labels. */
+ClusterInventory pipelineInventory(std::initializer_list<int> nodes)
 {
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = false;
-    s0.owning_rank = 0;
-
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = false;
-    s1.owning_rank = 1;
-
-    std::vector<RankLocality> localities = {
-        {0, "node-alpha", 0},
-        {1, "node-beta", 1},
-    };
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
-
-    EXPECT_FALSE(topo.areColocated(0, 1));
-    EXPECT_EQ(topo.nodeCount(), 2);
-
-    ASSERT_EQ(topo.transfers.size(), 1u);
-    EXPECT_EQ(topo.transfers[0].locality, TransferLocality::INTER_NODE);
-}
-
-/**
- * @test No localities provided → existing build() path → locality stays UNKNOWN
- */
-TEST_F(Test__GlobalPPTopology, BuildWithoutLocalities_TransfersAreUnknown)
-{
-    auto topo = buildCanonical3Stage();
-    for (const auto &t : topo.transfers)
+    ClusterInventory inventory;
+    for (const int node : nodes)
     {
-        EXPECT_EQ(t.locality, TransferLocality::UNKNOWN);
+        RankInventory rank;
+        rank.rank = static_cast<int>(inventory.ranks.size());
+        rank.node_id = node;
+        rank.hostname = "same-label";
+        inventory.ranks.push_back(std::move(rank));
+    }
+    inventory.world_size = static_cast<int>(inventory.ranks.size());
+    return inventory;
+}
+
+/** @brief Bind the standard mixed-device pipeline to canonical physical membership. */
+GlobalPPTopology boundPipeline(const ClusterInventory &inventory)
+{
+    return GlobalPPTopology::build(buildCanonical3Stage().stages, 24, inventory);
+}
+}
+
+/** @test Hostname differences cannot turn communicator-proven local ranks into remote ones. */
+TEST_F(Test__GlobalPPTopology, PhysicalIdentityIgnoresHostnameLabels)
+{
+    auto inventory = pipelineInventory({7, 7});
+    inventory.ranks[1].hostname = "different-label";
+    const auto topology = boundPipeline(inventory);
+    ASSERT_EQ(topology.transfers.size(), 3u);
+    for (const auto &edge : topology.transfers)
+    {
+        const auto &connection = edge.physicalConnection();
+        EXPECT_EQ(connection.sourceRank(), edge.sender_rank);
+        EXPECT_EQ(connection.destinationRank(), edge.receiver_rank);
+        EXPECT_EQ(connection.sourceNode(), 7);
+        EXPECT_EQ(connection.destinationNode(), 7);
+        EXPECT_EQ(connection.locality(), edge.isLocalHandoff()
+            ? RankConnectionLocality::SameRank : RankConnectionLocality::SameNode);
     }
 }
 
-/**
- * @test areColocated returns false when no localities provided
- */
-TEST_F(Test__GlobalPPTopology, AreColocated_NoLocalities)
+/** @test Sparse, reordered physical IDs distinguish nodes even with identical hostname labels. */
+TEST_F(Test__GlobalPPTopology, DirectedPhysicalIdentitySurvivesRankProjection)
 {
-    auto topo = buildCanonical3Stage();
-    EXPECT_FALSE(topo.areColocated(0, 1));
-}
-
-/**
- * @test nodeCount returns 0 when no localities provided
- */
-TEST_F(Test__GlobalPPTopology, NodeCount_NoLocalities)
-{
-    auto topo = buildCanonical3Stage();
-    EXPECT_EQ(topo.nodeCount(), 0);
-}
-
-/**
- * @test ranksOnNode returns correct groupings for multi-node topology
- */
-TEST_F(Test__GlobalPPTopology, RanksOnNode)
-{
-    std::vector<RankLocality> localities = {
-        {0, "host-a", 0}, {1, "host-a", 0},
-        {2, "host-b", 1}, {3, "host-b", 1},
-    };
-
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = true;
-    s0.participating_ranks = {0, 1};
-    s0.per_rank_device = GlobalDeviceAddress::cpu(0);
-
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = true;
-    s1.participating_ranks = {2, 3};
-    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
-
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 4, localities);
-
-    auto node0_ranks = topo.ranksOnNode(0);
-    ASSERT_EQ(node0_ranks.size(), 2u);
-    EXPECT_EQ(node0_ranks[0], 0);
-    EXPECT_EQ(node0_ranks[1], 1);
-
-    auto node1_ranks = topo.ranksOnNode(1);
-    ASSERT_EQ(node1_ranks.size(), 2u);
-    EXPECT_EQ(node1_ranks[0], 2);
-    EXPECT_EQ(node1_ranks[1], 3);
-
-    EXPECT_EQ(topo.nodeCount(), 2);
-    EXPECT_TRUE(topo.areColocated(0, 1));
-    EXPECT_TRUE(topo.areColocated(2, 3));
-    EXPECT_FALSE(topo.areColocated(0, 2));
-    EXPECT_FALSE(topo.areColocated(1, 3));
-}
-
-/**
- * @test Fan-out transfers with mixed locality (single → global TP, cross-node)
- */
-TEST_F(Test__GlobalPPTopology, FanOutTransfers_MixedLocality)
-{
-    std::vector<RankLocality> localities = {
-        {0, "node-a", 0},
-        {1, "node-b", 1},
-        {2, "node-b", 1},
-    };
-
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = false;
-    s0.owning_rank = 0;
-    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
-    s0.devices = {GlobalDeviceAddress::cpu(0)};
-
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = true;
-    s1.participating_ranks = {1, 2};
-    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
-
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 3, localities);
-
-    // Fan-out: 2 transfers (rank 0 → rank 1, rank 0 → rank 2)
-    ASSERT_EQ(topo.transfers.size(), 2u);
-    for (const auto &t : topo.transfers)
+    const auto topology = boundPipeline(pipelineInventory({19, 3}));
+    for (int rank = 0; rank < 2; ++rank)
     {
-        EXPECT_EQ(t.sender_rank, 0);
-        EXPECT_EQ(t.locality, TransferLocality::INTER_NODE);
+        const auto plan = GlobalPPRankPlanBuilder::build(topology, rank);
+        for (const auto *action : plan.transferActions())
+        {
+            const auto &connection = action->physicalConnection(rank);
+            const auto original = std::find_if(topology.transfers.begin(), topology.transfers.end(),
+                [&](const auto &edge) { return edge.mpi_tag == action->mpi_tag; });
+            ASSERT_NE(original, topology.transfers.end());
+            const auto &expected = original->physicalConnection();
+            EXPECT_EQ(connection.sourceRank(), expected.sourceRank());
+            EXPECT_EQ(connection.destinationRank(), expected.destinationRank());
+            EXPECT_EQ(connection.sourceNode(), expected.sourceNode());
+            EXPECT_EQ(connection.destinationNode(), expected.destinationNode());
+            EXPECT_EQ(connection.locality(), original->isLocalHandoff()
+                ? RankConnectionLocality::SameRank : RankConnectionLocality::CrossNode);
+        }
+    }
+    EXPECT_EQ(topology.transfers.front().physicalConnection().sourceNode(), 19);
+    EXPECT_EQ(topology.transfers.front().physicalConnection().destinationNode(), 3);
+}
+
+/** @test Fan-out projects each edge separately; sharing a destination stage does not imply a node. */
+TEST_F(Test__GlobalPPTopology, FanOutRetainsMixedNodeMembership)
+{
+    auto entry = buildCanonical3Stage().stages.front();
+    entry.last_layer = 11;
+    auto tail = makeNodeLocalCpuTPStage(1, 12, 23, {1, 2}, false, true);
+    const auto topology = GlobalPPTopology::build({entry, tail}, 24, pipelineInventory({9, 9, 27}));
+    ASSERT_EQ(topology.transfers.size(), 2u);
+    EXPECT_EQ(topology.transfers[0].physicalConnection().locality(), RankConnectionLocality::SameNode);
+    EXPECT_EQ(topology.transfers[1].physicalConnection().locality(), RankConnectionLocality::CrossNode);
+}
+
+/** @test A geometry-only plan cannot silently authorize local or remote transport. */
+TEST_F(Test__GlobalPPTopology, StructuralPlansRejectPhysicalTransportQueries)
+{
+    const auto topology = buildCanonical3Stage();
+    for (const auto &edge : topology.transfers)
+    {
+        EXPECT_FALSE(edge.connection.has_value());
+        EXPECT_THROW((void)edge.physicalConnection(), std::logic_error);
+    }
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        const auto plan = GlobalPPRankPlanBuilder::build(topology, rank);
+        for (const auto *action : plan.transferActions())
+            EXPECT_THROW((void)action->physicalConnection(rank), std::logic_error);
     }
 }
 
-/**
- * @test Fan-out transfers with all ranks on same node → INTRA_NODE
- */
-TEST_F(Test__GlobalPPTopology, FanOutTransfers_IntraNodeLocality)
+/** @test Every discovery rank must be identified, including idle ranks and pipelines without edges. */
+TEST_F(Test__GlobalPPTopology, RejectsIncompletePhysicalMembership)
 {
-    std::vector<RankLocality> localities = {
-        {0, "same-host", 0},
-        {1, "same-host", 0},
-        {2, "same-host", 0},
-    };
+    auto inventory = pipelineInventory({4, 5, 6});
+    inventory.ranks.back().node_id = -1;
+    EXPECT_THROW(boundPipeline(inventory), std::invalid_argument);
+    inventory = pipelineInventory({4, 5});
+    inventory.ranks[1].rank = 0;
+    EXPECT_THROW(boundPipeline(inventory), std::invalid_argument);
+    inventory = pipelineInventory({4, 5});
+    inventory.ranks.pop_back();
+    EXPECT_THROW(boundPipeline(inventory), std::invalid_argument);
+    inventory = pipelineInventory({});
+    EXPECT_THROW(boundPipeline(inventory), std::invalid_argument);
 
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = false;
-    s0.owning_rank = 0;
-    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
-    s0.devices = {GlobalDeviceAddress::cpu(0)};
+    auto single = buildCanonical3Stage().stages.front();
+    single.last_layer = 23;
+    single.has_lm_head = true;
+    inventory = pipelineInventory({-1});
+    EXPECT_THROW(GlobalPPTopology::build({single}, 24, inventory), std::invalid_argument);
 
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = true;
-    s1.participating_ranks = {1, 2};
-    s1.per_rank_device = GlobalDeviceAddress::cpu(0);
+    inventory = pipelineInventory({0});
+    single.first_layer = -1;
+    EXPECT_THROW(GlobalPPTopology::build({single}, 24, inventory), std::invalid_argument);
+    EXPECT_THROW(GlobalPPTopology::build({single}, -1, inventory), std::invalid_argument);
+}
 
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 3, localities);
-
-    ASSERT_EQ(topo.transfers.size(), 2u);
-    for (const auto &t : topo.transfers)
+/** @test A previously bound edge/action cannot retain stale identity after endpoint edits. */
+TEST_F(Test__GlobalPPTopology, RejectsEditedPhysicalEndpoints)
+{
+    auto topology = boundPipeline(pipelineInventory({0, 1}));
+    auto edge = topology.transfers.front();
+    edge.receiver_rank = edge.sender_rank;
+    EXPECT_THROW((void)edge.physicalConnection(), std::logic_error);
+    edge = topology.transfers.front();
+    edge.kind = GlobalPPTransferKind::LOCAL_HANDOFF;
+    EXPECT_THROW((void)edge.physicalConnection(), std::logic_error);
+    auto plan = GlobalPPRankPlanBuilder::build(topology, 0);
+    for (const auto *original : plan.transferActions())
     {
-        EXPECT_EQ(t.locality, TransferLocality::INTRA_NODE);
+        auto action = *original;
+        EXPECT_THROW((void)action.physicalConnection(2), std::logic_error);
+        action.peer_rank = 2;
+        EXPECT_THROW((void)action.physicalConnection(0), std::logic_error);
+        action = *original;
+        action.direction = RankTransferAction::Direction::NONE;
+        EXPECT_THROW((void)action.physicalConnection(0), std::logic_error);
+        action.direction = static_cast<RankTransferAction::Direction>(-1);
+        EXPECT_THROW((void)action.physicalConnection(0), std::logic_error);
     }
 }
 
-/**
- * @test toString includes locality and node info when localities are present
- */
-TEST_F(Test__GlobalPPTopology, ToStringIncludesLocality)
+/** @test Diagnostics expose physical identities without rebuilding a hostname inventory. */
+TEST_F(Test__GlobalPPTopology, PhysicalConnectionDiagnostics)
 {
-    std::vector<RankLocality> localities = {
-        {0, "host-a", 0},
-        {1, "host-b", 1},
-    };
-
-    GlobalPPStageSpec s0;
-    s0.stage_id = 0;
-    s0.first_layer = 0;
-    s0.last_layer = 11;
-    s0.has_embedding = true;
-    s0.is_global_tp = false;
-    s0.owning_rank = 0;
-    s0.inner_mode = InnerParallelism::SINGLE_DEVICE;
-    s0.devices = {GlobalDeviceAddress::cpu(0)};
-
-    GlobalPPStageSpec s1;
-    s1.stage_id = 1;
-    s1.first_layer = 12;
-    s1.last_layer = 23;
-    s1.has_lm_head = true;
-    s1.is_global_tp = false;
-    s1.owning_rank = 1;
-    s1.inner_mode = InnerParallelism::SINGLE_DEVICE;
-    s1.devices = {GlobalDeviceAddress::cpu(0)};
-
-    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2, localities);
-
-    std::string str = topo.toString();
-    EXPECT_NE(str.find("INTER_NODE"), std::string::npos);
-    EXPECT_NE(str.find("host-a"), std::string::npos);
-    EXPECT_NE(str.find("host-b"), std::string::npos);
-}
-
-/**
- * @test transferLocalityName returns correct strings
- */
-TEST(Test__TransferLocality, TransferLocalityName)
-{
-    EXPECT_STREQ(transferLocalityName(TransferLocality::INTRA_NODE), "INTRA_NODE");
-    EXPECT_STREQ(transferLocalityName(TransferLocality::INTER_NODE), "INTER_NODE");
-    EXPECT_STREQ(transferLocalityName(TransferLocality::UNKNOWN), "UNKNOWN");
+    const auto topology = boundPipeline(pipelineInventory({19, 3}));
+    const auto description = topology.toString();
+    EXPECT_NE(description.find("CROSS_NODE"), std::string::npos);
+    EXPECT_NE(description.find("SAME_RANK"), std::string::npos);
+    EXPECT_NE(description.find("nodes=19->3"), std::string::npos);
+    EXPECT_EQ(description.find("same-label"), std::string::npos);
+    EXPECT_NE(topology.toTable().find("CROSS_NODE"), std::string::npos);
+    EXPECT_STREQ(pipelineConnectionName(RankConnectionLocality::SameNode), "SAME_NODE");
+    EXPECT_THROW(pipelineConnectionName(static_cast<RankConnectionLocality>(-1)), std::invalid_argument);
 }

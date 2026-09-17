@@ -4,7 +4,7 @@
  *
  * Tests verify:
  * 1. PreparedWeightStore owns embedding handles and can release them
- * 2. FP32 tensors are rejected for packed embedding preparation
+ * 2. FP32/FP16/BF16 tensors and nested slices reject packed preparation
  * 3. Q8_0 and Q4_0 tensors get proper EmbedQ8 repack + handle metadata
  * 4. Prepared refs and tensor lookups resolve existing handles without creating entries
  * 5. Different bindings get separate embedding entries
@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -21,14 +23,17 @@
 
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
+#include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/EmbedQ8Repack.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightStore.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/Tensors.h"
+#include "tensors/TensorSlice.h"
 #include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/EmbeddingVerifierFormats.h"
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
@@ -133,6 +138,56 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FP32TensorRejectsPackedPreparati
         std::runtime_error);
     PreparedWeightRef rejected{kModelId, binding.binding_id, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
     EXPECT_EQ(store.embeddingHandle(rejected), nullptr);
+}
+
+/** @test Wrapping storage cannot change its native embedding representation. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NestedSlicesPreserveEveryFormatCapability)
+{
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        // K=256 covers every superblock codebook, including Q8_K, which has
+        // no NativeVNNI metadata but does have complete native unpack support.
+        std::unique_ptr<TensorBase> tensor = format.create({3, 256}, 481);
+        for (int nesting = 0; nesting != 3; ++nesting)
+        {
+            SCOPED_TRACE(nesting);
+            EXPECT_EQ(IINT8Unpackable::fromTensor(tensor.get()) != nullptr,
+                      format.prepared_embed_q8);
+            if (!format.prepared_embed_q8)
+            {
+                for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+                {
+                    // Validation is device-free: no GPU is initialized. It
+                    // must not demand an EmbedQ8 handle for native storage.
+                    EmbeddingStage::Params params;
+                    params.device_id = device;
+                    params.embed_table = tensor.get();
+                    EmbeddingStage stage(params);
+                    std::string error;
+                    EXPECT_TRUE(stage.validatePreparedWeights(&error)) << error;
+                }
+                EXPECT_EQ(KernelFactory::prepareEmbeddingHandleLocal(
+                              tensor.get(), 256, DeviceId::cpu()), nullptr);
+                EXPECT_THROW(repackEmbeddingToQ8(tensor.get(), 256), std::runtime_error);
+                if (const auto *slice = dynamic_cast<const TensorSlice *>(tensor.get()))
+                {
+                    std::array<int8_t, 32> output;
+                    output.fill(91);
+                    EXPECT_THROW(slice->unpack_block_to_int8(0, 0, output.data()),
+                                 std::logic_error);
+                    EXPECT_TRUE(std::all_of(output.begin(), output.end(),
+                                            [](int8_t value) { return value == 91; }));
+                }
+            }
+            else
+            {
+                auto packed = repackEmbeddingToQ8(tensor.get(), 256);
+                EXPECT_GT(packed.data.size(), 0u);
+            }
+            tensor = std::make_unique<TensorSlice>(std::move(tensor), SliceMetadata{});
+        }
+    }
 }
 
 // ============================================================================

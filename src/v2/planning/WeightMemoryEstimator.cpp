@@ -1,7 +1,6 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
-#include "config/GDNHeadAssignment.h"
-#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
+#include "planning/WeightShardGeometry.h"
 #include "kernels/common/EmbedQ8Block.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -107,53 +106,6 @@ namespace llaminar2
                    name.ends_with(".ffn_down_exps.weight");
         }
 
-        /** @brief Scale an integral tensor measure by an exact expert fraction. */
-        size_t selectedExpertFraction(
-            size_t complete,
-            int selected,
-            int total)
-        {
-            if (selected == 0 || complete == 0)
-                return 0;
-            if (selected == total)
-                return complete;
-
-            const size_t selected_size = static_cast<size_t>(selected);
-            const size_t total_size = static_cast<size_t>(total);
-            const size_t complete_quotient = complete / total_size;
-            const size_t complete_remainder = complete % total_size;
-            if (complete_quotient >
-                std::numeric_limits<size_t>::max() / selected_size)
-                throw std::overflow_error(
-                    "Routed-expert memory fraction overflows size_t");
-            const size_t quotient_bytes =
-                complete_quotient * selected_size;
-            if (complete_remainder >
-                (std::numeric_limits<size_t>::max() - total_size + 1u) /
-                    selected_size)
-            {
-                throw std::overflow_error(
-                    "Routed-expert memory remainder overflows size_t");
-            }
-            const size_t remainder_bytes =
-                (complete_remainder * selected_size + total_size - 1u) /
-                total_size;
-            if (quotient_bytes >
-                std::numeric_limits<size_t>::max() - remainder_bytes)
-            {
-                throw std::overflow_error(
-                    "Routed-expert memory total overflows size_t");
-            }
-
-            /*
-             * Expert parents are expert-major GGUF tensors, so their byte and
-             * element counts are normally exactly divisible. Round upward for
-             * malformed or future padded layouts: admission may be
-             * conservative, but it must never undercount a resident slice.
-             */
-            return quotient_bytes + remainder_bytes;
-        }
-
         bool isQuantizedFormat(const std::string &quant_type)
         {
             return quant_type != "F32" &&
@@ -182,24 +134,6 @@ namespace llaminar2
             return device.is_gpu()
                        ? alignUp(bytes, kWeightPoolAlignment)
                        : bytes;
-        }
-
-        /** @brief Return one equal TP shard's exact row count. */
-        size_t equalShardRows(
-            size_t rows,
-            int shard_index,
-            int total_shards)
-        {
-            if (total_shards <= 1)
-                return rows;
-            if (shard_index < 0 || shard_index >= total_shards)
-            {
-                throw std::invalid_argument(
-                    "Weight memory estimator received an invalid TP shard index");
-            }
-            const size_t degree = static_cast<size_t>(total_shards);
-            const size_t index = static_cast<size_t>(shard_index);
-            return rows / degree + (index < rows % degree ? 1u : 0u);
         }
 
         size_t exactGpuPackedMatrixBytes(
@@ -271,319 +205,6 @@ namespace llaminar2
             return quotient_bytes + remainder_bytes;
         }
 
-        /** @brief One typed interval in a model-owned logical dimension. */
-        struct LogicalShardInterval
-        {
-            size_t start = 0u;
-            size_t count = 0u;
-            size_t total = 0u;
-        };
-
-        /** @brief Divide one semantic dimension while keeping remainders whole. */
-        LogicalShardInterval equalLogicalShardInterval(
-            size_t total,
-            int shard_index,
-            int total_shards,
-            const std::string &tensor_name)
-        {
-            if (total == 0u || total_shards <= 0 || shard_index < 0 ||
-                shard_index >= total_shards)
-            {
-                throw std::invalid_argument(
-                    "Weight memory estimator cannot divide the semantic dimension for " +
-                    tensor_name);
-            }
-            const size_t degree = static_cast<size_t>(total_shards);
-            const size_t index = static_cast<size_t>(shard_index);
-            const size_t quotient = total / degree;
-            const size_t remainder = total % degree;
-            const size_t count = quotient + (index < remainder ? 1u : 0u);
-            if (count == 0u)
-            {
-                throw std::invalid_argument(
-                    "Tensor-parallel degree exceeds the semantic dimension for " +
-                    tensor_name);
-            }
-            return {
-                .start = index * quotient + std::min(index, remainder),
-                .count = count,
-                .total = total,
-            };
-        }
-
-        /**
-         * @brief Resolve the assignment interval named by the schema.
-         *
-         * This function translates only typed dimension coordinates. Tensor
-         * names and sharding policy remain owned by WeightShardingConfig.
-         */
-        LogicalShardInterval logicalShardInterval(
-            WeightDimensionType dimension,
-            const ModelMemoryProfile &profile,
-            const DeviceShardingAssignment &assignment,
-            const std::string &tensor_name)
-        {
-            const auto checked = [&tensor_name](
-                                     int start,
-                                     int count,
-                                     int total,
-                                     const char *dimension_name)
-            {
-                if (total <= 0 || start < 0 || count <= 0 ||
-                    start > total - count)
-                {
-                    throw std::invalid_argument(
-                        "Weight memory estimator received an invalid " +
-                        std::string(dimension_name) + " assignment for " +
-                        tensor_name);
-                }
-                return LogicalShardInterval{
-                    .start = static_cast<size_t>(start),
-                    .count = static_cast<size_t>(count),
-                    .total = static_cast<size_t>(total),
-                };
-            };
-
-            switch (dimension)
-            {
-            case WeightDimensionType::Heads:
-            case WeightDimensionType::ProportionalHeads:
-            case WeightDimensionType::FusedQKVHeads:
-                return checked(
-                    assignment.head_start,
-                    assignment.head_count,
-                    profile.n_heads,
-                    "query-head");
-            case WeightDimensionType::KVHeads:
-                return checked(
-                    assignment.kv_head_start,
-                    assignment.kv_head_count,
-                    profile.n_kv_heads,
-                    "KV-head");
-            case WeightDimensionType::FFNHidden:
-                return checked(
-                    assignment.d_ff_start,
-                    assignment.d_ff_count,
-                    profile.d_ff,
-                    "FFN");
-            case WeightDimensionType::Vocab:
-                return checked(
-                    assignment.vocab_start,
-                    assignment.vocab_count,
-                    profile.vocab_size,
-                    "vocabulary");
-            case WeightDimensionType::Bias1D:
-            case WeightDimensionType::None:
-                break;
-            }
-            throw std::invalid_argument(
-                "Sharded weight has no typed slice dimension in the model schema: " +
-                tensor_name);
-        }
-
-        /** @brief Resolve an equal cross-rank interval in a schema-owned dimension. */
-        LogicalShardInterval equalSchemaInterval(
-            WeightDimensionType dimension,
-            const ModelMemoryProfile &profile,
-            int shard_index,
-            int total_shards,
-            const std::string &tensor_name)
-        {
-            size_t total = 0u;
-            switch (dimension)
-            {
-            case WeightDimensionType::Heads:
-            case WeightDimensionType::ProportionalHeads:
-            case WeightDimensionType::FusedQKVHeads:
-                total = static_cast<size_t>(profile.n_heads);
-                break;
-            case WeightDimensionType::KVHeads:
-                total = static_cast<size_t>(profile.n_kv_heads);
-                break;
-            case WeightDimensionType::FFNHidden:
-                total = static_cast<size_t>(profile.d_ff);
-                break;
-            case WeightDimensionType::Vocab:
-                total = static_cast<size_t>(profile.vocab_size);
-                break;
-            case WeightDimensionType::Bias1D:
-            case WeightDimensionType::None:
-                throw std::invalid_argument(
-                    "Sharded weight has no typed slice dimension in the model schema: " +
-                    tensor_name);
-            }
-            return equalLogicalShardInterval(
-                total, shard_index, total_shards, tensor_name);
-        }
-
-        /** @brief Apply a logical interval to a flat element count exactly as a slice boundary. */
-        size_t intervalElementCount(
-            size_t complete_elements,
-            LogicalShardInterval interval)
-        {
-            if (interval.total == 0u ||
-                interval.start > interval.total - interval.count)
-            {
-                throw std::invalid_argument(
-                    "Weight shard interval is invalid");
-            }
-            const size_t begin =
-                complete_elements * interval.start / interval.total;
-            const size_t end =
-                complete_elements * (interval.start + interval.count) /
-                interval.total;
-            return end - begin;
-        }
-
-        /**
-         * @brief Resolve a fused-QKV participant's exact element count.
-         *
-         * GDN uses modulo-linked key/value ownership while full attention uses
-         * independent query and KV ranges. Both are already encoded in the
-         * same typed model geometry and assignment consumed by weight loading.
-         */
-        size_t fusedQKVElementCount(
-            const TensorSizeInfo &tensor,
-            const ModelMemoryProfile &profile,
-            const DeviceShardingAssignment &assignment)
-        {
-            if (tensor.K == 0u || tensor.elements % tensor.K != 0u)
-            {
-                throw std::invalid_argument(
-                    "Fused-QKV tensor lacks an integral matrix shape: " +
-                    tensor.name);
-            }
-            const size_t rows = tensor.elements / tensor.K;
-            if (profile.gdn_group_count > 0 &&
-                profile.gdn_time_step_rank > 0 &&
-                profile.gdn_state_size > 0)
-            {
-                const size_t expected_gdn_rows =
-                    static_cast<size_t>(
-                        2 * profile.gdn_group_count +
-                        profile.gdn_time_step_rank) *
-                    static_cast<size_t>(profile.gdn_state_size);
-                if (rows == expected_gdn_rows)
-                {
-                    const auto gdn = GDNHeadAssignment::fromPartition(
-                        profile.gdn_group_count,
-                        profile.gdn_time_step_rank,
-                        assignment.head_start,
-                        assignment.head_count,
-                        profile.n_heads);
-                    return gdn.localFusedRows(profile.gdn_state_size) *
-                           tensor.K;
-                }
-            }
-
-            if (profile.n_heads > 0 && profile.n_kv_heads > 0 &&
-                profile.head_dim > 0)
-            {
-                const size_t expected_attention_rows =
-                    static_cast<size_t>(profile.n_heads) *
-                        static_cast<size_t>(profile.head_dim) +
-                    2u * static_cast<size_t>(profile.n_kv_heads) *
-                        static_cast<size_t>(profile.head_dim);
-                if (rows == expected_attention_rows)
-                {
-                    const size_t local_rows =
-                        static_cast<size_t>(assignment.head_count) *
-                            static_cast<size_t>(profile.head_dim) +
-                        2u * static_cast<size_t>(assignment.kv_head_count) *
-                            static_cast<size_t>(profile.head_dim);
-                    return local_rows * tensor.K;
-                }
-            }
-
-            return intervalElementCount(
-                tensor.elements,
-                logicalShardInterval(
-                    WeightDimensionType::FusedQKVHeads,
-                    profile,
-                    assignment,
-                    tensor.name));
-        }
-
-        /** @brief Resolve the exact participant-local logical element count. */
-        size_t tensorParallelElementCount(
-            const TensorSizeInfo &tensor,
-            const ModelMemoryProfile &profile,
-            const WeightShardingConfig &sharding,
-            int shard_index,
-            int total_shards,
-            const std::optional<DeviceShardingAssignment> &assignment)
-        {
-            // Metadata-only planner fixtures can carry zero-byte layer markers
-            // to identify hybrid layer kinds. They have no physical weight
-            // allocation and therefore no shard geometry to resolve.
-            if (tensor.elements == 0u)
-                return 0u;
-            const auto [mode, dimension] =
-                sharding.getModeAndDimension(tensor.name);
-            if (mode == WeightShardingMode::Replicate)
-                return tensor.elements;
-
-            if (mode == WeightShardingMode::ExpertIdApportioned)
-            {
-                if (profile.expert_count <= 0)
-                {
-                    throw std::invalid_argument(
-                        "Expert-id sharded weight requires model expert_count metadata: " +
-                        tensor.name);
-                }
-                const size_t local_experts = equalShardRows(
-                    static_cast<size_t>(profile.expert_count),
-                    shard_index,
-                    total_shards);
-                return selectedExpertFraction(
-                    tensor.elements,
-                    static_cast<int>(local_experts),
-                    profile.expert_count);
-            }
-
-            if (!assignment.has_value())
-            {
-                /* Divide the schema's semantic axis, never the flat byte
-                 * count. This keeps vocabulary rows, heads, and FFN blocks
-                 * indivisible when a uniform cross-rank topology owns no
-                 * DeviceShardingAssignment object. */
-                const LogicalShardInterval interval = equalSchemaInterval(
-                    dimension,
-                    profile,
-                    shard_index,
-                    total_shards,
-                    tensor.name);
-                if (dimension == WeightDimensionType::FusedQKVHeads)
-                {
-                    const LogicalShardInterval kv_interval =
-                        equalSchemaInterval(
-                            WeightDimensionType::KVHeads,
-                            profile,
-                            shard_index,
-                            total_shards,
-                            tensor.name);
-                    DeviceShardingAssignment uniform;
-                    uniform.device = DeviceId::cpu();
-                    uniform.local_rank = shard_index;
-                    uniform.head_start = static_cast<int>(interval.start);
-                    uniform.head_count = static_cast<int>(interval.count);
-                    uniform.kv_head_start =
-                        static_cast<int>(kv_interval.start);
-                    uniform.kv_head_count =
-                        static_cast<int>(kv_interval.count);
-                    return fusedQKVElementCount(
-                        tensor, profile, uniform);
-                }
-                return intervalElementCount(tensor.elements, interval);
-            }
-
-            if (dimension == WeightDimensionType::FusedQKVHeads)
-                return fusedQKVElementCount(tensor, profile, *assignment);
-            return intervalElementCount(
-                tensor.elements,
-                logicalShardInterval(
-                    dimension, profile, *assignment, tensor.name));
-        }
     } // anonymous namespace
 
     DeviceWeightResidency::DeviceWeightResidency(
@@ -737,7 +358,8 @@ namespace llaminar2
         int last_layer,
         const DeviceWeightResidency &residency,
         const std::optional<DeviceShardingAssignment>
-            &tensor_parallel_assignment)
+            &tensor_parallel_assignment,
+        WeightComponentScope components)
     {
         if (total_shards <= 0 || shard_index < 0 ||
             shard_index >= total_shards)
@@ -773,16 +395,24 @@ namespace llaminar2
             }
         }
 
-        WeightEstimate est;
-        std::optional<WeightShardingConfig> sharding;
-        if (total_shards > 1)
+        bool owns_embedding = false;
+        bool owns_terminal = false;
+        switch (components)
         {
-            /* SchemaFactoryRegistry is the sole tensor-name policy authority.
-             * Unsupported TP architecture is a configuration error, not a
-             * reason to guess from substrings and silently mis-admit memory. */
-            sharding = SchemaFactoryRegistry::getWeightShardingConfig(
-                profile.architecture);
+        case WeightComponentScope::EmbeddingAndTerminal:
+            owns_embedding = owns_terminal = true;
+            break;
+        case WeightComponentScope::Embedding: owns_embedding = true; break;
+        case WeightComponentScope::Terminal: owns_terminal = true; break;
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: break;
+        default:
+            throw std::invalid_argument("Weight estimate has an invalid global component scope");
         }
+
+        WeightEstimate est;
+        const WeightShardGeometryResolver geometry_resolver(
+            profile, device, shard_index, total_shards, tensor_parallel_assignment);
         const bool has_explicit_lm_head = std::any_of(
             profile.tensors.begin(),
             profile.tensors.end(),
@@ -791,21 +421,22 @@ namespace llaminar2
                 return isLMHeadTensor(tensor.name);
             });
 
-        for (const auto &t : profile.tensors)
+        // Each call describes one semantic runtime use. A tied vocabulary has
+        // one GGUF source but distinct lookup and GEMM representations on GPU.
+        // Resolving its output alias through the normal schema also preserves
+        // head sharding when it differs from embedding sharding.
+        const auto accumulate = [&](const TensorSizeInfo &t, bool count_native)
         {
             // Filter by PP layer range
             if (t.layer_index >= 0)
             {
                 if (t.layer_index < first_layer || t.layer_index > last_layer)
-                    continue;
+                    return;
             }
-            // Non-layer tensors (embedding, lm_head, final_norm) are included on all PP stages
-            // In a real PP setup you'd filter embedding to first stage and lm_head to last,
-            // but for estimation this is conservative (slight overcount).
 
             const bool routed_expert_tensor = isRoutedExpertTensor(t.name);
             if (!routed_expert_tensor && !residency.includesNonRoutedWeights())
-                continue;
+                return;
 
             int selected_routed_experts = profile.expert_count;
             if (routed_expert_tensor && residency.selectsRoutedExperts())
@@ -818,31 +449,19 @@ namespace llaminar2
                 selected_routed_experts =
                     residency.selectedRoutedExpertsForLayer(t.layer_index);
                 if (selected_routed_experts == 0)
-                    continue;
+                    return;
             }
 
-            size_t selected_elements =
+            const auto geometry = geometry_resolver.resolve(t,
                 routed_expert_tensor && residency.selectsRoutedExperts()
-                    ? selectedExpertFraction(
-                          t.elements,
-                          selected_routed_experts,
-                          profile.expert_count)
-                    : t.elements;
-            if (total_shards > 1 &&
-                !(routed_expert_tensor && residency.selectsRoutedExperts()))
-            {
-                selected_elements = tensorParallelElementCount(
-                    t,
-                    profile,
-                    *sharding,
-                    shard_index,
-                    total_shards,
-                    tensor_parallel_assignment);
-            }
+                    ? std::optional<size_t>(static_cast<size_t>(selected_routed_experts))
+                    : std::nullopt);
+            const size_t selected_elements = geometry.elements();
             const size_t native = selectedElementBytes(
                 t.native_bytes, selected_elements, t.elements);
 
-            est.native_bytes += native;
+            if (count_native)
+                est.native_bytes += native;
 
             // Compute the exact runtime representation selected by loading.
             size_t device_size;
@@ -890,28 +509,6 @@ namespace llaminar2
                             profile.d_model);
                     est.prepared_embedding_bytes += device_size;
 
-                    if (!has_explicit_lm_head)
-                    {
-                        const auto *format =
-                            native_vnni_formats::forQuantType(t.quant_type);
-                        const size_t tied_lm_head_bytes =
-                            format
-                                ? exactGpuPackedMatrixBytes(
-                                      local_rows,
-                                      static_cast<size_t>(profile.d_model),
-                                      *format)
-                                : static_cast<size_t>(
-                                      static_cast<float>(
-                                          local_rows *
-                                          static_cast<size_t>(profile.d_model)) *
-                                      getGPUPackedBytesPerWeight(
-                                          t.quant_type,
-                                          static_cast<size_t>(
-                                              profile.d_model)));
-                        device_size += tied_lm_head_bytes;
-                        est.lm_head_bytes += tied_lm_head_bytes;
-                        est.tied_lm_head_bytes += tied_lm_head_bytes;
-                    }
                 }
                 else
                 {
@@ -919,9 +516,15 @@ namespace llaminar2
                             native_vnni_formats::forQuantType(t.quant_type);
                         format && t.K > 0)
                     {
-                        const size_t rows = selected_elements / t.K;
-                        device_size =
-                            exactGpuPackedMatrixBytes(rows, t.K, *format);
+                        // Packing is a function of N and K, not merely N*K.
+                        // In particular an input shard keeps every output row;
+                        // reinterpreting it as fewer full-K rows can underprice
+                        // row/block padding on both CUDA and ROCm.
+                        const auto &matrix = geometry.matrix();
+                        const size_t rows = matrix
+                            ? matrix->rows * matrix->instances : selected_elements / t.K;
+                        const size_t columns = matrix ? matrix->columns : t.K;
+                        device_size = exactGpuPackedMatrixBytes(rows, columns, *format);
                     }
                     else
                     {
@@ -940,9 +543,51 @@ namespace llaminar2
                 device_size = static_cast<size_t>(
                     static_cast<float>(selected_elements) * bytes_per_weight);
             }
+            if (device.is_gpu() && isEmbeddingTensor(t.name) &&
+                !isQuantizedFormat(t.quant_type))
+            {
+                // "Prepared" describes the graph-ready lookup view, not only
+                // the EmbedQ8 representation. Native floating lookup reads a
+                // raw device allocation prepared by WeightManager. Publish its
+                // existing bytes as a component so a mirrored vocabulary view
+                // is admitted beside the primary shard. This is a subset of
+                // device_bytes, never a second primary allocation charge.
+                est.prepared_embedding_bytes += device_size;
+            }
             if (isLMHeadTensor(t.name))
                 est.lm_head_bytes += device_size;
             est.device_bytes += device_size;
+        };
+
+        for (const auto &t : profile.tensors)
+        {
+            if (t.layer_index < 0 && components == WeightComponentScope::LayersOnly)
+                continue;
+            if (isEmbeddingTensor(t.name))
+            {
+                if (owns_embedding)
+                    accumulate(t, true);
+                if (owns_terminal && !has_explicit_lm_head && residency.includesNonRoutedWeights())
+                {
+                    auto head = t;
+                    head.name = "output.weight";
+                    const auto before = est.device_bytes;
+                    const auto previous_head = est.lm_head_bytes;
+                    accumulate(head, !owns_embedding);
+                    const auto tied_bytes = est.lm_head_bytes - previous_head;
+                    est.tied_lm_head_bytes += tied_bytes;
+                    // CPU's existing prepared-source contract shares a tied
+                    // tensor within the same participant. A GPU has a separate
+                    // GEMM pool entry, including for FP32/FP16/BF16 sources.
+                    if (device.is_cpu() && owns_embedding)
+                        est.device_bytes = before;
+                }
+                continue;
+            }
+            if (!owns_terminal &&
+                (isLMHeadTensor(t.name) || inferWeightRole(t.name) == WeightRole::OutputNorm))
+                continue;
+            accumulate(t, true);
         }
 
         return est;

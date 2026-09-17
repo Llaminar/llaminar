@@ -13,8 +13,9 @@
  *                                   with an injected IGlobalTPContext
  *   - createTestableInferenceRunner  for model-light global/NodeTP tests
  *
- * Phase 4: each returned StageRunnerEntry owns a StageWeightContext with a
- * stage-local PreparedWeightStore threaded into concrete runner creation.
+ * Each stage retains its exact layer scope and the model-owned additive
+ * PreparedWeightStore. Runtime policies use the same canonical projection as
+ * ordinary inference, and a local TP runner owns exactly one TP context.
  *
  * @author David Sanftenberg
  * @date May 2026
@@ -54,9 +55,12 @@ namespace llaminar2
         /// MPI context (optional; nullptr for unit tests without MPI)
         std::shared_ptr<IMPIContext> mpi_ctx;
 
-        /// Base runner config (max_seq_len, activation_precision, etc.).
-        /// The factory patches pp_stage_config and tp_ctx before forwarding.
-        InferenceRunnerConfig runner_config;
+        /// Canonical policy, projected through the same factories as ordinary
+        /// execution. A stage must not invent its own subset of runtime fields.
+        RuntimeConfig runtime;
+
+        /// One model-owned additive binding namespace, shared by every stage.
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
         /// Registry of domain communicators for global TP stages.
         /// May be nullptr; if so, global TP stage building will throw.
@@ -70,8 +74,8 @@ namespace llaminar2
     /**
      * @brief Factory for per-domain pipeline stage runners.
      *
-     * All methods are static.  Callers hold the returned StageRunnerEntry which
-     * owns both the runner and any context lifetime (local_tp_ctx, global_tp_ctx).
+     * All methods are static. Callers hold the returned StageRunnerEntry; its
+     * runner owns local TP, while the entry retains a borrowed global TP owner.
      */
     class StageRunnerFactory
     {
@@ -101,18 +105,21 @@ namespace llaminar2
         // Internal dispatch helpers
         // -------------------------------------------------------------------------
 
+        /** @brief Bind one stage's policy, layer range and shared weight authority. */
         static StageRunnerEntry buildSingleDevice(
             const GlobalPPStageSpec &stage,
             const RankStageAction &action,
             const StageBuildContext &ctx,
             const FactoryPPStageConfig &pp_cfg);
 
+        /** @brief Build a local stage whose rank runner owns its sole TP context. */
         static StageRunnerEntry buildLocalTP(
             const GlobalPPStageSpec &stage,
             const RankStageAction &action,
             const StageBuildContext &ctx,
             const FactoryPPStageConfig &pp_cfg);
 
+        /** @brief Bind the registry's exact cross-rank TP context to a stage. */
         static StageRunnerEntry buildGlobalTP(
             const GlobalPPStageSpec &stage,
             const RankStageAction &action,

@@ -20,6 +20,7 @@
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "HipBLASGemmKernel.h"
+#include "ROCmFloatingPointGemmWorkspaceContract.h"
 #include "backends/ComputeBackend.h"   // DeviceManager
 #include "backends/DeviceId.h"         // DeviceId for cache lookup
 #include "kernels/rocm/ROCmKernelBase.h"
@@ -309,6 +310,12 @@ namespace llaminar2
                 return false;
             }
 
+            // Partition scopes cannot silently fall through to a different
+            // arithmetic implementation when a caller supplies another epilogue.
+            const bool fixed_columns = FloatingOutputPartitionScope::requiresFixedColumns(*this, n);
+            if (fixed_columns && (!transpose_B || alpha != 1.f || beta != 0.f || bias))
+                throw std::invalid_argument("Floating replicated output requires the fixed FP32 projection contract");
+
             // Get device pointers (caller must have data on GPU)
             const float *d_A = static_cast<const float *>(A->gpu_data_ptr());
             float *d_C = static_cast<float *>(C->gpu_data_ptr());
@@ -462,9 +469,10 @@ namespace llaminar2
             }
 
             /*
-             * Qwen3.6 GDN alpha/beta projections are small-output FP32 GEMMs
-             * (N<=64).  Use the local fixed-tree kernel for both decode and
-             * prefill so their reduction order is stable and graph-capturable.
+             * Serial decode, mirrored heads, and narrow GDN projections use
+             * the same fixed per-column tree as grouped verifier publication.
+             * Physical N must never select a different K reduction for a
+             * replicated vocabulary head or for its serial shard oracle.
              * If this explicit route is requested, missing stream/workspace is
              * a hard failure instead of a quiet hipBLAS detour.
              */
@@ -476,7 +484,7 @@ namespace llaminar2
                 alpha == 1.0f &&
                 beta == 0.0f &&
                 m > 0 &&
-                n > 0 && n <= 64 &&
+                n > 0 && (n <= 64 || m == 1 || fixed_columns) &&
                 k > 0;
 
             const bool can_use_small_n_projection =
@@ -710,7 +718,12 @@ namespace llaminar2
              * which makes request padding and grouped publication byte-stable
              * without giving up one-launch grouped execution.
              */
-            if (precision_ != Precision::FP32)
+            const bool fixed_columns = std::any_of(projections.begin(), projections.end(),
+                [](const auto &projection) {
+                    return projection.kernel && FloatingOutputPartitionScope::requiresFixedColumns(
+                        *projection.kernel, projection.n);
+                });
+            if (precision_ != Precision::FP32 || m == 1 || fixed_columns)
             {
                 return multiply_fused_verifier_rows_decode_equivalent(
                     input, projections, m, k, mpi_ctx, workspace);
@@ -949,15 +962,10 @@ namespace llaminar2
                           << m);
                 return false;
             }
-            if (precision_ == Precision::FP32)
-            {
-                return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
-            }
-
             (void)mpi_ctx;
             if (!input || input->native_type() != TensorType::FP32 || projections.empty() || k <= 0)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection rejected: input="
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection rejected: input="
                           << (input != nullptr)
                           << " input_type=" << (input ? static_cast<int>(input->native_type()) : -1)
                           << " projections=" << projections.size()
@@ -966,7 +974,7 @@ namespace llaminar2
             }
             if (!gpu_stream_)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection requires an explicit ROCm stream");
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection requires an explicit ROCm stream");
                 return false;
             }
 
@@ -982,12 +990,13 @@ namespace llaminar2
             const float *d_input = static_cast<const float *>(input->gpu_data_ptr());
             if (!d_input)
             {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection input has no ROCm device data");
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection input has no ROCm device data");
                 return false;
             }
 
             const int weight_dtype = (precision_ == Precision::BF16) ? 1 : 0;
-            const char *dtype_tag = (precision_ == Precision::BF16) ? "bf16" : "fp16";
+            const char *dtype_tag = precision_ == Precision::FP32 ? "fp32" :
+                (precision_ == Precision::BF16 ? "bf16" : "fp16");
             std::vector<bool> completed(projections.size(), false);
 
             for (size_t seed_index = 0; seed_index < projections.size(); ++seed_index)
@@ -998,13 +1007,13 @@ namespace llaminar2
                 const auto &seed = projections[seed_index];
                 if (!seed.kernel || !seed.output || seed.bias || seed.n <= 0)
                 {
-                    LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection invalid seed at "
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection invalid seed at "
                               << seed_index);
                     return false;
                 }
                 if (seed.output->native_type() != TensorType::FP32 || seed.output->isMapped())
                 {
-                    LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection output must be unmapped FP32 at "
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection output must be unmapped FP32 at "
                               << seed_index);
                     return false;
                 }
@@ -1045,7 +1054,7 @@ namespace llaminar2
                             projection_kernel->N_ != static_cast<size_t>(projection.n) ||
                             !projection_kernel->d_weights_)
                         {
-                            LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection incompatible kernel at "
+                            LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection incompatible kernel at "
                                       << projection_index);
                             return false;
                         }
@@ -1053,7 +1062,7 @@ namespace llaminar2
                         float *d_output = static_cast<float *>(projection.output->gpu_data_ptr());
                         if (!d_output)
                         {
-                            LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection output has no ROCm data at "
+                            LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection output has no ROCm data at "
                                       << projection_index);
                             return false;
                         }
@@ -1064,7 +1073,14 @@ namespace llaminar2
                     if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
                         return false;
 
-                    if (!rocmFp32x16_batched_projection(
+                    // Both storage families share serial decode's fixed tree.
+                    // Wide FP32 verifier rows must not re-enter generic BLAS.
+                    const bool launched = precision_ == Precision::FP32
+                        ? rocmFp32_small_n_batched_projection(
+                            d_batch_A_ptrs_, d_batch_B_ptrs_, d_batch_C_ptrs_,
+                            m, seed.n, k, static_cast<int>(group_count),
+                            rocm_device_id_, gpu_stream_, VerifierKernelModeScope::rowsFor(m))
+                        : rocmFp32x16_batched_projection(
                             d_batch_A_ptrs_,
                             d_batch_B_ptrs_,
                             d_batch_C_ptrs_,
@@ -1075,9 +1091,10 @@ namespace llaminar2
                             weight_dtype,
                             rocm_device_id_,
                             gpu_stream_,
-                    VerifierKernelModeScope::rowsFor(m)))
+                            VerifierKernelModeScope::rowsFor(m));
+                    if (!launched)
                     {
-                        LOG_ERROR("[ROCmFloatingPointGemmKernel] FP32x16 grouped verifier projection kernel failed"
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel] floating grouped verifier projection kernel failed"
                                   << " dtype=" << dtype_tag
                                   << " M=" << m
                                   << " N=" << seed.n
@@ -1089,11 +1106,12 @@ namespace llaminar2
                     for (size_t local = 0; local < group_count; ++local)
                         completed[group_indices[group_offset + local]] = true;
 
-                if (PerfStatsCollector::isDomainEnabled("kernel"))
+                    if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_fp32x16_grouped_verifier_projection_calls",
+                            precision_ == Precision::FP32 ? "rocm_fp32_small_n_batched_projection_calls"
+                                                        : "rocm_fp32x16_grouped_verifier_projection_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),
@@ -1103,7 +1121,9 @@ namespace llaminar2
                                 {"n", std::to_string(seed.n)},
                                 {"k", std::to_string(k)},
                                 {"projections", std::to_string(group_count)},
-                                {"route", "fixed_order_fp32x16_batched_projection"}});
+                                {"batch", std::to_string(group_count)},
+                                {"route", precision_ == Precision::FP32 ? "fixed_order_fp32_batched_projection"
+                                                                        : "fixed_order_fp32x16_batched_projection"}});
                     }
 
                     group_offset += group_count;
@@ -1363,19 +1383,9 @@ namespace llaminar2
         // =====================================================================
 
         WorkspaceRequirements ROCmFloatingPointGemmKernel::getWorkspaceRequirements(
-            int m, int n, int k) const
+            int, int, int) const
         {
-            // The adapter must publish the complete low-level BOM, not merely
-            // its pointer tables. The memory authority admits/materializes it.
-            WorkspaceRequirements reqs = hipblas_kernel_->getWorkspaceRequirements(m, n, k);
-
-            const size_t pointer_array_bytes =
-                floating_gemm_abi::kMaxBatchedProjections *
-                sizeof(float *);
-            reqs.buffers.push_back({batchAPtrsBufferName(), pointer_array_bytes, 256, true});
-            reqs.buffers.push_back({batchBPtrsBufferName(), pointer_array_bytes, 256, true});
-            reqs.buffers.push_back({batchCPtrsBufferName(), pointer_array_bytes, 256, true});
-            return reqs;
+            return floating_gemm_workspace::projectionRequirements();
         }
 
         void ROCmFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)

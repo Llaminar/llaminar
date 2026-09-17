@@ -6,6 +6,8 @@
  * standard matrix and that every generated policy reaches the production
  * configuration without parsing its GoogleTest name.  They intentionally load
  * no model and touch no accelerator; real-weight campaigns certify execution.
+ * Phase-specific numerical allowances must survive expansion without changing
+ * the ordinary decode or recursively conditioned MTP logit budgets.
  */
 
 #include "integration/parity/ModelParityDefinition.h"
@@ -1176,6 +1178,61 @@ namespace llaminar2::test::parity
             0.234f);
     }
 
+    TEST(ModelParityDefinition, PrefillKLOverrideDoesNotChangeDecodeOrMTPBudgets)
+    {
+        ParityConfig config;
+        config.kl_threshold = 0.005f;
+        config.mtp_kl_threshold = 0.004f;
+        EXPECT_FLOAT_EQ(config.prefillKLThreshold(), 0.005f);
+
+        config.prefill_kl_threshold = 0.008f;
+        EXPECT_FLOAT_EQ(config.prefillKLThreshold(), 0.008f);
+        EXPECT_FLOAT_EQ(config.kl_threshold, 0.005f);
+        EXPECT_FLOAT_EQ(config.mtp_kl_threshold.value_or(config.kl_threshold), 0.004f);
+        config.mtp_kl_threshold.reset();
+        EXPECT_FLOAT_EQ(config.mtp_kl_threshold.value_or(config.kl_threshold), 0.005f);
+
+        config.prefill_kl_threshold.reset();
+        config.kl_threshold = 0.003f;
+        EXPECT_FLOAT_EQ(config.prefillKLThreshold(), 0.003f);
+    }
+
+    TEST(ModelParityDefinition, PrefillAllowanceIsConfinedToItsDeclaredKVPrecision)
+    {
+        auto definition = makeDefinition(makeSingleDeviceTopology());
+        definition.precisions.kv_cache = {
+            KVCachePrecision::FP16, KVCachePrecision::Q8_1, KVCachePrecision::TQ};
+        definition.thresholds.kl_threshold = 0.005f;
+        definition.thresholds.mtp_kl_threshold = 0.004f;
+        definition.thresholds.min_top5_accuracy = 95.0f;
+        auto approved = definition.thresholds;
+        approved.prefill_kl_threshold = 0.008f;
+        approved.min_top5_accuracy = 80.0f;
+        definition.precisions.threshold_overrides = {{
+            .activation = ActivationPrecision::FP32,
+            .kv_cache = KVCachePrecision::TQ,
+            .thresholds = approved,
+        }};
+
+        const auto cases = expandModelParityDefinition(definition);
+        ASSERT_EQ(cases.size(), 3u);
+        for (const auto &test_case : cases)
+        {
+            const bool selected = test_case.kv_cache_precision == KVCachePrecision::TQ;
+            const auto config = test_case.toTestConfig();
+            EXPECT_EQ(config.thresholds.prefill_kl_threshold.has_value(), selected);
+            if (selected)
+                EXPECT_FLOAT_EQ(*config.thresholds.prefill_kl_threshold, 0.008f);
+            EXPECT_FLOAT_EQ(config.thresholds.kl_threshold, 0.005f);
+            ASSERT_TRUE(config.thresholds.mtp_kl_threshold.has_value());
+            EXPECT_FLOAT_EQ(*config.thresholds.mtp_kl_threshold, 0.004f);
+            EXPECT_FLOAT_EQ(config.thresholds.min_top5_accuracy, selected ? 80.0f : 95.0f);
+            EXPECT_FLOAT_EQ(config.thresholds.cosine_threshold, definition.thresholds.cosine_threshold);
+            EXPECT_FLOAT_EQ(config.thresholds.decode_cosine_threshold, definition.thresholds.decode_cosine_threshold);
+            EXPECT_FLOAT_EQ(config.thresholds.min_top1_accuracy, definition.thresholds.min_top1_accuracy);
+        }
+    }
+
     TEST(ModelParityDefinition, MTPKLOverrideChangesOnlyItsTypedPolicy)
     {
         auto definition = makeDefinition(
@@ -2243,7 +2300,7 @@ namespace llaminar2::test::parity
         EXPECT_NO_THROW(ModelParityGenerationWorkload(384, 384));
         EXPECT_NO_THROW(ModelParityGenerationWorkload(1024, 768));
         EXPECT_THROW(ModelParityGenerationWorkload{}.withReadiness(0), std::invalid_argument);
-        EXPECT_THROW(ModelParityGenerationWorkload{}.withReadiness(601), std::invalid_argument);
+        EXPECT_THROW(ModelParityGenerationWorkload{}.withReadiness(901), std::invalid_argument);
         EXPECT_EQ(ModelParityGenerationWorkload{}.withReadiness(180).minimumTokens(), 384);
     }
 
@@ -2404,6 +2461,36 @@ namespace llaminar2::test::parity
         for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
                                     qwen36::qwen36MoERocm2ExpertOverlayTopology()})
             EXPECT_TRUE(qwen36::qwen36MoEParityDefinition(topology, "/references/moe", {}).e2e_certifiable.empty());
+    }
+
+    TEST(ModelParityDefinition, Qwen38GPUCertificationExportsAdmittedContextForHTTPHarness)
+    {
+        for (const auto address : {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+        {
+            const auto topology = qwen36::qwen36SingleDeviceTopology("single", address);
+            const auto definition = qwen38::qwen38DenseParityDefinition(topology, "/references/qwen38");
+            std::size_t tagged = 0;
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                ++tagged;
+                const int expected_context = address.isCUDA() ? 8192 : 32768;
+                const int expected_prompt = address.isCUDA() ? 4096 : 16384;
+                EXPECT_EQ(cell.e2e_certification->context_length, expected_context);
+                EXPECT_EQ(cell.e2e_certification->minimum_prompt_tokens, expected_prompt);
+                EXPECT_EQ(cell.e2e_certification->generation_tokens, 2048);
+                // The HTTP harness owns context admission; shared runtime argv
+                // must not overwrite its E2E geometry with the short HF fixture.
+                std::ostringstream exported;
+                PrintTo(cell, &exported);
+                const auto record = nlohmann::json::parse(exported.str());
+                EXPECT_EQ(record.at("e2e").at("context_length"), expected_context);
+                EXPECT_EQ(record.at("e2e").at("minimum_prompt_tokens"), expected_prompt);
+                EXPECT_EQ(record.at("runtime").at("context_length"), 4096);
+                EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+            }
+            EXPECT_EQ(tagged, 1u);
+        }
     }
 
     TEST(ModelParityDefinition, Qwen38E2ERoundTripsAllMTPPoliciesOnEachBackend)

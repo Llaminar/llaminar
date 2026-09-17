@@ -53,7 +53,28 @@ namespace llaminar2::test::parity::qwen38
         if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
             definition.topology.participants.size() == 1 &&
             !definition.topology.participants.front().address.isCPU())
-            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
+        {
+            // Exercise the selected admitted single-device context for each
+            // certification GPU. The 24-GiB CUDA configuration requires an
+            // 8K profile to leave space for this IQ4_XS model's complete
+            // captured physical BOM; the 32-GiB MI50 admits 32K. Keep this
+            // capability fact in the typed profile, not in the HTTP runner.
+            ModelParityE2EProfile profile;
+            if (definition.topology.participants.front().address.isCUDA())
+            {
+                profile.context_length = 8192;
+                profile.minimum_prompt_tokens = 4096;
+            }
+            else
+            {
+                profile.context_length = 32768;
+                profile.minimum_prompt_tokens = 16384;
+            }
+            definition.e2e_certifiable = {{
+                .mtp = ModelParityMTP::DynamicDepth,
+                .profile = profile,
+            }};
+        }
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen38

@@ -1,429 +1,347 @@
 /**
  * @file ClusterInventoryGatherer.cpp
- * @brief Implementation of cluster-wide device inventory gathering
+ * @brief One hardware projection and MPI exchange for planning and execution.
  *
- * Extracted from OrchestrationRunner::gatherClusterInventory().
- *
- * @author David Sanftenberg
- * @date April 2026
+ * DeviceManager owns physical discovery. This module preserves those facts,
+ * attaches actual rank/NUMA membership, and exchanges them collectively.
+ * Configuration is deliberately absent: selection consumes inventory, never
+ * rewrites it. Local errors are published before payload collectives so peers
+ * cannot proceed with an invented or partially empty record.
  */
-
 #include "planning/ClusterInventoryGatherer.h"
-#include "backends/ComputeBackend.h"
-#include "backends/HardwareInventory.h"
-#include "utils/Logger.h"
+#include "planning/ExecutionRankMembership.h"
 #include "utils/MPITopology.h"
 #include "utils/NodeDetection.h"
 #include "utils/NUMATopology.h"
-
-#include <mpi.h>
-#include <unistd.h>
+#include "utils/MPIContext.h"
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <set>
+#include <stdexcept>
+#include <omp.h>
 
 namespace llaminar2
 {
-
-    ClusterInventory gatherClusterInventory(
-        const std::shared_ptr<IMPIContext> &mpi_ctx,
-        const std::vector<GlobalDeviceAddress> &explicit_tp_devices,
-        const std::string &hostfile)
+    namespace
     {
-        ClusterInventory inventory;
-
-        const bool single_rank = !mpi_ctx || mpi_ctx->world_size() == 1;
-
-        /*
-         * A NUMA binding describes the CPU locality of one MPI process; it is
-         * not a hardware-ownership boundary.  With several ranks, the local
-         * filter lets inventory binding assign each accelerator to its nearest
-         * rank.  A sole rank necessarily owns the complete host, including
-         * accelerators attached to another socket, so retaining that filter
-         * would make valid LocalTP devices disappear from the production plan.
-         *
-         * Inventory gathering runs before graph/context construction.  It is
-         * therefore safe to broaden an earlier bootstrap enumeration here;
-         * doing so after contexts existed would invalidate their DeviceManager
-         * indices and is intentionally outside this API's lifecycle.
-         */
-        auto &dm = DeviceManager::instance();
-        if (dm.devices().empty() ||
-            (single_rank && dm.local_numa_node() >= 0))
-        {
-            int target_numa_node = -1;
-            if (!single_rank)
-            {
-                const auto numa_info = NUMATopology::detectLocalNUMANode();
-                target_numa_node =
-                    numa_info.detection_succeeded &&
-                            numa_info.local_numa_node >= 0
-                        ? numa_info.local_numa_node
-                        : 0;
-            }
-            dm.initialize(target_numa_node, false); // Tables already printed pre-MPI
-        }
-        const auto &devices = dm.devices();
-
-        // Helper to convert ComputeBackendType to DeviceType
-        auto toDeviceType = [](ComputeBackendType backend) -> DeviceType
+        /** @brief Translate a discovered backend without inventing CPU devices. */
+        DeviceType deviceType(ComputeBackendType backend)
         {
             switch (backend)
             {
-            case ComputeBackendType::GPU_CUDA:
-                return DeviceType::CUDA;
-            case ComputeBackendType::GPU_ROCM:
-                return DeviceType::ROCm;
-            case ComputeBackendType::GPU_VULKAN:
-                return DeviceType::Vulkan;
-            case ComputeBackendType::GPU_METAL:
-                return DeviceType::Metal;
-            case ComputeBackendType::CPU:
-            default:
-                return DeviceType::CPU;
+            case ComputeBackendType::CPU: return DeviceType::CPU;
+            case ComputeBackendType::GPU_CUDA: return DeviceType::CUDA;
+            case ComputeBackendType::GPU_ROCM: return DeviceType::ROCm;
+            case ComputeBackendType::GPU_VULKAN: return DeviceType::Vulkan;
+            case ComputeBackendType::GPU_METAL: return DeviceType::Metal;
             }
-        };
+            throw std::invalid_argument("Unknown backend in hardware observation");
+        }
 
-        // Detect CPU hardware once for enriching RankInventory
-        auto hw = HardwareInventory::detect();
-
-        // Helper to enrich a RankInventory with detected CPU hardware.
-        // Each rank reports its LOCAL socket's cores/threads (local_rank = socket index).
-        // Machine-wide topology (cpu_sockets count, cpu_socket_info) is preserved for display.
-        auto enrichCPUInfo = [&](RankInventory &ri)
+        /** @brief Reject MPI setup errors at the operation which produced them. */
+        void requireMPI(int status, const char *operation)
         {
-            const int num_sockets = static_cast<int>(hw.cpu_sockets.size());
-            ri.cpu_sockets = num_sockets;
-            ri.numa_nodes = num_sockets;
-            ri.cpu_socket_info = hw.cpu_sockets;
+            if (status != MPI_SUCCESS)
+                throw std::runtime_error(std::string("Cluster inventory exchange failed: ") + operation);
+        }
 
-            // Determine which socket this rank owns (local_rank maps to socket index)
-            int my_socket = ri.local_rank;
-            if (my_socket >= 0 && my_socket < num_sockets)
-            {
-                const auto &sock = hw.cpu_sockets[my_socket];
-                ri.cpu_cores = sock.num_physical_cores();
-                ri.cpu.compute_units = sock.num_threads();
-                ri.cpu.memory_bytes = sock.memory_bytes;
-                ri.cpu.free_memory_bytes =
-                    sock.available_memory_bytes;
-                ri.cpu_memory_bytes = sock.memory_bytes;
-                if (!sock.model_name.empty())
-                    ri.cpu.name = sock.model_name;
-            }
-            else
-            {
-                // Fallback: single-rank or unknown mapping — report full machine
-                int total_cores = 0, total_threads = 0;
-                size_t total_mem = 0;
-                size_t available_mem = 0;
-                for (const auto &sock : hw.cpu_sockets)
-                {
-                    total_cores += sock.num_physical_cores();
-                    total_threads += sock.num_threads();
-                    total_mem += sock.memory_bytes;
-                    available_mem += sock.available_memory_bytes;
-                }
-                ri.cpu_cores = total_cores;
-                ri.cpu.compute_units = total_threads;
-                ri.cpu.memory_bytes = total_mem;
-                ri.cpu.free_memory_bytes = std::min(
-                    available_mem, total_mem);
-                ri.cpu_memory_bytes = total_mem > 0 ? total_mem : ri.cpu_memory_bytes;
-                if (!hw.cpu_sockets.empty() && !hw.cpu_sockets[0].model_name.empty())
-                    ri.cpu.name = hw.cpu_sockets[0].model_name;
-            }
-        };
-
-        // For single-rank execution, create a simple inventory
-        if (single_rank)
+        /**
+         * @brief Publish a local setup failure before any variable-size exchange.
+         * @param comm All participants in the inventory transaction.
+         * @param size Number of participants.
+         * @param error Local diagnostic, empty on success.
+         *
+         * Fixed-size diagnostics are initialization-only. All observers throw
+         * the same first-rank failure; none create a placeholder inventory.
+         */
+        void publishDiscoveryStatus(MPI_Comm comm, int size, const std::string &error)
         {
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.hostname = "localhost";
-            rank_inv.numa_nodes = 1;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
+            std::array<char, 1024> local{};
+            std::copy_n(error.data(), std::min(error.size(), local.size() - 1), local.data());
+            std::vector<char> errors(static_cast<std::size_t>(size) * local.size());
+            requireMPI(MPI_Allgather(local.data(), local.size(), MPI_CHAR,
+                                    errors.data(), local.size(), MPI_CHAR, comm), "discovery status");
+            for (int rank = 0; rank < size; ++rank)
+                if (errors[static_cast<std::size_t>(rank) * local.size()] != '\0')
+                    throw std::runtime_error("Cluster inventory rank " + std::to_string(rank) +
+                        ": " + (errors.data() + static_cast<std::size_t>(rank) * local.size()));
+        }
 
-            // Add CPU by default
-            rank_inv.cpu.type = DeviceType::CPU;
-            rank_inv.cpu.local_device_id = 0;
-
-            // Enrich with detected CPU hardware (sets cpu_cores, cpu_memory_bytes, etc.)
-            // Single-rank sees the full machine (local_rank=0, fallback path in enrichCPUInfo)
-            enrichCPUInfo(rank_inv);
-
-            // Fallback: if HardwareInventory didn't find NUMA memory, use sysconf
-            if (rank_inv.cpu_memory_bytes == 0)
-            {
-                long pages = sysconf(_SC_PHYS_PAGES);
-                long page_size = sysconf(_SC_PAGE_SIZE);
-                if (pages > 0 && page_size > 0)
-                    rank_inv.cpu_memory_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-            }
-            if (rank_inv.cpu.memory_bytes == 0)
-                rank_inv.cpu.memory_bytes = rank_inv.cpu_memory_bytes;
-
-            // Enumerate actual GPUs from DeviceManager
-            for (const auto &dev : devices)
-            {
-                if (dev.type != ComputeBackendType::CPU)
+        /**
+         * @brief Reindex measured P2P edges to the rank's visible device order.
+         * @param rank Record whose GPU list is already complete.
+         * @param backend Backend of the matrix.
+         * @param observed Optional real driver observation.
+         *
+         * Backend ordinals can be sparse or filtered; matrix index is never
+         * mistaken for a device ID. An absent observation remains absent.
+         */
+        void projectPeers(RankInventory &rank, DeviceType backend,
+                          const std::optional<P2PMatrix> &observed)
+        {
+            if (!observed) return;
+            const auto &source = *observed;
+            if (source.can_access.size() != source.device_ids.size())
+                throw std::invalid_argument("Malformed observed P2P matrix");
+            std::set<int> unique;
+            for (std::size_t row = 0; row < source.device_ids.size(); ++row)
+                if (source.device_ids[row] < 0 || !unique.insert(source.device_ids[row]).second ||
+                    source.can_access[row].size() != source.device_ids.size())
+                    throw std::invalid_argument("Malformed observed P2P row or ordinal");
+            std::vector<int> indices;
+            for (const auto &gpu : rank.gpus)
+                if (gpu.type == backend)
                 {
-                    DeviceInfo gpu;
-                    gpu.type = toDeviceType(dev.type);
-                    gpu.local_device_id = dev.device_id;
-                    gpu.memory_bytes = dev.total_memory_bytes;
-                    gpu.free_memory_bytes = dev.free_memory_bytes;
-                    gpu.compute_units = dev.compute_units;
-                    gpu.name = dev.name;
-                    gpu.numa_node = dev.numa_node;
-                    gpu.compute_capability_major = dev.compute_capability / 10;
-                    gpu.compute_capability_minor = dev.compute_capability % 10;
-                    rank_inv.gpus.push_back(gpu);
-
-                    LOG_DEBUG("[gatherClusterInventory] Found GPU: " << dev.name
-                                                                     << " (" << dev.total_memory_bytes / (1024 * 1024 * 1024) << " GB)");
+                    const auto index = source.indexForDevice(gpu.local_device_id);
+                    if (!index) throw std::invalid_argument("Visible GPU missing from observed P2P matrix");
+                    indices.push_back(*index);
                 }
-            }
+            auto &count = backend == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count;
+            auto &matrix = backend == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
+            count = static_cast<int>(indices.size());
+            for (int from : indices)
+                for (int to : indices)
+                    matrix.push_back(source.can_access[from][to]);
+        }
+    }
 
-            // If explicit tp_devices are configured, filter the enumerated list to match
-            if (!explicit_tp_devices.empty())
+    RankInventory makeRankInventory(const HardwareInventory &hardware,
+                                    const RankHardwareLocation &location)
+    {
+        // This is a startup-only projection of the already owned observation,
+        // not another driver query or allocation ledger. CPU binding must not
+        // remove a GPU on a different socket from automatic planning.
+        std::vector<ComputeDevice> accelerators;
+        accelerators.reserve(hardware.cuda_devices.size() + hardware.rocm_devices.size());
+        accelerators.insert(accelerators.end(), hardware.cuda_devices.begin(), hardware.cuda_devices.end());
+        accelerators.insert(accelerators.end(), hardware.rocm_devices.begin(), hardware.rocm_devices.end());
+        return makeRankInventory(hardware, accelerators, location);
+    }
+
+    RankInventory makeRankInventory(const HardwareInventory &hardware,
+                                    std::span<const ComputeDevice> visible_devices,
+                                    const RankHardwareLocation &location)
+    {
+        if (location.rank < 0 || location.node < 0 || location.local_rank < 0 ||
+            hardware.cpu_sockets.empty() || location.cpu_worker_threads < 0)
+            throw std::invalid_argument("Incomplete rank hardware identity or CPU observation");
+        RankInventory rank;
+        rank.rank = location.rank;
+        rank.node_id = location.node;
+        rank.local_rank = location.local_rank;
+        rank.hostname = location.hostname;
+        rank.cpu.type = DeviceType::CPU;
+        rank.cpu.numa_node = location.cpu_numa_node.value_or(-1);
+        rank.cpu_sockets = static_cast<int>(hardware.cpu_sockets.size());
+        rank.cpu_socket_info = hardware.cpu_sockets;
+        rank.cpu_execution = hardware.cpu_execution;
+        rank.cpu_worker_threads = location.cpu_worker_threads;
+        const auto cpu = hardware.cpuDevice(location.cpu_numa_node.value_or(-1));
+        rank.cpu.memory_bytes = cpu.total_memory_bytes;
+        rank.cpu.free_memory_bytes = cpu.free_memory_bytes;
+        rank.cpu.compute_units = cpu.compute_units;
+        rank.cpu.last_level_cache_bytes = cpu.last_level_cache_bytes;
+        rank.cpu.name = cpu.name;
+
+        // CPU ownership follows actual NUMA binding, not local MPI rank.
+        // Whole-host ownership is explicit: socket zero must not silently cap
+        // a single-process CPU plan or be counted again as a second socket.
+        std::set<int> nodes;
+        for (const auto &socket : hardware.cpu_sockets)
+        {
+            nodes.insert(socket.numa_node);
+            if (location.cpu_numa_node && socket.numa_node != *location.cpu_numa_node)
+                continue;
+            rank.cpu_cores += socket.num_physical_cores();
+        }
+        rank.numa_nodes = static_cast<int>(nodes.size());
+        rank.cpu_memory_bytes = rank.cpu.memory_bytes;
+
+        std::set<std::pair<DeviceType, int>> ordinals;
+        for (const auto &device : visible_devices)
+        {
+            if (device.type == ComputeBackendType::CPU) continue;
+            const auto type = deviceType(device.type);
+            if (device.device_id < 0 || !ordinals.emplace(type, device.device_id).second ||
+                device.total_memory_bytes == 0 || device.free_memory_bytes > device.total_memory_bytes)
+                throw std::invalid_argument("Invalid GPU ordinal or capacity in hardware observation");
+            DeviceInfo gpu;
+            gpu.type = type;
+            gpu.local_device_id = device.device_id;
+            gpu.memory_bytes = device.total_memory_bytes;
+            gpu.free_memory_bytes = device.free_memory_bytes;
+            gpu.compute_units = device.compute_units;
+            gpu.last_level_cache_bytes = device.last_level_cache_bytes;
+            gpu.name = device.name;
+            gpu.uuid = device.uuid;
+            gpu.numa_node = device.numa_node;
+            gpu.compute_capability_major = device.compute_capability / 10;
+            gpu.compute_capability_minor = device.compute_capability % 10;
+            gpu.pcie_gen = device.pcie.pcie_gen;
+            gpu.pcie_width = device.pcie.link_width;
+            gpu.pcie_speed_gts = device.pcie.link_speed_gts;
+            gpu.pcie_max_width = device.pcie.max_width;
+            gpu.pcie_max_speed_gts = device.pcie.max_speed_gts;
+            gpu.pcie_degraded = device.pcie.degraded;
+            gpu.pcie_bottleneck_bdf = device.pcie.bottleneck_bdf;
+            rank.gpus.push_back(std::move(gpu));
+        }
+        projectPeers(rank, DeviceType::CUDA, hardware.cuda_p2p);
+        projectPeers(rank, DeviceType::ROCm, hardware.rocm_p2p);
+        return rank;
+    }
+
+    namespace
+    {
+    /**
+     * @brief Execute the sole observation transaction, before publishing it.
+     * @param mpi_ctx Exact context identity; null is explicit local-only discovery.
+     * @return Complete observed records. No placement or allocation is performed.
+     *
+     * This private implementation is entered by the context's once-only owner,
+     * never by topology readers or by a second public refresh API.
+     */
+    ClusterInventory discoverClusterInventory(const IMPIContext *mpi_ctx)
+    {
+        const int declared_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+        const int declared_rank = mpi_ctx ? mpi_ctx->rank() : 0;
+        int size = declared_size;
+        int rank = declared_rank;
+        const MPI_Comm comm = mpi_ctx ? mpi_ctx->communicator() : MPI_COMM_NULL;
+        if (mpi_ctx)
+        {
+            if (comm == MPI_COMM_NULL)
+                throw std::invalid_argument("Cluster inventory requires a valid communicator identity");
+            int initialized = 0, finalized = 0;
+            requireMPI(MPI_Initialized(&initialized), "MPI initialization query");
+            if (initialized) requireMPI(MPI_Finalized(&finalized), "MPI retirement query");
+            if (!initialized || finalized)
+                throw std::logic_error("Cluster inventory requires a live MPI session");
+            // Actual membership sizes all protocol buffers. A malformed wrapper
+            // cannot turn a multi-rank transaction into a local observation or
+            // allocate a receive buffer smaller than its communicator.
+            requireMPI(MPI_Comm_size(comm, &size), "communicator size");
+            requireMPI(MPI_Comm_rank(comm, &rank), "communicator rank");
+        }
+        const bool distributed = size > 1;
+        if (size < 1 || rank < 0 || rank >= size || (distributed && comm == MPI_COMM_NULL))
+            throw std::invalid_argument("Cluster inventory requires a valid communicator identity");
+
+        NodeDetectionResult nodes;
+        RankHardwareLocation location;
+        location.rank = rank;
+        if (distributed)
+        {
+            nodes = NodeDetection::detect(comm);
+            location.node = nodes.node_ids.at(rank);
+            location.hostname = nodes.hostnames.at(rank);
+            location.local_rank = static_cast<int>(std::count(
+                nodes.node_ids.begin(), nodes.node_ids.begin() + rank, location.node));
+        }
+
+        RankInventory local;
+        std::vector<uint8_t> local_data;
+        std::string error;
+        try
+        {
+            if (declared_size != size || declared_rank != rank)
+                throw std::invalid_argument("MPI context identity disagrees with its communicator");
+            // Capture the configured execution team independently of physical
+            // cores. --threads and per-host bootstrap can legitimately choose
+            // a different budget on each rank; root must not reconstruct it.
+            if (omp_in_parallel() || omp_get_dynamic() || omp_get_max_threads() <= 0 ||
+                omp_get_thread_limit() < omp_get_max_threads())
+                throw std::invalid_argument("Inventory requires a fixed, non-nested CPU execution team");
+            location.cpu_worker_threads = omp_get_max_threads();
+            if (distributed)
             {
-                LOG_DEBUG("[gatherClusterInventory] Using explicitly configured TP devices (count="
-                          << explicit_tp_devices.size() << ")");
-
-                // Map DeviceType → ComputeBackendType for lookup
-                auto toBackendType = [](DeviceType dt) -> ComputeBackendType
-                {
-                    switch (dt)
-                    {
-                    case DeviceType::CUDA:
-                        return ComputeBackendType::GPU_CUDA;
-                    case DeviceType::ROCm:
-                        return ComputeBackendType::GPU_ROCM;
-                    case DeviceType::Vulkan:
-                        return ComputeBackendType::GPU_VULKAN;
-                    case DeviceType::Metal:
-                        return ComputeBackendType::GPU_METAL;
-                    default:
-                        return ComputeBackendType::CPU;
-                    }
-                };
-
-                rank_inv.gpus.clear();
-                for (size_t i = 0; i < explicit_tp_devices.size(); ++i)
-                {
-                    const auto &addr = explicit_tp_devices[i];
-                    DeviceInfo gpu;
-                    gpu.type = addr.device_type;
-                    gpu.local_device_id = addr.device_ordinal;
-
-                    // Look up actual device info from DeviceManager enumeration
-                    int dev_idx = dm.find_device(toBackendType(addr.device_type), addr.device_ordinal);
-                    if (dev_idx >= 0)
-                    {
-                        const auto &dev = devices[static_cast<size_t>(dev_idx)];
-                        gpu.memory_bytes = dev.total_memory_bytes;
-                        gpu.free_memory_bytes = dev.free_memory_bytes;
-                        gpu.compute_units = dev.compute_units;
-                        gpu.name = dev.name;
-                        gpu.numa_node = dev.numa_node;
-                        gpu.compute_capability_major = dev.compute_capability / 10;
-                        gpu.compute_capability_minor = dev.compute_capability % 10;
-                        LOG_DEBUG("[gatherClusterInventory] Explicit TP device " << i << ": "
-                                                                                 << dev.name << " (ordinal=" << addr.device_ordinal
-                                                                                 << ", " << dev.total_memory_bytes / (1024 * 1024) << " MB total, "
-                                                                                 << dev.free_memory_bytes / (1024 * 1024) << " MB free)");
-                    }
-                    else
-                    {
-                        LOG_WARN("[gatherClusterInventory] Explicit TP device " << i
-                                                                                << " (ordinal=" << addr.device_ordinal
-                                                                                << ") not found in DeviceManager — memory info unavailable");
-                    }
-                    rank_inv.gpus.push_back(gpu);
-                }
+                const auto numa = NUMATopology::detectLocalNUMANode();
+                if (!numa.detection_succeeded || numa.local_numa_node < 0)
+                    throw std::runtime_error("Multi-rank hardware discovery requires exact CPU NUMA affinity");
+                location.cpu_numa_node = numa.local_numa_node;
             }
+            auto &manager = DeviceManager::instance();
+            // Reuse the complete observation even if another startup caller
+            // installed a socket-local execution view. Visibility projection
+            // cannot require re-enumeration or mutate that caller's view.
+            if (!manager.hardware())
+                manager.initialize(location.cpu_numa_node.value_or(-1), false);
+            const auto *hardware = manager.hardware();
+            if (!hardware) throw std::runtime_error("DeviceManager did not publish its hardware observation");
+            local = makeRankInventory(*hardware, location);
+            local_data = MPITopology::serializeRankInventory(local);
+            if (local_data.size() > INT_MAX)
+                throw std::runtime_error("Rank inventory exceeds MPI payload capacity");
+        }
+        catch (const std::exception &failure) { error = failure.what(); }
+        if (distributed) publishDiscoveryStatus(comm, size, error);
+        else if (!error.empty()) throw std::runtime_error(error);
 
-            inventory.ranks.push_back(rank_inv);
-            inventory.world_size = 1;
-            inventory.node_count = 1;
-            inventory.total_gpus = static_cast<int>(rank_inv.gpus.size());
-
-            LOG_DEBUG("[gatherClusterInventory] Discovered " << inventory.total_gpus << " GPU(s)");
+        ClusterInventory inventory;
+        inventory.world_size = size;
+        inventory.node_count = distributed ? nodes.node_count : 1;
+        if (!distributed)
+        {
+            inventory.ranks.push_back(std::move(local));
+            inventory.buildNodeAggregations();
             return inventory;
         }
 
-        // Multi-rank execution: build local RankInventory and exchange via MPI_Allgatherv.
-        const int world_size = mpi_ctx->world_size();
-        const int rank = mpi_ctx->rank();
-
-        MPI_Comm comm = mpi_ctx->communicator();
-
-        RankInventory local_rank_inv;
-        local_rank_inv.rank = rank;
-        local_rank_inv.node_id = -1;
-        local_rank_inv.local_rank = 0;
-        local_rank_inv.numa_nodes = 1;
-
-        // Hostname
-        char hostname_buf[MPI_MAX_PROCESSOR_NAME] = {0};
-        int hostname_len = 0;
-        if (MPI_Get_processor_name(hostname_buf, &hostname_len) == MPI_SUCCESS && hostname_len > 0)
-        {
-            local_rank_inv.hostname.assign(hostname_buf, static_cast<size_t>(hostname_len));
-        }
-        else
-        {
-            local_rank_inv.hostname = "unknown";
-        }
-
-        // Detect local rank within physical node (shared-memory communicator)
-        MPI_Comm local_comm = MPI_COMM_NULL;
-        if (MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
-        {
-            int local_rank = 0;
-            int local_world = 1;
-            MPI_Comm_rank(local_comm, &local_rank);
-            MPI_Comm_size(local_comm, &local_world);
-            local_rank_inv.local_rank = local_rank;
-            local_rank_inv.numa_nodes = local_world;
-            MPI_Comm_free(&local_comm);
-        }
-
-        // Populate CPU info
-        local_rank_inv.cpu.type = DeviceType::CPU;
-        local_rank_inv.cpu.local_device_id = 0;
-
-        // Enrich with detected CPU hardware (sets cpu_cores, cpu_memory_bytes, etc.)
-        enrichCPUInfo(local_rank_inv);
-
-        // Populate GPU info from DeviceManager
-        for (const auto &dev : devices)
-        {
-            if (dev.type == ComputeBackendType::CPU)
-            {
-                continue;
-            }
-
-            DeviceInfo gpu;
-            gpu.type = toDeviceType(dev.type);
-            gpu.local_device_id = dev.device_id;
-            gpu.memory_bytes = dev.total_memory_bytes;
-            gpu.free_memory_bytes = dev.free_memory_bytes;
-            gpu.compute_units = dev.compute_units;
-            gpu.name = dev.name;
-            gpu.numa_node = dev.numa_node;
-            gpu.compute_capability_major = dev.compute_capability / 10;
-            gpu.compute_capability_minor = dev.compute_capability % 10;
-            local_rank_inv.gpus.push_back(gpu);
-        }
-
-        // Override with explicit tp_devices if configured
-        if (!explicit_tp_devices.empty())
-        {
-            local_rank_inv.gpus.clear();
-            for (size_t i = 0; i < explicit_tp_devices.size(); ++i)
-            {
-                const auto &addr = explicit_tp_devices[i];
-                DeviceInfo gpu;
-                gpu.type = addr.device_type;
-                gpu.local_device_id = static_cast<int>(i);
-                gpu.memory_bytes = 0;
-                local_rank_inv.gpus.push_back(gpu);
-            }
-        }
-
-        // Serialize local inventory
-        std::vector<uint8_t> local_data = MPITopology::serializeRankInventory(local_rank_inv);
         const int local_size = static_cast<int>(local_data.size());
-
-        // Gather serialized sizes from all ranks
-        std::vector<int> all_sizes(world_size, 0);
-        MPI_Allgather(
-            &local_size, 1, MPI_INT,
-            all_sizes.data(), 1, MPI_INT,
-            comm);
-
-        // Compute displacements for allgatherv
-        std::vector<int> displacements(world_size, 0);
-        int total_size = 0;
-        for (int r = 0; r < world_size; ++r)
+        std::vector<int> sizes(size), offsets(size);
+        requireMPI(MPI_Allgather(&local_size, 1, MPI_INT, sizes.data(), 1, MPI_INT, comm), "payload sizes");
+        int total = 0;
+        for (int peer = 0; peer < size; ++peer)
         {
-            displacements[r] = total_size;
-            total_size += all_sizes[r];
+            if (sizes[peer] <= 0 || sizes[peer] > INT_MAX - total)
+                throw std::runtime_error("Invalid cluster inventory payload extent");
+            offsets[peer] = total;
+            total += sizes[peer];
         }
-
-        std::vector<uint8_t> all_data(static_cast<size_t>(total_size));
-        MPI_Allgatherv(
-            local_data.data(), local_size, MPI_BYTE,
-            all_data.data(), all_sizes.data(), displacements.data(), MPI_BYTE,
-            comm);
-
-        // Deserialize inventories from all ranks
-        inventory.world_size = world_size;
-        inventory.ranks.resize(world_size);
-        for (int r = 0; r < world_size; ++r)
+        std::vector<uint8_t> payload(static_cast<std::size_t>(total));
+        requireMPI(MPI_Allgatherv(local_data.data(), local_size, MPI_BYTE,
+                                 payload.data(), sizes.data(), offsets.data(), MPI_BYTE, comm), "rank payloads");
+        for (int peer = 0; peer < size; ++peer)
         {
-            const uint8_t *ptr = all_data.data() + displacements[r];
-            const size_t size = static_cast<size_t>(all_sizes[r]);
-            try
-            {
-                inventory.ranks[r] = MPITopology::deserializeRankInventory(ptr, size);
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("[gatherClusterInventory] Failed to deserialize rank " << r << ": " << e.what());
-                inventory.ranks[r].rank = r;
-                inventory.ranks[r].hostname = "error";
-                inventory.ranks[r].node_id = -1;
-            }
+            // Every observer validates identical bytes. A malformed record is
+            // fatal, never an empty rank or zero-byte invented GPU.
+            auto record = MPITopology::deserializeRankInventory(payload.data() + offsets[peer], sizes[peer]);
+            if (record.rank != peer || record.node_id != nodes.node_ids[peer] ||
+                record.hostname != nodes.hostnames[peer])
+                throw std::runtime_error("Inventory payload identity disagrees with MPI membership");
+            inventory.ranks.push_back(std::move(record));
         }
-
-        // Build deterministic node_id mapping from hostname (single source of truth).
-        // Rank 0 parses the hostfile (if any) and computes node IDs, then broadcasts
-        // to all ranks. This avoids requiring the hostfile to exist on remote hosts.
-        std::vector<std::string> hostnames;
-        hostnames.reserve(static_cast<size_t>(world_size));
-        for (const auto &rank_inv : inventory.ranks)
-        {
-            hostnames.push_back(rank_inv.hostname);
-        }
-
-        // node_ids: one int per rank. node_count appended as element [world_size].
-        std::vector<int> node_id_buf(static_cast<size_t>(world_size) + 1);
-
-        if (rank == 0)
-        {
-            NodeDetectionResult detection;
-            if (!hostfile.empty())
-            {
-                detection = NodeDetection::fromHostnames(hostnames, hostfile);
-            }
-            else
-            {
-                detection = NodeDetection::fromHostnames(hostnames);
-            }
-            for (int r = 0; r < world_size; ++r)
-            {
-                node_id_buf[r] = detection.node_ids[r];
-            }
-            node_id_buf[world_size] = detection.node_count;
-        }
-
-        MPI_Bcast(node_id_buf.data(),
-                  static_cast<int>(node_id_buf.size()),
-                  MPI_INT, 0, comm);
-
-        for (int r = 0; r < world_size; ++r)
-        {
-            inventory.ranks[r].node_id = node_id_buf[r];
-        }
-
-        inventory.node_count = node_id_buf[world_size];
         inventory.buildNodeAggregations();
-
-        LOG_DEBUG("[gatherClusterInventory] Discovered " << inventory.total_gpus
-                                                         << " GPU(s) across " << world_size
-                                                         << " ranks on " << inventory.node_count << " node(s)");
         return inventory;
     }
+    } // namespace
 
+    std::shared_ptr<const ClusterInventory> MPIContext::clusterInventory() const
+    {
+        // The alias retains the immutable membership owner without copying its
+        // projection or entering discovery on an already selected communicator.
+        if (membership_)
+            return std::shared_ptr<const ClusterInventory>(membership_, &membership_->inventory());
+        std::call_once(inventory_once_, [this] {
+            try
+            {
+                inventory_publication_ = std::make_shared<const ClusterInventory>(
+                    discoverClusterInventory(this));
+            }
+            catch (...) { inventory_publication_ = std::current_exception(); }
+        });
+        if (const auto *failure = std::get_if<std::exception_ptr>(&inventory_publication_))
+            std::rethrow_exception(*failure);
+        return std::get<std::shared_ptr<const ClusterInventory>>(inventory_publication_);
+    }
+
+    std::shared_ptr<const ClusterInventory> gatherClusterInventory(const std::shared_ptr<IMPIContext> &mpi_ctx,
+                                            const std::string & /*hostfile*/)
+    {
+        // Hostfile is launch provenance, not a second source of MPI membership.
+        // Context-bound readers all consume the very same immutable observation.
+        return mpi_ctx ? mpi_ctx->clusterInventory() :
+            std::make_shared<const ClusterInventory>(discoverClusterInventory(nullptr));
+    }
 } // namespace llaminar2

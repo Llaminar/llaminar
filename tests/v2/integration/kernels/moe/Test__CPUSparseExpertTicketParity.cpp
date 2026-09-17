@@ -7,6 +7,9 @@
  * canonical return ticket across narrow/wide packets. Independent serial CPU
  * expert rows certify the result after the real captured CUDA/ROCm consumer;
  * synthetic ticket payloads alone cannot catch a compute-to-ticket stride bug.
+ * The endpoint starts with an empty prepared bank. Its metadata declaration is
+ * admitted and bound through the production non-graph workspace allocator,
+ * then real prepared experts arrive without rebinding or growing that storage.
  */
 
 #include "backends/BackendManager.h"
@@ -14,6 +17,8 @@
 #include "backends/IGPUGraphCapture.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/WorkspaceAllocator.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
@@ -21,6 +26,7 @@
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "transfer/TransferEngine.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 
 #include <array>
 #include <cmath>
@@ -72,6 +78,7 @@ std::unique_ptr<TensorBase> floatingWeight(
  */
 void runSparseExpertTicketParity(DeviceId device)
 {
+    if (!hasCPUBackend()) initCPUBackend(-1);
     constexpr int experts = 8;
     constexpr int max_rows = 15;
     constexpr int top_k = 8;
@@ -113,7 +120,7 @@ void runSparseExpertTicketParity(DeviceId device)
                               format.tensor_type == TensorType::BF16 ||
                               format.tensor_type == TensorType::FP32;
         std::vector<std::unique_ptr<TensorBase>> weights;
-        std::vector<std::unique_ptr<ITensorGemm>> engines;
+        std::vector<std::shared_ptr<ITensorGemm>> engines;
         std::array<std::vector<ITensorGemm *>, 3> projections;
         for (int expert = 0; expert < experts; ++expert)
             for (int projection = 0; projection < 3; ++projection)
@@ -171,11 +178,54 @@ void runSparseExpertTicketParity(DeviceId device)
         params.expert_intermediate = intermediate;
         params.layer_idx = 0;
         params.runtime_participant_index = 1;
-        params.expert_mask.assign(experts, true);
-        params.prepared_gate_gemm = projections[0];
-        params.prepared_up_gemm = projections[1];
-        params.prepared_down_gemm = projections[2];
+        params.expert_mask.assign(experts, false);
+        params.expert_weight_resolution_policy = MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly;
+        params.cpu_workspace_source = MoELocalExpertStage::CPUExpertWorkspaceSource{
+            .gate = format.tensor_type, .up = format.tensor_type, .down = format.tensor_type,
+            .workers = cpu::native_vnni::nativeVNNIInvocationWorkerCount(),
+            .execution = CPUExecutionGeometry::local()};
+        auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+            MoEOverlayParticipantResidency::Config{.participant_id = 1, .device = DeviceId::cpu(),
+                .num_layers = 1, .num_experts = experts});
+        MoEOverlayParticipantResidencyBank initial{.epoch = 1, .participant_id = 1,
+            .device = DeviceId::cpu(), .layers = {{std::vector<bool>(experts, false),
+                std::vector<MoEOverlayPreparedExpertTriplet>(experts)}}};
+        auto ready = residency->prepareReadyBank(std::move(initial));
+        ASSERT_TRUE(ready.has_value());
+        ASSERT_EQ(residency->installReadyBank(std::move(*ready)),
+            MoEOverlayParticipantBankInstallStatus::Installed);
+        params.overlay_participant_residency = residency;
         MoELocalExpertStage stage(params);
+
+        // Do not lend the stage any currently prepared engine requirements:
+        // the empty tier's source declaration alone must cover future work.
+        const auto declared = stage.getWorkspaceRequirements(max_rows);
+        const size_t bytes = declared.total_bytes_with_alignment();
+        PhysicalMemoryPlanBuilder memory_plan;
+        memory_plan.add({.world_rank = 0, .device = DeviceId::cpu(),
+            .total_bytes = bytes, .admission_available_bytes = bytes},
+            PhysicalMemoryOwner::ExecutionWorkspace, bytes);
+        auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(memory_plan.build()), 0);
+        WorkspaceAllocator allocator(memory);
+        ComputeGraph host_boundary;
+        WorkspaceSizingHints hints;
+        hints.max_seq_len = hints.serial_family_max_rows = max_rows;
+        hints.d_model = width;
+        hints.batch_size = 1;
+        hints.graph_family_policy = WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+        ASSERT_TRUE(allocator.allocateForGraph(host_boundary, hints,
+            {{.consumer = &stage, .device = DeviceId::cpu(), .m = max_rows,
+              .shape_policy = WorkspaceConsumerShapePolicy::FixedDeclaredShape}}));
+        ASSERT_EQ(stage.getWorkspace(), allocator.getDeviceWorkspace(DeviceId::cpu()));
+        const auto workspace_generation = allocator.deviceGeneration(DeviceId::cpu());
+        std::vector<void *> workspace_addresses;
+        for (const auto &buffer : declared.buffers)
+            workspace_addresses.push_back(stage.getWorkspace()->getBuffer(buffer.name));
+        // Revoke borrowed pointers before the allocator retires its storage,
+        // including assertion-unwind paths below.
+        auto unbind = [&](MoELocalExpertStage *value) { value->unbindWorkspace(); };
+        std::unique_ptr<MoELocalExpertStage, decltype(unbind)> binding(&stage, unbind);
         auto result = TestTensorFactory::createFP32({capacity, size_t(width)});
         ASSERT_TRUE(result->ensureOnDevice(device, stream));
         TransferEngine::requireDeviceInput(result.get(), device, stream);
@@ -205,6 +255,14 @@ void runSparseExpertTicketParity(DeviceId device)
             }
         };
         std::unique_ptr<void, decltype(drain)> pending_guard(ticket.get(), drain);
+        // The oracle is an independent serial invocation, not a borrower of
+        // the endpoint's scratch. Include each engine's exact K-tree envelope
+        // even at one row, where wider CPU teams can require ordered partials.
+        auto oracle_requirements = cpuSwiGLUWorkspaceRequirements(1, intermediate);
+        for (const auto &engine : engines)
+            oracle_requirements.merge(
+                dynamic_cast<const IWorkspaceConsumer &>(*engine).getWorkspaceRequirements(1));
+        CPUProjectionTestWorkspace oracle_workspace(oracle_requirements);
         auto oracle_input = TestTensorFactory::createFP32({1u, size_t(width)});
         auto gate = TestTensorFactory::createFP32({1u, size_t(intermediate)});
         auto up = TestTensorFactory::createFP32({1u, size_t(intermediate)});
@@ -214,10 +272,23 @@ void runSparseExpertTicketParity(DeviceId device)
             {3, 3}, {1, 4}, {15, 2}, {1, 1}, {1, 8}}};
         for (size_t replay = 0; replay < shapes.size(); ++replay)
         {
+            if (replay % 3 == 0)
+            {
+                const uint64_t previous = 1 + replay / 3;
+                auto candidate = residency->cloneCandidate(previous, previous + 1);
+                for (int expert = 0; expert < experts; ++expert)
+                    candidate.layers[0].setResidentExpert(expert,
+                        {engines[expert * 3], engines[expert * 3 + 1], engines[expert * 3 + 2]});
+                auto prepared = residency->prepareReadyBank(std::move(candidate));
+                ASSERT_TRUE(prepared.has_value());
+                ASSERT_EQ(residency->installReadyBank(std::move(*prepared)),
+                    MoEOverlayParticipantBankInstallStatus::Installed);
+                ASSERT_TRUE(residency->retire(previous));
+            }
             const auto [rows, routes] = shapes[replay];
             SCOPED_TRACE("replay=" + std::to_string(replay) +
                          " rows=" + std::to_string(rows) + " routes=" + std::to_string(routes));
-            input.residency_epoch = 1u + replay / 3u;
+            input.residency_epoch = 2u + replay / 3u;
             input.live_row_count = rows;
             input.live_entry_count = rows * routes;
             std::vector<float> expected(capacity * width, 0.0f);
@@ -247,9 +318,10 @@ void runSparseExpertTicketParity(DeviceId device)
                         {projections[0][expert], gate.get(), intermediate, nullptr, "gate"},
                         {projections[1][expert], up.get(), intermediate, nullptr, "up"}};
                     ASSERT_TRUE(projections[0][expert]->multiply_fused_tensor(
-                        oracle_input.get(), pair, 1, width));
+                        oracle_input.get(), pair, 1, width, nullptr, oracle_workspace.get()));
                     ASSERT_TRUE(projections[2][expert]->multiply_tensor_with_fused_swiglu(
-                        gate.get(), up.get(), down.get(), 1, width, intermediate));
+                        gate.get(), up.get(), down.get(), 1, width, intermediate,
+                        1.0f, 0.0f, oracle_workspace.get()));
                     for (int col = 0; col < width; ++col)
                     {
                         ASSERT_TRUE(std::isfinite(down->data()[col]));
@@ -262,6 +334,13 @@ void runSparseExpertTicketParity(DeviceId device)
             ASSERT_TRUE(graph->launch());
             pending = true;
             ASSERT_TRUE(stage.execute(&cpu));
+            ASSERT_EQ(allocator.deviceGeneration(DeviceId::cpu()), workspace_generation);
+            for (size_t buffer = 0; buffer < declared.buffers.size(); ++buffer)
+            {
+                const auto &descriptor = declared.buffers[buffer];
+                ASSERT_EQ(stage.getWorkspace()->getBuffer(descriptor.name), workspace_addresses[buffer]);
+                ASSERT_EQ(stage.getWorkspace()->getBufferSize(descriptor.name), descriptor.size_bytes);
+            }
             TransferEngine::publishDeviceWrite(result.get(), device, stream);
             ASSERT_TRUE(result->ensureOnHost(stream));
             ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));

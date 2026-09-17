@@ -7,6 +7,8 @@
  * expert-overlay deployments. Dense continuation remains local to each graph;
  * cross-rank expert work is addressed by logical participant identity so CUDA,
  * ROCm, and CPU/NUMA endpoints can share one production model topology.
+ * Native-capture ownership follows every declared service boundary: portable
+ * inter-host MPI and colocated CPU work share the typed ticket lifecycle.
  */
 
 #include "Qwen35MoEGraph.h"
@@ -37,6 +39,7 @@
 #include "../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../execution/moe/MoEOverlayRankBatchTransport.h"
+#include "../../execution/moe/MoEOverlayRankBatchGraphSchedule.h"
 #include "../../execution/moe/MoEOverlaySparseCollective.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../execution/moe/MoERebalanceController.h"
@@ -1591,13 +1594,6 @@ namespace llaminar2
                 fields.push_back({prefix + ".primary_owned_by_current_rank",
                                   boolField(domain.primary_owned_by_current_rank)});
                 fields.push_back({prefix + ".local_reachable_for_mvp", boolField(domain.local_reachable_for_mvp)});
-                fields.push_back({prefix + ".requires_domain_scoped_collective_context",
-                                  boolField(domain.requires_domain_scoped_collective_context)});
-                fields.push_back({prefix + ".domain_scoped_collective_context_ready",
-                                  boolField(domain.domain_scoped_collective_context_ready)});
-                fields.push_back({prefix + ".multi_participant_execution_pending",
-                                  boolField(domain.multi_participant_execution_pending)});
-                fields.push_back({prefix + ".pending_reason", domain.pending_reason});
 
                 fields.push_back({prefix + ".participant.count", std::to_string(domain.participants.size())});
                 for (size_t participant_index = 0; participant_index < domain.participants.size(); ++participant_index)
@@ -1629,8 +1625,6 @@ namespace llaminar2
                 fields.push_back({prefix + ".domain_name", tier.domain_name});
                 fields.push_back({prefix + ".primary_device", tier.primary_device.to_string()});
                 fields.push_back({prefix + ".local_reachable_for_mvp", boolField(tier.local_reachable_for_mvp)});
-                fields.push_back({prefix + ".multi_participant_execution_pending",
-                                  boolField(tier.multi_participant_execution_pending)});
             }
         }
 
@@ -2057,7 +2051,7 @@ namespace llaminar2
          * @param d_model Declarative hidden dimension.
          * @param expert_intermediate Declarative expert intermediate dimension.
          * @return Three exact projection specs, or std::nullopt when any engine
-         *         cannot export a valid, geometry-compatible NativeVNNI descriptor.
+         *         cannot export a valid, geometry-compatible weight descriptor.
          */
         std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
         transferSlotSpecsFromPreparedExpertEngines(
@@ -2079,6 +2073,20 @@ namespace llaminar2
             {
                 if (!engine || n <= 0 || k <= 0)
                     return std::nullopt;
+
+                ContiguousFloatingPointWeightDescriptor floating{};
+                if (engine->exportContiguousFloatingPointWeights(floating))
+                {
+                    DeviceMoEFloatingMatrixDesc matrix;
+                    DeviceMoEWeightFormat format;
+                    if (!exportDeviceMoEFloatingMatrixDescriptor(floating, matrix, format) ||
+                        matrix.n != n || matrix.k != k)
+                        return std::nullopt;
+                    return DeviceMoETransferSlotDirectory::ProjectionSpec{
+                        .label = label, .N = n, .K = k,
+                        .format = ExpertWeightFormat::floating(floating.type),
+                    };
+                }
 
                 DeviceNativeVNNIMatrixDesc descriptor{};
                 NativeVnniSourceIdentity source_identity{};
@@ -5821,7 +5829,7 @@ namespace llaminar2
             {
                 throw std::logic_error(
                     "Qwen35 MoE cannot identify a transfer directory without "
-                    "a NativeVNNI format profile");
+                    "an expert weight format profile");
             }
 
             /*
@@ -5842,8 +5850,11 @@ namespace llaminar2
                     << ":cb" << static_cast<int>(spec.codebook_id)
                     << ":pb" << spec.payload_bytes_per_block
                     << ":asym" << (spec.is_asymmetric ? 1 : 0)
-                    << ":emins" << (spec.has_emins ? 1 : 0);
+                    << ":emins" << (spec.has_emins ? 1 : 0)
+                    << ":format" << static_cast<int>(spec.format.kind);
             }
+            key << ":floating_capacity=" << static_cast<int>(
+                graph_rebalance_transfer_profile->floating_allocation_format);
             key << ":wire="
                 << graph_rebalance_transfer_profile->max_wire_payload_bytes;
             return key.str();
@@ -5861,7 +5872,7 @@ namespace llaminar2
             {
                 throw std::logic_error(
                     "Qwen35 MoE transfer-directory creation requires a "
-                    "NativeVNNI format profile");
+                    "weight format profile");
             }
 
             const uint32_t transfer_slot_count =
@@ -5988,7 +5999,7 @@ namespace llaminar2
             if (!graph_rebalance_transfer_profile.has_value())
             {
                 throw std::runtime_error(
-                    "Qwen35 MoE graph-side transfer binding requires a NativeVNNI transfer profile for layer " +
+                    "Qwen35 MoE graph-side transfer binding requires an expert weight transfer profile for layer " +
                     std::to_string(layer_idx) + " on " + device.to_string() +
                     (context ? std::string(" (") + context + ")" : std::string{}));
             }
@@ -6557,7 +6568,7 @@ namespace llaminar2
                     if (!graph_rebalance_transfer_profile.has_value())
                     {
                         throw std::runtime_error(
-                            "Qwen35 MoE graph-side rebalance requires a NativeVNNI transfer profile for layer " +
+                            "Qwen35 MoE graph-side rebalance requires an expert weight transfer profile for layer " +
                             std::to_string(layer_idx) + " on " + device.to_string() +
                             (context ? std::string(" (") + context + ")" : std::string{}));
                     }
@@ -9055,40 +9066,39 @@ namespace llaminar2
                     const bool mapped_activation_topology =
                         saw_remote_participant &&
                         all_remote_participants_are_node_local;
-                    if (mapped_activation_topology)
+                    if (!mapped_activation_local_participants.empty() ||
+                        (saw_remote_participant &&
+                         !all_remote_participants_are_node_local))
                     {
                         /*
-                         * A purely GPU/mapped endpoint transaction remains one
-                         * indivisible native executable. A colocated CPU
-                         * endpoint introduces one intentional fixed-ticket
-                         * boundary: captured GPU publication, manual CPU sparse
-                         * work, then captured GPU ingress. Declare that
-                         * lifecycle explicitly so replay policy cannot infer it
-                         * from mutable placement masks or broad topology flags.
+                         * Both colocated CPU service and portable inter-host
+                         * MPI require the same captured/manual/captured ticket
+                         * lifecycle. Transport locality selects the wire path,
+                         * not ownership of the executable launch. Declaring
+                         * this before building host dispatch also installs its
+                         * producer cutpoint and the base builder's terminal
+                         * contract, including setup-only materialization.
+                         *
+                         * The logical root owns host work. LocalTP siblings
+                         * close matching native units without running that
+                         * work or publishing the transaction a second time.
                          */
-                        if (mapped_activation_local_participants.empty())
-                        {
-                            graph.setNativeCaptureEnvelope(
-                                GraphNativeCaptureEnvelope::
-                                    DeviceOwnedTimelineTransaction);
-                        }
-                        else
-                        {
-                            /*
-                             * The CPU ticket cuts the continuation domain's
-                             * native timeline, not just the logical root's
-                             * graph. The root owns the manual ticket boundary;
-                             * every LocalTP sibling follows the same segmented
-                             * wave schedule without executing host work.
-                             */
-                            graph.setNativeCaptureEnvelope(
-                                sparse_graph_contract
-                                        .ownsDispatchAuthority()
-                                    ? GraphNativeCaptureEnvelope::
-                                          HeterogeneousTicketAuthorityTransaction
-                                    : GraphNativeCaptureEnvelope::
-                                          HeterogeneousTicketFollowerTransaction);
-                        }
+                        graph.setNativeCaptureEnvelope(
+                            sparse_graph_contract.ownsDispatchAuthority()
+                                ? GraphNativeCaptureEnvelope::
+                                      HeterogeneousTicketAuthorityTransaction
+                                : GraphNativeCaptureEnvelope::
+                                      HeterogeneousTicketFollowerTransaction);
+                    }
+                    else if (mapped_activation_topology)
+                    {
+                        // With no host-serviced boundary, every mapped device
+                        // wait/publication remains inside one native graph.
+                        graph.setNativeCaptureEnvelope(
+                            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+                    }
+                    if (mapped_activation_topology)
+                    {
                         mapped_activation_dispatch_wave_identities.reserve(
                             mapped_activation_remote_participants.size());
                         mapped_activation_return_wave_identities.reserve(
@@ -9101,16 +9111,6 @@ namespace llaminar2
                             mapped_activation_return_wave_identities.push_back(
                                 mapped_return_wave_identity(participant));
                         }
-                    }
-                    else if (!mapped_activation_local_participants.empty())
-                    {
-                        /* A one-rank GPU+CPU topology still crosses the same
-                         * explicit captured/manual/captured boundary. Its
-                         * lifecycle is heterogeneous even though no MPI peer
-                         * exists, so make segmentation a declared graph fact. */
-                        graph.setNativeCaptureEnvelope(
-                            GraphNativeCaptureEnvelope::
-                                HeterogeneousTicketAuthorityTransaction);
                     }
                     use_mapped_activation_parent =
                         sparse_graph_contract.ownsDispatchAuthority() &&
@@ -9930,6 +9930,11 @@ namespace llaminar2
                                 "Qwen35 MoE cannot rank-batch an interleaved participant order without changing canonical FP32 accumulation order");
                         }
 
+                        // Previous tiers may own the shared return destination.
+                        // Freeze that entry edge: a later peer in this tier must
+                        // never inherit the preceding peer's blocking return.
+                        const std::string rank_batch_entry = last_return_reduce;
+                        std::vector<MoEOverlayRankBatchGraphLane> rank_batch_lanes;
                         for (const auto &[target_world_rank, participants] :
                              rank_groups)
                         {
@@ -10103,11 +10108,11 @@ namespace llaminar2
                                 dispatch_dependency);
                             distributed_rank_batch_dispatch_nodes.push_back(
                                 batch_dispatch_name);
-                            if (!last_return_reduce.empty())
+                            if (!rank_batch_entry.empty())
                             {
                                 graph.addDependency(
                                     batch_dispatch_name,
-                                    last_return_reduce);
+                                    rank_batch_entry);
                             }
 
                             std::vector<std::shared_ptr<
@@ -10193,6 +10198,10 @@ namespace llaminar2
                             graph.addDependency(
                                 batch_return_name,
                                 batch_dispatch_name);
+                            rank_batch_lanes.push_back({
+                                .dispatch = batch_dispatch_name,
+                                .returned = batch_return_name,
+                            });
 
                             std::string tier_terminal = batch_return_name;
                             if (dispatch_ticket_storage &&
@@ -10244,6 +10253,8 @@ namespace llaminar2
                             last_return_reduce = tier_terminal;
                             first_return_scatter = false;
                         }
+                        if (!rank_batch_lanes.empty())
+                            wireMoEOverlayRankBatchForkJoin(graph, rank_batch_lanes);
                         if (local_rank_participants.empty())
                             continue;
 
@@ -12129,6 +12140,20 @@ namespace llaminar2
                     {
                         ordered_reduce_dependency =
                             local_canonical_ticket_terminal;
+                    }
+                    else if (!last_return_reduce.empty())
+                    {
+                        /*
+                         * Portable MPI returns use a separate dense buffer.
+                         * Keep the local fold in the captured ingress suffix,
+                         * after that return, so host ticket parsing and all
+                         * rank-batch service remain one contiguous manual unit.
+                         * An independent fold here would split host parsing
+                         * from MPI dispatch with a needless GPU launch. Local
+                         * expert computation still runs in the producer graph;
+                         * this DAG edge introduces no stream synchronization.
+                         */
+                        ordered_reduce_dependency = last_return_reduce;
                     }
 
                     MoECanonicalRouteReduceStage::Params reduce_params;

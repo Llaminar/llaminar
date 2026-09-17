@@ -15,6 +15,7 @@
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../../loaders/ModelContext.h"
+#include "../../loaders/PreparedWeightStore.h"
 #include "../../utils/Logger.h"
 #include "../../utils/MPIContext.h"
 
@@ -102,7 +103,13 @@ namespace llaminar2
         StageBuildContext context;
         context.model_ctx = model_ctx;
         context.mpi_ctx = mpi_ctx;
-        context.runner_config = InferenceRunnerConfig::fromPlan(plan);
+        context.runtime = plan.runtime;
+        const auto weights = model_ctx->concreteWeightManager();
+        if (!weights)
+            throw std::logic_error("Named-domain graph requires the model-owned weight manager");
+        context.prepared_weight_store = weights->preparedWeightStoreIfInitialized();
+        if (!context.prepared_weight_store)
+            context.prepared_weight_store = std::make_shared<PreparedWeightStore>();
         context.domain_registry = &domains;
 
         GlobalOrchestrator::Config global;

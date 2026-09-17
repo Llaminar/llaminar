@@ -286,6 +286,7 @@ namespace llaminar2::test
                 /*domain_id=*/kDomain,
                 /*color=*/0,
                 /*key=*/rank_,
+                GlobalDeviceAddress::cpu(0), // Fixture's declared synthetic endpoint.
                 /*hostfile_path=*/"",
                 CollectiveBackendType::UPI);
             ASSERT_NE(continuation_tp_, nullptr);

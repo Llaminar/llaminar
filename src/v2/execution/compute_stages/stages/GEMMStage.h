@@ -189,6 +189,9 @@ namespace llaminar2
          */
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
+        /** @brief Declare projection scratch and the explicitly selected input transform. */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+
     private:
         Params params_;
 

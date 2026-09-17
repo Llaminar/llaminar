@@ -46,15 +46,8 @@
 #include "WeightLoadProgress.h"
 #include "gpu_pipeline/RepackFormat.h"
 
-// Backend-specific GEMM kernels (for GPU pipeline kernel creation)
 #ifdef HAVE_ROCM
-#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
-#include "../kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "../kernels/rocm/gemm/ROCmWeightPacker.h"
-#endif
-#ifdef HAVE_CUDA
-#include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
-#include "../kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #endif
 #include "../tensors/BlockStructures.h"
 #include <iostream>
@@ -179,7 +172,7 @@ namespace llaminar2
 
         bool hasVnniPackedQuantizedPayload(const TensorBase *tensor)
         {
-            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+            const auto *unpackable = IINT8Unpackable::fromTensor(tensor);
             return unpackable && unpackable->vnniFormatInfo() != nullptr;
         }
 
@@ -3133,8 +3126,8 @@ namespace llaminar2
         return clone;
     }
 
-    bool WeightManager::isReplicatedGpuPreparationSource(
-        const std::string &name) const
+    bool WeightManager::isGpuPreparationSource(
+        const std::string &name, const TensorBase &tensor) const
     {
         /*
          * Expert tensors are deliberately excluded from isGemmWeight(): the
@@ -3143,9 +3136,9 @@ namespace llaminar2
          */
         const bool is_moe_expert =
             name.find("_exps.weight") != std::string::npos;
-        return name == "token_embd.weight" ||
-               is_moe_expert ||
-               isGemmWeight(name);
+        if (inferWeightRole(name) == WeightRole::Embedding)
+            return IINT8Unpackable::fromTensor(&tensor) != nullptr;
+        return is_moe_expert || isGemmWeight(name);
     }
 
     std::shared_ptr<TensorBase> WeightManager::getWeightForDevice(
@@ -3465,8 +3458,8 @@ namespace llaminar2
                 // On GPU, mark tensors HOST_RESIDENT when the TransferEngine
                 // upload would produce a dead copy:
                 //
-                // - token_embd.weight: The embedding kernel reads host data
-                //   to repack into a device workspace; never read on GPU.
+                // - Quantized token_embd.weight: preparation owns EmbedQ8.
+                //   Native FP32/FP16/BF16 tables instead remain raw device reads.
                 //
                 // - GEMM weights (attn_q/k/v/output, ffn_gate/up/down, etc.):
                 //   ROCmQuantisedGemmKernel uploads its own VNNI-repacked copy
@@ -3478,8 +3471,7 @@ namespace llaminar2
                 //   reads host views and batch-packs into VNNI slabs with its own
                 //   GPU upload.  Uploading the raw 3D tensor here wastes ~8 GB/device
                 //   and fragments VRAM, making subsequent hipMalloc calls very slow.
-                const bool is_moe_expert = (name.find("_exps.weight") != std::string::npos);
-                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight || is_moe_expert))
+                if (device.is_gpu() && isGpuPreparationSource(name, *tensor))
                 {
                     tensor->setHostResident();
                 }
@@ -6720,95 +6712,12 @@ namespace llaminar2
             const auto &dense_job = gemm_weights[i];
             const std::string &name = dense_job.name;
             TensorBase *tensor = dense_job.tensor;
-            const auto *vnni = weight_formats[i].second;
             if (!tensor)
                 continue;
 
-            auto slot = pool->getSlot(name);
-            if (!slot)
-            {
-                // Slot missing means this weight wasn't planned (shouldn't happen)
-                if (vnni)
-                    LOG_WARN("[WeightManager] GPU pipeline: no slot for " << name);
-                continue;
-            }
-
-            const int N = static_cast<int>(tensor->rows());
-            const int K = static_cast<int>(tensor->cols());
-
-            std::unique_ptr<ITensorGemm> kernel;
-
-            if (!vnni)
-            {
-                // Floating-point weight: create FP GEMM kernel from raw device pointer
-                const auto type = tensor->native_type();
-#ifdef HAVE_ROCM
-                if (target_device.is_rocm())
-                {
-                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
-                    if (type == TensorType::FP16)
-                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
-                    else if (type == TensorType::BF16)
-                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
-                    kernel = std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
-                        slot->d_native_vnni_payload, N, K,
-                        target_device.ordinal, precision, orchestrator);
-                }
-#endif
-#ifdef HAVE_CUDA
-                if (target_device.is_cuda())
-                {
-                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
-                    if (type == TensorType::FP16)
-                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
-                    else if (type == TensorType::BF16)
-                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
-                    kernel = std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
-                        slot->d_native_vnni_payload, N, K,
-                        target_device.ordinal, precision, orchestrator);
-                }
-#endif
-            }
-            else
-            {
-                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
-
-#ifdef HAVE_ROCM
-                if (target_device.is_rocm())
-                {
-                    kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                        N, K, target_device.ordinal,
-                        slot->d_native_vnni_payload,
-                        slot->d_native_vnni_scales,
-                        slot->d_native_vnni_mins,
-                        slot->d_native_vnni_emins,
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                        orchestrator,
-                        NativeVnniSourceIdentity{
-                            .codebook_id = vnni->codebook_id,
-                            .is_superblock = vnni->is_superblock,
-                            .present = true}); // lifetime owner: keeps VRAM pool alive
-                }
-#endif
-
-#ifdef HAVE_CUDA
-                if (target_device.is_cuda())
-                {
-                    kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                        N, K, target_device.ordinal,
-                        slot->d_native_vnni_payload,
-                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                        orchestrator,
-                        NativeVnniSourceIdentity{
-                            .codebook_id = vnni->codebook_id,
-                            .is_superblock = vnni->is_superblock,
-                            .present = true}); // lifetime owner: keeps VRAM pool alive
-                }
-#endif
-            } // end else (quantized path)
+            // One backend/format binding path is shared with bounded startup samples.
+            auto kernel = llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
+                *tensor, target_device, orchestrator, name);
 
             if (kernel)
             {
@@ -6859,7 +6768,6 @@ namespace llaminar2
         size_t moe_registered = 0;
         for (size_t i = 0; i < moe_jobs.size(); ++i)
         {
-            const auto *vnni = moe_vnni_infos[i];
             const auto &mj = moe_jobs[i];
             const auto &storage = moe_storage_refs[i];
 
@@ -6870,183 +6778,14 @@ namespace llaminar2
                     mj.slot_name);
             }
 
-            auto slot = pool->getSlot(storage.slot_name);
-            if (!slot)
-            {
-                throw std::runtime_error(
-                    "[WeightManager] GPU pipeline has no coalesced pool slot '" +
-                    storage.slot_name + "' for MoE expert " + mj.slot_name);
-            }
-
-            const int N = static_cast<int>(mj.view->rows());
-            const int K = static_cast<int>(mj.view->cols());
-
-            uint8_t *expert_payload = nullptr;
-            void *expert_scales = nullptr;
-            void *expert_mins = nullptr;
-            void *expert_emins = nullptr;
-
-            auto require_region = [&](size_t offset,
-                                      size_t bytes,
-                                      size_t available,
-                                      const char *region)
-            {
-                if (offset > available || bytes > available - offset)
-                {
-                    throw std::runtime_error(
-                        "[WeightManager] GPU pipeline " + std::string(region) +
-                        " subregion exceeds coalesced slot '" + storage.slot_name +
-                        "' for MoE expert " + mj.slot_name);
-                }
-            };
-
-            if (!vnni)
-            {
-                const size_t raw_bytes = mj.view->size_bytes();
-                if (N <= 0 || raw_bytes % static_cast<size_t>(N) != 0)
-                {
-                    throw std::runtime_error(
-                        "[WeightManager] GPU pipeline FP MoE expert has invalid row-byte geometry: " +
-                        mj.slot_name);
-                }
-                const size_t bytes_per_row = raw_bytes / static_cast<size_t>(N);
-                const size_t payload_offset =
-                    static_cast<size_t>(storage.row_offset) * bytes_per_row;
-                require_region(payload_offset, raw_bytes, slot->payload_bytes, "payload");
-                expert_payload = slot->d_native_vnni_payload + payload_offset;
-            }
-            else
-            {
-                const auto allocation = overlay_preparation_plan
-                                            ? reusableDeviceVnniAllocationFormat(
-                                                  *vnni)
-                                            : NativeVnniReusableDeviceAllocationFormat{
-                                                  .payload_bytes_per_block =
-                                                      static_cast<uint8_t>(
-                                                          vnni->payload_bytes),
-                                                  .has_mins =
-                                                      vnni->is_asymmetric,
-                                                  .has_emins =
-                                                      vnni->has_emins,
-                                              };
-                const NativeVnniFormatInfo allocation_format{
-                    .codebook_id = vnni->codebook_id,
-                    .payload_bytes =
-                        allocation.payload_bytes_per_block,
-                    .is_asymmetric = allocation.has_mins,
-                    .is_superblock = vnni->is_superblock,
-                    .has_emins = allocation.has_emins,
-                    .max_abs_factor = vnni->max_abs_factor,
-                };
-                const auto offsets = nativeVnniPackedRegionSizes(
-                    static_cast<size_t>(storage.row_offset),
-                    static_cast<size_t>(K),
-                    allocation_format);
-                const auto lengths = nativeVnniPackedRegionSizes(
-                    static_cast<size_t>(N),
-                    static_cast<size_t>(K),
-                    *vnni);
-
-                require_region(offsets.payload_bytes, lengths.payload_bytes,
-                               slot->payload_bytes, "payload");
-                require_region(offsets.scales_bytes, lengths.scales_bytes,
-                               slot->scales_bytes, "scales");
-                require_region(offsets.mins_bytes, lengths.mins_bytes,
-                               slot->mins_bytes, "mins");
-                require_region(offsets.emins_bytes, lengths.emins_bytes,
-                               slot->emins_bytes, "embedded-mins");
-
-                expert_payload = slot->d_native_vnni_payload + offsets.payload_bytes;
-                expert_scales = slot->d_native_vnni_scales
-                                    ? static_cast<uint8_t *>(slot->d_native_vnni_scales) + offsets.scales_bytes
-                                    : nullptr;
-                expert_mins = slot->d_native_vnni_mins
-                                  ? static_cast<uint8_t *>(slot->d_native_vnni_mins) + offsets.mins_bytes
-                                  : nullptr;
-                expert_emins = slot->d_native_vnni_emins
-                                   ? static_cast<uint8_t *>(slot->d_native_vnni_emins) + offsets.emins_bytes
-                                   : nullptr;
-            }
-
-            std::shared_ptr<ITensorGemm> kernel;
-
-            if (!vnni)
-            {
-                // Floating-point MoE expert: create FP GEMM kernel
-                const auto type = mj.view->native_type();
-#ifdef HAVE_ROCM
-                if (target_device.is_rocm())
-                {
-                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
-                    if (type == TensorType::FP16)
-                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
-                    else if (type == TensorType::BF16)
-                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
-                    kernel = std::make_shared<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
-                        expert_payload, N, K,
-                        target_device.ordinal, precision, orchestrator);
-                }
-#endif
-#ifdef HAVE_CUDA
-                if (target_device.is_cuda())
-                {
-                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
-                    if (type == TensorType::FP16)
-                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
-                    else if (type == TensorType::BF16)
-                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
-                    kernel = std::make_shared<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
-                        expert_payload, N, K,
-                        target_device.ordinal, precision, orchestrator);
-                }
-#endif
-            }
-            else
-            {
-                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
-
-#ifdef HAVE_ROCM
-                if (target_device.is_rocm())
-                {
-                    kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                        N, K, target_device.ordinal,
-                        expert_payload,
-                        expert_scales,
-                        expert_mins,
-                        expert_emins,
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                        orchestrator,
-                        NativeVnniSourceIdentity{
-                            .codebook_id = vnni->codebook_id,
-                            .is_superblock = vnni->is_superblock,
-                            .present = true},
-                        overlay_preparation_plan
-                            ? reusableDeviceVnniAllocationFormat(*vnni)
-                            : NativeVnniReusableDeviceAllocationFormat{});
-                }
-#endif
-
-#ifdef HAVE_CUDA
-                if (target_device.is_cuda())
-                {
-                    kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                        N, K, target_device.ordinal,
-                        expert_payload,
-                        static_cast<uint16_t *>(expert_scales),
-                        static_cast<uint16_t *>(expert_mins),
-                        static_cast<uint32_t *>(expert_emins),
-                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                        orchestrator,
-                        NativeVnniSourceIdentity{
-                            .codebook_id = vnni->codebook_id,
-                            .is_superblock = vnni->is_superblock,
-                            .present = true},
-                        overlay_preparation_plan
-                            ? reusableDeviceVnniAllocationFormat(*vnni)
-                            : NativeVnniReusableDeviceAllocationFormat{});
-                }
-#endif
-            } // end else (quantized path)
+            // Coalesced offsets use the same checked pool-stride contract as
+            // dense weights. Reusable storage is not a different source codebook.
+            std::shared_ptr<ITensorGemm> kernel(
+                llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
+                    *mj.view, target_device, orchestrator, storage.slot_name,
+                    static_cast<size_t>(storage.row_offset), overlay_preparation_plan
+                        ? GPUPreparedWeightPoolLayout::MigrationReusable
+                        : GPUPreparedWeightPoolLayout::SourceNative));
 
             if (kernel)
             {
@@ -7260,7 +6999,7 @@ namespace llaminar2
              * independent binding identities.
              */
             if (binding.identity.role == WeightRole::Embedding &&
-                dynamic_cast<const IINT8Unpackable *>(binding.tensor))
+                IINT8Unpackable::fromTensor(binding.tensor))
             {
                 WeightBinding prepared_binding = binding;
                 prepared_binding.residency.home_device = target_device;
@@ -7321,26 +7060,16 @@ namespace llaminar2
             if (!tensor->gpu_data_ptr() ||
                 !tensor->is_on_device(target_device))
             {
-                /*
-                 * HOST_RESIDENT tensors have an explicit backend-owned
-                 * representation (for example prepared embeddings) and are not
-                 * raw graph weights. Every other exact non-GEMM binding must
-                 * expose valid storage on its declared device now.
-                 */
-                if (tensor->memoryResidency() != MemoryResidency::HOST_RESIDENT)
-                {
-                    markPrepState(
-                        name,
-                        target_device,
-                        WeightPrepState::FAILED,
-                        false,
-                        "frozen non-GEMM binding lacks exact device residency");
-                    throw std::runtime_error(
-                        "[WeightManager] Exact frozen non-GEMM binding '" + name +
-                        "' was not resident on " + target_device.to_string() +
-                        " after preparation");
-                }
-                continue;
+                // Prepared representations were handled by their typed roles
+                // above. A HOST_RESIDENT flag alone cannot excuse a missing raw
+                // graph operand, especially for native floating embeddings.
+                markPrepState(
+                    name, target_device, WeightPrepState::FAILED, false,
+                    "frozen non-GEMM binding lacks exact device residency");
+                throw std::runtime_error(
+                    "[WeightManager] Exact frozen non-GEMM binding '" + name +
+                    "' was not resident on " + target_device.to_string() +
+                    " after preparation; a raw graph weight cannot be host-only");
             }
 
             markPrepState(
@@ -9085,7 +8814,7 @@ namespace llaminar2
             const bool share_preparation_source =
                 cached &&
                 device.is_gpu() &&
-                isReplicatedGpuPreparationSource(name);
+                isGpuPreparationSource(name, *cached);
             if (share_preparation_source)
             {
                 cached->setHostResident();

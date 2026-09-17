@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cctype>
 #include <numeric>
+#include <limits>
 #include <cmath>
 #include <set>
 #include <unordered_map>
@@ -26,6 +27,18 @@
 
 namespace llaminar2
 {
+
+    std::optional<size_t> OrchestrationConfig::memoryLimitBytes(DeviceType backend) const
+    {
+        if (backend != DeviceType::CPU && backend != DeviceType::CUDA && backend != DeviceType::ROCm)
+            throw std::invalid_argument("Memory limits require CPU, CUDA or ROCm storage");
+        const auto &mib = backend == DeviceType::CPU ? max_cpu_memory_mb : max_gpu_memory_mb;
+        constexpr size_t bytes_per_mib = 1024u * 1024u;
+        if (!mib) return std::nullopt;
+        if (*mib > std::numeric_limits<size_t>::max() / bytes_per_mib)
+            throw std::overflow_error("Configured memory limit overflows size_t");
+        return *mib * bytes_per_mib;
+    }
 
     // =========================================================================
     // Enum to String Conversions
@@ -626,6 +639,16 @@ namespace llaminar2
          */
         if (!plan.routed_tiers.empty())
         {
+            // Resolve omitted roles from the same integer ordering used by
+            // residency. An explicit continuation/shared choice always wins.
+            const auto preferred = std::min_element(
+                plan.routed_tiers.begin(), plan.routed_tiers.end(),
+                [](const RoutedExpertTier &lhs, const RoutedExpertTier &rhs)
+                { return lhs.priority < rhs.priority; });
+            if (plan.continuation_domain.empty())
+                plan.continuation_domain = preferred->domain;
+            if (plan.shared_expert_domain.empty())
+                plan.shared_expert_domain = plan.continuation_domain;
             auto coverage = std::max_element(
                 plan.routed_tiers.begin(),
                 plan.routed_tiers.end(),
@@ -681,6 +704,21 @@ namespace llaminar2
 
         if (!errors.empty())
             return errors;
+
+        if (plan.continuation_dense_policy_intent == MoEContinuationDensePolicyIntent::Automatic)
+        {
+            const auto continuation = index_by_name.find(plan.continuation_domain);
+            if (continuation != index_by_name.end())
+            {
+                // Multiple continuation participants use the installed TP
+                // policy, including NodeTP CPU pools. Replicating full dense
+                // weights requires an explicit policy and its corresponding BOM.
+                plan.continuation_domain_spec.setDensePolicy(
+                    inventory[continuation->second].participants.size() > 1u
+                        ? DenseParallelPolicy::TensorParallel
+                        : DenseParallelPolicy::Replicated);
+            }
+        }
 
         config.domain_definitions.clear();
         config.domain_definitions.reserve(inventory.size());
@@ -967,6 +1005,8 @@ namespace llaminar2
     std::vector<std::string> OrchestrationConfig::validate() const
     {
         std::vector<std::string> errors;
+        if (prefill_max_bucket_size && *prefill_max_bucket_size <= 0)
+            errors.push_back("Prefill maximum bucket size must be positive");
 
         // =====================================================================
         // Device Selection Validation (declarative rule framework)
@@ -1355,6 +1395,14 @@ namespace llaminar2
     {
         std::ostringstream oss;
         oss << "OrchestrationConfig {\n";
+        if (execution_rank_selection)
+        {
+            oss << "  execution_discovery_ranks: [";
+            const auto &ranks = execution_rank_selection->discoveryRanks();
+            for (size_t index = 0; index < ranks.size(); ++index)
+                oss << (index ? ", " : "") << ranks[index];
+            oss << "]\n";
+        }
 
         // Introspection flags
         if (dry_run)
@@ -1369,6 +1417,8 @@ namespace llaminar2
             oss << "  validate_only: true\n";
 
         // Device assignment
+        if (prefill_max_bucket_size)
+            oss << "  prefill_max_bucket_size: " << *prefill_max_bucket_size << "\n";
         oss << "  device_mode: " << deviceAssignmentModeToString(device_mode) << "\n";
         if (device_for_this_rank)
         {

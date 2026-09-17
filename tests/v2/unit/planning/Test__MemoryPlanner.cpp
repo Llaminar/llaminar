@@ -18,6 +18,9 @@
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "backends/DeviceId.h"
 
@@ -63,8 +66,8 @@ namespace
             p.tensors.push_back(t);
         };
 
-        addTensor("token_embd.weight", 896, 151936, "Q8_0");
-        addTensor("output.weight", 896, 151936, "Q8_0");
+        addTensor("token_embd.weight", 151936, 896, "Q8_0");
+        addTensor("output.weight", 151936, 896, "Q8_0");
         addTensor("output_norm.weight", 1, 896, "F32");
 
         for (int layer = 0; layer < 24; ++layer)
@@ -207,6 +210,7 @@ namespace
     {
         DevicePlanConfig config;
         config.device = device;
+        config.cpu_execution = device.is_cpu() ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
         config.device_compute_units = device.is_cuda() ? 82 : 60;
         config.device_total_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
         config.device_free_bytes = config.device_total_bytes;
@@ -629,6 +633,7 @@ TEST(Test__MemoryPlanner,
 
     DevicePlanConfig cpu_cfg = cfg;
     cpu_cfg.device = DeviceId::cpu();
+    cpu_cfg.cpu_execution = test::kSyntheticCPUExecutionGeometry;
     const auto cpu_plan = MemoryPlanner::plan(profile, {cpu_cfg});
     ASSERT_EQ(cpu_plan.devices.size(), 1u);
     EXPECT_EQ(
@@ -692,9 +697,10 @@ TEST(Test__MemoryPlanner, TerminalParticipantOwnsTrailingMTPWeights)
 
 TEST(Test__MemoryPlanner, GPUActivationBufferSizing_UsesLargestPrefillBucket)
 {
-    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::cuda(0)), 4096);
-    EXPECT_EQ(resolveActivationBufferSeqLen(2048, DeviceId::cuda(0)), 2048);
-    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::rocm(0)), 4096);
+    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::cuda(0)), 512);
+    EXPECT_EQ(resolveActivationBufferSeqLen(2048, DeviceId::cuda(0)), 512);
+    EXPECT_EQ(resolveActivationBufferSeqLen(256, DeviceId::cuda(0)), 256);
+    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::rocm(0)), 512);
     EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::cpu()), 131072);
 }
 
@@ -880,7 +886,8 @@ TEST(Test__MemoryPlanner,
                     /*two prefill + decode + prefix bridge + four MTP forwards=*/8u,
                 .model_graph_topology_variant_count = 1u,
                 .auxiliary_executable_count =
-                    owner_plan.generalAuxiliaryExecutableSlotCount(),
+                    owner_plan.generalAuxiliaryExecutableSlotCount() +
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(cfg.device, true),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));
@@ -1278,6 +1285,7 @@ TEST(Test__MemoryPlanner, CertifiedRetainedWeightsUseIncrementalAdmissionOnCPUAn
         DevicePlanConfig config;
         config.device = device;
         config.device_compute_units = device.is_cpu() ? 32 : 82;
+        config.cpu_execution = device.is_cpu() ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
         config.device_total_bytes = 24ULL * 1024ULL * 1024ULL * 1024ULL;
         config.device_free_bytes = config.device_total_bytes;
         config.batch_size = 1;
@@ -1550,6 +1558,27 @@ TEST(Test__MemoryPlanner,
         << "Protocol payload capacity is not a second physical GPU buffer";
 }
 
+/** @test Native PP owns only its fence; it does not borrow TP conversion capacity. */
+TEST(Test__MemoryPlanner, NativePipelineFenceAccountingIsBackendSymmetric)
+{
+    const auto profile = createTestProfile();
+    for (auto backend : {CollectiveBackendType::NCCL, CollectiveBackendType::RCCL})
+    {
+        DevicePlanConfig config;
+        config.device = backend == CollectiveBackendType::NCCL ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        config.device_total_bytes = config.device_free_bytes = 64ull << 30;
+        config.device_compute_units = 128;
+        config.max_seq_len = 256;
+        const auto before = MemoryPlanner::plan(profile, {config}).physicalPlan().totalBytes();
+        config.local_pipeline_backend = backend;
+        const auto after = MemoryPlanner::plan(profile, {config}).physicalPlan().totalBytes();
+        EXPECT_EQ(after - before, CollectiveMemoryEstimator::nativePipelineBoundaryBytes(backend));
+        EXPECT_EQ(after - before, sizeof(int32_t));
+    }
+    EXPECT_THROW((void)CollectiveMemoryEstimator::nativePipelineBoundaryBytes(CollectiveBackendType::AUTO), std::invalid_argument);
+    EXPECT_THROW((void)CollectiveMemoryEstimator::nativePipelineBoundaryBytes(CollectiveBackendType::HOST), std::invalid_argument);
+}
+
 TEST(Test__MemoryPlanner,
      MirroredTerminalHeadIsPricedForSerialOracleWhenMTPIsOff)
 {
@@ -1599,6 +1628,58 @@ TEST(Test__MemoryPlanner,
         planned.devices.front().additional_weight_bytes(),
         mirrored.prepared_embedding_bytes + mirrored.lm_head_bytes)
         << "Serial decode and grouped MTP must retain the same mirrored terminal surface.";
+}
+
+/**
+ * @brief Admit native mirrored tables beside primary shards through the one BOM.
+ *
+ * The old embedding component counted only EmbedQ8 and silently contributed
+ * zero for native floating tables. Both GPU backends must price the full
+ * physical view at every TP degree, independent of how small its primary
+ * vocabulary shard is. This is device-free metadata admission, not a ledger.
+ */
+TEST(Test__MemoryPlanner, NativeMirroredVocabularyIsNotFreeAtAnyTPDegree)
+{
+    for (const auto &format : {"F32", "F16", "BF16"})
+    {
+        auto profile = createTestProfile();
+        const size_t element_bytes = std::string(format) == "F32" ? 4u : 2u;
+        for (auto &tensor : profile.tensors)
+        {
+            if (tensor.name != "token_embd.weight" && tensor.name != "output.weight")
+                continue;
+            profile.total_native_bytes -= tensor.native_bytes;
+            tensor.quant_type = format;
+            tensor.native_bytes = tensor.elements * element_bytes;
+            profile.total_native_bytes += tensor.native_bytes;
+        }
+        for (const DeviceType backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            for (int degree = 2; degree <= 8; ++degree)
+            {
+                SCOPED_TRACE(std::string(format) + " " + DeviceId(backend, 0).toString() +
+                             " degree=" + std::to_string(degree));
+                DevicePlanConfig config;
+                config.device = DeviceId(backend, 0);
+                config.device_total_bytes = 64ULL << 30u;
+                config.device_free_bytes = config.device_total_bytes;
+                config.device_compute_units = 64;
+                config.total_shards = degree;
+                config.local_tp_backend = backend == DeviceType::CUDA
+                    ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                config.first_layer = 0;
+                config.last_layer = profile.n_layers - 1;
+                config.max_seq_len = 64;
+                config.additional_weight_sets = {
+                    AdditionalPersistentWeightSet::MirroredDecodeEmbedding,
+                    AdditionalPersistentWeightSet::MirroredMTPTerminalHead};
+                const auto planned = MemoryPlanner::plan(profile, {config});
+                ASSERT_EQ(planned.devices.size(), 1u);
+                EXPECT_EQ(planned.devices.front().additional_weight_bytes(),
+                          2u * static_cast<size_t>(profile.vocab_size) * profile.d_model * element_bytes);
+            }
+        }
+    }
 }
 
 /**
@@ -1842,8 +1923,7 @@ TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
 
     EXPECT_EQ(pp_plan.devices.size(), 2u);
 
-    // Each PP stage should have roughly half the weights of the full model
-    // (plus replicated embedding/lm_head/norms, so > 50% each)
+    // Each PP stage owns only its layer interval and actual global endpoints.
     DevicePlanConfig full;
     full.device = DeviceId::cuda(0);
     full.device_compute_units = 82;
@@ -1861,6 +1941,128 @@ TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
     // Each stage should have half the KV cache layers (12 vs 24)
     EXPECT_LT(pp_plan.devices[0].kv_cache_bytes(), full_plan.devices[0].kv_cache_bytes());
     EXPECT_EQ(pp_plan.devices[0].kv_cache_bytes(), pp_plan.devices[1].kv_cache_bytes());
+}
+
+/** @brief PMA receives each PP stage's actual endpoint weights, not full-model globals. */
+TEST(Test__MemoryPlanner, PipelineWeightBOMPartitionsEndpointsAndMirrors)
+{
+    const auto profile = createTestProfile();
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (int degree : {1, 2, 4, 8})
+        {
+            SCOPED_TRACE(std::to_string(static_cast<int>(backend)) + ":" + std::to_string(degree));
+            DevicePlanConfig cfg;
+            cfg.device = DeviceId(backend, 0);
+            cfg.device_compute_units = 60;
+            cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+            cfg.max_seq_len = 64;
+            cfg.total_shards = degree;
+            if (degree > 1)
+                cfg.additional_weight_sets = {AdditionalPersistentWeightSet::MirroredDecodeEmbedding,
+                                              AdditionalPersistentWeightSet::MirroredMTPTerminalHead};
+            const auto full = MemoryPlanner::plan(profile, {cfg}).devices.front().total_weight_bytes();
+            size_t stages = 0;
+            for (int stage = 0; stage < 3; ++stage)
+            {
+                cfg.first_layer = stage * 8;
+                cfg.last_layer = stage * 8 + 7;
+                cfg.owns_embedding = stage == 0;
+                stages += MemoryPlanner::plan(profile, {cfg}).devices.front().total_weight_bytes();
+            }
+            EXPECT_EQ(stages, full) << "A three-stage pipeline must not clone vocabulary weights or mirrors";
+        }
+}
+
+/**
+ * @brief PP followers retain main rollback state, never another shifted predictor.
+ *
+ * CPU and both GPU BOMs must use the same ownership rule. A follower still
+ * verifies speculative rows in its own layers, so clearing MTP entirely would
+ * under-admit rollback state even though it removes the excess shifted cache.
+ */
+TEST(Test__MemoryPlanner, PipelineFollowersRetainRollbackButNotPredictorCaches)
+{
+    auto profile = createTestProfile();
+    profile.mtp_layer_count = 1;
+    ++profile.n_layers;
+    auto predictor = profile.tensors[3];
+    predictor.name = "blk.24.attn_q.weight";
+    predictor.layer_index = 24;
+    profile.tensors.push_back(predictor);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const std::string precision : {"fp32", "fp16"})
+            for (const int degree : {1, 2})
+                for (int stage = 0; stage < 3; ++stage)
+                {
+                    SCOPED_TRACE(device.toString() + ":" + precision + ":" +
+                                 std::to_string(degree) + ":" + std::to_string(stage));
+                    DevicePlanConfig cfg;
+                    cfg.device = device;
+                    cfg.cpu_execution = device.is_cpu()
+                        ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
+                    cfg.device_compute_units = 60;
+                    cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+                    cfg.max_seq_len = 64;
+                    cfg.kv_precision = precision;
+                    cfg.total_shards = degree;
+                    cfg.first_layer = stage * 8;
+                    cfg.last_layer = stage * 8 + 7;
+                    cfg.owns_embedding = stage == 0;
+                    const auto ordinary = MemoryPlanner::plan(profile, {cfg}).devices.front();
+                    cfg.mtp_enabled = true;
+                    const auto speculative = MemoryPlanner::plan(profile, {cfg}).devices.front();
+                    if (stage == 2)
+                        EXPECT_GT(speculative.kv_cache_bytes(), ordinary.kv_cache_bytes());
+                    else
+                        EXPECT_EQ(speculative.kv_cache_bytes(), ordinary.kv_cache_bytes())
+                            << "A nonterminal stage owns no learned predictor";
+                    EXPECT_GT(speculative.checkpoint_state_bytes(), ordinary.checkpoint_state_bytes())
+                        << "Every main-model stage still owns rollback state";
+                    if (device.is_gpu())
+                        EXPECT_EQ(speculative.sequence_metadata_bytes(),
+                                  static_cast<size_t>(4 * (8 + (stage == 2 ? 1 : 0)) + 8) *
+                                      2 * sizeof(int32_t));
+                }
+}
+
+/** @brief Only the pipeline tail owns learned predictor weights and its token lookup. */
+TEST(Test__MemoryPlanner, PipelinePredictorWeightsBelongOnlyToTheTerminalStage)
+{
+    auto profile = createTestProfile();
+    profile.mtp_layer_count = 1;
+    ++profile.n_layers;
+    auto predictor = profile.tensors[3];
+    predictor.name = "blk.24.attn_q.weight";
+    predictor.layer_index = 24;
+    profile.tensors.push_back(predictor);
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = DeviceId(backend, 0);
+        cfg.device_compute_units = 60;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+        cfg.max_seq_len = 64;
+        cfg.total_shards = 2;
+        cfg.mtp_enabled = true;
+        cfg.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedMTPSidecarDense};
+        cfg.first_layer = 0;
+        cfg.last_layer = 11;
+        const auto entry = MemoryPlanner::plan(profile, {cfg}).devices.front();
+        EXPECT_EQ(entry.additional_weight_bytes(), 0u);
+
+        cfg.first_layer = 12;
+        cfg.last_layer = 23;
+        cfg.owns_embedding = false;
+        const auto terminal = MemoryPlanner::plan(profile, {cfg}).devices.front();
+        const auto primary = WeightMemoryEstimator::estimate(profile, cfg.device, 0, 2,
+            12, 24, {}, {}, WeightComponentScope::EmbeddingAndTerminal);
+        const auto replica = WeightMemoryEstimator::estimate(profile, cfg.device, 0, 1,
+            24, 24, {}, {}, WeightComponentScope::LayersOnly);
+        EXPECT_EQ(terminal.weight_bytes(), primary.device_bytes);
+        EXPECT_EQ(terminal.total_weight_bytes(), primary.device_bytes + replica.device_bytes);
+        EXPECT_EQ(terminal.additional_weight_bytes(), replica.device_bytes);
+        EXPECT_GT(replica.device_bytes, 0u);
+    }
 }
 
 TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
@@ -1979,6 +2181,7 @@ TEST(Test__MemoryPlanner, CPUOnly_AttentionWorkspaceUsesPhysicalWorkerBOM)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cpu();
+    cfg.cpu_execution = test::kSyntheticCPUExecutionGeometry;
     cfg.device_total_bytes = 128ULL * 1024 * 1024 * 1024;
     cfg.device_free_bytes = 64ULL * 1024 * 1024 * 1024;
     cfg.device_compute_units = 28;
@@ -1988,13 +2191,29 @@ TEST(Test__MemoryPlanner, CPUOnly_AttentionWorkspaceUsesPhysicalWorkerBOM)
 
     auto plan = MemoryPlanner::plan(profile, {cfg});
 
-    const auto expected = attention_workspace::cpuParallelRequirements({
+    auto expected = attention_workspace::cpuParallelRequirements({
         .compact_query_rows =
             attention::kMaxGroupedVerifierAttentionRows,
         .local_query_heads = profile.n_heads,
         .head_dim = profile.head_dim,
         .worker_count = cfg.device_compute_units,
     });
+    // Attention and the named FFN transform coexist in the graph workspace;
+    // layer-serial transforms share one tile rather than one tile per layer.
+    expected.merge(cpuSwiGLUWorkspaceRequirements(
+        cfg.batch_size * cfg.max_seq_len, profile.d_ff));
+    expected.merge(cpuProjectionQ8WorkspaceRequirements(
+        cfg.batch_size * cfg.max_seq_len, profile.d_ff));
+    // All ordinary projections contribute their common name maximum. Terminal
+    // projection has one live sampling row, not the prefill family's row count.
+    for (const auto &tensor : profile.tensors)
+    {
+        if (tensor.quant_type != "Q8_0" || tensor.name == "token_embd.weight") continue;
+        expected.merge(CPUProjectionWorkspaceContract::sourceNative(tensor.quant_type, {
+            .rows = tensor.name == "output.weight" ? 1 : cfg.batch_size * cfg.max_seq_len,
+            .n = static_cast<int>(tensor.elements / tensor.K), .k = static_cast<int>(tensor.K),
+            .workers = cfg.device_compute_units, .execution = cfg.cpu_execution}));
+    }
     EXPECT_EQ(
         plan.devices[0].workspace_bytes(),
         expected.total_bytes_with_alignment());
@@ -2385,6 +2604,29 @@ TEST(Test__MemoryPlanner, CpuExpertParticipantUsesTheSameResidentTicketBucket)
     EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len(), 32);
     EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len(), 32)
         << "CPU cold endpoints consume the same segmented ticket geometry as captured GPU participants";
+    ASSERT_EQ(selected.device_inputs.size(), 2u);
+    EXPECT_EQ(selected.device_inputs[0].activation_seq_len, 32);
+    EXPECT_EQ(selected.device_inputs[1].activation_seq_len, 32);
+}
+
+TEST(Test__MemoryPlanner, SelectedInputsPreserveCPUContinuationCapacityBesideGPUBuckets)
+{
+    const auto profile = createMoEOverlayProfile();
+    for (auto gpu : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto accelerator = overlayDeviceConfig(gpu);
+        auto cpu = overlayDeviceConfig(DeviceId::cpu());
+        cpu.max_seq_len = 512;
+        cpu.activation_seq_len = 512;
+        const auto selected = MemoryPlanner::planLargestFittingResidentGraphRows(profile, {accelerator, cpu}, {16, 32});
+        ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
+        ASSERT_EQ(selected.device_inputs.size(), 2u);
+        EXPECT_EQ(selected.device_inputs[0].activation_seq_len, 32);
+        EXPECT_EQ(selected.device_inputs[1].activation_seq_len, 512);
+        EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len(), 512);
+        const auto replay = MemoryPlanner::plan(profile, selected.device_inputs);
+        EXPECT_FALSE(replay.admit().plan().requiredFootprintMismatch(selected.memory_plan.admit().plan()));
+    }
 }
 
 /**
@@ -2435,6 +2677,7 @@ TEST(Test__MemoryPlanner,
 
     DevicePlanConfig cpu = diagnostic;
     cpu.device = DeviceId::cpu();
+    cpu.cpu_execution = test::kSyntheticCPUExecutionGeometry;
     const auto cpu_plan = MemoryPlanner::plan(profile, {cpu});
     ASSERT_EQ(cpu_plan.devices.size(), 1u);
     EXPECT_EQ(cpu_plan.devices.front().graph_snapshot_bytes(), 0u);
@@ -2508,6 +2751,7 @@ TEST(Test__MemoryPlanner, EffectiveKVSnapshotSelectionRespectsLayerOwnership)
     cfg.graph_snapshot_memory.effective_kv.reset();
     EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 128u);
     cfg.device = DeviceId::cpu();
+    cfg.cpu_execution = test::kSyntheticCPUExecutionGeometry;
     EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().graph_snapshot_bytes(), 0u);
 }
 

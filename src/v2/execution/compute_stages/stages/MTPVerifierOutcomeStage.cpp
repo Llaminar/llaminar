@@ -1,6 +1,12 @@
 /**
  * @file MTPVerifierOutcomeStage.cpp
  * @brief Implementation of graph-owned MTP verifier outcome publication.
+ *
+ * Participant-local reduction consumes full-vocabulary logits on their exact
+ * captured stream. Typed speculative history binds both the uncommitted branch
+ * and its resident active width; it cannot enter ordinary committed-only
+ * sampling when either input is missing. Persistent arena mailboxes carry the
+ * result directly to the device controller without a host sampling boundary.
  */
 
 #include "MTPVerifierOutcomeStage.h"
@@ -138,14 +144,15 @@ namespace llaminar2
             return false;
         }
 
-        if (!backend->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+        if (!backend->enqueueArgmaxF32RowsWithHistoryDevice(
                 logits,
                 params_.verifier_row_count,
                 params_.vocab_size,
-                params_.binding.verifier_input_tokens_device,
-                params_.binding.generated_token_counts_device,
-                params_.binding.penalty_policy_device,
-                params_.binding.active_verifier_row_count_device,
+                GenerationPenaltyHistory::speculative(
+                    params_.binding.generated_token_counts_device,
+                    params_.binding.penalty_policy_device,
+                    params_.binding.verifier_input_tokens_device,
+                    params_.binding.active_verifier_row_count_device),
                 params_.device_id.gpu_ordinal(),
                 stream,
                 params_.binding.argmax_values_device,

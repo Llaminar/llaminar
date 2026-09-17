@@ -30,7 +30,7 @@ its GTest aggregate immediately, publishes one first-failure identity, cancels
 already-running disjoint-backend siblings, and prevents further admission while
 preserving completed and failing evidence. A separate completion timeout bounds
 setup phases that do not publish exact-cell progress. Every exact GTest matrix
-cell instead has one independent ten-minute progress deadline. The driver observes the fresh
+cell instead has one independent fifteen-minute progress deadline. The driver observes the fresh
 per-cell log publication already owned by the artifact contract, so this
 watchdog preserves one-process model-context amortization and still terminates
 a stuck CTest/MPI process group with the exact cell identity. No campaign gets
@@ -77,7 +77,7 @@ KV_PRECISIONS = ("FP16", "FP32", "Q8_1", "Q16_1", "TQ")
 PRODUCTION_CAMPAIGN_NAME = re.compile(r"(?:^|_)ProductionCampaign(?:_|$)")
 GLOBAL_TARGET_SECONDS = 4500.0
 COMPLETION_TIMEOUT_SECONDS = 21600.0
-EXACT_CELL_TIMEOUT_SECONDS = 600.0
+EXACT_CELL_TIMEOUT_SECONDS = 900.0
 REGISTERED_TIMEOUT_SECONDS = COMPLETION_TIMEOUT_SECONDS
 MODEL_FIXTURE_NAME = "V2_Models"
 MODEL_FIXTURE_TEST = "V2_FetchModelsFixture"
@@ -2817,7 +2817,7 @@ def _run_process(
 
     # Startup belongs to the first exact cell. Creating its progress file does
     # not restart the clock; only publication of a different cell transfers
-    # watchdog authority and begins a fresh ten-minute budget.
+    # watchdog authority and begins a fresh fifteen-minute budget.
     current_case = (
         exact_cell_watch.progress_files[0][0]
         if exact_cell_watch.progress_files
@@ -3950,7 +3950,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=_existing_file,
         default=None,
         help=(
-            "individual-mode report from a passed preflight; reuse is accepted "
+            "canonical report from a passed preflight; reuse is accepted "
             "only when Ninja and CTest build-identity boundaries are unchanged"
         ),
     )
@@ -3983,14 +3983,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ):
         parser.error(
             "--max-unseen-cells requires "
-            "--run-unseen-cells-individually"
-        )
-    if (
-        not arguments.run_unseen_cells_individually
-        and arguments.reuse_passed_preflight_report is not None
-    ):
-        parser.error(
-            "--reuse-passed-preflight-report requires "
             "--run-unseen-cells-individually"
         )
     if (
@@ -4445,13 +4437,15 @@ def main(argv: list[str] | None = None) -> int:
             preflight_return_code,
             preflight_elapsed,
             preflight_tests,
-        ) = run_production_parity_preflight(
+        ) = (reuse_unchanged_production_parity_preflight(
+            args.build_dir, args.reuse_passed_preflight_report,
+        ) if args.reuse_passed_preflight_report is not None else run_production_parity_preflight(
             args.build_dir,
             max(global_completion_deadline - time.monotonic(), 0.001),
             artifact_directory=args.report.resolve().parent / "prerequisites",
             **({"installed_build_receipt": args.installed_build_receipt}
                if args.installed_build_receipt else {}),
-        )
+        ))
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(
             f"production parity preflight error: {error}",

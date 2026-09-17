@@ -9,7 +9,7 @@
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeVNNI_GEMV
  */
-
+#include "../../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -29,7 +29,6 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
-
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #ifdef HAVE_ONEDNN
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
@@ -46,6 +45,7 @@
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/NativeVNNIEquivalenceInventory.h"
 #include "utils/VerifierRowTestInventory.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -53,6 +53,36 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /** Prove integer activation packing independently of serial/grouped kernel agreement. */
+    TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
+    {
+        Q8_1Block block{};
+        block.d = 0x3456;
+        block.sum_qs = -321;
+        for (int offset = 0; offset <= 28; ++offset)
+        for (int lane = 0; lane < 4; ++lane)
+        for (int value = -128; value <= 127; ++value)
+        {
+            // Distinct neighboring lanes catch word-wide carries, lane swaps,
+            // alignment assumptions and accidental changes to scale metadata.
+            for (int i = 0; i < 32; ++i)
+                block.qs[i] = static_cast<int8_t>((i * 73 + 19) % 256 - 128);
+            block.qs[offset + lane] = static_cast<int8_t>(value);
+            const auto before = block;
+            std::array<uint8_t, 4> expected{};
+            for (int i = 0; i < 4; ++i)
+                expected[i] = static_cast<uint8_t>(static_cast<int>(block.qs[offset + i]) + 128);
+            const int32_t avx2 = pack_q8_1_unsigned_word_avx2(block, offset);
+            ASSERT_EQ(std::memcmp(&avx2, expected.data(), expected.size()), 0)
+                << "offset=" << offset << " lane=" << lane << " value=" << value;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+            const int32_t avx512 = pack_q8_1_unsigned_word(block, offset);
+            ASSERT_EQ(std::memcmp(&avx512, expected.data(), expected.size()), 0);
+#endif
+            ASSERT_EQ(std::memcmp(&block, &before, sizeof(block)), 0);
+        }
+    }
+
     std::filesystem::path qwen36DenseModelPath()
     {
         if (const char *env = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL"))
@@ -380,7 +410,9 @@ namespace
         FP32Tensor A_tensor(std::vector<size_t>{(size_t)M, (size_t)K});
         std::memcpy(A_tensor.mutable_data(), A_data, (size_t)M * K * sizeof(float));
         FP32Tensor C_tensor(std::vector<size_t>{(size_t)M, (size_t)N});
-        bool ok = kernel.multiply_tensor(&A_tensor, &C_tensor, M, N, K);
+        CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel}));
+        bool ok = kernel.multiply_tensor(&A_tensor, &C_tensor, M, N, K,
+            true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
         if (ok)
             std::memcpy(C_data, C_tensor.data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -822,6 +854,11 @@ namespace
         gates.reserve(workers);
         ups.reserve(workers);
         expected.resize(workers);
+        const auto requirements = shared_kernel.getWorkspaceRequirements(3);
+        CPUProjectionTestWorkspace reference_workspace(3, K, requirements);
+        std::vector<std::unique_ptr<CPUProjectionTestWorkspace>> workspaces;
+        for (int worker = 0; worker < workers; ++worker)
+            workspaces.push_back(std::make_unique<CPUProjectionTestWorkspace>(3, K, requirements));
 
         CPUNativeVNNIGemmKernel reference_kernel(weights.get());
         ASSERT_TRUE(reference_kernel.isValid());
@@ -835,7 +872,8 @@ namespace
 
             FP32Tensor output({static_cast<size_t>(m), static_cast<size_t>(N)});
             ASSERT_TRUE(reference_kernel.multiply_tensor_with_fused_swiglu(
-                gates.back().get(), ups.back().get(), &output, m, N, K));
+                gates.back().get(), ups.back().get(), &output, m, N, K,
+                1.0f, 0.0f, reference_workspace.get()));
             expected[worker].assign(output.data(), output.data() + output.numel());
         }
 
@@ -858,7 +896,8 @@ namespace
                                      for (int iter = 0; iter < iterations; ++iter)
                                      {
                                          if (!shared_kernel.multiply_tensor_with_fused_swiglu(
-                                                 gates[worker].get(), ups[worker].get(), &output, m, N, K))
+                                                 gates[worker].get(), ups[worker].get(), &output, m, N, K,
+                                                 1.0f, 0.0f, workspaces[worker]->get()))
                                          {
                                              failed.store(true, std::memory_order_release);
                                              return;
@@ -930,7 +969,11 @@ namespace
                 N};
         }
 
-        ASSERT_TRUE(kernels[0]->multiply_fused_expert_down(descs.data(), experts, 1, K));
+        WorkspaceRequirements requirements;
+        for (const auto &kernel : kernels)
+            requirements.merge(kernel->getWorkspaceRequirements(experts));
+        CPUProjectionTestWorkspace workspace(experts, K, requirements);
+        ASSERT_TRUE(kernels[0]->multiply_fused_expert_down(descs.data(), experts, 1, K, workspace.get()));
 
         for (int expert = 0; expert < experts; ++expert)
         {
@@ -1102,6 +1145,7 @@ namespace
                     0.0f);
                 std::vector<float> serial(grouped.size(), 0.0f);
                 std::vector<float> serial_fp32_input(grouped.size(), 0.0f);
+                std::vector<Q8_1Block> serial_q8(blocks_per_row);
                 CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc
                     descriptor{
                         .kernel = &kernel,
@@ -1116,7 +1160,8 @@ namespace
                 ASSERT_TRUE(
                     CPUNativeVNNIGemmKernel::
                         multiply_batched_preq_decode_equivalent(
-                            &descriptor, 1, K));
+                            &descriptor, 1, K,
+                            llaminar2::test::NativeVNNITestPartialStorage(&descriptor, 1, M).span()));
 
                 for (int row = 0; row < M; ++row)
                 {
@@ -1124,7 +1169,7 @@ namespace
                         packed,
                         quantized.data() +
                             static_cast<size_t>(row) * blocks_per_row,
-                        serial.data() + static_cast<size_t>(row) * N,
+                        serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                         ISAPath::AUTO);
                     // The ordinary entrypoint must publish the same Q8 bytes
                     // as grouped execution. Prequantized-only comparisons
@@ -1132,7 +1177,7 @@ namespace
                     gemv_native_vnni(
                         packed,
                         input.data() + static_cast<size_t>(row) * K,
-                        serial_fp32_input.data() + static_cast<size_t>(row) * N);
+                        serial_fp32_input.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(), serial_q8);
                 }
                 expectBitwiseEqualFloatRows(
                     std::string(format.label) + " serial FP32-input policy",
@@ -1210,11 +1255,15 @@ namespace
                 N});
         }
 
+        WorkspaceRequirements requirements;
+        for (const auto &kernel : kernels)
+            requirements.merge(kernel->getWorkspaceRequirements(static_cast<int>(descs.size())));
+        CPUProjectionTestWorkspace workspace(static_cast<int>(descs.size()), K, requirements);
         ASSERT_TRUE(kernels.front()->multiply_fused_expert_down(
             descs.data(),
             static_cast<int>(descs.size()),
             1,
-            K));
+            K, workspace.get()));
 
         for (size_t format_index = 0; format_index < ALL_FORMATS.size(); ++format_index)
         {
@@ -1346,9 +1395,12 @@ namespace
 
                 FP32Tensor product(
                     {static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto requirements = kernel.getWorkspaceRequirements(M, N, K);
+                kernel.appendOutputAccumulationWorkspaceRequirements(requirements, M, N);
+                CPUProjectionTestWorkspace workspace(M, K, requirements);
                 ASSERT_TRUE(kernel.multiply_tensor(
                     &input, &product, M, N, K,
-                    true, 1.0f, 0.0f, nullptr));
+                    true, 1.0f, 0.0f, nullptr, nullptr, -1, workspace.get()));
 
                 FP32Tensor actual(
                     {static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -1367,7 +1419,7 @@ namespace
 
                 ASSERT_TRUE(kernel.multiply_tensor(
                     &input, &actual, M, N, K,
-                    true, alpha, beta, &bias));
+                    true, alpha, beta, &bias, nullptr, -1, workspace.get()));
                 expectBitwiseEqualFloatRows(
                     "CPU NativeVNNI general epilogue " + format.name +
                         " M=" + std::to_string(M),
@@ -1479,11 +1531,14 @@ namespace
                     {&kernel0, &fused0, N0, nullptr, "mtp_proj0"},
                     {&kernel1, &fused1, N1, nullptr, "mtp_proj1"}};
 
-                ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K))
+                CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel0, &kernel1}));
+                ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace.get()))
                     << fmt.name << " fused projection failed at M=" << M;
-                ASSERT_TRUE(kernel0.multiply_tensor(input.get(), &separate0, M, N0, K))
+                ASSERT_TRUE(kernel0.multiply_tensor(input.get(), &separate0, M, N0, K,
+                    true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()))
                     << fmt.name << " separate projection 0 failed at M=" << M;
-                ASSERT_TRUE(kernel1.multiply_tensor(input.get(), &separate1, M, N1, K))
+                ASSERT_TRUE(kernel1.multiply_tensor(input.get(), &separate1, M, N1, K,
+                    true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()))
                     << fmt.name << " separate projection 1 failed at M=" << M;
 
                 const size_t count0 = static_cast<size_t>(M) * N0;
@@ -1561,8 +1616,9 @@ namespace
                 std::vector<ITensorGemm::TensorProjectionDesc> projections = {
                     {&kernel0, &batched0, N0, nullptr, "mtp_verifier_projection0"},
                     {&kernel1, &batched1, N1, nullptr, "mtp_verifier_projection1"}};
+                CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel0, &kernel1}));
                 ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
-                    input.get(), projections, M, K))
+                    input.get(), projections, M, K, nullptr, workspace.get()))
                     << fmt0.name << "/" << fmt1.name
                     << " grouped verifier GEMM hook failed at M=" << M;
 
@@ -1797,11 +1853,11 @@ namespace
                     gemv_native_vnni_preq(
                         packed0,
                         row_input,
-                        serial0.data() + static_cast<size_t>(row) * N0);
+                        serial0.data() + static_cast<size_t>(row) * N0, llaminar2::test::NativeVNNITestPartialStorage(packed0, 1).span());
                     gemv_native_vnni_preq(
                         packed1,
                         row_input,
-                        serial1.data() + static_cast<size_t>(row) * N1);
+                        serial1.data() + static_cast<size_t>(row) * N1, llaminar2::test::NativeVNNITestPartialStorage(packed1, 1).span());
                 }
 
                 for (const VerifierRowsPolicy policy : policies)
@@ -1840,6 +1896,7 @@ namespace
                     ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(
                         quantized_rows.data(),
                         descriptors.data(),
+                        llaminar2::test::NativeVNNITestPartialStorage(descriptors.data(), descriptors.size(), M).span(),
                         static_cast<int>(descriptors.size()),
                         M,
                         packed0.blocks_per_row));
@@ -1893,6 +1950,7 @@ namespace
                     ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(
                         quantized_rows.data(),
                         descriptors.data(),
+                        llaminar2::test::NativeVNNITestPartialStorage(descriptors.data(), descriptors.size(), M).span(),
                         static_cast<int>(descriptors.size()),
                         M,
                         packed0.blocks_per_row));
@@ -1972,6 +2030,28 @@ namespace
         }
         EXPECT_EQ(observed_projection_launches, expected_projection_launches);
 
+        // Prove the optimized physical assignment ran. An all-format byte
+        // match alone would not detect reverting to cache-defeating striping.
+        std::set<int> workshare_chunks;
+        uint64_t bundle_launches = 0;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"kernel.cpu_native_vnni_fused_full_k_workshare"}))
+        {
+            const int chunk = std::stoi(record.tags.at("task_chunk"));
+            const int shared = std::stoi(record.tags.at("shared_weight_tasks"));
+            const int tasks = std::stoi(record.tags.at("parallel_tasks"));
+            const int threads = std::stoi(record.tags.at("threads"));
+            EXPECT_GE(chunk, 1);
+            EXPECT_LE(chunk, shared);
+            EXPECT_GE((tasks + chunk - 1) / chunk, std::min(tasks, threads));
+            workshare_chunks.insert(chunk);
+            bundle_launches += record.count;
+        }
+        EXPECT_EQ(bundle_launches * 2, expected_projection_launches);
+        EXPECT_TRUE(workshare_chunks.contains(1));
+        ASSERT_FALSE(workshare_chunks.empty());
+        EXPECT_GT(*workshare_chunks.rbegin(), 1);
+
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
@@ -2039,6 +2119,12 @@ namespace
 
                 FP32Tensor mirrored_output(
                     {static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto requirements = cpuProjectionTestRequirements(M, {&shard0_kernel, &shard1_kernel, &shard2_kernel});
+                {
+                    const auto scope = mirrored_kernel.beginOutputPartitionEquivalenceScope(N, serial_partition_n);
+                    requirements.merge(mirrored_kernel.getWorkspaceRequirements(M));
+                }
+                CPUProjectionTestWorkspace workspace(M, K, requirements);
                 FP32Tensor shard0_output(
                     {static_cast<size_t>(M),
                      static_cast<size_t>(serial_partition_n)});
@@ -2061,7 +2147,8 @@ namespace
                     if (M == 1)
                     {
                         ASSERT_TRUE(mirrored_kernel.multiply_tensor(
-                            input.get(), &mirrored_output, M, N, K));
+                            input.get(), &mirrored_output, M, N, K,
+                            true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
                     }
                     else
                     {
@@ -2078,7 +2165,7 @@ namespace
                                     input.get(),
                                     mirrored_projection,
                                     M,
-                                    K));
+                                    K, nullptr, workspace.get()));
                     }
                 }
                 EXPECT_EQ(cpuNativeVNNISerialOutputPartitionN(), 0)
@@ -2096,7 +2183,7 @@ namespace
                             &output,
                             M,
                             shard_width,
-                            K);
+                            K, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
                     }
                     std::vector<ITensorGemm::TensorProjectionDesc> projection = {{
                         &kernel,
@@ -2105,7 +2192,7 @@ namespace
                         nullptr,
                         name}};
                     return kernel.multiply_fused_verifier_rows_decode_equivalent(
-                        input.get(), projection, M, K);
+                        input.get(), projection, M, K, nullptr, workspace.get());
                 };
                 ASSERT_TRUE(execute_shard(
                     shard0_kernel,
@@ -2318,7 +2405,7 @@ namespace
                     gemm_native_vnni_preq(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                         M,
                         N,
                         ISAPath::AUTO,
@@ -2452,6 +2539,10 @@ namespace
      * actually executed instead of normalized to the already-certified full-K
      * route.  A one-worker team isolates arithmetic order from task scheduling;
      * the separate full-K topology suite owns parallel N/M work sharing.
+     * Fused projections must honor those same continuation panels, including
+     * odd row counts and compact column tails. A second projection reverses
+     * its activation rows and uses a padded output stride so stale panel state
+     * or a mistaken shared input cannot accidentally satisfy the oracle.
      */
     TEST_F(
         CPUNativeVNNIGemvTest,
@@ -2503,9 +2594,14 @@ namespace
                     packed,
                     quantized_rows.data() +
                         static_cast<size_t>(row) * K_BLOCKS,
-                    serial.data() + static_cast<size_t>(row) * N,
+                    serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                     ISAPath::AUTO);
             }
+
+            std::vector<Q8_1Block> reversed_rows(quantized_rows.size());
+            for (int row = 0; row < MAX_M; ++row)
+                std::copy_n(quantized_rows.data() + (MAX_M - 1 - row) * K_BLOCKS,
+                            K_BLOCKS, reversed_rows.data() + row * K_BLOCKS);
 
             for (const int M : runtime_rows)
             {
@@ -2530,7 +2626,7 @@ namespace
                     gemm_native_vnni_preq(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                         M,
                         N,
                         ISAPath::AUTO,
@@ -2556,14 +2652,49 @@ namespace
                         serial.data(),
                         grouped.size(),
                         static_cast<size_t>(N));
+
+                    constexpr int PADDED_N = N + 7;
+                    constexpr float guard = -12345.0f;
+                    std::vector<float> fused(static_cast<size_t>(M) * N, guard);
+                    std::vector<float> reversed(static_cast<size_t>(M) * PADDED_N, guard);
+                    const std::array<FusedVerifierRowsDesc, 2> projections = {{
+                        {.packed = &packed, .output = fused.data(), .N = N, .ldc = N,
+                         .verifier_schedule = VerifierRowsPolicy::FullKTwoRowNbc1},
+                        {.packed = &packed, .output = reversed.data(), .N = N,
+                         .ldc = PADDED_N, .input = reversed_rows.data(),
+                         .verifier_schedule = VerifierRowsPolicy::FullKTwoRowNbc1},
+                    }};
+                    PerfStatsCollector::reset();
+                    ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(
+                        quantized_rows.data(), projections.data(), llaminar2::test::NativeVNNITestPartialStorage(projections.data(), projections.size(), M).span(), projections.size(),
+                        M, K_BLOCKS));
+                    expectBitwiseEqualFloatRows(
+                        format.name + " cache-tiled fused M=" + std::to_string(M),
+                        fused.data(), serial.data(), fused.size(), N);
+                    for (int row = 0; row < M; ++row)
+                    {
+                        expectBitwiseEqualFloatRows(
+                            format.name + " reversed cache-tiled fused row=" + std::to_string(row),
+                            reversed.data() + row * PADDED_N,
+                            serial.data() + (MAX_M - 1 - row) * N, N, N);
+                        for (int column = N; column < PADDED_N; ++column)
+                            EXPECT_EQ(reversed[row * PADDED_N + column], guard);
+                    }
+                    uint64_t projection_launches = 0;
+                    for (const auto &record : PerfStatsCollector::snapshot(
+                             {"kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"}))
+                    {
+                        ASSERT_EQ(record.tags.at("route"), "grouped_full_k_two_row_n_major");
+                        EXPECT_EQ(std::stoi(record.tags.at("k_tile_blocks")), k_tile_blocks);
+                        projection_launches += record.count;
+                    }
+                    EXPECT_EQ(projection_launches, projections.size());
                 }
             }
         }
-
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
-
     /**
      * @test Prove CPU production prefill is serial-row exact over canonical M.
      *
@@ -2811,7 +2942,7 @@ namespace
                             packed,
                             quantized_rows.data() +
                                 static_cast<size_t>(row) * k_blocks,
-                            serial.data() + static_cast<size_t>(row) * N,
+                            serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                             ISAPath::AUTO);
                     }
 
@@ -2851,7 +2982,7 @@ namespace
                             gemm_native_vnni_preq(
                                 packed,
                                 quantized_rows.data(),
-                                grouped,
+                                grouped, llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                                 M,
                                 N,
                                 ISAPath::AUTO,
@@ -2997,7 +3128,7 @@ namespace
                         packed,
                         quantized_rows.data() +
                             static_cast<size_t>(row) * k_blocks,
-                        serial.data() + static_cast<size_t>(row) * N);
+                        serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span());
                 }
 
                 std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
@@ -3007,7 +3138,7 @@ namespace
                         gemm_native_vnni_preq_decode_equivalent_rows(
                             packed,
                             quantized_rows.data(),
-                            grouped.data(),
+                            grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                             M,
                             N,
                             ISAPath::AUTO,
@@ -3037,7 +3168,7 @@ namespace
                 gemm_native_vnni_preq(
                     packed,
                     quantized_rows.data(),
-                    grouped.data(),
+                    grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                     M,
                     N,
                     ISAPath::AUTO,
@@ -3180,7 +3311,7 @@ namespace
                             gemm_native_vnni_preq_decode_equivalent_rows(
                                 packed,
                                 quantized_rows.data(),
-                                grouped.data(),
+                                grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                                 M,
                                 N,
                                 ISAPath::AUTO,
@@ -3193,7 +3324,7 @@ namespace
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
                         M,
                         N,
                         ISAPath::AUTO,
@@ -3204,7 +3335,7 @@ namespace
                             packed,
                             quantized_rows.data() +
                                 static_cast<size_t>(row) * packed.blocks_per_row,
-                            serial.data() + static_cast<size_t>(row) * N,
+                            serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                             ISAPath::AUTO);
                     }
                     expectBitwiseEqualFloatRows(
@@ -3303,11 +3434,12 @@ namespace
                     {&kernel0, &grouped0, N0, nullptr, "mtp_verifier_kparallel_projection0"},
                     {&kernel1, &grouped1, N1, nullptr, "mtp_verifier_kparallel_projection1"}};
 
+                CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel0, &kernel1}));
                 ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
                     input.get(),
                     projections,
                     M,
-                    K))
+                    K, nullptr, workspace.get()))
                     << fmt.name << " K-parallel grouped verifier projections failed";
 
                 std::vector<float> serial0(
@@ -3523,11 +3655,11 @@ namespace
                     gemv_native_vnni_preq(
                         packed0,
                         row_input,
-                        serial0.data() + static_cast<size_t>(row) * N0);
+                        serial0.data() + static_cast<size_t>(row) * N0, llaminar2::test::NativeVNNITestPartialStorage(packed0, 1).span());
                     gemv_native_vnni_preq(
                         packed1,
                         row_input,
-                        serial1.data() + static_cast<size_t>(row) * N1);
+                        serial1.data() + static_cast<size_t>(row) * N1, llaminar2::test::NativeVNNITestPartialStorage(packed1, 1).span());
                 }
 
                 for (const VerifierRowsPolicy policy : policies)
@@ -3566,6 +3698,7 @@ namespace
                             gemm_native_vnni_fused_verifier_rows_preq(
                                 quantized_rows.data(),
                                 descriptors.data(),
+                                llaminar2::test::NativeVNNITestPartialStorage(descriptors.data(), descriptors.size(), M).span(),
                                 static_cast<int>(descriptors.size()),
                                 M,
                                 packed0.blocks_per_row),
@@ -3576,6 +3709,7 @@ namespace
                     ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(
                         quantized_rows.data(),
                         descriptors.data(),
+                        llaminar2::test::NativeVNNITestPartialStorage(descriptors.data(), descriptors.size(), M).span(),
                         static_cast<int>(descriptors.size()),
                         M,
                         packed0.blocks_per_row));
@@ -3733,9 +3867,11 @@ namespace
             ASSERT_NE(gate, nullptr);
             ASSERT_NE(up, nullptr);
 
+            CPUProjectionTestWorkspace down_workspace(M, K);
             FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
             ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                gate.get(), up.get(), &grouped_down, M, NDown, K))
+                gate.get(), up.get(), &grouped_down, M, NDown, K,
+                1.0f, 0.0f, down_workspace.get()))
                 << "CPU FP32 grouped verifier SwiGLU-down projection failed";
 
             std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
@@ -3886,9 +4022,11 @@ namespace
                 ASSERT_NE(gate, nullptr);
                 ASSERT_NE(up, nullptr);
 
+                CPUProjectionTestWorkspace down_workspace(M, K);
                 FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
                 ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                    gate.get(), up.get(), &grouped_down, M, NDown, K))
+                    gate.get(), up.get(), &grouped_down, M, NDown, K,
+                    1.0f, 0.0f, down_workspace.get()))
                     << "CPU FP16 grouped verifier SwiGLU/down failed";
 
                 std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
@@ -3906,7 +4044,8 @@ namespace
                         up->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
                         static_cast<size_t>(K) * sizeof(float));
                     ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                        &gate_row, &up_row, &down_row, 1, NDown, K))
+                        &gate_row, &up_row, &down_row, 1, NDown, K,
+                        1.0f, 0.0f, down_workspace.get()))
                         << "CPU FP16 serial verifier SwiGLU/down failed for row " << row;
                     std::memcpy(
                         serial_down.data() + static_cast<size_t>(row) * static_cast<size_t>(NDown),
@@ -3990,9 +4129,11 @@ namespace
                 ASSERT_NE(gate, nullptr);
                 ASSERT_NE(up, nullptr);
 
+                CPUProjectionTestWorkspace down_workspace(M, K);
                 FP32Tensor grouped_down({static_cast<size_t>(M), static_cast<size_t>(NDown)});
                 ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                    gate.get(), up.get(), &grouped_down, M, NDown, K))
+                    gate.get(), up.get(), &grouped_down, M, NDown, K,
+                    1.0f, 0.0f, down_workspace.get()))
                     << "CPU BF16 grouped verifier SwiGLU/down failed";
 
                 std::vector<float> serial_down(static_cast<size_t>(M) * static_cast<size_t>(NDown), 0.0f);
@@ -4010,7 +4151,8 @@ namespace
                         up->data() + static_cast<size_t>(row) * static_cast<size_t>(K),
                         static_cast<size_t>(K) * sizeof(float));
                     ASSERT_TRUE(down_kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                        &gate_row, &up_row, &down_row, 1, NDown, K))
+                        &gate_row, &up_row, &down_row, 1, NDown, K,
+                        1.0f, 0.0f, down_workspace.get()))
                         << "CPU BF16 serial verifier SwiGLU/down failed for row " << row;
                     std::memcpy(
                         serial_down.data() + static_cast<size_t>(row) * static_cast<size_t>(NDown),
@@ -4217,6 +4359,7 @@ namespace
                                     static_cast<size_t>(Intermediate)});
             FP32Tensor observed_down({static_cast<size_t>(M),
                                       static_cast<size_t>(OutputWidth)});
+            CPUProjectionTestWorkspace down_workspace(M, Intermediate);
             ASSERT_TRUE(gate_kernel.multiply_tensor(
                 &input, &observed_gate, M, Intermediate, DModel));
             ASSERT_TRUE(up_kernel.multiply_tensor(
@@ -4227,7 +4370,7 @@ namespace
                 &observed_down,
                 M,
                 OutputWidth,
-                Intermediate));
+                Intermediate, 1.0f, 0.0f, down_workspace.get()));
 
             /*
              * Production sparse execution enters a projection bundle rather
@@ -4292,7 +4435,7 @@ namespace
                         &verifier_down,
                         M,
                         OutputWidth,
-                        Intermediate));
+                        Intermediate, 1.0f, 0.0f, down_workspace.get()));
 
             std::vector<float> expected_gate(
                 static_cast<size_t>(M) * Intermediate);
@@ -4496,7 +4639,7 @@ namespace
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed,
             quantized.data(),
-            grouped.data(),
+            grouped.data(), llaminar2::test::NativeVNNITestPartialStorage(packed, M).span(),
             M,
             N,
             ISAPath::AUTO,
@@ -4507,7 +4650,7 @@ namespace
                 packed,
                 quantized.data() +
                     static_cast<size_t>(row) * packed.blocks_per_row,
-                serial.data() + static_cast<size_t>(row) * N,
+                serial.data() + static_cast<size_t>(row) * N, llaminar2::test::NativeVNNITestPartialStorage(packed, 1).span(),
                 ISAPath::AUTO);
         }
         expectBitwiseEqualFloatRows(
@@ -4571,8 +4714,9 @@ namespace
             {&kernel0, &grouped0, N0, nullptr, "proj0"},
             {&kernel1, &grouped1, N1, nullptr, "proj1"}};
 
+        CPUProjectionTestWorkspace workspace(M, K, kernel0.getWorkspaceRequirements(M));
         ASSERT_TRUE(kernel0.multiply_fused_verifier_rows_decode_equivalent(
-            input.get(), grouped_projections, M, K))
+            input.get(), grouped_projections, M, K, nullptr, workspace.get()))
             << "Grouped verifier projection should support rotated CPU NativeVNNI weights";
 
         std::vector<float> serial0(static_cast<size_t>(M) * static_cast<size_t>(N0), 0.0f);
@@ -4591,7 +4735,7 @@ namespace
                 {&kernel0, &row0, N0, nullptr, "proj0"},
                 {&kernel1, &row1, N1, nullptr, "proj1"}};
 
-            ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K))
+            ASSERT_TRUE(kernel0.multiply_fused_tensor(&row_input, row_projections, 1, K, nullptr, workspace.get()))
                 << "Serial decode projection failed for row " << row;
             std::memcpy(
                 serial0.data() + static_cast<size_t>(row) * static_cast<size_t>(N0),
@@ -4670,8 +4814,9 @@ namespace
                 FP32Tensor batched({static_cast<size_t>(M), static_cast<size_t>(shape.N)});
                 std::vector<ITensorGemm::TensorProjectionDesc> projections = {
                     {&kernel, &batched, shape.N, nullptr, "qwen36_verifier_projection"}};
+                CPUProjectionTestWorkspace workspace(M, shape.K, kernel.getWorkspaceRequirements(M));
                 ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
-                    input.get(), projections, M, shape.K))
+                    input.get(), projections, M, shape.K, nullptr, workspace.get()))
                     << shape.name << " grouped verifier GEMM hook failed";
 
                 std::vector<float> serial(
@@ -4767,8 +4912,9 @@ namespace
                     FP32Tensor grouped({static_cast<size_t>(M), static_cast<size_t>(N)});
                     std::vector<ITensorGemm::TensorProjectionDesc> projections = {
                         {&kernel, &grouped, N, nullptr, "qwen36_gdn_out"}};
+                    CPUProjectionTestWorkspace workspace(M, K, kernel.getWorkspaceRequirements(M));
                     ASSERT_TRUE(kernel.multiply_fused_verifier_rows_decode_equivalent(
-                        input.get(), projections, M, K))
+                        input.get(), projections, M, K, nullptr, workspace.get()))
                         << tensor_name << " grouped verifier GEMM hook failed";
 
                     std::vector<float> serial(static_cast<size_t>(M) * static_cast<size_t>(N), 0.0f);

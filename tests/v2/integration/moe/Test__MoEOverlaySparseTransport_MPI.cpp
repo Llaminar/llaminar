@@ -5,6 +5,8 @@
  * The rank-batch case models several accelerator participants on one socket
  * and proves they cross the MPI boundary in one authenticated envelope in each
  * direction while retaining exact row, weight, epoch, and participant identity.
+ * Directed follower pauses and fixed-slot reuse separately prove graph lifetime
+ * completion; an empty numerical contribution must never retire remote work.
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
@@ -24,6 +26,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -109,6 +112,21 @@ namespace llaminar2::test
             }
 
             std::vector<MoEOverlayInferenceTransactionTicket> tickets;
+        };
+
+        /** @brief Hold graph retirement behind an independent test-only MPI edge. */
+        class PausedTransactionExecutor final : public IMoEOverlayInferenceTransactionExecutor
+        {
+        public:
+            /** @brief Publish entry, then await release without sending an expert result. */
+            bool executeMoEOverlayInferenceTransaction(
+                const MoEOverlayInferenceTransactionTicket &, std::string *) override
+            {
+                int marker = 1;
+                MPI_Send(&marker, 1, MPI_INT, 0, 19001, MPI_COMM_WORLD);
+                MPI_Recv(&marker, 1, MPI_INT, 0, 19002, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                return marker == 1;
+            }
         };
     } // namespace
 
@@ -1034,6 +1052,332 @@ namespace llaminar2::test
             control_ticket_witnesses,
             rank_ == 0 ? expected.size() * 3u + 2u
                        : sent_ticket_count + expected.size());
+    }
+
+    /**
+     * @brief No numerical result is not evidence that the follower graph retired.
+     *
+     * A peer deliberately executes no expert payload and stays inside its graph
+     * until the test releases it. The publisher must retain its live slot while
+     * the peer is held, even though local numerical work has already completed.
+     * This guards the prerequisite for eliminating zero-row return round trips.
+     */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, GraphRetirementWaitsForExplicitFollowerCompletion)
+    {
+        if (world_size_ != 2)
+            GTEST_SKIP() << "This directed interleaving requires exactly two MPI ranks";
+        constexpr std::size_t slots = 2;
+        const MoEOverlayInferenceTopologyIdentity topology{
+            .workspace_generation = 72,
+            .topology_fingerprint_low = 0x12345678u,
+            .topology_fingerprint_high = 0x9abcdef0u,
+            .source_world_rank = 0,
+            .target_world_rank = 1,
+        };
+        const MoEOverlayInferenceTransactionProtocol::Config protocol{
+            .topology = topology, .slot_count = slots,
+            .max_request_count = 1, .max_rows_per_request = 16,
+            .max_mtp_draft_depth = 15,
+        };
+        auto channel = std::make_shared<MoEOverlayMPIInferenceTransactionChannel>(
+            MoEOverlayMPIInferenceTransactionChannel::Config{
+                .mpi_ctx = mpi_ctx_, .source_world_rank = 0,
+                .target_world_rank = 1, .send_slot_count = slots});
+        if (rank_ == 0)
+        {
+            MoEOverlayInferenceTransactionPublisher publisher({channel, protocol});
+            std::string error;
+            ASSERT_TRUE(publisher.beginCommand({5, 9, 17}, &error)) << error;
+            const auto transaction = publisher.publish({
+                .graph_role = MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                .logical_step_id = 100, .placement_epoch = 17,
+                .request_count = 1, .logical_rows_per_request = 16,
+                .physical_rows_per_request = 16, .draft_depth = 15,
+            });
+            ASSERT_TRUE(transaction.ok) << transaction.error;
+            int entered = 0;
+            MPI_Recv(&entered, 1, MPI_INT, 1, 19001, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            std::promise<void> retiring;
+            auto entered_retirement = retiring.get_future();
+            auto completion = std::async(std::launch::async, [&] {
+                retiring.set_value();
+                return publisher.retire(transaction, &error);
+            });
+            entered_retirement.wait();
+            const auto before_release = completion.wait_for(std::chrono::milliseconds(50));
+            // Release before any fatal assertion so both ranks always retire.
+            MPI_Send(&entered, 1, MPI_INT, 1, 19002, MPI_COMM_WORLD);
+            EXPECT_EQ(before_release, std::future_status::timeout)
+                << "Graph retirement inferred remote completion from absent numerical work";
+            EXPECT_TRUE(completion.get()) << error;
+            EXPECT_TRUE(publisher.complete(17, 0, &error)) << error;
+        }
+        else
+        {
+            PausedTransactionExecutor executor;
+            MoEOverlayInferenceTransactionFollower follower({
+                .channel = channel, .executor = &executor, .protocol = protocol});
+            const auto result = follower.runOneCommand();
+            EXPECT_TRUE(result.ok) << result.error;
+            EXPECT_EQ(result.executed_transactions, 1u);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    /**
+     * @brief Completion identity and fixed storage survive out-of-order joins and reuse.
+     *
+     * Both receipts are preposted in dispatch order, but the source joins the
+     * second graph first. Stale command/epoch/geometry joins cannot release any
+     * slot. Only the real follower may produce completion receipts. Twenty
+     * commands wrap the two-slot ring repeatedly without adding model work.
+     */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, CompletionReceiptsAuthenticateIdentityAndReuseFixedSlots)
+    {
+        if (world_size_ != 2)
+            GTEST_SKIP() << "This directed channel test requires exactly two ranks";
+        const MoEOverlayInferenceTopologyIdentity topology{
+            .workspace_generation = 73,
+            .topology_fingerprint_low = 0x12345678u,
+            .topology_fingerprint_high = 0x9abcdef0u,
+            .source_world_rank = 0, .target_world_rank = 1,
+        };
+        auto channel_owner = std::make_shared<MoEOverlayMPIInferenceTransactionChannel>(
+            MoEOverlayMPIInferenceTransactionChannel::Config{
+            .mpi_ctx = mpi_ctx_, .source_world_rank = 0,
+            .target_world_rank = 1, .send_slot_count = 2});
+        auto &channel = *channel_owner;
+        RecordingTransactionExecutor executor;
+        std::unique_ptr<MoEOverlayInferenceTransactionFollower> follower;
+        if (rank_ == 1)
+        {
+            follower = std::make_unique<MoEOverlayInferenceTransactionFollower>(
+                MoEOverlayInferenceTransactionFollower::Config{
+                    .channel = channel_owner, .executor = &executor,
+                    .protocol = {.topology = topology, .slot_count = 2,
+                                 .max_request_count = 1, .max_rows_per_request = 16,
+                                 .max_mtp_draft_depth = 15}});
+        }
+        for (std::uint64_t iteration = 1; iteration <= 20; ++iteration)
+        {
+            SCOPED_TRACE(iteration);
+            const MoEOverlayInferenceCommandIdentity command{iteration, iteration, iteration};
+            std::array<MoEOverlayInferenceTransactionTicket, 2> tickets;
+            for (std::size_t index = 0; index < tickets.size(); ++index)
+            {
+                tickets[index] = makeMoEOverlayInferenceExecutionTicket(
+                    topology, command, index + 1, iteration * 10 + index,
+                    iteration, MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                    1, 16, 16, 15, -1);
+            }
+            std::string error;
+            if (rank_ == 0)
+            {
+                for (const auto &ticket : tickets)
+                    ASSERT_TRUE(channel.publish(ticket, &error)) << error;
+                // Delivery (even of a completed receipt) cannot free a slot;
+                // ownership lasts until the matching explicit join.
+                EXPECT_EQ(channel.inFlightSendCount(), 2u);
+                EXPECT_FALSE(channel.publish(tickets[0], &error));
+                EXPECT_NE(error.find("joining live graph completions"), std::string::npos);
+                auto stale = tickets[0];
+                ++stale.command_id;
+                EXPECT_FALSE(channel.awaitCompletion(stale, &error));
+                stale = tickets[0];
+                ++stale.placement_epoch;
+                EXPECT_FALSE(channel.awaitCompletion(stale, &error));
+                stale = tickets[0];
+                ++stale.workspace_generation;
+                EXPECT_FALSE(channel.awaitCompletion(stale, &error));
+                stale = tickets[0];
+                --stale.draft_depth;
+                EXPECT_FALSE(channel.awaitCompletion(stale, &error));
+                stale = tickets[0];
+                --stale.logical_rows_per_request;
+                EXPECT_FALSE(channel.awaitCompletion(stale, &error));
+                EXPECT_FALSE(channel.receive().ok);
+                ASSERT_TRUE(channel.awaitCompletion(tickets[1], &error)) << error;
+                EXPECT_EQ(channel.inFlightSendCount(), 1u);
+                ASSERT_TRUE(channel.awaitCompletion(tickets[0], &error)) << error;
+                EXPECT_EQ(channel.inFlightSendCount(), 0u);
+                EXPECT_FALSE(channel.awaitCompletion(tickets[0], &error));
+                ASSERT_TRUE(channel.publish(makeMoEOverlayInferenceTerminalTicket(
+                    topology, command, 3, iteration,
+                    MoEOverlayInferenceTransactionAction::Complete, 0), &error)) << error;
+            }
+            else
+            {
+                const auto result = follower->runOneCommand();
+                ASSERT_TRUE(result.ok) << result.error;
+                EXPECT_EQ(result.executed_transactions, 2u);
+                ASSERT_GE(executor.tickets.size(), tickets.size());
+                EXPECT_EQ(executor.tickets[executor.tickets.size() - 2], tickets[0]);
+                EXPECT_EQ(executor.tickets.back(), tickets[1]);
+            }
+            // The terminal also consumes a source send slot; finish this command
+            // before testing the next command's deliberately full execution ring.
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+        EXPECT_EQ(channel.inFlightSendCount(), 0u);
+    }
+
+    /**
+     * @brief Empty numerical results do not wait for peer execution or reuse caller metadata.
+     *
+     * The peer holds its first return behind a test edge. Only numerical
+     * completion may cross that pause; the separate graph-retirement test owns
+     * the terminal proof. Alternating empty/nonempty rounds catches orphaned MPI
+     * receives that could otherwise consume a later real result.
+     */
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, EmptyNumericalReturnDoesNotWaitAndPreservesFollowingPayload)
+    {
+        if (world_size_ != 2)
+            GTEST_SKIP() << "This interleaving requires exactly two ranks";
+        ScopedTransportPerfStats perf_stats("forward_graph,moe_overlay_transport");
+        for (const auto layout : {MoEOverlayReturnLayout::ParticipantTokenPartials,
+                                  MoEOverlayReturnLayout::CanonicalExpertRoutes})
+        {
+            auto wire = std::make_shared<MoEOverlayRankBatchWireWorkspace>(
+                MoEOverlayRankBatchWireWorkspace::Config{
+                    .participant_ids = {11, 23}, .max_total_rows = 2,
+                    .max_total_entries = 2, .d_model = 4, .top_k = 1,
+                    .return_layout = layout});
+            MoEOverlayMPIRankBatchTransport transport({
+                .mpi_ctx = mpi_ctx_, .source_world_rank = 0, .target_world_rank = 1,
+                .workspace = wire, .transaction_slot_count = 64,
+                .asynchronous_send_slot_count = 2});
+            std::array<MoEOverlayCollectiveWorkspace, 2> storage;
+            for (auto &workspace : storage)
+                workspace.ensureCapacity(1, 1, 4, 1, DeviceId::cpu());
+            std::array<MoEOverlaySparseRows, 2> dispatch{
+                storage[0].localExpertInput(0, 0), storage[1].localExpertInput(0, 0)};
+            std::array<MoEOverlayReturnRows, 2> returned{
+                storage[0].localExpertOutput(0, 0), storage[1].localExpertOutput(0, 0)};
+            const std::array<const MoEOverlaySparseRows *, 2> dispatch_out{&dispatch[0], &dispatch[1]};
+            const std::array<MoEOverlaySparseRows *, 2> dispatch_in{&dispatch[0], &dispatch[1]};
+            const std::array<const MoEOverlayReturnRows *, 2> return_out{&returned[0], &returned[1]};
+            const std::array<MoEOverlayReturnRows *, 2> return_in{&returned[0], &returned[1]};
+            for (int round = 0; round < 24; ++round)
+            {
+                SCOPED_TRACE(round);
+                const bool empty = round % 2 == 0;
+                const auto key = [&](MoEOverlayCollectiveDirection direction) {
+                    return round % 3 == 0
+                        ? makeMTPMoEOverlayRankBatchKey(91, round + 1, 15, 0, 0, 0, 0, 1, direction)
+                        : makeMoEOverlayRankBatchKey(91, round + 1,
+                            round % 3 == 1 ? ExpertHistogramSource::PrefillChunk
+                                           : ExpertHistogramSource::DecodeToken,
+                            0, 0, 0, 0, 1, direction);
+                };
+                for (std::size_t index = 0; index < dispatch.size(); ++index)
+                {
+                    auto &row = dispatch[index];
+                    row.source_participant = 7;
+                    row.target_participant = index == 0 ? 11 : 23;
+                    row.residency_epoch = 100 + round + index;
+                    // One participant stays empty even in a nonempty rank batch.
+                    row.live_row_count = row.live_entry_count = !empty && index == 1 ? 1 : 0;
+                    row.entry_offsets_host[0] = 0;
+                    row.entry_offsets_host[1] = static_cast<int>(row.live_entry_count);
+                    row.row_ids_host[0] = 0;
+                    row.expert_ids_host[0] = 3;
+                    row.route_weights_host[0] = 1.0f;
+                    row.original_route_slots_host[0] = row.compact_route_slots_host[0] = 0;
+                    std::fill_n(row.hidden_rows_fp32, 4, static_cast<float>(round + 1));
+                }
+                const auto dispatched = rank_ == 0
+                    ? transport.exchangeDispatch(key(MoEOverlayCollectiveDirection::Dispatch), dispatch_out, {})
+                    : transport.exchangeDispatch(key(MoEOverlayCollectiveDirection::Dispatch), {}, dispatch_in);
+                ASSERT_TRUE(dispatched.ok) << dispatched.error;
+                for (std::size_t index = 0; index < returned.size(); ++index)
+                {
+                    auto &row = returned[index];
+                    row.source_participant = dispatch[index].target_participant;
+                    row.target_participant = dispatch[index].source_participant;
+                    row.residency_epoch = dispatch[index].residency_epoch;
+                    row.layout = layout;
+                    row.live_row_count = dispatch[index].live_row_count;
+                    row.row_ids_host[0] = 0;
+                    std::fill_n(row.output_rows_fp32, 4, static_cast<float>(round + 101));
+                }
+                if (rank_ == 0)
+                {
+                    // Source publication owns its own metadata snapshot. Caller
+                    // views may be reused as soon as dispatch bytes are retained.
+                    for (auto &row : dispatch)
+                    {
+                        row.residency_epoch = 9999;
+                        row.source_participant = 999;
+                    }
+                    for (auto &row : returned)
+                    {
+                        row.live_row_count = 1;
+                        row.residency_epoch = 0;
+                    }
+                    if (round == 0)
+                    {
+                        int marker = 0;
+                        MPI_Recv(&marker, 1, MPI_INT, 1, 19003, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                        std::promise<void> entered;
+                        auto ready = entered.get_future();
+                        auto result = std::async(std::launch::async, [&] {
+                            entered.set_value();
+                            return transport.exchangeReturn(key(MoEOverlayCollectiveDirection::ReturnReduce), {}, return_in);
+                        });
+                        ready.wait();
+                        const auto state = result.wait_for(std::chrono::milliseconds(100));
+                        MPI_Send(&marker, 1, MPI_INT, 1, 19004, MPI_COMM_WORLD);
+                        EXPECT_EQ(state, std::future_status::ready)
+                            << "An empty numerical contribution waited for a remote reply";
+                        const auto completed = result.get();
+                        ASSERT_TRUE(completed.ok) << completed.error;
+                    }
+                    else
+                    {
+                        const auto completed = transport.exchangeReturn(
+                            key(MoEOverlayCollectiveDirection::ReturnReduce), {}, return_in);
+                        ASSERT_TRUE(completed.ok) << completed.error;
+                    }
+                    for (std::size_t index = 0; index < returned.size(); ++index)
+                    {
+                        EXPECT_EQ(returned[index].live_row_count, !empty && index == 1 ? 1u : 0u);
+                        EXPECT_EQ(returned[index].residency_epoch, 100u + round + index);
+                        EXPECT_EQ(returned[index].source_participant, index == 0 ? 11 : 23);
+                        EXPECT_EQ(returned[index].target_participant, 7);
+                        EXPECT_EQ(returned[index].layout, layout);
+                        if (!empty && index == 1)
+                            EXPECT_FLOAT_EQ(returned[index].output_rows_fp32[3], static_cast<float>(round + 101));
+                    }
+                }
+                else
+                {
+                    if (round == 0)
+                    {
+                        int marker = 1;
+                        MPI_Send(&marker, 1, MPI_INT, 0, 19003, MPI_COMM_WORLD);
+                        MPI_Recv(&marker, 1, MPI_INT, 0, 19004, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    }
+                    const auto completed = transport.exchangeReturn(
+                        key(MoEOverlayCollectiveDirection::ReturnReduce), return_out, {});
+                    ASSERT_TRUE(completed.ok) << completed.error;
+                }
+            }
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+        uint64_t dispatches = 0, returns = 0, empty_outcomes = 0, submissions = 0;
+        for (const auto &record : PerfStatsCollector::snapshot())
+        {
+            if (record.name == "moe_overlay_rank_batch_dispatch_transactions") dispatches += record.count;
+            if (record.name == "moe_overlay_rank_batch_return_transactions") returns += record.count;
+            if (record.name == "moe_overlay_rank_batch_empty_return_transactions") empty_outcomes += record.count;
+            if (record.name == "rank_batch_async_send_submissions") submissions += record.count;
+        }
+        EXPECT_EQ(dispatches, 48u);
+        EXPECT_EQ(returns, 24u);
+        EXPECT_EQ(empty_outcomes, 24u);
+        EXPECT_EQ(submissions, rank_ == 0 ? 48u : 24u)
+            << "Empty outcomes must not claim physical MPI sends";
     }
 
 } // namespace llaminar2::test

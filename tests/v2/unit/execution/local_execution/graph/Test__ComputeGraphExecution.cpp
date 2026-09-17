@@ -22,6 +22,7 @@
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include "backends/NativeParallelGraphBranch.h"
+#include "execution/moe/MoEOverlayRankBatchGraphSchedule.h"
 #include <algorithm>
 #include <memory>
 #include <set>
@@ -31,6 +32,62 @@
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
+
+/** @test Independent peer sends all run before ordered shared-destination writes. */
+TEST(MoEOverlayRankBatchGraphSchedule, ForksEveryPeerBeforeOrderedReturns)
+{
+    for (int count = 1; count <= 8; ++count)
+    {
+        SCOPED_TRACE(count);
+        ComputeGraph graph;
+        std::vector<MoEOverlayRankBatchGraphLane> lanes;
+        int submitted = 0;
+        std::vector<int> consumed;
+        // Reverse node insertion prevents incidental map/insertion ordering
+        // from satisfying the invariant in place of graph dependencies.
+        for (int index = count - 1; index >= 0; --index)
+        {
+            const auto dispatch = "dispatch_" + std::to_string(index);
+            const auto returned = "return_" + std::to_string(index);
+            auto send = std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_DISPATCH);
+            send->setOnExecute([&](IDeviceContext *) { ++submitted; });
+            auto receive = std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE);
+            receive->setOnExecute([&, index](IDeviceContext *) {
+                EXPECT_EQ(submitted, count);
+                consumed.push_back(index);
+            });
+            graph.addNode(dispatch, std::move(send), DeviceId::cpu());
+            graph.addNode(returned, std::move(receive), DeviceId::cpu());
+            graph.addDependency(returned, dispatch);
+        }
+        for (int index = 0; index < count; ++index)
+            lanes.push_back({"dispatch_" + std::to_string(index), "return_" + std::to_string(index)});
+        wireMoEOverlayRankBatchForkJoin(graph, lanes);
+        for (auto *stage : graph.getExecutionStages())
+            ASSERT_TRUE(stage->execute(nullptr)); // Device-free protocol test doubles only.
+        ASSERT_EQ(consumed.size(), static_cast<size_t>(count));
+        for (int index = 0; index < count; ++index)
+            EXPECT_EQ(consumed[index], index);
+    }
+}
+
+/** @test Invalid lane identities cannot be admitted as independent channels. */
+TEST(MoEOverlayRankBatchGraphSchedule, RejectsMissingAliasedAndMistypedNodes)
+{
+    ComputeGraph graph;
+    graph.addNode("dispatch", std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_DISPATCH), DeviceId::cpu());
+    graph.addNode("return", std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE), DeviceId::cpu());
+    graph.addNode("compute", std::make_unique<MockComputeStage>(), DeviceId::cpu());
+    const std::vector<std::vector<MoEOverlayRankBatchGraphLane>> invalid{
+        {}, {{"missing", "return"}}, {{"dispatch", "missing"}},
+        {{"dispatch", "dispatch"}}, {{"compute", "return"}},
+        {{"dispatch", "return"}, {"dispatch", "return"}},
+    };
+    for (const auto &lanes : invalid)
+        EXPECT_THROW(wireMoEOverlayRankBatchForkJoin(graph, lanes), std::invalid_argument);
+    EXPECT_TRUE(graph.getNode("return")->dependencies.empty())
+        << "Validate the entire declaration before mutating graph edges";
+}
 
 namespace
 {

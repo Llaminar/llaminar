@@ -1748,7 +1748,10 @@ namespace llaminar2
 
     inline bool deviceMoEDirectoryCopyReady(const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
-        return deviceMoEMatrixCopyReady(entry.descriptor.gate, entry) &&
+        if (deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
+            return deviceMoEFloatingExpertCopyReady(entry.descriptor);
+        return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
+               deviceMoEMatrixCopyReady(entry.descriptor.gate, entry) &&
                deviceMoEMatrixCopyReady(entry.descriptor.up, entry) &&
                deviceMoEMatrixCopyReady(entry.descriptor.down, entry);
     }
@@ -1805,6 +1808,10 @@ namespace llaminar2
         const DeviceMoEExpertDirectoryEntry &src,
         const DeviceMoEExpertDirectoryEntry &dst) noexcept
     {
+        if (deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
+            return deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
+        if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeVNNI)
+            return false;
         return deviceMoEMatrixFitsTransferCapacity(
                    src.descriptor.gate,
                    dst.descriptor.gate) &&
@@ -1823,6 +1830,11 @@ namespace llaminar2
         DeviceMoEExpertDirectoryEntry &dst,
         const DeviceMoEExpertDirectoryEntry &src) noexcept
     {
+        // Only the occupant's arithmetic tag changes. Destination pointers and
+        // allocation capacities survive every quantized/floating transition.
+        dst.descriptor.weight_format = src.descriptor.weight_format;
+        if (deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
+            return;
         deviceMoERetargetTransferMatrixFormat(
             dst.descriptor.gate,
             src.descriptor.gate);

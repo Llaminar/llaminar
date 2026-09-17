@@ -31,6 +31,7 @@
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../moe/MoEOverlayDeviceControllerGraphService.h"
 #include "../../planning/MemoryPlanner.h"
+#include "../../planning/PlanningModelMetadata.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
@@ -136,6 +137,22 @@ namespace llaminar2
          * @param plan_builder Plan builder for creating execution plans
          */
         OrchestrationRunner(
+            OrchestrationConfig config,
+            std::unique_ptr<IExecutionPlanBuilder> plan_builder);
+
+        /**
+         * @brief Construct within an explicitly admitted execution communicator.
+         * @param execution_context Non-null exact active membership and observation.
+         * @param config Configuration expressed in that execution rank namespace.
+         * @param plan_builder Canonical model-aware rank compiler.
+         * @throws std::invalid_argument for a missing execution context.
+         *
+         * Initialization must never replace this context with WORLD or SELF.
+         * Inactive ranks do not construct a runner. Resource admission and graph
+         * setup still use the ordinary production initialization lifecycle.
+         */
+        OrchestrationRunner(
+            std::shared_ptr<IMPIContext> execution_context,
             OrchestrationConfig config,
             std::unique_ptr<IExecutionPlanBuilder> plan_builder);
 
@@ -475,6 +492,14 @@ namespace llaminar2
          * @brief Gather cluster inventory for plan building
          */
         ClusterInventory gatherClusterInventory();
+
+        /**
+         * @brief Return this admission's sole immutable planning model descriptor.
+         * @return Root-published metadata, or the exact preloaded loader's descriptor
+         *         for an explicitly injected pre-built execution plan.
+         * @throws std::logic_error if neither admission form owns model metadata.
+         */
+        const PlanningModelMetadata &planningModelMetadata();
 
         /**
          * @brief Set up LOCAL TP context if enabled
@@ -841,7 +866,7 @@ namespace llaminar2
         /** @brief Communicator authority used to authenticate one init phase. */
         enum class InitializationConsensusScope : std::uint8_t
         {
-            BootstrapWorld,
+            BootstrapContext,
             ActiveContext,
             ExpertOverlayContext,
         };
@@ -904,6 +929,11 @@ namespace llaminar2
         void printStartupBanner(FILE *stream = stderr);
 
         bool shouldUseMTPDecode() const;
+        /**
+         * @brief Validate active MTP depth and installed verifier ownership.
+         * @return Fatal reason, or empty when the selected runner may execute.
+         * GPU state remains resident; this inspects immutable contracts only.
+         */
         std::string mtpDecodeHardFailureReason() const;
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
@@ -981,6 +1011,15 @@ namespace llaminar2
          *         initialization event for the complete request set.
          */
         bool admitRequestBatchDeviceResidentGeneration(int request_count);
+        /**
+         * @brief Run the admitted ordinary GPU response through its complete graph.
+         * @return Terminal tokens or a fatal lifecycle/unsupported-policy diagnostic.
+         *
+         * Shares the speculative request admission and resident continuation
+         * mailbox, but does not manufacture verifier work or MTP statistics.
+         * Only the immutable request and terminal result cross the host boundary.
+         */
+        GenerationResult decodeOrdinaryDeviceResidentGeneration();
         /**
          * @brief Advance the scheduler position after one committed decode row.
          *
@@ -1300,6 +1339,8 @@ namespace llaminar2
         RankExecutionPlan plan_;
         bool plan_built_{false};
         ClusterInventory cluster_inventory_;
+        /** Root-published metadata retained for placement and canonical BOM construction. */
+        std::optional<PlanningModelMetadata> planning_model_metadata_;
 
         // Dependencies (injected or created)
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
@@ -1577,6 +1618,8 @@ namespace llaminar2
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
         SamplingParams active_sampling_params_;                         // Current sampling params for decodeStep()
+        /** Immutable ordinary request seeds, retained across budget continuations. */
+        std::optional<GenerationRequestSeeds> ordinary_generation_seeds_;
         SamplingParams recommended_sampling_params_;                    // Model-specific defaults
         std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format

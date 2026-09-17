@@ -17,6 +17,7 @@
 
 #include "ParityTestBase.h"
 #include "ModelParityGenerationWorkload.h"
+#include "ModelParityCrossHostE2E.h"
 
 #include "backends/GlobalDeviceAddress.h"
 #include "config/ActivationPrecisionPolicy.h"
@@ -577,6 +578,12 @@ namespace llaminar2::test::parity
         std::optional<ModelParityExpertMovement> movement;
         ModelParityPrefillGraphPolicy prefill_graph;
         ModelParityE2EProfile profile;
+        /**
+         * Remote variants use this cell's model/runtime policies and automatic
+         * overlay placement. Both public frontend routes are mandatory. These
+         * are separate E2E cases, not extra numerical-fixture parameters.
+         */
+        std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
     };
 
     /**
@@ -682,6 +689,8 @@ namespace llaminar2::test::parity
 
         /** Eligibility is not a certificate: the HTTP runner must prove it. */
         std::optional<ModelParityE2EProfile> e2e_certification;
+        /** Canonical cross-host E2E intent; concrete hosts are bound by provisioning. */
+        std::vector<ModelParityRemoteCPUHosts> remote_cpu_overlays;
         /** Actual-output obligation, independent of the short deep-parity prompts. */
         ModelParityGenerationWorkload generation_workload;
 
@@ -2077,6 +2086,21 @@ namespace llaminar2::test::parity
                 static_cast<std::int64_t>(profile.minimum_prompt_tokens) + profile.generation_tokens >=
                     profile.context_length)
                 throw std::invalid_argument("invalid E2E certification selection/profile");
+            if (!selection.remote_cpu_overlays.empty())
+            {
+                // A remote variant starts from a single continuation GPU.
+                // Never reinterpret a local TP/CPU topology as remote ranks.
+                if (topology.kind != ModelParityTopologyKind::SingleDevice ||
+                    topology.participants.size() != 1 ||
+                    (!topology.participants.front().address.isCUDA() &&
+                     !topology.participants.front().address.isROCm()) ||
+                    selection.owner_order || selection.movement)
+                    throw std::invalid_argument("cross-host E2E variants require a single-GPU source cell");
+                std::set<int> host_counts;
+                for (const auto &remote : selection.remote_cpu_overlays)
+                    if (!host_counts.insert(remote.count()).second)
+                        throw std::invalid_argument("duplicate cross-host E2E topology");
+            }
             std::size_t matched = 0;
             for (auto &test_case : cases)
             {
@@ -2093,6 +2117,7 @@ namespace llaminar2::test::parity
                 if (test_case.e2e_certification)
                     throw std::invalid_argument("overlapping E2E certification selections");
                 test_case.e2e_certification = profile;
+                test_case.remote_cpu_overlays = selection.remote_cpu_overlays;
                 ++matched;
             }
             if (matched != 1)

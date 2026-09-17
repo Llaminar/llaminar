@@ -137,20 +137,33 @@ partial hits; MTP independently adds shifted sidecar and full-hit hidden-state
 obligations. This contract is part of serial-control identity, not inferred
 from model filenames, response flags or optional profiling.
 
-The in-progress generation runner reuses the mature HTTP harness's local or
-Docker server lifecycle. List its existing serial controls without loading
-weights:
+The routine generation runner reuses the mature HTTP harness's local or
+Docker server lifecycle. Its default `regression` mode selects only MTP-off
+and dynamic-depth cells and compares them with reviewed, versioned serial
+answers. The full mathematical matrix and fixed-depth cases are explicit
+diagnostics, not routine CI. Token drift or suspected accuracy bugs call for
+the specific matching HF mathematical cell and checkpoint CSVs, not silently
+replacing expected tokens. List routine cells without loading weights:
 
 ```bash
 python3 scripts/ci/run_model_parity_generation.py \
-  --mode collect-controls --list --output parity-results/generation-controls
+  --list --output parity-results/generation-list
 ```
+
+For regression, supply the full `--manifest`, `--cpu-isa AVX512` or `AVX2`,
+and the materialized `--corpus-root` (default `corpora/`). Approval comes from
+`scripts/ci/approved_generation_corpora.json` in admitted source, never from a
+candidate report. Exact request bodies include prompt bytes and seeds; each
+cell explicitly names its `serial_control_id`. Token payloads and that complete
+mapping are versioned in `Llaminar/corpora`, with the source gitlink and approval
+pin identifying the reviewed baseline. Missing/stale mappings fail before
+model launch. CI never acquires or overwrites expected tokens.
 
 For an exact selector discovered above, `--mode collect-controls` acquires
 unapproved MTP-off observations. `--mode compare-controls --controls PATH`
 compares selected cells with those controls. The expander exports each control
 relationship, exact prompt/sampler request and fresh/full/partial probe order;
-the runner does not synthesize an Off configuration from MTP argv. Both modes
+the runner does not synthesize an Off configuration from MTP argv. Both diagnostic modes
 run the full Unit/preflight gate once before admitting their cells, use the
 shared tmpfs cache, and stop at the first failure. Output directories must be
 new; comparison never updates control files. MTP collection without a serial
@@ -311,8 +324,33 @@ recall, multi-needle JSON recall, structured long generation, cache reset,
 near-limit admission and oversized-context rejection. It additionally retains
 the harness's chat, streaming, prefix, error-response, graph/PerfStats, memory,
 and shutdown checks. There is no model-size skip for a tagged cell. Each HTTP
-cell has the canonical ten-minute watchdog, including startup and shutdown;
+cell has the canonical fifteen-minute watchdog, including startup and shutdown;
 expiry retires its full server/MPI process group and records a timeout.
+
+Remote MPI certification has a distinct typed declaration on the same E2E
+selection: `remote_cpu_overlays`. It adds one-GPU/remote-CPU topology intents,
+each expanded over default-auto plan/apply and direct default-auto serve, while
+leaving the source numerical matrix unchanged. `model_parity_inventory.py
+--scope cross-host-e2e` lists those exact emitted cases without starting VMs or
+inference. The exporter retains model/runtime identity in the parent record;
+the remote projection must not reuse its source cell's fixed local device map.
+Azure resource configuration is independent of model eligibility. The
+production image pipeline runs `scripts/ci/run_production_cross_host_e2e.py`
+immediately after the HTTP suite; it provisions one owned CPU pool per image,
+selects each case's exact hostfile membership, stages the image and complete shards, runs both routes, and
+requires verified retirement before benchmarks. Discovery alone is not a
+cross-host execution certificate. See `docs/production-ci.md` for the provider
+boundary and cleanup receipt procedure.
+
+The HTTP harness's explicit `--cross-host-configuration` and `--cross-host-case`
+selectors consume that source record and one exact emitted scenario. They do
+not provision VMs or invent server placement. In addition to ordinary HTTP,
+capture/MTP/prefix/movement checks, the post-shutdown observer requires distinct
+MPI physical-host membership, positive completed remote CPU routes in prefill
+and decode/verifier, and matched sender/receiver payload and ordering evidence.
+Header bytes or idle MPI participants cannot establish remote expert execution.
+The compact `*.cross-host.json` result must still be bound to the tested image,
+ISA, actual frontend plan and verified cloud cleanup before certification.
 
 Prefix checks include both a different-answer shared-prefix request and an exact
 repeat. Short shared text alone may not reach a stored hybrid-state boundary.
@@ -355,6 +393,17 @@ derived from a GGUF filename or shard size. Process-tree RSS remains telemetry
 because shared/file-backed pages are not equivalent to engine-owned bytes.
 Graceful shutdown must return zero and preserve every rank's final evidence.
 
+Each rank also publishes `server.execution_topology` from its admitted plan;
+the service authority publishes `server.execution_policy` once. The observers
+require this complete startup contract for explicit, auto and saved-plan
+frontends alike. Selected compute devices and attention-owning devices are
+distinct: CPU or GPU expert-only tiers do not acquire an attention obligation.
+MTP, prefix and residency feature requirements come from parsed runtime policy,
+never CLI substring searches. Every HTTP cell sends the prefix-related request
+sequence; a configured cache additionally needs completed restore evidence.
+These startup projections do not prove execution by themselves and are never
+consulted by inference or placement controllers.
+
 Heterogeneous retained parents have their own executable/materialization/launch
 records; compilation children and an unrelated full-graph helper cannot certify
 them. The host-transfer gate admits the reviewed shared activation collective
@@ -364,18 +413,23 @@ collective boundary, not permission to mirror GPU execution state on the host.
 
 Explicit heterogeneous collective segmentation likewise needs physical native
 executables, not a full-graph record with a different name. The HTTP observer
-joins every segment's nonempty capture and launch by rank, device, graph context
-and stage identity. It requires transaction zero for setup-materialized units
+joins every segment's nonempty capture and launch by rank, device, graph context,
+setup-issued executable-family ID and stage identity. Context names may serve
+several prebuilt variants; an unused variant never borrows or owes a sibling's
+launches. The observation ID follows cache ownership moves and request reuse,
+and changes only on a new capture plan. It is not an execution-state authority.
+The observer requires transaction zero for setup-materialized units
 and replay for repeated execution. Missing units, graph-only children, eager
 warmup and homogeneous segmentation remain failures. Setup-only buckets need no
-synthetic inference to produce launch evidence.
+synthetic inference to produce launch evidence. Remote MTP sidecars use the same
+physical segmented proof instead of a fictitious monolithic replay requirement.
 
 The same profile owns `readiness_timeout_seconds` (default 60). Override it in
 an exact certification selector's `.profile` when model loading and graph setup
 need a larger budget; the initial 122B tags use 180 seconds. Discovery exports
 this value and the driver passes it to the HTTP harness, overriding inherited
 startup-timeout environment settings. It is independent of the request timeout
-and cannot extend the ten-minute exact-cell watchdog. Neither the runner nor
+and cannot extend the fifteen-minute exact-cell watchdog. Neither the runner nor
 the harness infers a timeout from model size or a cell name. Rebuild and export
 the manifest after changing a profile.
 
@@ -392,6 +446,11 @@ reference directory. The file declares `qwen35`, 64 main blocks and one MTP
 predictor, so it uses the existing hybrid-GDN/HF reference family. Its canonical
 dense matrix replaces Qwen3.6 dense; historical focused Qwen3.6 regressions and
 the separate Qwen3.6 MoE matrix retain their original model identities.
+Its single-ROCm HTTP profile allocates 32,768 context tokens and requires
+needle prompts of at least 16,384 tokens. The 24-GiB single-CUDA profile
+allocates its admitted 16,384-token context and requires at least 8,192 prompt
+tokens. Both retain the full near-limit, reset, prefix-restore and
+long-generation checks.
 
 ## Numerical cell contract
 
@@ -415,6 +474,15 @@ The comparison code remains in `ParityTestBase.h`: cosine similarity, relative
 L2, KL divergence, Top-K overlap, distribution statistics, NaN/Inf checks, and
 per-layer threshold assertions are unchanged. Fusing phases removes duplicate
 setup; it does not weaken the oracle or compare fewer checkpoints.
+
+Numerical allowances belong to the typed model/backend/KV definition. The
+ordinary `kl_threshold` continues to govern decode and any MTP budget that
+inherits it. A separately reviewed prefill-only allowance uses
+`prefill_kl_threshold`, projected through `BackendThresholds` into `ParityConfig`;
+prefill comparisons, assertions and diagnostics use `prefillKLThreshold()`.
+Leaving the override unset retains the ordinary limit. Do not relax the shared
+KL field when only prefill was approved, or edit generated inventory JSON to
+make a numerical allowance look like a different runtime configuration.
 
 Missing models, hardware, decode references, graph evidence, or snapshot
 publication are failures in a production campaign. Focused developer tests may
@@ -505,7 +573,7 @@ loaded weights match the reference. Any missing declaration,
 non-memory filesystem, capacity shortfall, mutation during copy, reference
 descriptor mismatch, exact-cell timeout, or setup completion timeout is a hard
 failure.
-Every generated GTest cell has a fixed 600-second progress deadline spanning
+Every generated GTest cell has a fixed 900-second progress deadline spanning
 its setup, inference, evidence publication, teardown, and transition to the
 next cell. The staging and authentication time are part of the same 75-minute
 target; by default the temporary corpus is removed when the run exits. Every
@@ -838,7 +906,7 @@ runs the model-free integration preflight, before staging the
 download fixture once, stages the selected real weights into
 RAM once, overlaps only backend-disjoint work, runs every campaign even after
 the target is missed, and records the complete correctness result. Every exact
-matrix cell has a fixed 600-second watchdog.
+matrix cell has a fixed 900-second watchdog.
 The driver observes that cell's fresh `test_log.txt`; entering the next cell
 renews the deadline, while expiry terminates the complete CTest/MPI process
 group and records `exact_cell_timeout` plus the exact GTest identity. This
@@ -846,7 +914,7 @@ retains process-resident model/prepared-weight reuse without permitting a
 silent aggregate to occupy devices for hours. An independent 21,600-second
 completion ceiling bounds setup phases that cannot publish exact-cell progress;
 configure it separately with `--completion-timeout-seconds`. It is not a
-cumulative matrix deadline. Once inference begins, the ten-minute exact-cell
+cumulative matrix deadline. Once inference begins, the fifteen-minute exact-cell
 watchdog is the sole timeout authority. C++ cells write timing evidence but do not
 assert the 75-minute target individually. `production-campaigns.json` records
 separate correctness and performance statuses, timeout evidence, staged byte

@@ -1318,6 +1318,17 @@ namespace llaminar2
             std::span<const DeviceId> devices) const;
 
         /**
+         * @brief Return the exact page-rounded backing extent used by mapped-host allocation.
+         * @param bytes Positive requested payload capacity.
+         * @return Physical host bytes contributed to PMA before materialization.
+         * @throws std::invalid_argument for zero bytes, or std::overflow_error for an unrepresentable extent.
+         *
+         * The allocator and BOM contributors share this geometry calculation;
+         * it does not query free memory, admit capacity or maintain a ledger.
+         */
+        [[nodiscard]] static size_t mappedHostRegionAllocationBytes(size_t bytes);
+
+        /**
          * @brief Allocate one native mapped slab and partition exclusive slots.
          *
          * High-cardinality retained transfer protocols need one independently
@@ -1635,6 +1646,26 @@ namespace llaminar2
             size_t bytes,
             DeviceId device,
             void *stream) const;
+
+        /**
+         * @brief Copy either direction between bounded device scratch and mapped pages using a GPU kernel.
+         * @param lane Prepared function/stream lifetime on the exact owning GPU.
+         * @param direction Explicit source/destination direction; never inferred from pointer values.
+         * @param device_region Graph-private immutable device-buffer owner.
+         * @param device_offset First device byte in the transfer.
+         * @param mapped_region Registered mapped-page owner retained through completion.
+         * @param mapped_offset First mapped byte in the transfer.
+         * @param bytes Positive byte extent contained by both owners.
+         * @throws std::exception for invalid ownership, bounds or native launch failure.
+         *
+         * The lane proves module preparation happened before capture. This is
+         * the explicit compute-kernel mechanism on both GPU backends, not the
+         * backend-selected background DMA/progress policy. There is no copying
+         * fallback, allocation, event wait or coherence mutation inside it.
+         */
+        void enqueueMappedKernelCopy(const PersistentTransferExecutionLane &lane,
+            MappedTransferDirection direction, DeviceTransferBuffer &device_region, size_t device_offset,
+            const MappedHostTransferRegion &mapped_region, size_t mapped_offset, size_t bytes) const;
 
         /**
          * @brief Submit a prepared background copy independently of peer-held work.

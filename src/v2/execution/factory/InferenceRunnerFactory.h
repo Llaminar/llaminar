@@ -68,7 +68,6 @@
 #include "../../utils/MPIContext.h"
 #include "../mpi_orchestration/PlacementPlan.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
-#include "../../config/PipelineConfig.h"
 #include "FactoryPPStageConfig.h"
 #include <functional>
 #include <map>
@@ -190,7 +189,7 @@ namespace llaminar2
         std::optional<FactoryPPStageConfig> pp_stage_config;
 
         /// Optional MPI hostfile path for hostfile-aware node detection.
-        /// When set, NodeDetection uses hostfile hostname ordering to assign node IDs
+        /// Launch provenance; physical node IDs come from MPI shared-memory membership.
         /// instead of relying purely on first-appearance ordering from MPI_Allgather.
         std::string hostfile;
 
@@ -301,25 +300,36 @@ namespace llaminar2
          */
         static InferenceRunnerConfig fromPlan(const RankExecutionPlan &plan)
         {
+            return fromRuntime(plan.runtime);
+        }
+
+        /**
+         * @brief Project the canonical runtime policy into one device runner.
+         * @param runtime Already normalized policy, including graph admission.
+         * @return Policy without topology or resource ownership; those are bound
+         *         by the stage/participant construction authority afterwards.
+         */
+        static InferenceRunnerConfig fromRuntime(const RuntimeConfig &runtime)
+        {
             InferenceRunnerConfig config;
-            config.max_seq_len = plan.runtime.max_seq_len;
-            config.activation_seq_len = plan.runtime.resident_graph_rows;
-            config.batch_size = plan.runtime.batch_size;
-            config.activation_precision = plan.runtime.activation_precision;
-            config.kv_cache_precision = plan.runtime.kv_cache_precision;
+            config.max_seq_len = runtime.max_seq_len;
+            config.activation_seq_len = runtime.resident_graph_rows;
+            config.batch_size = runtime.batch_size;
+            config.activation_precision = runtime.activation_precision;
+            config.kv_cache_precision = runtime.kv_cache_precision;
             config.tp_allreduce_precision_override =
-                plan.runtime.tp_allreduce_precision_override;
-            config.fused_attention_backend = plan.runtime.fused_attention_backend;
-            config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
-            config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
-            config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
+                runtime.tp_allreduce_precision_override;
+            config.fused_attention_backend = runtime.fused_attention_backend;
+            config.kv_cache_scale_k = runtime.kv_cache_scale_k;
+            config.kv_cache_scale_v = runtime.kv_cache_scale_v;
+            config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
             config.routed_expert_owner_order =
-                plan.runtime.routed_expert_owner_order;
-            config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
-            config.moe_routed_prefill = plan.runtime.moe_routed_prefill;
-            config.moe_rebalance = plan.runtime.moe_rebalance;
-            config.prefix_cache = plan.runtime.prefix_cache;
-            config.mtp = plan.runtime.mtp;
+                runtime.routed_expert_owner_order;
+            config.moe_hot_expert_cache = runtime.moe_hot_expert_cache;
+            config.moe_routed_prefill = runtime.moe_routed_prefill;
+            config.moe_rebalance = runtime.moe_rebalance;
+            config.prefix_cache = runtime.prefix_cache;
+            config.mtp = runtime.mtp;
             return config;
         }
     };
@@ -434,47 +444,6 @@ namespace llaminar2
         const ILocalTPContext *local_tp_ctx,
         const ITPContext *tp_ctx);
 
-    /**
-     * @brief Factory function to create a unified LOCAL PP runner
-     *
-     * Creates a DeviceGraphOrchestrator configured for LOCAL Pipeline Parallelism
-     * (multiple PP stages on multiple local devices within a single MPI rank).
-     * The factory handles:
-     * - Building GraphConfig from model metadata
-     * - Calling setPipelineConfig() on the orchestrator
-     * - Auto-configuring weights for each layer's device using getWeightForDevice()
-     * - Initializing PP contexts for inter-stage activation transfers
-     *
-     * This is the **production entry point** for LOCAL PP. Tests and production
-     * code should use this instead of manually wiring weights.
-     *
-     * @param model_ctx Model context with weights (REPLICATED strategy recommended)
-     * @param pipeline_config Complete pipeline configuration (TP domains + PP stages)
-     * @param config General runner configuration
-     * @return Unique pointer to IInferenceRunner, or nullptr on failure
-     *
-     * @code
-     * // Example: 2-stage LOCAL PP with CUDA and CPU
-     * auto pipeline_config = std::make_shared<PipelineConfig>();
-     * pipeline_config->total_layers = 24;
-     * pipeline_config->tp_domains = {
-     *     {"stage0_domain", {DeviceId::cuda(0)}, CollectiveBackendType::HOST},
-     *     {"stage1_domain", {DeviceId::cpu()}, CollectiveBackendType::HOST}
-     * };
-     * pipeline_config->pp_stages = {
-     *     PPStageConfig::firstStage(0, "stage0_domain", 0, 12),
-     *     PPStageConfig::lastStage(1, "stage1_domain", 12, 24)
-     * };
-     * pipeline_config->pp_transfer_backends[{0, 1}] = CollectiveBackendType::HOST;
-     *
-     * auto runner = createUnifiedPipelineRunner(model_ctx, pipeline_config);
-     * runner->forward(tokens.data(), seq_len);
-     * @endcode
-     */
-    std::unique_ptr<IInferenceRunner> createUnifiedPipelineRunner(
-        std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<PipelineConfig> pipeline_config,
-        const InferenceRunnerConfig &config = {});
 
     /**
      * @brief Factory function to create a Pipeline Parallelism stage runner

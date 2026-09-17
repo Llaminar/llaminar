@@ -1,18 +1,37 @@
 /**
  * @file RuntimeInitPhase.h
  * @brief Post-MPI runtime initialization: MPI init, affinity, DeviceManager, runner creation
+ *
+ * Resolve declared placement against observed rank affinity before creating
+ * allocator singletons. Pure placement helpers are shared with tests so MPI
+ * rank numbering cannot accidentally become physical NUMA identity.
+ * Automatic selection publishes root's complete apply configuration on the
+ * discovery communicator. Saved and automatic configurations then use the same
+ * MPI split authority before this frontend creates any inference runner.
  */
 
 #pragma once
 
 #include "app/AppContext.h"
 #include "config/OrchestrationConfig.h"
+#include "planning/AutomaticPlanningStartup.h"
 #include <iosfwd>
 #include <optional>
+#include <variant>
 
 namespace llaminar2
 {
     struct NUMAInfo;
+
+    /** @brief Terminal startup outcome when no inference context is returned. */
+    enum class RuntimeInitExit
+    {
+        Completed = 0, ///< Successful dry-run or inactive-rank completion.
+        Failed = 1,    ///< A precise startup failure has already been reported.
+    };
+
+    /** @brief Active runtime or an explicit terminal result, never a config flag. */
+    using RuntimeInitResult = std::variant<AppContext, RuntimeInitExit>;
 
     /**
      * @brief Post-MPI runtime initialization
@@ -28,6 +47,33 @@ namespace llaminar2
     class RuntimeInitPhase
     {
     public:
+        /** @brief Use the same startup cost policy as the public plan command. */
+        RuntimeInitPhase();
+        /**
+         * @brief Inject cost preparation without replacing frontend or admission lifecycle.
+         * @param prepare Nonempty evidence policy; every discovery rank participates.
+         * @throws std::invalid_argument for an absent preparation policy.
+         *
+         * This dependency changes only evidence collection/pricing. Model parsing, the
+         * production compiler, PMA, publication, rank admission and runner
+         * construction remain the ordinary frontend path.
+         */
+        explicit RuntimeInitPhase(AutomaticPlanningStartup::Prepare prepare);
+        /**
+         * @brief Resolve CPU shorthand to this rank's observed physical endpoint.
+         * @param config Parsed intent; unchanged when CPU shorthand is not active.
+         * @param mpi_rank Actual communicator rank, not a socket/NUMA index.
+         * @param mpi_world_size Admitted communicator size.
+         * @param numa_info Observed rank affinity from the canonical NUMA probe.
+         * @throws std::runtime_error if the rank or its CPU locality is unknown.
+         *
+         * Retire the shorthand's device selector while installing the explicit
+         * map. Repeated resolution is idempotent and requires no extra collective.
+         */
+        static void resolveCPUShorthand(
+            OrchestrationConfig &config, int mpi_rank, int mpi_world_size,
+            const NUMAInfo &numa_info);
+
         /**
          * @brief Resolve the immutable CPU backend NUMA identity for one rank.
          *
@@ -63,7 +109,9 @@ namespace llaminar2
          * visibility boundary. Any explicit accelerator intent—including a
          * rank-agnostic ExpertOverlay domain—requires the complete host view so
          * inventory binding can choose the actual owning rank after cards move
-         * between sockets.
+         * between sockets. Automatic search also requires that view whenever
+         * its hard backend constraints permit a GPU. A CPU-only hard filter
+         * keeps the rank-local CPU observation without creating GPU contexts.
          *
          * @param config Parsed orchestration intent.
          * @param mpi_rank World rank being initialized.
@@ -74,16 +122,46 @@ namespace llaminar2
             int mpi_rank);
 
         /**
+         * @brief Establish one rank's immutable CPU/backend and hardware observation identities.
+         *
+         * This is the shared pre-inventory transition for the serving frontend
+         * and the public `plan` command.  It intentionally performs no MPI
+         * collective, model access, planner selection, arena allocation, or
+         * runner construction: its caller owns failure publication before a
+         * subsequent inventory exchange.  CPU backend identity and
+         * DeviceManager's complete hardware observation must agree, otherwise
+         * planning could measure a different endpoint from the one that later
+         * admits inference.
+         *
+         * The configuration is borrowed and never rewritten.  Serving resolves
+         * the legacy CPU shorthand to an explicit map immediately before this
+         * call; `plan` deliberately retains its automatic request unchanged so
+         * its apply document is the sole selection authority.
+         *
+         * @param config Parsed request or already-applied configuration.
+         * @param discovery_rank Exact rank in the unsplit discovery communicator.
+         * @param discovery_world_size Size of that communicator.
+         * @throws std::runtime_error when affinity or CPU ownership cannot be
+         *         established for the declared topology.
+         */
+        static void initializeDiscoveryRuntime(
+            const OrchestrationConfig &config,
+            int discovery_rank,
+            int discovery_world_size);
+
+        /**
          * @brief Run dry-run preflight on an already-created runner.
          *
-         * This helper owns the dry-run-specific lifecycle after MPI/device setup:
-         * initialize the runner in validation-only mode, print the resolved plan
-         * on rank 0, and shut the runner back down.
+         * Initialize validation-only state and print the resolved plan on rank
+         * zero. The caller owns runner destruction and the outer MPI session;
+         * reporting must not encode failure by mutating requested configuration.
          *
          * @return true when dry-run validation succeeds; false when it fails
+         * @param runner Caller-owned runner; this function does not shut it down.
+         * @param mpi_rank Exact admitted communicator rank for output selection.
+         * @param out Destination for the resolved plan on rank zero.
          */
-        static bool runDryRunPreflight(OrchestrationConfig &config,
-                                       IOrchestrationRunner &runner,
+        static bool runDryRunPreflight(IOrchestrationRunner &runner,
                                        int mpi_rank,
                                        std::ostream &out);
 
@@ -91,14 +169,18 @@ namespace llaminar2
          * @brief Execute the runtime init phase
          *
          * On success, returns a fully-initialized AppContext with runner and tokenizer.
-         * On failure, returns nullopt (errors already logged, MPI finalized).
+         * Successful dry-run and failure are distinct terminal values. Their
+         * local owners unwind before the process session finalizes MPI.
          *
-         * @param config Orchestration config (may be mutated for CPU shorthand mapping)
+         * @param config Request, replaced by published apply policy before rank admission.
          * @param argc Argument count (MPI_Init may modify)
          * @param argv Argument vector (MPI_Init may modify)
-         * @return AppContext on success, nullopt on failure
+         * @return Active context or typed terminal exit (errors already logged).
          */
-        std::optional<AppContext> execute(OrchestrationConfig &config, int &argc, char **&argv);
+        RuntimeInitResult execute(OrchestrationConfig &config, int &argc, char **&argv);
+
+    private:
+        AutomaticPlanningStartup::Prepare prepare_; ///< Shared evidence policy before discovery membership narrows.
     };
 
 } // namespace llaminar2

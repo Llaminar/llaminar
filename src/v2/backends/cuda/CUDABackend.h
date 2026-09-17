@@ -174,14 +174,11 @@ namespace llaminar2
             bool first_token_already_in_history,
             int device_id,
             void *stream) override;
-        bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+        bool enqueueArgmaxF32RowsWithHistoryDevice(
             const void *data_device,
             int rows,
             int cols,
-            const void *verifier_input_tokens_device,
-            const void *generated_token_counts_device,
-            const void *penalty_policy_device,
-            const void *active_rows_device,
+            const GenerationPenaltyHistory &history,
             int device_id,
             void *stream,
             void *out_values_device,
@@ -292,7 +289,8 @@ namespace llaminar2
             void *out_probability_device = nullptr,
             uint64_t threshold_seed = 0,
             const void *threshold_position_device = nullptr,
-            int threshold_position_offset = 0) override;
+            int threshold_position_offset = 0,
+            const uint64_t *threshold_seed_device = nullptr) override;
         bool enqueueSampleProcessedLogitsF32Device(
             const void *logits_device,
             int vocab_size,
@@ -808,19 +806,10 @@ namespace llaminar2
             void *out_position_ids_device,
             void *out_request_length_device,
             void *out_base_position_snapshot_device) override;
-        bool enqueueInitializeMTPDeviceLogicalState(
-            const void *sampled_tokens_device,
-            const void *target_positions_device,
-            int request_count,
-            int device_id,
-            void *stream,
-            void *out_base_cached_tokens_device,
-            void *out_target_positions_device,
-            void *out_accepted_state_counts_device,
-            void *out_next_condition_tokens_device,
-            void *out_all_drafts_accepted_flags_device,
-            void *out_stopped_flags_device,
-            void *out_publication_ok_flags_device) override;
+        /** @brief Enqueue the shared typed logical-frontier initializer on its exact stream. */
+        bool enqueueInitializeGenerationLogicalState(
+            const GenerationLogicalStateInitialization &initialization,
+            int device_id, void *stream) override;
 
         // GPU-side sparse logit penalty application
         bool prepareLogitPenaltyWorkspace(

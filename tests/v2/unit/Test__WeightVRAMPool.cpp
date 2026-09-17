@@ -48,6 +48,26 @@ namespace llaminar2
         EXPECT_GE(pool.totalPlannedBytes(), min_expected);
     }
 
+    /** @brief Non-concurrent raw/packed views pay the larger size, never both. */
+    TEST(Test__WeightVRAMPool, ContiguousAliasSharesPackedStorageWithoutOverlap)
+    {
+        constexpr size_t raw_bytes = 32u * 64u * sizeof(float);
+        WeightVRAMPool pool;
+        pool.planWeight("mixed", 32, 64, 16, true, true, 0,
+                        {.bytes = raw_bytes});
+        EXPECT_EQ(pool.totalPlannedBytes(), raw_bytes);
+        pool.planRawWeight("following", 32, 64, raw_bytes);
+        EXPECT_EQ(pool.totalPlannedBytes(), 2u * raw_bytes);
+
+        // A smaller alias cannot truncate native scales/minima or move the
+        // next allocation backward. Quantized-only plans remain byte identical.
+        WeightVRAMPool baseline;
+        WeightVRAMPool smaller;
+        baseline.planWeight("native", 32, 64, 32, true, true, 0);
+        smaller.planWeight("native", 32, 64, 32, true, true, 0, {.bytes = 16});
+        EXPECT_EQ(smaller.totalPlannedBytes(), baseline.totalPlannedBytes());
+    }
+
     TEST(Test__WeightVRAMPool, GetSlotBeforeAllocate)
     {
         WeightVRAMPool pool;

@@ -99,6 +99,7 @@ namespace llaminar2
     struct PlacementPlan;
     struct PPActivationContract;
     class PipelineGraphExecutionPlan;
+    class PipelineDeviceGeneration;
 
     namespace rank_orchestrator_detail
     {
@@ -251,6 +252,9 @@ namespace llaminar2
 
             /// Activation precision for intermediate buffers
             ActivationPrecision activation_precision = ActivationPrecision::FP32;
+
+            /// Preserve the selected attention implementation across TP composition.
+            FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
             /// KV cache scale factors (K and V separate)
             float kv_cache_scale_k = 256.0f;
@@ -436,6 +440,13 @@ namespace llaminar2
              * @return Populated Config
              */
             static Config fromPlan(const RankExecutionPlan &plan);
+
+            /**
+             * @brief Project canonical runtime policy without guessing topology.
+             * @param runtime Normalized policy shared by ordinary and PP stages.
+             * @return Policy-only config; the caller must bind exact participants.
+             */
+            static Config fromRuntime(const RuntimeConfig &runtime);
         };
 
         // =====================================================================
@@ -1943,6 +1954,10 @@ namespace llaminar2
 
         /// LOCAL PP context for inter-stage transfers (PP mode)
         std::unique_ptr<ILocalPPContext> pp_ctx_;
+
+        /** Native pipeline collective owner outlives every participant graph.
+         * Only the tail owns generation; followers own their layer state. */
+        std::unique_ptr<PipelineDeviceGeneration> pp_device_generation_;
 
         /// Effective parallelism mode (resolved from config)
         ParallelismMode mode_ = ParallelismMode::TP;

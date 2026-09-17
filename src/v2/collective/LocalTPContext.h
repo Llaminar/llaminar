@@ -170,6 +170,15 @@ namespace llaminar2
             int device_index,
             void *stream,
             int timeout_ms) override;
+        /**
+         * @brief Admit only the persistent native graph-lifecycle fence words.
+         * Pipeline P2P uses FP32 banks directly and must not reserve TP's FP16
+         * conversion scratch. Call during single-threaded setup before capture.
+         * @param memory_authority Existing rank-wide allocation authority.
+         * @return Whether every participant's exact fence allocation is ready.
+         */
+        bool reserveGraphCaptureBoundaryResources(
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority);
         bool collectiveSidebandOnStream(
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
             int device_index,
@@ -549,6 +558,7 @@ namespace llaminar2
          * @return true if backend was successfully initialized
          */
         bool initializeBackend();
+        /** @brief Materialize exact fence leases while the setup mutex is held. */
         bool initializeGraphCaptureBoundaryDeviceWords(
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority);
         void releaseGraphCaptureBoundaryDeviceWords() noexcept;

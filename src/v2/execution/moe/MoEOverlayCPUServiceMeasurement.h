@@ -25,6 +25,8 @@ namespace llaminar2
     class MoEOverlayCPUServiceMeasurement final
     {
     public:
+        static constexpr int kMeasuredSamples = 3; ///< Bounded completed FFN observations.
+        static constexpr int kMaximumRows = 8; ///< Largest retained service-sample input family.
         /** @brief Complete model dimensions for a singleton full-expert observation. */
         struct Geometry
         {
@@ -35,10 +37,35 @@ namespace llaminar2
         /**
          * @brief Maximum concurrently allocated setup payload on one CPU resource.
          * @param geometry Full expert dimensions, not a tensor-parallel shard.
+         * @param invocation_workspace_bytes Canonical merged kernel requirements for this sample family.
          * @return Exact maximum of the serial phase scratch families.
          * @throws std::invalid_argument for nonpositive dimensions.
          */
-        [[nodiscard]] static size_t allocationBytes(Geometry geometry);
+        [[nodiscard]] static size_t allocationBytes(Geometry geometry, size_t invocation_workspace_bytes);
+
+        /** @return Exact bounded row count used for this observed production phase. */
+        [[nodiscard]] static int rowsForPhase(ExpertHistogramSource source);
+
+        /**
+         * @brief Observe one privately owned, completely prepared CPU expert.
+         * @param source Canonical gate/up/down engines retained for this call.
+         * @param device Exact CPU allocator/worker, never a GPU proxy.
+         * @param layer Logical layer for the production stage's diagnostic identity.
+         * @param phase Production phase selecting its bounded representative batch.
+         * @param geometry Full, unsharded expert dimensions.
+         * @param memory Authority admitting the existing grouped workspace and tensors.
+         * @return Sum of completed FFN nanoseconds across kMeasuredSamples, after warmup.
+         * @throws std::exception for invalid geometry, ownership, admission or execution.
+         *
+         * Used both by startup planning and by the published-bank certifier below.
+         * This does not publish a bank or alter routing. The original engines are
+         * never rebound; private execution views use the same production stage,
+         * arithmetic and explicit workspace as resident expert service.
+         */
+        [[nodiscard]] static uint64_t measurePrepared(
+            const MoEOverlayPreparedExpertTriplet &source, DeviceId device, int layer,
+            ExpertHistogramSource phase, Geometry geometry,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory);
 
         /**
          * @brief Measure missing CPU class/phase coordinates from the initial bank.

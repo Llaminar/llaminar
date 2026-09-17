@@ -18,6 +18,7 @@
 #include "tensors/FP16Utils.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 
 #include <cmath>
 #include <numeric>
@@ -148,6 +149,7 @@ protected:
             return false;
 
         MoEExpertComputeStage stage(params);
+        test::CPUStageTestWorkspace workspace(stage, seq_len);
         return stage.execute(cpu_ctx_.get());
     }
 

@@ -1733,20 +1733,9 @@ namespace llaminar2
         return slice;
     }
 
-    std::shared_ptr<MappedHostTransferRegion>
-    TransferEngine::allocateMappedHostRegion(
-        size_t bytes,
-        std::span<const DeviceId> devices) const
+    size_t TransferEngine::mappedHostRegionAllocationBytes(size_t bytes)
     {
-        if (bytes == 0u || devices.empty() ||
-            std::any_of(
-                devices.begin(),
-                devices.end(),
-                [](DeviceId device) { return !device.is_gpu(); }))
-        {
-            throw std::invalid_argument(
-                "TransferEngine::allocateMappedHostRegion requires positive bytes and local GPU endpoints");
-        }
+        if (!bytes) throw std::invalid_argument("Mapped host backing requires a positive payload extent");
         const long page_size_value = ::sysconf(_SC_PAGESIZE);
         if (page_size_value <= 0)
         {
@@ -1759,8 +1748,17 @@ namespace llaminar2
             throw std::overflow_error(
                 "TransferEngine mapped-host capacity alignment overflow");
         }
-        const size_t mapping_bytes =
-            ((bytes + page_size - 1u) / page_size) * page_size;
+        return ((bytes + page_size - 1u) / page_size) * page_size;
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::allocateMappedHostRegion(
+        size_t bytes,
+        std::span<const DeviceId> devices) const
+    {
+        if (devices.empty() || std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return !device.is_gpu(); }))
+            throw std::invalid_argument("TransferEngine::allocateMappedHostRegion requires local GPU endpoints");
+        const size_t mapping_bytes = mappedHostRegionAllocationBytes(bytes);
 
         if (devices.size() == 1u)
         {
@@ -1913,21 +1911,7 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Mapped host transfer slices require positive geometry and an exact GPU");
         }
-        const long page_size_value = ::sysconf(_SC_PAGESIZE);
-        if (page_size_value <= 0)
-        {
-            throw std::runtime_error(
-                "Mapped host transfer slices could not resolve the host page size");
-        }
-        const size_t page_size = static_cast<size_t>(page_size_value);
-        if (bytes_per_slice >
-            std::numeric_limits<size_t>::max() - (page_size - 1u))
-        {
-            throw std::overflow_error(
-                "Mapped host transfer slice alignment overflowed");
-        }
-        const size_t stride =
-            ((bytes_per_slice + page_size - 1u) / page_size) * page_size;
+        const size_t stride = mappedHostRegionAllocationBytes(bytes_per_slice);
         if (slice_count > std::numeric_limits<size_t>::max() / stride)
         {
             throw std::overflow_error(
@@ -2569,6 +2553,28 @@ namespace llaminar2
             throw std::runtime_error(
                 "TransferEngine progress-kernel launch was rejected");
         }
+    }
+
+    void TransferEngine::enqueueMappedKernelCopy(const PersistentTransferExecutionLane &lane,
+        MappedTransferDirection direction, DeviceTransferBuffer &device_region, size_t device_offset,
+        const MappedHostTransferRegion &mapped_region, size_t mapped_offset, size_t bytes) const
+    {
+        if (!lane.valid() || !device_region.isBound() || !mapped_region.isBound() || !bytes ||
+            (direction != MappedTransferDirection::DeviceToHost && direction != MappedTransferDirection::HostToDevice))
+            throw std::invalid_argument("Mapped kernel copy requires a prepared lane, bounded owners and direction");
+        if (!device_region.contains(device_offset, bytes) || !mapped_region.contains(mapped_offset, bytes))
+            throw std::out_of_range("Mapped kernel copy exceeds its immutable region");
+        const DeviceId device = lane.device();
+        IBackend *backend = resolveBackend(device);
+        if (!backend || device_region.device_ != device || device_region.backend_ != backend ||
+            mapped_region.backendFor(device) != backend)
+            throw std::invalid_argument("Mapped kernel copy owner/backend identity mismatch");
+        void *device_bytes = device_region.mutableDeviceData(device_offset);
+        void *mapped_bytes = mapped_region.deviceAlias(device, mapped_offset);
+        const bool outbound = direction == MappedTransferDirection::DeviceToHost;
+        if (!backend->copyDeviceVisibleRegionByKernelOnStream(outbound ? mapped_bytes : device_bytes,
+                outbound ? device_bytes : mapped_bytes, bytes, device.gpu_ordinal(), lane.stream()))
+            throw std::runtime_error("Mapped kernel copy launch was rejected");
     }
 
     void TransferEngine::enqueueBackgroundMappedCopy(

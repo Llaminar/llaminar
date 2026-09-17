@@ -6,13 +6,15 @@
  * process or GPU backend directly. The continuation rank therefore publishes
  * one immutable @ref MoEOverlayInferenceTransactionTicket immediately before
  * the first sparse dispatch of that graph transaction. The remote rank consumes
- * the ticket, executes exactly the named retained graph, and then waits for the
- * next ticket. Compact activations and expert outputs continue to travel through
+ * the ticket, executes exactly the named retained graph, publishes its terminal
+ * receipt, and then waits for the next ticket. Compact activations and expert
+ * outputs travel through
  * @ref MoEOverlayMPIRankBatchTransport; this control channel never carries model
  * state.
  *
  * Both directions use setup-owned fixed storage. Publishing a ticket retains its
- * bytes in a ring until `MPI_Test` reports completion, while receiving actively
+ * bytes in a ring until transport and authenticated graph completion retire.
+ * Receiving actively
  * progresses only the exact request whose bytes are required to choose a graph.
  * No blocking MPI wait or hot-path allocation is permitted.
  */
@@ -107,7 +109,7 @@ namespace llaminar2
          */
         explicit MoEOverlayMPIInferenceTransactionChannel(Config config);
 
-        /** @brief Drain source-owned sends before their fixed storage is released. */
+        /** @brief Drain endpoint-owned sends; unjoined execution ownership is fatal. */
         ~MoEOverlayMPIInferenceTransactionChannel();
 
         MoEOverlayMPIInferenceTransactionChannel(
@@ -120,12 +122,25 @@ namespace llaminar2
             MoEOverlayMPIInferenceTransactionChannel &&) = delete;
 
         /**
-         * @brief Publish one ticket from a stable fixed slot without waiting.
+         * @brief Publish one ticket and prepost its exact graph-completion receive.
          *
          * Completion means MPI owns an immutable transport slot. The caller may
          * immediately release or mutate its original ticket value.
          */
         bool publish(
+            const MoEOverlayInferenceTransactionTicket &ticket,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Join the exact remote graph terminal before reusing its source slot.
+         * @param ticket Original execution ticket, including command, epoch, and geometry.
+         * @param error Optional failure diagnostic.
+         * @return True only after the follower's identical completion receipt arrives.
+         *
+         * Numerical returns are not retirement evidence: an empty route can have
+         * no return payload while its follower graph is still using the placement.
+         */
+        bool awaitCompletion(
             const MoEOverlayInferenceTransactionTicket &ticket,
             std::string *error = nullptr);
 
@@ -153,16 +168,53 @@ namespace llaminar2
         /** @return MPI world rank of this process on the bound communicator. */
         [[nodiscard]] int localWorldRank() const noexcept;
 
-        /** @return Number of source ticket sends not yet retired by MPI. */
+        /** @return Number of control slots still owned by transport or graph completion. */
         [[nodiscard]] std::size_t inFlightSendCount() const noexcept;
 
     private:
-        /** @brief One setup-owned immutable ticket and its exact MPI request. */
+        // Only the owner that joins executor return and protocol retirement can
+        // produce this terminal edge. Graph callers cannot fabricate completion.
+        friend class MoEOverlayInferenceTransactionFollower;
+
+        /**
+         * @brief Publish completion of the follower's currently executing graph.
+         * @param ticket Exact receive identity after executor and protocol retirement.
+         * @param error Optional failure diagnostic.
+         * @return True once setup-owned storage retains the immutable receipt.
+         *
+         * This edge carries no sampler, KV, or model state and is private to the
+         * follower lifecycle authority rather than an ordinary graph-facing API.
+         */
+        bool publishCompletion(
+            const MoEOverlayInferenceTransactionTicket &ticket,
+            std::string *error = nullptr);
+
+        /** @brief A transport send and a graph terminal have distinct lifetimes. */
+        enum class SlotLifecycle : std::uint8_t
+        {
+            Available,
+            Sending,
+            AwaitingGraphCompletion,
+            Failed,
+        };
+
+        /** @brief Receiving another ticket must not overwrite an unretired identity. */
+        enum class ReceiveLifecycle : std::uint8_t
+        {
+            Idle,
+            Receiving,
+            Executing,
+            Failed,
+        };
+
+        /** @brief Setup-owned immutable ticket, receipt, and their exact MPI requests. */
         struct SendSlot
         {
             MoEOverlayInferenceTransactionTicket ticket{};
+            MoEOverlayInferenceTransactionTicket completion_ticket{};
             MPI_Request request = MPI_REQUEST_NULL;
-            bool in_flight = false;
+            MPI_Request completion_request = MPI_REQUEST_NULL;
+            SlotLifecycle lifecycle = SlotLifecycle::Available;
         };
 
         /** @brief Retire sends completed by one non-blocking progress pass. */
@@ -178,13 +230,15 @@ namespace llaminar2
             const char *operation,
             std::string *error) const;
 
-        /** @brief Teardown-only bounded drain of every source send. */
+        /** @brief Drain sends on both endpoints; unjoined graph ownership is fatal. */
         void drainNoexcept() noexcept;
 
         Config config_;
         mutable std::vector<SendSlot> send_slots_;
         std::size_t next_send_slot_ = 0;
         MoEOverlayInferenceTransactionTicket receive_ticket_{};
+        MPI_Request receive_request_ = MPI_REQUEST_NULL;
+        ReceiveLifecycle receive_lifecycle_ = ReceiveLifecycle::Idle;
     };
 
     /**
@@ -243,7 +297,7 @@ namespace llaminar2
             const MoEOverlayInferenceExecutionDescriptor &) const = default;
     };
 
-    /** @brief Source-owned live transaction retained until data return completes. */
+    /** @brief Source-owned transaction retained through local and remote graph completion. */
     struct MoEOverlayPublishedInferenceTransaction
     {
         bool ok = false; ///< True only after the control ticket was submitted.
@@ -274,7 +328,7 @@ namespace llaminar2
         /** @brief Publish one exact retained-graph execution ticket. */
         [[nodiscard]] virtual MoEOverlayPublishedInferenceTransaction publish(
             const MoEOverlayInferenceExecutionDescriptor &descriptor) = 0;
-        /** @brief Retire one source slot after its data-plane return is complete. */
+        /** @brief Join remote graph completion after local return consumption, then retire. */
         virtual bool retire(
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) = 0;
@@ -322,7 +376,7 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayPublishedInferenceTransaction publish(
             const MoEOverlayInferenceExecutionDescriptor &descriptor) override;
 
-        /** @brief Retire a graph transaction after its sparse return completed. */
+        /** @brief Join the exact follower receipt after local sparse return consumption. */
         bool retire(
             const MoEOverlayPublishedInferenceTransaction &transaction,
             std::string *error = nullptr) override;

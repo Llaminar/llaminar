@@ -1,11 +1,14 @@
 /**
  * @file SingleShotChatMode.cpp
  * @brief Single-shot chat mode (--chat-single)
+ *
+ * Request termination belongs to this mode; process finalization belongs to
+ * the caller's MPIProcessSession. Returning first retires mode-local adapters
+ * and handlers before the runner, contexts and outer session are destroyed.
  */
 
 #include "app/modes/SingleShotChatMode.h"
 #include "app/AppContext.h"
-#include "app/MPIShutdown.h"
 #include "app/modes/ConsoleOutput.h"
 #include "utils/Logger.h"
 #include "utils/ChatTemplate.h"
@@ -18,7 +21,14 @@ namespace llaminar2
 {
     namespace
     {
-        int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
+        /**
+         * @brief Terminate the request channel while retaining outer MPI ownership.
+         * @param ctx Active caller-owned application resources.
+         * @param mode_name Diagnostic name of this request frontend.
+         * @param detail Failure shared with followers before runner retirement.
+         * @return Nonzero command exit; the caller's scope finalizes MPI later.
+         */
+        int shutdownAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
             const bool is_authority =
@@ -37,7 +47,6 @@ namespace llaminar2
                     ctx.runner->abortMPIWorkers(detail);
                 ctx.runner->shutdown();
             }
-            mpiShutdown();
             return 1;
         }
     } // namespace
@@ -66,7 +75,6 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
-            mpiShutdown();
             return 0;
         }
 
@@ -75,14 +83,13 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
         }
 
-        auto shutdownAndFinalize = [&](int exit_code) -> int
+        auto shutdownAndReturn = [&](int exit_code) -> int
         {
             if (mpi_coordinated)
             {
                 runner->shutdownMPIWorkers();
             }
             runner->shutdown();
-            mpiShutdown();
             return exit_code;
         };
 
@@ -90,7 +97,7 @@ namespace llaminar2
         {
             LOG_ERROR("Chat mode requires a model with a chat template.");
             LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
-            return shutdownAndFinalize(1);
+            return shutdownAndReturn(1);
         }
 
         LOG_INFO("Running single-shot chat...");
@@ -126,12 +133,12 @@ namespace llaminar2
         catch (const std::exception &e)
         {
             LOG_ERROR("Error encoding conversation with chat template: " << e.what());
-            return shutdownAndFinalize(1);
+            return shutdownAndReturn(1);
         }
 
         if (token_count <= 0)
         {
-            return shutdownAndFinalize(1);
+            return shutdownAndReturn(1);
         }
 
         LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
@@ -147,7 +154,7 @@ namespace llaminar2
         if (!runner->prefill(token_ids))
         {
             LOG_ERROR("Chat prefill failed: " << runner->lastError());
-            return shutdownAndFinalize(1);
+            return shutdownAndReturn(1);
         }
 
         // Determine max tokens: -1 means unlimited
@@ -173,7 +180,7 @@ namespace llaminar2
             if (!result.success())
             {
                 LOG_ERROR("Decode step failed: " << result.error);
-                return shutdownAndFinalize(1);
+                return shutdownAndReturn(1);
             }
 
             if (result.tokens.empty())
@@ -214,15 +221,15 @@ namespace llaminar2
         std::cout << std::endl;
         LOG_INFO("Chat generation complete.");
 
-        return shutdownAndFinalize(0);
+        return shutdownAndReturn(0);
     }
     catch (const std::exception &e)
     {
-        return finalizeAfterUnhandledException(ctx, "Single-shot chat mode", e.what());
+        return shutdownAfterUnhandledException(ctx, "Single-shot chat mode", e.what());
     }
     catch (...)
     {
-        return finalizeAfterUnhandledException(ctx, "Single-shot chat mode", "unknown non-std exception");
+        return shutdownAfterUnhandledException(ctx, "Single-shot chat mode", "unknown non-std exception");
     }
 
 } // namespace llaminar2

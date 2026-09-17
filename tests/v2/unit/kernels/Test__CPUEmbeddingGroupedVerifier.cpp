@@ -19,6 +19,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "tensors/Tensors.h"
+#include "tensors/TensorSlice.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
@@ -236,6 +237,34 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier,
             format, embedding_table.get(), vocab_size, d_model);
         runOutputFormatSweep<Q8_1Tensor>(
             format, embedding_table.get(), vocab_size, d_model);
+    }
+}
+
+/** @brief Nested TP wrappers retain exact CPU results for every source format. */
+TEST_F(Test__CPUEmbeddingGroupedVerifier, NestedSlicesMatchUnwrappedSourceBytes)
+{
+    constexpr int vocab_size = 19, d_model = 256;
+    const std::array<int, 3> tokens{0, 7, vocab_size - 1};
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto table = format.create({vocab_size, d_model}, 462);
+        FP32Tensor reference({tokens.size(), d_model});
+        {
+            CPUEmbeddingKernelT<FP32Tensor> kernel;
+            ASSERT_TRUE(kernel.apply_tensor(table.get(), tokens.data(), tokens.size(),
+                                            d_model, &reference));
+        }
+        for (int nesting = 0; nesting != 2; ++nesting)
+        {
+            table = std::make_unique<TensorSlice>(std::move(table), SliceMetadata{});
+            FP32Tensor actual({tokens.size(), d_model});
+            CPUEmbeddingKernelT<FP32Tensor> kernel;
+            ASSERT_TRUE(kernel.apply_tensor(table.get(), tokens.data(), tokens.size(),
+                                            d_model, &actual));
+            expectByteExact(actual.raw_data(), reference.raw_data(), reference.size_bytes(),
+                            std::string(format.label) + " nested CPU source");
+        }
     }
 }
 

@@ -97,12 +97,11 @@ CONTROL_NAMES = {
     "while",
 }
 
-# Dedicated diagnostics and benchmark translation units do not participate in
+# Dedicated diagnostic translation units do not participate in
 # production inference. Keeping these path exemptions narrow avoids hundreds
 # of caller entries while still preventing runtime code from acquiring a new
 # blocking boundary unnoticed.
 NON_PRODUCTION_PATH_CATEGORIES: tuple[tuple[str, str], ...] = (
-    ("src/v2/backends/benchmarks/", "benchmark"),
     ("src/v2/utils/CUDAKernelProfiler.cu", "profiler"),
     ("src/v2/utils/ROCmKernelProfiler.hip", "profiler"),
 )
@@ -347,6 +346,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "host_result",
+        # All participant copies/events are enqueued before this terminal-only
+        # observation of independent KV positions. No transaction or prefill
+        # dispatcher may wait on these host-result events.
+        ("src/v2/execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp", "PipelineDeviceGeneration::finish", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::finishDeviceResidentGeneration", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::forwardMTPBatchAndSampleGreedy", "backend_sync_compute", 1),

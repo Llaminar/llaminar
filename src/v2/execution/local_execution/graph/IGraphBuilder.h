@@ -17,6 +17,7 @@
 #pragma once
 
 #include "DeviceGraphExecutor.h"
+#include "DeviceDecodePositionBinding.h"
 #include "GraphSchema.h"
 #include "GraphResolver.h"
 #include "../../../models/GraphTypes.h"
@@ -594,13 +595,13 @@ namespace llaminar2
          * @brief Materialize scalar serial-decode position from live GPU KV state.
          *
          * Ordinary GPU decode binds a stable arena position row into the
-         * captured graph. Immediately before replay, the orchestrator snapshots
-         * the canonical device KV count into that row on the graph stream. This
+         * captured graph. Its first captured node snapshots the canonical
+         * device KV count into that row on every replay. This
          * keeps RoPE, attention, and replicated-expert tie breaking on one
          * immutable device-owned logical position even when attention advances
          * the live cache count later in the same graph.
          */
-        bool materialize_serial_decode_position_from_device_kv = false;
+        std::optional<DeviceDecodePositionBinding> device_decode_position;
         /**
          * @brief Semantic representation of this invocation's positions.
          *

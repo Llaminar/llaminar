@@ -40,6 +40,10 @@ namespace llaminar2::test::parity::qwen36
                 source.topology.participants.front().address.isROCm();
             if (!overlay && !single_rocm) continue;
             auto variant = source;
+            // Cloud certification is explicit model eligibility, not an
+            // inherited promise for a different set of fine-tuned weights.
+            for (auto &selection : variant.e2e_certifiable)
+                selection.remote_cpu_overlays.clear();
             variant.model.test_id = "Ornith15MoE_35B_Q4KM";
             variant.model.model_path = "/opt/llaminar-models/Ornith-1.5-35B-Q4_K_M.gguf";
             // Never authenticate the fine-tune against its parent's reference pack.

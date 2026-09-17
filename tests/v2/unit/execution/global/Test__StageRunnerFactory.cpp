@@ -8,7 +8,7 @@
  * Acceptance criteria (Phase 3):
  * - Single-device stage: non-null runner, correct stage_id/domain, pp_stage_config,
  *   no local/global tp ctx.
- * - Local TP stage:      non-null runner, correct local_tp_ctx, no global_tp_ctx.
+ * - Local TP stage:      non-null runner, the runner-owned local TP context, no global_tp_ctx.
  * - Global TP stage:     non-null runner using injected GlobalTPContext,
  *                        global_tp_ctx != nullptr, correct tp_rank_in_domain.
  * - IDLE action throws std::invalid_argument.
@@ -26,6 +26,7 @@
 #include "execution/global/StageRunnerFactory.h"
 #include "execution/global/DomainCommunicatorRegistry.h"
 #include "collective/GlobalTPContext.h"
+#include "loaders/PreparedWeightStore.h"
 #include "tensors/TensorClasses.h"
 #include "mocks/MockModelContext.h"
 
@@ -57,15 +58,24 @@ namespace llaminar2::test
     }
 
     /**
-     * Build a minimal StageBuildContext using makeMinimalModelCtx().
+     * @brief Build a device-free stage context with the complete model layer count.
+     * @param registry Optional injected global TP communicator registry.
+     * @param model_layers Global main-forward layers, not the local stage width.
+     *
+     * Scoped factory admission now checks actual model bounds. A fixture that
+     * declares a one-layer model cannot legitimately request layers 10 through 19.
      */
-    static StageBuildContext makeCtx(DomainCommunicatorRegistry *registry = nullptr)
+    static StageBuildContext makeCtx(DomainCommunicatorRegistry *registry = nullptr,
+                                     int model_layers = 1)
     {
         StageBuildContext ctx;
-        ctx.model_ctx = makeMinimalModelCtx();
+        auto model = makeMinimalModelCtx();
+        model->setBlockCount(model_layers);
+        ctx.model_ctx = std::move(model);
         ctx.mpi_ctx = nullptr;
-        ctx.runner_config.max_seq_len = 128;
-        ctx.runner_config.batch_size = 1;
+        ctx.runtime.max_seq_len = 128;
+        ctx.runtime.batch_size = 1;
+        ctx.prepared_weight_store = std::make_shared<PreparedWeightStore>();
         ctx.domain_registry = registry;
         return ctx;
     }
@@ -209,7 +219,7 @@ namespace llaminar2::test
         EXPECT_EQ(entry.pp_stage_config->last_layer, 1);
         EXPECT_TRUE(entry.pp_stage_config->has_embedding);
         EXPECT_FALSE(entry.pp_stage_config->has_lm_head);
-        EXPECT_EQ(entry.local_tp_ctx, nullptr);
+        EXPECT_EQ(entry.localTPContext(), nullptr);
         EXPECT_EQ(entry.global_tp_ctx, nullptr);
         ASSERT_NE(entry.weight_context, nullptr);
         EXPECT_NE(entry.weight_context->prepared_store, nullptr);
@@ -241,7 +251,7 @@ namespace llaminar2::test
         ASSERT_TRUE(entry.pp_stage_config.has_value());
         EXPECT_FALSE(entry.pp_stage_config->has_embedding);
         EXPECT_TRUE(entry.pp_stage_config->has_lm_head);
-        EXPECT_EQ(entry.local_tp_ctx, nullptr);
+        EXPECT_EQ(entry.localTPContext(), nullptr);
         EXPECT_EQ(entry.global_tp_ctx, nullptr);
     }
 
@@ -249,7 +259,7 @@ namespace llaminar2::test
     {
         // Verify inclusive-to-exclusive conversion: action.last_layer=4 -> pp_cfg.last_layer=5
         auto [spec, action] = makeSingleDeviceStage(0, 2, 4, /*emb=*/false, /*lm=*/false);
-        auto ctx = makeCtx();
+        auto ctx = makeCtx(nullptr, 6);
 
         StageRunnerEntry entry = StageRunnerFactory::create(spec, action, ctx);
 
@@ -278,9 +288,9 @@ namespace llaminar2::test
         ASSERT_TRUE(entry.pp_stage_config.has_value());
         EXPECT_EQ(entry.pp_stage_config->first_layer, 0);
         EXPECT_EQ(entry.pp_stage_config->last_layer, 1);
-        // local_tp_ctx is non-null (lifetime holder)
-        EXPECT_NE(entry.local_tp_ctx, nullptr);
-        EXPECT_EQ(entry.local_tp_ctx->backend(), CollectiveBackendType::HOST);
+        // The diagnostic accessor must resolve the runner's only TP context.
+        EXPECT_NE(entry.localTPContext(), nullptr);
+        EXPECT_EQ(entry.localTPContext()->backend(), CollectiveBackendType::HOST);
         EXPECT_EQ(entry.global_tp_ctx, nullptr);
         ASSERT_NE(entry.weight_context, nullptr);
         EXPECT_NE(entry.weight_context->prepared_store, nullptr);
@@ -297,6 +307,81 @@ namespace llaminar2::test
 
         EXPECT_EQ(entry.domain_name, "rocm_socket0");
         EXPECT_NE(entry.runner, nullptr);
+    }
+
+    TEST(Test__StageRunnerFactory, LocalTPContextIsOwnedOnlyByTheRunner)
+    {
+        auto [spec, action] = makeLocalTPStage(0, 0, 0);
+        auto ctx = makeCtx();
+        auto entry = StageRunnerFactory::create(spec, action, ctx);
+        const auto *rank = dynamic_cast<const RankOrchestrator *>(entry.runner.get());
+        ASSERT_NE(rank, nullptr);
+        EXPECT_EQ(entry.localTPContext(), rank->localTPContext());
+        entry.runner.reset();
+        EXPECT_EQ(entry.localTPContext(), nullptr);
+    }
+
+    TEST(Test__StageRunnerFactory, SameModelStagesShareOnePreparedNamespace)
+    {
+        auto ctx = makeCtx(nullptr, 2);
+        auto [head_spec, head_action] = makeSingleDeviceStage(0, 0, 0, true, false);
+        auto [tail_spec, tail_action] = makeSingleDeviceStage(1, 1, 1, false, true);
+        auto head = StageRunnerFactory::create(head_spec, head_action, ctx);
+        auto tail = StageRunnerFactory::create(tail_spec, tail_action, ctx);
+        ASSERT_NE(head.weight_context, tail.weight_context);
+        EXPECT_EQ(head.weight_context->prepared_store, ctx.prepared_weight_store);
+        EXPECT_EQ(tail.weight_context->prepared_store, ctx.prepared_weight_store);
+        EXPECT_NE(head.pp_stage_config->first_layer, tail.pp_stage_config->first_layer);
+    }
+
+    TEST(Test__StageRunnerFactory, RuntimePolicyProjectionPreservesCompositionPolicy)
+    {
+        RuntimeConfig policy;
+        policy.max_seq_len = 8192;
+        policy.resident_graph_rows = 512;
+        policy.batch_size = 2;
+        policy.kv_cache_precision = KVCachePrecision::FP32;
+        policy.kv_cache_scale_k = 73.0f;
+        policy.kv_cache_scale_v = 19.0f;
+        policy.fused_attention_backend = FusedAttentionBackend::TILED;
+        policy.tp_allreduce_precision_override = "fp32";
+        policy.prefix_cache.ram_budget_bytes = 123456u;
+        policy.prefix_cache.disk_budget_bytes = 654321u;
+        policy.mtp.enabled = true;
+        policy.mtp.draft_tokens = 3;
+        policy.mtp.graph_capacity_draft_tokens = 15;
+        policy.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        policy.routed_expert_owner_order = RoutedExpertOwnerOrder::Random;
+        policy.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        policy.moe_rebalance.window_size = 517;
+        policy.moe_routed_prefill.overlay_segment_rows = 512;
+        const auto rank = RankOrchestrator::Config::fromRuntime(policy);
+        const auto device = InferenceRunnerConfig::fromRuntime(policy);
+        EXPECT_EQ(rank.max_seq_len, device.max_seq_len);
+        EXPECT_EQ(rank.resident_graph_rows, 512);
+        EXPECT_EQ(device.activation_seq_len, 512);
+        EXPECT_EQ(rank.batch_size, 2);
+        EXPECT_EQ(device.batch_size, 2);
+        EXPECT_EQ(rank.kv_cache_precision, policy.kv_cache_precision);
+        EXPECT_EQ(device.kv_cache_precision, policy.kv_cache_precision);
+        EXPECT_EQ(rank.fused_attention_backend, policy.fused_attention_backend);
+        EXPECT_EQ(device.fused_attention_backend, policy.fused_attention_backend);
+        EXPECT_EQ(rank.kv_cache_scale_k, 73.0f);
+        EXPECT_EQ(rank.kv_cache_scale_v, 19.0f);
+        EXPECT_EQ(rank.tp_allreduce_precision_override, "fp32");
+        EXPECT_EQ(rank.prefix_cache.ram_budget_bytes, 123456u);
+        EXPECT_EQ(rank.prefix_cache.disk_budget_bytes, 654321u);
+        EXPECT_TRUE(rank.mtp.enabled);
+        EXPECT_EQ(rank.mtp.draft_tokens, 3);
+        EXPECT_EQ(rank.mtp.graph_capacity_draft_tokens, 15);
+        EXPECT_EQ(rank.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+        EXPECT_EQ(rank.routed_expert_owner_order, RoutedExpertOwnerOrder::Random);
+        EXPECT_EQ(rank.moe_rebalance.mode, MoERebalanceRuntimeMode::Off);
+        EXPECT_EQ(rank.moe_rebalance.window_size, 517);
+        EXPECT_EQ(rank.moe_routed_prefill.overlay_segment_rows, 512);
+        EXPECT_EQ(device.moe_rebalance.window_size, rank.moe_rebalance.window_size);
+        EXPECT_EQ(device.mtp.graph_capacity_draft_tokens, rank.mtp.graph_capacity_draft_tokens);
+        EXPECT_EQ(device.prefix_cache.ram_budget_bytes, rank.prefix_cache.ram_budget_bytes);
     }
 
     // =========================================================================
@@ -324,7 +409,7 @@ namespace llaminar2::test
         EXPECT_EQ(entry.stage_id, 1);
         EXPECT_NE(entry.global_tp_ctx, nullptr);
         EXPECT_EQ(entry.global_tp_ctx->domainId(), 1);
-        EXPECT_EQ(entry.local_tp_ctx, nullptr);
+        EXPECT_EQ(entry.localTPContext(), nullptr);
         ASSERT_TRUE(entry.pp_stage_config.has_value());
         EXPECT_EQ(entry.pp_stage_config->first_layer, 0);
         EXPECT_EQ(entry.pp_stage_config->last_layer, 1);
@@ -368,7 +453,7 @@ namespace llaminar2::test
         DomainCommunicatorRegistry registry;
         registry.addContextForTest(2, std::move(global_ctx));
 
-        auto ctx = makeCtx(&registry);
+        auto ctx = makeCtx(&registry, 24);
 
         StageRunnerEntry entry = StageRunnerFactory::create(spec, action, ctx);
 
@@ -443,10 +528,10 @@ namespace llaminar2::test
 
         EXPECT_NE(entry0.runner, nullptr);
         EXPECT_EQ(entry0.stage_id, 0);
-        EXPECT_NE(entry0.local_tp_ctx, nullptr);
+        EXPECT_NE(entry0.localTPContext(), nullptr);
         EXPECT_EQ(entry0.global_tp_ctx, nullptr);
-        EXPECT_EQ(entry0.local_tp_ctx->degree(), 2);
-        EXPECT_EQ(entry0.local_tp_ctx->devices().size(), 2u);
+        EXPECT_EQ(entry0.localTPContext()->degree(), 2);
+        EXPECT_EQ(entry0.localTPContext()->devices().size(), 2u);
         ASSERT_TRUE(entry0.pp_stage_config.has_value());
         EXPECT_EQ(entry0.pp_stage_config->first_layer, 0);
         EXPECT_EQ(entry0.pp_stage_config->last_layer, 1);
@@ -468,7 +553,7 @@ namespace llaminar2::test
 
         EXPECT_NE(entry1.runner, nullptr);
         EXPECT_EQ(entry1.stage_id, 1);
-        EXPECT_EQ(entry1.local_tp_ctx, nullptr);
+        EXPECT_EQ(entry1.localTPContext(), nullptr);
         EXPECT_NE(entry1.global_tp_ctx, nullptr);
         EXPECT_EQ(entry1.global_tp_ctx->domainId(), 1);
         EXPECT_EQ(entry1.global_tp_ctx->degree(), 1);
@@ -508,7 +593,7 @@ namespace llaminar2::test
         EXPECT_EQ(entry0.stage_id, 0);
         EXPECT_EQ(entry0.domain_name, "node_tp");
         EXPECT_NE(entry0.global_tp_ctx, nullptr);
-        EXPECT_EQ(entry0.local_tp_ctx, nullptr);
+        EXPECT_EQ(entry0.localTPContext(), nullptr);
         EXPECT_EQ(entry0.global_tp_ctx->degree(), 1);
         ASSERT_NE(entry0.weight_context, nullptr);
         ASSERT_NE(entry0.weight_context->prepared_store, nullptr);
@@ -521,10 +606,10 @@ namespace llaminar2::test
 
         EXPECT_NE(entry1.runner, nullptr);
         EXPECT_EQ(entry1.stage_id, 1);
-        EXPECT_NE(entry1.local_tp_ctx, nullptr);
+        EXPECT_NE(entry1.localTPContext(), nullptr);
         EXPECT_EQ(entry1.global_tp_ctx, nullptr);
-        EXPECT_EQ(entry1.local_tp_ctx->degree(), 2);
-        EXPECT_EQ(entry1.local_tp_ctx->devices().size(), 2u);
+        EXPECT_EQ(entry1.localTPContext()->degree(), 2);
+        EXPECT_EQ(entry1.localTPContext()->devices().size(), 2u);
         ASSERT_NE(entry1.weight_context, nullptr);
         ASSERT_NE(entry1.weight_context->prepared_store, nullptr);
         EXPECT_NE(entry0.weight_context, entry1.weight_context);

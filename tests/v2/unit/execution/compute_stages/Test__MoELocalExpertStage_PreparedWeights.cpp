@@ -18,6 +18,7 @@
 #include "loaders/ExpertSlabTypes.h"
 #include "mocks/MockComputeStage.h"
 #include "tensors/Tensors.h"
+#include "utils/TestTensorFactory.h"
 
 #include <gtest/gtest.h>
 
@@ -1244,10 +1245,14 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     p.d_model = 32;
     p.expert_intermediate = 64;
     p.layer_idx = 0;
-    // Provide sentinel non-null raw tensors.
-    p.gate_exps = reinterpret_cast<TensorBase *>(uintptr_t{0x4000});
-    p.up_exps = reinterpret_cast<TensorBase *>(uintptr_t{0x5000});
-    p.down_exps = reinterpret_cast<TensorBase *>(uintptr_t{0x6000});
+    // Source metadata is part of workspace declaration even before preparing
+    // engines. Supply real tiny tensor objects, not invalid sentinel addresses.
+    auto gate = llaminar2::test::TestTensorFactory::createFP32({4, 64, 32});
+    auto up = llaminar2::test::TestTensorFactory::createFP32({4, 64, 32});
+    auto down = llaminar2::test::TestTensorFactory::createFP32({4, 32, 64});
+    p.gate_exps = gate.get();
+    p.up_exps = up.get();
+    p.down_exps = down.get();
 
     MoELocalExpertStage stage(p);
     std::string err;

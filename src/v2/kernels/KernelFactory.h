@@ -132,7 +132,15 @@ namespace llaminar2
     class BF16Tensor;
     class TurboQuantContext;
     class PhysicalMemoryAuthority;
+    class LoadOrchestrator;
     struct HybridKVCacheConfig;
+
+    /** @brief Physical pool stride, distinct from the initial execution codebook. */
+    enum class GPUPreparedWeightPoolLayout
+    {
+        SourceNative, ///< Pool contains the initial source's prepared representation.
+        MigrationReusable, ///< Each slot reserves the canonical initial/migrated union.
+    };
 
     enum class TensorType; // Forward declare from Tensors.h
 
@@ -1375,6 +1383,30 @@ namespace llaminar
                     size_t total_vocab = 0);
 
                 /**
+                 * @brief Bind a GPU GEMM to a range in the canonical prepared-weight pool.
+                 * @param tensor Logical matrix metadata; no host bytes are read or retained.
+                 * @param device Exact device, checked against the pool owner's backend.
+                 * @param owner Persistent allocation owner retained by the returned engine.
+                 * @param slot_name Existing physical slot, including coalesced expert slabs.
+                 * @param row_offset First matrix row within that slot's physical layout.
+                 * @param layout Initial-only or migration-reusable allocation stride.
+                 * @return Backend engine with unbound execution stream/workspace.
+                 * @throws std::invalid_argument for unsupported metadata, device or layout.
+                 * @throws std::out_of_range for a matrix that exceeds any pool region.
+                 *
+                 * This is construction, not loading or readiness publication. The
+                 * existing loader must complete before publishing a ready prepared
+                 * handle. No copies, repacking, physical allocation, second live
+                 * ledger or host tensor ownership is introduced by this factory.
+                 */
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemmFromGPUWeightPool(
+                    const llaminar2::TensorBase &tensor, llaminar2::DeviceId device,
+                    std::shared_ptr<llaminar2::LoadOrchestrator> owner,
+                    const std::string &slot_name, size_t row_offset = 0,
+                    llaminar2::GPUPreparedWeightPoolLayout layout =
+                        llaminar2::GPUPreparedWeightPoolLayout::SourceNative);
+
+                /**
                  * @brief Prepare repacked GEMM weights for a borrowed expert view.
                  *
                  * This pointer overload is restricted to source-independent
@@ -1402,14 +1434,14 @@ namespace llaminar
                  * alive for that preparation transaction. Quantized CPU engines
                  * likewise repack into engine-owned storage.
                  *
-                 * @param tensor Shared expert view (2D slice of a 3D parent).
+                 * @param tensor Immutable shared expert view (2D slice of a 3D parent).
                  * @param target_device Exact preparation device.
                  * @param prep_kind Requested preparation representation.
                  * @param placement Final CPU storage first-touch policy, applied before copying.
                  * @return Prepared engine with a complete source-lifetime contract.
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
-                    std::shared_ptr<llaminar2::TensorBase> tensor,
+                    std::shared_ptr<const llaminar2::TensorBase> tensor,
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO,
                     llaminar2::CPUWeightStoragePlacement placement = llaminar2::CPUWeightStoragePlacement::local());
@@ -1468,10 +1500,10 @@ namespace llaminar
                  * engine's stream, library handle, or workspace. GPU kernels
                  * therefore receive a new execution handle over the identical
                  * immutable allocation, retained by the original engine. CPU
-                 * floating kernels similarly isolate their workspace binding;
-                 * CPU NativeVNNI kernels have no instance-local stream or
-                 * workspace and share immutable weights/thread-local scratch
-                 * directly. No weights are copied, repacked,
+                 * kernels declare invocation-owned workspace: neither a shared
+                 * NativeVNNI engine nor a floating execution view can retain a
+                 * mutable workspace binding. Each CPU stage supplies its own
+                 * transform storage. No weights are copied, repacked,
                  * registered in a global cache, or admitted a second time.
                  *
                  * @param source Lifetime-pinned, fully prepared expert engine.

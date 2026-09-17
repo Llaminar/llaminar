@@ -41,10 +41,20 @@ namespace llaminar2
      * live KV counts, ring heads, and compact row metadata remain device replay
      * data behind those addresses. A graph may therefore be reused across many
      * decode transactions without observing or republishing any value on host.
+     * A pipeline follower checkpoints only its local main cache: the terminal
+     * participant alone assembles verifier tokens and controls logical width.
      */
     class MTPVerifierPreparationStage final : public IComputeStage
     {
     public:
+        /** @brief Explicit preparation ownership; an unspecified role cannot execute. */
+        enum class Authority : uint8_t
+        {
+            Unbound,
+            VerifierInputOwner,
+            PipelineFollower,
+        };
+
         /**
          * @brief One request-major row in the verifier token matrix.
          *
@@ -61,16 +71,18 @@ namespace llaminar2
             int32_t *destination_device = nullptr;
             int draft_token_count = 0;
 
+            /** @brief Validate the resident sources and destination against the physical bucket. */
             [[nodiscard]] bool valid(int padded_seq_len) const noexcept
             {
                 return first_token_device != nullptr &&
                        destination_device != nullptr &&
                        draft_token_count >= 0 &&
-                       draft_token_count + 1 <= padded_seq_len &&
+                       draft_token_count < padded_seq_len &&
                        (draft_token_count == 0 ||
                         draft_tokens_device != nullptr);
             }
 
+            /** @brief Compare immutable row bindings, not the token values behind them. */
             bool operator==(const TokenRowBinding &) const = default;
         };
 
@@ -88,12 +100,14 @@ namespace llaminar2
             void *checkpoint_device = nullptr;
             size_t checkpoint_bytes = 0;
 
+            /** @brief Require a complete cache-owned opaque checkpoint destination. */
             [[nodiscard]] bool valid() const noexcept
             {
                 return cache != nullptr && sequence_index >= 0 &&
                        checkpoint_device != nullptr && checkpoint_bytes > 0;
             }
 
+            /** @brief Compare exact cache, request, destination and opaque byte capacity. */
             bool operator==(const MainKVCheckpointBinding &) const = default;
         };
 
@@ -111,12 +125,17 @@ namespace llaminar2
          * mode `draft_token_count` and `valid_graph_row_count` are setup evidence,
          * not capture identity: one fused kernel reads the live depth and reuses
          * the same physical bucket for every logical width it can contain.
+         * PipelineFollower binds only backend, physical geometry and local
+         * checkpoints. All token/controller/row-publication fields must be empty;
+         * its verifier receives terminal-owned metadata through explicit graph
+         * collectives, not through a second local preparation authority.
          */
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
 
             IBackend *backend = nullptr;
+            Authority authority = Authority::Unbound;
             std::span<const TokenRowBinding> token_rows;
             int request_count = 0;
             int padded_seq_len = 0;
@@ -142,24 +161,36 @@ namespace llaminar2
 
         static_assert(StageParamsRequired<Params>);
 
+        /** @brief Retain immutable binding copies; the caller's temporary spans may expire. */
         explicit MTPVerifierPreparationStage(Params params);
 
+        /** @brief Validate the role, then enqueue its complete preparation on the exact stream. */
         bool execute(IDeviceContext *ctx) override;
+        /** @brief Return the shared stage kind for owner and follower preparation. */
         ComputeStageType type() const override
         {
             return ComputeStageType::MTP_VERIFIER_PREPARATION;
         }
+        /** @brief Return the caller's stable diagnostic stage name. */
         std::string name() const override { return params_.stage_name; }
+        /** @brief Estimate owner geometry arithmetic; a follower only copies checkpoint bytes. */
         size_t estimatedFlops() const override;
+        /** @brief Estimate traffic from this role's actual bindings, without allocating storage. */
         size_t estimatedMemoryBytes() const override;
+        /** @brief GPU preparation is captured; CPU execution has its own host-owned lifecycle. */
         bool supportsBackend(ComputeBackendType backend) const override;
+        /** @brief All preparation operations are native-capture safe. */
         bool isGraphCapturable() const override { return true; }
+        /** @brief Preparation is participant-local; collectives remain explicit graph edges. */
         bool isCollectiveStage() const override { return false; }
+        /** @brief Persistent device bindings need no stage-local coherence transition. */
         CoherencePolicy coherencePolicy() const override
         {
             return CoherencePolicy::NONE;
         }
+        /** @brief Report role and immutable geometry without reading device execution state. */
         StageDumpInfo buildDumpInfoImpl() const override;
+        /** @brief Declare owner arena buffers; followers reference only cache-owned checkpoint storage. */
         StageBufferContract bufferContract() const override;
 
         /**
@@ -197,13 +228,22 @@ namespace llaminar2
             return describeCaptureIdentity(params_);
         }
 
+        /** @brief Expose retained immutable bindings for graph construction diagnostics. */
         [[nodiscard]] const Params &getParams() const noexcept
         {
             return params_;
         }
 
     private:
+        /** @brief Reject incomplete or contradictory authority bindings before any device mutation. */
         [[nodiscard]] bool validate() const;
+
+        /**
+         * @brief Capture each local request's full opaque KV frontier on the supplied stream.
+         * @param stream Validated exact capture/replay stream; never a default stream.
+         * @return Whether every cache accepted its checkpoint operation.
+         */
+        [[nodiscard]] bool captureLocalKVCheckpoints(void *stream) const;
 
         std::vector<TokenRowBinding> owned_token_rows_;
         std::vector<MainKVCheckpointBinding> owned_main_kv_checkpoints_;

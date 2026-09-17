@@ -860,6 +860,55 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
  * routed layer. Both graphs publish into one runtime table, so they must derive
  * the same directory capacity despite their different scheduling windows.
  */
+TEST_F(ComputeStagesTest, MoEDeviceRebalanceFloatingAndQuantizedCapacityShareOneAllocation)
+{
+    using Directory = DeviceMoETransferSlotDirectory;
+    const auto capacity = Directory::planBufferedCapacity(1, 1, 1);
+    std::vector<std::vector<Directory::ProjectionSpec>> layers;
+    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+    {
+        std::vector<Directory::ProjectionSpec> specs;
+        for (const auto *label : {"gate", "up", "down"})
+            specs.push_back({.label = label, .N = 32, .K = 64,
+                             .format = ExpertWeightFormat::floating(type)});
+        const auto profile = Directory::profileForLayerFormats({specs});
+        EXPECT_EQ(profile.max_wire_payload_bytes,
+                  3u * 32u * 64u * (type == TensorType::FP32 ? 4u : 2u));
+        EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes,
+                  capacity.total_slots * profile.max_wire_payload_bytes);
+        layers.push_back(std::move(specs));
+    }
+    const auto raw_profile = Directory::profileForLayerFormats(layers);
+    const auto raw_bytes = Directory::allocationBOM(capacity, raw_profile).payload_bytes;
+    for (const auto &source_format : native_vnni_formats::kAllSourceFormats)
+    {
+        const auto &format = *source_format.metadata;
+        std::vector<Directory::ProjectionSpec> quantized;
+        for (const auto *label : {"gate", "up", "down"})
+            quantized.push_back({.label = label, .N = 32, .K = 64,
+                .payload_bytes_per_block = format.payload_bytes,
+                .is_asymmetric = format.is_asymmetric, .has_emins = format.has_emins,
+                .codebook_id = format.codebook_id,
+                .format = ExpertWeightFormat::nativeVnni({
+                    .codebook_id = format.codebook_id,
+                    .is_superblock = format.is_superblock, .present = true})});
+        auto mixed = layers;
+        mixed.push_back(quantized);
+        const auto profile = Directory::profileForLayerFormats(mixed);
+        EXPECT_EQ(profile.floating_allocation_format, DeviceMoEWeightFormat::FP32);
+        EXPECT_EQ(profile.max_wire_payload_bytes, raw_profile.max_wire_payload_bytes);
+        EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes, raw_bytes);
+        // Order must not alter either admission or the actual wire capacity.
+        std::reverse(mixed.begin(), mixed.end());
+        const auto reversed = Directory::profileForLayerFormats(mixed);
+        EXPECT_EQ(Directory::allocationBOM(capacity, reversed).payload_bytes, raw_bytes);
+        EXPECT_EQ(reversed.max_wire_payload_bytes, profile.max_wire_payload_bytes);
+    }
+    layers.front()[1].format = ExpertWeightFormat::floating(TensorType::BF16);
+    EXPECT_THROW(Directory::profileForLayerFormats(layers), std::invalid_argument);
+}
+
+/** @brief Scheduling windows must not change the runtime-domain allocation. */
 TEST_F(ComputeStagesTest, MoEDeviceRebalancePersistentSlotsCoverRuntimeDomain)
 {
     DeviceMoERebalanceConfig config;

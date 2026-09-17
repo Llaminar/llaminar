@@ -1513,7 +1513,7 @@ TEST_F(Test__CUDAGemmBatchInvariance,
         SCOPED_TRACE(
             "codebook=" + std::to_string(static_cast<int>(codebook)));
         size_t observed_max_bytes = 0;
-        for (const int bucket : kDefaultPrefillGraphBucketSizes)
+        for (const int bucket : kSupportedPrefillGraphBucketSizes)
         {
             if (bucket > kMaxM)
                 break;

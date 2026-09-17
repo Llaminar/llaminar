@@ -6,6 +6,7 @@
  * cover complete continuation domains, unrelated expert tiers, repeated local
  * ordinals across ranks, request reuse, parser round trips, and the sealed
  * device policy. No model, GPU context, or performance timing is involved.
+ * CPU ownership is an explicit observed NUMA fact, not a rank-ordinal inference.
  */
 #include <gtest/gtest.h>
 
@@ -46,6 +47,7 @@ namespace
             entry.hostname = "node";
             entry.node_id = 0;
             entry.numa_nodes = result.world_size;
+            entry.cpu.numa_node = rank;
             entry.gpus = std::move(devices[rank]);
             result.ranks.push_back(std::move(entry));
         }

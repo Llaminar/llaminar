@@ -4,6 +4,9 @@
  *
  * Contains ForwardGraphSignature, ForwardGraphSignatureHash, and ForwardGraphCache —
  * the key data structures for caching compiled forward graphs between decode steps.
+ * Borrowed resident input addresses are part of capture identity; their changing
+ * contents are not. A residency flag alone cannot distinguish two physical
+ * producers whose addresses are embedded in different native graph nodes.
  */
 
 #pragma once
@@ -244,8 +247,10 @@ namespace llaminar2
     /**
      * @brief Signature for caching full forward graphs.
      *
-     * Captures the execution shape so that graphs built for identical shapes
-     * can be reused across decode steps without rebuilding stages/kernels.
+     * Captures execution shape, policy and borrowed resident input addresses.
+     * Identical bindings reuse graphs as their device values change; a different
+     * input owner selects its own retained graph instead of silently replaying
+     * an old pointer or relying on a host prelude to repair captured nodes.
      */
     struct ForwardGraphSignature
     {
@@ -263,11 +268,13 @@ namespace llaminar2
         int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
         MTPVerifierOutcomeGraphMode mtp_verifier_outcome_graph_mode =
             MTPVerifierOutcomeGraphMode::Disabled; ///< Terminal compact outcome topology captured by this graph.
-        bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
-        bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
+        const void *device_token_ids = nullptr; ///< Exact borrowed token row embedded by native embedding nodes.
+        const void *device_position_ids = nullptr; ///< Exact borrowed position row embedded by native RoPE nodes.
         ForwardPositionPolicy position_policy = ForwardPositionPolicy::ExplicitRows; ///< Position geometry captured by this graph.
         const int32_t *device_sequence_lengths = nullptr; ///< Exact borrowed row-count owner embedded by captured stages.
+        std::optional<DeviceDecodePositionBinding> device_decode_position; ///< Exact scalar KV snapshot topology and borrowed addresses.
         uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
+        const void *pipeline_forward_edges = nullptr; ///< Frozen transport/participant/bank owner; exact graph identity.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
         uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
@@ -283,12 +290,25 @@ namespace llaminar2
         /** Semantic diagnostic-node topology embedded in the native graph. */
         uint64_t snapshot_configuration_identity = 1;
 
+        /** @return Whether embedding consumes a resident row; presence has no separate mutable flag. */
+        [[nodiscard]] bool usesDeviceTokenIds() const noexcept
+        {
+            return device_token_ids != nullptr;
+        }
+
+        /** @return Whether RoPE consumes resident rows; values may change, their captured address may not. */
+        [[nodiscard]] bool usesDevicePositionIds() const noexcept
+        {
+            return device_position_ids != nullptr;
+        }
+
         /** @return Whether this graph embeds a device-owned request-length source. */
         [[nodiscard]] bool usesDeviceSequenceLengths() const noexcept
         {
             return device_sequence_lengths != nullptr;
         }
 
+        /** @return Whether every shape, policy and borrowed capture binding agrees. */
         bool operator==(const ForwardGraphSignature &other) const
         {
             return seq_len == other.seq_len &&
@@ -304,12 +324,14 @@ namespace llaminar2
                    all_position_logit_rows == other.all_position_logit_rows &&
                    mtp_verifier_outcome_graph_mode ==
                        other.mtp_verifier_outcome_graph_mode &&
-                   uses_device_token_ids == other.uses_device_token_ids &&
-                   uses_device_position_ids == other.uses_device_position_ids &&
+                   device_token_ids == other.device_token_ids &&
+                   device_position_ids == other.device_position_ids &&
                    position_policy == other.position_policy &&
                    device_sequence_lengths == other.device_sequence_lengths &&
+                   device_decode_position == other.device_decode_position &&
                    device_prefill_chunk_capture_identity ==
                        other.device_prefill_chunk_capture_identity &&
+                   pipeline_forward_edges == other.pipeline_forward_edges &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
                    mtp_main_terminal_hidden_capture_identity ==
@@ -385,8 +407,10 @@ namespace llaminar2
         };
     }
 
+    /** @brief Hash the same immutable fields used by forward-cache equality. */
     struct ForwardGraphSignatureHash
     {
+        /** @return A lookup hash that never reads mutable device input contents. */
         size_t operator()(const ForwardGraphSignature &sig) const
         {
             size_t h = std::hash<int>{}(sig.seq_len);
@@ -407,14 +431,23 @@ namespace llaminar2
                       static_cast<uint8_t>(
                           sig.mtp_verifier_outcome_graph_mode)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
-            h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
-            h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<const void *>{}(sig.device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<const void *>{}(sig.device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint8_t>{}(static_cast<uint8_t>(sig.position_policy)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<const int32_t *>{}(sig.device_sequence_lengths) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            if (sig.device_decode_position)
+            {
+                const auto &binding = *sig.device_decode_position;
+                for (const void *address : {static_cast<const void *>(binding.backend),
+                                           static_cast<const void *>(binding.cached_tokens),
+                                           static_cast<const void *>(binding.position)})
+                    h ^= (std::hash<const void *>{}(address) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            }
             h ^= (std::hash<uint64_t>{}(
                       sig.device_prefill_chunk_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<const void *>{}(sig.pipeline_forward_edges) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.shifted_mtp_prefill_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));

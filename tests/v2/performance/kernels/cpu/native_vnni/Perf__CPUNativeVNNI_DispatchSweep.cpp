@@ -19,6 +19,7 @@
  * @note Run with Release build: ctest -R V2_Perf_CPUNativeVNNI_DispatchSweep
  */
 
+#include "../../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -783,11 +784,12 @@ namespace
 
             std::vector<float> reference(static_cast<size_t>(M) * N);
             std::vector<float> output(static_cast<size_t>(M) * N);
+            llaminar2::test::NativeVNNITestPartialStorage partial_storage(packed, M);
             applyOverrides(1, K_BLOCKS, 0, 0);
             gemm_native_vnni_preq(
                 packed,
                 quantized.data(),
-                reference.data(),
+                reference.data(), partial_storage.span(),
                 M,
                 N,
                 ISAPath::AUTO,
@@ -801,7 +803,7 @@ namespace
                 gemm_native_vnni_preq(
                     packed,
                     quantized.data(),
-                    output.data(),
+                    output.data(), partial_storage.span(),
                     M,
                     N,
                     ISAPath::AUTO,
@@ -840,7 +842,7 @@ namespace
                         gemm_native_vnni_preq(
                             packed,
                             quantized.data(),
-                            output.data(),
+                            output.data(), partial_storage.span(),
                             M,
                             N,
                             ISAPath::AUTO,
@@ -863,7 +865,7 @@ namespace
                     gemm_native_vnni_preq(
                         packed,
                         quantized.data(),
-                        output.data(),
+                        output.data(), partial_storage.span(),
                         M,
                         N,
                         ISAPath::AUTO,

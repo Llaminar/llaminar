@@ -8,7 +8,10 @@
  * replay, malformed transitions and reuse without any model or accelerator.
  */
 #include "kernels/common/SamplingMath.h"
+#include "backends/GenerationPenaltyHistory.h"
 #include "execution/mtp/DeviceGenerationContract.h"
+#include "execution/mtp/OrdinaryGenerationGraphPlan.h"
+#include "kernels/common/GenerationLogicalState.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>
@@ -22,6 +25,177 @@ using llaminar2::DeviceGenerationAdmissionRequest;
 using llaminar2::DeviceGenerationTerminalError;
 using llaminar2::validateDeviceGenerationTerminal;
 
+/** @test Admission cannot silently discard an ordinary request's sampling law. */
+TEST(OrdinaryGenerationController, OrdinarySamplingAdmissionRejectsUnsupportedOrIncompleteLaw)
+{
+    llaminar2::SamplingParams law;
+    law.top_k = 40;
+    DeviceGenerationAdmissionRequest request{
+        .request_count = 1, .max_new_tokens = 384,
+        .depth_policy = DeviceGenerationPolicy::ordinary(),
+        .sampling_seeds = llaminar2::GenerationRequestSeeds(std::vector<uint64_t>{19}),
+        .ordinary_sampling = law};
+    ASSERT_TRUE(request.valid());
+    for (int defect = 0; defect < 9; ++defect)
+    {
+        auto broken = request;
+        switch (defect)
+        {
+        case 0: broken.sampling_seeds.reset(); break;
+        case 1: broken.ordinary_sampling->temperature = -1; break;
+        case 2: broken.ordinary_sampling->top_k = 0; break;
+        case 3: broken.ordinary_sampling->top_k = kMaxTopK + 1; break;
+        case 4: broken.ordinary_sampling->top_p = 0; break;
+        case 5: broken.ordinary_sampling->top_p = 1.01F; break;
+        case 6: broken.ordinary_sampling->frequency_penalty = std::numeric_limits<float>::quiet_NaN(); break;
+        case 7: broken.ordinary_sampling->dry_multiplier = 1; break;
+        case 8: broken.depth_policy = DeviceGenerationPolicy::fixed(2); break;
+        }
+        EXPECT_FALSE(broken.valid()) << defect;
+    }
+    request.sampling_seeds.reset();
+    request.ordinary_sampling->temperature = 0;
+    EXPECT_TRUE(request.valid()) << "Greedy needs no unused random seed";
+}
+
+/** @test Shared speculative parent ownership is charged only once in the BOM. */
+TEST(OrdinaryGenerationController, OrdinaryGraphOwnerInventoryMatchesNativeAndHostedPrograms)
+{
+    using llaminar2::DeviceId;
+    using llaminar2::OrdinaryGenerationGraphPlan;
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), false), 2u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cuda(0), true), 1u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), false), 4u);
+    EXPECT_EQ(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::rocm(0), true), 3u);
+    EXPECT_THROW(OrdinaryGenerationGraphPlan::additionalExecutableCount(DeviceId::cpu(), false), std::invalid_argument);
+}
+
+/** @test Admission owns resolved randomness; wrong row geometry fails before launch. */
+TEST(OrdinaryGenerationController, RequestSeedAdmissionOwnsExactNonzeroRows)
+{
+    using llaminar2::GenerationRequestSeeds;
+    EXPECT_THROW(GenerationRequestSeeds(std::vector<uint64_t>{}), std::invalid_argument);
+    EXPECT_THROW(GenerationRequestSeeds(std::vector<uint64_t>{19, 0}), std::invalid_argument);
+    std::vector<uint64_t> caller_seeds{19, std::numeric_limits<uint64_t>::max(), 142};
+    DeviceGenerationAdmissionRequest request{
+        .request_count = 3, .max_new_tokens = 4,
+        .depth_policy = DeviceGenerationPolicy::ordinary(),
+        .sampling_seeds = GenerationRequestSeeds(caller_seeds)};
+    caller_seeds.assign(3, 0);
+    EXPECT_TRUE(request.valid());
+    EXPECT_EQ(request.sampling_seeds->values()[0], 19u);
+    EXPECT_EQ(request.sampling_seeds->values()[1], std::numeric_limits<uint64_t>::max());
+    request.request_count = 2;
+    EXPECT_FALSE(request.valid());
+    request.request_count = 3;
+    request.max_new_tokens = 0;
+    request.depth_policy = DeviceGenerationPolicy::forwardOnly();
+    request.initial_leading_row_disposition = DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+    EXPECT_FALSE(request.valid()) << "A forward-only transaction cannot consume sampling seeds";
+    request.sampling_seeds.reset();
+    EXPECT_TRUE(request.valid());
+}
+
+/** @test Arena registration and PMA planning share the same packed seed geometry. */
+TEST(OrdinaryGenerationController, RequestSeedGeometryIncludesRetainedInactiveRows)
+{
+    using llaminar2::GenerationRequestSeedGeometry;
+    EXPECT_THROW(GenerationRequestSeedGeometry(0, 1), std::invalid_argument);
+    EXPECT_THROW(GenerationRequestSeedGeometry(1, 0), std::invalid_argument);
+    for (const int ordinary : {1, 3, 8})
+        for (const int retained : {1, 3, 15})
+        {
+            const GenerationRequestSeedGeometry geometry(ordinary, retained);
+            EXPECT_EQ(geometry.requests(), static_cast<size_t>(std::max(ordinary, retained)));
+            EXPECT_EQ(geometry.bytes(), geometry.requests() * sizeof(uint64_t));
+            EXPECT_EQ(geometry.requests() * geometry.words_per_request * sizeof(int32_t), geometry.bytes());
+        }
+}
+
+/** @test Unsampled logits are a valid frontier, not a fabricated pending token. */
+TEST(OrdinaryGenerationController, InitialFrontierHasExplicitUnsampledAndSampledStates)
+{
+    using llaminar2::GenerationInitialFrontier;
+    using llaminar2::GenerationLogicalStateInitialization;
+    std::array<std::array<int32_t, 4>, 7> rows{};
+    std::array<int32_t, 4> positions{0, 17, 4096, -1};
+    std::array<int32_t, 4> tokens{3, -1, 42, 7};
+    GenerationLogicalStateInitialization initialization{
+        .positions = positions.data(), .request_count = 4,
+        .output = {.base_cached_tokens = rows[0].data(), .target_positions = rows[1].data(),
+            .accepted_state_counts = rows[2].data(), .next_condition_tokens = rows[3].data(),
+            .all_drafts_accepted_flags = rows[4].data(), .stopped_flags = rows[5].data(),
+            .publication_ok_flags = rows[6].data()}};
+    for (const auto source : {GenerationInitialFrontier::UnsampledLogits,
+                             GenerationInitialFrontier::SampledCondition})
+    {
+        initialization.source = source;
+        initialization.sampled_tokens = source == GenerationInitialFrontier::SampledCondition
+            ? tokens.data() : nullptr;
+        ASSERT_TRUE(initialization.valid());
+        for (auto &row : rows) row.fill(-77);
+        for (int request = 0; request < 4; ++request)
+        {
+            const bool healthy = positions[request] >= 0 &&
+                (source == GenerationInitialFrontier::UnsampledLogits || tokens[request] >= 0);
+            EXPECT_EQ(initialization.initializeRequest(request), healthy);
+            EXPECT_EQ(rows[0][request], positions[request]);
+            EXPECT_EQ(rows[1][request], positions[request]);
+            EXPECT_EQ(rows[2][request], 0);
+            EXPECT_EQ(rows[3][request], healthy && source == GenerationInitialFrontier::SampledCondition
+                ? tokens[request] : -1);
+            EXPECT_EQ(rows[4][request], 0);
+            EXPECT_EQ(rows[5][request], 0);
+            EXPECT_EQ(rows[6][request], healthy ? 1 : 0);
+        }
+        const auto before = rows;
+        EXPECT_FALSE(initialization.initializeRequest(-1));
+        EXPECT_FALSE(initialization.initializeRequest(4));
+        EXPECT_EQ(rows, before);
+    }
+    initialization.sampled_tokens = nullptr;
+    EXPECT_FALSE(initialization.valid());
+    initialization.source = GenerationInitialFrontier::UnsampledLogits;
+    initialization.sampled_tokens = tokens.data();
+    EXPECT_FALSE(initialization.valid()) << "An unsampled declaration cannot smuggle in a condition token";
+    initialization.source = static_cast<GenerationInitialFrontier>(255);
+    EXPECT_FALSE(initialization.valid());
+}
+
+/** @test Shared and padded per-request stop rows have one checked interpretation. */
+TEST(OrdinaryGenerationController, StopPolicyIsBoundedSharedOrRequestLocal)
+{
+    EXPECT_TRUE(OrdinaryGenerationStopTokens{}.valid());
+    EXPECT_EQ(OrdinaryGenerationStopTokens{}.evaluate(0, 42), 0);
+    std::array<int32_t, 2 * (kSpeculativeBatchMaxStopTokens + 2)> tokens;
+    tokens.fill(-1);
+    tokens[0] = 42;
+    tokens[kSpeculativeBatchMaxStopTokens + 2] = 43;
+    OrdinaryGenerationStopTokens policy{tokens.data(), kSpeculativeBatchMaxStopTokens,
+        kSpeculativeBatchMaxStopTokens + 2};
+    ASSERT_TRUE(policy.valid());
+    EXPECT_EQ(policy.evaluate(0, 42), 1);
+    EXPECT_EQ(policy.evaluate(1, 42), 0);
+    EXPECT_EQ(policy.evaluate(1, 43), 1);
+    policy.request_stride = 0;
+    EXPECT_EQ(policy.evaluate(1, 42), 1);
+    EXPECT_EQ(policy.evaluate(1, 43), 0);
+    tokens[kSpeculativeBatchMaxStopTokens - 1] = -2;
+    EXPECT_EQ(policy.evaluate(0, 42), -1) << "A match must not hide malformed tail entries";
+    policy.request_stride = -1;
+    EXPECT_FALSE(policy.valid());
+    policy.request_stride = kSpeculativeBatchMaxStopTokens - 1;
+    EXPECT_FALSE(policy.valid());
+    policy.request_stride = 0;
+    policy.count = kSpeculativeBatchMaxStopTokens + 1;
+    EXPECT_FALSE(policy.valid());
+    policy.count = -1;
+    EXPECT_FALSE(policy.valid());
+    policy.count = 1;
+    policy.tokens = nullptr;
+    EXPECT_FALSE(policy.valid());
+}
+
 /** @test The shared transition owns both response and next-forward state, not just counters. */
 TEST(OrdinaryGenerationController, PublicationAdvancesTheLiveFrontierExactlyOnce)
 {
@@ -31,16 +205,18 @@ TEST(OrdinaryGenerationController, PublicationAdvancesTheLiveFrontierExactlyOnce
     {
         Control control{};
         std::array<int32_t, 256> response{};
-        int32_t sample = 42, stop = 0, position = 7, next = 19, stopped = 0, ok = 1;
+        std::array<int32_t, 512> history{};
+        int32_t sample = 42, stop = -1, position = 7, next = 19, stopped = 0, ok = 1;
         OrdinaryGenerationPublication publication{
-            .request_count = 1, .sampled_tokens = &sample, .stopped_flags = &stop,
+            .request_count = 1, .sampled_tokens = &sample, .stop_tokens = {&stop, 1, 0},
             .source = leading == DeviceGenerationLeadingRowDisposition::PendingResponse
                 ? Source::PrefillLogits : Source::DecodeLogits,
             .response_tokens = response.data(), .response_token_stride = response.size(),
             .control = control.data(), .control_stride = control.size(),
             .frontier = {.cached_tokens = &position, .next_condition_tokens = &next,
                 .stopped_flags = &stopped, .publication_ok_flags = &ok,
-                .request_capacity = 1, .context_capacity = 4096}};
+                .request_capacity = 1, .context_capacity = 4096},
+            .history = {history.data(), 512, 512, 1}};
         ASSERT_TRUE(initialize_device_generation_control(
             budget, response.size(), DeviceGenerationPolicy::ordinary(), control.data(), leading));
         for (int row = 0; row < budget; ++row) {
@@ -51,33 +227,38 @@ TEST(OrdinaryGenerationController, PublicationAdvancesTheLiveFrontierExactlyOnce
             EXPECT_EQ(next, sample);
             EXPECT_EQ(response[row], sample);
             EXPECT_EQ(ok, 1);
+            EXPECT_EQ(history[sample], 1);
             publication.source = Source::DecodeLogits;
         }
         const auto terminal = control;
         const int terminal_position = position, terminal_next = next;
-        sample = -1; stop = -1;
+        sample = -1; stop = -2;
         for (int repeat = 0; repeat < 20; ++repeat)
             ASSERT_TRUE(publish_ordinary_generation_request(publication, 0));
         EXPECT_EQ(control, terminal);
         EXPECT_EQ(position, terminal_position);
         EXPECT_EQ(next, terminal_next);
+        for (int token = 0; token < 512; ++token)
+            EXPECT_EQ(history[token], token >= 42 && token < 42 + budget ? 1 : 0);
     }
 }
 
-/** @test No invalid position, producer flag or sample partially commits the response. */
+/** @test No invalid position, stop policy or sample partially commits the response. */
 TEST(OrdinaryGenerationController, InvalidPublicationKeepsResponseAndFrontierUnadvanced)
 {
     for (int defect = 0; defect < 6; ++defect) {
         Control control{};
         std::array<int32_t, 2> response{-77, -77};
-        int32_t sample = 42, stop = 0, position = 7, next = 19, stopped = 0, ok = 1;
+        std::array<int32_t, 64> history{};
+        int32_t sample = 42, stop = -1, position = 7, next = 19, stopped = 0, ok = 1;
         OrdinaryGenerationPublication publication{
-            .request_count = 1, .sampled_tokens = &sample, .stopped_flags = &stop,
+            .request_count = 1, .sampled_tokens = &sample, .stop_tokens = {&stop, 1, 0},
             .source = Source::DecodeLogits, .response_tokens = response.data(), .response_token_stride = 2,
             .control = control.data(), .control_stride = control.size(),
             .frontier = {.cached_tokens = &position, .next_condition_tokens = &next,
                 .stopped_flags = &stopped, .publication_ok_flags = &ok,
-                .request_capacity = 1, .context_capacity = 8}};
+                .request_capacity = 1, .context_capacity = 8},
+            .history = {history.data(), 64, 64, 1}};
         ASSERT_TRUE(initialize_device_generation_control(2, 2, DeviceGenerationPolicy::ordinary(),
             control.data(), DeviceGenerationLeadingRowDisposition::AlreadyEmitted));
         switch (defect) {
@@ -85,7 +266,7 @@ TEST(OrdinaryGenerationController, InvalidPublicationKeepsResponseAndFrontierUna
         case 1: position = 8; break;
         case 2: position = std::numeric_limits<int32_t>::max(); break;
         case 3: ok = 0; break;
-        case 4: stop = 2; break;
+        case 4: stop = -2; break;
         case 5: sample = -1; break;
         }
         const int original_position = position;
@@ -98,6 +279,7 @@ TEST(OrdinaryGenerationController, InvalidPublicationKeepsResponseAndFrontierUna
         EXPECT_EQ(next, 19);
         EXPECT_EQ(stopped, 0);
         EXPECT_EQ(ok, 0);
+        EXPECT_EQ(history, (std::array<int32_t, 64>{}));
         const auto failed = control;
         EXPECT_FALSE(publish_ordinary_generation_request(publication, 0));
         EXPECT_EQ(control, failed);
@@ -109,14 +291,17 @@ TEST(OrdinaryGenerationController, ForwardOnlyPublishesPositionWithoutSamplerSta
 {
     Control control{};
     std::array<int32_t, 2> response{-77, -77};
+    std::array<int32_t, 64> history;
+    history.fill(-77); // Forward-only must not read or repair sampler history.
     int32_t poison = -1, position = 7, next = 19, stopped = 0, ok = 1;
     OrdinaryGenerationPublication publication{
-        .request_count = 1, .sampled_tokens = &poison, .stopped_flags = &poison,
+        .request_count = 1, .sampled_tokens = &poison, .stop_tokens = {&poison, 1, 0},
         .source = Source::DecodeLogits, .response_tokens = response.data(), .response_token_stride = 2,
         .control = control.data(), .control_stride = control.size(),
         .frontier = {.cached_tokens = &position, .next_condition_tokens = &next,
             .stopped_flags = &stopped, .publication_ok_flags = &ok,
-            .request_capacity = 1, .context_capacity = 8}};
+            .request_capacity = 1, .context_capacity = 8},
+        .history = {history.data(), 64, 64, 1}};
     ASSERT_TRUE(initialize_device_generation_control(0, 2, DeviceGenerationPolicy::forwardOnly(),
         control.data(), DeviceGenerationLeadingRowDisposition::AlreadyEmitted));
     for (int repeat = 0; repeat < 20; ++repeat)
@@ -126,6 +311,7 @@ TEST(OrdinaryGenerationController, ForwardOnlyPublishesPositionWithoutSamplerSta
     EXPECT_EQ(stopped, 0);
     EXPECT_EQ(ok, 1);
     EXPECT_EQ(response, (std::array<int32_t, 2>{-77, -77}));
+    for (int count : history) EXPECT_EQ(count, -77);
 }
 
 /** @test Sampling may directly own the destination rows, including EOS at full context. */
@@ -133,14 +319,17 @@ TEST(OrdinaryGenerationController, AliasedSamplerPublicationNeedsNoExtraStaging)
 {
     Control control{};
     std::array<int32_t, 1> response{-77};
-    int32_t position = std::numeric_limits<int32_t>::max(), next = 42, stopped = 1, ok = 1;
+    std::array<int32_t, 64> history{};
+    int32_t position = std::numeric_limits<int32_t>::max(), next = 42, stopped = 0, ok = 1;
+    const int32_t stop_tokens[] = {-1, 42, -1};
     OrdinaryGenerationPublication publication{
-        .request_count = 1, .sampled_tokens = &next, .stopped_flags = &stopped,
+        .request_count = 1, .sampled_tokens = &next, .stop_tokens = {stop_tokens, 3, 0},
         .source = Source::PrefillLogits, .response_tokens = response.data(), .response_token_stride = 1,
         .control = control.data(), .control_stride = control.size(),
         .frontier = {.cached_tokens = &position, .next_condition_tokens = &next,
             .stopped_flags = &stopped, .publication_ok_flags = &ok,
-            .request_capacity = 1, .context_capacity = std::numeric_limits<int32_t>::max()}};
+            .request_capacity = 1, .context_capacity = std::numeric_limits<int32_t>::max()},
+        .history = {history.data(), 64, 64, 1}};
     ASSERT_TRUE(initialize_device_generation_control(1, 1, DeviceGenerationPolicy::ordinary(), control.data()));
     ASSERT_TRUE(publish_ordinary_generation_request(publication, 0));
     EXPECT_EQ(position, std::numeric_limits<int32_t>::max());
@@ -148,12 +337,98 @@ TEST(OrdinaryGenerationController, AliasedSamplerPublicationNeedsNoExtraStaging)
     EXPECT_EQ(next, 42);
     EXPECT_EQ(stopped, 1);
     EXPECT_EQ(ok, 1);
+    EXPECT_EQ(history[42], 1);
     EXPECT_EQ(control[kDeviceGenerationControlModelStopped], 1);
     auto incomplete = publication;
     incomplete.frontier = {};
     EXPECT_FALSE(incomplete.valid());
     EXPECT_FALSE(publish_ordinary_generation_request(incomplete, 0));
     EXPECT_FALSE(publish_ordinary_generation_request(publication, 1));
+}
+
+/** @test Ordinary history cannot masquerade as an incomplete speculative branch. */
+TEST(OrdinaryGenerationController, PenaltyHistoryProvenanceIsExplicit)
+{
+    using llaminar2::GenerationPenaltyHistory;
+    int counts = 0, policy = 0, tokens = 0, rows = 1;
+    const auto committed = GenerationPenaltyHistory::committed(&counts, &policy);
+    EXPECT_TRUE(committed.admitsRows(1));
+    EXPECT_FALSE(committed.admitsRows(0));
+    EXPECT_FALSE(committed.admitsRows(2));
+    EXPECT_EQ(committed.counts(), &counts);
+    EXPECT_EQ(committed.policy(), &policy);
+    EXPECT_EQ(committed.branchTokens(), nullptr);
+    EXPECT_EQ(committed.activeRows(), nullptr);
+    const auto speculative = GenerationPenaltyHistory::speculative(&counts, &policy, &tokens, &rows);
+    EXPECT_TRUE(speculative.admitsRows(1));
+    EXPECT_TRUE(speculative.admitsRows(16));
+    EXPECT_FALSE(speculative.admitsRows(-1));
+    EXPECT_EQ(speculative.branchTokens(), &tokens);
+    EXPECT_EQ(speculative.activeRows(), &rows);
+    EXPECT_THROW(GenerationPenaltyHistory::committed(nullptr, &policy), std::invalid_argument);
+    EXPECT_THROW(GenerationPenaltyHistory::committed(&counts, nullptr), std::invalid_argument);
+    EXPECT_THROW(GenerationPenaltyHistory::speculative(&counts, &policy, nullptr, &rows), std::invalid_argument);
+    EXPECT_THROW(GenerationPenaltyHistory::speculative(&counts, &policy, &tokens, nullptr), std::invalid_argument);
+}
+
+/** @test History bounds/overflow fail before any token or frontier becomes visible. */
+TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailureAtomic)
+{
+    constexpr int vocab = 64, stride = 67;
+    std::array<int32_t, 2 * stride> counts{};
+    OrdinaryGenerationHistory history{counts.data(), vocab, stride, 2};
+    EXPECT_TRUE(history.validFor(2));
+    EXPECT_FALSE(history.validFor(3));
+    auto invalid = history;
+    invalid.request_stride = vocab - 1;
+    EXPECT_FALSE(invalid.validFor(2));
+    invalid = history;
+    invalid.counts = nullptr;
+    EXPECT_FALSE(invalid.validFor(1));
+
+    for (int defect = 0; defect < 5; ++defect)
+    {
+        SCOPED_TRACE(defect);
+        Control control{};
+        std::array<int32_t, 2> response{-77, -77};
+        int32_t sample = 42, position = 7, next = 19, stopped = 0, ok = 1;
+        counts.fill(0);
+        counts[42] = defect == 2 ? -1 : defect == 3 ? INT32_MAX : 5;
+        counts[stride + 42] = 17; // Same token on another request is another owner.
+        if (defect == 0) sample = -1;
+        if (defect == 1) sample = vocab;
+        const auto before = counts;
+        OrdinaryGenerationPublication publication{
+            .request_count = 1, .sampled_tokens = &sample,
+            .stop_tokens = {&sample, 1, 0}, .source = Source::PrefillLogits,
+            .response_tokens = response.data(), .response_token_stride = 2,
+            .control = control.data(), .control_stride = control.size(),
+            .frontier = {&position, &next, &stopped, &ok, 1, 8},
+            .history = history};
+        ASSERT_TRUE(initialize_device_generation_control(2, 2,
+            DeviceGenerationPolicy::ordinary(), control.data()));
+        EXPECT_EQ(publish_ordinary_generation_request(publication, 0), defect == 4);
+        if (defect == 4)
+        {
+            EXPECT_EQ(response[0], 42);
+            EXPECT_EQ(counts[42], 6);
+            EXPECT_EQ(stopped, 1);
+            for (int replay = 0; replay < 20; ++replay)
+                EXPECT_TRUE(publish_ordinary_generation_request(publication, 0));
+            EXPECT_EQ(counts[42], 6) << "EOS/terminal replay cannot add history twice";
+            EXPECT_EQ(counts[stride + 42], 17);
+        }
+        else
+        {
+            EXPECT_EQ(counts, before);
+            EXPECT_EQ(response, (std::array<int32_t, 2>{-77, -77}));
+            EXPECT_EQ(next, 19);
+            EXPECT_EQ(ok, 0);
+            EXPECT_EQ(control[kDeviceGenerationControlErrorCode],
+                static_cast<int>(DeviceGenerationError::InvalidOrdinarySample));
+        }
+        EXPECT_EQ(position, 7) << "Prefill publication must not consume model state";
+    }
 }
 
 TEST(OrdinaryGenerationController, PolicyIsExplicitAndKeepsTheSameStorageABI)

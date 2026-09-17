@@ -108,6 +108,7 @@ namespace llaminar2
         STOCHASTIC_PROCESSED_LOGITS, ///< Full-vocab processed-logit staging rows [4, vocab]
         STOCHASTIC_INVERSE_REJECTION_SAMPLES, ///< vLLM inverse-exp samples [3, vocab]
         STOCHASTIC_TARGET_SAMPLE_TOKENS, ///< Device-resident sampled main/verifier target tokens [1, 4]
+        SAMPLING_REQUEST_SEEDS, ///< Request-admitted UINT64 seeds in INT32 [requests,2] byte storage; stable capture address.
         STOCHASTIC_DRAFT_SAMPLE_TOKENS, ///< Device-resident sampled MTP draft tokens [1, 3]
         STOCHASTIC_DRAFT_SAMPLE_PROBS,  ///< Device-resident sampled MTP draft probabilities [1, 3]
         STOCHASTIC_TOPK_PARTIAL_VALS, ///< Target/verifier per-block stochastic top-k partial values [blocks, 32]
@@ -285,6 +286,8 @@ namespace llaminar2
             return "STOCHASTIC_INVERSE_REJECTION_SAMPLES";
         case BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS:
             return "STOCHASTIC_TARGET_SAMPLE_TOKENS";
+        case BufferId::SAMPLING_REQUEST_SEEDS:
+            return "SAMPLING_REQUEST_SEEDS";
         case BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS:
             return "STOCHASTIC_DRAFT_SAMPLE_TOKENS";
         case BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS:

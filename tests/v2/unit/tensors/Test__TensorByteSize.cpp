@@ -10,7 +10,7 @@
  * exception if not overridden, which causes GPU transfer failures.
  *
  * Tests cover:
- * - All 27 tensor types defined in CPUTensors.h
+ * - Every native source format and nested borrowed views in TensorClasses.h
  * - Verification that size_bytes() doesn't throw
  * - Verification that size_bytes() matches expected calculations
  * - For block-quantized tensors: size_bytes matches num_blocks * sizeof(BlockType)
@@ -22,8 +22,53 @@
 
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorFactory.h"
+#include "../../utils/QuantizedVerifierFormats.h"
+#include <array>
+#include <cstring>
 
 using namespace llaminar2;
+
+TEST(NativeTensorExtent, AllExpertFormatsRetainExactNestedViewExtents)
+{
+    auto formats = test::quantizedVerifierFormats();
+    formats.push_back({"FP32", TensorType::FP32, 0, false, 0,
+        [](const auto &shape, uint32_t seed) { return test::TestTensorFactory::createFP32Random(shape, seed); }});
+    formats.push_back({"FP16", TensorType::FP16, 0, false, 0,
+        [](const auto &shape, uint32_t seed) { return test::TestTensorFactory::createFP16Random(shape, seed); }});
+    formats.push_back({"BF16", TensorType::BF16, 0, false, 0,
+        [](const auto &shape, uint32_t seed) { return test::TestTensorFactory::createBF16Random(shape, seed); }});
+    for (const auto &format : formats)
+        for (size_t width : {256u, 512u})
+        {
+            SCOPED_TRACE(format.label);
+            std::shared_ptr<TensorBase> parent = format.create({12, width}, 971);
+            const size_t row_bytes = parent->size_bytes() / 12;
+            const auto *data = static_cast<const uint8_t *>(parent->raw_data());
+            const std::vector<uint8_t> expected(data + 3 * row_bytes, data + 5 * row_bytes);
+            auto view = parent->create_view({6, width}, 2 * width);
+            auto nested = view->create_view({2, width}, width);
+            EXPECT_EQ(view->size_bytes(), 6 * row_bytes);
+            EXPECT_EQ(nested->size_bytes(), 2 * row_bytes);
+            EXPECT_EQ(nested->native_type(), format.tensor_type);
+            // The logical extent and its address must remain valid after both
+            // caller-held ancestors retire; a view allocates no source bytes.
+            parent.reset();
+            view.reset();
+            EXPECT_EQ(nested->size_bytes(), expected.size());
+            EXPECT_EQ(std::memcmp(nested->raw_data(), expected.data(), expected.size()), 0);
+        }
+}
+
+TEST(NativeTensorExtent, CheckedGeometryRejectsOverflowWithoutAllocation)
+{
+    const std::array shape{size_t{256}, size_t{512}, size_t{8}};
+    EXPECT_EQ(nativeTensorExtent<Q4_0Block>(shape), 256u * 512u * 8u / 32u * sizeof(Q4_0Block));
+    const std::array too_many_elements{std::numeric_limits<size_t>::max(), size_t{2}};
+    EXPECT_THROW(nativeTensorExtent<Q8_0Block>(too_many_elements), std::overflow_error);
+    const std::array too_many_bytes{std::numeric_limits<size_t>::max()};
+    EXPECT_THROW(nativeTensorExtent(too_many_bytes, 1, 2), std::overflow_error);
+    EXPECT_THROW(nativeTensorExtent(shape, 0, 1), std::invalid_argument);
+}
 
 // ============================================================================
 // Test Fixture

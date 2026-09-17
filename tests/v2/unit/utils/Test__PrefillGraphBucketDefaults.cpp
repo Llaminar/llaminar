@@ -23,6 +23,40 @@ namespace llaminar2
 {
     namespace
     {
+        /** @test Serving defaults are compact without shrinking kernel coverage. */
+        TEST(Test__PrefillGraphBucketDefaults, ServingDefaultsCapAt512)
+        {
+            EXPECT_EQ(defaultPrefillGraphBucketSizes(),
+                      (std::vector<int>{64, 128, 256, 384, 512}));
+            EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 512);
+            EXPECT_EQ(supportedPrefillGraphBucketSizes().back(), 4096);
+            EXPECT_EQ(defaultNativeVNNIDispatchTrainingRows().back(), 4096);
+        }
+
+        /** @test Explicit caps preserve larger, smaller and non-grid shapes. */
+        TEST(Test__PrefillGraphBucketDefaults, ExplicitMaximumOwnsExactEndpoint)
+        {
+            for (const int cap : {1, 32, 64, 255, 512, 600, 1024, 4096, 8192})
+            {
+                const auto buckets = prefillGraphBucketSizes(cap);
+                ASSERT_FALSE(buckets.empty());
+                EXPECT_EQ(buckets.back(), cap);
+                EXPECT_TRUE(std::is_sorted(buckets.begin(), buckets.end()));
+                EXPECT_EQ(std::adjacent_find(buckets.begin(), buckets.end()),
+                          buckets.end());
+                for (const int supported : kSupportedPrefillGraphBucketSizes)
+                    EXPECT_EQ(std::binary_search(buckets.begin(), buckets.end(), supported),
+                              supported <= cap);
+            }
+        }
+
+        /** @test A malformed row limit cannot silently select another capacity. */
+        TEST(Test__PrefillGraphBucketDefaults, RejectsNonpositiveMaximum)
+        {
+            EXPECT_THROW(prefillGraphBucketSizes(0), std::invalid_argument);
+            EXPECT_THROW(prefillGraphBucketSizes(-1), std::invalid_argument);
+        }
+
         TEST(Test__PrefillGraphBucketDefaults, RejectsInvalidGeometry)
         {
             EXPECT_EQ(nativeVNNIBatchInvariantTileRows(0, 4096, 4096), 0);
@@ -190,8 +224,8 @@ namespace llaminar2
                 EXPECT_GT(test_case.active_rows, previous_active_rows);
                 EXPECT_GE(test_case.bucket_rows, test_case.active_rows);
                 EXPECT_TRUE(std::binary_search(
-                    kDefaultPrefillGraphBucketSizes.begin(),
-                    kDefaultPrefillGraphBucketSizes.end(),
+                    kSupportedPrefillGraphBucketSizes.begin(),
+                    kSupportedPrefillGraphBucketSizes.end(),
                     test_case.bucket_rows));
                 previous_active_rows = test_case.active_rows;
             }
@@ -213,13 +247,13 @@ namespace llaminar2
             }
 
             for (size_t index = 1;
-                 index < kDefaultPrefillGraphBucketSizes.size();
+                 index < kSupportedPrefillGraphBucketSizes.size();
                  ++index)
             {
                 const int lower =
-                    kDefaultPrefillGraphBucketSizes[index - 1];
+                    kSupportedPrefillGraphBucketSizes[index - 1];
                 const int upper =
-                    kDefaultPrefillGraphBucketSizes[index];
+                    kSupportedPrefillGraphBucketSizes[index];
                 if (upper <= 256)
                     continue;
                 for (int active_rows : {lower + 1, upper - 1, upper})
@@ -245,7 +279,7 @@ namespace llaminar2
             EXPECT_TRUE(std::is_sorted(rows.begin(), rows.end()));
             EXPECT_EQ(std::adjacent_find(rows.begin(), rows.end()), rows.end());
             EXPECT_EQ(rows.front(), 2);
-            EXPECT_EQ(rows.back(), kDefaultPrefillGraphBucketSizes.back());
+            EXPECT_EQ(rows.back(), kSupportedPrefillGraphBucketSizes.back());
         }
 
         TEST(Test__PrefillGraphBucketDefaults,

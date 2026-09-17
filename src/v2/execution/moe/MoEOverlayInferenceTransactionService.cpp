@@ -4,7 +4,8 @@
  *
  * An outer command owns one or more bounded execution sequences. Each sequence
  * pins its placement epoch and admits symmetric graph groups, whose follower
- * slots retire only after the exact sparse-return boundary. Observability uses
+ * slots retire only after local graph completion and the follower's authenticated
+ * terminal receipt. Numerical returns cannot prove empty-route retirement. Observability uses
  * those existing protocol identities; it never owns execution progress. In
  * particular, chunked prefill and ticketed generation may retire many sequences
  * under one command without being duplicate transactions.
@@ -28,6 +29,32 @@ namespace llaminar2
     {
         /** MPI guarantees at least 32767 as the maximum valid tag. */
         constexpr int kInferenceTransactionTicketTag = 32742;
+        /** Separate direction/tag prevents a scheduler ticket matching a receipt. */
+        constexpr int kInferenceTransactionCompletionTag = 32743;
+
+        /** @brief Observe exact graph retirement on each endpoint, independently of numerical traffic. */
+        void recordGraphCompletion(
+            const MoEOverlayInferenceTransactionTicket &ticket, const char *endpoint)
+        {
+            if (!PerfStatsCollector::isDomainEnabled("forward_graph"))
+                return;
+            PerfStatsCollector::recordOrderedSequenceStep(
+                "forward_graph", "moe_overlay_graph_completion_sequence",
+                {ticket.workspace_generation, ticket.request_generation,
+                 ticket.command_id, ticket.transaction_ordinal, ticket.logical_step_id,
+                 ticket.placement_epoch, ticket.topology_fingerprint_low,
+                 ticket.topology_fingerprint_high,
+                 static_cast<uint64_t>(ticket.graph_role),
+                 static_cast<uint64_t>(ticket.request_count),
+                 static_cast<uint64_t>(ticket.logical_rows_per_request),
+                 static_cast<uint64_t>(ticket.physical_rows_per_request),
+                 static_cast<uint64_t>(ticket.draft_depth),
+                 static_cast<uint64_t>(ticket.sidecar_depth)},
+                "inference", "mpi",
+                {{"source_world_rank", std::to_string(ticket.source_world_rank)},
+                 {"target_world_rank", std::to_string(ticket.target_world_rank)},
+                 {"endpoint_role", endpoint}});
+        }
 
         /** @brief Store a diagnostic only when requested. */
         bool fail(std::string message, std::string *error)
@@ -433,16 +460,17 @@ namespace llaminar2
 
     void MoEOverlayMPIInferenceTransactionChannel::progressSendSlots() const
     {
-        if (config_.mpi_ctx->rank() != config_.source_world_rank)
-            return;
         for (auto &slot : send_slots_)
         {
-            if (!slot.in_flight)
+            if (slot.lifecycle == SlotLifecycle::Available ||
+                slot.lifecycle == SlotLifecycle::Failed)
                 continue;
             if (config_.mpi_ctx->test(&slot.request))
             {
                 slot.request = MPI_REQUEST_NULL;
-                slot.in_flight = false;
+                // MPI delivery alone never releases an execution ticket's slot.
+                if (slot.lifecycle == SlotLifecycle::Sending)
+                    slot.lifecycle = SlotLifecycle::Available;
             }
         }
     }
@@ -493,7 +521,7 @@ namespace llaminar2
             {
                 const std::size_t index =
                     (next_send_slot_ + offset) % send_slots_.size();
-                if (!send_slots_[index].in_flight)
+                if (send_slots_[index].lifecycle == SlotLifecycle::Available)
                 {
                     next_send_slot_ = (index + 1u) % send_slots_.size();
                     return &send_slots_[index];
@@ -504,6 +532,18 @@ namespace llaminar2
 
         if (auto *slot = find_available())
             return slot;
+
+        // Only transport-owned sends can become reusable through MPI progress.
+        // Execution slots require the caller's explicit join; spinning cannot
+        // fix an undersized graph sequence and would hide an admission defect.
+        if (std::none_of(send_slots_.begin(), send_slots_.end(),
+                [](const SendSlot &slot) {
+                    return slot.lifecycle == SlotLifecycle::Sending;
+                }))
+        {
+            fail("ExpertOverlay control ring requires joining live graph completions before publishing more work", error);
+            return nullptr;
+        }
 
         const auto begin = std::chrono::steady_clock::now();
         const auto deadline =
@@ -558,24 +598,127 @@ namespace llaminar2
         slot->ticket = ticket;
         try
         {
+            if (ticket.action == MoEOverlayInferenceTransactionAction::Execute)
+            {
+                // Post before dispatch: the peer may finish immediately, and the
+                // fixed receipt buffer must outlive the entire graph transaction.
+                slot->lifecycle = SlotLifecycle::AwaitingGraphCompletion;
+                slot->completion_ticket = {};
+                slot->completion_request = config_.mpi_ctx->irecv(
+                    &slot->completion_ticket, sizeof(slot->completion_ticket),
+                    MPI_BYTE, config_.target_world_rank,
+                    kInferenceTransactionCompletionTag);
+            }
+            else
+            {
+                slot->lifecycle = SlotLifecycle::Sending;
+            }
             slot->request = config_.mpi_ctx->isend(
                 &slot->ticket,
                 sizeof(slot->ticket),
                 MPI_BYTE,
                 config_.target_world_rank,
                 kInferenceTransactionTicketTag);
-            slot->in_flight = slot->request != MPI_REQUEST_NULL;
             recordTicket(ticket, "publisher", "submitted");
             return true;
         }
         catch (const std::exception &exception)
         {
-            slot->request = MPI_REQUEST_NULL;
-            slot->in_flight = false;
+            // Never recycle storage that MPI may still reference after failure.
+            slot->lifecycle = SlotLifecycle::Failed;
             return fail(
                 std::string("ExpertOverlay transaction ticket send failed: ") +
                     exception.what(),
                 error);
+        }
+    }
+
+    bool MoEOverlayMPIInferenceTransactionChannel::awaitCompletion(
+        const MoEOverlayInferenceTransactionTicket &ticket,
+        std::string *error)
+    {
+        if (localWorldRank() != sourceWorldRank())
+            return fail("Only the continuation authority may join graph completion", error);
+        const auto found = std::find_if(send_slots_.begin(), send_slots_.end(),
+            [&](const SendSlot &slot) {
+                return slot.lifecycle == SlotLifecycle::AwaitingGraphCompletion &&
+                       slot.ticket == ticket;
+            });
+        if (found == send_slots_.end())
+            return fail("ExpertOverlay completion has no matching live execution ticket", error);
+
+        auto &slot = *found;
+        const auto begin = std::chrono::steady_clock::now();
+        try
+        {
+            MPI_Status status{};
+            if (!progressRequestToCompletion(
+                    &slot.completion_request, &status,
+                    "ExpertOverlay follower graph completion", error))
+            {
+                slot.lifecycle = SlotLifecycle::Failed;
+                return false;
+            }
+            if (config_.mpi_ctx->getCount(status, MPI_BYTE) !=
+                    static_cast<int>(sizeof(slot.completion_ticket)) ||
+                slot.completion_ticket != slot.ticket)
+            {
+                slot.lifecycle = SlotLifecycle::Failed;
+                return fail("ExpertOverlay follower completion failed exact ticket authentication", error);
+            }
+            // The completion proves peer execution, not necessarily local MPI
+            // send-buffer release. Join both owners before recycling the slot.
+            if (!progressRequestToCompletion(&slot.request, nullptr,
+                    "ExpertOverlay completed graph ticket send", error))
+            {
+                slot.lifecycle = SlotLifecycle::Failed;
+                return false;
+            }
+            slot.lifecycle = SlotLifecycle::Available;
+            recordGraphCompletion(ticket, "source");
+            recordTicketTiming(ticket, "graph_completion_wait", "publisher",
+                               begin, std::chrono::steady_clock::now());
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            slot.lifecycle = SlotLifecycle::Failed;
+            return fail(std::string("ExpertOverlay graph completion failed: ") +
+                        exception.what(), error);
+        }
+    }
+
+    bool MoEOverlayMPIInferenceTransactionChannel::publishCompletion(
+        const MoEOverlayInferenceTransactionTicket &ticket,
+        std::string *error)
+    {
+        if (localWorldRank() != targetWorldRank() ||
+            receive_lifecycle_ != ReceiveLifecycle::Executing ||
+            ticket != receive_ticket_)
+        {
+            return fail("ExpertOverlay completion must name the follower's exact executing ticket", error);
+        }
+        SendSlot *slot = acquireSendSlot(error);
+        if (!slot)
+            return false;
+        slot->ticket = ticket;
+        slot->lifecycle = SlotLifecycle::Sending;
+        try
+        {
+            // One fixed receipt per complete graph, never a per-layer barrier.
+            slot->request = config_.mpi_ctx->isend(
+                &slot->ticket, sizeof(slot->ticket), MPI_BYTE,
+                sourceWorldRank(), kInferenceTransactionCompletionTag);
+            receive_lifecycle_ = ReceiveLifecycle::Idle;
+            recordGraphCompletion(ticket, "target");
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            slot->lifecycle = SlotLifecycle::Failed;
+            receive_lifecycle_ = ReceiveLifecycle::Failed;
+            return fail(std::string("ExpertOverlay completion publication failed: ") +
+                        exception.what(), error);
         }
     }
 
@@ -589,12 +732,18 @@ namespace llaminar2
                 "Only the remote follower may receive an ExpertOverlay transaction ticket";
             return result;
         }
+        if (receive_lifecycle_ != ReceiveLifecycle::Idle)
+        {
+            result.error = "ExpertOverlay follower cannot receive before completing its current graph";
+            return result;
+        }
 
         try
         {
             receive_ticket_ = {};
+            receive_lifecycle_ = ReceiveLifecycle::Receiving;
             MPI_Status status{};
-            MPI_Request request = config_.mpi_ctx->irecv(
+            receive_request_ = config_.mpi_ctx->irecv(
                 &receive_ticket_,
                 sizeof(receive_ticket_),
                 MPI_BYTE,
@@ -602,16 +751,18 @@ namespace llaminar2
                 kInferenceTransactionTicketTag);
             const auto receive_begin = std::chrono::steady_clock::now();
             if (!progressRequestToCompletion(
-                    &request,
+                    &receive_request_,
                     &status,
                     "ExpertOverlay transaction ticket receive",
                     &result.error))
             {
+                receive_lifecycle_ = ReceiveLifecycle::Failed;
                 return result;
             }
             const int received = config_.mpi_ctx->getCount(status, MPI_BYTE);
             if (received != static_cast<int>(sizeof(receive_ticket_)))
             {
+                receive_lifecycle_ = ReceiveLifecycle::Failed;
                 result.error =
                     "ExpertOverlay transaction control message has the wrong fixed size";
                 return result;
@@ -622,10 +773,14 @@ namespace llaminar2
                 receive_ticket_.target_world_rank !=
                     config_.target_world_rank)
             {
+                receive_lifecycle_ = ReceiveLifecycle::Failed;
                 result.error =
                     "ExpertOverlay transaction control message failed lane authentication";
                 return result;
             }
+            receive_lifecycle_ = receive_ticket_.action ==
+                    MoEOverlayInferenceTransactionAction::Execute
+                ? ReceiveLifecycle::Executing : ReceiveLifecycle::Idle;
             result.ok = true;
             result.ticket = receive_ticket_;
             recordTicketTiming(
@@ -639,6 +794,7 @@ namespace llaminar2
         }
         catch (const std::exception &exception)
         {
+            receive_lifecycle_ = ReceiveLifecycle::Failed;
             result.error =
                 std::string("ExpertOverlay transaction ticket receive failed: ") +
                 exception.what();
@@ -659,7 +815,7 @@ namespace llaminar2
         }
         std::size_t count = 0;
         for (const auto &slot : send_slots_)
-            count += slot.in_flight ? 1u : 0u;
+            count += slot.lifecycle != SlotLifecycle::Available ? 1u : 0u;
         return count;
     }
 
@@ -670,17 +826,24 @@ namespace llaminar2
 
     void MoEOverlayMPIInferenceTransactionChannel::drainNoexcept() noexcept
     {
-        if (!config_.mpi_ctx ||
-            config_.mpi_ctx->rank() != config_.source_world_rank)
-        {
+        if (!config_.mpi_ctx)
             return;
-        }
         try
         {
+            if (receive_lifecycle_ != ReceiveLifecycle::Idle)
+            {
+                LOG_ERROR("ExpertOverlay control channel destroyed with an unretired follower graph or receive");
+                std::terminate();
+            }
             for (auto &slot : send_slots_)
             {
-                if (!slot.in_flight)
+                if (slot.lifecycle == SlotLifecycle::Available)
                     continue;
+                if (slot.lifecycle != SlotLifecycle::Sending)
+                {
+                    LOG_ERROR("ExpertOverlay control channel destroyed with an unjoined graph completion");
+                    std::terminate();
+                }
                 std::string error;
                 if (!progressRequestToCompletion(
                         &slot.request,
@@ -692,7 +855,7 @@ namespace llaminar2
                     std::terminate();
                 }
                 slot.request = MPI_REQUEST_NULL;
-                slot.in_flight = false;
+                slot.lifecycle = SlotLifecycle::Available;
             }
         }
         catch (const std::exception &exception)
@@ -812,7 +975,8 @@ namespace llaminar2
                 "ExpertOverlay transaction publisher cannot retire an unpublished handle",
                 error);
         }
-        if (!protocol_.markReturnReady(
+        if (!channel_->awaitCompletion(transaction.ticket, error) ||
+            !protocol_.markReturnReady(
                 transaction.slot_index, transaction.ticket, error) ||
             !protocol_.retire(
                 transaction.slot_index, transaction.ticket, error))
@@ -3165,6 +3329,10 @@ namespace llaminar2
                 "follower",
                 execution_end,
                 std::chrono::steady_clock::now());
+            // The exact executor terminal and local protocol retirement precede
+            // the receipt; empty numerical routes cannot erase this lifetime edge.
+            if (!channel_->publishCompletion(ticket, &result.error))
+                return result;
             ++result.executed_transactions;
             recordTicket(ticket, "follower", "executed");
         }

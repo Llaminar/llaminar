@@ -108,10 +108,11 @@ namespace llaminar2
 
         // Runtime Initialization (MPI_Init, model load, runner creation)
         RuntimeInitPhase init;
-        auto ctx_opt = init.execute(config, argc, argv);
-        if (!ctx_opt)
-            return config.dry_run ? 0 : 1;
-        auto ctx = std::move(*ctx_opt);
+        auto initialized = init.execute(config, argc, argv);
+        if (const auto *terminal = std::get_if<RuntimeInitExit>(&initialized))
+            return static_cast<int>(*terminal);
+        // This owner outlives mode-local handlers and retires MPI last.
+        auto ctx = std::get<AppContext>(std::move(initialized));
 
         // Run benchmark directly — no mode chain needed
         BenchmarkMode mode;

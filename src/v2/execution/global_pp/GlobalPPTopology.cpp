@@ -2,6 +2,12 @@
  * @file GlobalPPTopology.cpp
  * @brief Implementation of Global PP topology data structures
  *
+ * Structural construction derives activation edges from stage membership.
+ * Production binding projects physical endpoint identities from the canonical
+ * ClusterInventory; this file owns no second rank/hostname inventory. Node
+ * membership and transport cost are independent: slow local links stay local,
+ * and fast remote links remain cross-node.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -206,69 +212,23 @@ namespace llaminar2
     }
 
     GlobalPPTopology GlobalPPTopology::build(std::vector<GlobalPPStageSpec> specs,
-                                            int num_layers, int num_ranks,
-                                            std::vector<RankLocality> localities)
+                                            int num_layers, const ClusterInventory &inventory)
     {
-        auto topo = build(std::move(specs), num_layers, num_ranks);
-        topo.rank_localities = std::move(localities);
-
-        // Annotate transfers with locality
-        for (auto &t : topo.transfers)
-        {
-            if (t.sender_rank < 0 || t.receiver_rank < 0)
-                continue;
-
-            int node_sender = -1, node_receiver = -1;
-            for (const auto &loc : topo.rank_localities)
-            {
-                if (loc.rank == t.sender_rank) node_sender = loc.node_id;
-                if (loc.rank == t.receiver_rank) node_receiver = loc.node_id;
-            }
-
-            if (node_sender >= 0 && node_receiver >= 0)
-            {
-                t.locality = (node_sender == node_receiver)
-                    ? TransferLocality::INTRA_NODE
-                    : TransferLocality::INTER_NODE;
-            }
-        }
-
+        if (inventory.world_size <= 0 ||
+            inventory.ranks.size() != static_cast<size_t>(inventory.world_size))
+            throw std::invalid_argument("Pipeline binding requires complete cluster membership");
+        // Validate even idle ranks and a single-stage topology with no transfer
+        // edges. A partially populated inventory is never physical evidence.
+        for (int rank = 0; rank < inventory.world_size; ++rank)
+            (void)inventory.connectionBetweenRanks(rank, rank);
+        auto topo = build(std::move(specs), num_layers, inventory.world_size);
+        const auto errors = topo.validate();
+        if (!errors.empty())
+            throw std::invalid_argument("Invalid physically bound pipeline: " + errors.front());
+        for (auto &transfer : topo.transfers)
+            transfer.connection = inventory.connectionBetweenRanks(
+                transfer.sender_rank, transfer.receiver_rank);
         return topo;
-    }
-
-    bool GlobalPPTopology::areColocated(int rank_a, int rank_b) const
-    {
-        if (rank_localities.empty()) return false;
-        int node_a = -1, node_b = -1;
-        for (const auto &loc : rank_localities)
-        {
-            if (loc.rank == rank_a) node_a = loc.node_id;
-            if (loc.rank == rank_b) node_b = loc.node_id;
-        }
-        return node_a >= 0 && node_a == node_b;
-    }
-
-    std::vector<int> GlobalPPTopology::ranksOnNode(int node_id) const
-    {
-        std::vector<int> result;
-        for (const auto &loc : rank_localities)
-        {
-            if (loc.node_id == node_id)
-                result.push_back(loc.rank);
-        }
-        return result;
-    }
-
-    int GlobalPPTopology::nodeCount() const
-    {
-        if (rank_localities.empty()) return 0;
-        std::set<int> nodes;
-        for (const auto &loc : rank_localities)
-        {
-            if (loc.node_id >= 0)
-                nodes.insert(loc.node_id);
-        }
-        return static_cast<int>(nodes.size());
     }
 
     const GlobalPPStageSpec *GlobalPPTopology::stageForLayer(int layer) const
@@ -317,6 +277,7 @@ namespace llaminar2
         if (total_layers <= 0)
         {
             errors.push_back("total_layers must be > 0");
+            return errors;
         }
 
         if (world_size <= 0)
@@ -346,7 +307,7 @@ namespace llaminar2
         std::vector<int> layer_coverage(total_layers, 0);
         for (const auto &stage : stages)
         {
-            for (int l = stage.first_layer; l <= stage.last_layer && l < total_layers; ++l)
+            for (int l = std::max(0, stage.first_layer); l <= stage.last_layer && l < total_layers; ++l)
             {
                 layer_coverage[l]++;
             }
@@ -403,7 +364,7 @@ namespace llaminar2
             {
                 for (int r : stage.participating_ranks)
                 {
-                    if (r >= world_size)
+                    if (r < 0 || r >= world_size)
                     {
                         errors.push_back("Stage " + std::to_string(stage.stage_id) +
                                          " participating_rank " + std::to_string(r) +
@@ -422,22 +383,6 @@ namespace llaminar2
         oss << "GlobalPPTopology {\n";
         oss << "  total_layers=" << total_layers << ", world_size=" << world_size
             << ", stages=" << stages.size() << ", transfers=" << transfers.size() << "\n";
-
-        if (!rank_localities.empty())
-        {
-            oss << "  Nodes: " << nodeCount() << " (";
-            std::set<std::string> hostnames;
-            for (const auto &loc : rank_localities)
-                hostnames.insert(loc.hostname);
-            bool first = true;
-            for (const auto &h : hostnames)
-            {
-                if (!first) oss << ", ";
-                oss << h;
-                first = false;
-            }
-            oss << ")\n";
-        }
 
         for (const auto &stage : stages)
         {
@@ -485,7 +430,12 @@ namespace llaminar2
                 << " (rank " << t.sender_rank << " → " << t.receiver_rank
                 << " tag=" << t.mpi_tag;
             if (t.isNoop()) oss << " NO-OP";
-            if (t.locality != TransferLocality::UNKNOWN) oss << " " << transferLocalityName(t.locality);
+            if (t.connection)
+            {
+                const auto &connection = t.physicalConnection();
+                oss << ' ' << pipelineConnectionName(connection.locality())
+                    << " nodes=" << connection.sourceNode() << "->" << connection.destinationNode();
+            }
             oss << ")\n";
         }
 
@@ -587,8 +537,8 @@ namespace llaminar2
             {
                 if (t.isNoop()) continue;
                 std::string locality;
-                if (t.locality != TransferLocality::UNKNOWN)
-                    locality = transferLocalityName(t.locality);
+                if (t.connection)
+                    locality = pipelineConnectionName(t.physicalConnection().locality());
                 else
                     locality = "-";
 
@@ -604,23 +554,6 @@ namespace llaminar2
 
             oss << "\nActivation Transfers:\n"
                 << ttable.to_string();
-        }
-
-        // ── Node info ──
-        if (!rank_localities.empty())
-        {
-            oss << "\nNodes: " << nodeCount() << " (";
-            std::set<std::string> hostnames;
-            for (const auto &loc : rank_localities)
-                hostnames.insert(loc.hostname);
-            bool first = true;
-            for (const auto &h : hostnames)
-            {
-                if (!first) oss << ", ";
-                oss << h;
-                first = false;
-            }
-            oss << ")\n";
         }
 
         return oss.str();

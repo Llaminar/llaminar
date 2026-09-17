@@ -24,6 +24,7 @@
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/Logger.h"
+#include "../../utils/ObservedCollectiveInventory.h"
 
 #include <iostream>
 #include <cmath>
@@ -44,9 +45,11 @@ namespace llaminar2
     // process exit (not between tests).
     // =========================================================================
 
+    /** @brief Real-device collective fixture backed by canonical hardware observation. */
     class CollectiveContextROCmTest : public ::testing::Test
     {
     protected:
+        /** @brief Require the suite's real backend before constructing participants. */
         void SetUp() override
         {
             auto *rocm_backend = getROCmBackend();
@@ -70,6 +73,7 @@ namespace llaminar2
             }
         }
 
+        /** @brief Join the fixture's device work before releasing test resources. */
         void TearDown() override
         {
             auto *rocm_backend = getROCmBackend();
@@ -114,59 +118,16 @@ namespace llaminar2
         int rocm_count_ = 0;
 
     private:
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildROCmInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *rocm_backend = getROCmBackend();
-            if (rocm_backend != nullptr)
-            {
-                for (int i = 0; i < rocm_count_; ++i)
-                {
-                    DeviceInfo gpu;
-                    gpu.type = DeviceType::ROCm;
-                    gpu.local_device_id = i;
-                    gpu.memory_bytes = rocm_backend->deviceMemoryTotal(i);
-                    gpu.name = rocm_backend->deviceName(i);
-                    rank_inv.gpus.push_back(gpu);
-                }
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(0, rocm_count_);
         }
 
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildSingleROCmInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *rocm_backend = getROCmBackend();
-            if (rocm_backend != nullptr && rocm_count_ > 0)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::ROCm;
-                gpu.local_device_id = 0;
-                gpu.memory_bytes = rocm_backend->deviceMemoryTotal(0);
-                gpu.name = rocm_backend->deviceName(0);
-                rank_inv.gpus.push_back(gpu);
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(0, 1);
         }
 
         // Static context caching - RCCL communicators live for the process lifetime

@@ -184,19 +184,6 @@ namespace llaminar2
                                               const MPIEnvironmentInfo &env);
 
         /**
-         * @brief Parse hostfile to determine total available hosts/slots
-         *
-         * Supports OpenMPI hostfile format:
-         *   hostname1 slots=N
-         *   hostname2 slots=M
-         *
-         * @param hostfile_path Path to hostfile
-         * @return Vector of (hostname, slots) pairs, empty if file invalid
-         */
-        static std::vector<std::pair<std::string, int>> parseHostfile(
-            const std::string &hostfile_path);
-
-        /**
          * @brief Read OpenMPI cpu-set mask string for a NUMA node (e.g., "28-55,84-111")
          */
         static std::string getCpuSetForNumaNode(int numa_node);

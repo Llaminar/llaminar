@@ -1,1 +1,0 @@
-../../../.agents/model-parity-testing/SKILL.md

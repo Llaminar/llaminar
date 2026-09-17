@@ -43,6 +43,14 @@ local/hosted pipeline, independent AVX512/AVX2 image certificates, and checked-i
 runs commit their compact result JSON under `benchmarks/production/results/`.
 Both full E2E server suites pass before either image's benchmarks run; ISA-specific
 high-water marks and certificates are never reused across the two images.
+For targeted cross-host iteration, the remote runner can prioritize failing or
+unseen canonical cases without reducing the required certification matrix;
+see the CI guide's Azure workflow.
+
+The [Llaminar testing workflow](.agents/llaminar-testing/SKILL.md) covers Unit
+and production-preflight gates, reviewed HTTP token regression (MTP off and
+dynamic depth), explicit diagnostic numerical model parity,
+HTTP/remote-MPI E2E, and image/benchmark certification.
 
 ## Quickstart
 
@@ -138,6 +146,90 @@ these defaults; `--mtp-depth-demote-zero-accept auto` restores automatic
 selection. The resolved execution plan and benchmark JSON report the selected
 profile and effective threshold. Selecting a profile does not enable MTP or
 change the requested mode, depth bounds, or memory capacity.
+
+#### Compact expert-tier topology
+
+The CLI can declare a domain and its expert tier together. Integer priorities
+define preference (smaller is preferred); names carry no device-speed meaning.
+Omitted scope, collective, rank ownership and expert capacity are resolved by
+inventory binding and the canonical physical-memory admission. The preferred
+tier is the default continuation/base/shared domain; explicit role and compute
+policy overrides remain available in `serve --help`.
+
+```bash
+./build_v2_release/llaminar2 serve -m model.gguf \
+  --expert-tier 'compute=cuda:0,cuda:1;priority=0' \
+  --expert-tier 'capacity=rocm:0,rocm:1;priority=10'
+```
+
+Use `--hostfile cluster.hosts` (also accepted as `--mpi-hostfile`) to define MPI
+cluster membership. MPI admits the hostfile's slots unless `--mpi-procs` is
+explicit. Each host supplies its own hardware inventory and rank-local worker
+geometry; the initiating machine's CPU indices are not applied across hosts.
+A hostfile does not make a node-local-only execution transport cross-node.
+
+`plan` defaults to automatic placement and accepts the same inference options
+as `serve`, including MTP, KV precision and movement policy. It adds only
+`--output` and `--format` presentation options. Hard constraints use
+`--only-backends` / `--only-strategies`; there is no separate plan strategy
+vocabulary or KV-precision flag.
+
+For automatic ROCm-only compute with a 32K-token context:
+
+```bash
+./build_v2_release/llaminar2 serve -m model.gguf \
+  --only-backends rocm --context-length 32768
+```
+
+This permits CPU control/storage, but not CPU expert offload or CUDA compute.
+`--auto` is implicit without explicit placement. To plan for a cluster, save the
+selected configuration, then apply it without repeating the search constraints:
+
+```bash
+./build_v2_release/llaminar2 plan -m model.gguf --hostfile cluster.hosts \
+  --only-backends rocm,cpu --only-strategies expert-overlay \
+  --auto-hosts all \
+  --mtp --mtp-depth-policy dynamic --kv-cache-precision fp16 --output plan.json
+./build_v2_release/llaminar2 serve --config plan.json
+```
+
+Both auto frontends accept `--plan-workload 512,384` (YAML
+`planning.workload: 512,384`) to price an expected prefill/generation horizon.
+The positive token counts must fit `--context-length`. This is a ranking hint,
+not a generation limit; omission uses a balanced, context-bounded horizon.
+The plan summary reports that objective and the cost evidence. Applying a
+saved plan does not repeat the search or accept automatic workload hints.
+Automatic startup takes one bounded batch of source-format kernel, independent
+streaming-memory, and topology-specific link measurements. All candidates reuse
+it; planning does not warm up a synthetic model for each configuration. Costs
+include compiled weight ownership, live context work and communication, with
+zero interconnect cost for a single device. The reported estimates explicitly
+label routing/roofline/protocol approximations; they are not model benchmarks
+and assume neither future rebalancing gains nor an MTP acceptance rate.
+At equal estimated request cost, explicit preferences break ties first, then
+fewer compute devices win. A faster multi-device plan may still win; the
+single-device preference does not override performance or hard constraints.
+
+`--config` accepts authored YAML or the versioned JSON document owned by
+`OrchestrationConfigDocument`. JSON carries the complete typed configuration,
+including optional MTP settings and exact domain/rank declarations; malformed,
+missing, duplicate, or unknown fields fail instead of selecting defaults.
+Saved execution selections also retain discovery-rank order and the discovery
+process count. Direct auto-serve and `plan` share one startup transaction:
+publish intent and model metadata, prepare evidence on the discovery ranks,
+then select on root and publish the configuration. Discovery inventory remains
+the same immutable shared observation throughout. The frontend admits that exact subset before constructing
+runners; excluded processes do not load the model. Rank references inside the
+configuration name the selected execution namespace, not MPI discovery order.
+The cluster inventory records which ranks share a physical machine. Link
+measurements price those known connections; they do not infer local versus
+remote placement from speed, hostnames, or rank numbering.
+CLI arguments override the loaded configuration. Explicit
+`prefill_max_bucket_size` and deterministic settings are published through the
+same startup policy as their CLI equivalents. A configuration is still subject
+to current hardware and physical-memory admission; it is not a reservation or
+an inference certificate. The shared automatic planner's implementation status
+is tracked in [the orchestration plan](docs/v2/projects/2026-09/automatic-orchestration-plan.md).
 
 #### CPU Cross-socket TP/EP
 
@@ -308,6 +400,16 @@ routing changes.
 
 ### GPU Graph Capture
 
+Prefill uses captured chunks of at most 512 tokens by default, independently
+of the full KV context limit. Use `--prefill-max-bucket-size 1024` (or another
+positive row count) to select a different maximum. Smaller chunks reduce
+activation/workspace VRAM; larger chunks may improve prefill throughput.
+The option replaces the startup `LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES` list with
+the canonical buckets up to that size, including the exact requested endpoint.
+Without the option, an explicit environment bucket list remains authoritative.
+ExpertOverlay's separate `--moe-overlay-prefill-segment-rows` limit may further
+bound its chunk size; raise both limits to request larger overlay segments.
+
 For inference, Llaminar optimizes the hot decode path with CUDA and HIP graph
 capture where the backend and stage sequence support it. Prefill and decode
 build normal `ComputeGraph` objects first. Stable GPU segments can then be
@@ -351,11 +453,12 @@ them; source builds should install `openmpi-bin`, `libopenmpi-dev`, and
 `libnuma-dev`.
 
 You do not need to install the full CUDA Toolkit or the full ROCm user-space
-stack on the host. Those user-space libraries are in the image. Pick the image
-variant that matches the backends you want to expose: CPU-only images do not
-need GPU devices, CUDA images need NVIDIA Container Toolkit, ROCm images need
-the AMDGPU kernel driver and `/dev/kfd` plus `/dev/dri`, and the combined image
-needs both ecosystems.
+stack on the host. Those user-space libraries are in the image. The full image
+also runs on CPU-only cluster members without GPU drivers. Exposing CUDA needs
+NVIDIA Container Toolkit; exposing ROCm needs the AMDGPU kernel driver and
+`/dev/kfd` plus `/dev/dri`. Supply both ecosystems only when that host will use
+both GPU backends. CUDA driver binding is deferred until CUDA preparation, not
+required merely to load a combined CPU/CUDA/ROCm executable.
 
 1. Install Docker Engine:
 

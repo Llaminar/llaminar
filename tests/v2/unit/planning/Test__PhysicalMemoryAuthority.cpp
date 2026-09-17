@@ -1,6 +1,11 @@
 /**
  * @file Test__PhysicalMemoryAuthority.cpp
  * @brief Adversarial tests for topology-wide memory admission/materialization.
+ *
+ * Device-free BOMs exercise complete resource admission, exact allocation
+ * ownership and retirement. Capacity exhaustion is separately typed so search
+ * callers cannot hide malformed observations or lifetime failures as another
+ * rejected topology.
  */
 
 #include "planning/PhysicalMemoryAuthority.h"
@@ -72,6 +77,52 @@ TEST(PhysicalMemoryAuthority, CoalescesCpuAndGpuOwnersExactlyOnce)
     EXPECT_EQ(plan.totalBytes(), 862u);
     EXPECT_EQ(plan.incrementalBytes(), 812u);
     EXPECT_TRUE(plan.fits());
+}
+
+TEST(PhysicalMemoryAuthority, ExclusiveSetupPlansShareOwnerMaximaAndKeepConcurrentCharges)
+{
+    const auto cpu = resource(0, DeviceId::cpu(), 4000, 4000);
+    const auto gpu = resource(0, DeviceId::rocm(1), 4000, 4000);
+    PhysicalMemoryPlanBuilder first, second, complete;
+    first.add(cpu, PhysicalMemoryOwner::ModelSourcePayload, 100);
+    first.add(cpu, PhysicalMemoryOwner::WeightLoadStaging, 80);
+    second.add(cpu, PhysicalMemoryOwner::ModelSourcePayload, 100);
+    second.add(cpu, PhysicalMemoryOwner::WeightLoadStaging, 60);
+    second.add(gpu, PhysicalMemoryOwner::RoutedExpertWeights, 200);
+    const std::vector alternatives{first.build(), second.build()};
+    complete.add(cpu, PhysicalMemoryOwner::WeightLoadStaging, 7);
+    complete.addMutuallyExclusive(alternatives);
+    const auto plan = complete.build();
+    const auto *host = plan.find({0, DeviceId::cpu()});
+    ASSERT_NE(host, nullptr);
+    EXPECT_EQ(host->charge(PhysicalMemoryOwner::ModelSourcePayload).planned_bytes, 100u);
+    EXPECT_EQ(host->charge(PhysicalMemoryOwner::WeightLoadStaging).planned_bytes, 87u);
+    EXPECT_EQ(plan.find({0, DeviceId::rocm(1)})->charge(PhysicalMemoryOwner::RoutedExpertWeights).planned_bytes, 200u);
+    PhysicalMemoryPlanBuilder reversed;
+    const std::vector reverse{second.build(), first.build()};
+    reversed.add(cpu, PhysicalMemoryOwner::WeightLoadStaging, 7).addMutuallyExclusive(reverse);
+    EXPECT_EQ(reversed.build().summary(), plan.summary());
+}
+
+TEST(PhysicalMemoryAuthority, ExclusiveSetupFailureIsAtomicAndCannotInventResidencyCredit)
+{
+    const auto cpu = resource(0, DeviceId::cpu(), 4000, 4000);
+    PhysicalMemoryPlanBuilder complete, first;
+    complete.add(cpu, PhysicalMemoryOwner::ModelSourcePayload, 11);
+    first.add(cpu, PhysicalMemoryOwner::ExecutionWorkspace, 100);
+    const auto original = complete.build().summary();
+    for (int defect = 0; defect < 2; ++defect)
+    {
+        auto other = cpu;
+        if (defect == 0) --other.admission_available_bytes;
+        PhysicalMemoryPlanBuilder second;
+        second.add(other, PhysicalMemoryOwner::ExecutionWorkspace, 200, defect == 1 ? 100 : 0);
+        const std::vector alternatives{first.build(), second.build()};
+        EXPECT_THROW(complete.addMutuallyExclusive(alternatives), std::invalid_argument);
+        EXPECT_EQ(complete.build().summary(), original);
+    }
+    EXPECT_NO_THROW(complete.addMutuallyExclusive({}));
+    EXPECT_EQ(complete.build().summary(), original);
 }
 
 TEST(PhysicalMemoryAuthority, RejectsConflictingAllocatorObservations)
@@ -175,7 +226,38 @@ TEST(PhysicalMemoryAuthority, AggregateCertificateFailsOnAnyResource)
 
     EXPECT_THROW(
         PhysicalMemoryPlanAdmissionCertificate(builder.build()),
-        std::invalid_argument);
+        PhysicalMemoryCapacityExhausted);
+}
+
+TEST(PhysicalMemoryAuthority, OnlyCapacityExhaustionCanAdvanceCandidateSearch)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        PhysicalMemoryBOMBuilder bom(resource(0, device, 100, 0));
+        bom.add(PhysicalMemoryOwner::KVCache, 1);
+        EXPECT_THROW((void)PhysicalMemoryAdmissionCertificate(bom.build()), PhysicalMemoryCapacityExhausted);
+        EXPECT_THROW((void)PhysicalMemoryPlanAdmissionCertificate(
+            PhysicalMemoryPlanBuilder().add(bom.build()).build()), PhysicalMemoryCapacityExhausted);
+    }
+    try
+    {
+        (void)PhysicalMemoryPlanAdmissionCertificate(PhysicalMemoryPlanBuilder().build());
+        FAIL() << "An empty plan is not a complete admission";
+    }
+    catch (const PhysicalMemoryCapacityExhausted &)
+    {
+        FAIL() << "Malformed input cannot be caught as capacity exhaustion";
+    }
+    catch (const std::invalid_argument &) {}
+}
+
+TEST(PhysicalMemoryAuthority, ExplicitCeilingNeverAddsBytesOrAnAnonymousReserve)
+{
+    EXPECT_EQ(PhysicalMemoryAuthority::admissionCapacity(100, std::nullopt), 100u);
+    EXPECT_EQ(PhysicalMemoryAuthority::admissionCapacity(100, 200), 100u);
+    EXPECT_EQ(PhysicalMemoryAuthority::admissionCapacity(100, 75), 75u);
+    EXPECT_EQ(PhysicalMemoryAuthority::admissionCapacity(100, 0), 0u);
+    EXPECT_EQ(PhysicalMemoryAuthority::admissionCapacity(0, 100), 0u);
 }
 
 TEST(PhysicalMemoryAuthority, LiveLedgerSeparatesNewAndRetainedBytes)

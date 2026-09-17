@@ -1,13 +1,12 @@
 /**
  * @file ComputeBackend.h
- * @brief Device manager and compute context interfaces (LEGACY)
+ * @brief Canonical hardware publication and derived process-visible devices.
  *
- * ⚠️ DEPRECATION NOTICE (Phase 3 - October 2025):
- * GPU contexts were removed and replaced with the IBackend architecture
- * (see backends/IBackend.h).
- *
- * CPU device enumeration (DeviceManager) is still functional and used by Main.cpp.
- * Full removal is deferred until V2 has a production-ready device manager.
+ * DeviceManager owns one HardwareInventory observation. Derived device views
+ * preserve physical UUIDs, backend ordinals and NUMA/P2P facts for cluster
+ * planning; they do not own a parallel live memory ledger. CPUComputeContext
+ * remains the CPU execution adapter. GPU execution uses IBackend, not contexts
+ * created by this discovery interface.
  *
  * For GPU operations, use:
  * - backends/IBackend.h (abstract interface)
@@ -225,6 +224,10 @@ namespace llaminar2
         bool supports_bf16;        // Hardware BF16 support
         bool supports_int8;        // Hardware INT8 support
         PCIeLinkInfo pcie;         // PCIe link information (GPU devices only)
+        /// Driver UUID, independent of process-local ordinals and PCIe aliases.
+        std::string uuid;
+        /// Observed device-wide last-level cache; zero means unavailable, not zero-sized hardware.
+        size_t last_level_cache_bytes = 0;
     };
 
     /**
@@ -516,9 +519,11 @@ namespace llaminar2
          *
          * Contains the complete, unfiltered view of all hardware:
          * CPU sockets (model, cores, HT, memory), GPU devices, P2P matrices.
-         * Detected once on first initialize() call and cached.
+         * Published on initialize(), independently of logging. Reinitialization
+         * replaces the startup observation; callers must not retain pointers
+         * across that explicit setup boundary or reinitialize during execution.
          *
-         * @return Reference to the hardware inventory
+         * @return Borrowed observation, or nullptr before successful initialization.
          */
         const HardwareInventory *hardware() const { return hardware_.get(); }
 
@@ -529,8 +534,7 @@ namespace llaminar2
         std::vector<ComputeDevice> devices_;
         std::vector<std::shared_ptr<ComputeContext>> contexts_; // Cached per device
         std::vector<P2PMatrix> p2p_matrices_;                   // P2P access matrices (one per GPU backend)
-        std::unique_ptr<HardwareInventory> hardware_;           // Complete hardware inventory (detected once)
-        bool hardware_detected_ = false;                        // Whether hardware_ has been populated        size_t last_selected_device_ = 0;                       // Round-robin state
+        std::unique_ptr<HardwareInventory> hardware_; ///< Complete observation for this initialization.
         int local_numa_node_ = -1;                              // NUMA node filter (-1 = no filter)
         bool inventory_logged_ = false;                         // Only print device tables once
     };

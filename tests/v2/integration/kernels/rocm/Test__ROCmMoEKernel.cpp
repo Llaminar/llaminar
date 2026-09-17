@@ -28272,6 +28272,16 @@ TEST(Test__ROCmMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactByt
         llaminar2::test::NativeExpertTransferProofScope::CopyPublication);
 }
 
+/** @brief Captured slot reuse preserves all floating and quantized wire formats. */
+TEST(Test__ROCmMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
+{
+    int count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&count), hipSuccess);
+    if (count == 0) GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    llaminar2::test::runMixedFormatExpertTransferPublication(llaminar2::DeviceId::rocm(0), rocmMoETestStream());
+}
+
 /**
  * @brief Prove transferred CurrentBatchLLEP expert execution across all formats.
  *

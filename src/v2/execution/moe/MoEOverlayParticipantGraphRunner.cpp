@@ -72,6 +72,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <omp.h>
 
 namespace llaminar2
 {
@@ -97,6 +98,41 @@ namespace llaminar2
         std::string parentName(int layer, const char *suffix)
         {
             return "blk." + std::to_string(layer) + "." + suffix;
+        }
+
+        /**
+         * @brief Declare CPU arrival scratch from this layer's GGUF directory.
+         * @param model Metadata already loaded by the executing rank.
+         * @param layer Layer whose complete experts this participant executes.
+         * @param d_model Unsharded expert input/output width.
+         * @param intermediate Unsharded gate/up output width.
+         * @param experts Logical count used to validate all three parent shapes.
+         * @return Source identities and this executing rank's CPU policy facts.
+         * @throws std::invalid_argument For missing or inconsistent parent metadata.
+         *
+         * No weight is loaded or prepared here. Empty tiers declare the same
+         * eventual scratch as populated tiers, before any captured peer starts.
+         */
+        MoELocalExpertStage::CPUExpertWorkspaceSource cpuExpertWorkspaceSource(
+            const GGUFModel &model, int layer, int d_model, int intermediate, int experts)
+        {
+            std::array<TensorType, 3> formats;
+            for (size_t projection = 0; projection < kExpertParents.size(); ++projection)
+            {
+                const auto name = parentName(layer, kExpertParents[projection].suffix);
+                const auto *tensor = model.findTensor(name);
+                const bool down = kExpertParents[projection].role == WeightRole::MoEExpertDown;
+                const std::vector<uint64_t> expected{
+                    static_cast<uint64_t>(down ? intermediate : d_model),
+                    static_cast<uint64_t>(down ? d_model : intermediate),
+                    static_cast<uint64_t>(experts)};
+                if (!tensor || tensor->dimensions != expected)
+                    throw std::invalid_argument("CPU expert workspace requires exact source geometry for " + name);
+                formats[projection] = ggufToTensorType(tensor->type);
+            }
+            return {.gate = formats[0], .up = formats[1], .down = formats[2],
+                    .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),
+                    .execution = CPUExecutionGeometry::local()};
         }
 
         /** @brief Return true when at least one expert bit is owned. */
@@ -2752,6 +2788,8 @@ namespace llaminar2
                     local_params.d_model = d_model;
                     local_params.expert_intermediate = expert_intermediate;
                     local_params.layer_idx = layer;
+                    local_params.cpu_workspace_source = cpuExpertWorkspaceSource(
+                        config_.model_context->model(), layer, d_model, expert_intermediate, num_experts);
                     local_params.expert_mask = expert_mask;
                     local_params.overlay_participant_residency =
                         participant_residency;
@@ -2800,6 +2838,29 @@ namespace llaminar2
                         });
                 }
                 result->mapped_cpu_endpoints.push_back(std::move(endpoint));
+            }
+
+            if (!result->mapped_cpu_endpoints.empty())
+            {
+                // CPU followers are explicit heterogeneous boundaries, not
+                // nodes in a GPU parent. Register them as non-graph consumers
+                // of the same serial-family allocator; otherwise a graph-only
+                // walk silently omits every CPU layer's invocation workspace.
+                std::vector<WorkspaceConsumerRequest> consumers;
+                for (const auto &endpoint : result->mapped_cpu_endpoints)
+                    for (const auto &layer : endpoint->layers)
+                        consumers.push_back({.consumer = layer.local_expert.get(),
+                            .device = endpoint->device, .m = row_capacity,
+                            .shape_policy = WorkspaceConsumerShapePolicy::FixedDeclaredShape});
+                result->workspace_allocator = serial_graph_family_workspace_allocator_;
+                WorkspaceSizingHints hints;
+                hints.max_seq_len = row_capacity;
+                hints.serial_family_max_rows = row_capacity;
+                hints.d_model = d_model;
+                hints.batch_size = 1;
+                hints.graph_family_policy = WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant;
+                if (!result->workspace_allocator->allocateForGraph(*result->graph, hints, consumers))
+                    throw std::runtime_error("Mapped CPU followers could not bind their admitted serial workspace");
             }
 
             /*

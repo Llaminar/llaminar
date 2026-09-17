@@ -22,6 +22,7 @@
 #include <sstream>
 #include <fstream>
 #include <unordered_map>
+#include <map>
 #include <filesystem>
 #include <stdexcept>
 
@@ -70,6 +71,15 @@ namespace llaminar2
             for (const auto &domain : overlay->dense_domains)
                 for (const auto &address : domain.participants)
                     include(address);
+        }
+        if (intent == BootstrapDeviceIntent::Automatic)
+        {
+            // A CPU-only hard filter is compute intent even before a device
+            // has been selected. Honor it before backend discovery so remote
+            // CPU admission does not initialize excluded GPU runtimes.
+            const AutomaticOrchestrationRequest automatic(config.automatic_planning);
+            if (!automatic.allows(DeviceType::CUDA) && !automatic.allows(DeviceType::ROCm))
+                return BootstrapDeviceIntent::CpuOnly;
         }
         return intent;
     }
@@ -400,6 +410,86 @@ namespace llaminar2
     // Main execute method
     // =========================================================================
 
+    MPILaunchConfig MPIBootstrapPhase::discoveryLaunchConfig(const OrchestrationConfig &config)
+    {
+        if (config.hostfile.empty() && !config.execution_rank_selection)
+            throw std::invalid_argument("Discovery launch requires a hostfile or saved execution selection");
+        if (config.execution_rank_selection)
+        {
+            if (config.hostfile.empty() && config.mpi_procs <= 0)
+                throw std::invalid_argument("Saved local execution selection requires its discovery MPI process count");
+            if (config.mpi_procs > 0 && std::any_of(
+                    config.execution_rank_selection->discoveryRanks().begin(),
+                    config.execution_rank_selection->discoveryRanks().end(),
+                    [&](int rank) { return rank >= config.mpi_procs; }))
+                throw std::invalid_argument("Saved execution selection exceeds the requested discovery MPI process count");
+        }
+        MPILaunchConfig launch;
+        launch.hostfile = config.hostfile;
+        launch.num_procs = config.mpi_procs;
+        launch.report_bindings = config.mpi_verbose || config.verbose_level > 0;
+        launch.verbose = config.mpi_verbose;
+        launch.oversubscribe = config.mpi_oversubscribe;
+        // MPI maps/binds sockets using each host's hwloc discovery. Thread
+        // counts and CPU indices are deliberately absent from this command.
+        return launch;
+    }
+
+    void MPIBootstrapPhase::configureRequestedCPUThreads(const OrchestrationConfig &config)
+    {
+        if (config.n_threads > 0)
+        {
+            if (setenv("OMP_NUM_THREADS", std::to_string(config.n_threads).c_str(), 1) != 0)
+                throw std::runtime_error("Cannot publish requested CPU thread count");
+            omp_set_num_threads(config.n_threads);
+        }
+        // Scratch and service observations require the admitted team, not an
+        // OpenMP runtime that silently shrinks it under external load.
+        omp_set_dynamic(0);
+    }
+
+    void MPIBootstrapPhase::configureClusterRankThreads(const OrchestrationConfig &config)
+    {
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0)
+            throw std::runtime_error("Cannot read MPI rank affinity for cluster worker admission");
+        std::map<int, int> physical_cores;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+            if (CPU_ISSET(cpu, &affinity))
+                physical_cores.try_emplace(physicalRepresentativeForCpu(cpu), cpu);
+        if (physical_cores.empty() || physical_cores.contains(-1))
+            throw std::runtime_error("MPI cluster rank has no valid physical-core binding");
+        MPILaunchConfig workers;
+        workers.omp_threads_per_rank = config.n_threads > 0
+            ? config.n_threads : static_cast<int>(physical_cores.size());
+        workers.omp_places = "cores";
+        workers.omp_proc_bind = "close";
+        MPIBootstrap::configureOpenMPEnvironment(MPIBootstrap::detectCPUTopology(), workers);
+        // libgomp may already have parsed its environment before main(). The
+        // explicit runtime operation makes the observed team size authoritative.
+        omp_set_dynamic(0);
+        omp_set_num_threads(workers.omp_threads_per_rank);
+
+        // libgomp has no runtime setter for OMP_PLACES. Bind its persistent
+        // worker pool using the rank's own allowed CPU IDs instead of relying
+        // on environment strings changed after the runtime was loaded. Select
+        // an allowed sibling of each physical core, never an unavailable ID.
+        std::vector<int> worker_cpus;
+        for (const auto &[physical, allowed] : physical_cores)
+            worker_cpus.push_back(allowed);
+        int binding_failed = 0;
+#pragma omp parallel reduction(| : binding_failed)
+        {
+            cpu_set_t worker;
+            CPU_ZERO(&worker);
+            CPU_SET(worker_cpus[static_cast<std::size_t>(omp_get_thread_num()) % worker_cpus.size()], &worker);
+            binding_failed |= sched_setaffinity(0, sizeof(worker), &worker) != 0;
+        }
+        if (binding_failed)
+            throw std::runtime_error("Cannot bind MPI cluster rank's OpenMP workers to their physical cores");
+    }
+
     BootstrapResult MPIBootstrapPhase::execute(const OrchestrationConfig &config,
                                                int argc, char *argv[])
     {
@@ -413,7 +503,27 @@ namespace llaminar2
         // If already in MPI context or bootstrap disabled, continue to runtime init
         if (mpi_env.is_mpi_process || config.mpi_no_bootstrap)
         {
+            if (mpi_env.is_mpi_process && (!config.hostfile.empty() || config.execution_rank_selection))
+                configureClusterRankThreads(config);
             return {BootstrapResult::Action::CONTINUE, 0};
+        }
+
+        if (!config.hostfile.empty() || config.execution_rank_selection)
+        {
+            const auto launch = discoveryLaunchConfig(config);
+            if (config.mpi_dry_run)
+            {
+                for (const auto &argument : MPIBootstrap::buildMPIRunCommand(
+                         argc, argv, launch, cpu_topology))
+                    std::cout << argument << ' ';
+                std::cout << '\n';
+                return {BootstrapResult::Action::EXIT, 0};
+            }
+            // No inference endpoint can narrow the discovery namespace of a
+            // saved selection or remote cluster. MPI starts all requested ranks;
+            // their actual CPU/GPU inventory is gathered after initialization.
+            const int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch, cpu_topology);
+            return {BootstrapResult::Action::EXIT, result < 0 ? 1 : result};
         }
 
         // =================================================================

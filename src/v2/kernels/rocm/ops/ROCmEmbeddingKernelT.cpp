@@ -1,6 +1,10 @@
 /**
  * @file ROCmEmbeddingKernelT.cpp
- * @brief ROCm embedding kernel host-side implementation
+ * @brief ROCm device-resident native and prepared embedding dispatch.
+ *
+ * Floating tables retain their storage precision through TP wrappers. Native
+ * quantized tables require their model-owned prepared handle before recording;
+ * graph replay consumes persistent device token IDs and never repacks weights.
  */
 
 #include "ROCmEmbeddingKernelT.h"
@@ -700,10 +704,11 @@ namespace llaminar2
         // =====================================================================
 
         // --- Fast path: FP32 tensor already on GPU ---
-        auto *embed_fp32 = dynamic_cast<const FP32Tensor *>(embed_table);
-        if (embed_fp32 && embed_fp32->isOnGPU())
+        // Residency belongs to the tensor interface; a TP wrapper need not
+        // inherit the concrete FP32 storage class to expose its exact bytes.
+        if (embed_table->native_type() == TensorType::FP32 && embed_table->isOnGPU())
         {
-            float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            float *d_embed = const_cast<float *>(static_cast<const float *>(embed_table->gpu_data_ptr()));
             if (validate_gpu_ptrs &&
                 !validatePointerForDevice(d_embed, dev, "EMBED_FP32", /*fail_on_query_error=*/true))
             {
@@ -713,7 +718,7 @@ namespace llaminar2
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
             const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
                                               ? local_vocab_size_
-                                              : static_cast<int>(embed_fp32->rows());
+                                              : static_cast<int>(embed_table->rows());
             const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
             err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model,
                                         launch_vocab_size, launch_vocab_offset, stream);
@@ -795,7 +800,7 @@ namespace llaminar2
         }
 
         // --- Quantized path: consume model-owned prepared EmbedQ8 weights ---
-        if (dynamic_cast<const IINT8Unpackable *>(embed_table))
+        if (IINT8Unpackable::fromTensor(embed_table))
         {
             const DeviceId dev_id = DeviceId::rocm(dev);
             const PreparedEmbeddingHandle *prepared = prepared_embedding_handle_;

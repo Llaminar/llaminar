@@ -1029,7 +1029,7 @@ namespace llaminar2
         bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
-        std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
+        std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bounded serving ladder; --prefill-max-bucket-size publishes an explicit LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES override here.
         int prefill_graph_max_cached_buckets = static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);                                                                 ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 

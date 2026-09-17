@@ -1,6 +1,12 @@
 /**
  * @file MTPVerifierPreparationStage.cpp
  * @brief Device-only implementation of captured grouped-verifier preparation.
+ *
+ * The verifier-input owner assembles tokens, positions and transaction width.
+ * A pipeline follower shares only the cache-checkpoint portion of that lifecycle:
+ * it cannot derive a second budget or overwrite terminal-owned verifier metadata.
+ * Validation completes before any enqueue, and the common checkpoint helper
+ * preserves exact stream ordering without a host observation or extra buffer.
  */
 
 #include "MTPVerifierPreparationStage.h"
@@ -12,6 +18,7 @@
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -39,7 +46,12 @@ namespace llaminar2
 
     bool MTPVerifierPreparationStage::validate() const
     {
-        const int total_rows = params_.request_count * params_.padded_seq_len;
+        if (params_.authority != Authority::VerifierInputOwner &&
+            params_.authority != Authority::PipelineFollower)
+        {
+            LOG_ERROR("[MTPVerifierPreparationStage] An explicit preparation authority is required");
+            return false;
+        }
         const bool has_generation_control =
             params_.generation_control_device != nullptr;
         const bool has_any_maintenance_boundary =
@@ -55,10 +67,38 @@ namespace llaminar2
             LOG_ERROR("[MTPVerifierPreparationStage] An explicit GPU backend is required");
             return false;
         }
+        // Validate before multiplication; malformed physical geometry must not
+        // wrap into a smaller apparently valid token/checkpoint allocation.
         if (params_.request_count <= 0 || params_.padded_seq_len <= 0 ||
-            total_rows <= 0 ||
-            static_cast<int>(params_.token_rows.size()) !=
-                params_.request_count ||
+            params_.padded_seq_len > std::numeric_limits<int>::max() / params_.request_count)
+        {
+            LOG_ERROR("[MTPVerifierPreparationStage] Physical verifier geometry is invalid");
+            return false;
+        }
+        const int total_rows = params_.request_count * params_.padded_seq_len;
+        if (params_.main_kv_checkpoints.size() != static_cast<size_t>(params_.request_count) ||
+            !std::all_of(params_.main_kv_checkpoints.begin(), params_.main_kv_checkpoints.end(),
+                [](const MainKVCheckpointBinding &binding) { return binding.valid(); }))
+        {
+            LOG_ERROR("[MTPVerifierPreparationStage] Main-KV checkpoint cardinality does not match verifier requests");
+            return false;
+        }
+        if (params_.authority == Authority::PipelineFollower)
+        {
+            // Only the tail owns these producer bindings. Their absence is an
+            // enforceable role contract, not a request to skip incomplete work.
+            if (!params_.token_rows.empty() || params_.base_cached_tokens_device ||
+                params_.valid_graph_rows_device || params_.valid_graph_row_count != 0 ||
+                has_generation_control || params_.generation_control_stride != 0 ||
+                has_any_maintenance_boundary || params_.position_ids_device ||
+                params_.request_lengths_device || params_.base_cached_tokens_snapshot_device)
+            {
+                LOG_ERROR("[MTPVerifierPreparationStage] Pipeline follower cannot own verifier token, geometry or controller publication");
+                return false;
+            }
+            return true;
+        }
+        if (params_.token_rows.size() != static_cast<size_t>(params_.request_count) ||
             !std::all_of(
                 params_.token_rows.begin(),
                 params_.token_rows.end(),
@@ -96,19 +136,6 @@ namespace llaminar2
             LOG_ERROR("[MTPVerifierPreparationStage] Device-generation controller or maintenance-boundary geometry is incomplete");
             return false;
         }
-        if (static_cast<int>(params_.main_kv_checkpoints.size()) !=
-                params_.request_count ||
-            !std::all_of(
-                params_.main_kv_checkpoints.begin(),
-                params_.main_kv_checkpoints.end(),
-                [](const MainKVCheckpointBinding &binding)
-                {
-                    return binding.valid();
-                }))
-        {
-            LOG_ERROR("[MTPVerifierPreparationStage] Main-KV checkpoint cardinality does not match verifier requests");
-            return false;
-        }
         return true;
     }
 
@@ -120,6 +147,8 @@ namespace llaminar2
         void *const stream = requireGPUStream();
         if (!stream)
             return false;
+        if (params_.authority == Authority::PipelineFollower)
+            return captureLocalKVCheckpoints(stream);
         const int device_ordinal = params_.device_id.gpu_ordinal();
 
         /*
@@ -187,28 +216,8 @@ namespace llaminar2
             }
         }
 
-        /*
-         * Capture every request's complete ring-head/count bank before verifier
-         * append kernels can mutate it. Publication later restores accepted state
-         * relative to these opaque bytes, which is strictly stronger than keeping
-         * only a layer-zero count scalar.
-         */
-        for (const MainKVCheckpointBinding &binding :
-             params_.main_kv_checkpoints)
-        {
-            std::string error;
-            if (!binding.cache->captureDeviceSequenceStateCheckpoint(
-                    binding.sequence_index,
-                    binding.checkpoint_device,
-                    binding.checkpoint_bytes,
-                    stream,
-                    &error))
-            {
-                LOG_ERROR("[MTPVerifierPreparationStage] Main-KV checkpoint capture failed for sequence "
-                          << binding.sequence_index << ": " << error);
-                return false;
-            }
-        }
+        if (!captureLocalKVCheckpoints(stream))
+            return false;
 
         if (device_generation_controlled)
         {
@@ -274,8 +283,30 @@ namespace llaminar2
         return true;
     }
 
+    bool MTPVerifierPreparationStage::captureLocalKVCheckpoints(void *stream) const
+    {
+        // Preserve the complete local ring-head/count bank before any verifier
+        // append. Different PP stages own different layers, so a tail checkpoint
+        // or a layer-zero count alone cannot restore another participant's state.
+        for (const MainKVCheckpointBinding &binding : params_.main_kv_checkpoints)
+        {
+            std::string error;
+            if (!binding.cache->captureDeviceSequenceStateCheckpoint(
+                    binding.sequence_index, binding.checkpoint_device,
+                    binding.checkpoint_bytes, stream, &error))
+            {
+                LOG_ERROR("[MTPVerifierPreparationStage] Main-KV checkpoint capture failed for sequence "
+                          << binding.sequence_index << ": " << error);
+                return false;
+            }
+        }
+        return true;
+    }
+
     size_t MTPVerifierPreparationStage::estimatedFlops() const
     {
+        if (params_.authority == Authority::PipelineFollower)
+            return 0;
         return static_cast<size_t>(std::max(0, params_.request_count)) *
                static_cast<size_t>(std::max(0, params_.padded_seq_len)) * 3U;
     }
@@ -291,6 +322,8 @@ namespace llaminar2
         {
             checkpoint_bytes += binding.checkpoint_bytes;
         }
+        if (params_.authority == Authority::PipelineFollower)
+            return checkpoint_bytes;
         return token_rows * sizeof(int32_t) * 2U + checkpoint_bytes +
                static_cast<size_t>(std::max(0, params_.request_count)) *
                    sizeof(int32_t) * 3U;
@@ -306,6 +339,7 @@ namespace llaminar2
     StageDumpInfo MTPVerifierPreparationStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
+        info.addScalarInt("preparation_authority", static_cast<int>(params_.authority));
         info.addScalarInt("request_count", params_.request_count);
         info.addScalarInt("padded_seq_len", params_.padded_seq_len);
         info.addScalarInt(
@@ -323,6 +357,8 @@ namespace llaminar2
     StageBufferContract MTPVerifierPreparationStage::bufferContract() const
     {
         StageBufferContract contract;
+        if (params_.authority == Authority::PipelineFollower)
+            return contract;
         contract.addInput(BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS);
         contract.addInput(BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS);
         contract.addOutput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
@@ -361,6 +397,7 @@ namespace llaminar2
                     left.draft_token_count == right.draft_token_count);
         };
         return params_.device_id == other.device_id &&
+               params_.authority == other.authority &&
                params_.backend == other.backend &&
                params_.token_rows.size() == other.token_rows.size() &&
                std::equal(
@@ -406,6 +443,7 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "device=" << params.device_id.toString()
+            << ",authority=" << static_cast<int>(params.authority)
             << ",backend=" << params.backend
             << ",requests=" << params.request_count
             << ",padded_seq_len=" << params.padded_seq_len

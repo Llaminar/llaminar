@@ -9,6 +9,8 @@
  * - Polymorphic IGraphBuilder usage (MockGraphBuilder, not QwenStandardGraph)
  * - PP stage config validation during construction
  * - Field accessibility after construction
+ * - Embedded multi-device pipelines are rejected before resource setup; a
+ *   participant-local PP shard remains a supported constructor dependency.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -41,6 +43,18 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Record borrowed context wiring without creating a collective. */
+    class DomainWiringGraphBuilder final : public MockGraphBuilder
+    {
+    public:
+        /** @brief Preserve the exact injected pointer, never another owner. */
+        void setTPContext(const std::string &name, ITPContext *context) override
+        {
+            wired_contexts.emplace(name, context);
+        }
+        std::map<std::string, ITPContext *> wired_contexts;
+    };
+
     class ScopedEnvVars
     {
     public:
@@ -865,19 +879,19 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, PPStageConfig_NegativeFirs
 }
 
 // =============================================================================
-// Optional: Pipeline Config
+// Participant-local pipeline ownership
 // =============================================================================
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, PipelineConfig_NullByDefault)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, FullModel_IsParticipantLocal)
 {
     auto deps = minimalDeps();
     DeviceGraphOrchestrator dgo(std::move(deps));
 
-    // No pipeline config → single-device mode, no PP graph building
+    // No PP shard means this participant owns the full forward-layer interval.
     EXPECT_NE(std::as_const(dgo).graphBuilder(), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, PipelineConfig_WiredFromDeps)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, EmbeddedPipeline_RejectedBeforeSetup)
 {
     auto deps = minimalDeps();
 
@@ -890,11 +904,45 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, PipelineConfig_WiredFromDe
         PPStageConfig::firstStage(0, "gpu_a", 0, 12),
         PPStageConfig::lastStage(1, "gpu_b", 12, 24)};
 
-    deps.pipeline_config = pipeline;
+    GraphConfig config = mock_builder_->config();
+    config.pipeline_config = pipeline;
+    mock_builder_->setConfig(config);
+    EXPECT_THROW(DeviceGraphOrchestrator(std::move(deps)), std::invalid_argument);
+}
 
-    DeviceGraphOrchestrator dgo(std::move(deps));
-    // Pipeline config is stored and will be used during graph building
-    EXPECT_NE(std::as_const(dgo).graphBuilder(), nullptr);
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InjectedDomainContext_ExactIdentityAndLifetime)
+{
+    auto builder = std::make_shared<DomainWiringGraphBuilder>();
+    builder->setConfig(mock_builder_->config());
+    auto context = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    const auto *identity = context.get();
+    const std::weak_ptr<ITPContext> lifetime = context;
+    {
+        auto deps = minimalDeps();
+        deps.graph_builder = builder;
+        deps.domain_tp_contexts.emplace("continuation", context);
+        DeviceGraphOrchestrator dgo(std::move(deps));
+        context.reset();
+        EXPECT_FALSE(lifetime.expired());
+        ASSERT_EQ(builder->wired_contexts.size(), 1u);
+        EXPECT_EQ(builder->wired_contexts.at("continuation"), identity);
+    }
+    EXPECT_TRUE(lifetime.expired()) << "Only the owning participant retains the collective";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InvalidDomainContext_RejectedBeforeWiring)
+{
+    for (const bool missing_name : {false, true})
+    {
+        auto builder = std::make_shared<DomainWiringGraphBuilder>();
+        builder->setConfig(mock_builder_->config());
+        auto deps = minimalDeps();
+        deps.graph_builder = builder;
+        deps.domain_tp_contexts.emplace(missing_name ? "" : "continuation", missing_name
+            ? std::make_shared<llaminar2::test::MockLocalTPContext>() : nullptr);
+        EXPECT_THROW(DeviceGraphOrchestrator(std::move(deps)), std::invalid_argument);
+        EXPECT_TRUE(builder->wired_contexts.empty());
+    }
 }
 
 // =============================================================================

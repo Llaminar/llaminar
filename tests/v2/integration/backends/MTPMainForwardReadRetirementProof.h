@@ -7,12 +7,16 @@
  * hidden producers/readers; prepareLiveStateForForwardGraphExecution owns
  * the ordering edge. A timeline gate makes the race deterministic and proves
  * that submission returns while the reader is still pending on another stream.
+ * Metadata observation must retain that publication for a later mailbox writer;
+ * waiting on an unrelated metadata stream is not ownership of the write frontier.
  */
 #pragma once
 
+#include "backends/BackendManager.h"
 #include "backends/IBackend.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "memory/BufferArena.h"
 #include "transfer/TransferEngine.h"
@@ -31,11 +35,138 @@ namespace llaminar2
     /** @brief Inject only the device/publication needed by the real prelude. */
     struct DeviceGraphOrchestratorLiveStateTestAccess
     {
+        /** @return Exact last-forward producer for terminal-only device assertions. */
+        static void *mainForwardProducerStream(DeviceGraphOrchestrator &runner)
+        {
+            const auto forward = runner.forward_engine_ ? runner.forward_engine_->lastExecutedForwardGraph() : std::nullopt;
+            return forward ? forward->stream : nullptr;
+        }
+
+        /** @brief Borrow the follower's admitted checkpoint, never a tail rollback bank. */
+        static PipelineForwardGraphEdges::FollowerState pipelineFollowerState(DeviceGraphOrchestrator &runner)
+        {
+            const auto &checkpoint = runner.mtp_publication_main_kv_base_checkpoints_.at(0);
+            return {.backend = getBackendFor(runner.state_.device_id),
+                .checkpoint = {.cache = runner.state_.kv_cache.get(), .sequence_index = 0,
+                    .checkpoint_device = checkpoint.data(), .checkpoint_bytes = checkpoint.bytes}};
+        }
+
+        /** @brief Bind the real immutable contributor without constructing model arithmetic. */
+        static void bindPipelineEdges(DeviceGraphOrchestrator &runner, PipelineForwardGraphEdges *edges)
+        { runner.pipeline_forward_edges_ = edges; }
+
+        /** @brief Enter the real follower materializer without synthesizing a tail outcome. */
+        static bool prepareFollowerPublication(DeviceGraphOrchestrator &runner,
+            ComputeGraph &verifier, int rows, std::string *error)
+        { return runner.materializePipelineFollowerMTPPublicationGraph(verifier, rows, error); }
+
+        /** @return The installed graph, borrowed only while its DGO owns the workspace. */
+        static ComputeGraph *publicationGraph(DeviceGraphOrchestrator &runner)
+        { return runner.mtp_speculative_state_publication_graph_.graph.get(); }
+
+        /** @return Immutable production publication bindings, not device values. */
+        static const MTPSpeculativeStatePublicationStage::Params &publicationParams(DeviceGraphOrchestrator &runner)
+        { return runner.mtp_speculative_state_publication_graph_.stage->getParams(); }
+
+        /** @brief Exercise exact-stream and retained-transport checks before publication. */
+        static bool executePublication(DeviceGraphOrchestrator &runner, void *stream, std::string *error)
+        { return runner.executeMTPStatePublicationGraph(stream, error); }
+
+        /** @brief Install test outcome bindings through the real canonical checkpoint materializer. */
+        static bool installPublication(DeviceGraphOrchestrator &runner,
+            MTPSpeculativeStatePublicationStage::Params params, ComputeGraph &verifier, std::string *error)
+        { return runner.installMTPStatePublicationGraph(std::move(params), verifier, error); }
+
+        /** @brief Capture the complete local publication without launching a collective. */
+        static bool capturePublication(DeviceGraphOrchestrator &runner, void *stream, std::string *error)
+        { return runner.executeMTPStatePublicationGraph(stream, error,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch); }
+
+        /** @return The exact compiled production parent, never its uncomposed local child. */
+        static const IGPUGraphCapture *publicationCapture(DeviceGraphOrchestrator &runner)
+        {
+            auto &cache = runner.mtp_speculative_state_publication_graph_;
+            const auto &params = cache.stage->getParams();
+            const auto view = params.authority == MTPSpeculativeStatePublicationStage::Authority::PipelineFollower
+                ? runner.mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
+                    params.request_count, params.verifier_rows_per_request, nullptr)
+                : cache.segment_cache.deviceLoopGraphTemplate(*cache.graph);
+            return view ? view->capture : nullptr;
+        }
+
+        /** @brief Freeze native transport through the participant's ordinary executor. */
+        static bool capturePublicationTransport(DeviceGraphOrchestrator &runner, PipelineForwardGraphEdges &edges,
+            PipelineForwardGraphEdges::PublicationBanks banks, IDeviceContext &context, IWorkerGPUContext &gpu)
+        {
+            runner.pipeline_publication_transport_ = edges.materializePublicationTransport(banks, runner.executor_, context, gpu);
+            return static_cast<bool>(runner.pipeline_publication_transport_);
+        }
+
+        /** @brief Test terminal native resource retirement without exposing arena storage. */
+        static void retirePublicationTransport(DeviceGraphOrchestrator &runner)
+        { runner.pipeline_publication_transport_.reset(); }
+
+        /** @brief Retire borrowed graph/stage identities before a topology-only fixture exits. */
+        static void retirePublication(DeviceGraphOrchestrator &runner)
+        { runner.mtp_speculative_state_publication_graph_.invalidate(); }
+
+        /** @brief Describe the canonical local input banks used by captured MTP forwards. */
+        static ForwardInput followerInput(DeviceGraphOrchestrator &runner, int rows)
+        {
+            ForwardInput input;
+            input.device = runner.state_.device_id;
+            input.seq_len = rows;
+            input.batch_size = 1;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.execution_role = rows == 1 ? ForwardExecutionRole::MTPCondition
+                                             : ForwardExecutionRole::GroupedMTPVerifier;
+            input.kv_cache = runner.state_.kv_cache.get();
+            input.external_hidden_state = runner.pp_stage_config_->has_embedding
+                ? nullptr : runner.state_.hidden.get();
+            if (rows == 1)
+            {
+                const auto &logical = runner.device_resident_logical_sequence_state_storage_;
+                input.token_ids_device = logical.next_condition_tokens_device;
+                input.position_ids_device = logical.target_cached_tokens_device;
+                input.sequence_lengths_device = logical.target_cached_tokens_device;
+            }
+            else
+            {
+                input.token_ids_device = runner.mtp_verifier_input_tokens_dev_;
+                input.position_ids_device = static_cast<const int32_t *>(runner.mtp_verifier_position_ids_dev_);
+                input.sequence_lengths_device = static_cast<const int32_t *>(runner.mtp_verifier_request_lengths_dev_);
+            }
+            return input;
+        }
+
+        /** @brief Exercise real output binding without borrowing a terminal LM head. */
+        static bool bindFollowerOutputs(DeviceGraphOrchestrator &runner, ForwardExecutionRole role, size_t rows)
+        {
+            auto *full = runner.state_.logits.get();
+            auto *local = runner.state_.logits_local.get();
+            return runner.bindAllPositionLogitsOutputs(role, rows, full, local) && !full && !local;
+        }
+
+        /** @brief A follower's main condition must not require a shifted predictor or archive. */
+        static bool bindFollowerCondition(DeviceGraphOrchestrator &runner, ForwardStateTransaction transaction)
+        {
+            ForwardInput input;
+            input.device = runner.state_.device_id;
+            input.seq_len = input.batch_size = 1;
+            input.execution_role = ForwardExecutionRole::MTPCondition;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.state_transaction = transaction;
+            return runner.bindShiftedMTPPrefillTransaction(input, 1) &&
+                runner.bindMTPMainTerminalHiddenTransaction(input, 1) &&
+                !input.shifted_mtp_prefill && !input.mtp_main_terminal_hidden;
+        }
+
         /** @brief Bind one real backend and preallocate its production event. */
         static bool initialize(DeviceGraphOrchestrator &runner, DeviceId device)
         {
             runner.state_.device_id = device;
-            return runner.initializeShiftedMTPKVReadyEvent();
+            return runner.initializeShiftedMTPKVReadyEvent() &&
+                   runner.initializeMTPPrefillTerminalArchiveReadyEvent();
         }
 
         /** @brief Publish the exact sidecar stream after its captured read. */
@@ -59,6 +190,19 @@ namespace llaminar2
         static bool publicationRetained(const DeviceGraphOrchestrator &runner)
         {
             return runner.shifted_mtp_kv_ready_.valid;
+        }
+
+        /** @brief Borrow the production metadata edge without retiring its owner. */
+        static bool observeMetadata(const DeviceGraphOrchestrator &runner, void *stream)
+        {
+            return runner.waitForPendingShiftedMTPKVReadyForObservation(
+                stream, "shifted_row_device_outcome_metadata");
+        }
+
+        /** @brief Enter the real mailbox-writer boundary on a different stream. */
+        static bool prepareMailbox(DeviceGraphOrchestrator &runner, void *stream)
+        {
+            return runner.beginMTPTerminalHiddenMailboxWrite(stream, "metadata_then_mailbox_test");
         }
 
         /** @brief Bind one canonical arena slot and its preallocated producer event. */
@@ -110,6 +254,12 @@ namespace llaminar2
 
     namespace test
     {
+        /** @brief Two distinct production consumers of a retained sidecar read. */
+        enum class MTPReadRetirementBoundary
+        {
+            MainForward, ///< A main graph borrows without taking the sidecar handoff.
+            MetadataThenMailbox, ///< Metadata borrows; the actual mailbox writer consumes.
+        };
         /**
          * @brief Forced publication must retire the preceding forward before reuse.
          * @param context Exact current worker, also owning the control-token stream.
@@ -196,18 +346,20 @@ namespace llaminar2
          * @param context Current worker owning the exact streams and graph handles.
          * @param backend Same-device backend used for test storage and timeline gate.
          * @param device Complete backend/ordinal identity, never inferred from rank.
+         * @param boundary Actual production consumer sequence exercised by this proof.
          *
          * Storage is tested in native bytes, so the lifetime invariant is independent
          * of expert format or activation precision. Twenty retained replays check
          * actual bytes, nonblocking submission, and non-consuming event ownership.
          */
         inline void proveMTPMainForwardReadRetirement(
-            IWorkerGPUContext &context, IBackend &backend, DeviceId device)
+            IWorkerGPUContext &context, IBackend &backend, DeviceId device,
+            MTPReadRetirementBoundary boundary = MTPReadRetirementBoundary::MainForward)
         {
             constexpr std::size_t bytes = 4096;
             const int ordinal = context.deviceOrdinal();
             ASSERT_TRUE(backend.supportsStreamTimelineSignal64(ordinal));
-            std::array<void *, 2> streams{};
+            std::array<void *, 3> streams{};
             std::array<void *, 2> events{};
             std::array<std::unique_ptr<IGPUGraphCapture>, 3> graphs;
             std::unique_ptr<DeviceGraphOrchestrator> runner;
@@ -292,11 +444,25 @@ namespace llaminar2
                     streams[1], control->deviceAlias(device), round, ordinal));
                 ASSERT_TRUE(graphs[1]->launch());
                 ASSERT_TRUE(Peer::publishRead(*runner, streams[1]));
-                if (round == 1)
-                    EXPECT_THROW(Peer::prepareMain(*runner, nullptr, device, roles[0]),
-                                 std::runtime_error);
-                ASSERT_TRUE(Peer::prepareMain(*runner, streams[0], device, roles[(round - 1) % roles.size()]));
-                EXPECT_TRUE(Peer::publicationRetained(*runner));
+                if (boundary == MTPReadRetirementBoundary::MetadataThenMailbox)
+                {
+                    // Repeated metadata readers join a third stream. That wait
+                    // cannot protect the writer on stream 0 unless the original
+                    // publication remains available for its own acquire.
+                    ASSERT_TRUE(Peer::observeMetadata(*runner, streams[2]));
+                    ASSERT_TRUE(Peer::observeMetadata(*runner, streams[2]));
+                    EXPECT_TRUE(Peer::publicationRetained(*runner));
+                    ASSERT_TRUE(Peer::prepareMailbox(*runner, streams[0]));
+                    EXPECT_FALSE(Peer::publicationRetained(*runner));
+                }
+                else
+                {
+                    if (round == 1)
+                        EXPECT_THROW(Peer::prepareMain(*runner, nullptr, device, roles[0]),
+                                     std::runtime_error);
+                    ASSERT_TRUE(Peer::prepareMain(*runner, streams[0], device, roles[(round - 1) % roles.size()]));
+                    EXPECT_TRUE(Peer::publicationRetained(*runner));
+                }
                 ASSERT_TRUE(graphs[2]->launch());
                 ASSERT_TRUE(context.recordEventChecked(events[1], streams[0]));
                 // Give an incorrectly unordered overwrite time to finish. The

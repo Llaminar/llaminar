@@ -3,6 +3,8 @@
  * @brief Single-source inventory of captured ordinary-prefill row buckets.
  *
  * The runtime graph cache and offline dispatch trainers both consume this file.
+ * Serving selects its default bounded prefix through PrefillGraphBucketDefaults;
+ * trainers retain this complete inventory, including explicit larger shapes.
  * Keep one `LLAMINAR_PREFILL_GRAPH_BUCKET` invocation per physical graph bucket;
  * long prompts are chunked through these captures and therefore do not create
  * larger kernel-dispatch buckets.

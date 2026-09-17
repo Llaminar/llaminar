@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
@@ -55,6 +56,12 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#endif
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#endif
 
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -77,6 +84,13 @@
 
 namespace llaminar2::test
 {
+    /**
+     * @brief Captured compact/collective transfers reuse one slot across all formats.
+     * @param device Real CUDA or ROCm device under test.
+     * @param stream Exact non-default setup/capture stream.
+     */
+    void runMixedFormatExpertTransferPublication(DeviceId device, void *stream);
+
     namespace native_vnni_transfer_parity_detail
     {
         /**
@@ -969,6 +983,10 @@ namespace llaminar2::test
                     .n = kDModel,
                     .ldc = kDModel,
                 }}};
+                using PartialStorage = llaminar2::test::NativeVNNITestPartialStorage;
+                PartialStorage grouped_partials(std::max(
+                    PartialStorage::bundleFloats(gate_up.data(), gate_up.size(), rows),
+                    PartialStorage::bundleFloats(down.data(), down.size(), rows)));
                 ASSERT_TRUE(
                     CpuKernel::
                         execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
@@ -982,7 +1000,7 @@ namespace llaminar2::test
                             kIntermediate,
                             activation_blocks_per_row,
                             down.data(),
-                            static_cast<int>(down.size())));
+                            static_cast<int>(down.size()), grouped_partials.span()));
 
                 /*
                  * Keep an independent M=1 oracle beside the layer-global CPU
@@ -1005,11 +1023,11 @@ namespace llaminar2::test
                     cpu::native_vnni::gemv_native_vnni_preq(
                         cpu_kernels[0]->packedWeights(),
                         hidden_q8.data() + hidden_offset,
-                        cpu_serial_gate.data() + intermediate_offset);
+                        cpu_serial_gate.data() + intermediate_offset, llaminar2::test::NativeVNNITestPartialStorage(cpu_kernels[0]->packedWeights(), 1).span());
                     cpu::native_vnni::gemv_native_vnni_preq(
                         cpu_kernels[1]->packedWeights(),
                         hidden_q8.data() + hidden_offset,
-                        cpu_serial_up.data() + intermediate_offset);
+                        cpu_serial_up.data() + intermediate_offset, llaminar2::test::NativeVNNITestPartialStorage(cpu_kernels[1]->packedWeights(), 1).span());
                     primitives::compute_swiglu_gpu_aligned_expert_serial(
                         cpu_serial_gate.data() + intermediate_offset,
                         cpu_serial_up.data() + intermediate_offset,
@@ -1025,7 +1043,7 @@ namespace llaminar2::test
                     cpu::native_vnni::gemv_native_vnni_preq(
                         cpu_kernels[2]->packedWeights(),
                         cpu_serial_activation_q8.data() + activation_offset,
-                        cpu_serial_output.data() + output_offset);
+                        cpu_serial_output.data() + output_offset, llaminar2::test::NativeVNNITestPartialStorage(cpu_kernels[2]->packedWeights(), 1).span());
                 }
                 expectByteEqual(
                     std::string(backend_label) + " " + format.label +
@@ -1061,7 +1079,7 @@ namespace llaminar2::test
                     demoted_gate_up.data(), static_cast<int>(demoted_gate_up.size()),
                     kDModel, cpu_gate.data(), cpu_up.data(), cpu_activation_q8.data(),
                     rows, kIntermediate, activation_blocks_per_row,
-                    demoted_down.data(), static_cast<int>(demoted_down.size())));
+                    demoted_down.data(), static_cast<int>(demoted_down.size()), grouped_partials.span()));
                 expectByteEqual(
                     std::string(backend_label) + " " + format.label +
                         " GPU-demoted CPU gate vs initial CPU M=" + std::to_string(rows),

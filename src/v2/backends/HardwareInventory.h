@@ -17,6 +17,7 @@
 #pragma once
 
 #include "CPUSocketInfo.h"
+#include "CPUExecutionGeometry.h"
 #include "ComputeBackend.h"
 #include <string>
 #include <vector>
@@ -54,6 +55,8 @@ namespace llaminar2
         // =====================================================================
 
         std::vector<CPUSocketInfo> cpu_sockets; ///< Per-socket CPU info (sorted by socket_id)
+        CPUExecutionGeometry cpu_execution; ///< Policy observed by this CPU execution process.
+        std::map<int, size_t> cpu_last_level_cache_bytes; ///< Socket ID -> observed distinct LLC domain sum; absent/zero is unknown.
 
         /// Total physical cores across all sockets
         int total_physical_cores() const
@@ -72,6 +75,14 @@ namespace llaminar2
                 n += s.num_threads();
             return n;
         }
+
+        /**
+         * @brief Project one CPU endpoint from this observation without rediscovery.
+         * @param numa_node Exact NUMA locality, or -1 for whole-host ownership.
+         * @return CPU device with observed capacity, thread count and model name.
+         * @throws std::invalid_argument for absent locality or malformed capacity.
+         */
+        ComputeDevice cpuDevice(int numa_node = -1) const;
 
         /// Total CPU memory across all NUMA nodes (bytes)
         size_t total_cpu_memory() const

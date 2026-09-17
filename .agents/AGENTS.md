@@ -222,9 +222,9 @@ single-source.
   analysis, and ROCm kernel tuning.
 - `.agents/mtp-tuning/SKILL.md`: speculative decode, prefix-cache interaction,
   verifier parity, grouped MTP economics, and depth-controller work.
-- `.agents/model-parity-testing/SKILL.md`: real-weight production campaign
-  execution, PyTorch/Hugging Face reference packs, CSV-led diagnosis, matrix
-  extension, and the aggregate correctness/economy gate.
+- `.agents/llaminar-testing/SKILL.md`: Unit and production-preflight gates,
+  generation regressions, real-weight HF/CSV diagnostics, canonical matrix
+  extension, HTTP/remote-MPI E2E, and image/benchmark certification.
 - `.agents/nativevnni-gemm-tuning/SKILL.md`: cross-backend NativeVNNI
   GEMV/GEMM candidate tuning, evidence collection, dispatch installation, and
   corpus certification.
@@ -247,9 +247,10 @@ documentation.
 | Build types, options, and targets | `src/v2/CMakeLists.txt` |
 | CLI flags and help | `src/v2/config/CliSpec.*`, `OrchestrationConfigParser.*` |
 | CLI conflict rules | `src/v2/config/ConfigValidator.*` |
+| Lossless config documents and startup publication | `src/v2/config/OrchestrationConfigDocument.*`, `OrchestrationStartupPolicy.*` |
 | Runtime environment variables | `src/v2/utils/DebugEnv.h` |
 | Test names, labels, and registration | `tests/v2/CMakeLists.txt` |
-| Parity workflow | `.agents/model-parity-testing/SKILL.md`, `tests/v2/integration/parity/README.md`, and CMake registration |
+| Testing workflow | `.agents/llaminar-testing/SKILL.md`, `tests/v2/integration/parity/README.md`, `docs/production-ci.md`, and CMake registration |
 | Backend tuning procedure | `.agents/*-tuning/SKILL.md` |
 
 Files under `docs/v2/projects/` are dated plans, investigations, and handoffs.
@@ -316,6 +317,11 @@ second runtime search. Select the compatible library explicitly when configuring
 a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
 
+Full-backend binaries also run on CPU-only cluster members. Keep CUDA Driver
+API binding in `CUDADriverApi`, prepared before CUDA graph recording; do not
+restore a public `CUDA::cuda_driver` dependency or inject toolkit stubs into
+test discovery. Native CUDA execution still requires the real host driver.
+
 ```bash
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 
@@ -379,10 +385,45 @@ Device selection forms and their mutual exclusions evolve with the topology
 planner. Use `--help`, `ConfigValidator`, `--validate-only`, `--dry-run`, and
 `--explain-placement` rather than relying on a copied flag matrix.
 
+`plan` and `serve` share the complete runtime parser. Plan adds only checked
+output options; never restore a private MTP, KV, strategy or economy table.
+Pass the same inference policy into planning, then consume its apply document
+without replaying automatic-search constraints. Command discovery must retain
+that request's backend intent and MPI geometry. Automatic search runs only on
+discovery root through `AutomaticPlanningStartup`; every discovery rank first
+participates in evidence preparation using the context-owned immutable inventory.
+The shared transaction publishes one complete apply document before rank
+admission. Runner factories are apply-only; never
+move automatic selection into a factory or independently repeat it on followers.
+
 Production model activations currently support FP32 only. Other activation
 precision requests fail as unimplemented. KV-cache precision and expert weight
 formats are independent settings; their support does not imply support for
 another model activation dtype.
+
+Compact `--expert-tier 'name=devices;priority=N'` declarations adapt into the
+existing domain/tier types. Keep their default role selection in shared config
+normalization and their physical capacity in `PhysicalMemoryAuthority`, never
+in the CLI. `--hostfile` and `--mpi-hostfile` name the same MPI cluster intent;
+MPI owns hostfile slot admission, and each rank supplies its own hardware and
+worker geometry. Launcher-local CPU indices or widths must not cross that
+cluster boundary. A node-local transport remains node-local with a hostfile.
+Saved execution selection retains discovery-rank order and the discovery
+process count. Apply it through `MPIContextFactory::selectRanks` before runner
+construction; never interpret execution device maps using discovery rank IDs,
+or narrow the saved discovery launch from its selected inference endpoints.
+
+Automatic selection normally permits a physical-host subset. `--auto-hosts all`
+requires a compute participant on every discovered host, without requiring every
+MPI rank or assigning launcher-local device IDs to peers. The canonical remote
+E2E projection supplies this hard constraint; model execution evidence must still
+prove work on every remote CPU participant.
+
+Automatic ranking uses the shared `OrchestrationPlanningWorkload` policy.
+`--plan-workload <prefill,generation>` and YAML `planning.workload` specify
+expected positive token counts within context capacity; they do not constrain
+inference output. Do not substitute KV capacity or a frontend-local horizon
+for this objective. Applied plans contain placement, not another search policy.
 
 MTP hardware defaults are selected once by `ExecutionPlanBuilder` from the
 complete continuation domain and canonical device inventory. Their numeric
@@ -451,7 +492,12 @@ E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
 The full shippable-image gate is `scripts/ci/run_production_pipeline.py`:
 independent AVX512 and AVX2 full CPU/CUDA/ROCm Docker builds, each running the
-canonical Unit/preflight/model-parity driver and all E2E-tagged cells. Both full
+canonical Unit/preflight gate, reviewed HTTP token regressions (MTP off and
+dynamic depth only), and all E2E-tagged cells. Mathematical HF parity is explicit
+diagnosis via `--diagnostic-mathematical-parity`, never a routine CI dependency.
+Prompts, seeds and cell/control mappings are canonical source definitions;
+expected token payloads are versioned in `Llaminar/corpora` and source-pinned.
+Never update expected tokens automatically. Both full
 E2E server suites must pass before either ISA's benchmarks run. Only complete
 per-image evidence may attach a certificate; official publication requires
 both images. Explicit one-off diagnostic benchmarks cannot certify images.
@@ -460,6 +506,12 @@ high-water proposal; local
 runs never commit or publish implicitly. See `docs/production-ci.md`. Do not
 add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
+
+For an isolated model-free gate, `scripts/ci/run_production_prerequisites.py`
+delegates to the same complete Unit/preflight authority and preserves its
+receipt, CTest logs and JUnit evidence. An installed-builder receipt replaces
+build preparation only; it never skips tests or independently certifies an
+image. See `docs/production-ci.md` for the local and installed-image invocation.
 
 Naming conventions:
 
@@ -489,9 +541,12 @@ gate are:
 - `src/v2/execution/debug/AsyncStageDumper.h`
 - `tests/v2/integration/execution/debug/Test__StageDumpIntegrity.cpp`
 
-For model parity, use `.agents/model-parity-testing/SKILL.md`, then read
+Use `.agents/llaminar-testing/SKILL.md` for the testing workflow. For model parity, read
 `tests/v2/integration/parity/README.md` and discover the exact registered
-production campaigns. The aggregate campaign system replaces the historical
+diagnostic campaigns. On token drift or suspected accuracy errors, select the
+matching HF cell and use its CSVs to find the first divergent stage; do not
+launch the full mathematical matrix routinely or rebaseline the failing stream.
+The aggregate campaign system replaces the historical
 hand-picked PyTorch parity baseline: it keeps reference generation, live-path
 execution, every checkpoint comparison, CSV evidence, and the shared economy
 target in one registered matrix. Before model admission, a build must pass the

@@ -1,6 +1,10 @@
 /**
  * @file Test__Q3_KTensor_Views.cpp
  * @brief Unit tests for Q3_KTensor row-slice view support
+ *
+ * Dense and routed parents must expose the same source-native 2-D view ABI.
+ * These device-free tests check byte offsets, nested-view ownership and hostile
+ * ranges without using GEMM as a proxy for a correct storage descriptor.
  * @author David Sanftenberg
  */
 
@@ -8,13 +12,15 @@
 #include "tensors/Tensors.h"
 #include <memory>
 #include <cmath>
+#include <cstring>
+#include <limits>
 
 using namespace llaminar2;
 
 namespace
 {
 
-    // Helper to create a test Q3_K tensor with unique values
+    /** @return A small native matrix with a distinct pattern in every source block. */
     std::shared_ptr<Q3_KTensor> createTestTensor(size_t rows, size_t cols)
     {
         // Fill with unique block values for verification
@@ -214,9 +220,7 @@ TEST(Test__Q3_KTensor, SuperBlockAlignment)
     EXPECT_EQ(expected_blocks_per_row, 2);
 }
 
-// --- 3D Parent → 2D View regression tests ---
-// NOTE: Q3_KTensor::create_view does not yet support 3D parents.
-// These tests verify the rejection and will be updated when 3D support is added.
+// A GGUF expert parent keeps [K,N,experts] order, not ordinary [N,K].
 
 TEST(Test__Q3_KTensor, View3DParentBasicSlice)
 {
@@ -227,10 +231,10 @@ TEST(Test__Q3_KTensor, View3DParentBasicSlice)
     std::vector<uint8_t> raw(total_blocks * sizeof(Q3_KBlock));
     auto tensor_3d = std::make_shared<Q3_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q3_K doesn't support 3D parents yet - should throw
-    EXPECT_THROW(
-        tensor_3d->create_view({R, K}, 0),
-        std::invalid_argument);
+    auto view = tensor_3d->create_view({R, K}, 0);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape(), (std::vector<size_t>{R, K}));
+    EXPECT_EQ(view->raw_data(), tensor_3d->raw_data());
 }
 
 TEST(Test__Q3_KTensor, View3DParentWithOffset)
@@ -239,12 +243,19 @@ TEST(Test__Q3_KTensor, View3DParentWithOffset)
     const size_t blocks_per_row = K / 256;
     const size_t total_blocks = N * R * blocks_per_row;
     std::vector<uint8_t> raw(total_blocks * sizeof(Q3_KBlock));
+    for (size_t byte = 0; byte != raw.size(); ++byte) raw[byte] = static_cast<uint8_t>(byte * 37 + byte / 257);
     auto tensor_3d = std::make_shared<Q3_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q3_K doesn't support 3D parents yet - should throw
-    EXPECT_THROW(
-        tensor_3d->create_view({R, K}, 2 * R * K),
-        std::invalid_argument);
+    auto view = tensor_3d->create_view({R, K}, 2 * R * K);
+    auto nested = view->create_view({3, K}, 2 * K);
+    std::weak_ptr<TensorBase> lifetime = tensor_3d;
+    tensor_3d.reset();
+    view.reset();
+    EXPECT_FALSE(lifetime.expired());
+    const size_t byte_offset = (2 * R + 2) * blocks_per_row * sizeof(Q3_KBlock);
+    EXPECT_EQ(std::memcmp(nested->raw_data(), raw.data() + byte_offset, 3 * blocks_per_row * sizeof(Q3_KBlock)), 0);
+    nested.reset();
+    EXPECT_TRUE(lifetime.expired());
 }
 
 TEST(Test__Q3_KTensor, View3DParentBoundsCheck)
@@ -255,8 +266,12 @@ TEST(Test__Q3_KTensor, View3DParentBoundsCheck)
     std::vector<uint8_t> raw(total_blocks * sizeof(Q3_KBlock));
     auto tensor_3d = std::make_shared<Q3_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q3_K doesn't support 3D parents yet - should throw
     EXPECT_THROW(
         tensor_3d->create_view({R, K}, (N * R - R + 1) * K),
-        std::invalid_argument);
+        std::out_of_range);
+    EXPECT_THROW(tensor_3d->create_view({std::numeric_limits<size_t>::max(), K}, K), std::out_of_range);
+    EXPECT_THROW(tensor_3d->create_view({R, K}, std::numeric_limits<size_t>::max() / K * K), std::out_of_range);
+    EXPECT_THROW(tensor_3d->create_view({R, K}, 1), std::invalid_argument);
+    EXPECT_THROW(tensor_3d->create_view({R, 256}, 0), std::invalid_argument);
+    EXPECT_THROW(tensor_3d->create_view({0, K}, 0), std::invalid_argument);
 }

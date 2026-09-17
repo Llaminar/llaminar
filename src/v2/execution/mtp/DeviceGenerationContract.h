@@ -11,9 +11,12 @@
 #pragma once
 
 #include "kernels/common/SamplingMath.h"
+#include "execution/mtp/GenerationRequestSeeds.h"
+#include "utils/Sampler.h"
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <optional>
 
 namespace llaminar2
 {
@@ -32,11 +35,31 @@ struct DeviceGenerationAdmissionRequest
         sampling_math::DeviceGenerationPolicy::fixed(0); ///< Explicit algorithm and depth policy.
     sampling_math::DeviceGenerationLeadingRowDisposition initial_leading_row_disposition =
         sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+    /** Resident seeded sampling binding; absent for a consumer with no seed input. */
+    std::optional<GenerationRequestSeeds> sampling_seeds;
+    /**
+     * Complete ordinary request sampling law. Absent on a speculative
+     * transaction, whose retained sampler graph already owns that law.
+     * Seeds are bound separately so a random request seed is resolved exactly
+     * once at admission, never during capture or individual token production.
+     */
+    std::optional<SamplingParams> ordinary_sampling;
 
     /** @return Whether every immutable admission field is implemented and valid. */
     [[nodiscard]] bool valid() const noexcept
     {
-        return request_count > 0 && sampling_math::valid_device_generation_admission(
+        return request_count > 0 &&
+            (!ordinary_sampling || (depth_policy.isOrdinary() &&
+                std::isfinite(ordinary_sampling->temperature) && ordinary_sampling->temperature >= 0 &&
+                std::isfinite(ordinary_sampling->top_p) && ordinary_sampling->top_p > 0 && ordinary_sampling->top_p <= 1 &&
+                std::isfinite(ordinary_sampling->presence_penalty) &&
+                std::isfinite(ordinary_sampling->frequency_penalty) &&
+                (ordinary_sampling->is_greedy() || (sampling_seeds &&
+                    ordinary_sampling->top_k > 0 && ordinary_sampling->top_k <= sampling_math::kMaxTopK)) &&
+                (ordinary_sampling->dry_multiplier == 0 || ordinary_sampling->dry_penalty_last_n == 0))) &&
+            (!sampling_seeds || (!depth_policy.isForwardOnly() &&
+                sampling_seeds->values().size() == static_cast<std::size_t>(request_count))) &&
+            sampling_math::valid_device_generation_admission(
             depth_policy, max_new_tokens, initial_leading_row_disposition);
     }
 };

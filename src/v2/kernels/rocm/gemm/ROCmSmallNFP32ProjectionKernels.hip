@@ -1,11 +1,13 @@
 /**
  * @file ROCmSmallNFP32ProjectionKernels.hip
- * @brief Graph-capturable fixed-order small/output floating verifier projections.
+ * @brief Graph-capturable fixed-order floating verifier and replicated-head projections.
  *
  * These kernels back MTP verifier publication for floating-point GDN-style
  * projections. They keep M=1 serial decode and runtime grouped verifier rows
  * on the same explicit HIP stream and the same reduction tree, avoiding
  * hipBLAS shape-dependent accumulation changes in publication-sensitive state.
+ * Each output column has the same 256-lane K reduction regardless of physical
+ * output width, so narrow shards and a mirrored full vocabulary remain exact.
  */
 
 #include <hip/hip_runtime.h>
@@ -21,7 +23,6 @@ namespace
 {
     constexpr int SMALL_N_FP32_BLOCK = 256;
     constexpr int SMALL_N_FP32_MAX_BATCH = 8;
-    constexpr int SMALL_N_FP32_MAX_N = 64;
 
     struct Fp32BatchedProjectionPointers
     {
@@ -389,6 +390,12 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
     return complete_kernel_launch(hip_stream, "rocmFp32_stage_batched_projection_pointers");
 }
 
+/**
+ * @brief Launch fixed-column FP32 reductions at any positive output width.
+ *
+ * N indexes independent blocks; it never changes shared storage or the K tree.
+ * The former N<=64 restriction described a caller, not a kernel limitation.
+ */
 extern "C" bool rocmFp32_small_n_batched_projection(
     const float *const *d_A_array,
     const float *const *d_B_array,
@@ -406,7 +413,7 @@ extern "C" bool rocmFp32_small_n_batched_projection(
     const auto rows = row_range ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
     if (!d_A_array || !d_B_array || !d_C_array ||
         M <= 0 ||
-        N <= 0 || N > SMALL_N_FP32_MAX_N ||
+        N <= 0 ||
         K <= 0 ||
         batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
         !stream)

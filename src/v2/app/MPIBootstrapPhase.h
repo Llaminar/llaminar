@@ -107,6 +107,32 @@ namespace llaminar2
             const DeviceManager &dm,
             const CPUTopology &cpu_topology);
 
+        /**
+         * @brief Launch discovery without narrowing it to selected inference endpoints.
+         * @param config Hostfile or saved membership, rank-count and diagnostic intent.
+         * @return Slot-driven MPI launch; workers resolve affinity on each host.
+         * @throws std::invalid_argument without discovery intent or a saved local launch size.
+         */
+        static MPILaunchConfig discoveryLaunchConfig(const OrchestrationConfig &config);
+
+        /**
+         * @brief Size a hostfile-launched rank's worker team from actual affinity.
+         * @param config User thread override, otherwise discovered physical cores.
+         * @throws std::runtime_error when physical rank affinity is unavailable.
+         */
+        static void configureClusterRankThreads(const OrchestrationConfig &config);
+
+        /**
+         * @brief Apply an explicit thread request before canonical inventory publication.
+         * @param config Parsed plan/serve request; an absent override retains bootstrap's team.
+         * @throws std::runtime_error if the requested environment cannot be published.
+         *
+         * This does not rediscover cores or change affinity. Both frontends use
+         * the same fixed OpenMP budget; inventory observes it separately from
+         * physical capacity and workspace admission consumes that observation.
+         */
+        static void configureRequestedCPUThreads(const OrchestrationConfig &config);
+
         /** @brief Print the already initialized device inventory for diagnostics. */
         static void listDevices();
     };

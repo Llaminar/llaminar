@@ -4,6 +4,8 @@
  *
  * This file is compiled ONLY when HAVE_ROCM is defined, ensuring no CUDA header conflicts.
  * Compiled with hipcc to enable HIP runtime.
+ * Preserve driver UUIDs instead of using rank-local ordinals as physical
+ * identity: several ranks may legitimately observe the same accelerator.
  *
  * @author David Sanftenberg
  */
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
+#include "DeviceUUID.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -24,6 +27,7 @@ namespace llaminar2
     namespace rocm_enumeration
     {
 
+        /** @return Observed devices with immutable UUIDs and current capacities. */
         std::vector<ComputeDevice> enumerate_rocm_devices()
         {
             std::vector<ComputeDevice> devices;
@@ -81,7 +85,9 @@ namespace llaminar2
                 ComputeDevice dev;
                 dev.type = ComputeBackendType::GPU_ROCM;
                 dev.device_id = i;
+                dev.uuid = formatDeviceUUID(prop.uuid.bytes);
                 dev.compute_units = prop.multiProcessorCount;
+                dev.last_level_cache_bytes = prop.l2CacheSize > 0 ? static_cast<size_t>(prop.l2CacheSize) : 0;
                 dev.total_memory_bytes = prop.totalGlobalMem;
 
                 // Parse gcnArchName for architecture info
@@ -187,6 +193,7 @@ namespace llaminar2
             return devices;
         }
 
+        /** @return Observed PCIe NUMA affinity, or -1 when sysfs has no locality. */
         int get_rocm_device_numa_node(int device_id)
         {
             hipDeviceProp_t prop;
@@ -216,6 +223,7 @@ namespace llaminar2
             return numa_node;
         }
 
+        /** @return Directed driver P2P edges in the supplied ordinal order. */
         P2PMatrix query_p2p_matrix(const std::vector<ComputeDevice> &devices)
         {
             P2PMatrix matrix;

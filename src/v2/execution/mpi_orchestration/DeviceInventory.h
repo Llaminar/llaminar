@@ -17,11 +17,16 @@
  * 4. PlacementStrategy uses ClusterInventory to compute placement
  * 5. Each rank extracts its portion of the placement plan
  *
+ * Rank records describe visibility, not exclusive physical ownership. Node
+ * summaries union observed UUIDs and NUMA resources; they are immutable
+ * discovery facts, never a second live allocation/admission ledger.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #pragma once
+#include "backends/CPUExecutionGeometry.h"
 
 #include "../../backends/DeviceType.h"
 #include "../../backends/CPUSocketInfo.h"
@@ -29,9 +34,48 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <stdexcept>
 
 namespace llaminar2
 {
+
+    /** @brief Physical membership, independent of link speed and transport choice. */
+    enum class RankConnectionLocality { SameRank, SameNode, CrossNode };
+
+    /**
+     * @brief Immutable endpoint membership projected from one cluster inventory.
+     *
+     * Rank and node ordinals belong to that inventory's communicator namespace.
+     * Node identity is not an OS socket/NUMA index or hostname. Measurements can
+     * attach costs to this value but cannot change its physical classification.
+     */
+    class RankConnectionTopology final
+    {
+    public:
+        /** @return First endpoint's rank in the owning inventory. */
+        int sourceRank() const noexcept { return source_rank_; }
+        /** @return Second endpoint's rank in the owning inventory. */
+        int destinationRank() const noexcept { return destination_rank_; }
+        /** @return First endpoint's physical-node membership label. */
+        int sourceNode() const noexcept { return source_node_; }
+        /** @return Second endpoint's physical-node membership label. */
+        int destinationNode() const noexcept { return destination_node_; }
+        /** @return Classification derived only from authenticated rank/node identity. */
+        RankConnectionLocality locality() const noexcept
+        {
+            if (source_rank_ == destination_rank_) return RankConnectionLocality::SameRank;
+            return source_node_ == destination_node_ ? RankConnectionLocality::SameNode : RankConnectionLocality::CrossNode;
+        }
+        bool operator==(const RankConnectionTopology &) const = default;
+
+    private:
+        friend struct ClusterInventory;
+        /** @brief Only a validated inventory lookup may bind endpoint membership. */
+        RankConnectionTopology(int source_rank, int destination_rank, int source_node, int destination_node)
+            : source_rank_(source_rank), destination_rank_(destination_rank),
+              source_node_(source_node), destination_node_(destination_node) {}
+        int source_rank_, destination_rank_, source_node_, destination_node_;
+    };
 
     /**
      * @brief Convert DeviceType to string
@@ -95,6 +139,8 @@ namespace llaminar2
         double pcie_max_speed_gts = 0; ///< Max capable speed in GT/s (endpoint)
         bool pcie_degraded = false;    ///< True if running below max capability
         std::string pcie_bottleneck_bdf; ///< BDF of upstream bridge causing bottleneck (empty if none)
+        /** Observed device-wide last-level cache; required to authenticate streaming memory samples. */
+        size_t last_level_cache_bytes = 0;
 
         /// Check if this is a GPU (any type)
         bool isGPU() const
@@ -124,6 +170,7 @@ namespace llaminar2
      */
     struct RankInventory
     {
+        CPUExecutionGeometry cpu_execution; ///< Exact local CPU policy, never reconstructed on root.
         int rank = -1;        ///< MPI rank ID
         int node_id = -1;     ///< Physical node ID (ranks on same node share this)
         int local_rank = -1;  ///< Rank within node (0..ranks_per_node-1)
@@ -131,10 +178,26 @@ namespace llaminar2
 
         // CPU info
         DeviceInfo cpu;              ///< Host CPU capabilities
-        int cpu_cores = 0;           ///< Total CPU cores
+        int cpu_cores = 0;           ///< Physical cores in the observed CPU locality, not a worker budget.
+        int cpu_worker_threads = 0;  ///< Observed OpenMP team budget; zero means no execution observation.
         int cpu_sockets = 0;         ///< CPU sockets
         int numa_nodes = 0;          ///< NUMA nodes
         size_t cpu_memory_bytes = 0; ///< System RAM
+
+        /**
+         * @return Exact rank-local execution budget published after startup thread policy.
+         * @throws std::invalid_argument when only physical hardware was observed.
+         *
+         * Physical cores are topology, not permission to silently enlarge a
+         * requested team. Workspace admission and measured service must consume
+         * this same budget, including explicit one-thread and remote-rank cases.
+         */
+        int cpuWorkerThreads() const
+        {
+            if (cpu_worker_threads <= 0)
+                throw std::invalid_argument("Rank inventory has no positive CPU worker observation");
+            return cpu_worker_threads;
+        }
 
         // GPU/accelerator info
         std::vector<DeviceInfo> gpus; ///< GPU devices accessible to this rank
@@ -225,6 +288,17 @@ namespace llaminar2
         /// Check if any rank has GPU
         bool hasAnyGPU() const { return total_gpus > 0; }
 
+        /**
+         * @brief Resolve physical membership without discovery or measurements.
+         * @throws std::invalid_argument for absent ranks or malformed membership.
+         *
+         * Hostname aliases, NUMA IDs, rank adjacency and observed link latency
+         * never establish locality. Consumers of a selected execution inventory
+         * pass execution ranks; discovery observations use discovery ranks.
+         * A missing record is an error, not a local or remote default.
+         */
+        RankConnectionTopology connectionBetweenRanks(int source, int destination) const;
+
         /// Get rank inventory by rank ID
         const RankInventory &getRank(int rank) const
         {
@@ -247,51 +321,22 @@ namespace llaminar2
             return nodes[node_id];
         }
 
-        /// Build node aggregations from rank inventories
-        void buildNodeAggregations()
-        {
-            // Find unique node IDs
-            int max_node = 0;
-            for (const auto &r : ranks)
-            {
-                if (r.node_id > max_node)
-                    max_node = r.node_id;
-            }
-            node_count = max_node + 1;
-            nodes.resize(node_count);
-
-            // Initialize nodes
-            for (int n = 0; n < node_count; ++n)
-            {
-                nodes[n].node_id = n;
-            }
-
-            // Aggregate per node
-            for (const auto &r : ranks)
-            {
-                if (r.node_id < 0 || r.node_id >= node_count)
-                    continue;
-
-                auto &node = nodes[r.node_id];
-                node.hostname = r.hostname;
-                node.ranks.push_back(r.rank);
-                node.total_gpus += r.gpuCount();
-                node.total_gpu_memory += r.totalGPUMemory();
-                node.total_cpu_memory += r.cpu_memory_bytes;
-                node.total_cpu_cores += r.cpu_cores;
-            }
-
-            // Update cluster totals
-            total_gpus = 0;
-            total_gpu_memory = 0;
-            total_cpu_memory = 0;
-            for (const auto &node : nodes)
-            {
-                total_gpus += node.total_gpus;
-                total_gpu_memory += node.total_gpu_memory;
-                total_cpu_memory += node.total_cpu_memory;
-            }
-        }
+        /**
+         * @brief Rebuild physical summaries without counting overlapping views.
+         *
+         * UUIDs identify GPUs within one physical node even when visibility
+         * filters change their process-local ordinals. NUMA observations and
+         * physical core IDs similarly identify CPU resources. Free-memory
+         * samples may differ between observers; immutable physical capacities
+         * may not. Zero-capacity collective-only records carry membership, not
+         * an admissible physical resource.
+         *
+         * All work is staged locally and published together. A rejected record
+         * leaves the previous summary intact, and repeated calls are idempotent.
+         * @throws std::invalid_argument for ambiguous or conflicting resources.
+         * @throws std::overflow_error if a summary cannot represent its inputs.
+         */
+        void buildNodeAggregations();
 
         /// Generate human-readable summary
         std::string toString() const;

@@ -12,6 +12,7 @@
 #include "CUDANativeVNNIGemvShard.h"
 #include "CUDAGroupedVerifierLaunch.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "backends/cuda/CUDADriverApi.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -132,8 +133,8 @@ bool cudaNativeVNNIGemvTuned_fusedKpar_fp32(
     // queries are capture-safe and prove stronger, exact context ownership.
     // Nothing is downloaded, synchronized, or remembered in a shadow cache.
     if (cudaGetDevice(&current_device) != cudaSuccess || current_device != device ||
-        cuCtxGetCurrent(&current_context) != CUDA_SUCCESS || !current_context ||
-        cuStreamGetCtx(stream, &stream_context) != CUDA_SUCCESS ||
+        llaminar2::CUDADriverApi::instance().ctxGetCurrent(&current_context) != CUDA_SUCCESS || !current_context ||
+        llaminar2::CUDADriverApi::instance().streamGetCtx(stream, &stream_context) != CUDA_SUCCESS ||
         stream_context != current_context)
         return false;
     LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(

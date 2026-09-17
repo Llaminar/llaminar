@@ -504,16 +504,17 @@ namespace llaminar2
         // =======================================================================
 
         /**
-         * @brief Check if inner tensor supports INT8 unpacking
+         * @brief Delegate native unpack capability through every wrapper layer.
          */
-        bool supports_int8_unpack() const
+        bool supports_int8_unpack() const override
         {
-            return dynamic_cast<const IINT8Unpackable *>(inner()) != nullptr;
+            return IINT8Unpackable::fromTensor(inner()) != nullptr;
         }
 
+        /** @return Inner native packing metadata, or null for non-native storage. */
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 return unpackable->vnniFormatInfo();
@@ -521,17 +522,27 @@ namespace llaminar2
             return nullptr;
         }
 
+        /**
+         * @brief Forward one native block without changing source/destination coordinates.
+         * @param ctx Destination packing buffers and geometry.
+         * @param source_n Row in the inner tensor.
+         * @param destination_n Row in the packed destination.
+         * @param b Block index along K.
+         * @throws std::logic_error when the inner owner has no unpack contract.
+         */
         void packVnniBlock(
             const VnniPackContext &ctx,
             int source_n,
             int destination_n,
             int b) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 unpackable->packVnniBlock(ctx, source_n, destination_n, b);
             }
+            else
+                throw std::logic_error("Cannot pack floating-point TensorSlice as NativeVNNI");
         }
 
         /**
@@ -539,17 +550,14 @@ namespace llaminar2
          */
         void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 unpackable->unpack_block_to_int8(row_idx, k_block_offset, output);
             }
             else
             {
-                // Fallback: zero-fill if inner doesn't support INT8 unpacking
-                LOG_WARN("TensorSlice: inner tensor (type " << static_cast<int>(inner()->native_type())
-                                                            << ") does not implement IINT8Unpackable");
-                std::memset(output, 0, 32 * sizeof(int8_t)); // block_size = 32
+                throw std::logic_error("Cannot unpack floating-point TensorSlice as native INT8");
             }
         }
 
@@ -558,12 +566,12 @@ namespace llaminar2
          */
         float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 return unpackable->get_block_scale(row_idx, k_block_offset);
             }
-            return 1.0f; // Default scale
+            throw std::logic_error("Floating-point TensorSlice has no quantized block scale");
         }
 
         /**
@@ -571,12 +579,12 @@ namespace llaminar2
          */
         float get_block_min(size_t row_idx, size_t k_block_offset) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 return unpackable->get_block_min(row_idx, k_block_offset);
             }
-            return 0.0f; // Default min (symmetric)
+            throw std::logic_error("Floating-point TensorSlice has no quantized block minimum");
         }
 
         /**
@@ -584,12 +592,12 @@ namespace llaminar2
          */
         size_t superblock_size() const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 return unpackable->superblock_size();
             }
-            return 32; // Default to block size
+            throw std::logic_error("Floating-point TensorSlice has no quantized superblock");
         }
 
         /**
@@ -598,29 +606,36 @@ namespace llaminar2
         void unpack_superblock_to_int8(size_t row_idx, size_t superblock_idx,
                                        int8_t *output, float *scales, float *mins) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 unpackable->unpack_superblock_to_int8(row_idx, superblock_idx, output, scales, mins);
             }
             else
             {
-                // Fallback: use default implementation from base
-                IINT8Unpackable::unpack_superblock_to_int8(row_idx, superblock_idx, output, scales, mins);
+                throw std::logic_error("Cannot unpack floating-point TensorSlice as native INT8");
             }
         }
 
+        /**
+         * @brief Preserve the inner owner's row requantization arithmetic.
+         * @param row_idx Source row.
+         * @param K Logical row width.
+         * @param output Destination INT8 row with room for K elements.
+         * @return Inner owner's row scale.
+         * @throws std::logic_error for a non-quantized storage owner.
+         */
         float requantizeRowToInt8(
             size_t row_idx,
             size_t K,
             int8_t *output) const override
         {
-            auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
+            const auto *unpackable = IINT8Unpackable::fromTensor(inner());
             if (unpackable)
             {
                 return unpackable->requantizeRowToInt8(row_idx, K, output);
             }
-            return IINT8Unpackable::requantizeRowToInt8(row_idx, K, output);
+            throw std::logic_error("Cannot requantize TensorSlice without native INT8 unpacking");
         }
 
         // =======================================================================

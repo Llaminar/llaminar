@@ -115,14 +115,15 @@ namespace llaminar2
         /**
          * @brief Bind workspace to the underlying kernel
          *
-         * Delegates to the kernel's bindWorkspace(). Stores the workspace pointer
-         * locally for hasWorkspace() and getWorkspace() queries.
+         * Capture-bound kernels receive a persistent binding. Invocation-owned
+         * kernels remain immutable; the stage supplies its retained pointer as
+         * an execution argument. Both policies keep the stage-local lifetime.
          */
         void bindWorkspace(DeviceWorkspaceManager *workspace) override
         {
             bound_workspace_ = workspace;
             auto *consumer = getKernelAsWorkspaceConsumer();
-            if (consumer)
+            if (consumer && consumer->workspaceBindingPolicy() == WorkspaceBindingPolicy::PreparedEngine)
             {
                 consumer->bindWorkspace(workspace);
                 LOG_TRACE("[IWorkspaceConsumerStage] Bound workspace to kernel");
@@ -139,7 +140,7 @@ namespace llaminar2
         void unbindWorkspace() override
         {
             auto *consumer = getKernelAsWorkspaceConsumer();
-            if (consumer)
+            if (consumer && consumer->workspaceBindingPolicy() == WorkspaceBindingPolicy::PreparedEngine)
             {
                 consumer->unbindWorkspace();
             }
@@ -149,16 +150,16 @@ namespace llaminar2
         /**
          * @brief Check if workspace is bound
          *
-         * Returns true if both:
-         * 1. A workspace has been bound to this stage
-         * 2. The underlying kernel reports hasWorkspace() == true
+         * Returns true when this stage is bound and the kernel either consumes
+         * that invocation argument or confirms its prepared-engine binding.
          */
         bool hasWorkspace() const override
         {
             if (!bound_workspace_)
                 return false;
             auto *consumer = const_cast<IWorkspaceConsumerStage *>(this)->getKernelAsWorkspaceConsumer();
-            return consumer && consumer->hasWorkspace();
+            return consumer &&
+                (consumer->workspaceBindingPolicy() == WorkspaceBindingPolicy::Invocation || consumer->hasWorkspace());
         }
 
         /**

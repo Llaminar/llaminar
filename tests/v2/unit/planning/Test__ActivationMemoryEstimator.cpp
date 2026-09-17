@@ -171,6 +171,31 @@ TEST(Test__ActivationMemoryEstimator,
      * model probe. In particular it includes the 503,316,480-byte canonical
      * route tensor that exposed the original capacity-admission defect.
      */
-    constexpr size_t kExpectedDeclarativeArenaBytes = 2253085700ULL;
+    // The production arena additionally retains one admitted UINT64 seed.
+    constexpr size_t kExpectedDeclarativeArenaBytes = 2253085700ULL + sizeof(uint64_t);
     EXPECT_EQ(actual, kExpectedDeclarativeArenaBytes);
+}
+
+/** @test GPU request seeds use real retained row capacity, not MTP enablement or TP division. */
+TEST(Test__ActivationMemoryEstimator, GPUSeedBankUsesExactRequestCapacity)
+{
+    ModelMemoryProfile profile;
+    profile.d_model = 32;
+    profile.head_dim = 32;
+    profile.vocab_size = 64;
+    ActivationGraphMemoryGeometry geometry{
+        .batch_size = 1, .resident_graph_rows = 32, .local_d_ff = 64,
+        .local_n_heads = 1, .local_n_kv_heads = 1};
+    const auto cpu = ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu());
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const int requests : {1, 3, 8, 15})
+        {
+            geometry.generation_request_capacity = requests;
+            EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, device),
+                cpu + static_cast<size_t>(requests) * sizeof(uint64_t));
+            EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cpu()), cpu);
+        }
+    geometry.generation_request_capacity = 0;
+    EXPECT_THROW(ActivationMemoryEstimator::estimate(profile, geometry, DeviceId::cuda(0)),
+        std::invalid_argument);
 }

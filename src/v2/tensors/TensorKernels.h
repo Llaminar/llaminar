@@ -961,16 +961,18 @@ namespace llaminar2
          * @param num_descs Number of experts
          * @param m Always 1 for decode (single token)
          * @param k Input dimension (expert intermediate size)
-         * @return true if fused path executed, false to fall back to sequential
+         * @param workspace Invocation-owned scratch for all distinct expert inputs.
+         * @return true after the complete bundle executes; false rejects the bundle.
          */
         virtual bool multiply_fused_expert_down(
             const FusedExpertDownDesc *descs, int num_descs,
-            int m, int k)
+            int m, int k, DeviceWorkspaceManager *workspace = nullptr)
         {
             (void)descs;
             (void)num_descs;
             (void)m;
             (void)k;
+            (void)workspace;
             return false;
         }
 

@@ -1,6 +1,10 @@
 /**
  * @file PersistentStateMemoryEstimator.cpp
- * @brief Implements exact full-attention, GDN, and MTP state sizing.
+ * @brief Implements exact full-attention, GDN, and stage-owned MTP state sizing.
+ *
+ * The role is compiled from the same terminal ownership as live construction.
+ * Followers contribute rollback for their own main layers, never predictor
+ * storage. These are typed BOM contributions, not an independent live ledger.
  */
 
 #include "planning/PersistentStateMemoryEstimator.h"
@@ -20,12 +24,14 @@ namespace llaminar2
 {
     namespace
     {
+        /** @brief Persistent state family inferred from canonical layer metadata. */
         enum class LayerStorageKind
         {
             FullAttention,
             GDN,
         };
 
+        /** @brief Reject byte-count overflow before producing an admission contribution. */
         [[nodiscard]] std::size_t checkedAdd(
             std::size_t left,
             std::size_t right,
@@ -40,6 +46,7 @@ namespace llaminar2
             return left + right;
         }
 
+        /** @brief Check an exact layer's tensor directory for an architecture marker. */
         bool layerHasTensor(
             const ModelMemoryProfile &profile,
             int layer,
@@ -55,6 +62,7 @@ namespace llaminar2
                 });
         }
 
+        /** @brief Prefer concrete tensor geometry to the model's periodic layer map. */
         LayerStorageKind classifyLayer(
             const ModelMemoryProfile &profile,
             int layer)
@@ -98,8 +106,12 @@ namespace llaminar2
         int first_layer,
         int last_layer,
         const std::string &kv_precision,
-        bool mtp_enabled)
+        MTPStateRole mtp_role)
     {
+        if (mtp_role != MTPStateRole::Disabled &&
+            mtp_role != MTPStateRole::MainModelFollower &&
+            mtp_role != MTPStateRole::PredictorOwner)
+            throw std::invalid_argument("Unknown MTP persistent-state ownership role");
         PersistentStateEstimate result;
         // A main-model PP slice still uses the hybrid factory when its model
         // has a GDN layer map, even when this particular slice contains only
@@ -131,7 +143,7 @@ namespace llaminar2
             }
         }
 
-        if (mtp_enabled)
+        if (mtp_role == MTPStateRole::PredictorOwner)
         {
             for (int layer = main_layer_count;
                  layer < profile.n_layers;
@@ -208,7 +220,9 @@ namespace llaminar2
             }
         }
 
-        if (mtp_enabled)
+        // Every speculative main-model participant must be able to roll back
+        // rejected verifier rows, even when the predictor lives on another stage.
+        if (mtp_role != MTPStateRole::Disabled)
         {
             const auto checkpointPayloadBytes =
                 [&](int gdn_layers)

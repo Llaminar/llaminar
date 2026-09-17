@@ -1,6 +1,10 @@
 /**
  * @file AppContext.h
  * @brief Shared application state passed to execution modes
+ *
+ * The process session is declared first and destroyed last. Mode-local
+ * handlers unwind before their caller releases this context; runner and
+ * communicator owners therefore retire while MPI is still live on every exit.
  */
 
 #pragma once
@@ -9,7 +13,7 @@
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
 #include "utils/MPIContext.h"
-#include "app/MPIShutdown.h"
+#include "app/MPIProcessSession.h"
 #include "utils/Assertions.h"
 #include <cstdint>
 #include <memory>
@@ -36,6 +40,7 @@ namespace llaminar2
      */
     struct AppContext
     {
+        MPIProcessSession mpi_session; ///< Outlives every MPI-dependent member below.
         OrchestrationConfig config;
         std::shared_ptr<IMPIContext> mpi_ctx;
         std::unique_ptr<IOrchestrationRunner> runner;
@@ -73,13 +78,6 @@ namespace llaminar2
                        : CoordinatedRequestRole::Follower;
         }
 
-        /** @brief Shut down the runner and finalize MPI for this process. */
-        void finalize()
-        {
-            if (runner)
-                runner->shutdown();
-            mpiShutdown();
-        }
     };
 
 } // namespace llaminar2

@@ -26591,6 +26591,17 @@ TEST_F(Test__CUDAMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactB
 #endif
 }
 
+/** @brief Captured slot reuse preserves all floating and quantized wire formats. */
+TEST_F(Test__CUDAMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice()) GTEST_SKIP() << "No CUDA device available";
+    llaminar2::test::runMixedFormatExpertTransferPublication(llaminar2::DeviceId::cuda(0), stream_);
+#endif
+}
+
 /**
  * @brief Prove transferred CurrentBatchLLEP expert execution across all formats.
  *

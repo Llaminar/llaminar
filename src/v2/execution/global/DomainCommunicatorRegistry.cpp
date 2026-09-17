@@ -1,6 +1,9 @@
 /**
  * @file DomainCommunicatorRegistry.cpp
- * @brief Implementation of DomainCommunicatorRegistry
+ * @brief Exact admitted PP-stage communicator and endpoint construction.
+ *
+ * Stage membership determines split ordering and the participant's physical
+ * address. No world-rank or CPU-zero convention can replace that topology.
  *
  * @author David Sanftenberg
  * @date May 2026
@@ -65,7 +68,11 @@ namespace llaminar2
                 world_comm,
                 stage->stage_id, // domain_id = stage_id for unambiguous keying
                 color,
-                key);
+                key,
+                color == MPI_UNDEFINED ? std::nullopt : std::optional<GlobalDeviceAddress>(
+                    stage->per_rank_devices.empty() ? stage->per_rank_device
+                                                   : stage->per_rank_devices.at(key)),
+                "", stage->backend);
 
             if (color != MPI_UNDEFINED)
             {

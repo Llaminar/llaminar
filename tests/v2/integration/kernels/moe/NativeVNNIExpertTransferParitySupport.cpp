@@ -9,6 +9,7 @@
 #include "NativeVNNIExpertTransferParityTest.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 
 namespace llaminar2::test::native_vnni_transfer_parity_detail
 {
@@ -106,7 +107,12 @@ namespace llaminar2::test::native_vnni_transfer_parity_detail
         params.prepared_gate_gemm.assign(routes, engines[0]);
         params.prepared_up_gemm.assign(routes, engines[1]);
         params.prepared_down_gemm.assign(routes, engines[2]);
+        // Packet compaction may expose every routed entry as a physical row.
+        // Keep one admitted transform arena across all width changes, just as
+        // the owning graph does, and retire the stage before that arena.
+        CPUProjectionTestWorkspace invocation_workspace(rows * routes, std::max(d_model, intermediate));
         MoELocalExpertStage stage(params);
+        stage.bindWorkspace(invocation_workspace.get());
         CPUDeviceContext context(DeviceId::cpu());
 
         // Movement changes local route count without rebuilding the executor.

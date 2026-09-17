@@ -4702,6 +4702,13 @@ namespace llaminar2
         return true;
     }
 
+    bool LocalTPContext::reserveGraphCaptureBoundaryResources(
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return initializeGraphCaptureBoundaryDeviceWords(memory_authority);
+    }
+
     bool LocalTPContext::initializeGraphCaptureBoundaryDeviceWords(
         const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority)
     {
@@ -4727,7 +4734,7 @@ namespace llaminar2
             return false;
         }
 
-        constexpr size_t kControlBytes = sizeof(int32_t);
+        const size_t kControlBytes = CollectiveMemoryEstimator::nativePipelineBoundaryBytes(backend_);
         for (size_t slot = 0; slot < devices_.size(); ++slot)
         {
             if (graph_capture_boundary_device_words_[slot])

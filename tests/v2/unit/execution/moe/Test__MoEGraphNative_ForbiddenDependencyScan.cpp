@@ -5,6 +5,8 @@
  * These tests scan source files that are supposed to remain orchestration glue.
  * They catch accidental dependencies on legacy overlay runtime code and direct
  * CUDA/HIP runtime APIs before those dependencies can leak into compute stages.
+ * Shared planning adapters, rather than runner-private formulas, own typed
+ * admission inputs; live byte ownership remains in PhysicalMemoryAuthority.
  */
 
 #include <gtest/gtest.h>
@@ -8508,7 +8510,7 @@ namespace llaminar2::test
             << "The typed capacity must cross the helper, production create, prefill, and decode boundaries intact";
 
         EXPECT_NE(
-            abi.find("kVersion = 14u"),
+            abi.find("kVersion = 15u"),
             std::string::npos);
         EXPECT_NE(
             abi.find("kPlanEntryBytes = 64u"),
@@ -8791,7 +8793,10 @@ namespace llaminar2::test
         {
             const size_t begin = contents.find("__global__ void pack_rebalance_source_descriptors_kernel(");
             ASSERT_NE(begin, std::string::npos) << backend << " compact source descriptor kernel missing";
-            const size_t end = contents.find("__device__ void rebalance_copy_bytes", begin);
+            // Inlining/launch annotations are implementation details. Delimit
+            // by the next function's name so compiler tuning cannot hide the
+            // projected-command invariant checked below.
+            const size_t end = contents.find("void rebalance_copy_bytes(", begin);
             ASSERT_NE(end, std::string::npos) << backend << " compact source descriptor kernel end marker missing";
             const std::string body = contents.substr(begin, end - begin);
 
@@ -9654,7 +9659,7 @@ namespace llaminar2::test
                 "bool MTPSpeculativeStatePublicationStage::execute(");
         const size_t accepted_metadata =
             publication_stage_source.find(
-                "const bool metadata_enqueued =",
+                "!publishAcceptanceMetadata(stream)",
                 stage_execute);
         const size_t commit_call =
             publication_stage_source.find(
@@ -9665,14 +9670,25 @@ namespace llaminar2::test
         ASSERT_NE(commit_call, std::string::npos);
         EXPECT_LT(accepted_metadata, commit_call)
             << "Committed routing history must consume the accepted-state "
-               "metadata produced by the publication transaction.";
+               "metadata admitted by the publication authority.";
+        const size_t metadata_owner = publication_stage_source.find(
+            "bool MTPSpeculativeStatePublicationStage::publishAcceptanceMetadata(");
+        ASSERT_NE(metadata_owner, std::string::npos);
+        const auto metadata_body = publication_stage_source.substr(
+            metadata_owner, stage_execute - metadata_owner);
+        EXPECT_NE(metadata_body.find("Authority::PipelineFollower"), std::string::npos)
+            << "Followers consume tail-committed metadata, not another outcome decision.";
+        EXPECT_NE(metadata_body.find("Authority::BoundedGeneration"), std::string::npos);
+        EXPECT_NE(metadata_body.find("enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata("),
+                  std::string::npos);
+        EXPECT_NE(metadata_body.find("enqueueDeriveSpeculativePublicationMetadata("), std::string::npos);
 
         const size_t publication_entry =
             orchestrator_source.find(
                 "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(");
         const size_t captured_publication =
             orchestrator_source.find(
-                "executeMTPSpeculativeStatePublicationCaptured(",
+                "executeMTPStatePublicationGraph(",
                 publication_entry);
         const size_t publication_finalize =
             orchestrator_source.find(
@@ -11769,6 +11785,8 @@ namespace llaminar2::test
             root / "src/v2/execution/moe/MoEOverlayCapacityAdmission.cpp";
         const fs::path runner_source_path =
             root / "src/v2/execution/runner/OrchestrationRunner.cpp";
+        const fs::path planning_source_path =
+            root / "src/v2/planning/MoEOverlayPlanningInputs.cpp";
         const fs::path graph_source_path =
             root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
 
@@ -11777,12 +11795,14 @@ namespace llaminar2::test
         const std::string stage_source = readFile(stage_source_path);
         const std::string admission_source = readFile(admission_source_path);
         const std::string runner_source = readFile(runner_source_path);
+        const std::string planning_source = readFile(planning_source_path);
         const std::string graph_source = readFile(graph_source_path);
         ASSERT_FALSE(contract_header.empty()) << contract_header_path;
         ASSERT_FALSE(contract_source.empty()) << contract_source_path;
         ASSERT_FALSE(stage_source.empty()) << stage_source_path;
         ASSERT_FALSE(admission_source.empty()) << admission_source_path;
         ASSERT_FALSE(runner_source.empty()) << runner_source_path;
+        ASSERT_FALSE(planning_source.empty()) << planning_source_path;
         ASSERT_FALSE(graph_source.empty()) << graph_source_path;
 
         EXPECT_NE(
@@ -11818,9 +11838,25 @@ namespace llaminar2::test
             std::string::npos)
             << "The canonical physical ledger must own the maintenance bytes.";
         EXPECT_NE(
-            runner_source.find("device_rebalance_workspace_capacity"),
+            planning_source.find("device_rebalance_workspace_capacity"),
             std::string::npos)
-            << "Setup must carry typed capacity, never a materialized pointer.";
+            << "Shared planning must carry typed capacity, never a materialized pointer.";
+        EXPECT_NE(
+            runner_source.find("resolveMoEOverlayCapacityAdmissionPolicy("),
+            std::string::npos)
+            << "Runtime setup must use the same policy adapter as automatic planning.";
+        EXPECT_EQ(
+            runner_source.find("DeviceMoERebalanceWorkspaceCapacity"),
+            std::string::npos)
+            << "The runner must not reintroduce private workspace geometry.";
+        EXPECT_EQ(
+            runner_source.find("DeviceMoETransferSlotDirectory::planRuntimeCapacity("),
+            std::string::npos)
+            << "The runner must not independently price transfer-directory storage.";
+        EXPECT_EQ(
+            runner_source.find("overlayCapacityPolicy("),
+            std::string::npos)
+            << "The replaced runner-private policy must remain retired.";
         EXPECT_GE(
             countOccurrences(
                 graph_source,

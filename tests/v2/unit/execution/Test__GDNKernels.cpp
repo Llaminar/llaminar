@@ -66,6 +66,7 @@
 #include "../../utils/VerifierRowTestInventory.h"
 #include "../../utils/TestTensorFactory.h"
 #include "../../utils/PreparedWeightTestHarness.h"
+#include "../../utils/CPUProjectionTestWorkspace.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -3346,6 +3347,7 @@ TEST(Test__GDNKernels, Projection_Qwen36NodeTPPrefillShapeResolvesPreparedMixedF
     p.prepared_store = &store;
 
     GDNProjectionStage stage(p);
+    test::CPUStageTestWorkspace workspace(stage, M);
     ASSERT_TRUE(stage.execute(ctx.get()));
 
     auto assertFiniteNonzero = [](const TensorBase *tensor, int rows, int cols, const char *name)

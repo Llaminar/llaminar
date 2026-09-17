@@ -14,14 +14,15 @@ gate:
   the sealed retained parent's concurrent CPU ticket service and its completed
   submissions; they do not manufacture a cross-rank coordinator.
 
-Keeping topology parsing and record classification here makes the policy
+Keeping typed topology and record classification here makes the policy
 unit-testable. The shell harness remains responsible for feature-specific
 counters such as MTP acceptance and prefix-cache movement.
 
 Physical proof follows the installed executable family: one full graph,
 retained parent, or independently instantiated heterogeneous segments. Segment
-proof joins each unit's capture and launch by rank/device/context and stage
-identity; a neighboring executable or a graph-only child cannot satisfy it.
+proof joins each unit's capture and launch by rank/device/context, setup-issued
+executable-family ID and stage identity. Unused setup variants remain distinct;
+a neighboring executable or a graph-only child cannot satisfy live execution.
 """
 
 from __future__ import annotations
@@ -33,10 +34,6 @@ from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence
 
 
-_DEVICE_KIND_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_])(cuda|rocm|cpu):[0-9]+",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -63,29 +60,6 @@ class DecodeGraphRequirement(Enum):
     OBSERVE = "observe"
     CAPTURE = "capture"
     REPLAY = "replay"
-
-
-def device_kinds_for_cell(backend: str, extra_flags: str) -> frozenset[str]:
-    """Return every device kind explicitly present in one matrix cell.
-
-    The regular expression intentionally scans complete option values instead
-    of maintaining parsers for each domain grammar. It therefore recognizes:
-
-    * ``--tp-devices cuda:0,cuda:1``
-    * ``--define-domain stage=cuda:0,rocm:0;...``
-    * ``--device-map 0=cuda:0,1=rocm:0``
-    * ``--moe-routed-expert-domain name=0:cpu:0,1:cpu:0;...``
-
-    Unknown or auto-selected ``tp``/``pp`` cells remain conservatively
-    non-heterogeneous. They cannot use the segmentation exception without an
-    explicit, auditable mixed topology.
-    """
-
-    haystack = f"{backend} {extra_flags}"
-    return frozenset(
-        match.group(1).lower()
-        for match in _DEVICE_KIND_PATTERN.finditer(haystack)
-    )
 
 
 def _numeric(value: Any) -> float:
@@ -559,6 +533,15 @@ def _incomplete_graph_contexts(
                 reasons.append("sidecar has no matching certified retained parent")
             else:
                 replay_count += parent_counts[parent_key].get("replay", 0.0)
+        if counts.get("segmented", 0.0) > 0.0:
+            segment_key = (device, context)
+            if not allow_heterogeneous_execution or segment_key not in segmented_contexts:
+                reasons.append("sidecar has no matching certified segmented executable")
+            else:
+                # A remote collective is an explicit heterogeneous cutpoint.
+                # Its native units have already been checked independently;
+                # do not demand a nonexistent monolithic sidecar graph here.
+                replay_count += phase_counts.get(segment_key, {}).get("replay", 0.0)
         if rebuild_count > 1.0:
             reasons.append(
                 f"rebuilt graph {rebuild_count:g} times for one stable shape"
@@ -580,17 +563,18 @@ def _segmented_executable_contexts(
 ) -> tuple[set[tuple[str, str]], tuple[str, ...]]:
     """Authenticate every heterogeneous segment's physical capture/launch pair.
 
-    The publisher names units by their first/last stage and stage count within
-    one rank/device/context. Setup may materialize many unused bucket shapes;
-    their node counts are not launch counts. A used context must launch every
+    The publisher names units within one setup-issued executable family on a
+    rank/device/context. Setup may materialize unused variants with different
+    terminal stages under the same context; those variants are not live calls.
+    Their node counts are not launch counts. A used family must launch every
     unit, each launch must have its own nonempty executable, and a materialized
     family must publish transaction zero before it can claim replay. Runtime
     graph-cache identity separately authenticates embedded pointers/geometry.
     """
-    nodes: dict[tuple[str, str], set[tuple[str, str, str]]] = {}
-    launches: dict[tuple[str, str], dict[tuple[str, str, str], float]] = {}
-    materialized: set[tuple[str, str]] = set()
-    initial: set[tuple[str, str]] = set()
+    nodes: dict[tuple[str, str, str], set[tuple[str, str, str]]] = {}
+    launches: dict[tuple[str, str, str], dict[tuple[str, str, str], float]] = {}
+    materialized: set[tuple[str, str, str]] = set()
+    initial: set[tuple[str, str, str]] = set()
     invocations: dict[tuple[str, str], float] = {}
     errors: list[str] = []
     for record in records:
@@ -600,16 +584,26 @@ def _segmented_executable_contexts(
         context = str(tags.get("context", ""))
         if not context:
             continue
-        key = (_device_owner(record), context)
+        context_key = (_device_owner(record), context)
         name, value = record.get("name"), _record_value(record)
-        if name == "materialized_graph_transaction_zero_launches" and value > 0:
-            initial.add(key)
-        if name == "decode_capture_policy" or (
+        if name in {"decode_capture_policy", "sidecar_decode_capture_policy"} or (
                 name == "decode_graph_phase" and tags.get("phase") == "replay"):
-            invocations[key] = max(invocations.get(key, 0.0), value)
+            invocations[context_key] = max(invocations.get(context_key, 0.0), value)
         is_node = name == "segmented_graph_capture_executable_nodes"
         is_launch = name == "segmented_replay_segments" and tags.get("type") == "capturable"
-        if not (is_node or is_launch):
+        is_initial = name == "materialized_graph_transaction_zero_launches"
+        if not (is_node or is_launch or is_initial):
+            continue
+        family = str(tags.get("executable_family", ""))
+        key = (*context_key, family)
+        if not re.fullmatch(r"[1-9][0-9]*", family) or int(family) > (1 << 64) - 1:
+            errors.append(f"{context_key[0]}:{context} (invalid executable family identity)")
+            continue
+        if is_initial:
+            if not math.isfinite(value) or value != 1:
+                errors.append(f"{key[0]}:{context}/family={family} (invalid transaction-zero count)")
+            else:
+                initial.add(key)
             continue
         # Keep even an invalid node's context in the comparison. Otherwise a
         # malformed inventory could disappear rather than fail closed.
@@ -617,7 +611,8 @@ def _segmented_executable_contexts(
         stage = tuple(str(tags.get(field, "")) for field in
                       ("first_stage", "last_stage", "stage_count"))
         if (not stage[0] or not stage[1] or not stage[2].isdigit()
-                or int(stage[2]) <= 0 or not 0 < value < float("inf")):
+                or int(stage[2]) <= 0 or not 0 < value < float("inf")
+                or not value.is_integer()):
             errors.append(f"{key[0]}:{context} (invalid physical segment identity/count)")
             continue
         if is_node:
@@ -637,24 +632,31 @@ def _segmented_executable_contexts(
         reasons = []
         if not captured:
             reasons.append("no nonempty instantiated segments")
-        if replay or invocations.get(key, 0.0) > 0:
+        if replay or key in initial:
             if set(replay) - captured:
                 reasons.append("segment replay has no matching executable")
             if captured - set(replay):
                 reasons.append("instantiated segment has no matching launch")
             if key in materialized and key not in initial:
                 reasons.append("materialized segments have no transaction-zero launch")
-            if invocations.get(key, 0.0) > 1 and any(count < 2 for count in replay.values()):
+            if len(set(replay.values())) > 1:
                 reasons.append("segment missing replay after repeated execution")
         if reasons:
-            errors.append(f"{key[0]}:{key[1]} ({'; '.join(reasons)})")
-    return set(nodes), tuple(errors)
+            errors.append(f"{key[0]}:{key[1]}/family={key[2]} ({'; '.join(reasons)})")
+    contexts = {key[:2] for key in nodes}
+    live_contexts = {key[:2] for key, counts in launches.items() if counts}
+    for key in sorted(contexts - live_contexts):
+        if invocations.get(key, 0.0) > 0:
+            errors.append(f"{key[0]}:{key[1]} (no executable family launched after runtime admission)")
+    for key in sorted(initial - nodes.keys()):
+        if key[:2] in contexts:
+            errors.append(f"{key[0]}:{key[1]}/family={key[2]} (transaction zero has no matching executable)")
+    return contexts, tuple(errors)
 
 
 def validate_graph_capture_policy(
     records: Sequence[Mapping[str, Any]],
-    backend: str,
-    extra_flags: str,
+    device_kinds: frozenset[str],
     *,
     require_prefill_lifecycle: bool = False,
     decode_requirement: DecodeGraphRequirement = DecodeGraphRequirement.OBSERVE,
@@ -665,7 +667,8 @@ def validate_graph_capture_policy(
     report one concise failure without a Python traceback.
     """
 
-    device_kinds = device_kinds_for_cell(backend, extra_flags)
+    if not isinstance(device_kinds, frozenset) or not device_kinds or not device_kinds <= {"cpu", "cuda", "rocm"}:
+        raise ValueError("graph certification requires resolved device kinds")
     heterogeneous_device_mix = len(device_kinds) > 1
     has_collective_evidence = _has_collective_evidence(records)
     has_pipeline_boundary_evidence, pipeline_errors = _pipeline_boundary_evidence(records)

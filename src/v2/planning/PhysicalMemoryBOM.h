@@ -14,6 +14,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "planning/PhysicalMemoryCapacityExhausted.h"
 
 #include <array>
 #include <cstddef>
@@ -452,14 +453,14 @@ namespace llaminar2
     public:
         /**
          * @brief Certify a fitting immutable BOM.
-         * @throws std::invalid_argument when the BOM is over budget.
+         * @throws PhysicalMemoryCapacityExhausted when the valid BOM is over budget.
          */
         explicit PhysicalMemoryAdmissionCertificate(PhysicalMemoryBOM bom)
             : bom_(std::move(bom))
         {
             if (!bom_.fits())
             {
-                throw std::invalid_argument(
+                throw PhysicalMemoryCapacityExhausted(
                     "Physical memory admission failed for " +
                     bom_.resource().id() + ": deficit_bytes=" +
                     std::to_string(bom_.deficitBytes()));

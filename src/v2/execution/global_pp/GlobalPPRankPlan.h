@@ -95,6 +95,27 @@ namespace llaminar2
         int mpi_tag = 0;       ///< MPI tag for this transfer
         int from_stage = -1;   ///< Source stage
         int to_stage = -1;     ///< Destination stage
+        /** Same directed inventory projection on both the send and receive actions. */
+        std::optional<RankConnectionTopology> connection;
+
+        /**
+         * @brief Check physical membership against this action's local/peer endpoints.
+         * @param local_rank Owning rank in the plan's execution communicator.
+         * @return Immutable source-to-destination connection, never reversed on receive.
+         * @throws std::logic_error for unbound, inactive or edited actions.
+         */
+        [[nodiscard]] const RankConnectionTopology &physicalConnection(int local_rank) const
+        {
+            if (!connection || (direction != Direction::SEND && direction != Direction::RECV &&
+                                direction != Direction::LOCAL_HANDOFF))
+                throw std::logic_error("Pipeline rank action has no physical inventory binding");
+            const int source = direction == Direction::RECV ? peer_rank : local_rank;
+            const int destination = direction == Direction::RECV ? local_rank : peer_rank;
+            if (connection->sourceRank() != source || connection->destinationRank() != destination ||
+                ((direction == Direction::LOCAL_HANDOFF) != (peer_rank == local_rank)))
+                throw std::logic_error("Pipeline rank action does not match its physical endpoints");
+            return *connection;
+        }
     };
 
     // =========================================================================

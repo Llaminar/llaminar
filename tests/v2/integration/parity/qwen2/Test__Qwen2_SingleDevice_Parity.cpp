@@ -5,7 +5,9 @@
  * Model artifacts, physical topology, activation/KV precision, and numerical
  * contracts are declared as typed data. The shared model-parity generator
  * expands those declarations and the ordinary production fixture retains every
- * prefill/decode checkpoint comparison and CSV artifact.
+ * prefill/decode checkpoint comparison and CSV artifact. Compressed-KV numerical
+ * allowances are explicit per backend/format; a prefill-only KL allowance does
+ * not alter the ordinary decode or MTP contract.
  */
 
 #include "../ModelParityDefinition.h"
@@ -30,7 +32,14 @@ using namespace llaminar2::test::parity::qwen2;
 
 namespace
 {
-    /** @return Shared Qwen2 numerical contract with explicit quality limits. */
+    /**
+     * @brief Construct the shared Qwen2 checkpoint and vocabulary contract.
+     * @param kl_threshold Ordinary logit KL ceiling; unchanged by a prefill override.
+     * @param min_top1_accuracy Minimum Top-1 accuracy percentage.
+     * @param min_top5_accuracy Minimum Top-5 overlap percentage.
+     * @param pytorch_top1_in_topk Required rank neighborhood of HF's leading token.
+     * @return Independent value used by one typed model/backend/KV declaration.
+     */
     BackendThresholds qwen2Thresholds(
         float kl_threshold,
         float min_top1_accuracy,
@@ -49,7 +58,12 @@ namespace
         };
     }
 
-    /** @return Exact one-participant topology for one backend. */
+    /**
+     * @brief Declare a single participant without initializing its device.
+     * @param test_id Stable topology label used by the canonical expander.
+     * @param address Physical backend/device selector for this participant.
+     * @return One-rank, one-device topology with no collective.
+     */
     ModelParityTopologyDefinition singleDeviceTopology(
         std::string test_id,
         GlobalDeviceAddress address)
@@ -68,7 +82,15 @@ namespace
         };
     }
 
-    /** @return One model/topology definition with a generated KV axis. */
+    /**
+     * @brief Bind one model/topology to its exact precision and numerical policy.
+     * @param model Real model and independent reference-pack identity.
+     * @param topology Participant declaration consumed by production setup.
+     * @param thresholds Ordinary numerical contract for generated cells.
+     * @param kv_precisions Supported KV axis, with FP32 activations fixed.
+     * @param overrides Explicit numerical exceptions for declared precision pairs.
+     * @return Definition ready for the central Cartesian-product expander.
+     */
     ModelParityDefinition singleDeviceDefinition(
         ModelParityModelDefinition model,
         ModelParityTopologyDefinition topology,
@@ -86,7 +108,10 @@ namespace
         return definition;
     }
 
-    /** @return Exact typed declarations whose expansion replaces 18 records. */
+    /**
+     * @brief Declare the Qwen2 single-device matrix and scoped numerical allowances.
+     * @return Exact typed declarations expanding to the canonical eighteen cells.
+     */
     std::vector<ModelParityDefinition> qwen2SingleDeviceDefinitions()
     {
         const auto q4_model = qwen2Q40ParityModel();
@@ -103,18 +128,25 @@ namespace
             "ROCm0", GlobalDeviceAddress::rocm(0));
 
         const auto cpu_q4_default = qwen2Thresholds(0.005f, 90.0f, 95.0f);
+        // The independently reviewed Q8-KV row also exchanges one HF Top-5
+        // member. Its KL, layer, cosine and token-accuracy limits stay fixed.
+        const auto cpu_q4_q8 = qwen2Thresholds(0.005f, 90.0f, 80.0f);
         // This exact CPU/Q4_0/Q16_1 cell admits four of the five HF leaders:
         // independently audited scratch/cache approximation exchanges the fifth
         // and sixth logits. Keep every other distribution/stage gate unchanged,
-        // and do not extend this allowance to another backend or KV format.
+        // with any other backend/KV allowance declared separately below.
         const auto cpu_q4_q16 = qwen2Thresholds(0.006f, 90.0f, 80.0f);
         const auto cuda_q4_default = qwen2Thresholds(0.009f, 80.0f, 80.0f);
-        const auto cuda_q4_q8 = qwen2Thresholds(0.008f, 80.0f, 95.0f, 5);
+        const auto cuda_q4_q8 = qwen2Thresholds(0.008f, 80.0f, 80.0f, 5);
         const auto cuda_q4_tq = qwen2Thresholds(0.008f, 80.0f, 80.0f, 5);
         const auto rocm_q4_default = qwen2Thresholds(0.005f, 80.0f, 95.0f);
         const auto rocm_q4_fp16 = qwen2Thresholds(0.008f, 80.0f, 95.0f);
         const auto rocm_q4_quantized =
             qwen2Thresholds(0.005f, 80.0f, 95.0f, 5);
+        auto rocm_q4_tq = qwen2Thresholds(0.005f, 80.0f, 80.0f, 5);
+        // Only prefill needs the reviewed TurboQuant distribution allowance.
+        // Decode retains 0.005, and ROCm/Q8-KV keeps its existing entire gate.
+        rocm_q4_tq.prefill_kl_threshold = 0.008f;
         const auto q8_default = qwen2Thresholds(0.01f, 80.0f, 95.0f);
         const auto q8_quantized = qwen2Thresholds(0.01f, 80.0f, 95.0f, 5);
 
@@ -130,6 +162,11 @@ namespace
                 KVCachePrecision::TQ,
             },
             {
+                {
+                    .activation = ActivationPrecision::FP32,
+                    .kv_cache = KVCachePrecision::Q8_1,
+                    .thresholds = cpu_q4_q8,
+                },
                 {
                     .activation = ActivationPrecision::FP32,
                     .kv_cache = KVCachePrecision::Q16_1,
@@ -181,7 +218,7 @@ namespace
                 {
                     .activation = ActivationPrecision::FP32,
                     .kv_cache = KVCachePrecision::TQ,
-                    .thresholds = rocm_q4_quantized,
+                    .thresholds = rocm_q4_tq,
                 },
             }));
 
@@ -230,7 +267,10 @@ What is 2+2?<|im_end|>
         return definitions;
     }
 
-    /** @return One ordered generated case vector for GoogleTest discovery. */
+    /**
+     * @brief Expand once so test execution and discovery share identical cases.
+     * @return Stable ordered case vector; no model/device is loaded by expansion.
+     */
     const std::vector<ModelParityCase> &qwen2SingleDeviceCases()
     {
         static const auto cases = []
@@ -251,6 +291,7 @@ What is 2+2?<|im_end|>
     }
 } // namespace
 
+/** @brief Production captured-inference fixture for each centrally generated case. */
 class Qwen2SingleDeviceParityTest
     : public ConfigDrivenParityTest<Qwen2SingleDeviceParityTest>,
       public ModelParityCaseParameter
@@ -269,6 +310,12 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<ModelParityCase> &info)
     { return info.param.testName(); });
 
+/**
+ * @brief Enter the MPI-aware fixture and retire backend resources after testing.
+ * @param argc Number of command-line arguments consumed by MPI/GoogleTest.
+ * @param argv Original argument vector.
+ * @return GoogleTest status; process termination follows explicit backend shutdown.
+ */
 int main(int argc, char **argv)
 {
     int provided;

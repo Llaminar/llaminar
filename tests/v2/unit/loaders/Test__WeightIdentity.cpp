@@ -1,6 +1,9 @@
 /**
  * @file Test__WeightIdentity.cpp
  * @brief Unit tests for semantic weight identity and lifecycle classification.
+ *
+ * Role inference must match the roles assigned by production graph bindings;
+ * recurrent projection matrices must not become unclassified or scalar work.
  */
 
 #include <gtest/gtest.h>
@@ -27,6 +30,8 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("output_norm.weight"), WeightRole::OutputNorm);
     EXPECT_EQ(inferWeightRole("blk.3.attn_qkv.weight"), WeightRole::FusedQKV);
     EXPECT_EQ(inferWeightRole("blk.3.attn_output.weight"), WeightRole::AttentionWO);
+    EXPECT_EQ(inferWeightRole("blk.3.attn_gate.weight"), WeightRole::GDNProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_out.weight"), WeightRole::GDNProjection);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_alpha.weight"), WeightRole::GDNAlphaBetaProjection);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_beta.weight"), WeightRole::GDNAlphaBetaProjection);
     EXPECT_EQ(inferWeightRole("blk.3.ssm_a"), WeightRole::GDNSsmParam);

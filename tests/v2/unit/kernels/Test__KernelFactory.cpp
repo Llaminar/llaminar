@@ -11,6 +11,7 @@
  * 5. Error handling for unsupported GPU backends
  * 6. Setup service views preserve immutable CPU expert storage for every
  *    quantized source and floating format without a second allocation/repack.
+ * 7. GPU pool ownership and bounds reject invalid bindings without GPU access.
  */
 
 #include <gtest/gtest.h>
@@ -22,11 +23,83 @@
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "../../mocks/MockBackend.h"
 
 #include <limits>
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
+
+/** @brief Backend identity is checked before pointers can reach a native constructor. */
+TEST(GPUPreparedWeightBinding, RejectsMissingOrMismatchedOwnership)
+{
+    FP32Tensor tensor({32, 256});
+    for (DeviceType type : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        test::MockBackend backend(type);
+        const DeviceId device{type, 0};
+        auto owner = std::make_shared<LoadOrchestrator>(&backend, kTestOnlyUnadmittedGPUAllocation);
+        owner->addDevice(0);
+        EXPECT_EQ(owner->managedDevice(0), device);
+        EXPECT_THROW((void)owner->managedDevice(1), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, {}, "w"), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, DeviceId::cpu(), owner, "w"), std::invalid_argument);
+        const auto wrong_backend = type == DeviceType::CUDA ? DeviceId::rocm(0) : DeviceId::cuda(0);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, wrong_backend, owner, "w"), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, DeviceId{type, 1}, owner, "w"), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, "w"), std::invalid_argument);
+        owner->planRawWeight(0, "w", 32, 256, tensor.size_bytes());
+        // The mock only allocates host bytes. Every following call must reject
+        // its request before a CUDA/HIP engine can bind a library or a device.
+        ASSERT_TRUE(owner->getPool(0)->allocate(&backend, 0, 0));
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, "missing"), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, ""), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, "w", 0,
+            static_cast<GPUPreparedWeightPoolLayout>(99)), std::invalid_argument);
+        FP32Tensor rank_three({2, 32, 256});
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(rank_three, device, owner, "w"), std::invalid_argument);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, "w", 1), std::out_of_range);
+        EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(tensor, device, owner, "w",
+            std::numeric_limits<size_t>::max()), std::overflow_error);
+    }
+}
+
+/** @brief Every source format rejects a truncated matrix on both backend identities. */
+TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
+{
+    std::vector<std::unique_ptr<TensorBase>> weights;
+    for (const auto &format : test::quantizedVerifierFormats())
+        weights.push_back(format.create({32, 256}, 42));
+    weights.push_back(std::make_unique<FP16Tensor>(std::vector<size_t>{32, 256}));
+    weights.push_back(std::make_unique<BF16Tensor>(std::vector<size_t>{32, 256}));
+    weights.push_back(std::make_unique<FP32Tensor>(std::vector<size_t>{32, 256}));
+    for (DeviceType type : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto &tensor : weights)
+            for (auto layout : {GPUPreparedWeightPoolLayout::SourceNative, GPUPreparedWeightPoolLayout::MigrationReusable})
+            {
+                SCOPED_TRACE(static_cast<int>(tensor->native_type()));
+                SCOPED_TRACE(static_cast<int>(layout));
+                test::MockBackend backend(type);
+                const DeviceId device{type, 0};
+                auto owner = std::make_shared<LoadOrchestrator>(&backend, kTestOnlyUnadmittedGPUAllocation);
+                owner->addDevice(0);
+                if (auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor.get()))
+                {
+                    const auto &source = *unpackable->vnniFormatInfo();
+                    const auto allocation = layout == GPUPreparedWeightPoolLayout::MigrationReusable
+                        ? reusableDeviceVnniAllocationFormat(source)
+                        : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
+                            source.is_asymmetric, source.has_emins};
+                    owner->planWeight(0, "short", 16, 256, allocation.payload_bytes_per_block,
+                        allocation.has_mins, allocation.has_emins, tensor->size_bytes());
+                }
+                else owner->planRawWeight(0, "short", 16, 256, tensor->size_bytes() / 2);
+                ASSERT_TRUE(owner->getPool(0)->allocate(&backend, 0, 0));
+                EXPECT_THROW(KernelFactory::createGemmFromGPUWeightPool(*tensor, device, owner, "short", 0, layout),
+                    std::out_of_range);
+            }
+}
 
 /** @brief Metadata-only admission must exactly equal all allocated CPU scratch. */
 TEST(PreparedExpertServiceView, CPUWorkspaceBOMMatchesEveryPayload)
@@ -68,22 +141,29 @@ TEST(PreparedExpertServiceView, AllCPUFormatsRetainOriginalStorageAndLifetime)
         auto source = KernelFactory::prepareExpertGemmLocal(owner, DeviceId::cpu());
         ASSERT_NE(source, nullptr);
         auto *serving_binding = dynamic_cast<IWorkspaceConsumer *>(source.get());
-        if (serving_binding)
-            serving_binding->bindWorkspace(&serving_workspace);
+        ASSERT_NE(serving_binding, nullptr);
+        ASSERT_EQ(serving_binding->workspaceBindingPolicy(), WorkspaceBindingPolicy::Invocation);
+        serving_binding->bindWorkspace(&serving_workspace);
+        EXPECT_EQ(serving_binding->getWorkspace(), nullptr);
         std::weak_ptr<ITensorGemm> lifetime = source;
         auto view = KernelFactory::createExpertServiceExecutionView(source, DeviceId::cpu());
-        if (auto *workspace = dynamic_cast<IWorkspaceConsumer *>(view.get()))
+        auto *workspace = dynamic_cast<IWorkspaceConsumer *>(view.get());
+        ASSERT_NE(workspace, nullptr);
+        EXPECT_EQ(workspace->workspaceBindingPolicy(), WorkspaceBindingPolicy::Invocation);
+        EXPECT_FALSE(workspace->hasWorkspace());
+        EXPECT_EQ(workspace->getWorkspace(), nullptr);
+        // Interface participation declares demand; it does not imply mutable
+        // engine bindings. CPU owners must pass storage at each invocation.
+        workspace->bindWorkspace(&probe_workspace);
+        EXPECT_EQ(workspace->getWorkspace(), nullptr);
+        EXPECT_EQ(serving_binding->getWorkspace(), nullptr);
+        workspace->unbindWorkspace();
+        EXPECT_EQ(serving_binding->getWorkspace(), nullptr);
+        EXPECT_EQ(view->get_n(), 64);
+        EXPECT_EQ(view->get_k(), 256);
+        ContiguousFloatingPointWeightDescriptor original, borrowed;
+        if (source->exportContiguousFloatingPointWeights(original))
         {
-            ASSERT_NE(view.get(), source.get());
-            ASSERT_NE(serving_binding, nullptr);
-            EXPECT_FALSE(workspace->hasWorkspace());
-            EXPECT_EQ(workspace->getWorkspace(), nullptr);
-            workspace->bindWorkspace(&probe_workspace);
-            EXPECT_EQ(serving_binding->getWorkspace(), &serving_workspace);
-            workspace->unbindWorkspace();
-            EXPECT_EQ(serving_binding->getWorkspace(), &serving_workspace);
-            ContiguousFloatingPointWeightDescriptor original, borrowed;
-            ASSERT_TRUE(source->exportContiguousFloatingPointWeights(original));
             ASSERT_TRUE(view->exportContiguousFloatingPointWeights(borrowed));
             EXPECT_EQ(original.data, borrowed.data);
             EXPECT_EQ(original.type, borrowed.type);

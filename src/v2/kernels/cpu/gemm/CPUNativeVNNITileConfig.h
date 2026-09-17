@@ -38,6 +38,8 @@
 #include <stdexcept>
 
 #include "CPUNativeVNNIPreparedFootprint.h"
+#include "backends/CPUExecutionGeometry.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "utils/CPUFeatures.h"
 #include "utils/DebugEnv.h"
 
@@ -66,28 +68,6 @@ namespace llaminar2::cpu::native_vnni
         int omp_min_tasks;  ///< Minimum parallel tasks before falling back to serial
         ShapeCategory category;
         int k_tiles; ///< K-parallel tiles for GEMV (0 = N-parallel only)
-    };
-
-    /**
-     * @brief Cache geometry consumed by the deterministic tile policy.
-     *
-     * Production constructs this value from CPUID-backed `CacheInfo`; tests may
-     * provide explicit values to prove boundary behavior independently of the
-     * machine running CTest.
-     */
-    struct NativeVNNICacheTopology
-    {
-        std::uint64_t private_l2_bytes = 0;
-        std::uint64_t shared_l3_bytes = 0;
-        std::uint32_t private_l2_ways = 0;
-        std::uint32_t shared_l3_ways = 0;
-
-        /** @brief Return whether every required cache dimension is valid. */
-        [[nodiscard]] constexpr bool isValid() const noexcept
-        {
-            return private_l2_bytes > 0 && shared_l3_bytes > 0 &&
-                   private_l2_ways > 0 && shared_l3_ways > 0;
-        }
     };
 
     /**
@@ -197,7 +177,7 @@ namespace llaminar2::cpu::native_vnni
         int M,
         const NativeVNNIPreparedFootprint &footprint,
         int num_threads,
-        const NativeVNNICacheTopology &cache)
+        const CPUCacheGeometry &cache)
     {
         if (N <= 0 || K <= 0 || M <= 0 || !footprint.isValid())
         {
@@ -512,19 +492,42 @@ namespace llaminar2::cpu::native_vnni
         const NativeVNNIPreparedFootprint &footprint,
         int num_threads)
     {
-        const CacheInfo detected;
         return computeTileConfig(
             N,
             K,
             M,
             footprint,
             num_threads,
-            NativeVNNICacheTopology{
-                .private_l2_bytes = detected.l2_size,
-                .shared_l3_bytes = detected.l3_size,
-                .private_l2_ways = detected.l2_ways,
-                .shared_l3_ways = detected.l3_ways,
-            });
+            CPUExecutionGeometry::local().cache);
+    }
+
+    /**
+     * @brief One serial arithmetic policy for metadata admission and prepared execution.
+     * @param footprint Actual prepared encoding, never source bytes per weight.
+     * @param codebook Source arithmetic identity retained by preparation.
+     * @param numerical_policy Backend-native or the fixed cross-backend expert contract.
+     * @param policy_n Logical serial output width; may differ from a mirrored head's physical N.
+     * @param k Positive inner width of the prepared projection.
+     * @param workers Actual admitted workshare width.
+     * @param cache Observation from this participant, supplied explicitly for remote planning.
+     * @return Unchanged serial tile configuration including its ordered K tree.
+     * @throws std::invalid_argument For incomplete geometry or unsupported arithmetic identity.
+     */
+    inline NativeVNNITileConfig serialTileConfigForPreparedProjection(
+        const NativeVNNIPreparedFootprint &footprint, std::uint8_t codebook,
+        CPUProjectionNumericalPolicy numerical_policy, int policy_n, int k,
+        int workers, const CPUCacheGeometry &cache)
+    {
+        auto config = computeTileConfig(policy_n, k, 1, footprint, workers, cache);
+        if (numerical_policy == CPUProjectionNumericalPolicy::BackendNative) return config;
+        if (numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert ||
+            !MoEProjectionNumericalContract::ownsOrderedKPartitionTree(codebook))
+            throw std::invalid_argument("CPU NativeVNNI projection has no certified arithmetic tree");
+        const int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(k);
+        if (partitions <= 0)
+            throw std::invalid_argument("GPU-aligned CPU NativeVNNI requires positive block-aligned K");
+        config.k_tiles = partitions;
+        return config;
     }
 
 } // namespace llaminar2::cpu::native_vnni

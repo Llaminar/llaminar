@@ -91,7 +91,7 @@ namespace llaminar2
                     "[repackEmbeddingToQ8] Embedding dimension must be positive");
             }
 
-            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+            const auto *unpackable = IINT8Unpackable::fromTensor(embed_table);
             if (!unpackable)
             {
                 throw std::runtime_error(

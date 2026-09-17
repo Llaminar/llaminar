@@ -33,7 +33,6 @@ from graph_capture_perf_policy import (  # noqa: E402
     DecodeGraphRequirement,
     _incomplete_graph_contexts,
     _missing_prefill_phases,
-    device_kinds_for_cell,
     validate_graph_capture_policy,
 )
 from ranked_perf_artifacts import (  # noqa: E402
@@ -44,7 +43,6 @@ from ranked_perf_artifacts import (  # noqa: E402
 )
 from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy  # noqa: E402
 from flash_attention_perf_policy import (  # noqa: E402
-    attention_device_kinds_for_cell,
     validate_cpu_flash_attention_execution_policy,
     validate_flash_attention_plan_policy,
 )
@@ -65,6 +63,7 @@ from request_input_lifetime_perf_policy import (  # noqa: E402
     validate_request_input_lifetime_policy,
 )
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy  # noqa: E402
+from server_execution_contract import RuntimeFeaturePolicy  # noqa: E402
 
 
 def counter(
@@ -162,28 +161,28 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 with self.subTest(name=name, device=device):
                     record = counter(name, domain="moe_overlay_controller") | {"device": device}
                     self.assertIn("without a retained model", validate_runtime_feature_policy(
-                        [record], "", MovementEvidence.NOT_APPLICABLE) or "")
+                        [record], RuntimeFeaturePolicy(), MovementEvidence.NOT_APPLICABLE) or "")
                     self.assertIsNone(validate_runtime_feature_policy(
-                        [record | {"value": 0}], "", MovementEvidence.NOT_APPLICABLE))
+                        [record | {"value": 0}], RuntimeFeaturePolicy(), MovementEvidence.NOT_APPLICABLE))
         host = counter("prepared_context_restoration_edges", domain="moe_overlay_residency")
         self.assertIn("without a retained model", validate_runtime_feature_policy(
-            [host], "", MovementEvidence.NOT_APPLICABLE) or "")
-        self.assertIsNone(validate_runtime_feature_policy([host | {"value": 0}], "", MovementEvidence.NOT_APPLICABLE))
+            [host], RuntimeFeaturePolicy(), MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIsNone(validate_runtime_feature_policy([host | {"value": 0}], RuntimeFeaturePolicy(), MovementEvidence.NOT_APPLICABLE))
 
     def test_runtime_features_require_execution_not_lookup_or_domain_presence(self) -> None:
         """A cache hit or arbitrary MTP counter is not a completed feature."""
         records = [counter("harvest_inserts", domain="prefix_cache"),
                    counter("block_hits", domain="prefix_cache"),
                    counter("sidecar_graph_cache_hits", domain="mtp")]
-        self.assertIn("actual restore", validate_runtime_feature_policy(records, "--prefix-cache --mtp", MovementEvidence.NOT_APPLICABLE) or "")
-        self.assertIn("attempted and accepted", validate_runtime_feature_policy(records, "--mtp", MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIn("actual restore", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(prefix_cache=True, mtp=True), MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIn("attempted and accepted", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(mtp=True), MovementEvidence.NOT_APPLICABLE) or "")
 
     def test_runtime_features_require_mtp_state_in_prefix_restore(self) -> None:
         """Restoring only ordinary KV cannot certify a speculative request."""
         records = [counter("harvest_inserts", domain="prefix_cache"),
                    counter("populate_restores", domain="prefix_cache",
                            tags={"includes_mtp_state": "false"})]
-        self.assertIn("MTP-bearing", validate_runtime_feature_policy(records, "--prefix-cache --mtp", MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIn("MTP-bearing", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(prefix_cache=True, mtp=True), MovementEvidence.NOT_APPLICABLE) or "")
 
     def test_runtime_features_accept_completed_host_and_device_operations(self) -> None:
         """All backend paths owe restores, accepted drafts and physical commits."""
@@ -200,34 +199,34 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             with self.subTest(backend=backend):
                 records = [record | {"device": backend + ":0"} for record in common + completed]
                 self.assertIsNone(validate_runtime_feature_policy(iter(records),
-                    "--prefix-cache --mtp --mtp-depth-policy=dynamic --moe-residency-maintenance dynamic", MovementEvidence.REQUIRED))
+                    RuntimeFeaturePolicy(prefix_cache=True, mtp=True, mtp_depth_policy="dynamic", residency_maintenance="dynamic"), MovementEvidence.REQUIRED))
 
     def test_runtime_features_reject_unexecuted_dynamic_depth(self) -> None:
         """Fixed-depth activity cannot stand in for an adaptive controller."""
         records = [counter("draft_steps", domain="mtp"), counter("accepted_tokens", domain="mtp")]
-        self.assertIn("depth-controller", validate_runtime_feature_policy(records, "--mtp --mtp-depth-policy dynamic", MovementEvidence.NOT_APPLICABLE) or "")
+        self.assertIn("depth-controller", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(mtp=True, mtp_depth_policy="dynamic"), MovementEvidence.NOT_APPLICABLE) or "")
 
     def test_host_movement_needs_published_bytes_and_matching_bounded_sequences(self) -> None:
         """Committed edges, calibration copies and mismatched publications fail."""
         records = host_movement_records()
-        self.assertIsNone(validate_runtime_feature_policy(records, "", MovementEvidence.REQUIRED))
+        self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for omitted in range(len(records)):
             with self.subTest(omitted=omitted):
                 self.assertIsNotNone(validate_runtime_feature_policy(
-                    records[:omitted] + records[omitted + 1:], "", MovementEvidence.REQUIRED))
+                    records[:omitted] + records[omitted + 1:], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for field, value in (("rank", 1), ("device", "different-tier"), ("phase", "prefill"),
                              ("count", 2), ("sequence_word_count", 4),
                              ("sequence_digest_lo", 999), ("sequence_digest_hi", 999),
                              ("kind", "counter"), ("tags", {"purpose": "economy_calibration"})):
             with self.subTest(field=field):
                 broken = [*records[:-1], records[-1] | {field: value}]
-                self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+                self.assertIsNotNone(validate_runtime_feature_policy(broken, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for purpose in ("economy_calibration", "prepared_context_restoration", None):
             broken = [records[0], *[r | {"tags": {"purpose": purpose}} for r in records[1:]]]
-            self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+            self.assertIsNotNone(validate_runtime_feature_policy(broken, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for value in (0, -1, True, float("nan"), float("inf"), "invalid"):
             broken = [records[0], records[1] | {"value": value}, *records[2:]]
-            self.assertIsNotNone(validate_runtime_feature_policy(broken, "", MovementEvidence.REQUIRED))
+            self.assertIsNotNone(validate_runtime_feature_policy(broken, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
 
     def test_static_rejects_completed_placement_payload_without_an_owner_commit(self) -> None:
         """Actual copies are forbidden even if publication later aborts."""
@@ -235,22 +234,22 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                      "placement_published_payload_bytes"):
             with self.subTest(name=name):
                 record = counter(name, domain="moe_overlay_residency", tags={"purpose": "placement_change"})
-                self.assertIn("static", validate_runtime_feature_policy([record], "", MovementEvidence.FORBIDDEN) or "")
+                self.assertIn("static", validate_runtime_feature_policy([record], RuntimeFeaturePolicy(), MovementEvidence.FORBIDDEN) or "")
                 # A topology probe is distinct from a placement transaction.
                 record["tags"] = {"purpose": "economy_calibration"}
-                self.assertIsNone(validate_runtime_feature_policy([record], "", MovementEvidence.FORBIDDEN))
+                self.assertIsNone(validate_runtime_feature_policy([record], RuntimeFeaturePolicy(), MovementEvidence.FORBIDDEN))
 
     def test_host_publications_keep_noop_ranks_explicit_and_do_not_add_rank_mirrors(self) -> None:
         """No-op rank payloads may be zero, never missing, malformed or unmatched."""
         records = host_movement_records()
         follower = [r | {"rank": 1} for r in records]
         follower[1] = follower[1] | {"value": 0}
-        self.assertIsNone(validate_runtime_feature_policy(records + follower, "", MovementEvidence.REQUIRED))
+        self.assertIsNone(validate_runtime_feature_policy(records + follower, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for invalid in (None, True, -1, float("nan")):
             changed = [follower[0], follower[1] | {"value": invalid}, *follower[2:]]
-            self.assertIsNotNone(validate_runtime_feature_policy(records + changed, "", MovementEvidence.REQUIRED))
-        self.assertIsNotNone(validate_runtime_feature_policy(records + [follower[0], *follower[2:]], "", MovementEvidence.REQUIRED))
-        self.assertIsNotNone(validate_runtime_feature_policy(records + [records[-1]], "", MovementEvidence.REQUIRED))
+            self.assertIsNotNone(validate_runtime_feature_policy(records + changed, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
+        self.assertIsNotNone(validate_runtime_feature_policy(records + [follower[0], *follower[2:]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
+        self.assertIsNotNone(validate_runtime_feature_policy(records + [records[-1]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
 
     def test_runtime_features_native_movement_survives_empty_final_wave(self) -> None:
         """Terminal scratch reuse must not erase a qualified physical commit."""
@@ -265,14 +264,14 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             scratch = counter("device_rebalance_transfer_useful_payload_bytes",
                               domain="moe_rebalance", value=0)
             with self.subTest(backend=backend):
-                self.assertIsNone(validate_runtime_feature_policy(records + [scratch], "",
+                self.assertIsNone(validate_runtime_feature_policy(records + [scratch], RuntimeFeaturePolicy(),
                                   MovementEvidence.REQUIRED))
-                self.assertIn("static", validate_runtime_feature_policy(records, "",
+                self.assertIn("static", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
                               MovementEvidence.FORBIDDEN) or "")
                 for omitted in range(3):
                     partial = records[:omitted] + records[omitted + 1:]
                     self.assertIn("committed physical", validate_runtime_feature_policy(
-                        partial, "", MovementEvidence.REQUIRED) or "")
+                        partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
                 # Pairing a copy from one participant/request with another's
                 # apply can fabricate a transaction that never completed.
                 for field, value in (("device", f"{backend}:1"), ("rank", 1),
@@ -280,25 +279,25 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                                      ("tags", {"launch_count": "768"})):
                     mismatched = [records[0] | {field: value}, *records[1:]]
                     self.assertIn("committed physical", validate_runtime_feature_policy(
-                        mismatched, "", MovementEvidence.REQUIRED) or "")
+                        mismatched, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
                 for invalid in (0, -1, float("nan"), float("inf"), "invalid"):
                     incomplete = [records[0] | {"value": invalid}, *records[1:]]
                     self.assertIn("committed physical", validate_runtime_feature_policy(
-                        incomplete, "", MovementEvidence.REQUIRED) or "")
+                        incomplete, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
 
     def test_runtime_features_certify_device_overlay_commits_symmetrically(self) -> None:
         """The sole overlay authority emits a completed transaction/edge/byte trio."""
         for backend in ("cuda", "rocm"):
             records = [record | {"device": backend + ":0"} for record in device_overlay_movement_records()]
             with self.subTest(backend=backend):
-                self.assertIsNone(validate_runtime_feature_policy(records, "",
+                self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
                     MovementEvidence.REQUIRED))
-                self.assertIn("static", validate_runtime_feature_policy(records, "",
+                self.assertIn("static", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
                     MovementEvidence.FORBIDDEN) or "")
                 for omitted in range(len(records)):
                     partial = records[:omitted] + records[omitted + 1:]
                     self.assertIn("committed physical", validate_runtime_feature_policy(
-                        partial, "", MovementEvidence.REQUIRED) or "")
+                        partial, RuntimeFeaturePolicy(), MovementEvidence.REQUIRED) or "")
 
     def test_device_overlay_completion_cannot_join_unrelated_transactions_or_ranks(self) -> None:
         """Global positive totals cannot fabricate one completed transaction."""
@@ -306,19 +305,19 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         for field, value in (("rank", 1), ("device", "another-domain"), ("phase", "prefill")):
             with self.subTest(field=field):
                 self.assertIsNotNone(validate_runtime_feature_policy(
-                    [records[0] | {field: value}, *records[1:]], "", MovementEvidence.REQUIRED))
+                    [records[0] | {field: value}, *records[1:]], RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
         for field, value in (("transaction", "4"), ("candidate_epoch", "5"), ("policy_owner", "host")):
             with self.subTest(field=field):
                 self.assertIsNotNone(validate_runtime_feature_policy(
                     [records[0] | {"tags": records[0]["tags"] | {field: value}}, *records[1:]],
-                    "", MovementEvidence.REQUIRED))
+                    RuntimeFeaturePolicy(), MovementEvidence.REQUIRED))
 
     def test_runtime_features_reject_device_overlay_proposals(self) -> None:
         """Submitted commands and prepared arrivals cannot certify a commit."""
         records = [counter(name, domain="moe_overlay_controller") for name in
                    ("dynamic_movement_commands", "prepared_arrival_descriptor_publications",
                     "physical_wave_parallel_operations_started")]
-        self.assertIn("committed physical", validate_runtime_feature_policy(records, "",
+        self.assertIn("committed physical", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),
             MovementEvidence.REQUIRED) or "")
 
     def test_runtime_features_reject_proposals_and_unapplied_payloads(self) -> None:
@@ -328,14 +327,14 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                      "device_rebalance_wave_applied_arrivals_total"):
             with self.subTest(name=name):
                 self.assertIn("committed physical", validate_runtime_feature_policy(
-                    [counter(name, domain="moe_rebalance")], "--moe-residency-maintenance dynamic", MovementEvidence.REQUIRED) or "")
+                    [counter(name, domain="moe_rebalance")], RuntimeFeaturePolicy(residency_maintenance="dynamic"), MovementEvidence.REQUIRED) or "")
 
     def test_runtime_features_static_rejects_movement(self) -> None:
         """Static keeps its negative movement obligation."""
-        self.assertIsNone(validate_runtime_feature_policy([], "--moe-residency-maintenance off", MovementEvidence.FORBIDDEN))
+        self.assertIsNone(validate_runtime_feature_policy([], RuntimeFeaturePolicy(), MovementEvidence.FORBIDDEN))
         self.assertIn("static", validate_runtime_feature_policy(
             [counter("expert_migration_edges", domain="moe_overlay_residency")],
-            "--moe-residency-maintenance=off", MovementEvidence.FORBIDDEN) or "")
+            RuntimeFeaturePolicy(), MovementEvidence.FORBIDDEN) or "")
 
     def test_runtime_features_reject_nonfinite_or_malformed_success(self) -> None:
         """Invalid diagnostic values cannot create accepted-token evidence."""
@@ -343,18 +342,17 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             with self.subTest(value=value):
                 records = [counter("draft_steps", domain="mtp"),
                            counter("accepted_tokens", domain="mtp", value=value)]
-                self.assertIn("attempted and accepted", validate_runtime_feature_policy(records, "--mtp", MovementEvidence.NOT_APPLICABLE) or "")
+                self.assertIn("attempted and accepted", validate_runtime_feature_policy(records, RuntimeFeaturePolicy(mtp=True), MovementEvidence.NOT_APPLICABLE) or "")
 
     def test_runtime_features_do_not_invent_unconfigured_requirements(self) -> None:
         """KV/weight flags are not activation of prefix or speculative state."""
-        self.assertIsNone(validate_runtime_feature_policy([], "--kv-cache-precision fp16 --mtp-max-draft-tokens 15", MovementEvidence.NOT_APPLICABLE))
+        self.assertIsNone(validate_runtime_feature_policy([], RuntimeFeaturePolicy(), MovementEvidence.NOT_APPLICABLE))
 
     def test_runtime_movement_obligation_is_not_inferred_from_defaults(self) -> None:
         """The same Dynamic CLI default has different typed topology obligations."""
-        flags = "--moe-residency-maintenance dynamic"
-        self.assertIsNone(validate_runtime_feature_policy([], flags, MovementEvidence.NOT_APPLICABLE))
-        self.assertIn("committed physical", validate_runtime_feature_policy([], flags, MovementEvidence.REQUIRED) or "")
-        self.assertIn("typed movement", validate_runtime_feature_policy([], flags, "not_applicable") or "")
+        self.assertIsNone(validate_runtime_feature_policy([], RuntimeFeaturePolicy(residency_maintenance="dynamic"), MovementEvidence.NOT_APPLICABLE))
+        self.assertIn("committed physical", validate_runtime_feature_policy([], RuntimeFeaturePolicy(residency_maintenance="dynamic"), MovementEvidence.REQUIRED) or "")
+        self.assertIn("typed movement", validate_runtime_feature_policy([], RuntimeFeaturePolicy(residency_maintenance="dynamic"), "not_applicable") or "")
 
     def test_prefix_http_scenario_seeds_changes_answer_then_repeats_exactly(self) -> None:
         """Execute the shell scenario with a request observer instead of a server."""
@@ -536,8 +534,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
 
         result = validate_flash_attention_plan_policy(
             [query, context],
-            "rocm:0",
-            "",
+            frozenset({'rocm'}),
         )
         self.assertIsNone(result.error)
         self.assertEqual(result.expected_backends, frozenset({"rocm"}))
@@ -580,8 +577,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
 
         result = validate_flash_attention_plan_policy(
             [record],
-            "rocm:0",
-            "",
+            frozenset({'rocm'}),
         )
         self.assertIn("geometry-selected", result.error or "")
 
@@ -592,92 +588,15 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
 
         result = validate_flash_attention_plan_policy(
             [],
-            "pp",
-            "--define-domain mixed=cuda:0,rocm:0",
+            frozenset({'cuda', 'rocm'}),
         )
         self.assertIn("cuda, rocm", result.error or "")
 
-    def test_overlay_attention_ownership_follows_base_domain_not_expert_tiers(self) -> None:
-        """GPU roles can reverse; an expert tier does not acquire attention."""
-        for owner, expert in (("cuda", "rocm"), ("rocm", "cuda"), ("cpu", "cuda")):
-            flags = shlex.join([
-                "--moe-routed-expert-placement", "tiered-overlay",
-                "--moe-routed-expert-continuation-domain", "model",
-                "--moe-routed-expert-domain", f"model=localhost:-1:{owner}:0;scope=auto",
-                "--moe-routed-expert-domain", f"experts=localhost:-1:{expert}:0;scope=auto",
-            ])
-            with self.subTest(owner=owner):
-                self.assertEqual(attention_device_kinds_for_cell("tp", flags), {owner})
-                evidence = validate_flash_attention_plan_policy([], "tp", flags)
-                if owner == "cpu":
-                    self.assertIsNone(evidence.error)
-                else:
-                    self.assertEqual(evidence.expected_backends, {owner})
-                    self.assertIn(f"capture plan for: {owner}", evidence.error or "")
 
-    def test_overlay_explicit_base_domain_owns_attention(self) -> None:
-        """Use the same explicit base-domain precedence as the engine plan."""
-        flags = shlex.join([
-            "--moe-routed-expert-placement", "tiered-overlay",
-            "--moe-routed-expert-continuation-domain", "continuation",
-            "--moe-routed-expert-base-model-domain=base",
-            "--define-domain", "base=localhost:0:rocm:0;scope=rank-local",
-            "--moe-routed-expert-domain", "continuation=localhost:0:cuda:0",
-        ])
-        self.assertEqual(attention_device_kinds_for_cell("tp", flags), {"rocm"})
 
-    def test_overlay_attention_joins_matching_domain_namespaces(self) -> None:
-        """General orchestration and expert placement may name the same domain."""
-        for kind in ("cpu", "cuda", "rocm"):
-            for joined_option in (False, True):
-                members = f"localhost:-1:{kind}:0,localhost:-1:{kind}:1"
-                flags = [
-                    "--moe-routed-expert-placement", "single-domain",
-                    "--moe-routed-expert-continuation-domain", "model",
-                    "--define-domain", f"model={members};scope=rank_local",
-                ]
-                expert_spec = f"model={members};routed_compute=apportioned"
-                flags += ([f"--moe-routed-expert-domain={expert_spec}"]
-                          if joined_option else ["--moe-routed-expert-domain", expert_spec])
-                with self.subTest(kind=kind, joined_option=joined_option):
-                    self.assertEqual(
-                        attention_device_kinds_for_cell("tp", shlex.join(flags)),
-                        {kind},
-                    )
 
-    def test_overlay_attention_rejects_duplicate_within_one_namespace(self) -> None:
-        """Cross-namespace corroboration must not admit duplicate definitions."""
-        for option in ("--define-domain", "--moe-routed-expert-domain"):
-            flags = [
-                "--moe-routed-expert-placement", "single-domain",
-                "--moe-routed-expert-continuation-domain", "model",
-                option, "model=cuda:0,cuda:1",
-                option, "model=cuda:0,cuda:1",
-            ]
-            with self.subTest(option=option), self.assertRaises(ValueError):
-                attention_device_kinds_for_cell("tp", shlex.join(flags))
 
-    def test_overlay_attention_rejects_conflicting_cross_namespace_membership(self) -> None:
-        """Backend kind alone cannot authenticate participant identity or order."""
-        for members in ("cuda:0,cuda:2", "cuda:1,cuda:0", "rocm:0,rocm:1"):
-            flags = [
-                "--moe-routed-expert-placement", "single-domain",
-                "--moe-routed-expert-continuation-domain", "model",
-                "--define-domain", "model=cuda:0,cuda:1",
-                "--moe-routed-expert-domain", f"model={members}",
-            ]
-            with self.subTest(members=members), self.assertRaises(ValueError):
-                attention_device_kinds_for_cell("tp", shlex.join(flags))
 
-    def test_overlay_attention_ownership_rejects_missing_and_ambiguous_domains(self) -> None:
-        """Missing evidence cannot silently reclassify a continuation as expert-only."""
-        prefix = "--moe-routed-expert-placement tiered-overlay"
-        for suffix in ("", " --moe-routed-expert-continuation-domain",
-                       " --moe-routed-expert-continuation-domain absent",
-                       " --moe-routed-expert-continuation-domain model --moe-routed-expert-domain model=auto",
-                       " --moe-routed-expert-continuation-domain model --moe-routed-expert-domain model=cuda:0 --define-domain model=rocm:0"):
-            with self.subTest(suffix=suffix):
-                self.assertIn("attention", validate_flash_attention_plan_policy([], "tp", prefix + suffix).error or "")
 
     def test_cpu_flash_attention_policy_accepts_both_physical_modes(
         self,
@@ -1779,8 +1698,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             encoding="utf-8"
         )
         for marker in (
-            'flag_value("--mtp-verify-mode") != "speculative-sampling"',
-            'flag_value("--mtp-depth-policy") != "dynamic"',
+            'features.mtp_verify_mode != "speculative-sampling"',
+            'features.mtp_depth_policy != "dynamic"',
             'record.get("name") == "stochastic_accept_tests"',
             'get("device_resident") == "true"',
             '"stochastic_verify_request_batch_outcomes"',
@@ -1873,16 +1792,6 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertLess(health_wait, health_pass)
         self.assertLess(health_pass, stochastic_probe)
 
-    def test_device_kind_parser_covers_all_matrix_domain_syntaxes(self) -> None:
-        flags = (
-            "--tp-devices cuda:0,cuda:1 "
-            "--define-domain stage=rocm:0,rocm:1;backend=rccl "
-            "--moe-routed-expert-domain cold=0:cpu:0,1:cpu:0;scope=node_local"
-        )
-        self.assertEqual(
-            device_kinds_for_cell("tp", flags),
-            frozenset({"cuda", "rocm", "cpu"}),
-        )
 
     def test_homogeneous_full_graph_passes(self) -> None:
         records = [
@@ -1910,8 +1819,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices rocm:0,rocm:1",
+            frozenset({'rocm'}),
         )
         self.assertIsNone(result.error)
         self.assertTrue(result.has_full_graph_plan)
@@ -1953,8 +1861,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
             require_prefill_lifecycle=True,
         )
         self.assertIn("missing phases: replay", result.error or "")
@@ -1988,8 +1895,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         )
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices rocm:0,rocm:1",
+            frozenset({'rocm'}),
             require_prefill_lifecycle=True,
         )
         self.assertIsNone(result.error)
@@ -2004,12 +1910,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                        "capture_phase": "materialized_without_launch"}),
                    counter("prefill_graph_phase", tags={"bucket_seq_len": "256", "capture_phase": "replay"})]
         for backend in ("cuda", "rocm"):
-            self.assertIsNone(validate_graph_capture_policy(records, backend, "", require_prefill_lifecycle=True).error)
+            self.assertIsNone(validate_graph_capture_policy(records, frozenset({backend.split(":")[0]}), require_prefill_lifecycle=True).error)
         records[-1]["tags"]["bucket_seq_len"] = "512"
-        self.assertIn("capture", validate_graph_capture_policy(records, "cuda", "", require_prefill_lifecycle=True).missing_prefill_phases)
+        self.assertIn("capture", validate_graph_capture_policy(records, frozenset({'cuda'}), require_prefill_lifecycle=True).missing_prefill_phases)
         records[-1]["tags"]["bucket_seq_len"] = "256"
         records.append(counter("prefill_graph_phase", tags={"capture_phase": "warmup"}))
-        self.assertIn("retired eager warmup", validate_graph_capture_policy(records, "cuda", "", require_prefill_lifecycle=True).error)
+        self.assertIn("retired eager warmup", validate_graph_capture_policy(records, frozenset({'cuda'}), require_prefill_lifecycle=True).error)
 
     def test_native_setup_shapes_are_not_inference_invocations(self) -> None:
         """Unused materializations never demand synthetic inference to certify."""
@@ -2045,19 +1951,19 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                             tags={"context": "main_decode"}),
                     counter("decode_graph_phase", value=1532, device=device,
                             tags={"context": "main_decode", "phase": "replay"})]
-            self.assertIsNone(validate_graph_capture_policy(rows, device, "").error)
-            self.assertIn("missing launch", validate_graph_capture_policy(rows[:-1], device, "").error)
+            self.assertIsNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
+            self.assertIn("missing launch", validate_graph_capture_policy(rows[:-1], frozenset({device.split(":")[0]})).error)
             for field, bad in (("context", "unrelated"), ("type", "captured_child_template"),
                                ("source", "segmented_graph_capture")):
                 changed = copy.deepcopy(rows)
                 changed[1]["tags"][field] = bad
-                self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
+                self.assertIsNotNone(validate_graph_capture_policy(changed, frozenset({device.split(":")[0]})).error)
             changed = copy.deepcopy(rows)
             changed[1]["value"] = 0
-            self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
+            self.assertIsNotNone(validate_graph_capture_policy(changed, frozenset({device.split(":")[0]})).error)
             changed = copy.deepcopy(rows)
             changed[1]["domain"] = "unrelated"
-            self.assertIsNotNone(validate_graph_capture_policy(changed, device, "").error)
+            self.assertIsNotNone(validate_graph_capture_policy(changed, frozenset({device.split(":")[0]})).error)
 
     def test_native_materialization_count_cannot_mask_another_owner_or_launch(self) -> None:
         """Rank/context identity and exact counts prevent over-crediting setup."""
@@ -2082,9 +1988,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                    counter("full_graph_capture_executable_nodes", value=31, tags={
                        "context": "main_verifier", "source": "full_graph_capture", "type": "materialized_unlaunched_executable"}),
                    counter("decode_graph_phase", value=10, tags={"context": "main_verifier", "phase": "replay"})]
-        self.assertIsNone(validate_graph_capture_policy(records, "rocm", "").error)
+        self.assertIsNone(validate_graph_capture_policy(records, frozenset({'rocm'})).error)
         records[2]["tags"]["context"] = "main_decode"
-        self.assertIn("main_verifier", validate_graph_capture_policy(records, "rocm", "").error)
+        self.assertIn("main_verifier", validate_graph_capture_policy(records, frozenset({'rocm'})).error)
 
     def test_helper_executable_cannot_mask_legacy_verifier_warmup(self) -> None:
         """Context attribution must expose a verifier using retired eager warmup."""
@@ -2119,8 +2025,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "cuda:0",
-            "",
+            frozenset({'cuda'}),
         )
         self.assertIn("main_verifier", result.error or "")
         self.assertEqual(len(result.incomplete_contexts), 1)
@@ -2147,7 +2052,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 },
             ),
         ]
-        result = validate_graph_capture_policy(records, "rocm:0", "")
+        result = validate_graph_capture_policy(records, frozenset({'rocm'}))
         self.assertIn("context-matched executable", result.error or "")
 
     def test_repeated_mtp_sidecar_rebuilds_fail(self) -> None:
@@ -2190,8 +2095,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
         )
         self.assertIn("rebuilt graph 32 times", result.error or "")
         self.assertEqual(len(result.incomplete_contexts), 1)
@@ -2245,8 +2149,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
         )
         self.assertIsNone(result.error)
         self.assertEqual(result.incomplete_contexts, ())
@@ -2289,7 +2192,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 },
             ),
         ]
-        result = validate_graph_capture_policy(records, "cuda:0", "")
+        result = validate_graph_capture_policy(records, frozenset({'cuda'}))
         self.assertIn("rebuilt graph 2 times", result.error or "")
         self.assertEqual(
             result.incomplete_contexts,
@@ -2308,8 +2211,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
         )
         self.assertIn(
             "non-empty instantiated GPU graph executable",
@@ -2329,8 +2231,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
         )
         self.assertIn("forbidden for a homogeneous", result.error or "")
 
@@ -2353,8 +2254,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices rocm:0,rocm:1",
+            frozenset({'rocm'}),
         )
         self.assertTrue(result.has_segmented_execution)
         self.assertIn("forbidden for a homogeneous", result.error or "")
@@ -2385,8 +2285,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            "--tp-devices cuda:0,cuda:1",
+            frozenset({'cuda'}),
         )
         self.assertIsNone(result.error)
         self.assertFalse(result.has_segmented_execution)
@@ -2401,11 +2300,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "pp",
-            (
-                "--define-domain cuda_pp=cuda:0 "
-                "--define-domain rocm_pp=rocm:0"
-            ),
+            frozenset({'cuda', 'rocm'}),
         )
         self.assertIn("runtime-proven collective", result.error or "")
 
@@ -2435,13 +2330,13 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         """PP coordination is not an in-child collective on either GPU vendor."""
         for device in ("cuda:0", "rocm:0"):
             rows = self.pipeline_boundary_records(device)
-            result = validate_graph_capture_policy(rows, "pp", f"{device} cpu:0")
+            result = validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"}))
             self.assertIsNone(result.error)
             self.assertTrue(result.has_pipeline_boundary_evidence)
             self.assertFalse(result.has_collective_evidence)
             without_executable = [r for r in rows if r["name"] != "full_graph_capture_executable_nodes"]
-            self.assertIsNotNone(validate_graph_capture_policy(without_executable, "pp", f"{device} cpu:0").error)
-            self.assertIsNotNone(validate_graph_capture_policy(rows, "pp", f"{device}").error)
+            self.assertIsNotNone(validate_graph_capture_policy(without_executable, frozenset({device.split(":")[0], "cpu"})).error)
+            self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
 
     def test_pipeline_boundary_rejects_incomplete_or_cross_rank_evidence(self) -> None:
         """A policy tag or a neighboring rank cannot certify missing PP work."""
@@ -2463,7 +2358,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 # Even a nested TP child's valid collective cannot hide an
                 # incomplete outer pipeline lifecycle.
                 rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
-                self.assertIsNotNone(validate_graph_capture_policy(rows, "pp", "cuda:0 cpu:0").error)
+                self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'cpu'})).error)
 
     @classmethod
     def overlay_boundary_records(cls, device: str = "cuda:0", rank: int = 0,
@@ -2510,9 +2405,8 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     for phase in ("decode", "mtp"):
                         with self.subTest(device=device, rank=rank, native=native, host=host, phase=phase):
                             rows = self.overlay_boundary_records(device, rank, native, host, phase)
-                            flags = f"{device} " + ("cpu:0" if host else "cuda:0 rocm:0")
                             result = validate_graph_capture_policy(
-                                rows, "tp", flags, decode_requirement=DecodeGraphRequirement.REPLAY)
+                                rows, frozenset({device.split(":")[0], "cpu"} if host else {"cuda", "rocm"}), decode_requirement=DecodeGraphRequirement.REPLAY)
                             self.assertIsNone(result.error)
                             self.assertTrue(result.has_overlay_boundary_evidence)
                             self.assertFalse(result.has_collective_evidence)
@@ -2549,7 +2443,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 # A child's TP counter must not hide a broken outer boundary.
                 rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
                 self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
-                    rows, "tp", "cuda:0 cpu:0").error or "")
+                    rows, frozenset({'cuda', 'cpu'})).error or "")
 
     def test_overlay_boundary_distinguishes_many_sequences_in_one_command(self) -> None:
         """Four-row prefill and ticketed MTP retire sequences, not commands.
@@ -2568,30 +2462,29 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                         additional = copy.deepcopy(original)
                         additional["tags"]["sequence"] = str(sequence)
                         rows.append(additional)
-                    flags = f"{device} cpu:0"
-                    self.assertIsNone(validate_graph_capture_policy(rows, "tp", flags).error)
+                    self.assertIsNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"})).error)
                     # Distinct commands cannot recycle a sequence either.
                     duplicate = copy.deepcopy(rows[-1])
                     duplicate["tags"]["command"] = "99"
                     rows.append(duplicate)
                     self.assertIn("Incomplete ExpertOverlay", validate_graph_capture_policy(
-                        rows, "tp", flags).error or "")
+                        rows, frozenset({device.split(":")[0], "cpu"})).error or "")
 
     def test_overlay_boundary_keeps_native_executable_and_topology_obligations(self) -> None:
         """A retired command cannot certify missing GPU execution or eager work."""
         for device in ("cuda:0", "rocm:0"):
             rows = self.overlay_boundary_records(device)
-            self.assertIn("homogeneous", validate_graph_capture_policy(rows, device, "").error or "")
+            self.assertIn("homogeneous", validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error or "")
             for missing in ("retained_parent_executable_nodes", "retained_parent_transaction_zero_launches",
                             "retained_parent_replays"):
                 with self.subTest(device=device, missing=missing):
                     incomplete = [row for row in rows if row["name"] != missing]
                     self.assertIn("lifecycle", validate_graph_capture_policy(
-                        incomplete, "tp", f"{device} cpu:0").error or "")
+                        incomplete, frozenset({device.split(":")[0], "cpu"})).error or "")
             rows.append(dict(counter("decode_graph_phase", device=device,
                 tags={"context": "main_verifier", "phase": "warmup"}), rank=0))
             self.assertIn("eager warmup", validate_graph_capture_policy(
-                rows, "tp", f"{device} cpu:0").error or "")
+                rows, frozenset({device.split(":")[0], "cpu"})).error or "")
 
     @classmethod
     def local_ticket_boundary_records(cls, device: str = "cuda:0", rank: int = 0) -> list[dict]:
@@ -2619,7 +2512,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             for rank in (0, 1):
                 with self.subTest(device=device, rank=rank):
                     result = validate_graph_capture_policy(self.local_ticket_boundary_records(device, rank),
-                        "tp", f"{device} cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY)
+                        frozenset({device.split(":")[0], "cpu"}), decode_requirement=DecodeGraphRequirement.REPLAY)
                     self.assertIsNone(result.error)
                     self.assertTrue(result.has_overlay_boundary_evidence)
                     self.assertFalse(result.has_collective_evidence)
@@ -2644,13 +2537,37 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 rows = self.local_ticket_boundary_records()
                 mutate(rows)
                 rows.append(counter("decode_capture_policy", tags={"has_collectives": "true"}))
-                self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 cpu:0").error)
+                self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'cpu'})).error)
 
     def test_rank_local_ticket_boundary_never_permits_homogeneous_segmentation(self) -> None:
         """Even valid CPU-service records cannot change the requested topology."""
         for device in ("cuda:0", "rocm:0"):
             self.assertIn("homogeneous", validate_graph_capture_policy(
-                self.local_ticket_boundary_records(device), device, "").error or "")
+                self.local_ticket_boundary_records(device), frozenset({device.split(":")[0]})).error or "")
+
+    def test_mtp_first_launch_must_publish_its_own_ticket_inventory(self) -> None:
+        """Setup and replay cannot lend service evidence to an incomplete first launch.
+
+        MTP can capture and submit on first use, unlike setup-only prefill. The
+        controller and executor must export the same inventory for both paths.
+        Keep a valid ordinary family alongside MTP so it cannot mask the defect.
+        """
+        for device in ("cuda:0", "rocm:0"):
+            for context in ("main_verifier", "mtp_decode_sidecar_device_target_token_live_position"):
+                for missing in ("ticket_service_units", "boundary_authority", "child_units"):
+                    with self.subTest(device=device, context=context, missing=missing):
+                        ordinary = self.local_ticket_boundary_records(device)
+                        mtp = copy.deepcopy(ordinary)
+                        for row in mtp:
+                            row["tags"]["context"] = context
+                        self.assertIsNone(validate_graph_capture_policy(
+                            ordinary + mtp, frozenset({device.split(":")[0], "cpu"})).error)
+                        for row in mtp:
+                            if row["name"] == "retained_parent_transaction_zero_launches":
+                                del row["tags"][missing]
+                        self.assertIn("Incomplete ExpertOverlay graph boundary",
+                            validate_graph_capture_policy(
+                                ordinary + mtp, frozenset({device.split(":")[0], "cpu"})).error or "")
 
     def test_decode_replay_gate_uses_native_family_and_not_prefill_or_sidecar(self) -> None:
         """One graph policy owns replay validation for every executable family."""
@@ -2664,14 +2581,14 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     else:
                         rows = self.pipeline_boundary_records(device)
                     self.assertIsNone(validate_graph_capture_policy(
-                        rows, "tp", f"{device} cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY).error)
+                        rows, frozenset({device.split(":")[0], "cpu"}), decode_requirement=DecodeGraphRequirement.REPLAY).error)
                     for context in ("prefill_bucket", "mtp_decode_sidecar"):
                         unrelated = copy.deepcopy(rows)
                         for row in unrelated:
                             if "context" in row["tags"]:
                                 row["tags"]["context"] = context
                         self.assertIn("no context-matched decode", validate_graph_capture_policy(
-                            unrelated, "tp", f"{device} cpu:0",
+                            unrelated, frozenset({device.split(":")[0], "cpu"}),
                             decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
 
     def test_unused_retained_family_does_not_satisfy_required_decode_replay(self) -> None:
@@ -2679,9 +2596,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         rows = [row for row in self.overlay_boundary_records()
                 if row["name"] not in {"decode_capture_policy", "retained_parent_replays",
                                        "retained_parent_transaction_zero_launches"}]
-        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "cuda:0 cpu:0").error)
+        self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'cpu'})).error)
         self.assertIn("expected context-matched decode", validate_graph_capture_policy(
-            rows, "tp", "cuda:0 cpu:0", decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
+            rows, frozenset({'cuda', 'cpu'}), decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
 
     def test_short_probe_still_requires_decode_capture_not_only_a_plan(self) -> None:
         """Consolidation preserves the shell's unconditional GPU capture gate."""
@@ -2690,16 +2607,16 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                         tags={"context": "main_decode", "source": "full_graph_capture",
                               "type": "captured_executable"})]
         self.assertIn("no context-matched decode", validate_graph_capture_policy(
-            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.CAPTURE).error or "")
+            rows, frozenset({'cuda'}), decode_requirement=DecodeGraphRequirement.CAPTURE).error or "")
         rows.append(counter("decode_graph_phase", tags={"context": "main_decode", "phase": "capture"}))
         self.assertIsNone(validate_graph_capture_policy(
-            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.CAPTURE).error)
+            rows, frozenset({'cuda'}), decode_requirement=DecodeGraphRequirement.CAPTURE).error)
         self.assertIn("expected context-matched decode", validate_graph_capture_policy(
-            rows, "cuda:0", "", decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
+            rows, frozenset({'cuda'}), decode_requirement=DecodeGraphRequirement.REPLAY).error or "")
 
     @staticmethod
     def segmented_executable_records(device: str, rank: int = 1,
-                                     context: str = "main_decode") -> list[dict]:
+                                     context: str = "main_decode", family: int = 1) -> list[dict]:
         """Reduce the real mixed-vendor TP artifact to two captured segments.
 
         Setup instantiates both units without executing arithmetic. Transaction
@@ -2714,10 +2631,10 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 counter("decode_graph_phase", value=3, device=device,
                         tags={"context": context, "phase": "replay"}),
                 counter("materialized_graph_transaction_zero_launches", device=device,
-                        tags={"context": context, "segments": "3"})]
+                        tags={"context": context, "segments": "3", "executable_family": str(family)})]
         for first, last in (("embedding", "router"), ("ffn", "output")):
             tags = {"context": context, "first_stage": first,
-                    "last_stage": last, "stage_count": "2"}
+                    "last_stage": last, "stage_count": "2", "executable_family": str(family)}
             rows += [counter("segmented_graph_capture_executable_nodes", value=8,
                              device=device, tags=tags | {
                                  "source": "segmented_graph_capture",
@@ -2733,7 +2650,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 for context in ("main_decode", "prefill_bucket"):
                     with self.subTest(device=device, rank=rank, context=context):
                         rows = self.segmented_executable_records(device, rank, context)
-                        result = validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0")
+                        result = validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'}))
                         self.assertIsNone(result.error)
                         self.assertTrue(result.has_segmented_execution)
                         self.assertFalse(result.has_nonempty_full_graph_executable)
@@ -2747,7 +2664,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 with self.subTest(device=device, missing=missing):
                     rows = self.segmented_executable_records(device)
                     rows.remove(next(row for row in rows if row["name"] == missing))
-                    self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error)
             for field, value in (("rank", 0), ("device", "rocm:7"),
                                  ("context", "unrelated_helper"), ("source", "full_graph_capture"),
                                  ("first_stage", "different"), ("last_stage", "different"),
@@ -2758,7 +2675,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     rows = self.segmented_executable_records(device)
                     node = next(row for row in rows if row["name"] == "segmented_graph_capture_executable_nodes")
                     (node if field in {"rank", "device", "value"} else node["tags"])[field] = value
-                    self.assertIsNotNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error)
 
     def test_unused_segmented_family_needs_no_synthetic_launch(self) -> None:
         """Setup counts are physical units/shapes, never inference invocations."""
@@ -2768,22 +2685,71 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 and row["tags"].get("phase") != "replay"]
         rows.append(counter("decode_collective_graph_capture_policy",
                             tags={"has_collectives": "true"}))
-        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error)
+        self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error)
 
     def test_each_segment_replays_after_repeated_execution(self) -> None:
         """Repeated context submissions cannot borrow one neighbor's launches."""
         rows = self.segmented_executable_records("rocm:0")
         next(row for row in rows if row["name"] == "segmented_replay_segments")["value"] = 1
-        self.assertIn("missing replay", validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error or "")
+        self.assertIn("missing replay", validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error or "")
+
+    def test_segment_families_separate_unused_setup_from_live_variants(self) -> None:
+        """Unused setup tails do not inherit another variant's live obligation."""
+        for device in ("cuda:0", "rocm:0"):
+            with self.subTest(device=device):
+                live = self.segmented_executable_records(device, context="main_verifier", family=7)
+                unused = [row for row in self.segmented_executable_records(
+                    device, context="main_verifier", family=8)
+                    if row["name"] == "segmented_graph_capture_executable_nodes"]
+                unused[-1]["tags"]["last_stage"] = "unused_vocabulary_head"
+                rows = live + unused
+                self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'cpu', device.split(':')[0]})).error)
+                # A real launch must retain its own family, even if all stage
+                # names happen to match a neighboring prebuilt executable.
+                launch = next(row for row in live if row["name"] == "segmented_replay_segments")
+                launch["tags"]["executable_family"] = "8"
+                self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error)
+
+    def test_segment_family_identity_and_initial_submission_are_mandatory(self) -> None:
+        """Missing, malformed and borrowed family identities all fail closed."""
+        for name in ("segmented_graph_capture_executable_nodes", "segmented_replay_segments",
+                     "materialized_graph_transaction_zero_launches"):
+            for family in (None, "0", "-1", "bad", "1.0", str(1 << 64), "99"):
+                with self.subTest(name=name, family=family):
+                    rows = self.segmented_executable_records("rocm:0")
+                    tags = next(row["tags"] for row in rows if row["name"] == name)
+                    if family is None:
+                        del tags["executable_family"]
+                    else:
+                        tags["executable_family"] = family
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({'cpu', 'rocm'})).error)
+
+    def test_segmented_sidecar_uses_its_physical_family_proof(self) -> None:
+        """Remote MTP may segment only at a declared heterogeneous boundary."""
+        for device in ("cuda:0", "rocm:0"):
+            context = "mtp_decode_sidecar_device_target_token_live_position"
+            rows = self.segmented_executable_records(device, context=context)
+            rows.append(dict(counter("sidecar_graph_capture_path", value=4, device=device,
+                tags={"context": "caller_alias", "graph_context": context,
+                      "seq_len": "1", "path": "segmented"}), rank=1))
+            kinds = frozenset({'cpu', device.split(':')[0]})
+            self.assertIsNone(validate_graph_capture_policy(rows, kinds).error)
+            self.assertIn("homogeneous", validate_graph_capture_policy(
+                rows, frozenset({device.split(':')[0]})).error or "")
+            for name in ("segmented_graph_capture_executable_nodes", "segmented_replay_segments",
+                         "materialized_graph_transaction_zero_launches"):
+                broken = copy.deepcopy(rows)
+                broken.remove(next(row for row in broken if row["name"] == name))
+                self.assertIsNotNone(validate_graph_capture_policy(broken, kinds).error)
 
     def test_segment_proof_cannot_hide_eager_or_homogeneous_execution(self) -> None:
         """Physical segments are not permission to change the topology policy."""
         for device in ("cuda:0", "rocm:0"):
             rows = self.segmented_executable_records(device)
-            self.assertIn("homogeneous", validate_graph_capture_policy(rows, device, "").error or "")
+            self.assertIn("homogeneous", validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error or "")
             rows.append(dict(counter("decode_graph_phase", device=device,
                 tags={"context": "main_decode", "phase": "warmup"}), rank=1))
-            self.assertIn("eager warmup", validate_graph_capture_policy(rows, "tp", "cuda:0 rocm:0").error or "")
+            self.assertIn("eager warmup", validate_graph_capture_policy(rows, frozenset({'cuda', 'rocm'})).error or "")
 
     @staticmethod
     def retained_parent_records(device: str, rank: int = 1) -> list[dict]:
@@ -2813,7 +2779,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             for rank in (0, 1):
                 with self.subTest(device=device, rank=rank):
                     rows = self.retained_parent_records(device, rank)
-                    result = validate_graph_capture_policy(rows, "tp", f"--tp-devices {device},cpu:0")
+                    result = validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"}))
                     self.assertIsNone(result.error)
 
     def test_retained_parent_requires_its_own_nodes_and_launches(self) -> None:
@@ -2826,7 +2792,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     rows = [row for row in self.retained_parent_records(device) if row["name"] != missing]
                     rows.append(dict(counter("retained_parent_child_graph_nodes", value=2781,
                         device=device, tags={"context": "main_verifier"}), rank=1))
-                    result = validate_graph_capture_policy(rows, "tp", f"--tp-devices {device},cpu:0")
+                    result = validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"}))
                     self.assertIsNotNone(result.error)
             for field, value in (("rank", 0), ("device", "rocm:7"), ("context", "unrelated_helper")):
                 with self.subTest(device=device, field=field):
@@ -2837,7 +2803,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                     else:
                         nodes[field] = value
                     self.assertIsNotNone(validate_graph_capture_policy(
-                        rows, "tp", f"--tp-devices {device},cpu:0").error)
+                        rows, frozenset({device.split(":")[0], "cpu"})).error)
 
     def test_retained_parent_sidecar_requires_matching_physical_parent(self) -> None:
         """Logical sidecar aliases use native parent's replay evidence, not plain execution."""
@@ -2845,10 +2811,10 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         rows.append(dict(counter("sidecar_graph_capture_path", value=4, domain="mtp", device="rocm:0",
             tags={"context": "logical_alias", "graph_context": "main_verifier",
                   "seq_len": "1", "path": "retained_parent"}), rank=1))
-        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "rocm:0 cpu:0").error)
+        self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'rocm', 'cpu'})).error)
         rows[-1]["tags"]["graph_context"] = "foreign_parent"
         self.assertIn("no matching certified retained parent",
-                      validate_graph_capture_policy(rows, "tp", "rocm:0 cpu:0").error or "")
+                      validate_graph_capture_policy(rows, frozenset({'rocm', 'cpu'})).error or "")
 
     def test_unused_retained_family_requires_no_synthetic_launch(self) -> None:
         """Multiple setup shapes are not repeated inference invocations."""
@@ -2859,15 +2825,15 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             row["value"] *= 2
         rows.append(dict(counter("decode_collective_graph_capture_policy", device="cuda:0",
             tags={"has_collectives": "true"}), rank=1))
-        self.assertIsNone(validate_graph_capture_policy(rows, "tp", "cuda:0 cpu:0").error)
+        self.assertIsNone(validate_graph_capture_policy(rows, frozenset({'cuda', 'cpu'})).error)
 
     def test_retained_parent_cannot_hide_homogeneous_segmentation_or_warmup(self) -> None:
         for device in ("cuda:0", "rocm:0"):
             rows = self.retained_parent_records(device)
-            self.assertIn("homogeneous", validate_graph_capture_policy(rows, device, "").error or "")
+            self.assertIn("homogeneous", validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error or "")
             rows.append(dict(counter("decode_graph_phase", device=device,
                 tags={"context": "main_verifier", "phase": "warmup"}), rank=1))
-            self.assertIn("eager warmup", validate_graph_capture_policy(rows, "tp", f"{device} cpu:0").error or "")
+            self.assertIn("eager warmup", validate_graph_capture_policy(rows, frozenset({device.split(":")[0], "cpu"})).error or "")
 
     def test_heterogeneous_collective_segmentation_passes(self) -> None:
         records = [
@@ -2882,13 +2848,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         ]
         result = validate_graph_capture_policy(
             records,
-            "tp",
-            (
-                "--moe-routed-expert-domain "
-                "hot=cuda:0,cuda:1;scope=rank_local "
-                "--moe-routed-expert-domain "
-                "cold=0:cpu:0,1:cpu:0;scope=node_local"
-            ),
+            frozenset({'cuda', 'cpu'}),
         )
         self.assertIsNone(result.error)
         self.assertTrue(result.heterogeneous_device_mix)
@@ -2897,8 +2857,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
     def test_gpu_cell_without_any_replay_plan_fails(self) -> None:
         result = validate_graph_capture_policy(
             [],
-            "cuda:0",
-            "",
+            frozenset({'cuda'}),
         )
         self.assertIn("neither a full-graph plan", result.error or "")
 

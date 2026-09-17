@@ -354,12 +354,12 @@ namespace llaminar2
      * geometry, stale grants, unsupported paths and arithmetic overflow remain
      * fatal rather than being disguised as a smaller cache candidate.
      */
-    class MoEOverlayCapacityExhausted final : public std::invalid_argument
+    class MoEOverlayCapacityExhausted final : public PhysicalMemoryCapacityExhausted
     {
     public:
         /** @brief Preserve the exact limiting-resource diagnostic. */
         explicit MoEOverlayCapacityExhausted(const std::string &message)
-            : std::invalid_argument(message) {}
+            : PhysicalMemoryCapacityExhausted(message) {}
     };
 
     /** @brief Immutable capacity result consumed by placement and admission. */

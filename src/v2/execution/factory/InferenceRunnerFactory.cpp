@@ -1,6 +1,10 @@
 /**
  * @file InferenceRunnerFactory.cpp
  * @brief Factory implementation for creating IInferenceRunner instances
+ *
+ * The factory constructs participant-local full-model or PP-shard graphs.
+ * Rank/global orchestrators own multi-device composition and inject contexts;
+ * a DeviceGraphOrchestrator cannot own an embedded multi-stage pipeline.
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -31,7 +35,6 @@
 #include "../../collective/GlobalTPContext.h"
 #include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
-#include "../../config/PipelineConfig.h"
 #include "../../config/TensorParallelConfig.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
@@ -70,6 +73,23 @@
 
 namespace llaminar2
 {
+    void FactoryPPStageConfig::requireValidForModel(IModelContext &model) const
+    {
+        const auto loader = model.loader();
+        if (!loader)
+            throw std::invalid_argument("Pipeline stage validation requires complete model metadata");
+
+        // blockCount() can be a PP-local override. Only the total model count
+        // plus the canonical next-N manifest identifies the global main range.
+        const int main_layer_count = mainLayerCountExcludingMTP(
+            *loader, model.architecture(), model.totalBlockCount());
+        if (!isValid() || main_layer_count <= 0 || last_layer > main_layer_count)
+            throw std::invalid_argument("Pipeline stage layer range is outside the main model");
+        if (has_embedding && first_layer != 0)
+            throw std::invalid_argument("Pipeline embedding owner must begin at model layer zero");
+        if (has_lm_head && last_layer != main_layer_count)
+            throw std::invalid_argument("Pipeline vocabulary owner must end at the last main model layer");
+    }
 
     // Forward declarations of factory helpers
     static std::unique_ptr<IInferenceRunner> createDeviceGraphOrchestratorImpl(
@@ -586,6 +606,20 @@ namespace llaminar2
             return 0;
         }
 
+        /**
+         * @brief Bind dense continuation contexts from the resolved overlay domains.
+         * @param graph_config Participant graph whose borrowed context map is populated.
+         * @param owned_domain_tp_contexts Rank-local owners retaining created contexts.
+         * @param runner_mpi_ctx Admitted execution membership, never discovery WORLD.
+         * @param log_prefix Existing runner diagnostic identity.
+         * @param runner_config Optional injected context with its established ownership.
+         * @return Whether all required contexts are bound and retained.
+         *
+         * Domain scope is already resolved before graph construction. Forward it
+         * unchanged to the context factory; a transport name or hostname cannot
+         * reconstruct rank/node membership here. Graph stages borrow the owners
+         * in owned_domain_tp_contexts and never initiate their own discovery.
+         */
         bool populateMoEContinuationDomainTPContextsForGraph(
             GraphConfig &graph_config,
             DomainTPContextMap &owned_domain_tp_contexts,
@@ -598,7 +632,9 @@ namespace llaminar2
                 return true;
 
             ITPContext *injected_tp_context = runner_config ? runner_config->tp_ctx : nullptr;
-            MPI_Comm base_comm = runner_mpi_ctx ? runner_mpi_ctx->communicator() : MPI_COMM_WORLD;
+            // Local TP needs no MPI base; cross-rank creation must receive its
+            // exact admitted namespace, never a guessed launcher-wide world.
+            MPI_Comm base_comm = runner_mpi_ctx ? runner_mpi_ctx->communicator() : MPI_COMM_NULL;
 
             for (const auto &domain_name : denseMoEDomainNames(*plan))
             {
@@ -623,7 +659,7 @@ namespace llaminar2
                 if (owned_domain_tp_contexts.find(domain_name) == owned_domain_tp_contexts.end())
                 {
                     auto participation = denseDomainParticipation(*domain, runner_mpi_ctx);
-                    auto ctx = TPContextFactory::createFromDomain(participation, base_comm);
+                    auto ctx = TPContextFactory::createFromDomain(participation, domain->scope, base_comm);
                     if (!ctx)
                     {
                         LOG_WARN(log_prefix << " failed to create TP context for MoE continuation dense domain '"
@@ -898,7 +934,8 @@ namespace llaminar2
         /// Compute source geometry for all weights loaded by this rank.
         EagerLoadSourceGeometry computeEagerLoadSourceGeometry(
             const GGUFModel &model,
-            const std::vector<std::pair<std::string, bool>> &weights_to_load)
+            const std::vector<std::pair<std::string, bool>> &weights_to_load,
+            const std::vector<const char *> &global_weights)
         {
             EagerLoadSourceGeometry result;
             const auto add = [&](std::uint64_t bytes)
@@ -922,8 +959,9 @@ namespace llaminar2
                 if (auto *info = model.findTensor(name))
                     add(info->size_bytes);
             }
-            // Global weights loaded separately
-            for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+            // Use the same scoped globals as actual eager materialization.
+            // A middle PP stage does not stage the vocabulary head or table.
+            for (const char *global_name : global_weights)
             {
                 if (auto *info = model.findTensor(global_name))
                     add(info->size_bytes);
@@ -934,12 +972,13 @@ namespace llaminar2
         bool hostRamPreflight(
             const GGUFModel &model,
             const std::vector<std::pair<std::string, bool>> &weights_to_load,
+            const std::vector<const char *> &global_weights,
             DeviceId device,
             bool use_mmap,
             int world_rank)
         {
             const EagerLoadSourceGeometry source =
-                computeEagerLoadSourceGeometry(model, weights_to_load);
+                computeEagerLoadSourceGeometry(model, weights_to_load, global_weights);
             const size_t eager_weight_bytes = source.total_bytes;
             /**
              * Native GPU weights remain file-backed and are read directly into
@@ -1101,6 +1140,16 @@ namespace llaminar2
             log_prefix);
     }
 
+    /**
+     * @brief Validate graph ownership without redirecting a participant's device.
+     * @param graph_config Admitted graph policy and retained overlay descriptors.
+     * @param runner_mpi_ctx Exact communicator owning this participant.
+     * @param requested_device Device whose local graph is being constructed.
+     * @param log_prefix Diagnostic context used while resolving descriptors.
+     * @return The unchanged requested device after continuation/ownership checks.
+     * @throws std::runtime_error for an unavailable continuation collective or
+     *         a request naming a device not owned by this graph participant.
+     */
     DeviceId resolveMoEExpertOverlayExecutionDeviceForGraph(
         GraphConfig &graph_config,
         const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
@@ -1119,14 +1168,7 @@ namespace llaminar2
             return requested_device;
 
         const auto &continuation_domain = runtime_plan->continuationDomain();
-        if (continuation_domain.requires_domain_scoped_collective_context &&
-            !continuation_domain.domain_scoped_collective_context_ready)
-        {
-            throw std::runtime_error(
-                "MoE expert overlay continuation domain '" + continuation_domain.name +
-                "' has multiple participants but no graph-native collective runtime: " +
-                continuation_domain.pending_reason);
-        }
+        continuation_domain.validateContinuationCollectiveRuntime();
 
         const bool requested_is_continuation_participant =
             std::any_of(
@@ -2313,7 +2355,7 @@ namespace llaminar2
      *
      * Used when a pre-created IGlobalTPContext (from DomainCommunicatorRegistry or
      * createTestableInferenceRunner) is provided directly instead of being
-     * auto-created from MPI_COMM_WORLD.
+     * created from the exact admitted runner communicator.
      *
      * @param graph_config    Config to modify with TP dimensions
      * @param global_tp_ctx   The pre-created global TP context
@@ -2701,6 +2743,9 @@ namespace llaminar2
         }
         LOG_DEBUG("[InferenceRunner] Using device " << device);
 
+        if (config.pp_stage_config)
+            config.pp_stage_config->requireValidForModel(*model_ctx);
+
         // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
         LOG_DEBUG("[InferenceRunner] Using GRAPH path");
@@ -3017,7 +3062,7 @@ namespace llaminar2
         // =====================================================================
         // When GLOBAL TP is active (multi-rank with sharded weights, no LOCAL TP),
         // either use a pre-created context injected via config.tp_ctx, or
-        // auto-create one over MPI_COMM_WORLD (legacy path for simple setups).
+        // create one over the exact admitted runner communicator.
         // The injected path is used by StageRunnerFactory (Phase 3) so each global
         // TP stage gets a domain-scoped communicator, not a world-wide one.
         // =====================================================================
@@ -3035,11 +3080,14 @@ namespace llaminar2
         }
         else if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded && !local_tp_ctx)
         {
+            const auto inventory = mpi_ctx->clusterInventory();
+            const auto &observed = inventory->ranks.at(mpi_ctx->rank());
             auto ctx = GlobalTPContext::createWithSplit(
-                MPI_COMM_WORLD,
+                mpi_ctx->communicator(),
                 /*domain_id=*/0,
                 /*color=*/0, // All ranks in same domain
                 /*key=*/mpi_ctx->rank(),
+                GlobalDeviceAddress::fromLocalDeviceId(device, observed.hostname, observed.cpu.numa_node),
                 config.hostfile);
             if (ctx && ctx->isValid())
             {
@@ -3053,8 +3101,8 @@ namespace llaminar2
             }
             else
             {
-                LOG_WARN("[InferenceRunner] Failed to create GlobalTPContext - "
-                         "falling back to direct MPI AllreduceStage path");
+                LOG_ERROR("[InferenceRunner] Failed to create admitted GlobalTPContext");
+                return nullptr;
             }
         }
 
@@ -3399,6 +3447,9 @@ namespace llaminar2
         const std::string arch = model_ctx->architecture();
         auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
 
+        const FactoryPPStageConfig *pp_scope = config.pp_stage_config
+                                                   ? &*config.pp_stage_config
+                                                   : nullptr;
         const int n_layers = graph_config.n_layers > 0
                                  ? graph_config.n_layers
                                  : model_ctx->blockCount();
@@ -3409,9 +3460,11 @@ namespace llaminar2
         // Validate all layer weights against schema before loading.
         // Missing required weights are fatal; missing optional weights are skipped.
         auto validation = validateLayerWeights(
-            *schema_factory, n_layers,
+            *schema_factory, model_ctx->totalBlockCount(),
             [&](const std::string &name)
-            { return model_ctx->hasTensor(name); });
+            { return model_ctx->hasTensor(name); },
+            pp_scope ? pp_scope->first_layer : 0,
+            pp_scope ? pp_scope->last_layer : n_layers);
 
         if (!validation.success)
         {
@@ -3425,7 +3478,7 @@ namespace llaminar2
                                                     << " optional weights not present in model");
         }
 
-        if (!appendMTPWeightsIfRequested(
+        if ((!pp_scope || pp_scope->has_lm_head) && !appendMTPWeightsIfRequested(
                 config,
                 *model_ctx,
                 arch,
@@ -3439,6 +3492,21 @@ namespace llaminar2
         // Use validated weight list (only weights that exist in the model)
         auto &weights_to_load = validation.weights_to_load;
         const auto &gguf_model = model_ctx->model();
+
+        // One scoped list drives both eager materialization and progress.
+        // A terminal MTP sidecar needs the embedding table even when the main
+        // pipeline embedding stage lives elsewhere. Tied output heads use the
+        // same table; middle stages own none of these global weights.
+        std::vector<const char *> global_weights;
+        if (!pp_scope || pp_scope->has_embedding ||
+            (pp_scope->has_lm_head &&
+             (retainsMTPGraphCapacity(config.mtp) || !model_ctx->hasTensor("output.weight"))))
+            global_weights.push_back("token_embd.weight");
+        if (!pp_scope || pp_scope->has_lm_head)
+        {
+            global_weights.push_back("output_norm.weight");
+            global_weights.push_back("output.weight");
+        }
 
         const auto load_graph_participant_weight =
             [&graph_config, &weight_mgr](const std::string &weight_name)
@@ -3467,6 +3535,7 @@ namespace llaminar2
         if (!hostRamPreflight(
                 gguf_model,
                 weights_to_load,
+                global_weights,
                 device,
                 model_ctx->usesMmap(),
                 graph_config.local_rank))
@@ -3494,7 +3563,7 @@ namespace llaminar2
                     total_eager_bytes += info->size_bytes;
             }
             // Include global weights
-            for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+            for (const char *global_name : global_weights)
             {
                 if (auto *info = gguf_model.findTensor(global_name))
                     total_eager_bytes += info->size_bytes;
@@ -3621,34 +3690,16 @@ namespace llaminar2
             // here — passing CUDA:0 would put them in per_device_cache_,
             // which makes packGemmWeightsViaPipeline() think per_device_cache_
             // is the primary source and skip all per-layer weights from cache_.
-            auto lm_head = load_graph_participant_weight("output.weight");
-            if (!lm_head && model_ctx->hasTensor("token_embd.weight"))
-            {
-                // Tied embeddings: output.weight absent, token_embd.weight
-                // will be reused as the LM head GEMM weight. Load it now so
-                // packGemmWeightsViaPipeline() can find it in cache_ and
-                // include it in the GPU GEMM pipeline for repacking.
-                load_graph_participant_weight("token_embd.weight");
-                LOG_DEBUG("[InferenceRunner] Tied embeddings: token_embd.weight loaded for GPU GEMM pipeline");
-            }
-            else if (lm_head)
-            {
-                LOG_DEBUG("[InferenceRunner] output.weight loaded into cache for GPU pipeline enrollment");
-                // Also load token_embd.weight for embedding stage
-                if (model_ctx->hasTensor("token_embd.weight"))
-                    load_graph_participant_weight("token_embd.weight");
-            }
-
-            // Load output_norm for GPU upload during finalization
-            if (model_ctx->hasTensor("output_norm.weight"))
-                load_graph_participant_weight("output_norm.weight");
+            for (const char *name : global_weights)
+                if (model_ctx->hasTensor(name))
+                    load_graph_participant_weight(name);
 
             LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
 
             // Update progress with global weights and finish
             if (eager_progress_idx >= 0)
             {
-                for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+                for (const char *global_name : global_weights)
                 {
                     if (auto *info = gguf_model.findTensor(global_name))
                     {
@@ -3672,8 +3723,11 @@ namespace llaminar2
             validation,
             device,
             graph_config.tp_config.get(),
-            nullptr,
+            pp_scope,
             SingleDeviceWeightPlanOptions{
+                .include_terminal_mtp_embedding =
+                    retainsMTPGraphCapacity(config.mtp) &&
+                    (!pp_scope || pp_scope->has_lm_head),
                 .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
                 .replicate_routed_experts =
                     needsReplicatedRoutedExpertWeights(graph_config),
@@ -3703,7 +3757,9 @@ namespace llaminar2
         auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
-        if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
+        if (((!pp_scope || pp_scope->has_embedding) && !legacy_weights.embedding_table) ||
+            ((!pp_scope || pp_scope->has_lm_head) &&
+             (!legacy_weights.final_norm || !legacy_weights.lm_head)))
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
             return false;
@@ -3731,8 +3787,9 @@ namespace llaminar2
                 device,
                 /*include_expert_jobs=*/!overlay_runtime_plan_for_weight_prep))
         {
-            LOG_WARN("[InferenceRunner] Binding-driven weight preparation had issues for device "
+            LOG_ERROR("[InferenceRunner] Binding-driven weight preparation failed for device "
                      << device.to_string());
+            return false;
         }
 
         if (overlay_runtime_plan_for_weight_prep)
@@ -3839,458 +3896,12 @@ namespace llaminar2
         orchestrator->initializePreparedWeightStore(device);
 
         // Phase 9: Mark graph materialization complete — all weight bindings resolved
-        weight_mgr->markGraphMaterializationComplete();
+        // A scoped stage cannot close preparation for sibling stages that
+        // share this manager. The pipeline owner seals the complete family.
+        if (!pp_scope)
+            weight_mgr->markGraphMaterializationComplete();
 
         return true;
-    }
-
-    // =========================================================================
-    // Pipeline Parallelism Weight Configuration
-    // =========================================================================
-
-    /**
-     * @brief Configure orchestrator weights for a Pipeline Parallelism stage
-     *
-     * Similar to configureOrchestratorWeightsImpl but only loads weights for the
-     * layers and components owned by this PP stage.
-     *
-     * @param orchestrator The DeviceGraphOrchestrator to configure
-     * @param model_ctx Model context with weights
-     * @param device Target device for weight packing/upload
-     * @param pp_config PP stage configuration specifying which layers/components to load
-     * @return true on success, false on failure
-     */
-    static bool configurePPStageWeightsImpl(
-        DeviceGraphOrchestrator *orchestrator,
-        std::shared_ptr<ModelContext> model_ctx,
-        DeviceId device,
-        const FactoryPPStageConfig &pp_config,
-        const InferenceRunnerConfig &config)
-    {
-        if (!orchestrator || !model_ctx)
-        {
-            return false;
-        }
-
-        // =====================================================================
-        // Use the shared ModelContext's WeightManager (single WM per model).
-        // PP layer-range filtering is handled by prepareWeightsForDevice().
-        // =====================================================================
-        auto weight_mgr = model_ctx->concreteWeightManager();
-        if (!weight_mgr)
-        {
-            LOG_ERROR("[PPStageRunner] No weight manager in model context");
-            return false;
-        }
-
-        // Apply architecture-specific weight sharding config.
-        // setWeightShardingConfig is idempotent and does NOT clear the weight cache
-        // (unlike configure() which clears cache_ unconditionally).
-        const std::string arch = model_ctx->architecture();
-        weight_mgr->setWeightShardingConfig(
-            SchemaFactoryRegistry::getWeightShardingConfig(arch));
-
-        // =====================================================================
-        // Set WeightManager and PlacementMap for phase-aware weight access
-        // =====================================================================
-        orchestrator->setWeightManager(weight_mgr);
-        if (auto placement_map = model_ctx->placementMap())
-        {
-            orchestrator->setWeightPlacementMap(placement_map);
-            LOG_DEBUG("[PPStageRunner] Phase-aware weight access configured with placement map");
-        }
-
-        // =====================================================================
-        // Eagerly load ONLY this stage's layer weights into cache
-        // =====================================================================
-        auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
-
-        const int first_layer = pp_config.first_layer;
-        const int last_layer = pp_config.last_layer;
-        LOG_DEBUG("[PPStageRunner] Eagerly loading layers [" << first_layer << ", " << last_layer
-                                                             << ") of weights...");
-        ScopedWeightLoadDetailTimer pp_eager_layer_timer("weights.pp.eager_layer_cache_load");
-
-        // Validate layer weights against schema before loading.
-        auto pp_validation = validateLayerWeights(
-            *schema_factory, model_ctx->totalBlockCount(),
-            [&](const std::string &name)
-            { return model_ctx->hasTensor(name); },
-            first_layer, last_layer);
-
-        if (!pp_validation.success)
-        {
-            LOG_ERROR("[PPStageRunner] " << pp_validation.error_message());
-            return false;
-        }
-        /**
-         * MTP sidecar weights belong to the terminal PP stage only.
-         *
-         * RankOrchestrator passes a full-model ModelContext into every PP
-         * stage, so relying on WeightManager's global layer-range state is not
-         * enough here. Appending sidecar names to a non-terminal stage's local
-         * validation list would let that stage materialize and prepare the same
-         * trailing nextn block, then release its host upload clone before the
-         * real terminal sidecar owner can upload it. Keep the ownership rule
-         * explicit at the factory boundary where PP stage responsibilities are
-         * known.
-         */
-        if (pp_config.has_lm_head && !appendMTPWeightsIfRequested(
-                                         config,
-                                         *model_ctx,
-                                         arch,
-                                         pp_validation,
-                                         "[PPStageRunner]"))
-        {
-            return false;
-        }
-        else if (retainsMTPGraphCapacity(config.mtp) &&
-                 !pp_config.has_lm_head)
-        {
-            LOG_DEBUG("[PPStageRunner] MTP capacity retained, but this non-terminal PP stage does not own sidecar weights");
-        }
-
-        // Load global weights this stage owns.
-        // IMPORTANT: Pass the target device so first_device_ is set to the GPU
-        // device (not cpu). This ensures packGemmWeightsViaPipeline() and
-        // buildWeights() use the same tensor pointers, avoiding GPU GEMM cache misses.
-        if (pp_config.has_embedding)
-        {
-            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight", device);
-            if (!embedding)
-            {
-                LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
-                return false;
-            }
-            LOG_DEBUG("[PPStageRunner] Loaded embedding table for stage");
-        }
-
-        if (pp_config.has_lm_head)
-        {
-            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight", device);
-            auto lm_head = weight_mgr->getWeightForDevice("output.weight", device);
-            if (!lm_head)
-            {
-                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight", device);
-                if (embedding_fallback)
-                {
-                    LOG_DEBUG("[PPStageRunner] output.weight not found, using tied embeddings");
-                }
-            }
-            if (!final_norm)
-            {
-                LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm weight missing");
-                return false;
-            }
-            LOG_DEBUG("[PPStageRunner] Loaded final_norm and lm_head for stage");
-        }
-
-        // Load layer weights
-        for (const auto &[weight_name, is_optional] : pp_validation.weights_to_load)
-        {
-            auto weight = weight_mgr->getWeightForDevice(weight_name, device);
-
-            if (!weight)
-            {
-                if (is_optional)
-                {
-                    LOG_TRACE("[PPStageRunner] Optional weight not present: " << weight_name);
-                }
-                else
-                {
-                    LOG_ERROR("[PPStageRunner] Failed to load required weight: " << weight_name);
-                    return false;
-                }
-            }
-        }
-        LOG_DEBUG("[PPStageRunner] All layer weights for stage loaded into cache");
-
-        auto weight_plan = buildSingleDeviceWeightPlan(
-            *weight_mgr,
-            *model_ctx,
-            pp_validation,
-            device,
-            nullptr,
-            &pp_config,
-            SingleDeviceWeightPlanOptions{
-                .include_terminal_mtp_embedding =
-                    retainsMTPGraphCapacity(config.mtp) &&
-                    pp_config.has_lm_head,
-            });
-        if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
-            return false;
-        FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
-        auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
-        auto legacy_weights = toLegacyModelWeights(weight_bindings);
-
-        if (pp_config.has_embedding && !legacy_weights.embedding_table)
-        {
-            LOG_ERROR("[PPStageRunner] Frozen PP stage has_embedding=true but embedding missing");
-            return false;
-        }
-        if (pp_config.has_lm_head && (!legacy_weights.final_norm || !legacy_weights.lm_head))
-        {
-            LOG_ERROR("[PPStageRunner] Frozen PP stage has_lm_head=true but final_norm/lm_head missing");
-            return false;
-        }
-
-        // =====================================================================
-        // Prepare weights: GEMM pack + upload (layer-filtered, no host release)
-        // Host copies are released by the caller after ALL PP stages are prepared.
-        // =====================================================================
-        bool prepare_ok = weight_mgr->prepareWeightsForDevice(frozen_weights, device);
-
-        if (!prepare_ok)
-        {
-            LOG_WARN("[PPStageRunner] Weight preparation had issues for device "
-                     << device.to_string() << " layers [" << first_layer << ", " << last_layer << ")");
-        }
-
-        orchestrator->setFrozenWeightSet(
-            std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
-        LOG_DEBUG("[PPStageRunner] Weights configured for PP stage [" << first_layer << ", " << last_layer << ")");
-
-        // PP runners build the same frozen graph bindings as full runners, so
-        // initialize the model-owned prepared store before graph construction.
-        orchestrator->initializePreparedWeightStore(device);
-        return true;
-    }
-
-    // =========================================================================
-    // Unified Pipeline Runner Factory
-    // =========================================================================
-
-    /**
-     * @brief Configure weights for a unified LOCAL PP pipeline
-     *
-     * Sets up ModelWeights with device-aware weight loading based on
-     * the PipelineConfig. Each layer's weights are loaded for its assigned
-     * device (from getDeviceForLayer()).
-     *
-     * @param orchestrator Orchestrator to configure
-     * @param model_ctx Model context with weights
-     * @param pipeline_config Pipeline configuration with layer→device mapping
-     * @return true on success
-     */
-    static bool configureUnifiedPipelineWeightsImpl(
-        DeviceGraphOrchestrator *orchestrator,
-        std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<PipelineConfig> pipeline_config)
-    {
-        if (!orchestrator || !model_ctx || !pipeline_config)
-        {
-            LOG_ERROR("[UnifiedPipeline] Invalid arguments");
-            return false;
-        }
-
-        // Get primary device for embedding/lm_head (from first/last stage)
-        DeviceId embedding_device = pipeline_config->getDeviceForLayer(0);
-        DeviceId lm_head_device = pipeline_config->getDeviceForLayer(pipeline_config->total_layers - 1);
-
-        LOG_DEBUG("[UnifiedPipeline] Embedding device: " << embedding_device.to_string()
-                                                         << ", LM head device: " << lm_head_device.to_string());
-
-        // =====================================================================
-        // Global weights (embedding, final_norm, lm_head)
-        // =====================================================================
-        ModelWeights weights;
-
-        auto embedding = model_ctx->getWeightForDevice("token_embd.weight", embedding_device);
-        auto final_norm = model_ctx->getWeightForDevice("output_norm.weight", lm_head_device);
-        auto lm_head = model_ctx->getWeightForDevice("output.weight", lm_head_device);
-
-        // Tied embeddings: if output.weight is missing, reuse token_embd.weight
-        if (!lm_head && embedding)
-        {
-            LOG_DEBUG("[UnifiedPipeline] output.weight not found, using tied embeddings (token_embd.weight)");
-            lm_head = embedding;
-        }
-
-        if (!embedding || !final_norm || !lm_head)
-        {
-            LOG_ERROR("[UnifiedPipeline] Missing global weights");
-            return false;
-        }
-
-        weights.embedding_table = embedding.get();
-        weights.final_norm = final_norm.get();
-        weights.lm_head = lm_head.get();
-
-        // =====================================================================
-        // Layer weight accessor - uses PipelineConfig to determine device
-        // =====================================================================
-        auto model_ctx_ptr = model_ctx;
-        auto pipeline_config_ptr = pipeline_config;
-
-        weights.get_layer_weights = [model_ctx_ptr, pipeline_config_ptr](int layer_idx) -> LayerWeights
-        {
-            // Get device for this layer from pipeline config
-            DeviceId layer_device = pipeline_config_ptr->getDeviceForLayer(layer_idx);
-
-            LayerWeights layer;
-            std::string prefix = "blk." + std::to_string(layer_idx) + ".";
-
-            // Attention weights - get for layer's specific device
-            layer.wq = model_ctx_ptr->getWeightForDevice(prefix + "attn_q.weight", layer_device).get();
-            layer.wk = model_ctx_ptr->getWeightForDevice(prefix + "attn_k.weight", layer_device).get();
-            layer.wv = model_ctx_ptr->getWeightForDevice(prefix + "attn_v.weight", layer_device).get();
-            layer.wo = model_ctx_ptr->getWeightForDevice(prefix + "attn_output.weight", layer_device).get();
-            layer.attn_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_norm.weight", layer_device).get();
-
-            // Attention biases (may be null for Qwen2)
-            auto q_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_q.bias", layer_device);
-            auto k_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_k.bias", layer_device);
-            auto v_bias = model_ctx_ptr->getWeightForDevice(prefix + "attn_v.bias", layer_device);
-            layer.q_bias = q_bias ? q_bias.get() : nullptr;
-            layer.k_bias = k_bias ? k_bias.get() : nullptr;
-            layer.v_bias = v_bias ? v_bias.get() : nullptr;
-
-            // QK norm weights (Qwen3: per-head RMSNorm, may be null for Qwen2)
-            auto q_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_q_norm.weight", layer_device);
-            auto k_norm = model_ctx_ptr->getWeightForDevice(prefix + "attn_k_norm.weight", layer_device);
-            layer.q_norm = q_norm ? q_norm.get() : nullptr;
-            layer.k_norm = k_norm ? k_norm.get() : nullptr;
-
-            // FFN weights
-            layer.gate_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_gate.weight", layer_device).get();
-            layer.up_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_up.weight", layer_device).get();
-            layer.down_proj = model_ctx_ptr->getWeightForDevice(prefix + "ffn_down.weight", layer_device).get();
-            layer.ffn_norm = model_ctx_ptr->getWeightForDevice(prefix + "ffn_norm.weight", layer_device).get();
-
-            return layer;
-        };
-
-        orchestrator->setWeights(weights);
-        LOG_DEBUG("[UnifiedPipeline] Weights configured for " << pipeline_config->total_layers << " layers");
-        return true;
-    }
-
-    std::unique_ptr<IInferenceRunner> createUnifiedPipelineRunner(
-        std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<PipelineConfig> pipeline_config,
-        const InferenceRunnerConfig &config)
-    {
-        LOG_DEBUG("[UnifiedPipeline] createUnifiedPipelineRunner called");
-
-        // =====================================================================
-        // Validate inputs
-        // =====================================================================
-        if (!model_ctx)
-        {
-            LOG_ERROR("[UnifiedPipeline] model_ctx is null");
-            return nullptr;
-        }
-
-        if (!pipeline_config)
-        {
-            LOG_ERROR("[UnifiedPipeline] pipeline_config is null");
-            return nullptr;
-        }
-
-        std::string validation_error;
-        if (!pipeline_config->validate(&validation_error))
-        {
-            LOG_ERROR("[UnifiedPipeline] Invalid PipelineConfig: " << validation_error);
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Validate architecture
-        // =====================================================================
-        std::string architecture = model_ctx->architecture();
-        if (!SchemaFactoryRegistry::isSupported(architecture))
-        {
-            LOG_ERROR("[UnifiedPipeline] Unsupported architecture: " << architecture);
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Build GraphConfig via polymorphic builder
-        // =====================================================================
-        auto config_builder = createGraphConfigBuilder(architecture);
-        GraphConfig graph_config;
-        config_builder->populateFromModelContext(*model_ctx, graph_config);
-
-        // Execution-specific settings
-        graph_config.max_seq_len = config.max_seq_len;
-        graph_config.activation_precision = config.activation_precision;
-        graph_config.tp_allreduce_precision_override =
-            config.tp_allreduce_precision_override;
-        graph_config.prefix_cache = config.prefix_cache;
-        graph_config.mtp = config.mtp;
-
-        // Non-TP: use full dimensions
-        setFullDimensions(graph_config);
-
-        // Primary device is from first PP stage
-        DeviceId primary_device = pipeline_config->getDeviceForLayer(0);
-        graph_config.default_device = primary_device;
-        std::string graph_row_capacity_error;
-        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
-            config,
-            primary_device,
-            graph_row_capacity_error);
-        if (!graph_row_capacity)
-        {
-            LOG_ERROR("[UnifiedPipeline] Invalid graph activation envelope for "
-                      << primary_device.to_string() << ": "
-                      << graph_row_capacity_error);
-            return nullptr;
-        }
-        graph_config.max_activation_rows = *graph_row_capacity;
-        graph_config.max_request_count = std::max(1, config.batch_size);
-
-        LOG_DEBUG("[UnifiedPipeline] GraphConfig: "
-                  << "n_layers=" << graph_config.n_layers
-                  << ", d_model=" << graph_config.d_model
-                  << ", primary_device=" << primary_device.to_string());
-
-        // =====================================================================
-        // Create DeviceGraphOrchestrator with injected dependencies
-        // =====================================================================
-        DeviceGraphOrchestrator::Dependencies deps;
-        deps.model_ctx = model_ctx;
-        deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
-        deps.graph_builder->setModelContext(model_ctx);
-        deps.pipeline_config = pipeline_config;
-        deps.reusable_execution_workspaces =
-            config.reusable_execution_workspaces;
-        deps.physical_memory_authority =
-            physicalMemoryAuthorityForModel(model_ctx);
-
-        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            std::move(deps));
-
-        // =====================================================================
-        // Initialize inference state
-        // =====================================================================
-        InferenceStateInitConfig init_config;
-        init_config.activation_seq_len =
-            config.activation_seq_len > 0
-                ? config.activation_seq_len
-                : resolveActivationBufferSeqLen(config.max_seq_len, primary_device);
-
-        if (!orchestrator->initializeInferenceStateFromArena(
-                config.batch_size, config.max_seq_len, primary_device, init_config))
-        {
-            LOG_ERROR("[UnifiedPipeline] Failed to initialize inference state (arena path)");
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Configure weights (device-aware based on pipeline config)
-        // =====================================================================
-        if (!configureUnifiedPipelineWeightsImpl(orchestrator.get(), model_ctx, pipeline_config))
-        {
-            LOG_ERROR("[UnifiedPipeline] Failed to configure weights");
-            return nullptr;
-        }
-
-        LOG_DEBUG("[UnifiedPipeline] Created runner with "
-                  << pipeline_config->numStages() << " PP stages, "
-                  << pipeline_config->total_layers << " layers");
-
-        return orchestrator;
     }
 
     // =========================================================================
@@ -4303,195 +3914,12 @@ namespace llaminar2
         const FactoryPPStageConfig &pp_config,
         const InferenceRunnerConfig &config)
     {
-        LOG_DEBUG("[PPStageRunner] createPPStageRunner called: device=" << device.to_string()
-                                                                        << " layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ")"
-                                                                        << " has_embedding=" << pp_config.has_embedding
-                                                                        << " has_lm_head=" << pp_config.has_lm_head);
-
-        // =====================================================================
-        // Validate inputs
-        // =====================================================================
-        if (!model_ctx)
-        {
-            LOG_ERROR("[PPStageRunner] model_ctx is null");
-            return nullptr;
-        }
-
-        if (!device.is_valid())
-        {
-            LOG_ERROR("[PPStageRunner] Invalid device " << device << ". Use DeviceId::cpu() for CPU.");
-            return nullptr;
-        }
-
-        if (!pp_config.isValid())
-        {
-            LOG_ERROR("[PPStageRunner] Invalid FactoryPPStageConfig: first_layer=" << pp_config.first_layer
-                                                                                   << " last_layer=" << pp_config.last_layer);
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Validate architecture
-        // =====================================================================
-        std::string architecture = model_ctx->architecture();
-        if (!SchemaFactoryRegistry::isSupported(architecture))
-        {
-            LOG_ERROR("[PPStageRunner] Unsupported architecture: " << architecture);
-            return nullptr;
-        }
-
-        // Weight sharding configuration is applied once via the shared WeightManager.
-
-        // =====================================================================
-        // Build GraphConfig via polymorphic builder
-        // =====================================================================
-        auto config_builder = createGraphConfigBuilder(architecture);
-        GraphConfig graph_config;
-        config_builder->populateFromModelContext(*model_ctx, graph_config);
-
-        // Override n_layers for PP stage: graph builds only this stage's layers,
-        // not the full model. total_n_layers retains the full model count for
-        // GDN/FA pattern detection etc.
-        graph_config.n_layers = pp_config.layerCount();
-
-        // Execution-specific settings
-        graph_config.max_seq_len = config.max_seq_len;
-        graph_config.default_device = device;
-        std::string graph_row_capacity_error;
-        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
-            config,
-            device,
-            graph_row_capacity_error);
-        if (!graph_row_capacity)
-        {
-            LOG_ERROR("[PPStageRunner] Invalid graph activation envelope for "
-                      << device.to_string() << ": "
-                      << graph_row_capacity_error);
-            return nullptr;
-        }
-        graph_config.max_activation_rows = *graph_row_capacity;
-        graph_config.max_request_count = std::max(1, config.batch_size);
-        graph_config.activation_precision = config.activation_precision;
-
-        graph_config.fused_attention_backend = resolveEffectiveAttentionBackend(
-            config.activation_precision, config.fused_attention_backend);
-
-        // kv_cache_scale_k/v set by config builder — don't overwrite
-        graph_config.kv_cache_precision = config.kv_cache_precision;
-        graph_config.tp_allreduce_precision_override =
-            config.tp_allreduce_precision_override;
-        graph_config.prefix_cache = config.prefix_cache;
-        graph_config.mtp = config.mtp;
-
-        // TurboQuant context for TQ4/TQ KV cache
-        std::shared_ptr<TurboQuantContext> turboquant_ctx;
-        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
-            config.kv_cache_precision == KVCachePrecision::TQ)
-        {
-            turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
-            graph_config.turboquant_ctx = turboquant_ctx.get();
-        }
-
-        // KV rotation for Q16_1 kurtosis reduction
-        std::shared_ptr<ActivationRotation> kv_rotation;
-        if (config.kv_cache_precision == KVCachePrecision::Q16_1 && debugEnv().kv_rotation)
-        {
-            kv_rotation = std::make_shared<ActivationRotation>(
-                graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
-            graph_config.kv_rotation = kv_rotation.get();
-        }
-
-        // PP layer offset for KV cache indexing:
-        // When building graphs for PP stage [first_layer, last_layer), this offset
-        // is subtracted from global layer index to get local KV cache index.
-        graph_config.pp_layer_offset = pp_config.first_layer;
-
-        LOG_DEBUG("[PPStageRunner] GraphConfig: n_layers=" << graph_config.n_layers
-                                                           << " (PP stage owns layers ["
-                                                           << pp_config.first_layer << ", " << pp_config.last_layer << "))"
-                                                           << " pp_layer_offset=" << graph_config.pp_layer_offset);
-
-        // PP stages don't use tensor parallelism (TP) - they use full dimensions
-        // Inter-stage communication is handled by the PP orchestrator, not MPI collectives
-        setFullDimensions(graph_config);
-        if (!configureStaticMoEExpertRange(graph_config))
-            return nullptr;
-
-        LOG_DEBUG("[PPStageRunner] GraphConfig (no TP): "
-                  << "vocab=" << graph_config.vocab_size
-                  << ", d_model=" << graph_config.d_model
-                  << ", n_layers=" << graph_config.n_layers
-                  << ", n_heads=" << graph_config.n_heads
-                  << ", n_kv_heads=" << graph_config.n_kv_heads
-                  << ", d_ff=" << graph_config.d_ff
-                  << ", rope_theta=" << graph_config.rope_theta
-                  << ", rms_norm_eps=" << graph_config.rms_norm_eps
-                  << ", activation_precision=" << static_cast<int>(graph_config.activation_precision));
-
-        // =====================================================================
-        // Create DeviceGraphOrchestrator
-        // Note: No MPI context for PP stages - inter-stage comm handled externally
-        // =====================================================================
-        DeviceGraphOrchestrator::Dependencies deps;
-        deps.model_ctx = model_ctx;
-        deps.graph_builder =
-            GraphBuilderRegistry::create(architecture, graph_config, nullptr);
-        deps.graph_builder->setModelContext(model_ctx);
-        deps.pp_stage_config = pp_config;
-        deps.turboquant_ctx = std::move(turboquant_ctx);
-        deps.kv_rotation = std::move(kv_rotation);
-        deps.reusable_execution_workspaces =
-            config.reusable_execution_workspaces;
-        deps.physical_memory_authority =
-            physicalMemoryAuthorityForModel(model_ctx);
-        deps.weight_manager = model_ctx->concreteWeightManager();
-        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            std::move(deps));
-
-        // =====================================================================
-        // Initialize graph cache for ONLY this stage's layers
-        // =====================================================================
-        const int stage_layer_count = pp_config.layerCount();
-        orchestrator->initializeGraphCache(stage_layer_count);
-        LOG_DEBUG("[PPStageRunner] Graph cache initialized for " << stage_layer_count << " layers");
-
-        // =====================================================================
-        // Initialize inference state (allocates buffers)
-        // =====================================================================
-        InferenceStateInitConfig init_config;
-        init_config.activation_seq_len =
-            config.activation_seq_len > 0
-                ? config.activation_seq_len
-                : resolveActivationBufferSeqLen(config.max_seq_len, device);
-
-        if (!orchestrator->initializeInferenceStateFromArena(
-                config.batch_size, config.max_seq_len, device, init_config))
-        {
-            LOG_ERROR("[PPStageRunner] Failed to initialize inference state (arena path)");
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Load weights for this PP stage (partial weight loading)
-        // =====================================================================
-        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config, config))
-        {
-            LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
-            return nullptr;
-        }
-
-        // =====================================================================
-        // Note: No GPU collective setup for PP stages
-        // PP handles inter-stage communication externally (not via MPI collectives)
-        // =====================================================================
-
-        LOG_DEBUG("[PPStageRunner] PP stage runner created successfully: "
-                  << "layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ") "
-                  << "has_embedding=" << pp_config.has_embedding
-                  << " has_lm_head=" << pp_config.has_lm_head
-                  << " device=" << device.to_string());
-
-        return orchestrator;
+        // Pipeline geometry is a scoped input to the ordinary factory, not a
+        // second graph/weight policy implementation. This preserves expert
+        // authority, cancellation, memory admission, and future runtime fields.
+        auto scoped_config = config;
+        scoped_config.pp_stage_config = pp_config;
+        return createInferenceRunner(std::move(model_ctx), nullptr, device, scoped_config);
     }
 
     // =========================================================================
@@ -4510,6 +3938,13 @@ namespace llaminar2
             LOG_ERROR("[InferenceRunner] model_ctx is null");
             return nullptr;
         }
+
+        // Injected TP contexts use this factory in production too. Reject an
+        // invalid PP scope before schema, arena, or weight preparation here as
+        // well as in the concrete factory; neither entrypoint owns a different
+        // definition of the model's main-forward layer range.
+        if (config.pp_stage_config)
+            config.pp_stage_config->requireValidForModel(*model_ctx);
 
         // Validate device
         if (!device.is_valid())
@@ -4715,9 +4150,12 @@ namespace llaminar2
             deps.weight_manager = concrete_model_ctx->concreteWeightManager();
         // topology and collective_ctx left as nullptr for single-rank testing
 
-        // Create DeviceGraphOrchestrator with injected dependencies
-        auto orchestrator = DeviceGraphOrchestrator::createForTest(
-            std::move(deps));
+        // RankOrchestrator also uses this interface-injected factory in
+        // production. A concrete model must retain mandatory physical-memory
+        // admission; only a mock context can use the isolated unit-test owner.
+        auto orchestrator = std::dynamic_pointer_cast<ModelContext>(model_ctx)
+            ? std::make_unique<DeviceGraphOrchestrator>(std::move(deps))
+            : DeviceGraphOrchestrator::createForTest(std::move(deps));
 
         // Initialize graph cache
         orchestrator->initializeGraphCache(graph_config.n_layers);

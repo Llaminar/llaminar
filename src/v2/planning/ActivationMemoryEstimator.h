@@ -38,6 +38,7 @@ struct ActivationGraphMemoryGeometry
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    int generation_request_capacity = 1; ///< Retained sampler request rows, including disabled MTP capacity.
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */

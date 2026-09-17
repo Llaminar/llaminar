@@ -7,10 +7,13 @@
  * preserves the distinction between rank-local TP (`owner_rank`) and
  * cross-rank NodeTP (`world_ranks`); downstream typed configuration uses
  * that distinction to select the correct collective and graph shape.
+ * CPU ownership and GPU-to-CPU locality use observed affinity; MPI local rank
+ * is never a physical NUMA address, including after communicator reordering.
  */
 
 #include "MoEExpertOverlayExecutionPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
+#include "planning/RankHardwareOwnership.h"
 
 #include <algorithm>
 #include <set>
@@ -475,6 +478,15 @@ namespace llaminar2
             const DeviceInfo *device = nullptr;
         };
 
+        /**
+         * @brief Bind one GPU to an exact observed rank, preferring physical locality.
+         * @param participant Portable endpoint; explicit host/NUMA fields constrain matching.
+         * @param inventory Canonical rank observations, including CPU affinity and GPU locality.
+         * @param domain_name Domain identity for actionable failure diagnostics.
+         * @param pinned_rank Optional explicit owner, which is validated rather than replaced.
+         * @return Unique physical endpoint and its execution owner.
+         * @throws std::invalid_argument for absent or equally local ambiguous ownership.
+         */
         ResolvedParticipantBinding resolveGpuParticipantBinding(
             const GlobalDeviceAddress &participant,
             const ClusterInventory &inventory,
@@ -504,7 +516,7 @@ namespace llaminar2
                     }
                     visible.push_back(GpuBindingCandidate{&rank, &gpu});
                     if (gpu.numa_node >= 0 &&
-                        rank.local_rank == gpu.numa_node)
+                        rank.cpu.numa_node == gpu.numa_node)
                     {
                         local.push_back(GpuBindingCandidate{&rank, &gpu});
                     }
@@ -576,6 +588,16 @@ namespace llaminar2
             };
         }
 
+        /**
+         * @brief Bind a CPU endpoint using observed NUMA ownership, not rank ordering.
+         * @param participant Portable CPU address, possibly without a NUMA qualifier.
+         * @param inventory Exact communicator's hardware/affinity observations.
+         * @param domain_name Domain identity for diagnostics.
+         * @param participant_index Index for enumerating unqualified same-node CPU endpoints.
+         * @param pinned_rank Explicit owner to authenticate when supplied.
+         * @return Observed physical CPU address and its unique selected owner.
+         * @throws std::invalid_argument for missing or ambiguous ownership.
+         */
         ResolvedParticipantBinding resolveCpuParticipantBinding(
             const GlobalDeviceAddress &participant,
             const ClusterInventory &inventory,
@@ -590,8 +612,7 @@ namespace llaminar2
                     continue;
                 if (!rankMatchesParticipantHost(rank, participant))
                     continue;
-                if (participant.hasValidNuma() &&
-                    rank.local_rank != participant.numa_node)
+                if (!rankOwnsCPUNode(rank, participant.numa_node))
                 {
                     continue;
                 }
@@ -631,8 +652,8 @@ namespace llaminar2
                     candidates.end(),
                     [](const auto *left, const auto *right)
                     {
-                        if (left->local_rank != right->local_rank)
-                            return left->local_rank < right->local_rank;
+                        if (left->cpu.numa_node != right->cpu.numa_node)
+                            return left->cpu.numa_node < right->cpu.numa_node;
                         return left->rank < right->rank;
                     });
                 if (participant_index < candidates.size())
@@ -654,7 +675,7 @@ namespace llaminar2
                 address.hostname = selected->hostname;
             }
             if (!address.hasValidNuma())
-                address.numa_node = selected->local_rank;
+                address.numa_node = selected->cpu.numa_node;
             return ResolvedParticipantBinding{
                 .world_rank = selected->rank,
                 .address = std::move(address),
@@ -1059,6 +1080,16 @@ namespace llaminar2
             }
 
             const auto distinct = uniqueSortedRanks(resolved_ranks);
+            std::set<int> physical_nodes;
+            for (const int rank : distinct)
+            {
+                const auto observed = std::find_if(inventory.ranks.begin(), inventory.ranks.end(),
+                    [rank](const auto &candidate) { return candidate.rank == rank; });
+                if (observed == inventory.ranks.end() || observed->node_id < 0)
+                    throw std::invalid_argument("MoE overlay domain '" + domain.name +
+                        "' requires observed physical-node identity for every owner rank");
+                physical_nodes.insert(observed->node_id);
+            }
             if (domain.scope == ExecutionDomainScope::AUTO)
             {
                 /*
@@ -1066,16 +1097,27 @@ namespace llaminar2
                  * current NUMA/rank placement into the CLI. Resolve it only
                  * after inventory binding: one participant is SINGLE, several
                  * devices on one rank are LocalTP, and participants spanning
-                 * ranks are NodeTP. This remains deterministic because every
-                 * rank consumes the same gathered inventory.
+                 * ranks on one physical node are NodeTP. Across physical nodes
+                 * the scope is GLOBAL, even if each host reports NUMA node zero.
+                 * This uses the same observed node identity as sparse transport
+                 * selection; rank count alone never licenses shared memory.
                  */
                 if (domain.participants.size() == 1u)
                     domain.scope = ExecutionDomainScope::SINGLE;
                 else if (distinct.size() == 1u)
                     domain.scope = ExecutionDomainScope::RANK_LOCAL;
-                else
+                else if (physical_nodes.size() == 1u)
                     domain.scope = ExecutionDomainScope::NODE_LOCAL;
+                else
+                    domain.scope = ExecutionDomainScope::GLOBAL;
             }
+
+            if (domain.scope == ExecutionDomainScope::NODE_LOCAL && physical_nodes.size() != 1u)
+                throw std::invalid_argument("MoE overlay NodeTP domain '" + domain.name +
+                    "' spans physical hosts; use scope=global for cross-host participants");
+            if (physical_nodes.size() > 1u && domain.backend == CollectiveBackendType::UPI)
+                throw std::invalid_argument("MoE overlay domain '" + domain.name +
+                    "' requests node-local UPI across physical hosts; use a network collective");
 
             if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
             {
@@ -1107,7 +1149,7 @@ namespace llaminar2
             else
             {
                 /*
-                 * SINGLE and NODE_LOCAL retain participant-level bindings.
+                 * SINGLE, NODE_LOCAL and GLOBAL retain participant-level bindings.
                  * Repeated NodeTP ranks are valid when one MPI process owns
                  * several devices; collective code derives distinct MPI group
                  * membership separately from this physical participant map.

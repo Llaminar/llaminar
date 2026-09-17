@@ -17,6 +17,7 @@
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
+#include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
 #include "execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -31,8 +32,10 @@
 #include "utils/TestTensorFactory.h"
 #include "utils/DebugEnv.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -635,12 +638,97 @@ TEST_F(MoERoutingPrefillGraphCapture, GroupedVerifierUsesCaptureOnlyLaunchPrepar
     EXPECT_EQ(stage.activeRowCountDeviceForTesting(), &active_rows_);
 }
 
+/** @test Checkpoint-only preparation cannot alias an owner graph or reserve its token arena. */
+TEST(MTPVerifierPreparationGraphCapture,
+     FollowerAuthorityOwnsOnlyCheckpointBindings)
+{
+    using Preparation = MTPVerifierPreparationStage;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        // Host addresses are immutable identity witnesses only. This unit
+        // neither constructs a backend nor executes a checkpoint operation.
+        int32_t checkpoint = 0;
+        std::array checkpoints{Preparation::MainKVCheckpointBinding{
+            .checkpoint_device = &checkpoint, .checkpoint_bytes = sizeof(checkpoint)}};
+        Preparation::Params params;
+        params.device_id = device;
+        params.authority = Preparation::Authority::PipelineFollower;
+        params.request_count = 1;
+        params.padded_seq_len = 16;
+        params.main_kv_checkpoints = checkpoints;
+        Preparation follower(params);
+        EXPECT_TRUE(follower.bufferContract().empty());
+        EXPECT_EQ(follower.estimatedMemoryBytes(), sizeof(checkpoint));
+        EXPECT_EQ(follower.estimatedFlops(), 0u);
+        EXPECT_TRUE(follower.hasSameCaptureIdentity(params));
+        for (const auto authority : {Preparation::Authority::Unbound,
+                                     Preparation::Authority::VerifierInputOwner})
+        {
+            auto other = params;
+            other.authority = authority;
+            EXPECT_FALSE(follower.hasSameCaptureIdentity(other));
+            EXPECT_NE(follower.captureIdentityDescription(),
+                      Preparation::describeCaptureIdentity(other));
+        }
+        // Content changes are replay data; address/size/geometry changes are
+        // new graph identities. The constructor must retain its own span copy.
+        checkpoint = 15;
+        EXPECT_TRUE(follower.hasSameCaptureIdentity(params));
+        checkpoints[0].checkpoint_bytes += sizeof(checkpoint);
+        EXPECT_FALSE(follower.hasSameCaptureIdentity(params));
+        checkpoints[0].checkpoint_bytes = sizeof(checkpoint);
+        params.padded_seq_len = 2;
+        EXPECT_FALSE(follower.hasSameCaptureIdentity(params));
+    }
+    Preparation::TokenRowBinding row;
+    int32_t token = 0;
+    row.first_token_device = row.draft_tokens_device = &token;
+    row.destination_device = &token;
+    row.draft_token_count = std::numeric_limits<int>::max();
+    EXPECT_FALSE(row.valid(std::numeric_limits<int>::max()));
+}
+
+/** @test Authority is capture identity and followers require no sampler arena. */
+TEST(MTPSpeculativeStatePublicationGraphCapture,
+     FollowerAuthorityCannotReuseAnOutcomeGraphOrBorrowSamplerBuffers)
+{
+    using Publication = MTPSpeculativeStatePublicationStage;
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        Publication::Params params;
+        params.device_id = device;
+        params.authority = Publication::Authority::PipelineFollower;
+        params.request_count = 1;
+        params.verifier_rows_per_request = 16;
+        Publication follower(params);
+        EXPECT_TRUE(follower.bufferContract().empty());
+        EXPECT_EQ(follower.estimatedMemoryBytes(), 4u * sizeof(int32_t));
+        EXPECT_TRUE(follower.hasSameCaptureIdentity(params));
+        for (const auto authority : {Publication::Authority::Unbound,
+                                     Publication::Authority::CompactOutcome,
+                                     Publication::Authority::BoundedGeneration})
+        {
+            auto other = params;
+            other.authority = authority;
+            EXPECT_FALSE(follower.hasSameCaptureIdentity(other));
+        }
+        // Device contents are replay data, but their owning addresses must be
+        // exact. These host addresses are compared only; no device is touched.
+        int32_t accepted = 0;
+        params.accepted_state_counts_device = &accepted;
+        EXPECT_FALSE(follower.hasSameCaptureIdentity(params));
+        Publication bound(params);
+        accepted = 15;
+        EXPECT_TRUE(bound.hasSameCaptureIdentity(params));
+    }
+}
+
 /**
  * @brief Accepted-state publication must expose its producer-admission hook.
  *
  * A prepareGraphLaunch() implementation paired with policy None is dead code:
  * the graph controller correctly skips it and capture later sees an unknown
- * producer stream.  This regression locks the policy and the exact stream
+ * producer stream. This regression locks the policy and the exact stream
  * delivered to every deferred MoE histogram publisher together.
  */
 TEST(MTPSpeculativeStatePublicationGraphCapture,

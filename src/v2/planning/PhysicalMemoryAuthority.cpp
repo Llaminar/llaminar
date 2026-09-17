@@ -1,6 +1,11 @@
 /**
  * @file PhysicalMemoryAuthority.cpp
  * @brief Topology-wide CPU/GPU memory authority implementation.
+ *
+ * Immutable BOM admission, explicit capacity ceilings and live materialization
+ * share this authority. Capacity exhaustion is a typed candidate rejection;
+ * malformed ownership or accounting overflow cannot masquerade as a smaller
+ * admissible plan. Live claims and reservations retain one synchronized ledger.
  */
 
 #include "PhysicalMemoryAuthority.h"
@@ -15,6 +20,13 @@
 
 namespace llaminar2
 {
+    std::size_t PhysicalMemoryAuthority::admissionCapacity(
+        std::size_t observed_available_bytes,
+        std::optional<std::size_t> explicit_limit_bytes) noexcept
+    {
+        return explicit_limit_bytes ? std::min(observed_available_bytes, *explicit_limit_bytes)
+                                    : observed_available_bytes;
+    }
     namespace
     {
         /** @brief Add topology totals without permitting a wrapped admission. */
@@ -344,6 +356,38 @@ namespace llaminar2
         return add(builder.build());
     }
 
+    PhysicalMemoryPlanBuilder &PhysicalMemoryPlanBuilder::addMutuallyExclusive(
+        std::span<const PhysicalMemoryPlan> alternatives)
+    {
+        PhysicalMemoryPlanBuilder envelope;
+        for (const auto &alternative : alternatives)
+            for (const auto &bom : alternative.resources())
+            {
+                const auto *existing = envelope.plan_.find(
+                    {bom.resource().world_rank, bom.resource().device});
+                if (existing && !existing->resource().sameAllocator(bom.resource()))
+                    throw std::invalid_argument("Mutually exclusive memory plans disagree on allocator observation");
+                // Differences extend the envelope to this alternative's maximum.
+                // Never put a second sum/capacity ledger in a sampling caller.
+                PhysicalMemoryBOMBuilder extension(bom.resource());
+                for (size_t index = 0; index < PhysicalMemoryBOM::ownerCount(); ++index)
+                {
+                    const auto owner = PhysicalMemoryBOM::ownerAt(index);
+                    const auto &charge = bom.charge(owner);
+                    if (charge.already_resident_bytes)
+                        throw std::invalid_argument("Mutually exclusive memory plans cannot merge residency credits");
+                    const size_t previous = existing ? existing->charge(owner).planned_bytes : 0;
+                    if (charge.planned_bytes > previous)
+                        extension.add(owner, charge.planned_bytes - previous);
+                }
+                envelope.add(extension.build());
+            }
+        auto combined = *this;
+        for (const auto &bom : envelope.plan_.resources()) combined.add(bom);
+        plan_ = std::move(combined.plan_);
+        return *this;
+    }
+
     PhysicalMemoryPlan PhysicalMemoryPlanBuilder::build() const
     {
         PhysicalMemoryPlan result = plan_;
@@ -369,7 +413,7 @@ namespace llaminar2
                 plan_.resources().begin(),
                 plan_.resources().end(),
                 [](const auto &bom) { return !bom.fits(); });
-            throw std::invalid_argument(
+            throw PhysicalMemoryCapacityExhausted(
                 "Physical memory topology admission failed: " +
                 failed->summary());
         }

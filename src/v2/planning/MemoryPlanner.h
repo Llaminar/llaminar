@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
@@ -20,6 +21,7 @@
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
+#include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "loaders/PreparedWeightAdmission.h"
 
 #include <optional>
@@ -139,12 +141,15 @@ struct CapturedServingGraphMemoryInventory
     std::size_t fixed_executable_count = 0u;
     /** Canonical MTP helper/controller cache geometry and graph owners. */
     MTPGraphOwnerPlan mtp_graph_owners{MTPRuntimeConfig{}};
+    /** Present only when the complete ordinary request program is retained. */
+    std::optional<OrdinaryGenerationGraphPlan> ordinary_generation;
 
     /** @return true when this declaration names at least one executable. */
     [[nodiscard]] bool enabled() const noexcept
     {
         return !prefill_bucket_rows.empty() ||
                fixed_executable_count != 0u ||
+               ordinary_generation.has_value() ||
                mtp_graph_owners.auxiliaryExecutableSlotCount() != 0u;
     }
 };
@@ -175,6 +180,7 @@ resolveCapturedServingGraphMemoryInventory(
             (retains_mtp ? 1u : 0u) +
             resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp),
         .mtp_graph_owners = MTPGraphOwnerPlan(mtp),
+        .ordinary_generation = OrdinaryGenerationGraphPlan{},
     };
 }
 
@@ -221,6 +227,7 @@ struct DevicePlanConfig
      * exact runtime launch/workspace policy.
      */
     int device_compute_units = 0;
+    CPUExecutionGeometry cpu_execution; ///< Rank-published CPU kernel geometry; absent for GPU resources.
 
     // TP configuration for this device
     int shard_index = 0;
@@ -235,6 +242,9 @@ struct DevicePlanConfig
      * installed by LocalTP; AUTO is invalid, not an alias for absence.
      */
     std::optional<CollectiveBackendType> local_tp_backend;
+
+    /** Native local PP lifecycle resources, independent of TP weight sharding. */
+    std::optional<CollectiveBackendType> local_pipeline_backend;
 
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.
@@ -311,6 +321,9 @@ struct DevicePlanConfig
 
     /** Flattened target-verifier rows retained by the MTP graph family. */
     int mtp_target_query_rows = 2;
+
+    /** Retained random-seed request rows, independent of current MTP enablement. */
+    int generation_request_capacity = 1;
 
     /** Exact participant-local terminal-logit ownership used by MTP. */
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
@@ -393,6 +406,8 @@ struct ResidentGraphMemoryPlan
 {
     int resident_graph_rows = 0;
     MemoryPlan memory_plan;
+    /** Exact inputs used for this BOM, including unchanged CPU continuation rows. */
+    std::vector<DevicePlanConfig> device_inputs;
 
     /// @brief True when the selected row capacity and full context both fit.
     bool fits() const { return resident_graph_rows > 0 && memory_plan.fits(); }

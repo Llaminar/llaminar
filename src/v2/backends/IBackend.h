@@ -19,6 +19,8 @@
 #pragma once
 
 #include "DeviceType.h"
+#include "GenerationPenaltyHistory.h"
+#include "kernels/common/GenerationLogicalState.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -1197,26 +1199,23 @@ namespace llaminar2
         }
 
         /**
-         * @brief Enqueue decode-equivalent grouped argmax with device history.
+         * @brief Enqueue fused deterministic argmax against typed device history.
          *
          * Every verifier row is scored against the persistent generated-token
          * histogram plus only the preceding tokens in that row's speculative
          * branch.  Implementations must preserve serial float operation order
          * and deterministic lowest-token tie breaking.
          *
-         * @param active_rows_device Resident INT32 logical verifier width. This
-         *        pointer is mandatory for grouped GPU verification: both argmax
-         *        passes must ignore the inactive suffix of a larger captured
-         *        physical bucket without consulting a host scalar.
+         * @param history Explicit committed single-row or speculative history.
+         *        Speculative mode requires resident logical width: both passes
+         *        ignore the inactive suffix without consulting a host scalar.
+         *        Committed mode reads no speculative tokens and admits one row.
          */
-        virtual bool enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+        virtual bool enqueueArgmaxF32RowsWithHistoryDevice(
             const void *data_device,
             int rows,
             int cols,
-            const void *verifier_input_tokens_device,
-            const void *generated_token_counts_device,
-            const void *penalty_policy_device,
-            const void *active_rows_device,
+            const GenerationPenaltyHistory &history,
             int device_id,
             void *stream,
             void *out_values_device,
@@ -1229,10 +1228,7 @@ namespace llaminar2
             (void)data_device;
             (void)rows;
             (void)cols;
-            (void)verifier_input_tokens_device;
-            (void)generated_token_counts_device;
-            (void)penalty_policy_device;
-            (void)active_rows_device;
+            (void)history;
             (void)device_id;
             (void)stream;
             (void)out_values_device;
@@ -1631,6 +1627,11 @@ namespace llaminar2
          * `*threshold_position_device + threshold_position_offset`; this is the
          * fully resident MTP path and @p threshold is ignored. Requires an
          * explicit non-null stream.
+         * @param threshold_seed_device Optional admitted UINT64 seed. This
+         *        binding requires a resident position and a zero scalar seed;
+         *        the two seed sources are mutually exclusive. Request reset
+         *        may publish new seed bytes without recapture. A zero resident
+         *        seed yields an invalid sample for the controller to reject.
          */
         virtual bool enqueueSampleDistributionF32Device(
             const void *token_ids_device,
@@ -1643,7 +1644,8 @@ namespace llaminar2
             void *out_probability_device = nullptr,
             uint64_t threshold_seed = 0,
             const void *threshold_position_device = nullptr,
-            int threshold_position_offset = 0)
+            int threshold_position_offset = 0,
+            const uint64_t *threshold_seed_device = nullptr)
         {
             (void)token_ids_device;
             (void)probs_device;
@@ -1656,6 +1658,7 @@ namespace llaminar2
             (void)threshold_seed;
             (void)threshold_position_device;
             (void)threshold_position_offset;
+            (void)threshold_seed_device;
             return false;
         }
 
@@ -2924,13 +2927,15 @@ namespace llaminar2
 
         /**
          * @brief Publish an ordinary response and its live sequence frontier together.
-         * @param publication Persistent sampler, response, controller and logical-state bindings.
+         * @param publication Persistent sampler, stop-policy, response, controller and logical-state bindings.
          * @param device_id Backend-local device owning every binding.
          * @param stream Exact non-null producer stream, ordered after sampling.
          * @return Whether the allocation-free, capturable operation was enqueued.
          *
          * Only one lane owns each request's transition. This operation neither
-         * samples logits nor transfers tokens to the host. Invalid device-side
+         * samples logits nor transfers tokens to the host. It evaluates the
+         * admitted stop-token row itself, without a second stop-flag producer.
+         * Invalid device-side
          * state poisons the shared controller and invalidates the logical
          * frontier without partially advancing position or next-token bytes.
          * Both outputs borrow existing arena storage; no host mirror or extra
@@ -3538,63 +3543,23 @@ namespace llaminar2
         }
 
         /**
-         * @brief Seed the request-batched GPU logical-state mailbox after prefill.
+         * @brief Initialize the canonical logical frontier without consuming model state.
+         * @param initialization Typed unsampled-logits or sampled-condition producer and arena rows.
+         * @param device_id GPU ordinal owning every borrowed address.
+         * @param stream Exact non-null stream ordered after the declared producer.
+         * @return Whether the one bounded initialization kernel was enqueued.
          *
-         * The terminal prefill sampler already owns one sampled token per request
-         * in @p sampled_tokens_device. Request admission has likewise published
-         * each prompt's next logical position to @p target_positions_device. This
-         * primitive turns those two device rows into the first complete MTP
-         * publication mailbox in one bounded kernel launch. No mutable position or
-         * sampled-token shadow is adopted from host memory at this boundary.
-         *
-         * Production request admission and publication use separate persistent
-         * arena rows: the immutable admitted prompt lengths are inputs, while
-         * the outputs comprise one base-cache scratch row and six
-         * request-lifetime logical-state rows. Implementations must nevertheless
-         * remain alias-safe for focused kernel tests and must enqueue on the
-         * explicit non-null @p stream without allocation, synchronization, or
-         * a default-stream substitute.
-         *
-         * @param sampled_tokens_device Contiguous INT32 sampled prefill tokens.
-         * @param target_positions_device Device INT32 prompt positions, one per request.
-         * @param request_count Number of initialized request rows (one through four).
-         * @param device_id GPU ordinal owning every device pointer.
-         * @param stream Explicit CUDA/HIP stream ordered after terminal sampling.
-         * @param out_base_cached_tokens_device Device INT32 base cache lengths.
-         * @param out_target_positions_device Device INT32 next decode positions.
-         * @param out_accepted_state_counts_device Device INT32 zeroed accept counts.
-         * @param out_next_condition_tokens_device Device INT32 sampled conditions.
-         * @param out_all_drafts_accepted_flags_device Device INT32 zeroed flags.
-         * @param out_stopped_flags_device Device INT32 zeroed stop flags.
-         * @param out_publication_ok_flags_device Device INT32 one-valued validity flags.
-         * @return true when mailbox initialization was enqueued successfully.
+         * Ordinary prefill needs no fictitious sample. Speculative generation
+         * retains its sampled-condition contract through the same operation.
+         * No allocation, transfer, host observation or blocking wait occurs.
          */
-        virtual bool enqueueInitializeMTPDeviceLogicalState(
-            const void *sampled_tokens_device,
-            const void *target_positions_device,
-            int request_count,
-            int device_id,
-            void *stream,
-            void *out_base_cached_tokens_device,
-            void *out_target_positions_device,
-            void *out_accepted_state_counts_device,
-            void *out_next_condition_tokens_device,
-            void *out_all_drafts_accepted_flags_device,
-            void *out_stopped_flags_device,
-            void *out_publication_ok_flags_device)
+        virtual bool enqueueInitializeGenerationLogicalState(
+            const GenerationLogicalStateInitialization &initialization,
+            int device_id, void *stream)
         {
-            (void)sampled_tokens_device;
-            (void)target_positions_device;
-            (void)request_count;
+            (void)initialization;
             (void)device_id;
             (void)stream;
-            (void)out_base_cached_tokens_device;
-            (void)out_target_positions_device;
-            (void)out_accepted_state_counts_device;
-            (void)out_next_condition_tokens_device;
-            (void)out_all_drafts_accepted_flags_device;
-            (void)out_stopped_flags_device;
-            (void)out_publication_ok_flags_device;
             return false;
         }
 

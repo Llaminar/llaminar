@@ -1071,6 +1071,18 @@ add_v2_test(V2_Integration_DynamicDeviceHistogramCadenceLifecycle
     NO_MODELS
     TIMEOUT 30
 )
+# Force local serving shutdown at every admitted migration phase, including
+# graph-sequence readers and asynchronous cleanup. This uses the production
+# worker and authority with explicitly controlled completion events.
+add_v2_test(V2_Integration_ExpertOverlayLocalMaintenanceDrain
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_maintenance_service>
+        --gtest_filter=Test__MoEOverlayResidencyMaintenanceService.LocalShutdown*
+        --gtest_brief=1
+    LABELS "V2;Integration;Parity;ExpertOverlay;Dynamic;Async;TypedLifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_service_telemetry_publication
     V2_Unit_MoEOverlayServiceTelemetryPublication
@@ -1498,21 +1510,20 @@ add_v2_test(V2_Unit_PPStage_HierarchicalConfig
     MPI_PROCS 1
 )
 
-# Test: PPStage Global TP - GLOBAL_TP_DOMAIN support in PPStage
-# Note: Uses mpi_gtest_main.cpp for MPI initialization (needed for GlobalTPContext tests with MPI_COMM_SELF)
+# Test: PPStage Global TP - device-free metadata queries and exact endpoint identity.
+# Real communicator lifecycle/transport belongs to the MPI Integration suites.
 add_executable(v2_unit_ppstage_globaltp 
     unit/collective/Test__PPStage_GlobalTP.cpp
-    integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_unit_ppstage_globaltp 
     llaminar2_core 
-    GTest::gtest
-    MPI::MPI_CXX
+    GTest::gmock_main
 )
 add_v2_test(V2_Unit_PPStage_GlobalTP 
     COMMAND $<TARGET_FILE:v2_unit_ppstage_globaltp>
     LABELS "V2;Unit;Collective;PPStage;GlobalTP;Phase5"
-    MPI_PROCS 1
+    NO_MPI
+    NO_MODELS
 )
 
 # Test: LocalPPContext - LOCAL pipeline parallelism context configuration and transfer tracking
@@ -1674,9 +1685,6 @@ if(HAVE_CUDA AND HAVE_ROCM)
         GTest::gtest
         GTest::gtest_main
     )
-    if(NOT LLAMINAR_SHARED_CORE)
-        target_link_libraries(v2_integration_collective_backend device_benchmarks)
-    endif()
     target_include_directories(v2_integration_collective_backend PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
     )
@@ -1716,6 +1724,35 @@ if(HAVE_CUDA OR HAVE_ROCM)
     message(STATUS "V2 Tests: Added CrossDomainTransfer GPU integration tests")
 endif()
 
+# Full shipping binaries must start on remote CPU hosts with no NVIDIA driver.
+# Deny libcuda at the ELF boundary, without a stub or replacement CPU binary.
+if(HAVE_CUDA AND NOT V2_PERF_TESTS_ONLY)
+    add_library(v2_test_cuda_driver_visibility_audit MODULE
+        utils/CUDADriverVisibilityAudit.cpp)
+    add_executable(v2_integration_cuda_driver_api
+        integration/backends/Test__CUDADriverApi.cpp)
+    target_link_libraries(v2_integration_cuda_driver_api PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_dependencies(v2_integration_cuda_driver_api v2_test_cuda_driver_visibility_audit)
+    add_v2_test(V2_Integration_CUDADriverAbsent_CPUStartup
+        COMMAND $<TARGET_FILE:v2_integration_cuda_driver_api>
+            --gtest_filter=Test__CUDADriverApi.FullBackendCPUHostWithoutNvidiaDriver
+        LABELS "V2;Integration;Backends;NoModels;CPU;DriverLoading"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LD_AUDIT=$<TARGET_FILE:v2_test_cuda_driver_visibility_audit>"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    add_v2_test(V2_Integration_CUDADriverApi
+        COMMAND $<TARGET_FILE:v2_integration_cuda_driver_api>
+            --gtest_filter=Test__CUDADriverApi.NativePreparationPublishesOneCompleteTable
+        LABELS "V2;Integration;Backends;NoModels;CUDA;DriverLoading"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS)
+endif()
+
 # A heterogeneous build must not initialize the vendor that a process topology
 # explicitly excludes. Each case is a fresh, serial process because its oracle
 # is the native process-context state rather than a mock construction counter.
@@ -1726,8 +1763,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
         v2_integration_hardware_inventory_backend_isolation PRIVATE
         llaminar2_core
         GTest::gtest
-        GTest::gtest_main
-        CUDA::cuda_driver)
+        GTest::gtest_main)
 
     add_v2_test(V2_Integration_HardwareInventory_CUDAExcluded
         COMMAND
@@ -1995,6 +2031,39 @@ add_v2_test(V2_Integration_CPUStartupAffinity
     TIMEOUT 60
 )
 
+add_executable(v2_integration_cluster_inventory_bootstrap
+    integration/app/Test__ClusterInventoryBootstrap.cpp)
+target_link_libraries(v2_integration_cluster_inventory_bootstrap llaminar2_core)
+add_v2_test(V2_Integration_ClusterInventoryBootstrap
+    COMMAND $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap>
+    LABELS "V2;Integration;CPU;MPI;Bootstrap;Inventory;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS
+    TIMEOUT 60
+)
+
+# Command discovery must not lose a GPU on another CPU socket. Both vendors
+# exercise the same model-free MPI invariant with their actual drivers.
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_cluster_accelerator_inventory
+        integration/app/Test__ClusterAcceleratorInventory.cpp)
+    target_link_libraries(v2_integration_cluster_accelerator_inventory llaminar2_core)
+    foreach(backend CUDA ROCm)
+        if((backend STREQUAL "CUDA" AND HAVE_CUDA) OR (backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(backend STREQUAL "CUDA")
+                set(inventory_backend_environment "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(inventory_backend_environment "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            endif()
+            add_v2_test(V2_Integration_ClusterAcceleratorInventory_${backend}
+                COMMAND $<TARGET_FILE:v2_integration_cluster_accelerator_inventory>
+                LABELS "V2;Integration;${backend};MPI;Bootstrap;Inventory;Regression"
+                MPI_PROCS 2 NO_MODELS TIMEOUT 30
+                ENVIRONMENT ${inventory_backend_environment} "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
+        endif()
+    endforeach()
+endif()
+
 # Test: UPIBackend - UPI-based collective backend for cross-socket CPU tensor parallelism
 add_executable(v2_unit_upi_backend unit/collective/backends/Test__UPIBackend.cpp)
 target_link_libraries(v2_unit_upi_backend 
@@ -2013,6 +2082,7 @@ add_v2_test(V2_Unit_UPIBackend
 if(HAVE_CUDA OR HAVE_ROCM)
 add_library(v2_expert_transfer_parity_support OBJECT
     integration/kernels/moe/NativeVNNIExpertTransferParitySupport.cpp
+    integration/kernels/moe/MixedFormatExpertTransferPublication.cpp
     integration/kernels/moe/NativeVNNIExpertTransferGroupedParity.cpp)
 target_link_libraries(v2_expert_transfer_parity_support PUBLIC
     llaminar2_core GTest::gtest)
@@ -2094,9 +2164,6 @@ target_link_libraries(v2_unit_heterogeneous_backend
     GTest::gtest
     GTest::gtest_main
 )
-if(NOT LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_unit_heterogeneous_backend device_benchmarks)
-endif()
 add_v2_test(V2_Unit_HeterogeneousBackend 
     COMMAND $<TARGET_FILE:v2_unit_heterogeneous_backend>
     LABELS "V2;Unit;Collective;HeterogeneousBackend;CUDA;ROCm;CrossVendor"
@@ -2601,6 +2668,15 @@ set_tests_properties(V2_Unit_ServerGraphCapturePerfPolicy PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_ServerExecutionContract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_execution_contract.py
+)
+set_tests_properties(V2_Unit_ServerExecutionContract PROPERTIES
+    LABELS "V2;Unit;E2E;Server;GraphCapture;PerfStats;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_AcceleratorBuildTypeFlags
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_accelerator_build_type_flags.py
@@ -2669,6 +2745,24 @@ add_test(NAME V2_Unit_ProductionPipeline
 )
 set_tests_properties(V2_Unit_ProductionPipeline PROPERTIES
     LABELS "V2;Unit;BuildSystem;Parity;E2E;Benchmark;Certification;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_AzureCrossHostResources
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_azure_cross_host_resources.py
+)
+set_tests_properties(V2_Unit_AzureCrossHostResources PROPERTIES
+    LABELS "V2;Unit;E2E;MPI;Certification;Lifecycle;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CrossHostExpertOverlayEvidence
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_cross_host_expert_overlay_perf_policy.py
+)
+set_tests_properties(V2_Unit_CrossHostExpertOverlayEvidence PROPERTIES
+    LABELS "V2;Unit;E2E;MPI;MoE;Certification;Regression"
     TIMEOUT 30
 )
 
@@ -2858,6 +2952,7 @@ add_v2_test(V2_Unit_ParityReferenceCache
 # Typed, device-free expansion contract shared by every canonical parity suite.
 add_executable(v2_test_model_parity_definition
     unit/parity/Test__ModelParityDefinition.cpp
+    unit/parity/Test__ModelParityCrossHostE2E.cpp
 )
 target_link_libraries(v2_test_model_parity_definition
     llaminar2_core
@@ -7070,7 +7165,7 @@ add_v2_test(V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
 )
 add_v2_test(V2_Integration_CUDA_MoECompactTransferAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes
+            --gtest_filter=Test__CUDAMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__CUDAMoEKernel.CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;Transfer;Publication;AllFormats;ByteExact;Regression"
     MPI_PROCS 1
@@ -7247,10 +7342,11 @@ add_v2_test(V2_Integration_CUDAEmbeddingGroupedVerifier
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_Embedding
     COMMAND $<TARGET_FILE:v2_integration_cuda_embedding_grouped_verifier>
-            --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+            --gtest_filter=Test__CUDAEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__CUDAEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights:Test__CUDAEmbeddingGroupedVerifier.NestedVocabularySlicesPreserveCapturedRepresentation
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression"
     MPI_PROCS 1
+    NO_MODELS
 )
 endif()
 
@@ -9601,6 +9697,30 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
     MPI_PROCS 1
 )
 
+# Structured CLI composition stays device-free, including command extensions.
+add_executable(v2_test_cli_spec unit/config/Test__CliSpec.cpp)
+target_link_libraries(v2_test_cli_spec PRIVATE GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_cli_spec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
+add_v2_test(V2_Unit_CliSpec
+    COMMAND $<TARGET_FILE:v2_test_cli_spec>
+    LABELS "V2;Unit;Config;CLI"
+    NO_MPI NO_MODELS
+)
+
+# Test: Prefix cache and MTP config feature gates
+add_executable(v2_test_orchestration_plan_config
+    unit/config/Test__OrchestrationPlanConfig.cpp
+    unit/config/Test__OrchestrationConfigDocument.cpp
+    unit/config/Test__OrchestrationPlanningPolicy.cpp)
+target_link_libraries(v2_test_orchestration_plan_config llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_orchestration_plan_config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+add_v2_test(V2_Unit_OrchestrationPlanConfig
+    COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
+    LABELS "V2;Unit;Config;CLI;YAML;Orchestration"
+    MPI_PROCS 1
+)
+
 # Test: Prefix cache and MTP config feature gates
 add_executable(v2_test_prefix_mtp_config unit/config/Test__PrefixMTPConfig.cpp)
 target_link_libraries(v2_test_prefix_mtp_config llaminar2_core GTest::gtest GTest::gtest_main)
@@ -9814,7 +9934,8 @@ add_v2_test(V2_Unit_MTPSpecDecodeMetadata
 
 # Test: device-owned generation response and transaction controller
 add_executable(v2_test_device_generation_controller
-    unit/mtp/Test__DeviceGenerationController.cpp)
+    unit/mtp/Test__DeviceGenerationController.cpp
+    unit/mtp/Test__DeviceGenerationGraphProgram.cpp)
 target_link_libraries(v2_test_device_generation_controller
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_device_generation_controller PRIVATE
@@ -9914,7 +10035,9 @@ add_v2_test(V2_Unit_MTPStateTransaction
 )
 
 # Test: MTP verifier execution-policy selection
-add_executable(v2_test_mtp_verifier_policy unit/mtp/Test__MTPVerifierPolicy.cpp)
+add_executable(v2_test_mtp_verifier_policy
+    unit/mtp/Test__MTPVerifierPolicy.cpp
+    unit/mtp/Test__MTPStochasticVerificationOwner.cpp)
 target_link_libraries(v2_test_mtp_verifier_policy llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_mtp_verifier_policy PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -9923,6 +10046,13 @@ add_v2_test(V2_Unit_MTPVerifierPolicy
     COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
     LABELS "V2;Unit;MTP;VerifierPolicy;Rollback"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MTPStochasticVerificationOwner
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
+        --gtest_filter=MTPStochasticVerificationOwner.*
+    LABELS "V2;Integration;MTP;ExpertOverlay;TypedOwnership;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: MTP sidecar weight discovery and graph-facing bindings
@@ -10232,7 +10362,11 @@ add_v2_test(V2_Unit_RankExecutionPlan
 # Test: ExecutionPlanBuilder (builds execution plans from orchestration config)
 # Tests single device, LOCAL TP, GLOBAL TP, PP, named domains, weight sharding.
 # Part of Phase 1: Plan-to-Graph Translation
-add_executable(v2_test_execution_plan_builder unit/execution/mpi_orchestration/Test__ExecutionPlanBuilder.cpp)
+add_executable(v2_test_execution_plan_builder
+    unit/execution/mpi_orchestration/Test__ExecutionPlanBuilder.cpp
+    unit/planning/Test__ExecutionRankMembership.cpp
+    unit/planning/Test__AutomaticOrchestrationCandidates.cpp
+    unit/planning/Test__ResolvedRankOrchestration.cpp)
 target_link_libraries(v2_test_execution_plan_builder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ExecutionPlanBuilder
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
@@ -10586,6 +10720,7 @@ add_v2_test(V2_Unit_InferenceRunnerFactory_MultiDevice
 # Tests PPStageConfig validation (isValid) and layer counting (layerCount).
 # Part of Pipeline Parallelism implementation for multi-device inference.
 add_executable(v2_unit_pp_stage_config unit/execution/factory/Test__PPStageConfig.cpp)
+target_include_directories(v2_unit_pp_stage_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_unit_pp_stage_config
     llaminar2_core
     GTest::gtest
@@ -10759,16 +10894,12 @@ add_v2_test(V2_Unit_DeviceGraphOrchestratorDomainWiring
     MPI_PROCS 1
 )
 
-# Test: DeviceGraphOrchestrator PP+TP initialization logic
-# Tests that initializePPContexts() correctly:
-# - Detects TP domains (degree > 1) and uses HierarchicalPPConfig
-# - Falls back to flat LocalPPConfig when no TP domains
-# - Wires TP contexts to PP contexts properly
-add_executable(v2_test_device_graph_orchestrator_pptp_init unit/execution/local_execution/orchestrators/Test__DeviceGraphOrchestratorPPTPInit.cpp)
-target_link_libraries(v2_test_device_graph_orchestrator_pptp_init llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_DeviceGraphOrchestratorPPTPInit
-    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator_pptp_init>
-    LABELS "V2;Unit;DeviceGraphOrchestrator;PipelineParallel;TensorParallel;HierarchicalPPConfig;Phase6"
+# Declarative topology queries, not an orchestrator initialization proof.
+add_executable(v2_test_pipeline_topology_queries unit/config/Test__PipelineTopologyQueries.cpp)
+target_link_libraries(v2_test_pipeline_topology_queries llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PipelineTopologyQueries
+    COMMAND $<TARGET_FILE:v2_test_pipeline_topology_queries>
+    LABELS "V2;Unit;Config;PipelineParallel;TensorParallel"
     MPI_PROCS 1
 )
 
@@ -10835,7 +10966,9 @@ add_v2_test(V2_Unit_ChatCompletionHandler
     MPI_PROCS 1
 )
 
-add_executable(v2_test_server_mode unit/app/modes/Test__ServerMode.cpp)
+add_executable(v2_test_server_mode
+    unit/app/modes/Test__ServerMode.cpp
+    unit/app/modes/Test__ServerRankMembership.cpp)
 target_include_directories(v2_test_server_mode PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
 )
@@ -10859,8 +10992,8 @@ target_link_libraries(v2_test_completion_single_shot_modes
 )
 add_v2_test(V2_Unit_CompletionModeSingleShotChatMode
     COMMAND $<TARGET_FILE:v2_test_completion_single_shot_modes>
-    LABELS "V2;Unit;App;CompletionMode;SingleShotChatMode;MPI;Oneshot"
-    MPI_PROCS 1
+    LABELS "V2;Unit;App;CompletionMode;SingleShotChatMode;Oneshot"
+    NO_MPI NO_MODELS
 )
 
 # CLI Commands: DescribeCommand, PlanCommand, SubcommandRouter
@@ -10876,7 +11009,10 @@ add_v2_test(V2_Unit_Commands
 )
 
 # RuntimeInitPhase: dry-run preflight lifecycle and reporting
-add_executable(v2_test_runtime_init_phase unit/app/Test__RuntimeInitPhase.cpp)
+add_executable(v2_test_runtime_init_phase
+    unit/app/Test__RuntimeInitPhase.cpp
+    unit/app/Test__CPUShorthandPlacement.cpp
+    unit/app/Test__MPIProcessSession.cpp)
 target_include_directories(v2_test_runtime_init_phase PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
 )
@@ -10891,6 +11027,13 @@ add_v2_test(V2_Unit_RuntimeInitPhase
     LABELS "V2;Unit;App;RuntimeInitPhase;DryRun"
     MPI_PROCS 1
 )
+
+add_test(NAME V2_Unit_AppMPILifetimePolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_app_mpi_lifetime_policy.py)
+set_tests_properties(V2_Unit_AppMPILifetimePolicy PROPERTIES
+    LABELS "V2;Unit;App;SourcePolicy"
+    TIMEOUT 30)
 
 # Test: QwenStandardGraphSchema (schema-based QwenStandardGraph building - Phase 4d)
 # Tests the new buildForwardGraphFromSchema() method that uses
@@ -11784,19 +11927,17 @@ add_v2_test(V2_Unit_MPITopologyCapabilityExchange
     LABELS "V2;Unit;MPI;Topology;Serialization;DeviceInventory;Heterogeneous"
 )
 
-# Test: NodeDetection (canonical hostname-based node detection)
-# Note: Uses mpi_gtest_main.cpp for MPI initialization (needed for detect() with MPI_COMM_SELF)
+# Test: NodeDetection pure membership validation (real MPI proof is preflight).
 add_executable(v2_test_node_detection
     unit/utils/Test__NodeDetection.cpp
-    integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_test_node_detection
     llaminar2_core
-    GTest::gtest
+    GTest::gtest GTest::gtest_main
 )
 add_v2_test(V2_Unit_NodeDetection
     COMMAND $<TARGET_FILE:v2_test_node_detection>
-    MPI_PROCS 1
+    NO_MPI NO_MODELS
     LABELS "V2;Unit;MPI;Topology;NodeDetection"
 )
 
@@ -12076,6 +12217,74 @@ add_v2_test(V2_Unit_IQ4_NLTensor
     LABELS "V2;Unit;TensorOperations;Quantization;IQ4_NL;GEMM"
 )
 
+# Participant-owned scratch is exercised independently of the large native
+# kernel fixture, under both runtime ISAs. These are functional preflight gates.
+add_executable(v2_integration_floating_output_partitions
+    integration/kernels/Test__FloatingOutputPartitions.cpp)
+target_link_libraries(v2_integration_floating_output_partitions PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_integration_floating_output_partitions PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_FloatingOutputPartitionScope
+    COMMAND $<TARGET_FILE:v2_integration_floating_output_partitions>
+        --gtest_filter=FloatingOutputPartitions.CPUScopeIsolation
+    LABELS "V2;Unit;GEMM;Lifecycle;ThreadIsolation"
+    MPI_PROCS 1
+    NO_MODELS)
+foreach(V2_FLOAT_PARTITION_BACKEND CPU CUDA ROCm)
+    if((V2_FLOAT_PARTITION_BACKEND STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+       (V2_FLOAT_PARTITION_BACKEND STREQUAL "ROCm" AND NOT HAVE_ROCM))
+        continue()
+    endif()
+    add_v2_test(V2_Integration_FloatingOutputPartitions_${V2_FLOAT_PARTITION_BACKEND}
+        COMMAND $<TARGET_FILE:v2_integration_floating_output_partitions>
+            --gtest_filter=FloatingOutputPartitions.${V2_FLOAT_PARTITION_BACKEND}
+        LABELS "V2;Integration;${V2_FLOAT_PARTITION_BACKEND};GEMM;MTP;GraphCapture;ByteExact;ProductionParityPreflight"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120)
+endforeach()
+
+add_executable(v2_integration_embedding_weight_residency
+    integration/loaders/Test__EmbeddingWeightResidency.cpp)
+target_link_libraries(v2_integration_embedding_weight_residency PRIVATE
+    llaminar2_core GTest::gtest_main)
+target_include_directories(v2_integration_embedding_weight_residency PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+foreach(V2_EMBEDDING_RESIDENCY_BACKEND CUDA ROCm)
+    if((V2_EMBEDDING_RESIDENCY_BACKEND STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+       (V2_EMBEDDING_RESIDENCY_BACKEND STREQUAL "ROCm" AND NOT HAVE_ROCM))
+        continue()
+    endif()
+    add_v2_test(V2_Integration_EmbeddingWeightResidency_${V2_EMBEDDING_RESIDENCY_BACKEND}
+        COMMAND $<TARGET_FILE:v2_integration_embedding_weight_residency>
+            --gtest_filter=EmbeddingWeightResidency.${V2_EMBEDDING_RESIDENCY_BACKEND}
+        LABELS "V2;Integration;${V2_EMBEDDING_RESIDENCY_BACKEND};Embedding;PreparedWeights;GraphCapture;ByteExact;ProductionParityPreflight"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120)
+endforeach()
+
+add_executable(v2_integration_cpu_projection_workspace
+    integration/kernels/cpu/Test__CPUProjectionWorkspace.cpp)
+target_link_libraries(v2_integration_cpu_projection_workspace PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_integration_cpu_projection_workspace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+set(V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS)
+set(V2_CPU_PROJECTION_WORKSPACE_ISAS avx2)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    list(APPEND V2_CPU_PROJECTION_WORKSPACE_ISAS avx512)
+endif()
+foreach(V2_CPU_WORKSPACE_ISA IN LISTS V2_CPU_PROJECTION_WORKSPACE_ISAS)
+    string(TOUPPER "${V2_CPU_WORKSPACE_ISA}" V2_CPU_WORKSPACE_ISA_LABEL)
+    set(V2_CPU_WORKSPACE_TEST "V2_Integration_CPU_ProjectionWorkspace_${V2_CPU_WORKSPACE_ISA_LABEL}")
+    add_v2_test(${V2_CPU_WORKSPACE_TEST}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_projection_workspace> --gtest_brief=1
+        LABELS "V2;Integration;CPU;Workspace;AllFormats;MTP;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CPU_WORKSPACE_ISA}")
+    list(APPEND V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS ${V2_CPU_WORKSPACE_TEST})
+endforeach()
+
 # Integration Test: CPU NativeVNNI GEMV/GEMM Correctness (Q4_0, IQ4_NL)
 add_executable(v2_integration_cpu_native_vnni_gemv integration/kernels/cpu/native_vnni/Test__CPUNativeVNNI_GEMV.cpp)
 target_link_libraries(v2_integration_cpu_native_vnni_gemv
@@ -12129,21 +12338,60 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
-add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512
-    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
-            --gtest_brief=1
-    LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX512;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
-    MPI_PROCS 1
-)
+set(V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
+    V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2)
+if(USE_ONEDNN AND ONEDNN_FOUND)
+    add_executable(v2_integration_cpu_floating_skinny
+        integration/kernels/cpu/native_vnni/Test__CPUFloatingSkinny.cpp)
+    target_link_libraries(v2_integration_cpu_floating_skinny PRIVATE
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_CPU_FloatingSkinnySerialRows
+        COMMAND $<TARGET_FILE:v2_integration_cpu_floating_skinny> --gtest_brief=1
+        LABELS "V2;Integration;CPU;MTP;FP32;FP16;BF16;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
+        V2_Integration_CPU_FloatingSkinnySerialRows)
+endif()
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+                --gtest_filter=CPUActivationWordPacking.*:CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+                --gtest_brief=1
+        LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX512;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
+        V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512)
+endif()
 add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
-            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+            --gtest_filter=CPUActivationWordPacking.*:CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
             --gtest_brief=1
     LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX2;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
     MPI_PROCS 1
+    NO_MODELS
     ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
 )
+foreach(V2_FUSED_ISA AVX2 AVX512)
+    if(V2_FUSED_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_FUSED_ISA}" V2_FUSED_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+                --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedFullKForcedPoliciesAllFormatsRuntimeMMatchSerialDecodeRows
+                --gtest_brief=1
+        LABELS "V2;Integration;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_ISA};ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_RUNTIME_ISA}"
+    )
+    list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
+        V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA})
+endforeach()
 add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillBucketMInvariantAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets
@@ -12167,7 +12415,37 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
 # standalone v2_perf_cpu_moe_expert_verifier_rows benchmark below.
 set(V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS
     V2_Integration_CPU_CompactMultiScaleIntegerDot
-    V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2)
+    V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2
+    V2_Integration_CPU_ContributionRounding_AVX2)
+
+# Independent scalar rounding oracle: grouped/serial agreement alone cannot
+# catch a shared compiler contraction defect in their inlined block primitive.
+add_executable(v2_integration_cpu_contribution_rounding
+    integration/kernels/cpu/native_vnni/Test__CPUContributionRounding.cpp)
+target_link_libraries(v2_integration_cpu_contribution_rounding PRIVATE
+    GTest::gtest GTest::gtest_main)
+target_compile_features(v2_integration_cpu_contribution_rounding PRIVATE cxx_std_23)
+target_include_directories(v2_integration_cpu_contribution_rounding PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
+add_v2_test(V2_Integration_CPU_ContributionRounding_AVX2
+    COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
+            --gtest_filter=CPUContributionRounding.AVX2
+    LABELS "V2;Integration;CPU;AVX2;NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
+)
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    add_v2_test(V2_Integration_CPU_ContributionRounding_AVX512
+        COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
+                --gtest_filter=CPUContributionRounding.AVX512
+        LABELS "V2;Integration;CPU;AVX512;NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    list(APPEND V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS
+        V2_Integration_CPU_ContributionRounding_AVX512)
+endif()
 add_v2_test(V2_Integration_CPU_CompactMultiScaleIntegerDot
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.CompactMultiScaleAVX2DotExhaustiveSignedByteDomain
@@ -12275,6 +12553,17 @@ add_v2_test(V2_Perf_CPUNativeVNNI_DispatchSweep
 
 # Performance Test: CPU NativeVNNI GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
 add_executable(v2_perf_cpu_native_vnni_gemv performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp)
+add_executable(v2_perf_cpu_fused_verifier
+    performance/kernels/cpu/native_vnni/Perf__CPUFusedVerifier.cpp)
+target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_perf_cpu_fused_verifier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Perf_CPUFusedVerifier
+    COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
+    LABELS "V2;Performance;CPU;NativeVNNI;MTP;AllFormats"
+    MPI_PROCS 1
+    NO_MODELS
+)
 target_link_libraries(v2_perf_cpu_native_vnni_gemv
     llaminar2_core
     GTest::gtest
@@ -12909,8 +13198,21 @@ target_link_libraries(v2_integration_mpi_topology
 )
 add_v2_test(V2_Integration_MPITopology
     COMMAND $<TARGET_FILE:v2_integration_mpi_topology>
+        --gtest_filter=-*CPUOnlyStrategySelectedWithoutGPU
     MPI_PROCS 2
     LABELS "V2;Integration;MPI;Topology;WorkDistribution;CapabilityExchange;Placement;Phase1"
+    NO_MODELS
+)
+
+# CPU-only admission is a startup policy, not an assumption that the test host
+# lacks accelerators. Keep it in a separate process so discovery is never
+# retroactively edited after the manager publishes its hardware observation.
+add_v2_test(V2_Integration_MPITopology_CPUOnly
+    COMMAND $<TARGET_FILE:v2_integration_mpi_topology>
+        --gtest_filter=*CPUOnlyStrategySelectedWithoutGPU
+    MPI_PROCS 2
+    LABELS "V2;Integration;MPI;Topology;CapabilityExchange;Placement;CPU;Regression"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
     NO_MODELS
 )
 
@@ -13085,6 +13387,7 @@ add_v2_test(V2_Integration_TPAllreduceStage_MPI
 
 add_executable(v2_integration_moe_overlay_sparse_transport_mpi
     integration/moe/Test__MoEOverlaySparseTransport_MPI.cpp
+    integration/moe/Test__MoEOverlayRankBatchForkJoin_MPI.cpp
     integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_integration_moe_overlay_sparse_transport_mpi
@@ -13094,9 +13397,18 @@ target_link_libraries(v2_integration_moe_overlay_sparse_transport_mpi
 )
 add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
+            --gtest_filter=-Test__MoEOverlayRankBatchForkJoin_MPI.*
     LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI;MTP;DynamicDepth;Async;NoBlocking;PerfStats"
     MPI_PROCS 2
     TIMEOUT 60
+    NO_MODELS
+)
+add_v2_test(V2_Integration_MoEOverlayRankBatchForkJoin_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
+            --gtest_filter=Test__MoEOverlayRankBatchForkJoin_MPI.*
+    LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI;MTP;Async;Regression"
+    MPI_PROCS 3
+    TIMEOUT 30
     NO_MODELS
 )
 
@@ -14390,10 +14702,11 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Embedding
         COMMAND $<TARGET_FILE:v2_integration_rocm_embedding_grouped_verifier>
-                --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights
+                --gtest_filter=Test__ROCmEmbeddingGroupedVerifier.AllWeightFormatsDeviceTokensRuntimeMMatchSerialDecodeBytes:Test__ROCmEmbeddingGroupedVerifier.QuantizedExecutionRequiresMatchingPreparedDeviceWeights:Test__ROCmEmbeddingGroupedVerifier.NestedVocabularySlicesPreserveCapturedRepresentation
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;PreparedWeights;DeviceResident;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
     )
 
     # ROCm Flash Attention Parity Tests
@@ -14723,7 +15036,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_ROCm_MoECompactTransferAllFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-                --gtest_filter=Test__ROCmMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes
+                --gtest_filter=Test__ROCmMoEKernel.TransferredCurrentBatchAllNativeFormatsPublishExactBytes:Test__ROCmMoEKernel.CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MoE;Transfer;Publication;AllFormats;ByteExact;Regression"
         MPI_PROCS 1
@@ -15285,6 +15598,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_backend_behavior
         integration/collective/Test__LocalTPBackendBehavior.cpp
         integration/collective/Test__LocalTPNCCLGraphCapture.cpp
+        integration/collective/Test__PipelineGenerationNCCL.cpp
         integration/collective/Test__LocalTPRCCLGraphCapture.cpp
         integration/mpi_gtest_main.cpp
     )
@@ -15319,6 +15633,22 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;LocalTP;NCCL;CUDA;GraphCapture;MTP;BatchInvariantReduction"
             MPI_PROCS 1
             TIMEOUT 60
+            NO_MODELS
+        )
+        add_v2_test(V2_Integration_CUDA_NCCLNativeWhileRequestReplay
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=Test__LocalTPNCCLGraphCapture.NCCLNativeWhileCollectivesReuseAcrossRequestResets
+            LABELS "V2;Integration;LocalTP;NCCL;CUDA;GraphCapture;MTP;RequestReset;Regression"
+            MPI_PROCS 1
+            TIMEOUT 30
+            NO_MODELS
+        )
+        add_v2_test(V2_Integration_CUDA_PipelineGenerationCommandArrival
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=PipelineGenerationNCCL.TailCommandPrecedesPredicateAndRetiresEveryParticipant
+            LABELS "V2;Integration;Pipeline;NCCL;CUDA;GraphCapture;RequestReset;Regression"
+            MPI_PROCS 1
+            TIMEOUT 30
             NO_MODELS
         )
     endif()
@@ -15611,6 +15941,7 @@ add_v2_test(V2_Unit_PrefillDecodeTransition
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
     LABELS "V2;Unit;Orchestration;OrchestrationRunner;Regression;PrefillDecode"
     MPI_PROCS 1
+    NO_MODELS
 )
 add_v2_test(V2_Integration_MTPScalarCommitOwnership
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
@@ -15656,6 +15987,8 @@ message(STATUS "V2 Tests: Added MPI coordinated mode unit tests")
 # remaining model-free and device-free so failures reproduce in seconds.
 add_executable(v2_integration_rank_initialization_lifecycle_mpi
     integration/execution/runner/Test__RankInitializationLifecycleMPI.cpp
+    integration/execution/runner/Test__ExecutionRankAdmissionMPI.cpp
+    integration/execution/runner/Test__PlanningPublicationMPI.cpp
     integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_integration_rank_initialization_lifecycle_mpi
@@ -15669,8 +16002,193 @@ add_v2_test(V2_Integration_RankInitializationLifecycle_MPI
     MPI_PROCS 2
     TIMEOUT 30
     NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
 )
 message(STATUS "V2 Tests: Added rank initialization lifecycle MPI regressions")
+
+# Prepared, PMA-owned startup link observations use real MPI packets. These are
+# lifecycle/geometry proofs, not performance thresholds or model benchmarks.
+add_executable(v2_integration_planning_mpi_transfers
+    integration/planning/Test__PlanningMPITransferMeasurement.cpp
+    integration/planning/Test__PlanningExpertSampleMPI.cpp
+    integration/planning/Test__PlanningKernelServiceCatalogMPI.cpp
+    integration/planning/Test__PlanningMemoryBandwidthMeasurement.cpp
+    integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_integration_planning_mpi_transfers llaminar2_core GTest::gtest MPI::MPI_CXX)
+foreach(planning_mpi_ranks IN ITEMS 2 3)
+    add_v2_test(V2_Integration_PlanningMPITransfers_${planning_mpi_ranks}Ranks
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=PlanningMPITransferMeasurementIntegration.*:PlanningMatrixSampleMPI.*:PlanningExpertSampleMPI.CPU_*:PlanningExpertSampleMPI.Asymmetric*:PlanningKernelServiceCatalogMPI.CPU_*
+        LABELS "V2;Integration;Orchestration;Planning;Lifecycle;MPI;Regression"
+        MPI_PROCS ${planning_mpi_ranks}
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+endforeach()
+
+# Native follower preparation must consume published source bytes, not root's
+# GGUF path. One observer owns the GPU; the other rank remains CPU-only.
+foreach(planning_sample_backend IN ITEMS CUDA ROCm)
+    if((planning_sample_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+       (planning_sample_backend STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_PlanningMPIExpertSample_${planning_sample_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --gtest_filter=PlanningExpertSampleMPI.${planning_sample_backend}_*:PlanningKernelServiceCatalogMPI.${planning_sample_backend}_*
+            LABELS "V2;Integration;Orchestration;Planning;Lifecycle;MPI;${planning_sample_backend};Regression"
+            MPI_PROCS 2 TIMEOUT 30 NO_MODELS)
+    endif()
+endforeach()
+
+# Own MPI finalization inside the executable so an excluded discovery rank can
+# retire while two selected ranks still construct topology and run collectives.
+add_executable(v2_integration_execution_session_retirement
+    integration/app/Test__ExecutionSessionRetirement.cpp)
+target_link_libraries(v2_integration_execution_session_retirement
+    llaminar2_core MPI::MPI_CXX)
+add_v2_test(V2_Integration_ExecutionSessionRetirement_MPI
+    COMMAND $<TARGET_FILE:v2_integration_execution_session_retirement>
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Regression"
+    MPI_PROCS 3
+    TIMEOUT 30
+    NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
+# These executables enter the real frontend before MPI_Init, unlike GTest's
+# MPI main. Both failed preparation and failed dry-run must retire the session.
+add_executable(v2_integration_frontend_startup_failure
+    integration/app/Test__FrontendStartupFailure.cpp)
+target_link_libraries(v2_integration_frontend_startup_failure
+    llaminar2_core MPI::MPI_CXX)
+add_v2_test(V2_Integration_FrontendStartupFailure_MPI
+    COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure>
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Regression"
+    MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_FrontendDryRunFailure_MPI
+    COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure> --dry-run-proof
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Regression"
+    MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_FrontendSavedConfiguration_MPI
+    COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure> --saved-config-proof
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Config;Regression"
+    MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
+# Save/apply must select the actual execution communicator before any runner
+# exists. The same public frontend exercises normal retirement and rejection.
+foreach(selection IN ITEMS selected-follower reversed-selection asymmetric-selection absent-selection)
+    add_v2_test(V2_Integration_FrontendExecutionSelection_${selection}_MPI
+        COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure> --${selection}-proof
+        LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Config;Regression"
+        MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+endforeach()
+
+# Real frontend auto publication, before MPI rank admission and runner creation.
+add_executable(v2_integration_frontend_automatic_selection
+    integration/app/Test__FrontendAutomaticSelection.cpp)
+target_link_libraries(v2_integration_frontend_automatic_selection
+    llaminar2_core MPI::MPI_CXX)
+add_v2_test(V2_Integration_FrontendAutomaticSelection_MPI
+    COMMAND $<TARGET_FILE:v2_integration_frontend_automatic_selection>
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Planning;Regression"
+    MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+foreach(automatic_case IN ITEMS selected-follower cost-failure mixed-intent preparation-failure sample-failure follower-evaluator)
+    add_v2_test(V2_Integration_FrontendAutomaticSelection_${automatic_case}_MPI
+        COMMAND $<TARGET_FILE:v2_integration_frontend_automatic_selection> --${automatic_case}
+        LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Planning;Regression"
+        MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+endforeach()
+
+# Public plan command publishes one lossless apply document with a real CPU workspace ABI.
+add_executable(v2_integration_plan_command_publication
+    integration/app/Test__PlanCommandPublication.cpp)
+target_link_libraries(v2_integration_plan_command_publication
+    llaminar2_core MPI::MPI_CXX)
+add_v2_test(V2_Integration_PlanCommandPublication_MPI
+    COMMAND $<TARGET_FILE:v2_integration_plan_command_publication>
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Planning;Config;Regression"
+    MPI_PROCS 2 TIMEOUT 30 NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_PlanCommandPublication_Local
+    COMMAND $<TARGET_FILE:v2_integration_plan_command_publication> --local
+    LABELS "V2;Integration;Orchestration;Lifecycle;Planning;Config;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MPI NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
+# Startup observation lifecycle on production kernels; no real model admission.
+# One observer owns device 0: launching duplicate non-MPI gtest processes would
+# contaminate native graph-pool deltas with allocations from the other process.
+add_executable(v2_integration_planning_execution_measurement
+    integration/planning/Test__PlanningExecutionMeasurement.cpp
+    integration/planning/Test__PlanningProjectionMeasurement.cpp
+    integration/planning/Test__PlanningLocalTPMeasurement.cpp
+    integration/planning/Test__PlanningCPUExpertMeasurement.cpp
+    integration/planning/Test__PlanningGPUExpertMeasurement.cpp)
+target_link_libraries(v2_integration_planning_execution_measurement
+    llaminar2_core GTest::gtest_main)
+foreach(measurement_backend IN ITEMS CPU CUDA ROCm)
+    if(measurement_backend STREQUAL "CUDA" AND NOT HAVE_CUDA)
+        continue()
+    endif()
+    if(measurement_backend STREQUAL "ROCm" AND NOT HAVE_ROCM)
+        continue()
+    endif()
+    add_v2_test(V2_Integration_PlanningExecutionMeasurement_${measurement_backend}
+        COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+            --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}:PlanningExecutionMeasurementIntegration.${measurement_backend}_SourceSamples:PlanningExecutionMeasurementIntegration.${measurement_backend}_PreparedExpert*:PlanningExecutionMeasurementIntegration.${measurement_backend}_FloatingPreparedAccounting:PlanningExecutionMeasurementIntegration.${measurement_backend}_Projection*
+        LABELS "V2;Integration;Planning;${measurement_backend};Regression"
+        MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
+    # The standard launcher binds one socket and exposes that socket's physical
+    # core budget. CPU evidence therefore uses discovery's socket-local MPI
+    # ownership, not the single-rank whole-host inventory. GPU ordinal 0 must
+    # retain exactly one reporter.
+    set(streaming_measurement_ranks 1)
+    if(measurement_backend STREQUAL "CPU")
+        set(streaming_measurement_ranks 2)
+    endif()
+    add_v2_test(V2_Integration_PlanningStreamingBandwidth_${measurement_backend}
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_StreamingBandwidth
+        LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionParityPreflight"
+        MPI_PROCS ${streaming_measurement_ranks} TIMEOUT 60 NO_MODELS)
+    if(NOT measurement_backend STREQUAL "CPU")
+        add_v2_test(V2_Integration_PlanningHostDeviceService_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_HostDeviceService
+            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionParityPreflight"
+            MPI_PROCS 1 TIMEOUT 60 NO_MODELS)
+        add_v2_test(V2_Integration_PlanningNativeLocalTP_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeLocalTP
+            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionParityPreflight"
+            MPI_PROCS 1 TIMEOUT 60 NO_MODELS)
+        add_v2_test(V2_Integration_GPUPreparedWeightBinding_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_CoalescedPool
+            LABELS "V2;Integration;Kernels;${measurement_backend};Regression"
+            TIMEOUT 120 NO_MODELS)
+    endif()
+endforeach()
+
+# The AVX2 dispatch lane must retain the same bounded observation lifecycle.
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    add_v2_test(V2_Integration_PlanningStreamingBandwidth_CPU_AVX2
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=PlanningExecutionMeasurementIntegration.CPU_StreamingBandwidth
+        LABELS "V2;Integration;Planning;CPU;Regression;ProductionParityPreflight"
+        MPI_PROCS 2 TIMEOUT 60 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2")
+    add_v2_test(V2_Integration_PlanningProjectionMeasurement_CPU_AVX2
+        COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+            --gtest_filter=PlanningExecutionMeasurementIntegration.CPU_Projection*
+        LABELS "V2;Integration;Planning;CPU;Regression;ProductionParityPreflight"
+        MPI_PROCS 1 TIMEOUT 120 NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2")
+endif()
 
 # Real worker commands and pipeline transfers; no weights or accelerator setup.
 add_executable(v2_integration_pipeline_request_authority_mpi
@@ -15775,6 +16293,27 @@ add_v2_test(V2_Integration_OrchestrationRunner
     NO_MODELS
 )
 message(STATUS "V2 Tests: Added OrchestrationRunner integration tests")
+
+# Live PP state ownership: no model weights, explicit backend-owned resources.
+add_executable(v2_integration_pipeline_mtp_state
+    integration/execution/runner/Test__PipelineMTPStateOwnership.cpp)
+target_link_libraries(v2_integration_pipeline_mtp_state PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+set(V2_PIPELINE_MTP_STATE_TESTS "")
+foreach(_backend CPU CUDA ROCm)
+    if((_backend STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+       (_backend STREQUAL "ROCm" AND NOT HAVE_ROCM))
+        continue()
+    endif()
+    set(_test V2_Integration_PipelineMTPStateOwnership_${_backend})
+    add_v2_test(${_test}
+        COMMAND $<TARGET_FILE:v2_integration_pipeline_mtp_state>
+            --gtest_filter=*PipelineMTPStateOwnership*/${_backend}
+        LABELS "V2;Integration;${_backend};PipelineParallel;MTP;Lifecycle;MemoryBudget"
+        MPI_PROCS 1
+        NO_MODELS)
+    list(APPEND V2_PIPELINE_MTP_STATE_TESTS ${_test})
+endforeach()
 
 # Test: Scenario 7 Multi-Domain Pipeline Parallel
 # Validates end-to-end integration for multi-domain PP with heterogeneous devices.
@@ -16337,6 +16876,7 @@ if(HAVE_CUDA)
                 --gtest_brief=1
         LABELS "V2;Integration;CUDA;Execution;GraphCapture;MoE;Overlay;TicketProtocol;Heterogeneous;FixedCapacity;Padding;Regression"
         MPI_PROCS 1
+        NO_MODELS
         TIMEOUT 30
     )
 endif()
@@ -16347,6 +16887,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;Execution;GraphCapture;MoE;Overlay;TicketProtocol;Heterogeneous;FixedCapacity;Padding;Regression;gfx906"
         MPI_PROCS 1
+        NO_MODELS
         TIMEOUT 30
     )
 endif()
@@ -16401,6 +16942,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_gpu_sampling_kernels
         integration/backends/Test__GPUSamplingKernels.cpp
         integration/backends/Test__OrdinaryDeviceGeneration.cpp
+        integration/backends/Test__OrdinaryGenerationSampling.cpp
+        integration/backends/Test__HostedDeviceGenerationContinuation.cpp
     )
     target_include_directories(v2_integration_gpu_sampling_kernels PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
@@ -16455,7 +16998,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_DeviceGenerationController_CUDA
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*CUDA:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*CUDA:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*CUDA:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*CUDA:*OrdinaryDeviceGeneration*CUDA
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*CUDA:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*CUDA:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*CUDA:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*CUDA:*OrdinaryDeviceGeneration*CUDA:*HostedContinuation*CUDA
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
             NO_MODELS
@@ -16489,12 +17032,27 @@ if(HAVE_CUDA OR HAVE_ROCM)
         )
         add_v2_test(V2_Integration_DeviceGenerationController_ROCm
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*ROCm:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*ROCm:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*ROCm:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*ROCm:*OrdinaryDeviceGeneration*ROCm
+                --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*ROCm:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*ROCm:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*ROCm:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*ROCm:*OrdinaryDeviceGeneration*ROCm:*HostedContinuation*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
             NO_MODELS
         )
     endif()
+    # Keep the existing owner-preparation proof beside the new pipeline follower
+    # proof in preflight. Selecting the narrow test avoids rerunning all sampling
+    # kernels merely to check this shared captured checkpoint/row producer.
+    foreach(_backend CUDA ROCm)
+        if((_backend STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+           (_backend STREQUAL "ROCm" AND NOT HAVE_ROCM))
+            continue()
+        endif()
+        add_v2_test(V2_Integration_MTPVerifierPreparation_${_backend}
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*CapturedControllerOwnedMTPVerifierPreparationIsMTotal/${_backend}
+            LABELS "V2;Integration;${_backend};MTP;GraphCapture;Lifecycle;Regression"
+            MPI_PROCS 1
+            NO_MODELS)
+    endforeach()
     message(STATUS "V2 Tests: Added explicit CUDA/ROCm GPU Sampling Kernels integration tests")
 endif()
 
@@ -17060,10 +17618,10 @@ add_v2_test(V2_Integration_Qwen35MoEGraphNativeProductionLowering
     MPI_PROCS 1
 )
 
-# A retained CPU ticket and the local GPU experts are independent producers.
-# Certify their production graph join without loading a model, on every built
-# GPU backend. These focused checks join the shared preflight inventory below.
-set(V2_RANK_LOCAL_CANONICAL_JOIN_PREFLIGHT_TESTS)
+# Local and inter-host CPU tickets share typed capture ownership. Certify the
+# local producer join and remote MPI launch contract without loading a model,
+# on every built GPU backend, in the shared preflight inventory below.
+set(V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS)
 foreach(V2_CANONICAL_JOIN_BACKEND IN ITEMS CUDA ROCm)
     string(TOUPPER "${V2_CANONICAL_JOIN_BACKEND}" V2_CANONICAL_JOIN_BACKEND_UPPER)
     if(HAVE_${V2_CANONICAL_JOIN_BACKEND_UPPER})
@@ -17077,7 +17635,18 @@ foreach(V2_CANONICAL_JOIN_BACKEND IN ITEMS CUDA ROCm)
             NO_MODELS
             TIMEOUT 30
         )
-        list(APPEND V2_RANK_LOCAL_CANONICAL_JOIN_PREFLIGHT_TESTS ${V2_CANONICAL_JOIN_TEST})
+        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_CANONICAL_JOIN_TEST})
+        set(V2_REMOTE_TICKET_TEST
+            V2_Integration_Qwen35MoECrossHostTicketLowering_${V2_CANONICAL_JOIN_BACKEND})
+        add_v2_test(${V2_REMOTE_TICKET_TEST}
+            COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+                    --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.CrossHostCPUTicketUsesTypedCaptureLifecycle${V2_CANONICAL_JOIN_BACKEND}
+            LABELS "V2;Integration;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;MPI;GraphCapture;Regression"
+            MPI_PROCS 1
+            NO_MODELS
+            TIMEOUT 30
+        )
+        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_REMOTE_TICKET_TEST})
     endif()
 endforeach()
 
@@ -17250,7 +17819,7 @@ add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Embedding
     COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
-            --gtest_filter=Test__CPUEmbeddingGroupedVerifier.AllWeightAndOutputFormatsM234MatchSerialDecodeBytes:Test__CPUEmbeddingGroupedVerifier.CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts:Test__CPUEmbeddingGroupedVerifier.Q6KHighVocabularyRowIsByteIdenticalAtM1AndM2
+            --gtest_filter=Test__CPUEmbeddingGroupedVerifier.AllWeightAndOutputFormatsM234MatchSerialDecodeBytes:Test__CPUEmbeddingGroupedVerifier.CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts:Test__CPUEmbeddingGroupedVerifier.Q6KHighVocabularyRowIsByteIdenticalAtM1AndM2:Test__CPUEmbeddingGroupedVerifier.NestedSlicesMatchUnwrappedSourceBytes
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;Embedding;AllFormats;AllCodebooks;FP32;BF16;FP16;Q8_1;Regression"
     MPI_PROCS 1
@@ -17290,13 +17859,18 @@ add_v2_test(V2_Unit_WeightManagerPPSafety
 # =============================================================================
 
 # Test: ModelMemoryProfile — GGUF metadata extraction for memory planning
-add_executable(v2_test_model_memory_profile unit/planning/Test__ModelMemoryProfile.cpp)
-target_link_libraries(v2_test_model_memory_profile llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_ModelMemoryProfile
-    COMMAND $<TARGET_FILE:v2_test_model_memory_profile>
-    LABELS "V2;Unit;Planning;ModelMemoryProfile;GGUF"
-    MPI_PROCS 1
-)
+if(NOT V2_PERF_TESTS_ONLY)
+    add_executable(v2_test_model_memory_profile
+        unit/planning/Test__ModelMemoryProfile.cpp
+        unit/planning/Test__PlanningModelMetadata.cpp)
+    target_sources(v2_test_model_memory_profile PRIVATE unit/planning/Test__PlanningPublication.cpp)
+    target_link_libraries(v2_test_model_memory_profile llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Unit_ModelMemoryProfile
+        COMMAND $<TARGET_FILE:v2_test_model_memory_profile>
+        LABELS "V2;Unit;Planning;ModelMemoryProfile;GGUF"
+        MPI_PROCS 1
+    )
+endif()
 
 # Test: WeightMemoryEstimator — weight sizing with TP sharding and PP slicing
 add_executable(v2_test_weight_memory_estimator unit/planning/Test__WeightMemoryEstimator.cpp)
@@ -17335,8 +17909,25 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
 )
 
 # Test: MemoryPlanner — end-to-end planning with single/multi-device configs
-add_executable(v2_test_memory_planner unit/planning/Test__MemoryPlanner.cpp)
+add_executable(v2_test_memory_planner
+    unit/planning/Test__MemoryPlanner.cpp
+    unit/planning/Test__OrchestrationCandidateAdmission.cpp
+    unit/planning/Test__PlanningForwardWeightWork.cpp
+    unit/planning/Test__PlanningForwardStateWork.cpp
+    unit/planning/Test__AutomaticOrchestrationPlanner.cpp
+    unit/planning/Test__OrchestrationPerformanceEvidence.cpp
+    unit/planning/Test__PlanningExecutionMeasurement.cpp
+    unit/planning/Test__PlanningMemoryBandwidthMeasurement.cpp
+    unit/planning/Test__PlanningHostDeviceMeasurement.cpp
+    unit/planning/Test__PlanningLocalTPMeasurement.cpp
+    unit/planning/Test__PlanningMPITransferMeasurement.cpp
+    unit/planning/Test__PlanningKernelServiceCatalog.cpp
+    unit/planning/Test__PlanningModelSample.cpp
+    unit/planning/Test__CPUWeightPreparationMemory.cpp
+    unit/planning/Test__RankMemoryPlanInputs.cpp
+    unit/planning/Test__MoEOverlayPlanningInputs.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
 add_v2_test(V2_Unit_MemoryPlanner
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
     LABELS "V2;Unit;Planning;MemoryPlanner;MemoryBudget"
@@ -17356,13 +17947,17 @@ add_v2_test(V2_Unit_PhysicalMemoryAuthority
     NO_MODELS
 )
 
-# Test: ClusterInventoryGatherer — single-rank inventory gathering
-add_executable(v2_test_cluster_inventory_gatherer unit/planning/Test__ClusterInventoryGatherer.cpp)
+# Test: ClusterInventoryGatherer — pure projection from observed hardware fixtures.
+add_executable(v2_test_cluster_inventory_gatherer
+    unit/planning/Test__CPUCacheInventory.cpp
+    unit/planning/Test__ClusterInventoryGatherer.cpp
+    unit/planning/Test__ClusterInventoryPublication.cpp
+    unit/planning/Test__PhysicalInventoryAggregation.cpp)
 target_link_libraries(v2_test_cluster_inventory_gatherer llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_ClusterInventoryGatherer
     COMMAND $<TARGET_FILE:v2_test_cluster_inventory_gatherer>
     LABELS "V2;Unit;Planning;ClusterInventory"
-    MPI_PROCS 1
+    NO_MPI NO_MODELS
 )
 
 # Test: KVCacheConfig::estimateBytes() — bridge between KernelFactory config and planning
@@ -17999,10 +18594,15 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_PlanningExecutionMeasurement_CPU
     V2_Integration_GroupedVerifierRows_CPU_RoPE
+    V2_Integration_GroupedVerifierRows_CPU_AllFormats
     V2_Integration_CPUAttentionCacheSource
     V2_Integration_CPUAttentionKeyQ8
     V2_Integration_CPUStartupAffinity
+    V2_Integration_ClusterInventoryBootstrap
+    V2_Integration_ClusterAcceleratorInventory_CUDA
+    V2_Integration_ClusterAcceleratorInventory_ROCm
     V2_Integration_CPUSeededSamplingPositionIdentity
     V2_Integration_PrefixCacheCoordinatorMPI
     # The campaign prerequisite first builds and runs the complete V2_Unit_*
@@ -18015,24 +18615,51 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_MTPConditionCommitGraphIdentity
     V2_Integration_HeterogeneousTicketLifecycleEvidence
     V2_Integration_MTPScalarCommitOwnership
+    V2_Integration_MTPStochasticVerificationOwner
     V2_Integration_ParityMTPRoutingContributionBoundary
     V2_Integration_ParityRouteConditionedHFReference
     V2_Integration_MPITopology
+    V2_Integration_MPITopology_CPUOnly
     V2_Integration_RankInitializationLifecycle_MPI
+    V2_Integration_PlanningMPITransfers_2Ranks
+    V2_Integration_PlanningMPITransfers_3Ranks
+    V2_Integration_ExecutionSessionRetirement_MPI
+    V2_Integration_FrontendStartupFailure_MPI
+    V2_Integration_FrontendDryRunFailure_MPI
+    V2_Integration_FrontendSavedConfiguration_MPI
+    V2_Integration_FrontendAutomaticSelection_MPI
+    V2_Integration_FrontendAutomaticSelection_selected-follower_MPI
+    V2_Integration_FrontendAutomaticSelection_cost-failure_MPI
+    V2_Integration_FrontendAutomaticSelection_mixed-intent_MPI
+    V2_Integration_FrontendAutomaticSelection_preparation-failure_MPI
+    V2_Integration_FrontendAutomaticSelection_sample-failure_MPI
+    V2_Integration_FrontendAutomaticSelection_follower-evaluator_MPI
+    V2_Integration_PlanCommandPublication_MPI
+    V2_Integration_PlanCommandPublication_Local
+    V2_Integration_FrontendExecutionSelection_selected-follower_MPI
+    V2_Integration_FrontendExecutionSelection_reversed-selection_MPI
+    V2_Integration_FrontendExecutionSelection_asymmetric-selection_MPI
+    V2_Integration_FrontendExecutionSelection_absent-selection_MPI
     V2_Integration_PipelineRequestAuthority_MPI
     V2_Integration_TransferEngine_CopyActivation
     V2_Integration_OrchestrationRunner
+    ${V2_PIPELINE_MTP_STATE_TESTS}
     V2_Integration_MoEOverlayResidencyConsensus_MPI
+    V2_Integration_MoEOverlayTicketSegments_CUDA
+    V2_Integration_MoEOverlayTicketSegments_ROCm
     V2_Integration_MoEOverlaySparseTransport_MPI
+    V2_Integration_MoEOverlayRankBatchForkJoin_MPI
     V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
     ${V2_PREPARED_EXPERT_SERVICE_PREFLIGHT_TESTS}
     V2_Integration_MoEOverlayActivationProgressLifecycle
     V2_Integration_MoEGroupedVerifierHistogramBoundaryLifecycle
-    ${V2_RANK_LOCAL_CANONICAL_JOIN_PREFLIGHT_TESTS}
+    ${V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS}
     ${V2_CPU_SPARSE_TICKET_PREFLIGHT_TESTS}
     V2_Integration_CPU_NativeVNNIWeightPackingAllFormats
     ${V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS}
+    ${V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS}
     ${V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS}
+    ${V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS}
     V2_Integration_MmapReclaimLifecycle
     V2_Integration_TPSnapshotRuntimeGQASharding
     V2_Integration_TPSnapshotReplicatedMTPSidecarSharding
@@ -18048,6 +18675,7 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_DynamicAuthenticatedPromotionProofLifecycle
     V2_Integration_DynamicMaintenanceCadenceLifecycle
     V2_Integration_DynamicDeviceHistogramCadenceLifecycle
+    V2_Integration_ExpertOverlayLocalMaintenanceDrain
     V2_Integration_DynamicDependentCycleCohortLifecycle
     V2_Integration_MoEOverlayHostDemandAdmission
     V2_Integration_MoEOverlayHostRoutingWork
@@ -18062,7 +18690,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_PlanningExecutionMeasurement_CUDA
+    V2_Integration_PlanningMPIExpertSample_CUDA
+    V2_Integration_GPUPreparedWeightBinding_CUDA
+    V2_Integration_GroupedVerifierRows_CUDA_Embedding
     V2_Integration_CUDA_NCCLRetainedParentFragmentReentry
+    V2_Integration_CUDA_NCCLNativeWhileRequestReplay
+    V2_Integration_CUDA_PipelineGenerationCommandArrival
     V2_Integration_CUDA_TPCanonicalRankOrderGraphCapture
     V2_Integration_GDNLinkedStateReassembly_CUDA
     V2_Integration_GDNPrefillDecodeEquivalence_CUDA
@@ -18073,6 +18707,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDA_MoEOverlayEpoch
     V2_Integration_CUDAEventSynchronization
     V2_Integration_CUDAGraphCapture
+    V2_Integration_CUDADriverAbsent_CPUStartup
+    V2_Integration_CUDADriverApi
     V2_Integration_CUDAConcurrentPrefillBiasGraphCapture
     V2_Integration_CUDAConcurrentMergedWorkspaceAllFormats
     V2_Integration_CUDATinyProjectionAllFloatingFormats
@@ -18098,6 +18734,7 @@ if(HAVE_CUDA)
     ${V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_DeviceGenerationController_CUDA
     V2_Integration_DeviceGenerationSelector_CUDA
+    V2_Integration_MTPVerifierPreparation_CUDA
     V2_Integration_GPUGraphCaptureExecution_CUDA
     V2_Integration_CUDARequestBatchUnequalKVContinuation
     V2_Integration_CUDAAttentionKeyCachePartitions
@@ -18107,6 +18744,10 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_PlanningExecutionMeasurement_ROCm
+    V2_Integration_PlanningMPIExpertSample_ROCm
+    V2_Integration_GPUPreparedWeightBinding_ROCm
+    V2_Integration_GroupedVerifierRows_ROCm_Embedding
     V2_Integration_ROCm_DeviceCountedVerifierRows
     V2_Integration_GroupedVerifierRows_ROCm_AllFormats
     V2_Integration_ROCm_TPCanonicalRankOrderGraphCapture
@@ -18132,6 +18773,7 @@ if(HAVE_ROCM)
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_DeviceGenerationController_ROCm
     V2_Integration_HIPGraphCapture
+    V2_Integration_MTPVerifierPreparation_ROCm
     V2_Integration_GPUGraphCaptureExecution_ROCm
     V2_Integration_ROCmRequestBatchUnequalKVContinuation
     V2_Integration_ROCmAttentionKeyCachePartitions

@@ -348,6 +348,7 @@ namespace llaminar2
         // Collective
         ALLREDUCE,
         ROOTED_COLLECTIVE, ///< LocalTP reduce-to-root or root broadcast
+        PIPELINE_ACTIVATION_EXCHANGE, ///< Native adjacent-stage send/receive inside the local graph.
         ALLGATHER,
         ALLGATHER_V, ///< Variable-count allgather for heterogeneous TP
 
@@ -420,6 +421,8 @@ namespace llaminar2
          * penalties followed by compact top-k/top-p row construction.
          */
         MTP_STOCHASTIC_TARGET_DISTRIBUTION,
+        ORDINARY_GENERATION_SAMPLING, ///< Resident non-speculative sampling and frontier publication.
+        DECODE_POSITION_SNAPSHOT, ///< Captured root freezes canonical KV position before model work.
 
         /**
          * Terminal grouped-verifier transaction: device argmax/distribution
@@ -459,6 +462,7 @@ namespace llaminar2
         {
         case ComputeStageType::ALLREDUCE:
         case ComputeStageType::ROOTED_COLLECTIVE:
+        case ComputeStageType::PIPELINE_ACTIVATION_EXCHANGE:
         case ComputeStageType::ALLGATHER:
         case ComputeStageType::ALLGATHER_V:
         case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:

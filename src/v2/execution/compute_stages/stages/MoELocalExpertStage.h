@@ -30,6 +30,8 @@
 #include "../../moe/CPUCurrentBatchLLEP.h"
 #include "../../moe/MoERuntimeTable.h"
 #include "../../../loaders/ExpertSlabTypes.h"
+#include "../../../backends/CPUExecutionGeometry.h"
+#include "../../../tensors/TensorType.h"
 
 #include <cstddef>
 #include <chrono>
@@ -466,6 +468,22 @@ namespace llaminar2
             DeferredExplicitStage, ///< Require one graph-owned completion node.
         };
 
+        /**
+         * @brief Immutable source and participant facts for future CPU arrivals.
+         *
+         * An empty residency bank has no engine from which to ask for scratch.
+         * Metadata supplies the same projection contract before any expert is
+         * resident. This is a declaration, never an allocation or live ledger.
+         */
+        struct CPUExpertWorkspaceSource
+        {
+            TensorType gate;
+            TensorType up;
+            TensorType down;
+            int workers = 0; ///< This executing rank's admitted workshare budget.
+            CPUExecutionGeometry execution; ///< This rank's published cache/ISA facts.
+        };
+
         /** @brief Immutable construction inputs for one participant-local stage. */
         struct Params
         {
@@ -571,6 +589,12 @@ namespace llaminar2
             std::vector<ITensorGemm *> prepared_gate_gemm;
             std::vector<ITensorGemm *> prepared_up_gemm;
             std::vector<ITensorGemm *> prepared_down_gemm;
+            /**
+             * Source declaration required when a registry-only CPU endpoint can
+             * start without engines. Resident engines additionally contribute
+             * their actual prepared requirements, including rotated encodings.
+             */
+            std::optional<CPUExpertWorkspaceSource> cpu_workspace_source;
             /// Retains extracted per-expert views used by non-store engines.
             std::vector<std::shared_ptr<TensorBase>> expert_gate_views;
             std::vector<std::shared_ptr<TensorBase>> expert_up_views;

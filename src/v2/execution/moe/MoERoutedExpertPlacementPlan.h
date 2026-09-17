@@ -252,6 +252,14 @@ namespace llaminar2
         std::vector<int> resolved_live_experts_per_layer;
     };
 
+    /** @brief Configuration provenance, resolved before execution plan admission. */
+    enum class MoEContinuationDensePolicyIntent
+    {
+        Resolved,  ///< A programmatic/expanded plan already owns its dense policy.
+        Automatic, ///< Compact input derives policy from continuation cardinality.
+        Explicit,  ///< User override wins, irrespective of declaration order.
+    };
+
     struct MoEContinuationDomainSpec
     {
         std::string domain;
@@ -359,6 +367,14 @@ namespace llaminar2
         std::vector<RoutedExpertInitialLayerOrder>
             initial_layer_order_overrides;
         std::vector<RoutedExpertLayerPlacement> placements;
+
+        /**
+         * Input provenance only: runtime still consumes continuation_domain_spec.
+         * Keeping explicitness typed prevents a default-valued user override
+         * from being mistaken for omission during compact CLI/YAML expansion.
+         */
+        MoEContinuationDensePolicyIntent continuation_dense_policy_intent =
+            MoEContinuationDensePolicyIntent::Resolved;
 
         bool isTieredOverlay() const
         {

@@ -104,7 +104,7 @@ namespace llaminar
             static const llaminar2::NativeVnniFormatInfo *vnniFormatInfoIfPackable(
                 const llaminar2::TensorBase *tensor)
             {
-                const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+                const auto *unpackable = llaminar2::IINT8Unpackable::fromTensor(tensor);
                 return unpackable ? unpackable->vnniFormatInfo() : nullptr;
             }
 
@@ -3314,7 +3314,7 @@ namespace llaminar
             }
 
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
-                std::shared_ptr<llaminar2::TensorBase> tensor,
+                std::shared_ptr<const llaminar2::TensorBase> tensor,
                 llaminar2::DeviceId target_device,
                 GemmPreparationKind prep_kind,
                 llaminar2::CPUWeightStoragePlacement placement)
@@ -3551,7 +3551,7 @@ namespace llaminar
                 // intentionally a legacy INT8-VNNI GEMM format and therefore
                 // has no NativeVnniFormatInfo, but it still provides complete
                 // IINT8Unpackable rows for the universal EmbedQ8 representation.
-                if (!dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor))
+                if (!llaminar2::IINT8Unpackable::fromTensor(tensor))
                     return nullptr;
 
                 const size_t shard_rows = tensor->rows();

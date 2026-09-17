@@ -28,6 +28,7 @@
  */
 
 #include "CUDAQuantisedGemmKernel.h"
+#include "CUDAQuantisedGemmWorkspaceContract.h"
 #include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h" // DeviceManager
@@ -4472,13 +4473,64 @@ namespace llaminar2
         WorkspaceRequirements CUDAQuantisedGemmKernel::getWorkspaceRequirements(
             int m, int n, int k) const
         {
-            WorkspaceRequirements reqs;
+            if (n == 0) n = static_cast<int>(N_);
+            if (k == 0) k = static_cast<int>(K_);
+            bool has_native_codebook = false;
+            uint8_t native_codebook_id = 0;
+            uint8_t native_arithmetic_policy_codebook_id = 0;
+            if (packed_)
+            {
+                native_codebook_id = packed_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    packed_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              packed_->native_source_identity.codebook_id)
+                        : native_codebook_id;
+                has_native_codebook = true;
+            }
+            else if (weights_converted_ && impl_ && impl_->d_weights_native_vnni)
+            {
+                native_codebook_id = impl_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    impl_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              impl_->native_source_identity.codebook_id)
+                        : native_codebook_id;
+                has_native_codebook = true;
+            }
+            else if (weights_)
+            {
+                if (const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights_))
+                {
+                    if (const auto *info = unpackable->vnniFormatInfo())
+                    {
+                        native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+                        native_arithmetic_policy_codebook_id =
+                            canonicalDeviceVnniCodebookId(info->codebook_id);
+                        has_native_codebook = true;
+                    }
+                }
+            }
 
-            // Use internal dimensions if not specified
-            if (n == 0)
-                n = static_cast<int>(N_);
-            if (k == 0)
-                k = static_cast<int>(K_);
+            std::optional<quantized_gemm_workspace::NativeCodebooks> native;
+            if (has_native_codebook)
+                native = {native_codebook_id, native_arithmetic_policy_codebook_id};
+            return quantized_gemm_workspace::projectionRequirements(m, n, k, cuda_device_id_, native);
+        }
+
+        void CUDAQuantisedGemmKernel::appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, std::span<const int> projection_columns, int k) const
+        {
+            quantized_gemm_workspace::appendFusedProjectionRequirements(requirements, m, projection_columns, k);
+        }
+
+        WorkspaceRequirements quantized_gemm_workspace::projectionRequirements(
+            int m, int n, int k, int device_ordinal, std::optional<NativeCodebooks> native)
+        {
+            if (m <= 0 || n <= 0 || k <= 0 || device_ordinal < 0 ||
+                m > std::numeric_limits<int>::max() - 127 || k > std::numeric_limits<int>::max() - 31)
+                throw std::invalid_argument("CUDA projection workspace requires representable positive geometry");
+            WorkspaceRequirements reqs;
 
             // Native prefill kernels execute row tiles up to 128 rows. Edge
             // tiles guard logical output writes, but their scratch paths share
@@ -4527,44 +4579,11 @@ namespace llaminar2
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
             size_t temp_c_fp32_bytes = static_cast<size_t>(workspace_m) * n * sizeof(float);
-            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
-            bool has_native_codebook = false;
-            uint8_t native_codebook_id = 0;
-            uint8_t native_arithmetic_policy_codebook_id = 0;
-            if (packed_)
-            {
-                native_codebook_id = packed_->native_codebook_id;
-                native_arithmetic_policy_codebook_id =
-                    packed_->native_source_identity.present
-                        ? canonicalDeviceVnniCodebookId(
-                              packed_->native_source_identity.codebook_id)
-                        : native_codebook_id;
-                has_native_codebook = true;
-            }
-            else if (weights_converted_ && impl_ && impl_->d_weights_native_vnni)
-            {
-                native_codebook_id = impl_->native_codebook_id;
-                native_arithmetic_policy_codebook_id =
-                    impl_->native_source_identity.present
-                        ? canonicalDeviceVnniCodebookId(
-                              impl_->native_source_identity.codebook_id)
-                        : native_codebook_id;
-                has_native_codebook = true;
-            }
-            else if (weights_)
-            {
-                if (const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights_))
-                {
-                    if (const auto *info = unpackable->vnniFormatInfo())
-                    {
-                        native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
-                        native_arithmetic_policy_codebook_id =
-                            canonicalDeviceVnniCodebookId(info->codebook_id);
-                        has_native_codebook = true;
-                    }
-                }
-            }
+            const bool has_native_codebook = native.has_value();
+            const uint8_t native_codebook_id = native ? native->execution : 0;
+            const uint8_t native_arithmetic_policy_codebook_id = native ? native->arithmetic : 0;
 
             if (has_native_codebook && workspace_m > 1)
             {
@@ -4575,7 +4594,7 @@ namespace llaminar2
                         m,
                         n,
                         k,
-                        cuda_device_id_);
+                        device_ordinal);
                 const size_t prefill_scratch_slots =
                     concurrentPrefillScratchSlotsForM(m);
 
@@ -4644,11 +4663,11 @@ namespace llaminar2
             return reqs;
         }
 
-        void CUDAQuantisedGemmKernel::appendFusedProjectionWorkspaceRequirements(
+        void quantized_gemm_workspace::appendFusedProjectionRequirements(
             WorkspaceRequirements &requirements,
             int m,
             std::span<const int> projection_columns,
-            int k) const
+            int k)
         {
             if (m <= 1 || projection_columns.size() <= 1)
                 return;

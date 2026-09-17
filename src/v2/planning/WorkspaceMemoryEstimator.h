@@ -10,6 +10,7 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "backends/CPUExecutionGeometry.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
 #include <cstddef>
@@ -33,6 +34,7 @@ struct WorkspaceMemoryGeometry
      * This is execution parallelism, not the host's SMT thread count.
      */
     int device_compute_units = 0;
+    CPUExecutionGeometry cpu_execution; ///< Exact participant cache/ISA observation for CPU admission.
     int batch_size = 1; ///< Maximum simultaneously admitted requests.
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
@@ -115,7 +117,7 @@ public:
         const WorkspaceMemoryGeometry& geometry);
 
     /**
-     * @brief Estimate one sparse ExpertOverlay endpoint's GPU workspace.
+     * @brief Estimate one sparse ExpertOverlay endpoint's invocation workspace.
      *
      * This covers both legal endpoint graph forms without charging terminal
      * projection, attention, or other continuation-only graph names. A mapped
@@ -126,8 +128,10 @@ public:
      *
      * @param profile Parsed MoE geometry.
      * @param geometry Exact graph and participant geometry.
-     * @return Required graph-stable workspace bytes, or zero for CPU.
-     * @throws std::runtime_error for incomplete MoE geometry or non-GPU misuse.
+     * CPU endpoints retain their canonical SwiGLU input tile; their separate
+     * grouped tensor bank remains owned by the sparse arena's BOM.
+     * @return Required graph-stable or CPU invocation workspace bytes.
+     * @throws std::runtime_error for incomplete MoE geometry or invalid devices.
      */
     static size_t estimateRoutedExpertParticipant(
         const ModelMemoryProfile& profile,

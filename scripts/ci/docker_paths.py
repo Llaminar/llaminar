@@ -19,8 +19,6 @@ import hashlib
 import tempfile
 import uuid
 
-from production_artifacts import image_identity
-
 
 def containing_container() -> dict | None:
     """Identify our containing Docker namespace, or ordinary daemon-local host."""
@@ -97,14 +95,38 @@ def mounts(pairs: list[tuple[Path, str, bool]]) -> list[str]:
     return result
 
 
-def cuda_driver_required(image: str) -> bool:
-    """Honor image linkage independently of the selected inference topology.
+def validate_attached_execution(image: str) -> None:
+    """Prove Docker waits for a child and preserves delayed output and failure.
 
-    A full-backend shared core links the NVIDIA driver even when the request
-    selects only CPU or ROCm. Host driver injection is a deployment dependency;
-    it does not authorize the engine to execute on an unselected device.
+    A socket proxy can accept ordinary Docker API requests but truncate the
+    half-closed, hijacked connection used by exec/attach. The CLI then reports
+    success while its child still runs. Check that transport before spending
+    cloud capacity or accepting frontend evidence, without retries or a second
+    process-launch implementation. The caller chooses its Docker endpoint;
+    this function never silently changes it.
     """
-    return image_identity(image)["labels"].get("org.llaminar.cuda") == "ON"
+    name = "llaminar-attach-probe-" + uuid.uuid4().hex
+    marker = "llaminar-completed-" + uuid.uuid4().hex
+    # Match inference's host network; this local process/pipe proof must not
+    # wait for unrelated bridge or firewall provisioning.
+    subprocess.run(["docker", "create", "--name", name, "--network", "host", "--entrypoint", "/bin/sleep",
+                    image, "infinity"], check=True, stdout=subprocess.DEVNULL, timeout=30)
+    try:
+        subprocess.run(["docker", "start", name], check=True,
+                       stdout=subprocess.DEVNULL, timeout=30)
+        # The delay exceeds the proxy's half-close window; the sentinel and
+        # intentional nonzero exit must both arrive from this same child.
+        observed = subprocess.run(["docker", "exec", name, "/bin/sh", "-c",
+            'sleep 1; printf "%s\\n" "$1"; exit 23', "llaminar-attach-probe", marker],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+        if observed.returncode != 23 or observed.stdout != marker + "\n":
+            raise RuntimeError(
+                "Docker exec did not preserve child completion, output and exit status; "
+                "use a directly accessible daemon socket, not a half-close-breaking proxy. "
+                "The devcontainer exposes it as unix:///var/run/docker-host.sock.")
+    finally:
+        subprocess.run(["docker", "rm", "--force", "--volumes", name],
+                       check=True, stdout=subprocess.DEVNULL, timeout=30)
 
 
 def daemon_device_metadata(image: str, script: str) -> str:
@@ -120,7 +142,9 @@ def daemon_device_metadata(image: str, script: str) -> str:
     name = "llaminar-device-probe-" + uuid.uuid4().hex
     result_path = "/tmp/llaminar-device-metadata"
     subprocess.run([
-        "docker", "create", "--name", name, "--entrypoint", "/bin/sh",
+        # Metadata never needs a bridge. Match the host-network inference
+        # container so an unrelated network lifecycle cannot block admission.
+        "docker", "create", "--name", name, "--network", "host", "--entrypoint", "/bin/sh",
         "--mount", "type=bind,src=/dev,dst=/host-dev,readonly", image,
         "-c", 'exec /bin/sh -eu -c "$1" > "$2"',
         "llaminar-device-probe", script, result_path],
@@ -176,11 +200,15 @@ def nvidia_device_nodes(image: str) -> tuple[str, ...]:
 
 
 def device_args(image: str, backends: str, *, user: str = "0:0") -> list[str]:
-    """Supply image driver dependencies and the selected ROCm device nodes."""
+    """Expose drivers/devices only for the explicitly selected backend set.
+
+    A full image defers CUDA driver binding until CUDA preparation. CPU-only
+    remote ranks and ROCm lanes therefore need no NVIDIA runtime installation.
+    """
     result = ["--user", user, "--network", "host", "--ipc", "host",
               "--security-opt", "seccomp=unconfined", "--cap-add", "SYS_NICE",
               "--cap-add", "SYS_PTRACE"]
-    if "CUDA" in backends or cuda_driver_required(image):
+    if "CUDA" in backends:
         helper = Path(__file__).with_name("docker_gpu_run_args.sh")
         result += subprocess.check_output(["bash", str(helper), "--probe-image", image,
                                            "--required"], text=True).splitlines()
@@ -194,8 +222,6 @@ def device_args(image: str, backends: str, *, user: str = "0:0") -> list[str]:
 if __name__ == "__main__":
     if sys.argv[1] == "--publish-model-cache":
         publish_model_cache(Path(sys.argv[2]))
-    elif sys.argv[1] == "--cuda-driver-required":
-        print("yes" if cuda_driver_required(sys.argv[2]) else "no")
     elif sys.argv[1] == "--nvidia-device-nodes":
         for node in nvidia_device_nodes(sys.argv[2]):
             print(node)

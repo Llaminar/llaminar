@@ -14,6 +14,7 @@
  * - ALL ranks participate in compute by default (including rank 0)
  * - Equal work division by default, with hooks for future heterogeneous distribution
  * - Uses existing TensorSlice/SliceMetadata from tensors/TensorSlice.h
+ * - Retains the communicator context's immutable inventory; never refreshes it
  *
  * Implements IMPITopology interface for testability (January 2026 refactor).
  *
@@ -42,6 +43,7 @@ namespace llaminar2
     // Forward declarations - placement types in execution/PlacementPlan.h
     struct PlacementPlan;
     struct PlacementInput;
+    class IMPIContext;
 
     /**
      * @brief Compute capability descriptor for a single device
@@ -233,10 +235,19 @@ namespace llaminar2
          * - NUMA topology via NUMATopology class
          * - GPU/accelerator capabilities
          *
-         * After construction, calls exchangeCapabilities() to gather
-         * device info from all ranks.
+         * Standalone callers create one exact context for discovery. Production
+         * contexts use the overload below to retain their existing publication.
          */
         explicit MPITopology(MPI_Comm comm = MPI_COMM_WORLD);
+
+        /**
+         * @brief Construct communicator geometry from its existing observation.
+         * @param context Exact owner of MPI membership and immutable inventory.
+         *
+         * All members construct communicator geometry together. Inventory is
+         * shared, not copied or re-gathered; subsequent topology reads are local.
+         */
+        explicit MPITopology(const IMPIContext &context);
 
         /**
          * @brief Construct topology with explicit configuration (for testing)
@@ -303,7 +314,11 @@ namespace llaminar2
         // Communication Patterns
         // =========================================================================
 
-        /// Check if two ranks are on the same physical node
+        /**
+         * @brief Query canonical physical-node membership, not link performance.
+         * @throws std::invalid_argument for absent ranks or malformed membership.
+         * @throws std::logic_error when no inventory has been published.
+         */
         bool same_node(int rank_a, int rank_b) const override;
 
         /** @return Fresh non-zero namespace shared by ranks on this host. */
@@ -414,21 +429,10 @@ namespace llaminar2
         // Device Capability Management (IMPITopology interface)
         // =========================================================================
 
-        /**
-         * @brief Exchange device capabilities with all ranks
-         *
-         * Called automatically during construction. Can be called again
-         * if device configuration changes.
-         *
-         * After this call, get_placement(rank) returns complete info for any rank.
-         */
-        void exchangeCapabilities();
-
         /// Get compute weights for all ranks (for weighted work distribution)
         std::vector<float> get_compute_weights() const override;
 
-        /// Get cluster-wide device inventory (required by IMPITopology)
-        /// Note: Returns a reference to a local ClusterInventory built on demand
+        /** @brief Read the canonical setup snapshot; never discovers or communicates. */
         const ClusterInventory &clusterInventory() const override;
 
         // =========================================================================
@@ -448,7 +452,7 @@ namespace llaminar2
          * @param rank MPI rank ID
          * @return Reference to RankInventory for that rank
          *
-         * Requires exchangeCapabilities() to have been called first.
+         * Uses the immutable inventory installed during construction.
          */
         const RankInventory &getRankInventory(int rank) const;
 
@@ -463,7 +467,7 @@ namespace llaminar2
          *
          * Binary format:
          * [rank:4][node_id:4][local_rank:4][hostname_len:4][hostname:N]
-         * [cpu_cores:4][cpu_sockets:4][numa_nodes:4][cpu_memory:8]
+         * [cpu_cores:4][cpu_workers:4][cpu_sockets:4][numa_nodes:4][cpu_memory:8]
          * [cpu_device_info:variable]
          * [gpu_count:4][gpu1_info:variable][gpu2_info:variable]...
          *
@@ -472,6 +476,7 @@ namespace llaminar2
          * [compute_units:4][cc_major:4][cc_minor:4][tflops_fp16:4][tflops_int8:4]
          * [memory_bandwidth_gbps:4][name_len:4][name:N][uuid_len:4][uuid:N]
          * [supports_p2p:1][pcie_bus_id:4][numa_node:4]
+         * [PCIe metadata:variable][last_level_cache_bytes:8]
          */
         static std::vector<uint8_t> serializeRankInventory(const RankInventory &inventory);
 
@@ -490,7 +495,7 @@ namespace llaminar2
         /**
          * @brief Compute a PlacementPlan for weight/compute distribution
          *
-         * Uses the gathered device capabilities (from exchangeCapabilities())
+         * Uses the context-owned observed device capabilities
          * along with model metadata to compute optimal placement.
          *
          * IMPORTANT: This is deterministic - all ranks compute the same plan.
@@ -568,28 +573,29 @@ namespace llaminar2
         std::vector<RankPlacement> all_placements_;    ///< Placements from all ranks
         /** Fresh run identity broadcast through the node-local communicator. */
         uint64_t node_shared_memory_namespace_ = 0;
-        mutable ClusterInventory cluster_inventory_;   ///< Cached cluster inventory (lazy-built)
-        mutable bool cluster_inventory_built_ = false; ///< Whether cluster inventory was built
+        std::shared_ptr<const ClusterInventory> cluster_inventory_; ///< Exact immutable context publication.
 
         MPI_Comm world_comm_;
         MPI_Comm intra_node_comm_;
         MPI_Comm inter_node_comm_;
         bool owns_comms_; ///< Whether we created the derived communicators
 
-        /// Detect topology from MPI communicator
+        /** @brief Authenticate observed locality and publish the shared-memory run namespace. */
         void detect_topology();
 
-        /// Setup derived communicators (intra-node, inter-node)
+        /** @brief Construct the node-leader communicator from already-authenticated membership. */
         void setup_communicators();
 
-        /// Detect NUMA node and socket for this rank
-        void detect_numa_placement();
+        /**
+         * @brief Validate a complete inventory and derive placement projections.
+         * @param inventory Canonical discovery result, or explicit synthetic fixture.
+         * @throws std::invalid_argument if membership differs from this topology.
+         * No device discovery, new estimates or rank communication occurs here.
+         */
+        void installInventory(std::shared_ptr<const ClusterInventory> inventory);
 
-        /// Detect GPU/accelerator capabilities for this rank
-        void detect_device_capabilities();
-
-        /// Build cluster inventory from all_placements_ (lazy)
-        void buildClusterInventory() const;
+        /** @brief Release owned derived communicators on failure, move or destruction. */
+        void releaseCommunicators() noexcept;
     };
 
 } // namespace llaminar2

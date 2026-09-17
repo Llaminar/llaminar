@@ -22,6 +22,7 @@
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/Logger.h"
+#include "../../utils/ObservedCollectiveInventory.h"
 
 #include <iostream>
 #include <cmath>
@@ -36,9 +37,11 @@ namespace llaminar2
     // Test Fixture
     // =========================================================================
 
+    /** @brief Real-device collective fixture backed by canonical hardware observation. */
     class CollectiveContextCUDATest : public ::testing::Test
     {
     protected:
+        /** @brief Require the suite's real backend before constructing participants. */
         void SetUp() override
         {
             auto *cuda_backend = getCUDABackend();
@@ -62,6 +65,7 @@ namespace llaminar2
             }
         }
 
+        /** @brief Join the fixture's device work before releasing test resources. */
         void TearDown() override
         {
             auto *cuda_backend = getCUDABackend();
@@ -74,60 +78,16 @@ namespace llaminar2
             }
         }
 
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildCUDAInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *cuda_backend = getCUDABackend();
-            if (cuda_backend != nullptr)
-            {
-                for (int i = 0; i < cuda_count_; ++i)
-                {
-                    DeviceInfo gpu;
-                    gpu.type = DeviceType::CUDA;
-                    gpu.local_device_id = i;
-                    gpu.memory_bytes = cuda_backend->deviceMemoryTotal(i);
-                    gpu.name = cuda_backend->deviceName(i);
-                    gpu.supports_p2p = true;
-                    rank_inv.gpus.push_back(gpu);
-                }
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(cuda_count_, 0);
         }
 
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildSingleCUDAInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *cuda_backend = getCUDABackend();
-            if (cuda_backend != nullptr && cuda_count_ > 0)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::CUDA;
-                gpu.local_device_id = 0;
-                gpu.memory_bytes = cuda_backend->deviceMemoryTotal(0);
-                gpu.name = cuda_backend->deviceName(0);
-                rank_inv.gpus.push_back(gpu);
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(1, 0);
         }
 
         int cuda_count_ = 0;

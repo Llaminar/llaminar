@@ -25,6 +25,7 @@
 #include <fstream>
 #include <cmath>
 #include <numeric>
+#include <omp.h>
 
 namespace llaminar2
 {
@@ -34,6 +35,7 @@ namespace llaminar2
         class ModelLoaderRowSliceTest : public ::testing::Test
         {
         protected:
+            /** @brief Open the optional legacy row-slice fixture without device work. */
             void SetUp() override
             {
                 // Use a real model file for testing
@@ -303,6 +305,7 @@ namespace llaminar2
             static constexpr size_t kRowsPerExpert = 2u;
             static constexpr size_t kExpertCount = 5u;
 
+            /** @brief Create an independently owned native-format synthetic model. */
             void SetUp() override
             {
                 const GGUFTensorType type = GetParam();
@@ -339,6 +342,7 @@ namespace llaminar2
                 ASSERT_TRUE(loader_->loadModel(model_path_.string()));
             }
 
+            /** @brief Release mappings before removing the private synthetic fixture. */
             void TearDown() override
             {
                 loader_.reset();
@@ -348,6 +352,7 @@ namespace llaminar2
                 std::filesystem::remove(model_path_, ignored);
             }
 
+            /** @brief Serialize a minimal GGUF with exactly the test's native bytes. */
             void writeSyntheticModel(GGUFTensorType type)
             {
                 std::ofstream stream(
@@ -421,6 +426,108 @@ namespace llaminar2
                         bytes_per_expert_),
                     0)
                     << "Native bytes differ for packed expert " << packed_index;
+            }
+        }
+
+        TEST_P(ModelLoaderExpertSelectionTest,
+               ContiguousSliceAndSelectionRetainExactBytesAfterLoaderRelease)
+        {
+            auto slice = loader_->loadTensorExpertSlice(kTensorName, 1u, 4u);
+            auto selected = loader_->loadTensorExpertSelection(kTensorName, {1u, 2u, 3u});
+            ASSERT_NE(slice, nullptr);
+            ASSERT_NE(selected, nullptr);
+            // Quantized slices retain their mmap lease; floating slices retain
+            // their single owned allocation. Neither may borrow the loader.
+            loader_.reset();
+            for (const auto &tensor : {slice, selected})
+            {
+                EXPECT_EQ(tensor->native_type(), expectedTensorType(GetParam()));
+                EXPECT_EQ(tensor->shape(),
+                          (std::vector<size_t>{columns_, kRowsPerExpert, 3u}));
+                ASSERT_EQ(tensor->size_bytes(), 3u * bytes_per_expert_);
+                EXPECT_EQ(std::memcmp(tensor->raw_data(),
+                                      source_bytes_.data() + bytes_per_expert_,
+                                      tensor->size_bytes()), 0);
+            }
+        }
+
+        TEST_P(ModelLoaderExpertSelectionTest,
+               WholeNativePayloadPreservesBytesWithAndWithoutMappedFactory)
+        {
+            for (bool mapped : {false, true})
+                for (bool use_factory : {false, true})
+                {
+                    SCOPED_TRACE(mapped);
+                    SCOPED_TRACE(use_factory);
+                    auto loader = std::make_unique<ModelLoader>(use_factory ? factory_.get() : nullptr);
+                    loader->setUseMmap(mapped);
+                    ASSERT_TRUE(loader->loadModel(model_path_.string()));
+                    auto tensor = loader->loadTensor(kTensorName);
+                    ASSERT_NE(tensor, nullptr);
+                    loader.reset();
+                    EXPECT_EQ(tensor->native_type(), expectedTensorType(GetParam()));
+                    EXPECT_EQ(tensor->shape(),
+                        (std::vector<size_t>{columns_, kRowsPerExpert, kExpertCount}));
+                    ASSERT_EQ(tensor->size_bytes(), source_bytes_.size());
+                    EXPECT_EQ(std::memcmp(tensor->raw_data(), source_bytes_.data(), source_bytes_.size()), 0);
+                }
+        }
+
+        TEST_P(ModelLoaderExpertSelectionTest,
+               ContiguousSliceRejectsEmptyReversedAndOutOfRangeIntervals)
+        {
+            EXPECT_EQ(loader_->loadTensorExpertSlice(kTensorName, 1u, 1u), nullptr);
+            EXPECT_EQ(loader_->loadTensorExpertSlice(kTensorName, 3u, 1u), nullptr);
+            EXPECT_EQ(loader_->loadTensorExpertSlice(kTensorName, 0u, kExpertCount + 1u), nullptr);
+        }
+
+        TEST_P(ModelLoaderExpertSelectionTest,
+               LargeContiguousFirstTouchPreservesBytesWithIndependentWorkers)
+        {
+            if (GetParam() != GGUFTensorType::F32)
+                return; // The byte-copy scheduler is dtype-independent.
+            loader_.reset();
+            columns_ = 393217u; // Odd tails cross each 1 MiB copy boundary.
+            bytes_per_expert_ = kRowsPerExpert * columns_ * sizeof(float);
+            source_bytes_.resize(kExpertCount * bytes_per_expert_);
+            for (size_t byte = 0; byte < source_bytes_.size(); ++byte)
+                source_bytes_[byte] = static_cast<uint8_t>((byte * 29u + byte / 257u) & 255u);
+            writeSyntheticModel(GetParam());
+            loader_ = std::make_unique<ModelLoader>(factory_.get());
+            ASSERT_TRUE(loader_->loadModel(model_path_.string()));
+            const int previous = omp_get_max_threads();
+            for (const int workers : {1, 2, 4})
+            {
+                omp_set_num_threads(workers);
+                auto selected = loader_->loadTensorExpertSlice(kTensorName, 1u, 4u);
+                ASSERT_NE(selected, nullptr);
+                EXPECT_EQ(std::memcmp(selected->raw_data(),
+                    source_bytes_.data() + bytes_per_expert_, 3u * bytes_per_expert_), 0);
+                auto whole = loader_->loadTensor(kTensorName);
+                ASSERT_NE(whole, nullptr);
+                EXPECT_EQ(std::memcmp(whole->raw_data(), source_bytes_.data(), source_bytes_.size()), 0);
+            }
+            // Each existing worker owns a separate load; using collective
+            // worksharing here would silently omit chunks or deadlock.
+            std::array<std::shared_ptr<TensorBase>, 2> concurrent;
+            std::array<std::shared_ptr<TensorBase>, 2> concurrent_whole;
+#pragma omp parallel num_threads(2)
+            {
+                concurrent[omp_get_thread_num()] =
+                    loader_->loadTensorExpertSlice(kTensorName, 1u, 4u);
+                concurrent_whole[omp_get_thread_num()] = loader_->loadTensor(kTensorName);
+            }
+            omp_set_num_threads(previous);
+            for (const auto &selected : concurrent)
+            {
+                ASSERT_NE(selected, nullptr);
+                EXPECT_EQ(std::memcmp(selected->raw_data(),
+                    source_bytes_.data() + bytes_per_expert_, 3u * bytes_per_expert_), 0);
+            }
+            for (const auto &whole : concurrent_whole)
+            {
+                ASSERT_NE(whole, nullptr);
+                EXPECT_EQ(std::memcmp(whole->raw_data(), source_bytes_.data(), source_bytes_.size()), 0);
             }
         }
 

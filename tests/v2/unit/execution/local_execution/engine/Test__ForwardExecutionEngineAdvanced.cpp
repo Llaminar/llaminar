@@ -65,7 +65,6 @@ namespace
         int committed_forward_output_calls = 0;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
-        int get_pipeline_contexts_calls = 0;
 
         // ----- Configurable Behavior -----
         bool build_should_fail = false;
@@ -127,16 +126,6 @@ namespace
         }
 
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
-
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
-        {
-            get_pipeline_contexts_calls++;
-            call_sequence.push_back("getPipelineDeviceContexts");
-            std::unordered_map<DeviceId, IDeviceContext *> result;
-            if (ctx_)
-                result[ctx_->deviceId()] = ctx_;
-            return result;
-        }
 
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
@@ -255,12 +244,10 @@ protected:
     }
 
     ForwardExecutionEngine makeEngine(bool cache_enabled = true,
-                                      bool has_pp = false,
                                       std::optional<FactoryPPStageConfig> pp = std::nullopt)
     {
         ForwardExecutionEngine::Config config;
         config.cache_config.enabled = cache_enabled;
-        config.has_unified_pp = has_pp;
         config.pp_stage_config = pp;
         return ForwardExecutionEngine(std::move(config), executor_);
     }
@@ -741,7 +728,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPStageConfig_DifferentSignature)
         .last_layer = 12,
         .has_embedding = true,
         .has_lm_head = false};
-    auto engine = makeEngine(/*cache_enabled=*/true, /*has_pp=*/false, pp);
+    auto engine = makeEngine(/*cache_enabled=*/true, pp);
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 3;
 
@@ -759,7 +746,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPStageConfig_BuildReceivesInput)
         .last_layer = 16,
         .has_embedding = false,
         .has_lm_head = false};
-    auto engine = makeEngine(/*cache_enabled=*/true, /*has_pp=*/false, pp);
+    auto engine = makeEngine(/*cache_enabled=*/true, pp);
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 3;
 
@@ -783,7 +770,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced,
         .last_layer = 12,
         .has_embedding = true,
         .has_lm_head = false};
-    auto engine = makeEngine(/*cache_enabled=*/false, /*has_pp=*/false, pp);
+    auto engine = makeEngine(/*cache_enabled=*/false, pp);
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 1;
     FP32Tensor hidden(std::vector<size_t>{1, 8}, DeviceId::cpu());
@@ -810,7 +797,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_ResolvedOnCacheMiss)
         .last_layer = 24,
         .has_embedding = false, // Middle/last stage — needs PP copy
         .has_lm_head = true};
-    auto engine = makeEngine(/*cache_enabled=*/true, /*has_pp=*/false, pp);
+    auto engine = makeEngine(/*cache_enabled=*/true, pp);
 
     TrackingHost host(&mock_ctx_);
     host.graph_node_count = 3;
@@ -828,43 +815,6 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPCopyInfo_ResolvedOnCacheMiss)
 
     // PPCopyInfo should be resolved during cache miss path
     EXPECT_GE(host.resolve_pp_copy_calls, 1);
-}
-
-// =========================================================================
-// Unified PP Path
-// =========================================================================
-
-TEST_F(Test__ForwardExecutionEngineAdvanced, UnifiedPP_UsesPipelineContexts)
-{
-    auto engine = makeEngine(/*cache_enabled=*/true, /*has_pp=*/true);
-    TrackingHost host(&mock_ctx_);
-    host.graph_node_count = 3;
-
-    TestInput ti(1);
-    ForwardOutput output{};
-    engine.execute(ti.input, output, host);
-
-    // Unified PP path should request pipeline device contexts
-    EXPECT_GE(host.get_pipeline_contexts_calls, 1);
-}
-
-TEST_F(Test__ForwardExecutionEngineAdvanced, UnifiedPP_CacheAlwaysMiss)
-{
-    auto engine = makeEngine(/*cache_enabled=*/true, /*has_pp=*/true);
-    TrackingHost host(&mock_ctx_);
-    host.graph_node_count = 3;
-
-    ForwardOutput output{};
-
-    // First call
-    TestInput t1(1);
-    engine.execute(t1.input, output, host);
-    EXPECT_EQ(host.build_calls, 1);
-
-    // Second call — unified PP clears cache each time
-    TestInput t2(1);
-    engine.execute(t2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Unified PP should rebuild every time";
 }
 
 // =========================================================================

@@ -1,6 +1,10 @@
 /**
  * @file EmbeddingStage.cpp
- * @brief Implementation of EmbeddingStage
+ * @brief Participant-local embedding execution and prepared-weight contracts.
+ *
+ * Quantized sources consume model-owned EmbedQ8 handles, while native floating
+ * sources use their raw resident storage. Wrappers are resolved through the
+ * unpacking interface's actual capability, never their C++ inheritance alone.
  */
 
 #include "EmbeddingStage.h"
@@ -33,7 +37,7 @@ namespace llaminar2
             return true;
 
         // FP32 weights already resident on GPU do not need prepared embedding data.
-        if (!dynamic_cast<const IINT8Unpackable *>(embed_base))
+        if (!IINT8Unpackable::fromTensor(embed_base))
             return true;
 
         if (!params_.prepared_store || !params_.prepared_ref.has_value())
@@ -540,7 +544,7 @@ namespace llaminar2
             auto *source = const_cast<ITensor *>(params_.embed_table);
             const auto *base = dynamic_cast<const TensorBase *>(params_.embed_table);
             if (params_.device_id.is_gpu() &&
-                dynamic_cast<const IINT8Unpackable *>(base))
+                IINT8Unpackable::fromTensor(base))
             {
                 contract.addPreparedWeight(
                     source,

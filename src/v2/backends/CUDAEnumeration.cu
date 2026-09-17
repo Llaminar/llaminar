@@ -3,6 +3,8 @@
  * @brief CUDA device enumeration (separate compilation unit to avoid header conflicts)
  *
  * This file is compiled ONLY when HAVE_CUDA is defined, ensuring no HIP header conflicts.
+ * Driver UUIDs remain independent of visible ordinals so MPI discovery cannot
+ * count two process views of one GPU as two physical allocations.
  *
  * @author David Sanftenberg
  */
@@ -13,6 +15,7 @@
 #include <string>
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
+#include "DeviceUUID.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -20,6 +23,7 @@ namespace llaminar2
     namespace cuda_enumeration
     {
 
+        /** @return Observed devices with immutable UUIDs and current capacities. */
         std::vector<ComputeDevice> enumerate_cuda_devices()
         {
             std::vector<ComputeDevice> devices;
@@ -53,8 +57,10 @@ namespace llaminar2
                 dev.type = ComputeBackendType::GPU_CUDA;
                 dev.name = std::string(prop.name);
                 dev.device_id = i;
+                dev.uuid = formatDeviceUUID(prop.uuid.bytes);
                 dev.compute_capability = prop.major * 10 + prop.minor;
                 dev.compute_units = prop.multiProcessorCount;
+                dev.last_level_cache_bytes = prop.l2CacheSize > 0 ? static_cast<size_t>(prop.l2CacheSize) : 0;
                 dev.total_memory_bytes = prop.totalGlobalMem;
 
                 // Get free memory
@@ -91,6 +97,7 @@ namespace llaminar2
             return devices;
         }
 
+        /** @return Observed PCIe NUMA affinity, or -1 when sysfs has no locality. */
         int get_cuda_device_numa_node(int device_id)
         {
             cudaDeviceProp prop;
@@ -119,6 +126,7 @@ namespace llaminar2
             return numa_node;
         }
 
+        /** @return Directed driver P2P edges in the supplied ordinal order. */
         P2PMatrix query_p2p_matrix(const std::vector<ComputeDevice> &devices)
         {
             P2PMatrix matrix;

@@ -1,14 +1,16 @@
 /**
  * @file CUDABackend.cu
- * @brief CUDA backend implementation with cuda_runtime.h
+ * @brief NVIDIA backend allocation, streams, publication and execution resources.
  *
- * **Purpose**: Implements IBackend for NVIDIA GPUs. This .cu file is the ONLY
- * compilation unit that includes cuda_runtime.h, preventing header conflicts.
+ * Implements IBackend with exact native streams and event-aware ownership.
+ * CUDA preparation binds the required Driver API before graphs can be recorded;
+ * CPU-only cluster ranks need no NVIDIA driver to load this full-backend binary.
  *
  * @author David Sanftenberg
  */
 
 #include "CUDABackend.h"
+#include "CUDADriverApi.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -393,6 +395,8 @@ namespace llaminar2
             device_count_ = 0;
             // Log warning but don't throw - allow CPU-only execution
         }
+        if (device_count_ > 0)
+            (void)CUDADriverApi::instance(); // Resolve once, before any capture/reset.
         penalty_buffers_.resize(
             static_cast<size_t>(std::max(device_count_, 0)));
         runtime_generations_.assign(
@@ -1459,12 +1463,12 @@ namespace llaminar2
          * successor primary context.
          */
         CUdevice driver_device{};
-        CUresult driver_error = cuDeviceGet(&driver_device, device_id);
+        CUresult driver_error = llaminar2::CUDADriverApi::instance().deviceGet(&driver_device, device_id);
         unsigned int primary_context_flags = 0u;
         int primary_context_active = 1;
         if (driver_error == CUDA_SUCCESS)
         {
-            driver_error = cuDevicePrimaryCtxGetState(
+            driver_error = llaminar2::CUDADriverApi::instance().devicePrimaryCtxGetState(
                 driver_device,
                 &primary_context_flags,
                 &primary_context_active);
@@ -1472,7 +1476,7 @@ namespace llaminar2
         if (driver_error != CUDA_SUCCESS)
         {
             const char *driver_diagnostic = nullptr;
-            (void)cuGetErrorString(driver_error, &driver_diagnostic);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(driver_error, &driver_diagnostic);
             result.diagnostic =
                 "CUDA driver could not certify dormant successor context for CUDA:" +
                 std::to_string(device_id) + ": " +
@@ -1889,7 +1893,7 @@ namespace llaminar2
         unsigned long long threshold_seed,
         const int *threshold_position,
         int threshold_position_offset,
-        int device_idx, void *stream);
+        int device_idx, void *stream, const uint64_t *threshold_seed_device);
     extern "C" bool cudaOps_sample_processed_logits_f32(
         const float *logits,
         int vocab_size,
@@ -2395,19 +2399,8 @@ namespace llaminar2
         int32_t *out_base_position_snapshot,
         int device_idx,
         void *stream);
-    extern "C" bool cudaOps_initialize_mtp_device_logical_state(
-        const int32_t *sampled_tokens,
-        const int32_t *target_positions_device,
-        int request_count,
-        int32_t *out_base_cached_tokens,
-        int32_t *out_target_positions,
-        int32_t *out_accepted_state_counts,
-        int32_t *out_next_condition_tokens,
-        int32_t *out_all_drafts_accepted_flags,
-        int32_t *out_stopped_flags,
-        int32_t *out_publication_ok_flags,
-        int device_idx,
-        void *stream);
+    extern "C" bool cudaOps_initialize_generation_logical_state(
+        const GenerationLogicalStateInitialization &initialization, int device_idx, void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -2715,14 +2708,11 @@ namespace llaminar2
             stream);
     }
 
-    bool CUDABackend::enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+    bool CUDABackend::enqueueArgmaxF32RowsWithHistoryDevice(
         const void *data_device,
         int rows,
         int cols,
-        const void *verifier_input_tokens_device,
-        const void *generated_token_counts_device,
-        const void *penalty_policy_device,
-        const void *active_rows_device,
+        const GenerationPenaltyHistory &history,
         int device_id,
         void *stream,
         void *out_values_device,
@@ -2734,9 +2724,7 @@ namespace llaminar2
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !data_device || rows <= 0 || cols <= 0 ||
-            !verifier_input_tokens_device ||
-            !generated_token_counts_device || !penalty_policy_device ||
-            !active_rows_device ||
+            !history.admitsRows(rows) ||
             !stream || !out_values_device || !out_indices_device ||
             !partial_vals || !partial_idxs || partial_capacity < rows ||
             output_stride <= 0)
@@ -2754,11 +2742,11 @@ namespace llaminar2
             rows,
             cols,
             cols,
-            static_cast<const int *>(verifier_input_tokens_device),
-            static_cast<const int *>(generated_token_counts_device),
+            static_cast<const int *>(history.branchTokens()),
+            static_cast<const int *>(history.counts()),
             static_cast<const MTPGreedyPenaltyPolicy *>(
-                penalty_policy_device),
-            static_cast<const int *>(active_rows_device),
+                history.policy()),
+            static_cast<const int *>(history.activeRows()),
             static_cast<float *>(out_values_device),
             static_cast<int *>(out_indices_device),
             static_cast<float *>(partial_vals),
@@ -3240,12 +3228,14 @@ namespace llaminar2
         void *out_probability_device,
         uint64_t threshold_seed,
         const void *threshold_position_device,
-        int threshold_position_offset)
+        int threshold_position_offset,
+        const uint64_t *threshold_seed_device)
     {
         if (device_id >= device_count_ || device_id < 0 ||
             !token_ids_device || !probs_device ||
             top_k <= 0 || top_k > 256 || !stream || !out_token_device ||
-            (threshold_position_device && threshold_seed == 0))
+            (threshold_position_device && threshold_seed == 0 && !threshold_seed_device) ||
+            (threshold_seed_device && (!threshold_position_device || threshold_seed != 0)))
         {
             return false;
         }
@@ -3262,7 +3252,8 @@ namespace llaminar2
             static_cast<const int *>(threshold_position_device),
             threshold_position_offset,
             device_id,
-            stream);
+            stream,
+            threshold_seed_device);
     }
 
     bool CUDABackend::enqueueSampleProcessedLogitsF32Device(
@@ -4944,50 +4935,14 @@ namespace llaminar2
             stream);
     }
 
-    bool CUDABackend::enqueueInitializeMTPDeviceLogicalState(
-        const void *sampled_tokens_device,
-        const void *target_positions_device,
-        int request_count,
-        int device_id,
-        void *stream,
-        void *out_base_cached_tokens_device,
-        void *out_target_positions_device,
-        void *out_accepted_state_counts_device,
-        void *out_next_condition_tokens_device,
-        void *out_all_drafts_accepted_flags_device,
-        void *out_stopped_flags_device,
-        void *out_publication_ok_flags_device)
+    bool CUDABackend::enqueueInitializeGenerationLogicalState(
+        const GenerationLogicalStateInitialization &initialization,
+        int device_id, void *stream)
     {
-        if (device_id < 0 || device_id >= device_count_ ||
-            !sampled_tokens_device ||
-            !target_positions_device ||
-            request_count <= 0 ||
-            !stream ||
-            !out_base_cached_tokens_device ||
-            !out_target_positions_device ||
-            !out_accepted_state_counts_device ||
-            !out_next_condition_tokens_device ||
-            !out_all_drafts_accepted_flags_device ||
-            !out_stopped_flags_device ||
-            !out_publication_ok_flags_device)
-        {
+        if (device_id < 0 || device_id >= device_count_ || !stream || !initialization.valid())
             return false;
-        }
-
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
-        return cudaOps_initialize_mtp_device_logical_state(
-            static_cast<const int32_t *>(sampled_tokens_device),
-            static_cast<const int32_t *>(target_positions_device),
-            request_count,
-            static_cast<int32_t *>(out_base_cached_tokens_device),
-            static_cast<int32_t *>(out_target_positions_device),
-            static_cast<int32_t *>(out_accepted_state_counts_device),
-            static_cast<int32_t *>(out_next_condition_tokens_device),
-            static_cast<int32_t *>(out_all_drafts_accepted_flags_device),
-            static_cast<int32_t *>(out_stopped_flags_device),
-            static_cast<int32_t *>(out_publication_ok_flags_device),
-            device_id,
-            stream);
+        return cudaOps_initialize_generation_logical_state(initialization, device_id, stream);
     }
 
     // Forward declaration for CUDA penalty kernel
@@ -5245,8 +5200,8 @@ namespace llaminar2
          * wait/write calls fail closed if a driver cannot execute them.
          */
         CUdevice device = 0;
-        return cuInit(0) == CUDA_SUCCESS &&
-               cuDeviceGet(&device, device_id) == CUDA_SUCCESS;
+        return llaminar2::CUDADriverApi::instance().init(0) == CUDA_SUCCESS &&
+               llaminar2::CUDADriverApi::instance().deviceGet(&device, device_id) == CUDA_SUCCESS;
     }
 
     void *CUDABackend::allocateStreamTimelineSignal32(int device_id)
@@ -5294,7 +5249,7 @@ namespace llaminar2
             return false;
         }
 
-        const CUresult result = cuStreamWaitValue32(
+        const CUresult result = llaminar2::CUDADriverApi::instance().streamWaitValue32(
             reinterpret_cast<CUstream>(cuda_stream),
             static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
             value,
@@ -5303,8 +5258,8 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const char *description = nullptr;
-            (void)cuGetErrorName(result, &name);
-            (void)cuGetErrorString(result, &description);
+            (void)llaminar2::CUDADriverApi::instance().getErrorName(result, &name);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(result, &description);
             LOG_ERROR("[CUDABackend::streamWaitTimelineSignal32] cuStreamWaitValue32 failed: "
                       << (name ? name : "unknown") << " ("
                       << (description ? description : "no description") << ")");
@@ -5331,7 +5286,7 @@ namespace llaminar2
 
         // The default write mode includes the device memory fence that makes
         // every earlier H2D publication visible before consumers are released.
-        const CUresult result = cuStreamWriteValue32(
+        const CUresult result = llaminar2::CUDADriverApi::instance().streamWriteValue32(
             reinterpret_cast<CUstream>(cuda_stream),
             static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
             value,
@@ -5340,8 +5295,8 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const char *description = nullptr;
-            (void)cuGetErrorName(result, &name);
-            (void)cuGetErrorString(result, &description);
+            (void)llaminar2::CUDADriverApi::instance().getErrorName(result, &name);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(result, &description);
             LOG_ERROR("[CUDABackend::streamPublishTimelineSignal32] cuStreamWriteValue32 failed: "
                       << (name ? name : "unknown") << " ("
                       << (description ? description : "no description") << ")");
@@ -5355,8 +5310,8 @@ namespace llaminar2
         if (device_id < 0 || device_id >= device_count_)
             return false;
         CUdevice device = 0;
-        return cuInit(0) == CUDA_SUCCESS &&
-               cuDeviceGet(&device, device_id) == CUDA_SUCCESS;
+        return llaminar2::CUDADriverApi::instance().init(0) == CUDA_SUCCESS &&
+               llaminar2::CUDADriverApi::instance().deviceGet(&device, device_id) == CUDA_SUCCESS;
     }
 
     void *CUDABackend::allocateStreamTimelineSignal64(int device_id)
@@ -5423,7 +5378,7 @@ namespace llaminar2
             LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] capture stream is invalidated");
             return false;
         }
-        const CUresult result = cuStreamWaitValue64(
+        const CUresult result = llaminar2::CUDADriverApi::instance().streamWaitValue64(
             reinterpret_cast<CUstream>(cuda_stream),
             static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
             value,
@@ -5432,8 +5387,8 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const char *description = nullptr;
-            (void)cuGetErrorName(result, &name);
-            (void)cuGetErrorString(result, &description);
+            (void)llaminar2::CUDADriverApi::instance().getErrorName(result, &name);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(result, &description);
             LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] cuStreamWaitValue64 failed: "
                       << (name ? name : "unknown") << " ("
                       << (description ? description : "no description") << ")");
@@ -5476,7 +5431,7 @@ namespace llaminar2
             LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] capture stream is invalidated");
             return false;
         }
-        const CUresult result = cuStreamWriteValue64(
+        const CUresult result = llaminar2::CUDADriverApi::instance().streamWriteValue64(
             reinterpret_cast<CUstream>(cuda_stream),
             static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
             value,
@@ -5485,8 +5440,8 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const char *description = nullptr;
-            (void)cuGetErrorName(result, &name);
-            (void)cuGetErrorString(result, &description);
+            (void)llaminar2::CUDADriverApi::instance().getErrorName(result, &name);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(result, &description);
             LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] cuStreamWriteValue64 failed: "
                       << (name ? name : "unknown") << " ("
                       << (description ? description : "no description") << ")");

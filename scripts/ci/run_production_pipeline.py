@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Build, certify and optionally publish AVX512 and AVX2 full runtime images.
 
-Local and GitHub runs execute the same ordered pipeline. The numerical driver
-owns Unit -> ProductionParityPreflight -> full model parity; this driver then
-runs all tagged E2E cells and exactly those benchmarks on a pinned Release
-image. Only the final transition embeds certificates. Official publication
-commits compact JSON/high-water proposals, never corpora or diagnostic dumps.
+Local and GitHub runs execute the same ordered pipeline. Unit and production
+preflight precede approved serial/dynamic-MTP HTTP token regression; this driver then
+runs all tagged HTTP E2E cells, the separately declared cross-host MPI E2E
+projection (with owned Azure lease retirement), and exactly those benchmarks on
+a pinned Release image. Only the final transition embeds certificates. Official
+publication commits compact JSON/high-water proposals, never corpora or
+diagnostic dumps.
+The installed matrix exports one full inventory before model admission. Its
+complete shard set owns model identity pins; E2E and benchmark eligibility are
+an exact projection, never a separately discovered or configurable matrix.
+Container model paths are translated only inside their declared mount; aliases
+and parent traversal are rejected before any source shard is admitted.
 
 --through supports piecewise exercise. --resume reuses only identity-bound,
 digest-checked completed phases; modifying source invalidates the entire run.
@@ -29,7 +36,11 @@ import time
 import uuid
 
 import docker_paths
-from production_artifacts import digest, image_identity, ratchet, validate_image_e2e, validate_manifest, write_json
+from azure_cross_host_resources import DEFAULT_TUNNEL_SUBNET
+from model_parity_inventory import InventoryScope, cross_host_scenarios
+from generation_corpus import ApprovedGenerationCorpus
+from run_model_parity_generation import validate_regression_report
+from production_artifacts import digest, image_identity, model_identities, ratchet, validate_image_e2e, validate_manifest, validate_prerequisites, write_json
 
 ROOT = Path(__file__).resolve().parents[2]
 SHIPPING_ISAS = ("AVX512", "AVX2")
@@ -38,10 +49,24 @@ SHIPPING_ISAS = ("AVX512", "AVX2")
 class Phase(str, Enum):
     """Only successful ordered transitions can reach certification."""
     BUILD = "build"
+    PREREQUISITES = "prerequisites"
+    GENERATION = "generation"
     PARITY = "parity"
     E2E = "e2e"
+    CROSS_HOST_E2E = "cross-host-e2e"
     BENCHMARKS = "benchmarks"
     CERTIFY = "certify"
+
+
+def pipeline_phases(mathematical_parity: bool = False) -> tuple[Phase, ...]:
+    """Mathematical HF diagnostics are never an implicit routine dependency."""
+    return tuple(phase for phase in Phase if phase is not Phase.PARITY or mathematical_parity)
+
+
+class ImageRole(str, Enum):
+    """Installed test bundle and shipped runtime have distinct admission roles."""
+    BUILDER = "builder"
+    RUNTIME = "runtime"
 
 
 def run(command: list[str], log: Path, **kwargs) -> None:
@@ -107,13 +132,38 @@ def device_lease():
         yield
 
 
-def require_full_runtime(image: dict, source: dict, isa: str) -> None:
-    """Never certify an Integration binary, backend subset or mislabeled source."""
+def require_image(image: dict, source: dict, isa: str, role: ImageRole) -> None:
+    """Authenticate either image against caller-owned source, ISA and role.
+
+    Builder labels describe its embedded Release build and the unskipped
+    Integration installation. The installed-test receipt independently checks
+    real test files; labels neither replace that receipt nor waive execution.
+    Never infer the expected ISA from the image being checked.
+    """
+    if not isinstance(role, ImageRole):
+        raise TypeError("image admission requires a typed role")
+    if isa not in SHIPPING_ISAS:
+        raise ValueError("image admission requires an explicit shipping CPU ISA")
     expected = {"org.opencontainers.image.revision": source["revision"],
                 "org.llaminar.source_tree": source["tree"], "org.llaminar.build_type": "Release",
-                "org.llaminar.cpu_isa": isa, "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON"}
-    if any(image["labels"].get(key) != value for key, value in expected.items()):
-        raise ValueError("candidate is not the exact full-backend Release build admitted by this run")
+                "org.llaminar.cpu_isa": isa, "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
+                "org.llaminar.image_role": role.value}
+    if role is ImageRole.BUILDER:
+        expected["org.llaminar.integration_skipped"] = "0"
+    labels = image.get("labels") if isinstance(image, dict) else None
+    if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected.items()):
+        raise ValueError(f"{role.value} image does not match the admitted source/ISA/full-backend build")
+
+
+def require_image_pair(images: dict, source: dict, isa: str) -> None:
+    """Reject swapped, incomplete or cross-ISA test/runtime siblings."""
+    if not isinstance(images, dict) or set(images) != {role.value for role in ImageRole}:
+        raise ValueError("certification requires exactly one builder/runtime image pair")
+    for role in ImageRole:
+        require_image(images[role.value], source, isa, role)
+    identities = [images[role.value].get("id") for role in ImageRole]
+    if any(not isinstance(identity, str) or not identity for identity in identities) or identities[0] == identities[1]:
+        raise ValueError("builder/runtime roles require distinct immutable image identities")
 
 
 def build(args, source: dict, directory: Path) -> dict:
@@ -123,7 +173,8 @@ def build(args, source: dict, directory: Path) -> dict:
         snapshot(source["tree"], context)
     prefix = f"llaminar-ci:{source['tree'][:16]}-{args.cpu_isa.lower()}"
     images = {}
-    for target in ("builder", "runtime"):
+    for role in ImageRole:
+        target = role.value
         tag = prefix + "-" + target
         command = ["docker", "buildx", "build", "--load", "--network=host", "--progress=plain",
                    "--target", target, "-t", tag, "--build-arg", f"VCS_REF={source['revision']}",
@@ -133,7 +184,10 @@ def build(args, source: dict, directory: Path) -> dict:
                    "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}", str(context)]
         run(command, directory / f"build-{target}.log")
         images[target] = {"tag": tag, **image_identity(tag)}
-    require_full_runtime(images["runtime"], source, args.cpu_isa)
+        # Reject a foreign test bundle immediately, before paying for the next
+        # image or admitting any discovery/test process from the wrong build.
+        require_image(images[target], source, args.cpu_isa, role)
+    require_image_pair(images, source, args.cpu_isa)
     return images
 
 
@@ -172,18 +226,106 @@ def run_builder(images: dict, command: list[str], args, directory: Path, log: st
 
 
 def remap_manifest(document: dict, models: Path) -> dict:
-    """Translate paths at the container boundary without inventing configurations."""
+    """Translate only canonical paths inside the installed model mount.
+
+    The caller supplies its already resolved, absolute destination mount.
+    This operation is lexical: resolving container paths on the host would
+    consult the wrong filesystem. Shard stat pins and reviewed numerical
+    provenance independently authenticate the actual weights. Reject aliases
+    rather than normalizing malformed source declarations into another model.
+    Neither policy fields nor the input discovery document are mutated.
+    """
+    if not models.is_absolute() or ".." in models.parts or any(ch in str(models) for ch in "\x00\r\n"):
+        raise ValueError("model translation requires an absolute resolved destination mount")
     result = json.loads(json.dumps(document))
     def translate(path: str) -> str:
-        return str(models / Path(path).relative_to("/src/models"))
+        """Keep every relative shard component inside the admitted namespace."""
+        if not isinstance(path, str) or any(ch in path for ch in "\x00\r\n"):
+            raise ValueError("container model declaration requires a canonical path")
+        source = Path(path)
+        if source.as_posix() != path or ".." in source.parts:
+            raise ValueError("container model declaration contains a noncanonical path")
+        relative = source.relative_to("/src/models")
+        if not relative.parts:
+            raise ValueError("container model declaration names the mount, not a shard")
+        # relative_to alone accepts '..': the canonical check above is what
+        # prevents this join from escaping the caller's admitted model mount.
+        return str(models / relative)
     for row in result["cells"]:
         row["configuration"]["model"] = translate(row["configuration"]["model"])
         row["model_files"] = [translate(path) for path in row["model_files"]]
     return result
 
 
-def validate_parity(report: dict) -> None:
-    """Require both numerical evidence and the campaign's whole-run economy gate."""
+def e2e_projection(inventory: dict, revision: str) -> dict:
+    """Validate the full discovered inventory and copy its exact tagged rows.
+
+    The image runs the canonical metadata exporter with ALL scope and no
+    selectors. Its retained document, not an E2E count or a second model list,
+    owns membership. Check untagged rows before projection so malformed model
+    declarations cannot disappear from admission or subsequent resume checks.
+    The returned JSON is independent storage; translating or annotating a
+    consumer document cannot mutate its full-inventory parent.
+    """
+    if (not isinstance(inventory, dict) or type(inventory.get("schema")) is not int
+            or inventory["schema"] != 1 or inventory.get("source_revision") != revision
+            or inventory.get("scope") != InventoryScope.ALL.value):
+        raise ValueError("production certification requires the revision-bound all-cell inventory")
+    rows = inventory.get("cells")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("the full canonical inventory is empty or malformed")
+    cases, identities = set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key]
+                                           for key in ("case", "campaign", "backends")):
+            raise ValueError("full inventory omitted a canonical cell identity")
+        config, files = row.get("configuration"), row.get("model_files")
+        if (not isinstance(config, dict) or type(config.get("model_parity_schema")) is not int
+                or config["model_parity_schema"] != 1 or not isinstance(config.get("id"), str)
+                or not config["id"] or not isinstance(files, list) or not files
+                or any(not isinstance(path, str) or not path for path in files)
+                or len(set(files)) != len(files) or config.get("model") not in files):
+            raise ValueError("full inventory omitted a valid configuration or model-file declaration")
+        InventoryScope.ALL.accepts(config)
+        if row["case"] in cases or config["id"] in identities:
+            raise ValueError("the full canonical inventory contains duplicate cell identities")
+        cases.add(row["case"])
+        identities.add(config["id"])
+    projected = json.loads(json.dumps({**inventory, "scope": InventoryScope.E2E.value,
+        "cells": [row for row in rows if InventoryScope.E2E.accepts(row["configuration"])]}))
+    validate_manifest(projected, revision)
+    return projected
+
+
+def cross_host_e2e_projection(inventory: dict, revision: str) -> dict:
+    """Freeze remote eligibility from the same installed full-cell inventory.
+
+    The build phase may discover an empty projection without provisioning any
+    resources. Actual remote-phase admission must require its selected cells;
+    an empty document is not a passed remote certificate. Validate even untagged
+    records so stale exporters cannot silently erase requested coverage.
+    """
+    e2e_projection(inventory, revision)  # Reuse complete inventory admission.
+    selected, identities = [], set()
+    for row in inventory["cells"]:
+        scenarios = cross_host_scenarios(row["configuration"])
+        for scenario in scenarios:
+            if scenario["id"] in identities:
+                raise ValueError("duplicate remote scenario identity across canonical source cells")
+            identities.add(scenario["id"])
+        if scenarios:
+            selected.append(row)
+    return json.loads(json.dumps({**inventory, "scope": InventoryScope.CROSS_HOST_E2E.value,
+                                 "cells": selected}))
+
+
+def validate_parity(report: dict, cells: list[dict]) -> None:
+    """Require complete exact membership, numerical evidence and whole-run economy.
+
+    A positive count alone cannot prove coverage. Join each completed aggregate
+    and exact GoogleTest identity to the installed matrix before certification;
+    duplicates, omitted cells and a same-sized unrelated selection all fail.
+    """
     for field in ("correctness_passed", "performance_requirements_met", "artifact_contract_passed"):
         if report.get(field) is not True:
             raise ValueError(f"production parity gate is red: {field}")
@@ -193,30 +335,133 @@ def validate_parity(report: dict) -> None:
             or not any(name.startswith("V2_Integration_") for name in prerequisites)
             or not report.get("exact_matrix_cell_count")):
         raise ValueError("production parity omitted Unit/preflight or model cells")
+    expected = {(row["campaign"], row["case"]) for row in cells}
+    observed = []
+    campaigns = report.get("campaigns")
+    if (type(report.get("exact_matrix_cell_count")) is not int
+            or report["exact_matrix_cell_count"] != len(expected)
+            or not isinstance(campaigns, list) or not campaigns):
+        raise ValueError("production parity does not cover the full discovered inventory")
+    for campaign in campaigns:
+        if (not isinstance(campaign, dict) or type(campaign.get("return_code")) is not int
+                or campaign["return_code"] != 0 or campaign.get("outcome") != "completed"
+                or campaign.get("artifact_contract_passed") is not True
+                or not isinstance(campaign.get("gtest_cases"), list) or not campaign["gtest_cases"]
+                or not isinstance(campaign.get("campaign"), str)
+                or any(not isinstance(case, str) for case in campaign["gtest_cases"])):
+            raise ValueError("production parity contains incomplete aggregate evidence")
+        observed.extend((campaign["campaign"], case) for case in campaign["gtest_cases"])
+    if len(observed) != len(expected) or set(observed) != expected:
+        raise ValueError("production parity exact membership differs from the full discovered inventory")
 
 
-def model_identities(manifest: dict) -> dict:
-    """Pin every source shard by stat identity without reading/hashing weights."""
-    result = {}
-    for filename in sorted({path for row in manifest["cells"] for path in row["model_files"]}):
-        stat = Path(filename).stat()
-        result[filename] = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
-    return result
+def validate_cross_host_report(report: dict, manifest: dict, image: str,
+                               revision: str) -> None:
+    """Authenticate the remote MPI E2E result before benchmarks are admitted.
+
+    The remote runner owns cloud allocation, transport and HTTP execution.  It
+    publishes only compact per-scenario evidence here; this validator joins it
+    to the already validated manifest and immutable runtime image.  In
+    particular, a green HTTP report, a VM that merely booted, or an unretired
+    Azure lease cannot satisfy a declared remote scenario.
+    """
+    if not isinstance(manifest, dict) or manifest.get("scope") != InventoryScope.CROSS_HOST_E2E.value:
+        raise ValueError("cross-host certification requires a cross-host manifest")
+    expected = {
+        scenario["id"]: scenario
+        for row in manifest.get("cells", [])
+        for scenario in cross_host_scenarios(row["configuration"])
+    }
+    if not expected:
+        if (not isinstance(report, dict) or report.get("schema") != 1
+                or report.get("eligible") is not False
+                or report.get("complete") is not True
+                or report.get("source_revision") != revision
+                or report.get("image") != image
+                or report.get("manifest_digest") != digest(manifest)
+                or report.get("scenarios") != []
+                or report.get("all_resources_retired") is not True):
+            raise ValueError("cross-host E2E is not applicable but its report is malformed")
+        return
+    if (not isinstance(report, dict) or report.get("schema") != 1
+            or report.get("eligible") is not True or report.get("complete") is not True
+            or report.get("source_revision") != revision or report.get("image") != image
+            or report.get("manifest_digest") != digest(manifest)
+            or report.get("all_resources_retired") is not True
+            or not isinstance(report.get("scenarios"), list)):
+        raise ValueError("cross-host E2E report is incomplete or not bound to the tested image")
+    observed = report["scenarios"]
+    if len(observed) != len(expected) or {row.get("id") for row in observed} != set(expected):
+        raise ValueError("cross-host E2E scenario membership differs from the canonical projection")
+    seen = set()
+    for row in observed:
+        identity = row.get("id")
+        if identity in seen:
+            raise ValueError("cross-host E2E report repeats a scenario")
+        seen.add(identity)
+        source = expected[identity]
+        if (row.get("return_code") != 0 or row.get("outcome") != "passed"
+                or row.get("frontend") != source["frontend"]
+                or row.get("topology") != source["topology"]
+                or row.get("resource_retired") is not True
+                or row.get("transport_proof") is not True
+                or row.get("http_proof") is not True):
+            raise ValueError(f"cross-host E2E scenario is incomplete: {identity}")
 
 
-def validate_phase_prefix(phases: dict) -> None:
+def validate_phase_prefix(phases: dict, mathematical_parity: bool = False) -> None:
     """A resumable receipt may contain only a contiguous successful prefix."""
-    names = [phase.value for phase in Phase]
+    names = [phase.value for phase in pipeline_phases(mathematical_parity)]
     if set(phases) != set(names[:len(phases)]):
         raise ValueError("pipeline receipt has an impossible phase transition")
 
 
-def certificates(source: dict, images: dict, directory: Path) -> dict:
+def generation_evidence(directory: Path, inventory: dict, image: str, cpu_isa: str,
+                        corpus_root: Path) -> tuple[dict, dict]:
+    """Reauthenticate source-pinned answers and complete live regression evidence."""
+    corpus = ApprovedGenerationCorpus.load_reviewed(
+        directory / "source", corpus_root, cpu_isa, inventory, model_identities(inventory))
+    prerequisites = json.loads((directory / "prerequisites/prerequisites.json").read_text())
+    report = json.loads((directory / "generation/report.json").read_text())
+    validate_regression_report(report, inventory, prerequisites, image, cpu_isa, corpus.pin.document_digest)
+    return prerequisites, report
+
+
+def certificates(source: dict, images: dict, directory: Path, *, cpu_isa: str,
+                 corpus_root: Path = ROOT / "corpora", mathematical_parity: bool = False) -> dict:
     """Join complete evidence before making the irreversible certified transition."""
+    require_image_pair(images, source, cpu_isa)
+    inventory = json.loads((directory / "all-cells.json").read_text())
     manifest = json.loads((directory / "manifest.json").read_text())
+    if manifest != e2e_projection(inventory, source["revision"]):
+        raise ValueError("E2E/benchmark manifest differs from the full inventory's tagged projection")
     cells = validate_manifest(manifest, source["revision"])
-    parity = json.loads((directory / "parity.json").read_text())
-    validate_parity(parity)
+    # Remote MPI is a separate E2E family.  Keep its projection and evidence
+    # attached to the same full inventory, image and source identity; it must
+    # never be inferred from the ordinary HTTP report.  A model family without
+    # a declared cross-host topology is explicitly not applicable, whereas a
+    # declared scenario must have a completed cloud/SSH/MPI proof.
+    remote_manifest_path = directory / "cross-host-manifest.json"
+    remote_report_path = directory / "cross-host-e2e.json"
+    # Missing files are incomplete production evidence even when the remote
+    # projection is empty. Test fixtures obey this same contract: the absence
+    # of a manifest must never become a way to erase declared cloud coverage.
+    if not remote_manifest_path.is_file():
+        raise ValueError("cross-host phase has no canonical manifest")
+    remote_manifest = json.loads(remote_manifest_path.read_text())
+    if remote_manifest != cross_host_e2e_projection(inventory, source["revision"]):
+        raise ValueError("cross-host manifest differs from the canonical full-inventory projection")
+    if not remote_report_path.is_file():
+        raise ValueError("cross-host phase has no evidence report")
+    remote_report = json.loads(remote_report_path.read_text())
+    validate_cross_host_report(remote_report, remote_manifest, images["runtime"]["id"],
+                               source["revision"])
+    prerequisites, generation = generation_evidence(directory, inventory, images["runtime"]["id"],
+                                                    cpu_isa, corpus_root)
+    diagnostic = None
+    if mathematical_parity:
+        diagnostic = json.loads((directory / "parity.json").read_text())
+        validate_parity(diagnostic, inventory["cells"])
     e2e = json.loads((directory / "e2e.json").read_text())
     validate_image_e2e(e2e, manifest, images["runtime"]["id"])
     benchmarks = json.loads((directory / "benchmarks.json").read_text())
@@ -230,11 +475,19 @@ def certificates(source: dict, images: dict, directory: Path) -> dict:
             or {row["case"] for row in benchmarks["cells"]} != expected):
         raise ValueError("benchmark certificate is incomplete, stale or regressed")
     return {"schema": 1, "source": source, "tested_image": images["runtime"]["id"],
-            "cpu_isa": images["runtime"]["labels"]["org.llaminar.cpu_isa"],
+            "cpu_isa": cpu_isa,
             "test_image": images["builder"]["id"], "manifest_digest": digest(manifest),
-            "parity": {"report_digest": digest(parity), "exact_cells": parity["exact_matrix_cell_count"],
-                       "prerequisite_tests": parity["preflight_test_count"]},
+            "inventory_digest": digest(inventory),
+            "prerequisites": {"report_digest": digest(prerequisites),
+                              "tests": prerequisites["preflight_test_count"]},
+            "generation": {"report_digest": digest(generation), "exact_cells": generation["selected"],
+                           "corpus_digest": generation["corpus_digest"]},
+            "diagnostic_mathematical_parity": {"report_digest": digest(diagnostic)} if diagnostic else None,
             "e2e": {"report_digest": digest(e2e), "cells": sorted(expected)},
+            "cross_host_e2e": {"report_digest": digest(remote_report),
+                               "manifest_digest": digest(remote_manifest),
+                               "cells": sorted(scenario["id"] for row in remote_manifest["cells"]
+                                                for scenario in cross_host_scenarios(row["configuration"]))},
             "benchmarks": {"report_digest": digest(benchmarks), "cells": sorted(expected)},
             "certified": True}
 
@@ -258,7 +511,9 @@ def certify(args, source: dict, images: dict, directory: Path) -> dict:
     certificate files and parent directories. No shell or runtime executes in
     this container, and the exact tested candidate ID is its immutable parent.
     """
-    certificate = certificates(source, images, directory)
+    certificate = certificates(source, images, directory, cpu_isa=args.cpu_isa,
+        corpus_root=getattr(args, "corpus_root", ROOT / "corpora"),
+        mathematical_parity=getattr(args, "diagnostic_mathematical_parity", False))
     candidate = images["runtime"]
     tag = args.image or f"llaminar-certified:{source['tree'][:16]}-{args.cpu_isa.lower()}"
     with tempfile.TemporaryDirectory(prefix="certificate-layer-", dir=directory) as temporary:
@@ -300,7 +555,9 @@ def publication_payloads(source: dict, directory: Path, finals: dict, baseline: 
         path = directory / isa.lower()
         final = finals[isa]
         state = json.loads((path / "pipeline.json").read_text())
-        verified = certificates(source, state["images"], path)
+        verified = certificates(source, state["images"], path, cpu_isa=isa,
+            corpus_root=Path(state["identity"]["corpus_root"]),
+            mathematical_parity=state["identity"]["diagnostic_mathematical_parity"])
         if (final["certificate"] != verified or verified["cpu_isa"] != isa
                 or state.get("certified") is not True or state.get("final") != final):
             raise ValueError(f"stale or wrong-ISA certificate: {isa}")
@@ -370,6 +627,46 @@ def publish(source: dict, directory: Path, finals: dict) -> None:
         "images": {isa: {"image": final["tag"], "image_id": final["id"]} for isa, final in finals.items()}})
 
 
+def cross_host_identity(args) -> dict:
+    """Return non-secret remote infrastructure intent for resume authentication.
+
+    Cloud credentials and private key material are deliberately excluded.  A
+    changed location/SKU/network/SSH-public-key or disposal policy must start a
+    new receipt, while the Azure helper records the exact owned lease separately.
+    """
+    names = ("azure_subscription", "azure_location", "azure_vm_size", "azure_image",
+             "azure_os_disk_gib", "azure_ssh_source", "azure_ssh_public_key",
+             "azure_private_subnet", "azure_tunnel_subnet", "azure_disposal", "ssh_private_key")
+    return {name: str(getattr(args, name, "") or "") for name in names}
+
+
+def cross_host_cli_arguments(args) -> list[str]:
+    """Forward explicit cloud intent without putting credential contents in argv.
+
+    The private key is a path held by the local/CI credential boundary.  Azure
+    authentication itself is intentionally delegated to the already logged-in
+    `az` process (local login or CI federated login); no token is read or
+    serialized by this driver.
+    """
+    mapping = (("--azure-subscription", "azure_subscription"),
+               ("--azure-location", "azure_location"),
+               ("--azure-vm-size", "azure_vm_size"),
+               ("--azure-image", "azure_image"),
+               ("--azure-os-disk-gib", "azure_os_disk_gib"),
+               ("--azure-ssh-source", "azure_ssh_source"),
+               ("--azure-ssh-public-key", "azure_ssh_public_key"),
+               ("--azure-private-subnet", "azure_private_subnet"),
+               ("--azure-tunnel-subnet", "azure_tunnel_subnet"),
+               ("--azure-disposal", "azure_disposal"),
+               ("--ssh-private-key", "ssh_private_key"))
+    result = []
+    for flag, name in mapping:
+        value = getattr(args, name, None)
+        if value not in (None, ""):
+            result.extend((flag, str(value)))
+    return result
+
+
 def run_variant(args, source: dict) -> dict:
     """Advance one ISA prefix; the outer driver owns the shared device lease."""
     args.models = args.models.resolve(strict=True)
@@ -379,25 +676,31 @@ def run_variant(args, source: dict) -> dict:
     directory = args.output.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     receipt_path = directory / "pipeline.json"
+    mathematical_parity = getattr(args, "diagnostic_mathematical_parity", False)
+    corpus_root = getattr(args, "corpus_root", ROOT / "corpora").resolve()
+    if args.through == Phase.PARITY.value and not mathematical_parity:
+        raise ValueError("--through parity requires --diagnostic-mathematical-parity")
     identity = {"source": source, "cpu_isa": args.cpu_isa, "models": str(args.models),
                 "test_user": [os.getuid(), os.getgid()],
                 "ramdisk": str(args.model_ramdisk_root), "image_tag": args.image,
-                "reference_cache_root": str(args.reference_cache_root)}
+                "reference_cache_root": str(args.reference_cache_root),
+                "corpus_root": str(corpus_root), "diagnostic_mathematical_parity": mathematical_parity,
+                "cross_host": cross_host_identity(args)}
     state = {"schema": 1, "identity": identity, "phases": {}, "certified": False}
     if args.resume and receipt_path.exists():
         state = json.loads(receipt_path.read_text())
         if state.get("identity") != identity:
             raise ValueError("source/build inputs changed; start a new output directory")
-        validate_phase_prefix(state["phases"])
+        validate_phase_prefix(state["phases"], mathematical_parity)
     elif receipt_path.exists():
         raise ValueError("output already has a run; use --resume or a new directory")
-    for phase in Phase:
+    for phase in pipeline_phases(mathematical_parity):
         if source_identity() != source:
             raise ValueError("source changed after admission; no further certificate transitions allowed")
         if "model_sources" in state:
-            current = model_identities(json.loads((directory / "manifest.json").read_text()))
+            current = model_identities(json.loads((directory / "all-cells.json").read_text()))
             if state["model_sources"] != current:
-                raise ValueError("model files changed after numerical certification")
+                raise ValueError("model files changed after full-inventory admission")
         if phase.value in state["phases"]:
             evidence = state["phases"][phase.value]
             for name, checksum in evidence["files"].items():
@@ -405,8 +708,13 @@ def run_variant(args, source: dict) -> dict:
                     raise ValueError(f"changed/missing {phase.value} evidence: {name}")
             if phase == Phase.BUILD:
                 for item in state["images"].values():
-                    if image_identity(item["id"])["id"] != item["id"]:
-                        raise ValueError("installed build image changed")
+                    current_image = image_identity(item["id"])
+                    if any(current_image.get(key) != item.get(key) for key in ("id", "labels", "layers")):
+                        raise ValueError("installed build image identity/labels/layers changed")
+                require_image_pair(state["images"], source, args.cpu_isa)
+            elif phase == Phase.GENERATION:
+                generation_evidence(directory, json.loads((directory / "all-cells.json").read_text()),
+                                    state["images"]["runtime"]["id"], args.cpu_isa, corpus_root)
             print(f"[production-ci] REUSE {phase.value} (identity/evidence verified)", flush=True)
         else:
             started = time.monotonic()
@@ -415,23 +723,52 @@ def run_variant(args, source: dict) -> dict:
             files = []
             if phase == Phase.BUILD:
                 state["images"] = build(args, source, directory)
+                require_image_pair(state["images"], source, args.cpu_isa)
                 # Admit the canonical model files before any model test,
                 # not after numerical parity has already consumed them.
                 # This also makes a build-only run sufficient to discover
                 # exact candidates for standalone diagnostic exercises.
-                run_builder(state["images"], ["python3", "scripts/ci/run_model_parity_e2e.py",
-                    "--build-dir", "build_v2_integration", "--export-manifest", "/ci-results/container-manifest.json",
+                run_builder(state["images"], ["python3", "scripts/ci/model_parity_inventory.py",
+                    "--build-dir", "build_v2_integration", "--scope", InventoryScope.ALL.value,
+                    "--export-manifest", "/ci-results/container-all-cells.json",
                     "--source-revision", source["revision"]], args, directory, "discovery.log")
-                write_json(directory / "manifest.json", remap_manifest(
-                    json.loads((directory / "container-manifest.json").read_text()), args.models))
-                state["model_sources"] = model_identities(json.loads((directory / "manifest.json").read_text()))
-                files = ["manifest.json"]
+                inventory = remap_manifest(
+                    json.loads((directory / "container-all-cells.json").read_text()), args.models)
+                projected = e2e_projection(inventory, source["revision"])
+                remote = cross_host_e2e_projection(inventory, source["revision"])
+                state["model_sources"] = model_identities(inventory)
+                write_json(directory / "all-cells.json", inventory)
+                write_json(directory / "manifest.json", projected)
+                write_json(directory / "cross-host-manifest.json", remote)
+                files = ["container-all-cells.json", "all-cells.json", "manifest.json", "cross-host-manifest.json"]
+            elif phase == Phase.PREREQUISITES:
+                run_builder(state["images"], ["python3", "scripts/ci/run_production_prerequisites.py",
+                    "--build-dir", "build_v2_integration", "--installed-build-receipt", "/src/installed-tests.json",
+                    "--output", "/ci-results/prerequisites"], args, directory, "prerequisites.log")
+                validate_prerequisites(json.loads((directory / "prerequisites/prerequisites.json").read_text()))
+                files = ["prerequisites/prerequisites.json"]
+            elif phase == Phase.GENERATION:
+                # Reject missing/unapproved answers before launching a server.
+                inventory = json.loads((directory / "all-cells.json").read_text())
+                ApprovedGenerationCorpus.load_reviewed(directory / "source", corpus_root, args.cpu_isa,
+                                                       inventory, state["model_sources"])
+                run([sys.executable, str(directory / "source/scripts/ci/run_model_parity_generation.py"),
+                     "--mode", "regression", "--manifest", str(directory / "all-cells.json"),
+                     "--source-revision", source["revision"], "--container-image", state["images"]["runtime"]["id"],
+                     "--cpu-isa", args.cpu_isa, "--corpus-root", str(corpus_root),
+                     "--prerequisite-report", str(directory / "prerequisites/prerequisites.json"),
+                     "--model-ramdisk-root", str(args.model_ramdisk_root),
+                     "--output", str(directory / "generation")], directory / "generation.log", cwd=ROOT)
+                generation_evidence(directory, inventory, state["images"]["runtime"]["id"], args.cpu_isa, corpus_root)
+                files = ["generation/report.json"]
             elif phase == Phase.PARITY:
                 run_builder(state["images"], ["python3", "scripts/ci/run_production_parity_campaigns.py",
                     "--build-dir", "build_v2_integration", "--installed-build-receipt", "/src/installed-tests.json",
+                    "--reuse-passed-preflight-report", "/ci-results/prerequisites/prerequisites.json",
                     "--model-ramdisk-root", str(args.model_ramdisk_root), "--persistent-model-cache-dir", "cache",
                     "--report", "/ci-results/parity.json"], args, directory, "parity.log")
-                validate_parity(json.loads((directory / "parity.json").read_text()))
+                validate_parity(json.loads((directory / "parity.json").read_text()),
+                                json.loads((directory / "all-cells.json").read_text())["cells"])
                 files = ["parity.json"]
             elif phase == Phase.E2E:
                 run([sys.executable, str(directory / "source/scripts/ci/run_model_parity_e2e.py"),
@@ -442,6 +779,33 @@ def run_variant(args, source: dict) -> dict:
                 validate_image_e2e(json.loads((directory / "e2e.json").read_text()),
                     json.loads((directory / "manifest.json").read_text()), state["images"]["runtime"]["id"])
                 files = ["e2e.json"]
+            elif phase == Phase.CROSS_HOST_E2E:
+                remote_manifest = json.loads((directory / "cross-host-manifest.json").read_text())
+                if remote_manifest["cells"]:
+                    command = [sys.executable,
+                               str(directory / "source/scripts/ci/run_production_cross_host_e2e.py"),
+                               "--manifest", str(directory / "cross-host-manifest.json"),
+                               "--source-revision", source["revision"],
+                               "--container-image", state["images"]["runtime"]["id"],
+                               "--models", str(args.models),
+                               "--model-ramdisk-root", str(args.model_ramdisk_root),
+                               "--report", str(directory / "cross-host-e2e.json")]
+                    command.extend(cross_host_cli_arguments(args))
+                    run(command, directory / "cross-host-e2e.log", cwd=ROOT)
+                else:
+                    # Preserve the ordered lifecycle even when this source
+                    # inventory has no remote-tagged model.  This is an honest
+                    # non-applicable result, never an empty successful proof.
+                    write_json(directory / "cross-host-e2e.json", {
+                        "schema": 1, "eligible": False, "complete": True,
+                        "source_revision": source["revision"],
+                        "image": state["images"]["runtime"]["id"],
+                        "manifest_digest": digest(remote_manifest),
+                        "scenarios": [], "all_resources_retired": True})
+                validate_cross_host_report(
+                    json.loads((directory / "cross-host-e2e.json").read_text()),
+                    remote_manifest, state["images"]["runtime"]["id"], source["revision"])
+                files = ["cross-host-e2e.json"]
             elif phase == Phase.BENCHMARKS:
                 run([sys.executable, str(directory / "source/scripts/ci/run_model_parity_benchmarks.py"),
                      "--manifest", str(directory / "manifest.json"), "--source-revision", source["revision"],
@@ -482,13 +846,14 @@ def variant_arguments(args, isa: str, through: Phase) -> argparse.Namespace:
 def drive_variants(args, source: dict) -> dict:
     """Finish a gate for every ISA before entering the next gate for any ISA.
 
-    In particular, both full E2E suites precede the first benchmark. Runs are
+    In particular, both HTTP E2E suites and both remote MPI E2E suites precede
+    the first benchmark. Runs are
     sequential on this node so neither inference nor timing competes for its
     devices. Only immutable dependencies/reference packs are shared, never
     correctness results or image-bound certificates.
     """
     states = {}
-    for phase in Phase:
+    for phase in pipeline_phases(getattr(args, "diagnostic_mathematical_parity", False)):
         for isa in args.cpu_isas:
             print(f"[production-ci] ISA={isa} gate={phase.value}", flush=True)
             states[isa] = run_variant(variant_arguments(args, isa, phase), source)
@@ -504,14 +869,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-ramdisk-root", type=Path, default=Path("/mnt/llaminar-production-parity"))
     parser.add_argument("--reference-cache-root", type=Path, default=ROOT,
                         help="persistent HF pack parent; defaults to the existing workspace packs")
+    parser.add_argument("--corpus-root", type=Path, default=ROOT / "corpora",
+                        help="materialized versioned token corpus; approval comes from the source snapshot")
+    parser.add_argument("--diagnostic-mathematical-parity", action="store_true",
+                        help="explicitly add the full HF mathematical matrix; not a routine regression gate")
     parser.add_argument("--cpu-isa", choices=SHIPPING_ISAS, action="append", dest="cpu_isas",
                         help="local piecewise ISA selection; default and official publication require both")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--through", choices=[phase.value for phase in Phase], default="certify")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--image", help="AVX512 certified image tag; AVX2 appends -avx2")
+    parser.add_argument("--azure-subscription", default=os.environ.get("AZURE_SUBSCRIPTION_ID", ""),
+                        help="Azure subscription UUID for declared cross-host E2E (or AZURE_SUBSCRIPTION_ID)")
+    parser.add_argument("--azure-location", default=os.environ.get("LLAMINAR_AZURE_LOCATION", "uksouth"))
+    parser.add_argument("--azure-vm-size", default=os.environ.get("LLAMINAR_AZURE_VM_SIZE", "Standard_E16ads_v6"))
+    parser.add_argument("--azure-image", default=os.environ.get(
+        "LLAMINAR_AZURE_IMAGE", "Canonical:ubuntu-24_04-lts:server:24.04.202608270"))
+    parser.add_argument("--azure-os-disk-gib", type=int,
+                        default=int(os.environ.get("LLAMINAR_AZURE_OS_DISK_GIB", "256")))
+    parser.add_argument("--azure-ssh-source", default=os.environ.get("LLAMINAR_AZURE_SSH_SOURCE", ""),
+                        help="One public controller IPv4 /32; required when remote cells are declared")
+    parser.add_argument("--azure-ssh-public-key", default=os.environ.get("LLAMINAR_AZURE_SSH_PUBLIC_KEY", ""),
+                        help="Path to the Ed25519 public key used by the Azure lease")
+    parser.add_argument("--ssh-private-key", default=os.environ.get("LLAMINAR_AZURE_SSH_PRIVATE_KEY", ""),
+                        help="Private key path used only by the remote SSH transport")
+    parser.add_argument("--azure-private-subnet", default=os.environ.get("LLAMINAR_AZURE_PRIVATE_SUBNET", "10.221.0.0/24"))
+    parser.add_argument("--azure-tunnel-subnet", default=os.environ.get("LLAMINAR_AZURE_TUNNEL_SUBNET", DEFAULT_TUNNEL_SUBNET))
+    parser.add_argument("--azure-disposal", choices=("delete-owned-group", "deallocate-retain-disks"),
+                        default=os.environ.get("LLAMINAR_AZURE_DISPOSAL", "delete-owned-group"))
     parser.add_argument("--publish", action="store_true", help="official CI only: publish both certified images and one result commit")
     args = parser.parse_args(argv)
+    if args.through == Phase.PARITY.value and not args.diagnostic_mathematical_parity:
+        parser.error("--through parity requires --diagnostic-mathematical-parity")
     requested = args.cpu_isas or list(SHIPPING_ISAS)
     if len(set(requested)) != len(requested):
         parser.error("duplicate CPU ISA selection")
@@ -527,7 +916,10 @@ def main(argv: list[str] | None = None) -> int:
     identity = {"source": source, "cpu_isas": args.cpu_isas, "image": args.image,
                 "models": str(args.models.resolve()), "ramdisk": str(args.model_ramdisk_root.resolve()),
                 "reference_cache_root": str(args.reference_cache_root.resolve()),
-                "test_user": [os.getuid(), os.getgid()]}
+                "corpus_root": str(args.corpus_root.resolve()),
+                "diagnostic_mathematical_parity": args.diagnostic_mathematical_parity,
+                "test_user": [os.getuid(), os.getgid()],
+                "cross_host": cross_host_identity(args)}
     receipt = args.output / "pipeline.json"
     with device_lease():
         if args.resume:

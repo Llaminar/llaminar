@@ -349,7 +349,7 @@ namespace llaminar2
         throw std::logic_error("Unreachable KV-cache storage format");
     }
 
-    GPULogicalKVBlockEstimate
+    LogicalKVPayload
     KVCacheMemoryEstimator::estimateGPULogicalBlock(
         KVCacheFamily family,
         int token_count,
@@ -363,23 +363,33 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Logical GPU KV-block planning requires CUDA or ROCm");
         }
+        return logicalPayload(family, token_count, n_kv_heads, head_dim, kv_precision, device);
+    }
+
+    LogicalKVPayload KVCacheMemoryEstimator::logicalPayload(
+        KVCacheFamily family, int token_count, int n_kv_heads, int head_dim,
+        const std::string &kv_precision, DeviceId device)
+    {
+        requireSupportedDevice(device);
+        if (family != KVCacheFamily::AttentionOnly && family != KVCacheFamily::Hybrid)
+            throw std::invalid_argument("Unknown logical KV payload family");
         if (token_count <= 0 || n_kv_heads <= 0 || head_dim <= 0)
         {
             throw std::invalid_argument(
-                "Logical GPU KV-block geometry must be positive");
+                "Logical KV payload geometry must be positive");
         }
 
         const KVStorageFormat format = parseFormat(kv_precision);
         if (family == KVCacheFamily::Hybrid &&
             (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
-            throw std::invalid_argument("Hybrid GPU KV caches do not implement TurboQuant storage");
+            throw std::invalid_argument("Hybrid KV caches do not implement TurboQuant storage");
         const std::size_t tokens = static_cast<std::size_t>(token_count);
         const std::size_t heads = static_cast<std::size_t>(n_kv_heads);
         const std::size_t dimensions = static_cast<std::size_t>(head_dim);
         const std::size_t kv_dim = checkedMultiply(
             heads, dimensions, "logical-block KV dimension");
 
-        GPULogicalKVBlockEstimate result;
+        LogicalKVPayload result;
         switch (format)
         {
         case KVStorageFormat::FP32:
@@ -402,7 +412,7 @@ namespace llaminar2
         case KVStorageFormat::TQ4:
         case KVStorageFormat::TQ8:
         {
-            if (family == KVCacheFamily::Hybrid)
+            if (family == KVCacheFamily::Hybrid && device.is_gpu())
             {
                 // Hybrid GPU caches serialize their native linear Q8_1 rows;
                 // unlike attention-only caches they have no AQ8 request anchor.
@@ -453,8 +463,12 @@ namespace llaminar2
             break;
         }
         case KVStorageFormat::Q16_1:
-            throw std::invalid_argument(
-                "Q16_1 has no CUDA/ROCm KV-cache implementation");
+            if (!device.is_cpu())
+                throw std::invalid_argument("Q16_1 has no CUDA/ROCm KV-cache implementation");
+            // Reuse the CPU codec's head-block calculation. Its two tensors
+            // have identical extents and contain no metadata or scratch.
+            result.k_bytes = result.v_bytes = estimateCPUQ16(1, tokens, heads, head_dim) / 2;
+            break;
         }
 
         (void)checkedAdd(

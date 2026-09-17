@@ -4,6 +4,8 @@
  *
  * Provides concrete implementation of IGlobalTPContext for managing
  * tensor parallelism across multiple MPI ranks using UPI/MPI.
+ * Parent rank numbers and the resolved local CPU endpoint are construction
+ * inputs. Neither a WORLD query nor a fabricated CPU node supplies identity.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -13,7 +15,7 @@
 #include "CollectiveTimeoutPolicy.h"
 #include "DeviceGroup.h"
 #include "backends/ShmemSpinBackend.h"
-#include "../config/TPDomain.h"
+#include "execution/runner/RankInitializationLifecycle.h"
 #include "../tensors/Tensors.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -174,13 +176,15 @@ namespace llaminar2
         std::vector<int> world_ranks,
         bool owns_communicator,
         CollectiveBackendType backend_type,
-        std::vector<int> node_ids)
+        std::vector<int> node_ids,
+        std::optional<GlobalDeviceAddress> local_device)
         : domain_comm_(domain_comm),
           rooted_publication_comm_(MPI_COMM_NULL),
           domain_id_(domain_id),
           my_rank_in_domain_(my_rank_in_domain),
           domain_size_(domain_size),
           world_ranks_(std::move(world_ranks)),
+          local_device_(std::move(local_device)),
           node_ids_(std::move(node_ids)),
           all_same_node_(false),
           node_count_(0),
@@ -329,63 +333,12 @@ namespace llaminar2
     // Factory Methods
     // =============================================================================
 
-    std::unique_ptr<GlobalTPContext> GlobalTPContext::create(const TPDomain &domain)
-    {
-        if (domain.communicator == MPI_COMM_NULL)
-        {
-            LOG_ERROR("GlobalTPContext::create - TPDomain has null communicator");
-            return nullptr;
-        }
-
-        if (!domain.isValid())
-        {
-            LOG_ERROR("GlobalTPContext::create - TPDomain is invalid (size="
-                      << domain.domain_size << ", devices=" << domain.devices.size() << ")");
-            return nullptr;
-        }
-
-        // Get our position in the domain communicator
-        int my_rank, domain_size;
-        MPI_Comm_rank(domain.communicator, &my_rank);
-        MPI_Comm_size(domain.communicator, &domain_size);
-
-        // Verify domain_size matches TPDomain
-        if (domain_size != domain.domain_size)
-        {
-            LOG_WARN("GlobalTPContext::create - Communicator size (" << domain_size
-                                                                     << ") differs from TPDomain size (" << domain.domain_size << ")");
-        }
-
-        // Build world_ranks by gathering world ranks from all domain participants
-        // First, get our world rank
-        int my_world_rank;
-        MPI_Comm_rank(MPI_COMM_WORLD, &my_world_rank);
-
-        // Gather all world ranks
-        std::vector<int> world_ranks(domain_size);
-        MPI_Allgather(&my_world_rank, 1, MPI_INT,
-                      world_ranks.data(), 1, MPI_INT,
-                      domain.communicator);
-
-        LOG_DEBUG("GlobalTPContext::create - Domain " << domain.name
-                                                      << ": gathered world_ranks from " << domain_size << " participants");
-
-        // Create context - TPDomain owns the communicator, we don't
-        return std::unique_ptr<GlobalTPContext>(new GlobalTPContext(
-            domain.communicator,
-            0, // domain_id (use 0 for domains from TPDomain)
-            my_rank,
-            domain_size,
-            std::move(world_ranks),
-            false // owns_communicator = false (TPDomain owns it)
-            ));
-    }
-
     std::unique_ptr<GlobalTPContext> GlobalTPContext::createWithSplit(
         MPI_Comm base_comm,
         int domain_id,
         int color,
         int key,
+        std::optional<GlobalDeviceAddress> local_device,
         const std::string &hostfile_path,
         CollectiveBackendType backend_type)
     {
@@ -394,6 +347,18 @@ namespace llaminar2
             LOG_ERROR("GlobalTPContext::createWithSplit - base_comm is null");
             return nullptr;
         }
+
+        // Reject asymmetric unresolved endpoints collectively before any peer
+        // enters the split. Rank IDs must never supply a NUMA/device address.
+        const auto ready = RankInitializationLifecycle::execute(
+            {0, "global_tp_endpoint_binding"}, [&] {
+                return color == MPI_UNDEFINED ? !local_device.has_value()
+                    : local_device && local_device->isCPU() && local_device->numa_node >= 0;
+            }, [&](auto identity, auto outcome) {
+                return MPIRankInitializationConsensus::reach(base_comm, identity, outcome);
+            });
+        if (!ready.succeeded())
+            throw std::invalid_argument(ready.diagnostic("GlobalTP admission"));
 
         // Create new communicator via MPI_Comm_split
         MPI_Comm new_comm;
@@ -433,7 +398,8 @@ namespace llaminar2
                                                                        << " with color=" << color << ", key=" << key
                                                                        << ", size=" << domain_size);
 
-        // Detect node IDs using hostfile if provided, else auto-detect
+        // MPI shared-memory membership owns physical node IDs; hostfile names
+        // are launch provenance and cannot invent a second physical node map.
         // Doing this here (before constructor) means we pass node_ids directly,
         // and the constructor skips detectNodeIds() since node_ids will be non-empty.
         auto detection = NodeDetection::detect(new_comm, hostfile_path);
@@ -447,7 +413,7 @@ namespace llaminar2
             std::move(world_ranks),
             true, // owns_communicator = true (we created it)
             backend_type,
-            std::move(detection.node_ids)));
+            std::move(detection.node_ids), std::move(local_device)));
     }
 
     std::unique_ptr<GlobalTPContext> GlobalTPContext::createForTest(
@@ -526,6 +492,7 @@ namespace llaminar2
           my_rank_in_domain_(other.my_rank_in_domain_),
           domain_size_(other.domain_size_),
           world_ranks_(std::move(other.world_ranks_)),
+          local_device_(std::move(other.local_device_)),
           node_ids_(std::move(other.node_ids_)),
           all_same_node_(other.all_same_node_),
           node_count_(other.node_count_),
@@ -574,6 +541,7 @@ namespace llaminar2
             my_rank_in_domain_ = other.my_rank_in_domain_;
             domain_size_ = other.domain_size_;
             world_ranks_ = std::move(other.world_ranks_);
+            local_device_ = std::move(other.local_device_);
             node_ids_ = std::move(other.node_ids_);
             all_same_node_ = other.all_same_node_;
             node_count_ = other.node_count_;
@@ -843,23 +811,9 @@ namespace llaminar2
 
     GlobalDeviceAddress GlobalTPContext::localDevice() const
     {
-        // Get our world rank to construct the GlobalDeviceAddress
-        int world_rank = 0;
-        if (!world_ranks_.empty() && my_rank_in_domain_ >= 0 &&
-            static_cast<size_t>(my_rank_in_domain_) < world_ranks_.size())
-        {
-            world_rank = world_ranks_[my_rank_in_domain_];
-        }
-        else
-        {
-            // Fallback: query MPI directly
-            MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-        }
-
-        // Global TP is CPU-only, so return CPU device for this rank
-        // Use "rank<N>" as hostname to uniquely identify each rank's CPU
-        std::string hostname = "rank" + std::to_string(world_rank);
-        return GlobalDeviceAddress::cpu(0, hostname);
+        if (!local_device_)
+            throw std::logic_error("Membership-only test GlobalTP context has no bound CPU endpoint");
+        return *local_device_;
     }
 
     void GlobalTPContext::barrier() const
@@ -1525,7 +1479,7 @@ namespace llaminar2
             return;
         }
 
-        // Delegate to the canonical hostname-based node detection
+        // Delegate to canonical physical shared-memory node detection.
         auto detection = NodeDetection::detect(domain_comm_);
         node_ids_ = std::move(detection.node_ids);
         // node_count_ and all_same_node_ are computed by the caller

@@ -527,7 +527,7 @@ namespace llaminar2
         // =====================================================================
         // Quantized path: repack to EmbedQ8 via IINT8Unpackable, dequant per-row
         // =====================================================================
-        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+        const auto *unpackable = IINT8Unpackable::fromTensor(embed_table);
         if (!unpackable)
         {
             LOG_ERROR("[CPUEmbeddingKernelT] Embedding table type "

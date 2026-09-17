@@ -30,6 +30,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include "ROCmFloatingPointGemmWorkspaceContract.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include <stdexcept>
 #include <string>
@@ -561,10 +562,7 @@ namespace llaminar2
         WorkspaceRequirements HipBLASGemmKernel::getWorkspaceRequirements(
             int, int, int) const
         {
-            WorkspaceRequirements requirements;
-            requirements.buffers.push_back(
-                {kBiasMatmulWorkspace, kBiasMatmulWorkspaceBytes, 256, true});
-            return requirements;
+            return floating_gemm_workspace::blasRequirements();
         }
 
         // =====================================================================

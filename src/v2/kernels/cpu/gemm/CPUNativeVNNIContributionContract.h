@@ -24,17 +24,17 @@ namespace llaminar2::cpu::native_vnni
      * Prevent contraction while requiring the per-block primitive to inline.
      *
      * These functions execute once per output vector and Q8 block. An
-     * out-of-line call dominates the narrow AVX2 segment primitive, while
-     * forcing the same hint into AVX-512's dense multi-row body increases its
-     * register pressure. Keep the numerical controls common and make only the
-     * AVX2 leaf structurally inline.
+     * out-of-line call also forces the caller's live vector accumulators
+     * through the stack at every block. Keep this arithmetic boundary inline
+     * on both ISAs; the explicit rounded-register dependencies below preserve
+     * the device contribution program without a function-call boundary.
      */
 #define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP                                      \
-    __attribute__((optimize("fp-contract=off", "no-associative-math")))
+    __attribute__((always_inline, optimize("fp-contract=off", "no-associative-math")))
 #define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP_AVX2                                 \
     __attribute__((always_inline, optimize("fp-contract=off", "no-associative-math")))
 #elif defined(__clang__)
-#define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP
+#define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP __attribute__((always_inline))
 #define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP_AVX2 __attribute__((always_inline))
 #else
 #define LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP

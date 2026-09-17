@@ -32,6 +32,7 @@
  * `LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY=native|aligned`.
  */
 
+#include "../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
@@ -469,13 +470,17 @@ namespace
             });
         }
 
+        using PartialStorage = llaminar2::test::NativeVNNITestPartialStorage;
+        PartialStorage grouped_partials(std::max(
+            PartialStorage::bundleFloats(gate_up_descriptors.data(), gate_up_descriptors.size(), 1),
+            PartialStorage::bundleFloats(down_descriptors.data(), down_descriptors.size(), 1)));
         auto grouped_gate_up = [&]()
         {
             if (!CPUNativeVNNIGemmKernel::
                     multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors.data(),
                         static_cast<int>(gate_up_descriptors.size()),
-                        d_model))
+                        d_model, grouped_partials.span()))
             {
                 throw std::runtime_error("Grouped CPU MoE gate/up failed");
             }
@@ -497,7 +502,7 @@ namespace
                     multiply_batched_preq_decode_equivalent(
                         down_descriptors.data(),
                         static_cast<int>(down_descriptors.size()),
-                        intermediate))
+                        intermediate, grouped_partials.span()))
             {
                 throw std::runtime_error("Grouped CPU MoE down failed");
             }
@@ -522,13 +527,21 @@ namespace
                         intermediate,
                         activation_blocks,
                         down_descriptors.data(),
-                        static_cast<int>(down_descriptors.size())))
+                        static_cast<int>(down_descriptors.size()), grouped_partials.span()))
             {
                 throw std::runtime_error(
                     "Persistent-team grouped CPU MoE transaction failed");
             }
         };
 
+        // Serial oracle projections share the largest exact demand, prepared
+        // outside every warmup, timer and isolated profiler interval.
+        size_t partial_floats = 0;
+        for (const PreparedExpert &expert : experts)
+            for (const auto *kernel : {expert.gate.get(), expert.up.get(), expert.down.get()})
+                partial_floats = std::max(partial_floats,
+                    cpu::native_vnni::nativeVNNIProjectionPartialFloats(kernel->packedWeights(), 1));
+        test::NativeVNNITestPartialStorage partial_storage(partial_floats);
         auto serial_complete = [&]()
         {
             for (const PreparedExpert &expert : experts)
@@ -551,9 +564,9 @@ namespace
                         static_cast<size_t>(row) * d_model;
 
                     gemv_native_vnni_preq(
-                        expert.gate->packedWeights(), hidden_row, gate_row);
+                        expert.gate->packedWeights(), hidden_row, gate_row, partial_storage.span());
                     gemv_native_vnni_preq(
-                        expert.up->packedWeights(), hidden_row, up_row);
+                        expert.up->packedWeights(), hidden_row, up_row, partial_storage.span());
                     if (numerical_policy ==
                         CPUProjectionNumericalPolicy::GPUAlignedExpert)
                     {
@@ -581,7 +594,7 @@ namespace
                     gemv_native_vnni_preq(
                         expert.down->packedWeights(),
                         activation_row,
-                        down_row);
+                        down_row, partial_storage.span());
                 }
             }
         };

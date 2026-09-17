@@ -5,6 +5,8 @@
  * Test command construction with synthetic topology and validate malformed
  * placement before any hardware discovery, MPI launch, or model allocation.
  * Actual worker affinity belongs in the model-free CPU startup integration.
+ * Diagnostic export tests deliberately distinguish portable observation policy
+ * from launcher-local device visibility and cloud authentication environment.
  */
 
 #include "utils/MPIBootstrap.h"
@@ -15,11 +17,45 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace
 {
+    /** @brief Restore each mutated environment variable on every test exit. */
+    class ScopedLaunchEnvironment final
+    {
+    public:
+        /** @brief Set an explicit value, or remove it to exercise absent intent. */
+        ScopedLaunchEnvironment(const char *name, const char *value) : name_(name)
+        {
+            if (const char *previous = std::getenv(name))
+                previous_ = previous;
+            if (value)
+                ::setenv(name, value, 1);
+            else
+                ::unsetenv(name);
+        }
+
+        /** @brief Restore absence as absence, including assertion exits. */
+        ~ScopedLaunchEnvironment()
+        {
+            if (previous_)
+                ::setenv(name_.c_str(), previous_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+        }
+
+        ScopedLaunchEnvironment(const ScopedLaunchEnvironment &) = delete;
+        ScopedLaunchEnvironment &operator=(const ScopedLaunchEnvironment &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> previous_;
+    };
+
     /** @return MPI command for a synthetic topology without starting MPI. */
     std::vector<std::string> buildCommand(llaminar2::MPILaunchConfig config,
                                           llaminar2::CPUTopology topology)
@@ -42,6 +78,56 @@ namespace
     }
 
 } // namespace
+
+/** Remote SSH ranks receive observation intent through MPI, not local inheritance. */
+TEST(Test__MPIBootstrap, PortableDiagnosticsAreExplicitNameOnlyExports)
+{
+    const char *names[] = {
+        "LLAMINAR_LOG_LEVEL", "LLAMINAR_PERF_STATS_JSON",
+        "LLAMINAR_PERF_STATS_CSV", "LLAMINAR_PERF_STATS_FILTER",
+        "LLAMINAR_PERF_STATS_SUMMARY", "LLAMINAR_PERF_STATS_TABLE",
+        "LLAMINAR_PERF_STATS_TABLE_LIMIT", "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+        "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "LLAMINAR_GPU_STAGE_TIMING",
+        "LLAMINAR_GPU_STAGE_TIMING_DETAIL", "LLAMINAR_PROFILING"};
+    for (const char *hostfile : {"", "/cluster/hosts"})
+    {
+        llaminar2::MPILaunchConfig config;
+        config.hostfile = hostfile;
+        for (const char *name : names)
+        {
+            for (const char *value : {"/output with spaces/rank-{rank}.json", "0", ""})
+            {
+                ScopedLaunchEnvironment environment(name, value);
+                const auto command = buildCommand(config, {});
+                const auto found = std::find(command.begin(), command.end(), name);
+                ASSERT_NE(found, command.end()) << name;
+                ASSERT_NE(found, command.begin());
+                EXPECT_EQ(*(found - 1), "-x");
+                EXPECT_LT(found, std::find(command.begin(), command.end(), "llaminar2"));
+                EXPECT_EQ(std::count(command.begin(), command.end(), name), 1);
+                EXPECT_FALSE(contains(command, value));
+            }
+            ScopedLaunchEnvironment absent(name, nullptr);
+            EXPECT_FALSE(contains(buildCommand(config, {}), name));
+        }
+    }
+}
+
+/** Credentials and rank-local hardware policy must not become cluster-wide settings. */
+TEST(Test__MPIBootstrap, DiagnosticPropagationExcludesSecretsAndDeviceLocalPolicy)
+{
+    for (const char *name : {"LLAMINAR_AZURE_AUTH_TOKEN", "AZURE_CLIENT_SECRET",
+                            "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                            "OMP_NUM_THREADS", "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER"})
+    {
+        ScopedLaunchEnvironment environment(name, "not-a-portable-diagnostic");
+        llaminar2::MPILaunchConfig config;
+        config.hostfile = "/cluster/hosts";
+        const auto command = buildCommand(config, {});
+        EXPECT_FALSE(contains(command, name));
+        EXPECT_FALSE(contains(command, "not-a-portable-diagnostic"));
+    }
+}
 
 /** Explicit intent may never carry the unresolved NUMA sentinel into launch. */
 TEST(Test__MPIBootstrap, ExplicitCpuPlacementRejectsUnknownNode)

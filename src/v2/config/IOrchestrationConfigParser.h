@@ -3,7 +3,8 @@
  * @brief Interface for orchestration configuration parsing
  *
  * Provides a mockable interface for parsing orchestration configuration
- * from CLI arguments, YAML files, or YAML strings.
+ * from CLI arguments, authored YAML, or complete versioned JSON documents.
+ * Files and in-memory strings use the same format detection and admission.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -63,7 +64,7 @@ namespace llaminar2
          *   --cpu-layers-first          Put CPU layers at the beginning
          *
          *   --backend <type>            Default collective backend (auto, nccl, rccl, etc.)
-         *   --config <path>             Path to YAML configuration file
+         *   --config <path>             Authored YAML or versioned JSON configuration
          *
          *   MoE routed-expert placement uses named domains as the canonical
          *   hardware inventory. Use --moe-routed-expert-continuation-domain
@@ -79,7 +80,7 @@ namespace llaminar2
         virtual OrchestrationConfig parseArgs(int argc, char **argv) = 0;
 
         /**
-         * @brief Parse configuration from YAML file
+         * @brief Parse configuration from authored YAML or a versioned JSON file.
          *
          * YAML format example:
          * ```yaml
@@ -108,16 +109,16 @@ namespace llaminar2
          *     - "hot@rocm_hot;priority=0"
          * ```
          *
-         * @param path Path to YAML file
+         * @param path Path to an authored YAML or complete JSON configuration.
          * @return Parsed OrchestrationConfig
          * @throws std::invalid_argument if file doesn't exist or parsing fails
          */
         virtual OrchestrationConfig parseYamlFile(const std::string &path) = 0;
 
         /**
-         * @brief Parse configuration from YAML string (for testing)
+         * @brief Parse authored YAML or a complete versioned JSON document.
          *
-         * @param yaml YAML string content
+         * @param yaml Configuration document content; format is detected strictly.
          * @return Parsed OrchestrationConfig
          * @throws std::invalid_argument if parsing fails
          */

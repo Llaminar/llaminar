@@ -76,8 +76,8 @@ namespace llaminar2
         /**
          * @brief Get the MPI world ranks participating in this domain
          *
-         * These are the global MPI ranks (in MPI_COMM_WORLD) of the
-         * participants in this NODE_LOCAL TP domain.
+         * These are ranks in the exact admitted parent communicator of the
+         * participants in this NODE_LOCAL TP domain, not necessarily WORLD.
          *
          * @return Vector of world ranks, ordered by domain index
          */

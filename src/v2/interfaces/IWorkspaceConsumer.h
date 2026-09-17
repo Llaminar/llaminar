@@ -48,6 +48,20 @@ namespace llaminar2
     struct WorkspaceRequirements;
 
     /**
+     * @brief Where a prepared operation receives its execution scratch.
+     *
+     * GPU engines retain capture-stable bindings. Immutable CPU engines may
+     * serve independent participants concurrently and therefore receive the
+     * participant's workspace as an invocation argument instead. This policy
+     * describes ownership, not whether a kernel happens to need zero bytes.
+     */
+    enum class WorkspaceBindingPolicy
+    {
+        PreparedEngine,
+        Invocation,
+    };
+
+    /**
      * @brief Interface for kernels that consume centralized workspace buffers
      *
      * Kernels implementing this interface:
@@ -62,6 +76,12 @@ namespace llaminar2
     {
     public:
         virtual ~IWorkspaceConsumer() = default;
+
+        /** @return Binding authority; ordinary capture-bound engines retain their existing policy. */
+        virtual WorkspaceBindingPolicy workspaceBindingPolicy() const noexcept
+        {
+            return WorkspaceBindingPolicy::PreparedEngine;
+        }
 
         // =========================================================================
         // Workspace Requirements Declaration
@@ -122,16 +142,52 @@ namespace llaminar2
             (void)k;
         }
 
+        /**
+         * @brief Declare storage for preserving the output addend of a beta epilogue.
+         * @param requirements Calling stage's admitted named-buffer requirements.
+         * @param m Maximum simultaneously live product rows.
+         * @param n Product/output columns, not the input reduction width.
+         *
+         * Call only when beta is nonzero. Backends that accumulate directly
+         * need no additional storage; CPU NativeVNNI preserves the prior output
+         * while its unchanged GEMM writes a separate complete product.
+         */
+        virtual void appendOutputAccumulationWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, int n) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)n;
+        }
+
         // =========================================================================
         // Workspace Binding
         // =========================================================================
 
         /**
+         * @brief Add the intermediate required by a selected SwiGLU/down operation.
+         * @param requirements Stage-owned aggregate of simultaneously live buffers.
+         * @param m Maximum rows, including grouped verification.
+         * @param k Down-projection input width, not output width.
+         *
+         * Plain projections do not request this transform. Backends that fuse
+         * it entirely in registers need no additional storage.
+         */
+        virtual void appendSwiGLUWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, int k) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)k;
+        }
+
+        /**
          * @brief Bind a workspace manager to this kernel
          *
-         * After binding, the kernel uses buffers from the workspace manager.
-         * The workspace manager must have allocated all required buffers returned
-         * by getWorkspaceRequirements() for the maximum expected dimensions.
+         * Prepared-engine policy retains a borrowed binding. Invocation policy
+         * retains no kernel-global pointer; the owning stage supplies its arena
+         * with every call. In either case, the manager must have allocated the
+         * declared requirements before execution.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
          *                  Pass nullptr to unbind during allocator rebuilds.
@@ -142,10 +198,11 @@ namespace llaminar2
         virtual void bindWorkspace(DeviceWorkspaceManager *workspace) = 0;
 
         /**
-         * @brief Unbind workspace and return to legacy mode
+         * @brief End a prepared-engine binding before its arena retires.
          *
-         * Equivalent to bindWorkspace(nullptr). Capture-sensitive kernels should
-         * fail execution while unbound.
+         * Invocation-owned engines have no persistent pointer to clear. An
+         * absent required workspace is an execution error, never permission to
+         * construct replacement buffers in the hot path.
          */
         virtual void unbindWorkspace()
         {

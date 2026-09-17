@@ -11,6 +11,7 @@
 #include "NativeVNNIExpertTransferParityTest.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 
 #include <gtest/gtest.h>
 
@@ -156,6 +157,7 @@ namespace
             CpuKernel gate_cpu(gate_weight.get(), CpuKernel::NumericalPolicy::GPUAlignedExpert);
             CpuKernel up_cpu(up_weight.get(), CpuKernel::NumericalPolicy::GPUAlignedExpert);
             CpuKernel down_cpu(down_weight.get(), CpuKernel::NumericalPolicy::GPUAlignedExpert);
+            CPUProjectionTestWorkspace cpu_workspace(1, intermediate);
             DeviceMoEExpertDescriptor expert{};
             expert.logical_expert_id = 0;
             expert.owner_participant = 0;
@@ -187,7 +189,8 @@ namespace
                     {&up_cpu, cpu_up.get(), intermediate, nullptr, "up"}};
                 ASSERT_TRUE(gate_cpu.multiply_fused_tensor(hidden.get(), projections, 1, d_model));
                 ASSERT_TRUE(down_cpu.multiply_tensor_with_fused_swiglu(
-                    cpu_gate.get(), cpu_up.get(), cpu_output.get(), 1, d_model, intermediate));
+                    cpu_gate.get(), cpu_up.get(), cpu_output.get(), 1, d_model, intermediate,
+                    1.0f, 0.0f, cpu_workspace.get()));
                 expectCPUExpertPacketParity(
                     {&gate_cpu, &up_cpu, &down_cpu}, hidden->data(), cpu_output->data(),
                     1, d_model, intermediate);

@@ -205,7 +205,7 @@ namespace
         int32_t local_slot;
         uint32_t flags;
         llaminar2::DeviceMoEWeightFormat weight_format;
-        uint32_t reserved;
+        llaminar2::DeviceMoEWeightFormat floating_allocation_format;
     };
 
     static_assert(
@@ -7478,6 +7478,8 @@ namespace
     __device__ __forceinline__ bool rebalance_transfer_desc_ready(
         const DeviceMoEExpertDescriptorView &desc)
     {
+        if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
+            return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
                    llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
                rebalance_matrix_desc_ready(desc.gate) &&
@@ -7670,7 +7672,10 @@ namespace
     __device__ __forceinline__ bool rebalance_directory_copy_ready(
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
-        return rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
+        if (llaminar2::deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
+            return llaminar2::deviceMoEFloatingExpertCopyReady(entry.descriptor);
+        return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+               rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
                rebalance_matrix_copy_ready(entry.descriptor.up, entry) &&
                rebalance_matrix_copy_ready(entry.descriptor.down, entry);
     }
@@ -7754,6 +7759,10 @@ namespace
         const DeviceMoEExpertDirectoryEntryView &src,
         const DeviceMoEExpertDirectoryEntryView &dst)
     {
+        if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
+            return llaminar2::deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
+        if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI)
+            return false;
         return rebalance_matrix_fits_transfer_capacity(
                    src.descriptor.gate,
                    dst.descriptor.gate) &&
@@ -7769,6 +7778,11 @@ namespace
         DeviceMoEExpertDirectoryEntryView &dst,
         const DeviceMoEExpertDirectoryEntryView &src)
     {
+        // The destination owns its pointers/capacity; only occupant metadata
+        // changes after the complete transaction has passed validation.
+        dst.descriptor.weight_format = src.descriptor.weight_format;
+        if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
+            return;
         rebalance_retarget_transfer_matrix(
             dst.descriptor.gate,
             src.descriptor.gate);
@@ -10416,7 +10430,9 @@ namespace
         }
     }
 
-    __device__ void rebalance_copy_bytes(const void *src, const void *dst_const, unsigned long long bytes)
+    // Transfer helpers stay inline: out-of-line calls spill live descriptor
+    // pointers onto private scratch on gfx906, even for a plain vector copy.
+    __device__ __forceinline__ void rebalance_copy_bytes(const void *src, const void *dst_const, unsigned long long bytes)
     {
         const auto *src_bytes = static_cast<const uint8_t *>(src);
         auto *dst_bytes = const_cast<uint8_t *>(static_cast<const uint8_t *>(dst_const));
@@ -10495,12 +10511,19 @@ namespace
     __device__ __forceinline__ unsigned long long rebalance_expert_payload_bytes(
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
+        if (llaminar2::deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
+        {
+            const auto &expert = entry.descriptor;
+            return llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_gate, expert.weight_format) +
+                   llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_up, expert.weight_format) +
+                   llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_down, expert.weight_format);
+        }
         return rebalance_projection_payload_bytes(entry.descriptor.gate, entry) +
                rebalance_projection_payload_bytes(entry.descriptor.up, entry) +
                rebalance_projection_payload_bytes(entry.descriptor.down, entry);
     }
 
-    __device__ unsigned long long rebalance_pack_projection_to_payload(
+    __device__ __forceinline__ unsigned long long rebalance_pack_projection_to_payload(
         const DeviceNativeVNNIMatrixDescView &src,
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint8_t *payload)
@@ -10538,7 +10561,7 @@ namespace
         return offset;
     }
 
-    __device__ unsigned long long rebalance_unpack_projection_from_payload(
+    __device__ __forceinline__ unsigned long long rebalance_unpack_projection_from_payload(
         const uint8_t *payload,
         const DeviceNativeVNNIMatrixDescView &dst,
         const DeviceMoEExpertDirectoryEntryView &entry)
@@ -10576,7 +10599,58 @@ namespace
         return offset;
     }
 
-    __global__ void pack_rebalance_collective_payloads_kernel(
+    /** @brief Pack an exact floating or quantized expert using the same vector copy. */
+    __device__ __forceinline__ unsigned long long rebalance_pack_expert_to_payload(
+        const DeviceMoEExpertDirectoryEntryView &src, uint8_t *payload)
+    {
+        unsigned long long offset = 0;
+        if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
+        {
+            const auto &expert = src.descriptor;
+            const auto gate_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_gate, expert.weight_format);
+            const auto up_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_up, expert.weight_format);
+            const auto down_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_down, expert.weight_format);
+            rebalance_copy_bytes(expert.floating_gate.data, payload, gate_bytes);
+            rebalance_copy_bytes(expert.floating_up.data, payload + gate_bytes, up_bytes);
+            rebalance_copy_bytes(expert.floating_down.data, payload + gate_bytes + up_bytes, down_bytes);
+            return gate_bytes + up_bytes + down_bytes;
+        }
+        offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload + offset);
+        return offset;
+    }
+
+    /**
+     * @brief Copy a validated arrival into destination-owned pointers.
+     * Retargeting has already selected the source dtype without replacing the
+     * destination allocation capacity. Publication remains after the existing
+     * copy-complete fence, regardless of arithmetic family.
+     */
+    __device__ __forceinline__ unsigned long long rebalance_unpack_expert_from_payload(
+        const uint8_t *payload, const DeviceMoEExpertDirectoryEntryView &dst)
+    {
+        unsigned long long offset = 0;
+        if (llaminar2::deviceMoEWeightFormatIsFloating(dst.descriptor.weight_format))
+        {
+            const auto &expert = dst.descriptor;
+            const auto gate_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_gate, expert.weight_format);
+            const auto up_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_up, expert.weight_format);
+            const auto down_bytes = llaminar2::deviceMoEFloatingMatrixBytes(expert.floating_down, expert.weight_format);
+            rebalance_copy_bytes(payload, const_cast<void *>(expert.floating_gate.data), gate_bytes);
+            rebalance_copy_bytes(payload + gate_bytes, const_cast<void *>(expert.floating_up.data), up_bytes);
+            rebalance_copy_bytes(payload + gate_bytes + up_bytes, const_cast<void *>(expert.floating_down.data), down_bytes);
+            return gate_bytes + up_bytes + down_bytes;
+        }
+        offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.gate, dst);
+        offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.up, dst);
+        offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.down, dst);
+        return offset;
+    }
+
+    // The bridges launch 256 threads, never 1024. State that exact bound so
+    // LLVM need not spill descriptor state to support an impossible launch.
+    __global__ __launch_bounds__(256, 2) void pack_rebalance_collective_payloads_kernel(
         const DeviceMoERebalancePlanEntryView *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeaderView *gathered_command_headers,
         uint32_t plan_capacity,
@@ -10675,15 +10749,11 @@ namespace
             *reinterpret_cast<DeviceMoEExpertDirectoryEntryView *>(payload_slot) = src;
         __syncthreads();
 
-        unsigned long long offset = 0ULL;
         uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload_data + offset);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload_data + offset);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload_data + offset);
-        (void)offset;
+        (void)rebalance_pack_expert_to_payload(src, payload_data);
     }
 
-    __global__ void pack_rebalance_compact_payloads_kernel(
+    __global__ __launch_bounds__(256, 2) void pack_rebalance_compact_payloads_kernel(
         const DeviceMoERebalancePlanEntryView *plan_entries,
         const DeviceMoERebalanceCommandBufferHeaderView *command_headers,
         uint32_t plan_capacity,
@@ -10799,15 +10869,11 @@ namespace
             *reinterpret_cast<DeviceMoEExpertDirectoryEntryView *>(payload_slot) = src;
         __syncthreads();
 
-        unsigned long long offset = 0ULL;
         uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload_data + offset);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload_data + offset);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload_data + offset);
-        (void)offset;
+        (void)rebalance_pack_expert_to_payload(src, payload_data);
     }
 
-    __global__ void unpack_rebalance_collective_payloads_kernel(
+    __global__ __launch_bounds__(256, 2) void unpack_rebalance_collective_payloads_kernel(
         const DeviceMoERebalancePlanEntryView *plan_entries,
         const uint32_t *plan_count,
         uint32_t plan_capacity,
@@ -11019,9 +11085,7 @@ namespace
 
         unsigned long long offset = 0ULL;
         const uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
-        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.gate, src);
-        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.up, src);
-        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.down, src);
+        offset = rebalance_unpack_expert_from_payload(payload_data, dst);
         (void)offset;
         __syncthreads();
         __threadfence();

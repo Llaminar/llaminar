@@ -72,11 +72,11 @@ namespace llaminar2::test
         for (const int active : active_rows)
         {
             const auto bucket = std::lower_bound(
-                kDefaultPrefillGraphBucketSizes.begin(),
-                kDefaultPrefillGraphBucketSizes.end(),
+                kSupportedPrefillGraphBucketSizes.begin(),
+                kSupportedPrefillGraphBucketSizes.end(),
                 active);
             if (active <= kDefaultNativeVNNIVerifierRowCapacity ||
-                bucket == kDefaultPrefillGraphBucketSizes.end())
+                bucket == kSupportedPrefillGraphBucketSizes.end())
             {
                 throw std::logic_error(
                     "NativeVNNI geometry witness is outside ordinary-prefill "
@@ -107,10 +107,10 @@ namespace llaminar2::test
         const auto add_active_rows = [&cases](int active_rows)
         {
             const auto bucket = std::lower_bound(
-                kDefaultPrefillGraphBucketSizes.begin(),
-                kDefaultPrefillGraphBucketSizes.end(),
+                kSupportedPrefillGraphBucketSizes.begin(),
+                kSupportedPrefillGraphBucketSizes.end(),
                 active_rows);
-            if (bucket == kDefaultPrefillGraphBucketSizes.end())
+            if (bucket == kSupportedPrefillGraphBucketSizes.end())
             {
                 throw std::logic_error(
                     "NativeVNNI equivalence witness exceeds the largest "
@@ -123,13 +123,13 @@ namespace llaminar2::test
             add_active_rows(m);
 
         for (size_t index = 1;
-             index < kDefaultPrefillGraphBucketSizes.size();
+             index < kSupportedPrefillGraphBucketSizes.size();
              ++index)
         {
             const int lower =
-                kDefaultPrefillGraphBucketSizes[index - 1];
+                kSupportedPrefillGraphBucketSizes[index - 1];
             const int upper =
-                kDefaultPrefillGraphBucketSizes[index];
+                kSupportedPrefillGraphBucketSizes[index];
             if (upper <= exhaustive_m)
                 continue;
             add_active_rows(lower + 1);

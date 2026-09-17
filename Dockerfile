@@ -11,6 +11,10 @@
 # All dependency-install logic lives in scripts/docker/install-*.sh, which are
 # shared with .devcontainer/Dockerfile. Edit those scripts — not this file —
 # to change what gets installed.
+# Both output images declare their source, ISA, backend set and role. The
+# builder additionally records whether its Integration installation was
+# skipped; CI rejects skipped tests and still authenticates/executes the real
+# installed test inventory. Metadata never substitutes for a successful gate.
 #
 # Runtime usage (both CUDA + ROCm available; pick per invocation with -d):
 #   docker run --gpus all --rm -it \
@@ -321,22 +325,8 @@ RUN --mount=type=cache,target=/root/.ccache \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
      && echo "==> [integration] cmake build (parallel)" \
-     && mkdir /tmp/llaminar-build-discovery-driver \
-     && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
-            # POST_BUILD runs --gtest_list_tests, never test bodies. Permit that
-            # metadata-only process to load the SDK stub on a driver-free build
-            # node. Its private loader directory is removed before image seal;
-            # neither installed tests nor the runtime may use a driver stub.
-            ln -s "${CUDA_HOME}/lib64/stubs/libcuda.so" \
-                /tmp/llaminar-build-discovery-driver/libcuda.so.1; \
-        fi \
-     && LD_LIBRARY_PATH="/tmp/llaminar-build-discovery-driver:${LD_LIBRARY_PATH}" \
-        cmake --build build_v2_integration --parallel \
+     && cmake --build build_v2_integration --parallel \
             --target v2_unit_gate v2_production_parity_preflight_gate v2_model_parity_matrices \
-     && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
-            rm /tmp/llaminar-build-discovery-driver/libcuda.so.1; \
-        fi \
-     && rmdir /tmp/llaminar-build-discovery-driver \
      && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
      && { find build_v2_integration \
               \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
@@ -444,11 +434,20 @@ RUN set -e; \
 # Build identity is metadata, not an input to dependency installation or
 # compilation. Declare it last so a new revision cannot invalidate otherwise
 # identical expensive layers merely by changing an inherited RUN environment.
-COPY Dockerfile .dockerignore ./
+# The source-identity Unit constructs a tiny Git fixture using the real ignore
+# policy. Install that input too; skipping it makes native Units pass while the
+# same installed suite fails before the production preflight phase can begin.
+COPY Dockerfile .dockerignore .gitignore ./
 ARG VCS_REF
 ARG LLAMINAR_SOURCE_TREE
 LABEL org.opencontainers.image.revision="${VCS_REF}" \
-      org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}"
+      org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}" \
+      org.llaminar.image_role="builder" \
+      org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}" \
+      org.llaminar.build_type="${LLAMINAR_BUILD_TYPE}" \
+      org.llaminar.cuda="${LLAMINAR_ENABLE_CUDA}" \
+      org.llaminar.rocm="${LLAMINAR_ENABLE_ROCM}" \
+      org.llaminar.integration_skipped="${LLAMINAR_SKIP_INTEGRATION}"
 
 # =============================================================================
 # Stage 2: Runtime — slim image with only shared libs + the binary
@@ -525,6 +524,7 @@ LABEL org.opencontainers.image.title="Llaminar" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
+      org.llaminar.image_role="runtime" \
       org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}" \
       org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}" \
       org.llaminar.build_type="${LLAMINAR_BUILD_TYPE}" \

@@ -20,7 +20,9 @@ Example:
 
 The helper uses only the Python standard library and prints concise PASS/FAIL
 lines. It continues after independent failures when practical and exits nonzero
-if any check fails.
+if any check fails. Evidence is atomically published before and after each check:
+a watchdog interruption retains completed results and identifies the unfinished
+check, but only normal completion of all eight checks can certify the suite.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ import pathlib
 import re
 import socket
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Iterable
@@ -155,31 +159,77 @@ class TierSettings:
 
 
 class CheckRunner:
-    """Collects failures while printing concise harness-friendly status lines."""
+    """Own check results and publish interruption-safe, non-certifying progress.
 
-    def __init__(self, tag: str) -> None:
+    The result list is the sole authority for success/failure. An active-check
+    record is published before entering HTTP work, so even SIGKILL preserves
+    the last completed checks. Only finish() publishes terminal completeness;
+    a failed check may complete normally but still fails certificate admission.
+    """
+
+    def __init__(self, tag: str, artifact: pathlib.Path | None = None,
+                 metadata: dict[str, Any] | None = None) -> None:
+        """Start a fresh report; metadata records the unchanged canonical profile."""
         self.tag = tag
-        self.failures: list[str] = []
         self.results: list[dict[str, Any]] = []
+        self.artifact = artifact
+        self.metadata = dict(metadata or {})
+        self._publish()
 
-    def pass_(self, name: str, detail: str) -> None:
-        self.results.append({"name": name, "passed": True, "detail": detail})
-        print(f"PASS [{self.tag}] {name}: {detail}", flush=True)
+    @property
+    def failures(self) -> list[str]:
+        """Derive failures from recorded results rather than a second ledger."""
+        return [f"{row['name']}: {row['detail']}" for row in self.results if not row['passed']]
 
-    def fail(self, name: str, detail: str) -> None:
-        self.results.append({"name": name, "passed": False, "detail": detail})
-        self.failures.append(f"{name}: {detail}")
-        print(f"FAIL [{self.tag}] {name}: {detail}", flush=True)
+    def _publish(self, *, active_check: dict[str, Any] | None = None,
+                 finished: bool = False) -> None:
+        """Replace one complete JSON snapshot, never truncate the previous proof."""
+        if self.artifact is None:
+            return
+        self.artifact.parent.mkdir(parents=True, exist_ok=True)
+        document = {**self.metadata, "schema": 1,
+                    "complete": finished and len(self.results) == 8,
+                    "active_check": active_check, "results": self.results}
+        temporary = None
+        try:
+            # Close before rename and keep both paths on the same filesystem.
+            # No fsync is needed: this protects process interruption, not a
+            # promise to survive host power loss on a volatile artifact mount.
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                    prefix=".long-context-", suffix=".json", dir=self.artifact.parent,
+                    delete=False) as stream:
+                temporary = pathlib.Path(stream.name)
+                json.dump(document, stream, indent=2)
+                stream.write("\n")
+            os.replace(temporary, self.artifact)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def finish(self) -> None:
+        """Mark a normally completed sequence terminal without erasing failures."""
+        self._publish(finished=True)
 
     def run(self, name: str, check: Callable[[], str]) -> None:
+        """Time one check; cancellation leaves its START snapshot non-terminal."""
+        started = time.monotonic()
+        self._publish(active_check={"name": name, "started_unix_seconds": time.time()})
+        print(f"START [{self.tag}] {name}", flush=True)
+        passed = False
         try:
             detail = check()
         except CheckError as exc:
-            self.fail(name, str(exc))
+            detail = str(exc)
         except (RuntimeError, ValueError, TypeError, KeyError, IndexError) as exc:
-            self.fail(name, f"unexpected exception: {type(exc).__name__}: {exc}")
+            detail = f"unexpected exception: {type(exc).__name__}: {exc}"
         else:
-            self.pass_(name, detail)
+            passed = True
+        elapsed = time.monotonic() - started
+        self.results.append({"name": name, "passed": passed, "detail": detail,
+                             "elapsed_seconds": elapsed})
+        self._publish()
+        print(f"{'PASS' if passed else 'FAIL'} [{self.tag}] {name}: {detail} "
+              f"({elapsed:.3f}s)", flush=True)
 
 
 def parse_boolish(value: str) -> bool:
@@ -1064,7 +1114,12 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         return run_self_test()
 
-    runner = CheckRunner(args.tag)
+    artifact_dir = os.environ.get("LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR")
+    runner = CheckRunner(args.tag,
+        pathlib.Path(artifact_dir) / "long_context_results.json" if artifact_dir else None,
+        {"tier": args.tier, "context_length": args.context_length,
+         "minimum_prompt_tokens": args.min_prompt_tokens,
+         "generation_tokens": args.long_max_tokens})
     settings = tier_settings(args.tier, args.long_max_tokens)
     sentinels = expected_sentinels(args, settings)
 
@@ -1091,19 +1146,8 @@ def main(argv: list[str]) -> int:
     runner.run("valid near-boundary context", lambda: run_valid_boundary(args, settings))
     runner.run("oversized context rejection", lambda: run_oversized_boundary(args))
 
-    # A shell exit code alone cannot prove the full helper actually ran.
-    # Preserve per-scenario positive and negative evidence for certification.
-    artifact_dir = os.environ.get("LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR")
-    if artifact_dir:
-        path = pathlib.Path(artifact_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        (path / "long_context_results.json").write_text(json.dumps({
-            "schema": 1, "tier": args.tier, "context_length": args.context_length,
-            "minimum_prompt_tokens": args.min_prompt_tokens,
-            "generation_tokens": args.long_max_tokens,
-            "complete": len(runner.results) == 8,
-            "results": runner.results,
-        }, indent=2) + "\n", encoding="utf-8")
+    # Partial snapshots never acquire completeness merely by being present.
+    runner.finish()
 
     if runner.failures:
         print(f"FAIL [{args.tag}] summary: {len(runner.failures)} check(s) failed", flush=True)

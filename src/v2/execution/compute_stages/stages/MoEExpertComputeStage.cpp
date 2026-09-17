@@ -3899,7 +3899,8 @@ namespace llaminar2
                             published_router_q8,
                             batch_projections_,
                             /*m=*/1,
-                            d_model);
+                            d_model, CPUInvocationWorkspace::available<float>(
+                                bound_workspace_, kCPUProjectionPartials));
                     if (projected)
                     {
                         PerfStatsCollector::addCounter(
@@ -4248,7 +4249,8 @@ namespace llaminar2
                                 down_descs,
                                 num_active,
                                 1,
-                                intermediate);
+                                intermediate,
+                                bound_workspace_);
                 }
 
                 if (fused_ok)
@@ -5304,7 +5306,8 @@ namespace llaminar2
                         intermediate,
                         swiglu_q8_blocks_per_row,
                         down_projection_descriptors.data(),
-                        down_projection_count))
+                        down_projection_count, CPUInvocationWorkspace::available<float>(
+                            bound_workspace_, kCPUProjectionPartials)))
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI layer-batched "
                           "grouped FFN transaction failed in layer "
@@ -9084,8 +9087,9 @@ namespace llaminar2
                 workspace_top_k));
         }
 
-        // All expert GEMM engines use shared buffer names (not per-instance),
-        // so requirements from any one engine represent all of them.
+        // Names can be shared; format-derived CPU arithmetic geometry cannot.
+        // Each prepared CPU member contributes its own slab envelope. GPUs keep
+        // their existing format-independent simultaneous-width declaration.
         const auto &engines = params_.prepared_gate_gemm.empty()
                                   ? cached_gate_gemm_
                                   : params_.prepared_gate_gemm;
@@ -9100,6 +9104,8 @@ namespace llaminar2
                     workspace_rows,
                     n,
                     k));
+                if (params_.device_id.is_cpu())
+                    continue;
                 const int projection_width =
                     params_.expert_intermediate > 0
                         ? params_.expert_intermediate
@@ -9119,6 +9125,34 @@ namespace llaminar2
                     workspace_rows,
                     static_cast<size_t>(std::max(0, workspace_top_k)) * 2u);
                 break;
+            }
+        }
+
+        if (params_.device_id.is_cpu())
+        {
+            const auto &up_engines = params_.prepared_up_gemm.empty()
+                ? cached_up_gemm_ : params_.prepared_up_gemm;
+            for (auto *gemm : up_engines)
+                if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+                    combined.merge(consumer->getWorkspaceRequirements(
+                        workspace_rows, gemm->get_n(), gemm->get_k()));
+        }
+
+        // Down's input width is distinct from gate/up's. Declare its transform
+        // from the actual prepared engine, without mutating shared CPU bindings.
+        const auto &down_engines = params_.prepared_down_gemm.empty()
+            ? cached_down_gemm_ : params_.prepared_down_gemm;
+        for (auto *gemm : down_engines)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
+            {
+                // Serial gate/up and down reuse one activation bank. Decode's
+                // fused expert-down bundle keeps top-k distinct input rows live.
+                combined.merge(consumer->getWorkspaceRequirements(
+                    std::max(workspace_rows, workspace_top_k), gemm->get_n(), gemm->get_k()));
+                consumer->appendSwiGLUWorkspaceRequirements(
+                    combined, workspace_rows, gemm->get_k());
+                if (!params_.device_id.is_cpu()) break;
             }
         }
 
@@ -9144,7 +9178,10 @@ namespace llaminar2
             if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_up))
                 combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
             if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_down))
+            {
                 combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
+                c->appendSwiGLUWorkspaceRequirements(combined, rows, shared_down->get_k());
+            }
             if (auto *c = dynamic_cast<IWorkspaceConsumer *>(shared_gate))
             {
                 const std::array<int, 2> fused_columns = {
@@ -10817,7 +10854,10 @@ namespace llaminar2
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_up_gemm_))
             combined.merge(c->getWorkspaceRequirements(rows, intermediate, d_model));
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_down_gemm_))
+        {
             combined.merge(c->getWorkspaceRequirements(rows, d_model, intermediate));
+            c->appendSwiGLUWorkspaceRequirements(combined, rows, intermediate);
+        }
         if (auto *c = dynamic_cast<IWorkspaceConsumer *>(cached_gate_gemm_))
         {
             const std::array<int, 2> fused_columns = {

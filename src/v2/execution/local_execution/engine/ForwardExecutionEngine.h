@@ -35,6 +35,7 @@
 
 namespace llaminar2
 {
+    class PipelineForwardGraphEdges;
 
     // Forward declarations
     class TensorBase;
@@ -94,8 +95,8 @@ namespace llaminar2
         /**
          * @brief Build a forward graph for the given input.
          *
-         * The host dispatches internally to the appropriate builder
-         * (standard / partial PP / unified PP).
+         * The host builds this participant's full model or declared PP shard.
+         * Cross-device pipeline composition is outside this interface.
          */
         virtual GraphBuildResult buildForwardGraph(const ForwardInput &input) = 0;
 
@@ -126,9 +127,6 @@ namespace llaminar2
          * the process-lifetime in-memory worker without probing CUDA or ROCm.
          */
         virtual bool workerGPUContextUsesProcessPool(DeviceId device) const = 0;
-
-        /** Get device contexts for all devices in a unified PP pipeline. */
-        virtual std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() = 0;
 
         // ----- Workspace -----
 
@@ -772,7 +770,8 @@ namespace llaminar2
         {
             GraphCacheConfig cache_config;
             std::optional<FactoryPPStageConfig> pp_stage_config;
-            bool has_unified_pp = false; ///< pipeline_config_ && pipeline_config_->hasPP()
+            /** Frozen rank-owned prefill edges; cannot change after engine construction. */
+            const PipelineForwardGraphEdges *pipeline_forward_edges = nullptr;
         };
 
         ForwardExecutionEngine(Config config, DeviceGraphExecutor &executor);
@@ -859,6 +858,9 @@ namespace llaminar2
          * @param input  Prepared input (position_ids resolved, external_hidden applied)
          * @param output Receives logits/hidden pointers on success
          * @param host   Host interface for model-specific callbacks
+         * @param materialized_signature Optional exact cache identity published
+         *        only after successful native materialization. This is setup
+         *        provenance, not a claim that model arithmetic was executed.
          * @return true on success
          *
          * @pre ExplicitRows inputs provide `position_ids` or a GPU-resident
@@ -868,7 +870,8 @@ namespace llaminar2
          */
         bool execute(const ForwardInput &input,
                      ForwardOutput &output,
-                     IForwardExecutionHost &host);
+                     IForwardExecutionHost &host,
+                     std::optional<ForwardGraphSignature> *materialized_signature = nullptr);
 
         struct LastExecutedForwardGraphView
         {
@@ -999,17 +1002,19 @@ namespace llaminar2
         lastExecutedDeviceLoopGraphTemplate(std::string *error = nullptr) const;
 
         /**
-         * @brief Export one replay-ready capture by its complete immutable signature.
+         * @brief Export one materialized capture by its complete immutable signature.
          *
          * Parent graph construction may compose several forward geometries at
          * once, so mutable "last executed" state is not a sufficient identity.
          * This lookup requires an exact ForwardGraphSignature cache hit and never
          * substitutes a nearby bucket, a newer execution, or an eager path.
+         * Captured-and-instantiated setup children qualify before their first
+         * submission; semantic-node replay optimizations are not readiness.
          *
          * @param signature Complete forward-cache identity embedded by capture.
          * @param error Optional diagnostic describing the first violated hard
          *        contract. Failure never mutates cache state.
-         * @return Immutable capture view when the exact entry is replay-ready.
+         * @return Immutable capture view when the exact executable is materialized.
          */
         std::optional<DeviceLoopGraphTemplateView>
         deviceLoopGraphTemplate(
@@ -1017,10 +1022,32 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
+         * @brief Observe completed forwards embedded in a captured generation parent.
+         *
+         * The parent bypasses host per-forward dispatch. Its terminal authority
+         * supplies the completed invocation count; this method authenticates the
+         * original child identity and publishes passive replay evidence. It does
+         * not launch, transfer, wait, walk model stages, or mutate cache lifecycle.
+         * A prefill-only sample supplies zero and publishes no replay.
+         *
+         * @param signature Exact source identity retained by the parent compiler.
+         * @param source_capture Original borrowed child, not the enclosing parent.
+         * @param completed_invocations Authenticated completed forwards, not output tokens.
+         * @param error Optional first violated ownership or count invariant.
+         * @return True only when the source still belongs to this engine.
+         */
+        bool observeComposedForwardCompletion(
+            const ForwardGraphSignature &signature,
+            const IGPUGraphCapture *source_capture,
+            int64_t completed_invocations,
+            std::string *error = nullptr) const;
+
+        /**
          * @brief Inspect one exact retained decode graph without requiring monolithic capture.
          *
-         * The cache entry must already be in steady replay state and must own
-         * device-resident token and position inputs.  Both a single native
+         * The cache entry must own its complete materialized executable and
+         * device-resident token and position inputs. No preparatory inference
+         * launch is required. Both a single native
          * capture and a typed heterogeneous segmented plan are valid; warmup,
          * recapture, eager execution, and stale cache lookup are rejected.
          *
@@ -1426,7 +1453,6 @@ namespace llaminar2
             bool should_cache,
             IForwardExecutionHost &host,
             bool is_decode,
-            bool has_unified_pp,
             std::chrono::high_resolution_clock::time_point start);
 
         /**

@@ -8,6 +8,11 @@
  * publishes a single live row.  This makes a stale graph, mismatched topology,
  * or out-of-order MTP transaction a hard protocol failure rather than a silent
  * numerical corruption.
+ *
+ * A rank batch with no live rows or entries publishes only its dispatch. Both
+ * endpoints retain the authenticated empty numerical outcome without a return
+ * RPC. The independent graph-completion channel, not this zero-row result,
+ * owns follower retirement and placement lifetime.
  */
 
 #include "MoEOverlayRankBatchTransport.h"
@@ -696,7 +701,8 @@ namespace llaminar2
                                      ? config.max_total_entries : config.max_total_rows),
           max_total_entries_(config.max_total_entries),
           d_model_(config.d_model),
-          top_k_(config.top_k)
+          top_k_(config.top_k),
+          return_layout_(config.return_layout)
     {
         std::sort(participant_ids_.begin(), participant_ids_.end());
         if (participant_ids_.empty() || max_total_rows_ == 0 ||
@@ -1283,6 +1289,7 @@ namespace llaminar2
         }
         dispatch_ledger_.resize(config_.transaction_slot_count);
         return_ledger_.resize(config_.transaction_slot_count);
+        return_identities_.resize(config_.workspace->participantIds().size());
         dispatch_send_slots_.resize(config_.asynchronous_send_slot_count);
         return_send_slots_.resize(config_.asynchronous_send_slot_count);
         for (auto &slot : dispatch_send_slots_)
@@ -1295,13 +1302,86 @@ namespace llaminar2
     {
         drainSendSlotsNoexcept(dispatch_send_slots_, "dispatch");
         drainSendSlotsNoexcept(return_send_slots_, "return");
-        if (pending_return_dispatch_key_ ||
-            pending_return_receive_ != MPI_REQUEST_NULL)
+        if (pending_return_)
         {
             LOG_ERROR(
-                "MoE rank-batch transport destroyed with an unmatched preposted return receive");
+                "MoE rank-batch transport destroyed with an unmatched numerical return obligation");
             std::terminate();
         }
+    }
+
+    template <typename Row>
+    void MoEOverlayMPIRankBatchTransport::rememberDispatch(
+        const MoEOverlayRankBatchKey &key, std::span<Row *const> rows)
+    {
+        NumericalReturnKind kind = NumericalReturnKind::EmptyContribution;
+        for (size_t index = 0; index < rows.size(); ++index)
+        {
+            const auto &row = *rows[index];
+            if (row.live_row_count != 0 || row.live_entry_count != 0)
+                kind = NumericalReturnKind::PeerPayload;
+            return_identities_[index] = {
+                row.residency_epoch, row.target_participant,
+                row.source_participant, row.d_model};
+        }
+        pending_return_.emplace(PendingReturn{.dispatch_key = key, .kind = kind});
+    }
+
+    bool MoEOverlayMPIRankBatchTransport::publishEmptyReturn(
+        const MoEOverlayRankBatchKey &key,
+        std::span<MoEOverlayReturnRows *const> rows, std::string *error)
+    {
+        if (rows.size() != return_identities_.size() ||
+            std::any_of(rows.begin(), rows.end(), [](const auto *row) {
+                return !row || !row->row_ids_host || !row->output_rows_fp32;
+            }))
+        {
+            if (error) *error = "empty return has invalid participant storage";
+            return false;
+        }
+        // Only fixed metadata is published. Old tensor bytes are outside the
+        // zero-row live range and must not trigger a whole-buffer clear/copy.
+        for (size_t index = 0; index < rows.size(); ++index)
+        {
+            auto &row = *rows[index];
+            const auto &identity = return_identities_[index];
+            row.key = participantKey(key, identity.source_participant);
+            row.residency_epoch = identity.residency_epoch;
+            row.source_participant = identity.source_participant;
+            row.target_participant = identity.target_participant;
+            row.d_model = identity.d_model;
+            row.layout = config_.workspace->returnLayout();
+            row.live_row_count = 0;
+        }
+        return true;
+    }
+
+    bool MoEOverlayMPIRankBatchTransport::validateEmptyReturn(
+        std::span<const MoEOverlayReturnRows *const> rows, std::string *error) const
+    {
+        if (rows.size() != return_identities_.size())
+        {
+            if (error) *error = "empty return has incorrect participant count";
+            return false;
+        }
+        for (size_t index = 0; index < rows.size(); ++index)
+        {
+            const auto *row = rows[index];
+            const auto &identity = return_identities_[index];
+            if (!row || row->live_row_count != 0 ||
+                row->residency_epoch != identity.residency_epoch ||
+                row->source_participant != identity.source_participant ||
+                row->target_participant != identity.target_participant ||
+                row->d_model != identity.d_model ||
+                row->layout != config_.workspace->returnLayout() ||
+                !validateReturnRows(*row, identity.source_participant, identity.d_model, error))
+            {
+                if (error && error->empty())
+                    *error = "expert result contradicts authenticated empty dispatch";
+                return false;
+            }
+        }
+        return true;
     }
 
     void MoEOverlayMPIRankBatchTransport::progressSendSlots(
@@ -1540,6 +1620,13 @@ namespace llaminar2
             result.error_code = 3;
             return result;
         }
+        if (pending_return_)
+        {
+            result.ok = false;
+            result.error_code = 4;
+            result.error = "dispatch already owns an unmatched numerical return obligation";
+            return result;
+        }
 
         try
         {
@@ -1569,16 +1656,6 @@ namespace llaminar2
                         "dispatch source rank supplied inbound participant rows";
                     return result;
                 }
-                if (pending_return_dispatch_key_ ||
-                    pending_return_receive_ != MPI_REQUEST_NULL)
-                {
-                    result.ok = false;
-                    result.error_code = 4;
-                    result.error =
-                        "dispatch source already owns an unmatched preposted return receive";
-                    return result;
-                }
-
                 auto *slot = acquireSendSlot(
                     dispatch_send_slots_,
                     &next_dispatch_send_slot_,
@@ -1613,14 +1690,14 @@ namespace llaminar2
                  * published. A fast endpoint can therefore return immediately
                  * without rendezvous setup landing on the critical path.
                  */
-                auto return_capacity = config_.workspace->receiveCapacity();
-                pending_return_receive_ = config_.mpi_ctx->irecv(
-                    return_capacity.data(),
-                    return_capacity.size(),
-                    MPI_BYTE,
-                    config_.target_world_rank,
-                    kReturnTag);
-                pending_return_dispatch_key_ = key;
+                rememberDispatch(key, outbound);
+                if (pending_return_->kind == NumericalReturnKind::PeerPayload)
+                {
+                    auto return_capacity = config_.workspace->receiveCapacity();
+                    pending_return_->receive = config_.mpi_ctx->irecv(
+                        return_capacity.data(), return_capacity.size(), MPI_BYTE,
+                        config_.target_world_rank, kReturnTag);
+                }
 
                 slot->request = config_.mpi_ctx->isend(
                     slot->storage.data(),
@@ -1696,6 +1773,7 @@ namespace llaminar2
                                            ? Clock::now()
                                            : Clock::time_point{};
                 payload_bytes = static_cast<size_t>(received);
+                rememberDispatch(key, inbound);
                 if (timing_enabled)
                 {
                     codec_ns = static_cast<uint64_t>(
@@ -1764,6 +1842,13 @@ namespace llaminar2
             result.error_code = 3;
             return result;
         }
+        if (!pending_return_ || !sameRoundTrip(pending_return_->dispatch_key, key))
+        {
+            result.ok = false;
+            result.error_code = 6;
+            result.error = "return has no matching authenticated dispatch obligation";
+            return result;
+        }
 
         try
         {
@@ -1783,6 +1868,28 @@ namespace llaminar2
             size_t payload_bytes = 0;
             uint64_t codec_ns = 0;
             uint64_t wait_ns = 0;
+            if (pending_return_->kind == NumericalReturnKind::EmptyContribution)
+            {
+                // This proves no numerical work, not remote graph completion.
+                // The transaction controller joins the follower terminal later.
+                const bool valid = rank == config_.source_world_rank
+                    ? outbound.empty() && publishEmptyReturn(key, inbound, &result.error)
+                    : inbound.empty() && validateEmptyReturn(outbound, &result.error);
+                if (!valid)
+                {
+                    result.ok = false;
+                    result.error_code = 6;
+                    if (result.error.empty()) result.error = "empty return has invalid endpoint direction";
+                    return result;
+                }
+                pending_return_.reset();
+                telemetry.recordEmptyReturn(config_.workspace->participantIds().size());
+                if (timing_enabled)
+                    telemetry.recordTimings(0, 0, static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - total_begin).count()));
+                result.collective_complete = true;
+                return result;
+            }
             if (rank == config_.target_world_rank)
             {
                 if (!inbound.empty())
@@ -1838,6 +1945,7 @@ namespace llaminar2
                 }
                 telemetry.recordTransaction(
                     payload_bytes, config_.workspace->participantIds().size());
+                pending_return_.reset();
             }
             else
             {
@@ -1848,22 +1956,13 @@ namespace llaminar2
                     result.error = "return source rank supplied outbound participant rows";
                     return result;
                 }
-                if (!pending_return_dispatch_key_ ||
-                    !sameRoundTrip(*pending_return_dispatch_key_, key))
-                {
-                    result.ok = false;
-                    result.error_code = 6;
-                    result.error =
-                        "return source has no matching preposted receive for this dispatch";
-                    return result;
-                }
                 auto capacity = config_.workspace->receiveCapacity();
                 MPI_Status status{};
                 const auto wait_begin = timing_enabled
                                             ? Clock::now()
                                             : Clock::time_point{};
                 if (!progressRequestToCompletion(
-                        &pending_return_receive_,
+                        &pending_return_->receive,
                         &status,
                         "rank-batch return receive",
                         &result.error))
@@ -1875,8 +1974,6 @@ namespace llaminar2
                 const auto wait_end = timing_enabled
                                           ? Clock::now()
                                           : Clock::time_point{};
-                pending_return_receive_ = MPI_REQUEST_NULL;
-                pending_return_dispatch_key_.reset();
                 const int received = config_.mpi_ctx->getCount(status, MPI_BYTE);
                 const auto codec_begin = timing_enabled
                                              ? Clock::now()
@@ -1913,6 +2010,7 @@ namespace llaminar2
                 }
                 telemetry.recordTransaction(
                     payload_bytes, config_.workspace->participantIds().size());
+                pending_return_.reset();
             }
             if (timing_enabled)
             {

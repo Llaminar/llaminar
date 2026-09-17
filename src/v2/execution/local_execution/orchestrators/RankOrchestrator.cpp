@@ -20,6 +20,7 @@
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
 #include "PipelineGraphExecutionPlan.h"
+#include "PipelineDeviceGeneration.h"
 #include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../mtp/MTPSpecTransactionDriver.h"
 #include "../../mtp/MTPSpecStateContract.h"
@@ -822,26 +823,37 @@ namespace llaminar2
     // =========================================================================
 
     RankOrchestrator::Config
-    RankOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
+    RankOrchestrator::Config::fromRuntime(const RuntimeConfig &runtime)
     {
         Config config;
 
         // Runtime fields from pre-parsed RuntimeConfig
-        config.max_seq_len = plan.runtime.max_seq_len;
-        config.resident_graph_rows = plan.runtime.resident_graph_rows;
-        config.batch_size = plan.runtime.batch_size;
-        config.activation_precision = plan.runtime.activation_precision;
-        config.kv_cache_precision = plan.runtime.kv_cache_precision;
+        config.max_seq_len = runtime.max_seq_len;
+        config.resident_graph_rows = runtime.resident_graph_rows;
+        config.batch_size = runtime.batch_size;
+        config.activation_precision = runtime.activation_precision;
+        config.kv_cache_precision = runtime.kv_cache_precision;
         config.tp_allreduce_precision_override =
-            plan.runtime.tp_allreduce_precision_override;
-        config.prefix_cache = plan.runtime.prefix_cache;
-        config.mtp = plan.runtime.mtp;
-        config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
+            runtime.tp_allreduce_precision_override;
+        config.prefix_cache = runtime.prefix_cache;
+        config.mtp = runtime.mtp;
+        config.routed_expert_compute_policy = runtime.routed_expert_compute_policy;
         config.routed_expert_owner_order =
-            plan.runtime.routed_expert_owner_order;
-        config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
-        config.moe_routed_prefill = plan.runtime.moe_routed_prefill;
-        config.moe_rebalance = plan.runtime.moe_rebalance;
+            runtime.routed_expert_owner_order;
+        config.moe_hot_expert_cache = runtime.moe_hot_expert_cache;
+        config.moe_routed_prefill = runtime.moe_routed_prefill;
+        config.moe_rebalance = runtime.moe_rebalance;
+
+        config.fused_attention_backend = runtime.fused_attention_backend;
+        config.kv_cache_scale_k = runtime.kv_cache_scale_k;
+        config.kv_cache_scale_v = runtime.kv_cache_scale_v;
+        return config;
+    }
+
+    RankOrchestrator::Config
+    RankOrchestrator::Config::fromPlan(const RankExecutionPlan &plan)
+    {
+        Config config = fromRuntime(plan.runtime);
 
         if (plan.usesLocalPP())
         {
@@ -1786,6 +1798,7 @@ namespace llaminar2
                                                  runner_config.activation_seq_len = config_.resident_graph_rows;
                                                  runner_config.batch_size = config_.batch_size;
                                                  runner_config.activation_precision = config_.activation_precision;
+                                                 runner_config.fused_attention_backend = config_.fused_attention_backend;
                                                  runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                                                  runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
@@ -2089,6 +2102,7 @@ namespace llaminar2
             runner_config.activation_seq_len = config_.resident_graph_rows;
             runner_config.batch_size = config_.batch_size;
             runner_config.activation_precision = config_.activation_precision;
+            runner_config.fused_attention_backend = config_.fused_attention_backend;
             runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
             runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
             runner_config.kv_cache_precision = config_.kv_cache_precision;
@@ -2152,6 +2166,7 @@ namespace llaminar2
                 nested_config.resident_graph_rows = config_.resident_graph_rows;
                 nested_config.batch_size = config_.batch_size;
                 nested_config.activation_precision = config_.activation_precision;
+                nested_config.fused_attention_backend = config_.fused_attention_backend;
                 nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                 nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
@@ -2810,6 +2825,14 @@ namespace llaminar2
                 return false;
             }
 
+            if (PipelineDeviceGeneration::isHomogeneousGPUStageSet(pp_stage_runners_))
+            {
+                if (!pp_device_generation_)
+                    pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
+                if (!pp_device_generation_->prepareServing(plan)) return false;
+                return pp_graph_execution_plan_->markMaterialized(pp_stage_runners_.size());
+            }
+
             std::size_t materialized_native_segments = 0u;
             for (const auto &segment :
                  pp_graph_execution_plan_->segments())
@@ -3241,6 +3264,11 @@ namespace llaminar2
         const void *token_ids_device,
         int seq_len)
     {
+        if (pp_device_generation_)
+            return pp_device_generation_->forwardMTPVerifier(seq_len,
+                [&](IInferenceRunner &tail) {
+                    return tail.forwardGroupedMTPVerifierWithDeviceTokenIds(token_shadow, token_ids_device, seq_len);
+                });
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->forwardGroupedMTPVerifierWithDeviceTokenIds(
@@ -3421,6 +3449,12 @@ namespace llaminar2
             MTPConditionForwardPurpose purpose,
             int request_index)
     {
+        if (pp_device_generation_)
+            return pp_device_generation_->forwardMTPCondition(purpose,
+                [&](IInferenceRunner &tail) {
+                    return tail.advanceMTPMainConditionFromDeviceResidentLogicalState(
+                        token_shadow, logical_state, purpose, request_index);
+                });
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar
@@ -3493,6 +3527,11 @@ namespace llaminar2
         int target_sample_slot,
         MTPConditionForwardPurpose purpose)
     {
+        if (pp_device_generation_)
+            return pp_device_generation_->forwardMTPCondition(purpose,
+                [&](IInferenceRunner &tail) {
+                    return tail.advanceMTPMainConditionFromDeviceTargetSample(token_shadow, target_sample_slot, purpose);
+                });
         if (IInferenceRunner *pp_sidecar = finalPPSidecarRunner())
         {
             return pp_sidecar->advanceMTPMainConditionFromDeviceTargetSample(
@@ -3738,7 +3777,7 @@ namespace llaminar2
             return false;
         if ((mode_ == ParallelismMode::PP ||
              mode_ == ParallelismMode::TP_PP) &&
-            !pp_ctx_)
+            !pp_ctx_ && !(pp_device_generation_ && pp_device_generation_->prefillPrepared()))
         {
             return false;
         }
@@ -3791,7 +3830,7 @@ namespace llaminar2
         bool allow_padded_execution)
     {
         if (!tokens || seq_len <= 0 ||
-            pp_stage_runners_.empty() || !pp_ctx_)
+            pp_stage_runners_.empty() || (!pp_ctx_ && !(pp_device_generation_ && pp_device_generation_->prefillPrepared())))
         {
             LOG_ERROR(
                 "RankOrchestrator PP prefill schedule requires tokens, "
@@ -3835,6 +3874,27 @@ namespace llaminar2
         const std::size_t num_stages =
             pp_graph_execution_plan_->segmentCount();
         std::size_t completed_transactions = 0u;
+        if (pp_device_generation_ && pp_device_generation_->prefillPrepared())
+        {
+            if (!pp_device_generation_->prefill(tokens, seq_len, policy, pad_token_id, allow_padded_execution))
+                return false;
+            if (!skip_logits_gather_prefill_)
+            {
+                if (!logits_gatherer_)
+                {
+                    logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0, logits_backend_resolver_);
+                    applyLogitsGatherSkipFlags();
+                }
+                logits_gatherer_->copyFromStage(*pp_stage_runners_.back(), 0, config_.batch_size, config_.max_seq_len);
+            }
+            recordCompletedPPGraphTransactions("prefill", num_stages, root_schedule.chunks.size());
+            current_position_ += seq_len;
+            PerfStatsCollector::addCounter("forward_graph", "pipeline_prefill_chunk_transactions",
+                static_cast<double>(root_schedule.chunks.size()), "prefill", "rank",
+                {{"stages", std::to_string(num_stages)}, {"logical_rows", std::to_string(seq_len)},
+                 {"boundary_authority", "captured_native_pipeline_edges"}});
+            return true;
+        }
         for (const PrefillChunkPlan &chunk : root_schedule.chunks)
         {
             const int relative_offset =
@@ -12331,6 +12391,12 @@ namespace llaminar2
     bool RankOrchestrator::beginDeviceResidentGeneration(
         const DeviceGenerationAdmissionRequest &request)
     {
+        if (!pp_stage_runners_.empty() && request.depth_policy.isOrdinary())
+        {
+            if (!pp_device_generation_)
+                pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
+            return pp_device_generation_->begin(request);
+        }
         if (!request.valid())
         {
             LOG_ERROR("[RankOrchestrator] Invalid device-resident generation admission: requests="
@@ -12382,6 +12448,8 @@ namespace llaminar2
         DeviceGenerationLoopTopology topology,
         DeviceGenerationSamplingMode sampling_mode)
     {
+        if (pp_device_generation_ && pp_device_generation_->active())
+            return pp_device_generation_->materialize(request_count, draft_depth, topology, sampling_mode);
         if (request_count <= 0 || draft_depth <= 0 ||
             !isValidDeviceGenerationSamplingMode(sampling_mode))
         {
@@ -12749,6 +12817,8 @@ namespace llaminar2
 
     bool RankOrchestrator::launchDeviceResidentGeneration()
     {
+        if (pp_device_generation_ && pp_device_generation_->active())
+            return pp_device_generation_->launch();
         const auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         if (participants.empty())
@@ -12848,6 +12918,8 @@ namespace llaminar2
     bool RankOrchestrator::finishDeviceResidentGeneration(
         DeviceGenerationTerminalResult *out_result)
     {
+        if (pp_device_generation_ && pp_device_generation_->active())
+            return pp_device_generation_->finish(out_result);
         if (out_result)
             *out_result = DeviceGenerationTerminalResult{};
         if (!out_result)
@@ -13240,6 +13312,14 @@ namespace llaminar2
 
     bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
+        // Pipeline followers have no vocabulary output. Their typed main-forward
+        // policy is installed by the pipeline compiler, never by a tail sampler.
+        if (pp_device_generation_)
+        {
+            const bool ok = pp_stage_runners_.back()->setComputeAllPositionLogits(enabled);
+            if (ok && !enabled) current_all_position_logit_rows_ = 0;
+            return ok;
+        }
         auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         if (participants.empty())
@@ -13267,6 +13347,12 @@ namespace llaminar2
 
     bool RankOrchestrator::setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
     {
+        if (pp_device_generation_)
+        {
+            const bool ok = pp_stage_runners_.back()->setComputeRowIndexedAllPositionLogits(enabled, row_count);
+            if (ok) current_all_position_logit_rows_ = enabled ? row_count : 0;
+            return ok;
+        }
         auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         if (participants.empty())
@@ -13292,6 +13378,8 @@ namespace llaminar2
     bool RankOrchestrator::setMTPSpecVerifierInputPlan(
         const MTPSpecDecodeVerifierInputPlan &plan)
     {
+        if (pp_device_generation_)
+            return pp_stage_runners_.back()->setMTPSpecVerifierInputPlan(plan);
         auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         if (participants.empty())
@@ -13312,6 +13400,11 @@ namespace llaminar2
 
     void RankOrchestrator::clearMTPSpecVerifierInputPlan()
     {
+        if (pp_device_generation_)
+        {
+            pp_stage_runners_.back()->clearMTPSpecVerifierInputPlan();
+            return;
+        }
         auto &participants =
             !pp_stage_runners_.empty() ? pp_stage_runners_ : device_runners_;
         for (auto &runner : participants)

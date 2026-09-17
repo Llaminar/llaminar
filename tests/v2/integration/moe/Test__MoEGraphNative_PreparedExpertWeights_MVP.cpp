@@ -24,6 +24,7 @@
 #include "mocks/MockComputeStage.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 
 #include <algorithm>
 #include <iterator>
@@ -109,6 +110,7 @@ namespace llaminar2::test
         // -----------------------------------------------------------------------
         // Full-reference run using MoEExpertComputeStage with raw tensors.
         // -----------------------------------------------------------------------
+        /** @brief Execute the raw-weight oracle with independently owned invocation scratch. */
         bool runReference(IDeviceContext *ctx,
                           TensorBase *input,
                           TensorBase *routing_indices,
@@ -143,6 +145,7 @@ namespace llaminar2::test
             }
 
             MoEExpertComputeStage stage(std::move(params));
+            CPUStageTestWorkspace invocation_workspace(stage, seq_len);
             return stage.execute(ctx);
         }
 
@@ -351,6 +354,7 @@ namespace llaminar2::test
         // Execute.
         {
             MoELocalExpertStage local_stage(std::move(local_params));
+            CPUStageTestWorkspace invocation_workspace(local_stage, kSeqLen);
             ASSERT_TRUE(local_stage.execute(cpu_ctx_.get()));
         }
         EXPECT_GT(local_output.live_row_count, 0u)
@@ -483,6 +487,7 @@ namespace llaminar2::test
 
         {
             MoELocalExpertStage local_stage(std::move(local_params));
+            CPUStageTestWorkspace invocation_workspace(local_stage, kSeqLen);
             ASSERT_TRUE(local_stage.execute(cpu_ctx_.get()));
         }
         ASSERT_EQ(local_output.live_row_count, 2u);
@@ -611,7 +616,9 @@ namespace llaminar2::test
         local_params.prepared_up_gemm = std::move(prep.prepared_up_gemm);
         local_params.prepared_down_gemm = std::move(prep.prepared_down_gemm);
         local_params.moe_owned_kernels = std::move(prep.moe_owned_kernels);
+        // This owner spans every logical-prefix replay of the retained stage.
         MoELocalExpertStage local_stage(std::move(local_params));
+        CPUStageTestWorkspace invocation_workspace(local_stage, bucket_rows);
 
         auto inbound_return = workspace.returnReceive(kLayer, 0);
         MoESparseReturnReduceStage::Params return_params;

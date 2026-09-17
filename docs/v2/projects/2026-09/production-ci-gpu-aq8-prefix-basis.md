@@ -134,6 +134,20 @@ green below means four continuous 384-token requests, exact repeated token IDs,
 authenticated fresh/full/partial prefix outcomes and captured graph evidence.
 These are unapproved observations, not HF or image certificates.
 
+September 13 follow-on: the user approved Top-5 95%→80% for Qwen2 Q4_0
+CPU/Q8-KV, CUDA/Q8-KV and ROCm/TurboQuant-KV, plus a prefill-only KL budget
+of 0.008 for the last cell. The typed declarations now implement those exact
+allowances; ROCm/TurboQuant decode retains its 0.005 KL term in the existing
+cosine-or-KL contract. Following the matrix rebuild, phase-isolation tests and
+the full 650-Unit/167-preflight refresh, fresh exact HF retries all pass in
+`qwen2-approved-kv-allowances-fresh-01` with eight CSVs per cell. Whole-cell
+times are 2.900/3.817/3.448s for CPU-Q8/CUDA-Q8/ROCm-TQ. GPU captured
+prefill/decode and all three prefix phases pass. The [generation handoff](production-ci-generation-regression.md)
+records the full prefill/decode metrics, including CUDA's unchanged 4/5 HF
+token match; no numerical or generation equivalence is overstated.
+The older red rows below retain their original thresholds/results; they are
+not retrospectively relabeled as green evidence.
+
 | Weights / backend / KV | Result | Whole cell, seconds |
 |---|---|---:|
 | Q8_0 / CUDA / FP16 | Pass | 14.615 |
@@ -184,8 +198,12 @@ The CUDA TQ declaration already permits 80% Top-5; its passing status does
 not mean five-of-five overlap. No thresholds changed. ROCm TQ is a new
 post-fix numerical red despite passing long generation. This illustrates why
 token observations alone cannot approve their own mathematical baseline.
-All five incremental decode tokens and prefix checks pass in both red cells;
-the failing assertions are prefill distribution/ranking checks.
+All five incremental decode rows satisfy their configured gates in both red
+cells; this is not five-of-five token equality. Re-reading the original CSVs
+on September 13 confirms CUDA/Q8-KV matches four of five HF tokens (step 2
+selects 5562 instead of 3974), while ROCm/TQ matches all five. Full and partial
+restore checks pass; the fresh prefix row inherits the failing prefill
+checkpoint. The failing assertions are prefill distribution/ranking checks.
 
 Evidence roots: `gpu-aq8-hf-recheck-01`, `gpu-aq8-hf-cuda-tq-01`,
 `gpu-aq8-hf-cuda-q8-01`, `gpu-aq8-hf-rocm-q4-q8kv-01`,

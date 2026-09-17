@@ -170,6 +170,21 @@ namespace llaminar2
     std::unique_ptr<IOrchestrationRunnerFactory> createOrchestrationRunnerFactory();
 
     /**
+     * @brief Bind the public construction surface to admitted execution membership.
+     * @param execution_context Non-null selected communicator and observed inventory.
+     * @return Factory that retains this context for every runner it constructs.
+     * @throws std::invalid_argument for null membership; never substitutes WORLD.
+     *
+     * Automatic frontends use this boundary after publishing the selected apply
+     * document and admitting its ranks. Both factories are apply-only: neither
+     * may search for a different topology after membership has been fixed. The
+     * ordinary factory remains for explicit callers without a saved discovery
+     * selection; neither factory initializes MPI or starts model execution.
+     */
+    std::unique_ptr<IOrchestrationRunnerFactory> createOrchestrationRunnerFactory(
+        std::shared_ptr<IMPIContext> execution_context);
+
+    /**
      * @brief Factory function with injected dependencies (for testing)
      *
      * @param config_parser Config parser (nullptr for default)

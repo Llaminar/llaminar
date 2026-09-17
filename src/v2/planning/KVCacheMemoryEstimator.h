@@ -28,8 +28,8 @@ namespace llaminar2
         Hybrid,        ///< Main cache with the model's FA/GDN layer mapping.
     };
 
-    /** @brief Native packed bytes for one logical GPU prefix-cache layer. */
-    struct GPULogicalKVBlockEstimate
+    /** @brief Native packed bytes for one logical CPU/GPU cache layer. */
+    struct LogicalKVPayload
     {
         /** Key payload, including the immutable AQ8 anchor when compressed. */
         std::size_t k_bytes = 0;
@@ -93,13 +93,33 @@ namespace llaminar2
          *         invalid positive geometry.
          * @throws std::overflow_error when byte arithmetic overflows.
          */
-        static GPULogicalKVBlockEstimate estimateGPULogicalBlock(
+        static LogicalKVPayload estimateGPULogicalBlock(
             KVCacheFamily family,
             int token_count,
             int n_kv_heads,
             int head_dim,
             const std::string &kv_precision,
             DeviceId device);
+
+        /**
+         * @brief Native logical K/V payload, without replicas, scratch or metadata.
+         * @param family Actual main/sidecar cache construction family.
+         * @param token_count Positive number of live positions, not allocated capacity.
+         * @param n_kv_heads Participant-local KV heads.
+         * @param head_dim Coordinates in each head.
+         * @param kv_precision Installed native cache codec.
+         * @param device Concrete CPU, CUDA or ROCm owner.
+         * @return Canonical key/value bytes including an immutable key anchor when present.
+         * @throws std::exception for unsupported backend/codec/geometry or overflow.
+         *
+         * This is payload geometry, not an allocation or bandwidth decision.
+         * Traffic consumers may use successive extents to separate position
+         * bytes from the fixed anchor; they must declare their access/reuse
+         * assumptions rather than treating resident cache capacity as traffic.
+         */
+        static LogicalKVPayload logicalPayload(
+            KVCacheFamily family, int token_count, int n_kv_heads, int head_dim,
+            const std::string &kv_precision, DeviceId device);
 
         /**
          * @brief Return codec bytes/element when that value is geometry-free.

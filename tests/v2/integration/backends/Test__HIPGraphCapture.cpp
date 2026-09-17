@@ -22,6 +22,7 @@
 #include "MTPTerminalScratchCaptureProof.h"
 #include "MTPMainForwardReadRetirementProof.h"
 #include "GPUGraphMemoryContractProof.h"
+#include "NativeTimelineImportProof.h"
 
 #include <hip/hip_runtime.h>
 
@@ -58,6 +59,14 @@ protected:
 // Factory Tests
 // ===========================================================================
 
+/** @test Complete retained imports coexist with local recording fragments on HIP too. */
+TEST_F(Test__HIPGraphCapture, OrderedTimelineImportsRetainedNativeWork)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveNativeTimelineImports(ctx(), *backend); });
+}
+
 /** @test Scratch invalidation preserves in-flight readers and accepted bytes. */
 TEST_F(Test__HIPGraphCapture, MTPCatchupScratchRetiresBeforeAcceptedPublication)
 {
@@ -72,6 +81,15 @@ TEST_F(Test__HIPGraphCapture, MTPMainForwardWaitsForSidecarReadRetirement)
     auto *backend = getROCmBackend();
     ASSERT_NE(backend, nullptr);
     ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend, DeviceId::rocm(0)); });
+}
+
+/** @test Metadata observers cannot steal a later mailbox writer's sidecar edge. */
+TEST_F(Test__HIPGraphCapture, MTPShiftedMetadataPreservesMailboxWriterDependency)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ctx().submitAndWait([&] { test::proveMTPMainForwardReadRetirement(ctx(), *backend,
+        DeviceId::rocm(0), test::MTPReadRetirementBoundary::MetadataThenMailbox); });
 }
 
 /** @test Forced tokens retain the current forward's completion boundary. */

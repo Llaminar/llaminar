@@ -26,7 +26,7 @@ import time
 import urllib.request
 from typing import Iterable
 
-from generation_tokens import GenerationWorkload, TokenTrace, compare_tokens
+from generation_tokens import GenerationWorkload, TokenTrace, compare_tokens, _token_ids
 from generation_movement_ledger import MovementLedgerObserver, MovementRequirement
 from production_artifacts import write_json
 
@@ -70,7 +70,7 @@ def generation_profile(record: dict) -> dict:
     if (policy is MTPPolicy.OFF) != (identity == control):
         raise ValueError("only the MTP-off cell may name itself as its serial control")
     readiness = profile.get("readiness_timeout_seconds")
-    if type(readiness) is not int or not 0 < readiness <= 600:
+    if type(readiness) is not int or not 0 < readiness <= 900:
         raise ValueError("generation readiness must fit the exact-cell watchdog")
     context = record["runtime"].get("context_length")
     if type(context) is not int or context <= workload.max_tokens:
@@ -201,6 +201,42 @@ def admit_control(record: dict, expected: dict) -> dict[str, TokenTrace]:
     return observation_traces(source, expected)
 
 
+def admit_expected_tokens(record: dict, document: dict) -> dict[str, TokenTrace]:
+    """Consume a reviewed corpus projection, not yesterday's runtime receipts.
+
+    The outer driver authenticates the corpus pin before emitting this exact
+    cell projection. The HTTP-only helper still cannot certify an image. All
+    path, MTP, prefix and movement proofs come from today's actual responses.
+    """
+    profile = generation_profile(record)
+    if (not isinstance(document, dict) or document.get("schema") != 1
+            or document.get("kind") != "generation_expected_tokens"
+            or document.get("configuration") != record
+            or document.get("serial_control_id") != profile["serial_control_id"]):
+        raise ValueError("expected tokens do not match the admitted canonical cell/control")
+    rows = document.get("requests")
+    if (not isinstance(rows, list) or len(rows) != len(profile["requests"])
+            or any(not isinstance(row, dict) for row in rows)
+            or [row.get("id") for row in rows] != [row["id"] for row in profile["requests"]]):
+        raise ValueError("expected tokens omitted, duplicated or reordered requests")
+    workload = GenerationWorkload.from_record(record)
+    traces, repeats = {}, {}
+    for request, row in zip(profile["requests"], rows):
+        trace = TokenTrace(_token_ids(row.get("prompt"), "prompt"),
+                           _token_ids(row.get("completion"), "completion"), row.get("finish_reason"))
+        if (not trace.prompt or not workload.minimum_completion_tokens <= len(trace.completion) <= workload.max_tokens
+                or trace.finish_reason not in ("length", "stop")
+                or (trace.finish_reason == "length" and len(trace.completion) != workload.max_tokens)):
+            raise ValueError("expected tokens violate the continuous generation horizon or termination")
+        validate_partial_prompt(request, trace, traces.values())
+        body = json.dumps(request["body"], sort_keys=True)
+        if body in repeats and compare_tokens(repeats[body], trace):
+            raise ValueError("expected repeated requests differ")
+        repeats[body] = trace
+        traces[row["id"]] = trace
+    return traces
+
+
 def validate_prefix_outcome(profile: dict, request: dict, response: dict, trace: TokenTrace,
                             previous: Iterable[TokenTrace]) -> None:
     """Prove the requested restore from the runner's completed outcome.
@@ -316,7 +352,8 @@ def validate_mtp_outcome(profile: dict, response: dict) -> None:
         raise ValueError("fixed MTP request did not execute its named draft depth")
 
 
-def run_probes(record: dict, base_url: str, output: Path, expected: dict | None = None) -> dict:
+def run_probes(record: dict, base_url: str, output: Path, expected: dict | None = None,
+               *, expected_tokens: dict | None = None) -> dict:
     """Collect or compare an entire ordered workload within one bounded session.
 
     All observations remain diagnostic until the outer campaign authenticates
@@ -324,9 +361,12 @@ def run_probes(record: dict, base_url: str, output: Path, expected: dict | None 
     successful serial comparison cannot issue an image certificate here.
     """
     profile = generation_profile(record)
-    if expected is None and MTPPolicy(profile["mtp_policy"]) is not MTPPolicy.OFF:
+    if expected is not None and expected_tokens is not None:
+        raise ValueError("generation requires exactly one expected-token authority")
+    if expected is None and expected_tokens is None and MTPPolicy(profile["mtp_policy"]) is not MTPPolicy.OFF:
         raise ValueError("MTP generation requires its serial control before inference")
-    controls = admit_control(record, expected) if expected is not None else None
+    controls = (admit_expected_tokens(record, expected_tokens) if expected_tokens is not None
+                else admit_control(record, expected) if expected is not None else None)
     output.mkdir(parents=True, exist_ok=False)
     workload = GenerationWorkload.from_record(record)
     movement = MovementLedgerObserver(MovementRequirement(record["runtime"]["movement_evidence"]))
@@ -347,8 +387,13 @@ def run_probes(record: dict, base_url: str, output: Path, expected: dict | None 
             row = {"id": request["id"], "body": request["body"], "response": response,
                    "elapsed_seconds": time.monotonic() - before}
             report["requests"].append(row)
-            # Persist the offending response too: the first failure is the
-            # useful evidence, not just a boolean in the campaign report.
+            # The outer watchdog can kill this process while the next HTTP
+            # call is blocked, without executing finally. Atomically retain
+            # each returned response before validation or further inference.
+            # This partial document remains explicitly non-passing; only the
+            # complete checked sequence can publish success below.
+            report["elapsed_seconds"] = time.monotonic() - started
+            write_json(output / "observations.json", report)
             trace = workload.observe(response)
             validate_partial_prompt(request, trace, traces)
             validate_prefix_outcome(profile, request, response, trace, traces)
@@ -382,10 +427,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--configuration", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--control", type=Path)
+    expected = parser.add_mutually_exclusive_group()
+    expected.add_argument("--control", type=Path)
+    expected.add_argument("--expected-tokens", type=Path)
     args = parser.parse_args(argv)
     run_probes(json.loads(args.configuration.read_text()), args.base_url, args.output,
-               json.loads(args.control.read_text()) if args.control else None)
+               json.loads(args.control.read_text()) if args.control else None,
+               expected_tokens=json.loads(args.expected_tokens.read_text()) if args.expected_tokens else None)
     return 0
 
 

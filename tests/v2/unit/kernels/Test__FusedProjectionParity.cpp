@@ -23,6 +23,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/CPUProjectionTestWorkspace.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -107,6 +108,18 @@ protected:
             projs.push_back(std::move(pd));
         }
 
+        // Fused and serial invocations are mutually exclusive. Admit the maximum
+        // named requirement once, then explicitly pass that same arena to both.
+        WorkspaceRequirements requirements;
+        for (const auto &projection : projs)
+        {
+            const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(projection.kernel.get());
+            EXPECT_NE(consumer, nullptr);
+            if (!consumer) return 1e10f;
+            requirements.merge(consumer->getWorkspaceRequirements(m));
+        }
+        CPUProjectionTestWorkspace workspace(requirements);
+
         // --- Path 1: multiply_fused_tensor ---
         {
             std::vector<ITensorGemm::TensorProjectionDesc> fused_descs;
@@ -121,7 +134,7 @@ protected:
             }
 
             bool fused_ok = projs[0].kernel->multiply_fused_tensor(
-                input.get(), fused_descs, m, k);
+                input.get(), fused_descs, m, k, nullptr, workspace.get());
             EXPECT_TRUE(fused_ok) << "multiply_fused_tensor failed";
             if (!fused_ok)
                 return 1e10f;
@@ -132,7 +145,8 @@ protected:
         {
             bool seq_ok = projs[i].kernel->multiply_tensor(
                 input.get(), projs[i].output_sequential.get(),
-                m, proj_specs[i].n, k);
+                m, proj_specs[i].n, k, false, 1.0f, 0.0f, nullptr,
+                nullptr, -1, workspace.get());
             EXPECT_TRUE(seq_ok) << "multiply_tensor failed for projection " << i;
             if (!seq_ok)
                 return 1e10f;

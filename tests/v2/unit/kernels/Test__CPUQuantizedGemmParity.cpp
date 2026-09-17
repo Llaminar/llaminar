@@ -21,6 +21,7 @@
  * @note Run with:  ctest -R V2_Unit_CPUQuantizedGemmParity
  */
 
+#include "../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <omp.h>
 #include <algorithm>
@@ -34,6 +35,7 @@
 
 #include "tensors/Tensors.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/CPUProjectionTestWorkspace.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
@@ -195,7 +197,11 @@ namespace
         int K)
     {
         if (M != 1)
-            return kernel->multiply_tensor(input, output, M, N, K);
+        {
+            CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {kernel}));
+            return kernel->multiply_tensor(input, output, M, N, K,
+                true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
+        }
 
         using namespace llaminar2::cpu::native_vnni;
         auto *native_vnni =
@@ -215,7 +221,7 @@ namespace
         gemv_native_vnni_preq(
             native_vnni->packedWeights(),
             quantized_input.data(),
-            output->mutable_data(),
+            output->mutable_data(), llaminar2::test::NativeVNNITestPartialStorage(native_vnni->packedWeights(), 1).span(),
             ISAPath::AUTO,
             DecodeSchedulePolicy::Auto);
         return true;
@@ -642,6 +648,7 @@ namespace
         auto output = TestTensorFactory::createFP32Zeros(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
+        CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {gemm.get()}));
         const int saved_threads = omp_get_max_threads();
         for (int threads : {1, std::max(1, saved_threads)})
         {
@@ -650,7 +657,8 @@ namespace
             std::memset(output->mutable_data(), 0,
                         static_cast<size_t>(M) * N * sizeof(float));
 
-            ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), M, N, K));
+            ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), M, N, K,
+                true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
             const float *out = output->data();
             for (size_t i = 0; i < static_cast<size_t>(M) * N; ++i)
@@ -772,7 +780,7 @@ namespace
     {
         using namespace llaminar2::cpu::native_vnni;
 
-        constexpr NativeVNNICacheTopology cache{
+        constexpr CPUCacheGeometry cache{
             .private_l2_bytes = 1024u * 1024u,
             .shared_l3_bytes = 32u * 1024u * 1024u,
             .private_l2_ways = 16,
@@ -899,7 +907,7 @@ namespace
                 N, K, M, invalid_encoding, threads, cache),
             std::invalid_argument);
 
-        NativeVNNICacheTopology invalid_cache = cache;
+        CPUCacheGeometry invalid_cache = cache;
         invalid_cache.private_l2_ways = 0;
         EXPECT_THROW(
             (void)computeTileConfig(

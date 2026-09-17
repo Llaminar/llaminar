@@ -18,8 +18,9 @@ from collections import defaultdict
 from enum import Enum
 import math
 import json
-import shlex
 from typing import Any, Iterable, Mapping
+
+from server_execution_contract import RuntimeFeaturePolicy
 
 
 class MovementEvidence(str, Enum):
@@ -72,10 +73,10 @@ def _overlay_transaction(record: Mapping[str, Any]) -> tuple[Any, ...] | None:
 
 
 def validate_runtime_feature_policy(
-    records: Iterable[Mapping[str, Any]], extra_flags: str,
+    records: Iterable[Mapping[str, Any]], features: RuntimeFeaturePolicy,
     movement_evidence: MovementEvidence,
 ) -> str | None:
-    """Require actual execution of the public CLI's selected feature contract.
+    """Require actual execution of the admitted runtime's selected feature contract.
 
     Completed migration edges are emitted by the placement authority only after
     commit, but must be corroborated by measured, published payload bytes and
@@ -88,15 +89,8 @@ def validate_runtime_feature_policy(
     """
     if not isinstance(movement_evidence, MovementEvidence):
         return "runtime certification requires typed movement evidence"
-    arguments = shlex.split(extra_flags)
-    options: dict[str, str] = {}
-    for index, argument in enumerate(arguments):
-        flag, separator, value = argument.partition("=")
-        if not flag.startswith("--"):
-            continue
-        if not separator and index + 1 < len(arguments):
-            value = arguments[index + 1]
-        options[flag] = value
+    if not isinstance(features, RuntimeFeaturePolicy):
+        return "runtime certification requires typed feature policy"
 
     totals: dict[tuple[str, str], float] = defaultdict(float)
     native_observations: dict[tuple[Any, ...], dict[str, float]] = defaultdict(dict)
@@ -155,20 +149,20 @@ def validate_runtime_feature_policy(
                 and (record.get("tags") or {}).get("includes_mtp_state") == "true"):
             mtp_restores += value
 
-    if "--prefix-cache" in options:
+    if features.prefix_cache:
         if totals[("prefix_cache", "harvest_inserts")] <= 0:
             return "prefix-cache certification observed no harvested prefix"
         if totals[("prefix_cache", "populate_restores")] <= 0:
             return "prefix-cache certification observed no actual restore (lookup hits are insufficient)"
-        if "--mtp" in options and mtp_restores <= 0:
+        if features.mtp and mtp_restores <= 0:
             return "prefix-cache certification restored no MTP-bearing state"
 
-    if "--mtp" in options:
+    if features.mtp:
         attempts = (totals[("mtp", "draft_steps")]
                     + totals[("mtp", "device_generation_terminal_attempted_draft_tokens")])
         if attempts <= 0 or totals[("mtp", "accepted_tokens")] <= 0:
             return "MTP certification requires attempted and accepted draft tokens"
-        if (options.get("--mtp-depth-policy") == "dynamic"
+        if (features.mtp_depth_policy == "dynamic"
                 and totals[("mtp", "depth_policy_windows")] <= 0):
             return "dynamic MTP certification observed no depth-controller window"
 

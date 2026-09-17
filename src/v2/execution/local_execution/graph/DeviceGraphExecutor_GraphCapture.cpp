@@ -21,6 +21,7 @@
 #include "GraphCaptureGuard.h"
 #include "GraphCaptureStageActivity.h"
 #include "RetainedParentTicketServiceWorker.h"
+#include "RetainedParentPerfEvidence.h"
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
@@ -385,6 +386,48 @@ namespace llaminar2
             return reject("source graph has no stages");
         if (!initialized || needs_capture)
             return reject("graph cache is not replay-ready");
+        if (DeviceGraphExecutor::isRetainedParentPlanPolicy(graph_replay_plan_policy))
+        {
+            // A composed parent is the only executable. Exporting its graph-only
+            // source child would silently omit the fixed native exchange that
+            // the topology compiler inserted around local computation.
+            const auto &plan = retained_composed_parent_replay;
+            if (DeviceGraphExecutor::hasConcurrentTicketService(graph_replay_plan_policy) ||
+                !plan.concurrent_ticket_service_segment_indices.empty())
+                return reject("device-loop composition cannot hide host-serviced boundaries");
+            if (!plan.valid() || plan.graph != &graph ||
+                plan.topology_generation != graph.topologyGeneration() ||
+                plan.snapshot_configuration_epoch != snapshot_configuration_epoch ||
+                plan.capture_variant_signature != capture_variant_signature ||
+                plan.child_unit_count != segments.size() ||
+                plan.stages.size() != execution_order.size() ||
+                !retained_parent_capture || !retained_parent_capture->hasExecutable() ||
+                retained_parent_capture->nodeCount() == 0 || !capture_stream ||
+                retained_parent_capture->executionStream() != capture_stream)
+                return reject("composed parent has incomplete or stale native capture identity");
+            size_t covered_stages = 0;
+            for (const auto &segment : segments)
+            {
+                if (!segment.capturable || !segment.capture || segment.capture->hasExecutable())
+                    return reject("composed parent contains a manual or independently executable child");
+                for (const auto &name : segment.stage_names)
+                    if (covered_stages >= execution_order.size() || name != execution_order[covered_stages++])
+                        return reject("composed parent does not cover its complete source graph");
+            }
+            if (covered_stages != execution_order.size())
+                return reject("composed parent does not cover its complete source graph");
+            for (size_t index = 0; index < execution_order.size(); ++index)
+            {
+                const auto *node = graph.getNode(execution_order[index]);
+                if (!node || !node->stage || node->stage.get() != plan.stages[index] ||
+                    node->stage->graphCaptureVariantSignature() != plan.stage_variant_signatures[index] ||
+                    node->stage->graphLaunchPreparationPolicy() == GraphLaunchPreparationPolicy::CaptureAndReplay)
+                    return reject("composed parent changed a captured stage or requires external replay preparation");
+            }
+            return DeviceLoopGraphTemplateView{.capture = retained_parent_capture.get(),
+                .stream = capture_stream, .stage_count = execution_order.size(),
+                .captured_node_count = retained_parent_capture->nodeCount()};
+        }
         if (segments.size() != 1)
         {
             return reject(
@@ -2557,14 +2600,9 @@ namespace llaminar2
                     segment_cache.retained_parent_capture->nodeCount()),
                 "decode",
                 ctx->deviceId().toString(),
-                {{"context", segment_cache.perf_context},
-                 {"child_units", std::to_string(plan.child_unit_count)},
-                 {"boundary_authority",
-                  plan.concurrent_ticket_service_segment_indices.empty()
-                      ? "captured_device_units"
-                      : "concurrent_ticket_service"},
-                 {"ticket_service_units", std::to_string(
-                      plan.concurrent_ticket_service_segment_indices.size())}});
+                retainedParentBoundaryTags(
+                    segment_cache.perf_context, plan.child_unit_count,
+                    plan.concurrent_ticket_service_segment_indices));
             return true;
         };
 
@@ -2755,6 +2793,12 @@ namespace llaminar2
                     // Mirror the sealed inventory only after the launch and
                     // concurrent service have succeeded. These are physical
                     // programs, not a guessed count of logical MoE layers.
+                    auto boundary_tags = retainedParentBoundaryTags(
+                        segment_cache.perf_context,
+                        retained_parent_plan.child_unit_count,
+                        retained_parent_plan.concurrent_ticket_service_segment_indices);
+                    boundary_tags.emplace("materialized_during_setup",
+                        initial_launch_pending ? "true" : "false");
                     PerfStatsCollector::addCounter(
                         "forward_graph",
                         initial_launch_pending
@@ -2763,17 +2807,7 @@ namespace llaminar2
                         1.0,
                         "decode",
                         ctx->deviceId().toString(),
-                        {{"context", segment_cache.perf_context},
-                         {"child_units", std::to_string(
-                             retained_parent_plan.child_unit_count)},
-                         {"boundary_authority",
-                          retained_parent_plan.concurrent_ticket_service_segment_indices.empty()
-                              ? "captured_device_units"
-                              : "concurrent_ticket_service"},
-                         {"ticket_service_units", std::to_string(
-                              retained_parent_plan.concurrent_ticket_service_segment_indices.size())},
-                         {"materialized_during_setup",
-                          initial_launch_pending ? "true" : "false"}});
+                        std::move(boundary_tags));
                 }
                 segment_cache.recordSuccessfulReplay();
                 return true;
@@ -3212,6 +3246,7 @@ namespace llaminar2
                     "decode",
                     ctx ? ctx->deviceId().toString() : std::string{},
                     {{"context", segment_cache.perf_context},
+                     {"executable_family", std::to_string(segment_cache.evidence_family)},
                      {"segments",
                       std::to_string(segment_cache.segments.size())}});
             }
@@ -3522,6 +3557,7 @@ namespace llaminar2
                     "decode",
                     ctx ? ctx->deviceId().toString() : std::string{},
                     {{"context", segment_cache.perf_context},
+                     {"executable_family", std::to_string(segment_cache.evidence_family)},
                      {"segments",
                       std::to_string(segment_cache.segments.size())}});
             }

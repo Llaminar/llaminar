@@ -10,13 +10,19 @@
  * self-launched MPI children that inherit the same options through environ.
  * NUMA intent comes from the parsed address, not its textual width: serialized
  * unknown locality remains unresolved across CLI, YAML and rank-map surfaces.
+ * Automatic planning options preserve hard restrictions separately from hints.
+ * Both command frontends consume this configuration rather than owning another
+ * backend/strategy parser with different accepted values or defaults.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationConfigParser.h"
+#include "OrchestrationConfigDocument.h"
+#include "OrchestrationStartupPolicy.h"
 #include "config/ActivationPrecisionPolicy.h"
+#include "config/ExpertTierDefinition.h"
 #include "ParallelismTreeParser.h"          // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
@@ -98,6 +104,27 @@ namespace llaminar2
                 ++count;
             }
             return count;
+        }
+
+        /** @brief Parse the explicit action; the default remains infer-from-placement. */
+        OrchestrationPlanningMode parsePlanningMode(const std::string &value)
+        {
+            if (value == "auto") return OrchestrationPlanningMode::Automatic;
+            if (value == "apply") return OrchestrationPlanningMode::Apply;
+            throw std::invalid_argument("planning.mode must be auto or apply");
+        }
+
+        /** @brief Apply the shared planning section without accepting misspelled hard filters. */
+        void applyPlanningYamlKey(OrchestrationConfig &config, const std::string &key, const std::string &value)
+        {
+            if (key == "mode") config.planning_mode = parsePlanningMode(value);
+            else if (key == "only_backends") config.automatic_planning.only_backends = parseOrchestrationBackendList(value);
+            else if (key == "only_strategies") config.automatic_planning.only_strategies = parseOrchestrationStrategyList(value);
+            else if (key == "hosts") config.automatic_planning.host_participation = parseAutomaticHostParticipation(value);
+            else if (key == "workload") config.automatic_planning.workload = parseOrchestrationPlanningWorkload(value);
+            else if (key == "prefer_backend") config.automatic_planning.prefer_backend = parseOrchestrationComputeBackend(value);
+            else if (key == "prefer_strategy") config.automatic_planning.prefer_strategy = parseOrchestrationStrategy(value);
+            else throw std::invalid_argument("Unknown planning option: " + key);
         }
 
         std::string stripOuterQuotes(std::string value)
@@ -823,88 +850,28 @@ namespace llaminar2
             throw std::invalid_argument("Invalid routed-expert residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
         }
 
+        /** @brief Adapt expanded declarations through the compact typed grammar. */
         RoutedExpertDomain parseMoERoutedExpertDomainSpec(const std::string &spec)
         {
-            ExecutionDomainParseOptions options;
-            options.context = "MoE routed-expert domain";
-            options.require_scope = true;
-            options.allow_global_scope = false;
-            options.require_routed_expert_compute = true;
-            return RoutedExpertDomain::fromExecutionDomainDefinition(
-                ExecutionDomainDefinition::parse(spec, options));
+            return ExpertTierDefinition::parseDomain(spec);
         }
 
+        /** @brief Share capacity validation between expanded and compact tiers. */
         RoutedExpertTier parseMoERoutedExpertTierSpec(const std::string &spec)
         {
-            const auto sections = split(spec, ';');
-            if (sections.empty())
-            {
-                throw std::invalid_argument("MoE expert overlay tier spec is empty");
-            }
+            return ExpertTierDefinition::parsePlacement(spec);
+        }
 
-            const auto at_pos = sections[0].find('@');
-            if (at_pos == std::string::npos)
-            {
-                throw std::invalid_argument("Invalid MoE expert overlay tier spec: '" + spec + "' (expected name@domain;priority=N)");
-            }
-
-            RoutedExpertTier tier;
-            tier.name = trim(sections[0].substr(0, at_pos));
-            tier.domain = trim(sections[0].substr(at_pos + 1));
-            if (tier.name.empty() || tier.domain.empty())
-            {
-                throw std::invalid_argument("MoE expert overlay tier must include non-empty name and domain");
-            }
-
-            bool saw_priority = false;
-            for (size_t i = 1; i < sections.size(); ++i)
-            {
-                const auto eq_pos = sections[i].find('=');
-                if (eq_pos == std::string::npos)
-                {
-                    throw std::invalid_argument("Invalid MoE expert overlay tier option: '" + sections[i] + "'");
-                }
-
-                const std::string key = normalizeToken(sections[i].substr(0, eq_pos));
-                const std::string value = trim(sections[i].substr(eq_pos + 1));
-
-                if (key == "priority")
-                {
-                    tier.priority = std::stoi(value);
-                    saw_priority = true;
-                }
-                else if (key == "max_experts_per_layer")
-                {
-                    tier.max_experts_per_layer = std::stoi(value);
-                    if (tier.max_experts_per_layer < 0)
-                    {
-                        throw std::invalid_argument("MoE expert overlay tier max-experts-per-layer must be >= 0");
-                    }
-                }
-                else if (key == "memory_mb")
-                {
-                    if (normalizeToken(value) == "auto")
-                    {
-                        tier.memory_budget_bytes = 0;
-                    }
-                    else
-                    {
-                        const auto mb = std::stoull(value);
-                        tier.memory_budget_bytes = mb * 1024ULL * 1024ULL;
-                    }
-                }
-                else
-                {
-                    throw std::invalid_argument("Unknown MoE expert overlay tier option: '" + key + "'");
-                }
-            }
-
-            if (!saw_priority)
-            {
-                throw std::invalid_argument("MoE expert overlay tier '" + tier.name + "' is missing priority=<n>");
-            }
-
-            return tier;
+        /** @brief Append one compact declaration to the existing overlay authority. */
+        void appendExpertTier(OrchestrationConfig &config, const std::string &spec)
+        {
+            auto definition = ExpertTierDefinition::parse(spec);
+            auto plan = ensureMoERoutedExpertPlacementPlan(config);
+            plan->enabled = true;
+            if (plan->continuation_dense_policy_intent != MoEContinuationDensePolicyIntent::Explicit)
+                plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Automatic;
+            plan->domains.push_back(std::move(definition.domain));
+            plan->routed_tiers.push_back(std::move(definition.tier));
         }
 
         std::string formatMoERoutedExpertPlacementValidationErrors(
@@ -1020,6 +987,11 @@ namespace llaminar2
                 else if (key == "shared_expert_domain" || key == "shared_domain")
                 {
                     plan->shared_expert_domain = value;
+                }
+                else if (key == "dense_policy")
+                {
+                    plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(value));
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
                 }
                 else if (key == "residency_mode")
                 {
@@ -1238,6 +1210,7 @@ namespace llaminar2
             .addCategory("Server Configuration")
             .addCategory("Fused Attention")
             .addCategory("MPI Bootstrap")
+            .addCategory("Automatic Planning")
             .addCategory("Device Assignment")
             .addCategory("Tensor Parallelism")
             .addCategory("Pipeline Parallelism")
@@ -1251,6 +1224,82 @@ namespace llaminar2
             .addCategory("MTP")
             .addCategory("Heterogeneous Mode")
             .addCategory("Verbosity");
+
+        // One option authority for both `plan` and `serve`. Filters replace a
+        // previous YAML set rather than unexpectedly widening it by union.
+        spec.add({
+            .long_name = "--auto",
+            .category = "Automatic Planning",
+            .description = "Choose an execution plan (default without explicit placement); conflicts with declared topology",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &) {
+                c.planning_mode = OrchestrationPlanningMode::Automatic;
+            }),
+        });
+        spec.add({
+            .long_name = "--planning-mode",
+            .category = "Automatic Planning",
+            .value_label = "<auto|apply>",
+            .description = "Choose automatically, or apply declared placement without re-optimization",
+            .valid_values = {"auto", "apply"},
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.planning_mode = parsePlanningMode(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--only-backends",
+            .category = "Automatic Planning",
+            .value_label = "<cpu,cuda,rocm>",
+            .description = "Hard compute-backend restriction for auto; does not exclude host control/storage",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.only_backends = parseOrchestrationBackendList(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--only-strategies",
+            .category = "Automatic Planning",
+            .value_label = "<single,tp,pp,expert-overlay>",
+            .description = "Hard execution-strategy restriction for auto (comma-separated)",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.only_strategies = parseOrchestrationStrategyList(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--prefer-backend",
+            .category = "Automatic Planning",
+            .value_label = "<cpu|cuda|rocm>",
+            .description = "Soft backend preference; cannot override a hard filter or admission",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.prefer_backend = parseOrchestrationComputeBackend(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--plan-workload",
+            .category = "Automatic Planning",
+            .value_label = "<prefill,generation>",
+            .description = "Expected token counts for auto ranking; must fit context, does not limit inference",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.workload = parseOrchestrationPlanningWorkload(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--auto-hosts",
+            .category = "Automatic Planning",
+            .value_label = "<best-subset|all>",
+            .description = "Choose a host subset (default), or require compute on every discovered physical host",
+            .valid_values = {"best-subset", "all"},
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.host_participation = parseAutomaticHostParticipation(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--prefer-strategy",
+            .category = "Automatic Planning",
+            .value_label = "<single|tp|pp|expert-overlay>",
+            .description = "Soft strategy preference; never changes an applied plan",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.prefer_strategy = parseOrchestrationStrategy(v);
+            }),
+        });
 
         // --- Model Configuration ---------------------------------------------
         spec.add({
@@ -1268,6 +1317,20 @@ namespace llaminar2
             .value_label = "<n>",
             .description = "Maximum context/sequence length (default: 4096)",
             .setter = setters::parseInt(&OrchestrationConfig::max_seq_len, "--context-length"),
+        });
+        spec.add({
+            .long_name = "--prefill-max-bucket-size",
+            .category = "Model Configuration",
+            .value_label = "<rows>",
+            .description = "Maximum rows per captured prefill chunk (default: " +
+                std::to_string(kDefaultPrefillGraphMaxBucketSize) +
+                "); preserves context length; replaces LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.prefill_max_bucket_size =
+                        parsePositiveIntValue(value, "--prefill-max-bucket-size");
+                }),
         });
         spec.add({
             .long_name = "--mmap",
@@ -1359,16 +1422,6 @@ namespace llaminar2
                 {
                     c.deterministic = true;
                     c.temperature = 0.0f;
-                    if (setenv("LLAMINAR_DETERMINISTIC", "1", 1) != 0)
-                        throw std::runtime_error(
-                            "Could not publish --deterministic startup policy");
-                    // Logging and splash output may already have read DebugEnv.
-                    // Publish through its canonical reload before any device or
-                    // model initialization. Updating environ alone only fixes a
-                    // newly exec'd MPI child, leaving direct/profiler execution
-                    // with stale CUDA and ROCm policy. Re-parsing after MPI_Init
-                    // is intentionally idempotent; no inference is active here.
-                    mutableDebugEnv().reload();
                 }),
         });
 
@@ -1473,9 +1526,10 @@ namespace llaminar2
         });
         spec.add({
             .long_name = "--mpi-hostfile",
+            .aliases = {"--hostfile"},
             .category = "MPI Bootstrap",
             .value_label = "<path>",
-            .description = "MPI hostfile path (also used for node detection)",
+            .description = "Cluster hostfile for MPI launch and inventory (alias: --hostfile)",
             .setter = setters::assignString(&OrchestrationConfig::hostfile),
         });
         spec.add({
@@ -1726,7 +1780,7 @@ namespace llaminar2
             .long_name = "--config",
             .category = "Config File",
             .value_label = "<path>",
-            .description = "Load base configuration from YAML; subsequent CLI flags override it",
+            .description = "Load authored YAML or a versioned JSON configuration; CLI flags override it",
             .setter = setters::assignString(&OrchestrationConfig::config_file_path),
         });
 
@@ -1928,7 +1982,7 @@ namespace llaminar2
                 "Maximum live token rows in one captured ExpertOverlay prefill "
                 "segment (default: " +
                 std::to_string(kDefaultExpertOverlayPrefillSegmentRows) +
-                "; derived from the retained graph-cache budget)",
+                "; derived from the serving bucket cap and retained graph-cache budget)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2279,6 +2333,7 @@ namespace llaminar2
                     auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.dense_tp_enabled = parseBoolValue(v);
                     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
                 }),
         });
         spec.add({
@@ -2292,6 +2347,7 @@ namespace llaminar2
                     auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.dense_decode_replicated = parseBoolValue(v);
                     plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
                 }),
         });
         spec.add({
@@ -2309,6 +2365,7 @@ namespace llaminar2
                 {
                     auto plan = ensureMoERoutedExpertPlacementPlan(c);
                     plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(v));
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
                 }),
         });
         spec.add({
@@ -2324,10 +2381,17 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--expert-tier",
+            .category = "MoE Configuration",
+            .value_label = "<declaration>",
+            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically; domain policy overrides remain available.",
+            .setter = setters::custom<OrchestrationConfig>(appendExpertTier),
+        });
+        spec.add({
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define a routed-expert domain: \"name=devices;scope=auto|single|rank-local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_decode_assignment=static-owner|least-loaded-resident][;routed_prefill_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,0,1]\"; auto binds scope from discovered rank ownership",
+            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=apportioned|replicated|tensor-sharded][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, apportioned experts and static row assignment. Prefer --expert-tier to also declare priority.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -3024,6 +3088,17 @@ namespace llaminar2
 
     OrchestrationConfig OrchestrationConfigParser::parseArgs(int argc, char **argv)
     {
+        return parseCommandArgs(argc, argv, {});
+    }
+
+    OrchestrationConfig OrchestrationConfigParser::parseCommandArgs(
+        int argc, char **argv, const CliSpec<OrchestrationConfig> &options)
+    {
+        // One table owns all runtime semantics. Command extensions may add
+        // output controls, never replace an existing name or its setter.
+        static const CliSpec<OrchestrationConfig> shared_spec = buildSpec();
+        auto spec = shared_spec;
+        spec.extend(options);
         // Convert argc/argv into a vector for ergonomic iteration.
         std::vector<std::string> args;
         args.reserve(static_cast<size_t>(std::max(0, argc - 1)));
@@ -3034,9 +3109,9 @@ namespace llaminar2
         // the base config. The second pass (full CLI parse) will override any
         // individual fields specified on the command line.
         OrchestrationConfig config;
-        for (size_t i = 0; i + 1 < args.size(); ++i)
+        for (size_t i = 0; i < args.size(); ++i)
         {
-            if (args[i] == "--config")
+            if (args[i] == "--config" && i + 1 < args.size())
             {
                 config = parseYamlFile(args[i + 1]);
                 config.config_file_path = args[i + 1];
@@ -3057,7 +3132,6 @@ namespace llaminar2
         }
 
         // Second pass: apply every flag through the structured spec.
-        static const CliSpec<OrchestrationConfig> spec = buildSpec();
         spec.parse(args, config);
 
         // Cross-flag validation that doesn't fit cleanly into per-option setters.
@@ -3079,6 +3153,7 @@ namespace llaminar2
             throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(overlay_errors));
         }
 
+        publishOrchestrationStartupPolicy(config);
         return config;
     }
 
@@ -3105,6 +3180,19 @@ namespace llaminar2
 
     OrchestrationConfig OrchestrationConfigParser::parseYamlString(const std::string &yaml)
     {
+        // Generated documents share the same public --config entry point as
+        // authored YAML. A malformed document must never be retried as YAML.
+        const auto first = yaml.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos && yaml[first] == '{')
+        {
+            auto config = deserializeOrchestrationConfig(yaml);
+            requireImplementedActivationPrecision(config.activation_precision);
+            const auto errors = normalizeMoERoutedExpertPlacementDomains(config);
+            if (!errors.empty())
+                throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(errors));
+            publishOrchestrationStartupPolicy(config);
+            return config;
+        }
         OrchestrationConfig config;
 
         parseMoERoutedExpertPlacementYamlBlock(yaml, config);
@@ -3137,6 +3225,11 @@ namespace llaminar2
                 skipping_moe_block = false;
             }
 
+            // A top-level scalar ends the previous YAML section. Without this
+            // edge, `model_path` after `mtp:` is misread as an MTP option.
+            if (indent == 0)
+                current_section.clear();
+
             if (indent == 0 && trimmed == "moe_routed_expert_placement:")
             {
                 skipping_moe_block = true;
@@ -3151,6 +3244,8 @@ namespace llaminar2
             //   - "0=gpu:0-11"
             if (trimmed.rfind("-", 0) == 0)
             {
+                if (current_section == "planning")
+                    throw std::invalid_argument("Planning filters use named comma-separated scalar values, not anonymous list items");
                 std::string item = trim(trimmed.substr(1));
                 if (item.size() >= 2 &&
                     ((item.front() == '"' && item.back() == '"') ||
@@ -3168,6 +3263,11 @@ namespace llaminar2
                     }
                     continue;
                 }
+                if (current_section == "expert_tiers")
+                {
+                    appendExpertTier(config, item);
+                    continue;
+                }
                 if (current_section == "pp_stages")
                 {
                     auto stage = PPStageDefinition::tryParse(item);
@@ -3182,6 +3282,8 @@ namespace llaminar2
             // Check for section headers
             if (trimmed.back() == ':' && trimmed.find(':') == trimmed.size() - 1)
             {
+                if (current_section == "planning" && indent > 0)
+                    throw std::invalid_argument("Planning options require a nonempty scalar value: " + trimmed);
                 current_section = trimmed.substr(0, trimmed.size() - 1);
                 continue;
             }
@@ -3206,6 +3308,11 @@ namespace llaminar2
 
             const std::string normalized_section = normalizeToken(current_section);
             const std::string normalized_key = normalizeToken(key);
+            if (normalized_section == "planning")
+            {
+                applyPlanningYamlKey(config, normalized_key, value);
+                continue;
+            }
             if (normalized_section == "moe")
             {
                 applyMoEYamlKey(config, normalized_key, value);
@@ -3223,7 +3330,36 @@ namespace llaminar2
             }
 
             // Map YAML keys to config fields
-            if (key == "dry_run")
+            if (key == "model_path" || key == "model")
+            {
+                config.model_path = value;
+            }
+            else if (key == "max_seq_len" || key == "context_length")
+            {
+                config.max_seq_len = parsePositiveIntValue(value, key);
+            }
+            else if (normalized_key == "prefill_max_bucket_size")
+            {
+                config.prefill_max_bucket_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "deterministic")
+            {
+                config.deterministic = parseBoolValue(value);
+                if (config.deterministic) config.temperature = 0.0f;
+            }
+            else if (key == "batch_size")
+            {
+                config.batch_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "hostfile" || key == "mpi_hostfile")
+            {
+                config.hostfile = value;
+            }
+            else if (key == "mpi_procs")
+            {
+                config.mpi_procs = parseNonNegativeIntValue(value, key);
+            }
+            else if (key == "dry_run")
             {
                 config.dry_run = (toLower(value) == "true" || value == "1");
             }
@@ -3623,6 +3759,7 @@ namespace llaminar2
             throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
+        publishOrchestrationStartupPolicy(config);
         return config;
     }
 
@@ -3649,6 +3786,14 @@ namespace llaminar2
             "  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit\n";
 
         return spec.getHelpText(header, footer);
+    }
+
+    std::string OrchestrationConfigParser::getCommandHelpText(
+        const CliSpec<OrchestrationConfig> &options, const std::string &header)
+    {
+        auto spec = buildSpec();
+        spec.extend(options);
+        return spec.getHelpText(header);
     }
 
 } // namespace llaminar2

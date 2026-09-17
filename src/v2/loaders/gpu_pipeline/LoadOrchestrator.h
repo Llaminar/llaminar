@@ -110,7 +110,8 @@ namespace llaminar2
         void planWeight(int device_id, const std::string &name,
                         int N, int K, int payload_bytes_per_block,
                         bool is_asymmetric, bool has_emins,
-                        size_t raw_gguf_bytes);
+                        size_t raw_gguf_bytes,
+                        WeightVRAMPool::ContiguousAlias alias = {0});
 
         /**
          * @brief Plan one weight against an explicit physical owner line.
@@ -129,7 +130,8 @@ namespace llaminar2
             bool is_asymmetric,
             bool has_emins,
             size_t raw_gguf_bytes,
-            PhysicalMemoryOwner owner);
+            PhysicalMemoryOwner owner,
+            WeightVRAMPool::ContiguousAlias alias = {0});
 
         /// Plan a raw (floating-point) weight for a specific device. No repack needed.
         void planRawWeight(int device_id, const std::string &name, int N, int K, size_t raw_bytes);
@@ -159,6 +161,17 @@ namespace llaminar2
 
         /// Number of managed devices.
         size_t numDevices() const;
+
+        /**
+         * @brief Resolve a managed ordinal using the allocator's actual backend.
+         * @param device_id Ordinal already registered with this load owner.
+         * @return Exact CPU/CUDA/ROCm resource identity, without rediscovery.
+         * @throws std::invalid_argument for an absent backend or unmanaged ordinal.
+         *
+         * A slot address alone cannot prove which backend owns it. Kernel
+         * binding uses this identity before interpreting any prepared pointers.
+         */
+        [[nodiscard]] DeviceId managedDevice(int device_id) const;
 
         /// Add a weight job to be loaded on a specific device.
         /// Jobs larger than the allocated staging slot are split at complete

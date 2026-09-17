@@ -49,6 +49,23 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Immutable authority of this captured publication transaction.
+         *
+         * CompactOutcome derives metadata from an already reduced outcome.
+         * BoundedGeneration additionally commits the request's response budget.
+         * PipelineFollower consumes the tail's committed metadata and publishes
+         * only its own main-model state. It cannot own response, predictor or
+         * penalty-history storage. Unbound is rejected before any mutation.
+         */
+        enum class Authority
+        {
+            Unbound,
+            CompactOutcome,
+            BoundedGeneration,
+            PipelineFollower,
+        };
+
+        /**
          * @brief Persistent checkpoint used to restore one request's main KV metadata.
          *
          * The checkpoint is populated on the verifier stream before verifier
@@ -63,6 +80,7 @@ namespace llaminar2
             const void *base_checkpoint_device = nullptr;
             size_t base_checkpoint_bytes = 0;
 
+            /** @return Whether the owner supplied a complete persistent checkpoint binding. */
             [[nodiscard]] bool valid() const noexcept
             {
                 return cache != nullptr && first_sequence_index >= 0 &&
@@ -108,7 +126,8 @@ namespace llaminar2
             int32_t *next_sidecar_condition_tokens_device = nullptr;
             int32_t *next_sidecar_position_ids_device = nullptr;
 
-            bool generation_controller_owned = false;
+            /** Frozen authority belongs in capture identity, never request data. */
+            Authority authority = Authority::Unbound;
             int32_t *generation_response_tokens_device = nullptr;
             int generation_response_token_stride = 0;
             int *generation_control_device = nullptr;
@@ -156,6 +175,8 @@ namespace llaminar2
 
         static_assert(StageParamsRequired<Params>);
 
+        /** @brief Freeze ownership and addresses; execute rejects incomplete bindings.
+         * @param params Exact persistent bindings and publication authority. */
         explicit MTPSpeculativeStatePublicationStage(Params params);
 
         /**
@@ -201,22 +222,35 @@ namespace llaminar2
             return GraphLaunchPreparationPolicy::CaptureOnly;
         }
 
+        /** @brief Enqueue exactly this authority's publication DAG on the bound stream.
+         * @param ctx Participant-local execution context.
+         * @return False before mutation for invalid ownership, or on enqueue failure. */
         bool execute(IDeviceContext *ctx) override;
+        /** @return Canonical stage classification for captured accepted-state publication. */
         ComputeStageType type() const override
         {
             return ComputeStageType::MTP_SPEC_STATE_PUBLICATION;
         }
+        /** @return Caller-qualified diagnostic identity. */
         std::string name() const override { return params_.stage_name; }
+        /** @return Publication moves state; it performs no floating-point arithmetic. */
         size_t estimatedFlops() const override { return 0; }
+        /** @return Diagnostic metadata traffic estimate, not an allocation ledger. */
         size_t estimatedMemoryBytes() const override;
+        /** @return Whether the backend provides this device-resident publication protocol. */
         bool supportsBackend(ComputeBackendType backend) const override;
+        /** @return All runtime mutations are fixed native graph nodes. */
         bool isGraphCapturable() const override { return true; }
+        /** @return Transport is an explicit surrounding graph edge, never hidden here. */
         bool isCollectiveStage() const override { return false; }
+        /** @return Raw persistent bindings need no tensor coherence transition in this stage. */
         CoherencePolicy coherencePolicy() const override
         {
             return CoherencePolicy::NONE;
         }
+        /** @return Immutable geometry and authority for diagnostics. */
         StageDumpInfo buildDumpInfoImpl() const override;
+        /** @return Only the arena slots this authority actually reads or writes. */
         StageBufferContract bufferContract() const override;
 
         /**
@@ -231,14 +265,30 @@ namespace llaminar2
         [[nodiscard]] bool hasSameCaptureIdentity(
             const Params &other) const noexcept;
 
+        /** @return Immutable bindings; pointed-to device values remain runtime-owned. */
         const Params &getParams() const noexcept { return params_; }
 
-    private:
+        /** @brief Validate immutable ownership before constructing collective edges.
+         * @return Whether authority, local owners and capture geometry are complete.
+         * This reads no device values and enqueues nothing. Graph builders use
+         * the same admission as execute so malformed follower bindings cannot
+         * enter a collective before the local publication rejects them. */
         [[nodiscard]] bool validate() const;
+
+    private:
+        /** @brief Derive/commit only for outcome owners; followers consume existing metadata.
+         * @param stream Exact non-null capture or execution stream.
+         * @return Whether the authority-specific metadata operation was enqueued. */
+        [[nodiscard]] bool publishAcceptanceMetadata(void *stream) const;
+        /** @brief Publish local accepted router rows on their pre-admitted producer stream. */
         [[nodiscard]] bool publishMoEHistograms(void *stream) const;
+        /** @brief Restore each local KV owner from its own pre-verifier checkpoint. */
         [[nodiscard]] bool publishMainKV(void *stream) const;
+        /** @brief Publish predictor KV owned by the outcome authority, never a follower. */
         [[nodiscard]] bool publishShiftedKV(void *stream) const;
+        /** @brief Commit the outcome owner's penalty history once from accepted output. */
         [[nodiscard]] bool publishPenaltyHistory(void *stream) const;
+        /** @brief Select local recurrent-state rows using the committed device indices. */
         [[nodiscard]] bool publishVerifierState(void *stream) const;
 
         Params params_;

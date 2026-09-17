@@ -1,6 +1,14 @@
 /**
  * @file MPIBootstrap.cpp
- * @brief MPI self-bootstrap and environment configuration implementation
+ * @brief MPI self-bootstrap with explicit local versus cluster placement.
+ *
+ * The MPI launcher owns hostfile grammar and slot allocation. Local topology
+ * may supply placement only for a local launch; remote ranks size their teams
+ * from their own binding before inventory discovery. Never copy this host's
+ * CPU set or socket width into a cluster-wide command.
+ * Portable diagnostic environment is explicitly exported by name: remote SSH
+ * ranks do not inherit the launcher's ordinary environment. Rank/device-local
+ * placement and cloud credentials must never cross that boundary implicitly.
  *
  * @author David Sanftenberg
  */
@@ -22,6 +30,46 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Export explicitly supplied diagnostic policy to every MPI child.
+         * @param command Launcher argv, before the application executable.
+         *
+         * OpenMPI's name-only -x form preserves values containing spaces and
+         * avoids embedding paths or values in the printed launcher command.
+         * This is a propagation allowlist, not a second configuration parser:
+         * each rank's ordinary diagnostic authority interprets the same values.
+         * Never export the whole environment, backend visibility, CPU affinity,
+         * allocator policy or orchestration-provider credentials here.
+         */
+        void appendDiagnosticEnvironment(std::vector<std::string> &command)
+        {
+            constexpr const char *names[] = {
+                "LLAMINAR_LOG_LEVEL",
+                "LLAMINAR_PERF_STATS_JSON",
+                "LLAMINAR_PERF_STATS_CSV",
+                "LLAMINAR_PERF_STATS_FILTER",
+                "LLAMINAR_PERF_STATS_SUMMARY",
+                "LLAMINAR_PERF_STATS_TABLE",
+                "LLAMINAR_PERF_STATS_TABLE_LIMIT",
+                "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING",
+                "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING",
+                "LLAMINAR_GPU_STAGE_TIMING",
+                "LLAMINAR_GPU_STAGE_TIMING_DETAIL",
+                "LLAMINAR_PROFILING",
+            };
+            for (const char *name : names)
+            {
+                // Empty/false values are explicit policy too. Export only
+                // variables present in the launcher, never invent defaults.
+                if (DebugEnv::envValue(name) != nullptr)
+                {
+                    command.emplace_back("-x");
+                    command.emplace_back(name);
+                }
+            }
+        }
+
+        /** @brief Configure launcher-only hwloc discovery before execing MPI. */
         void configureLauncherEnvironment()
         {
             if (debugEnv().mpi_bootstrap.get("HWLOC_COMPONENTS").has_value())
@@ -489,60 +537,6 @@ namespace llaminar2
     }
 
     // ========================================================================
-    // Hostfile Parsing
-    // ========================================================================
-
-    std::vector<std::pair<std::string, int>> MPIBootstrap::parseHostfile(
-        const std::string &hostfile_path)
-    {
-        std::vector<std::pair<std::string, int>> hosts;
-
-        std::ifstream file(hostfile_path);
-        if (!file.is_open())
-        {
-            LOG_WARN("[MPIBootstrap] Cannot open hostfile: " << hostfile_path);
-            return hosts;
-        }
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Skip empty lines and comments
-            size_t start = line.find_first_not_of(" \t");
-            if (start == std::string::npos || line[start] == '#')
-            {
-                continue;
-            }
-
-            // Parse: hostname [slots=N]
-            std::istringstream iss(line);
-            std::string hostname;
-            iss >> hostname;
-
-            int slots = 1; // Default
-            std::string token;
-            while (iss >> token)
-            {
-                if (token.substr(0, 6) == "slots=")
-                {
-                    try
-                    {
-                        slots = std::stoi(token.substr(6));
-                    }
-                    catch (...)
-                    {
-                        // Keep default
-                    }
-                }
-            }
-
-            hosts.emplace_back(hostname, slots);
-        }
-
-        return hosts;
-    }
-
-    // ========================================================================
     // MPI Run Command Building
     // ========================================================================
 
@@ -557,28 +551,19 @@ namespace llaminar2
 
         // Number of processes
         int num_procs = config.num_procs;
-        if (num_procs <= 0)
+        if (num_procs <= 0 && config.hostfile.empty())
         {
-            // Auto-detect based on hostfile or local topology
-            if (!config.hostfile.empty())
-            {
-                auto hosts = parseHostfile(config.hostfile);
-                num_procs = 0;
-                for (const auto &[host, slots] : hosts)
-                {
-                    num_procs += slots;
-                }
-            }
-
-            if (num_procs <= 0)
-            {
-                // Local execution: one rank per socket
-                num_procs = topology.num_sockets;
-            }
+            num_procs = topology.num_sockets;
         }
 
-        cmd.push_back("-np");
-        cmd.push_back(std::to_string(num_procs));
+        // Omitting -np delegates cluster slot admission to MPI itself. Parsing
+        // a subset of hostfile grammar here would create a second authority
+        // and could silently launch only this machine after a parse failure.
+        if (num_procs > 0)
+        {
+            cmd.push_back("-np");
+            cmd.push_back(std::to_string(num_procs));
+        }
 
         // Hostfile for multi-machine
         if (!config.hostfile.empty())
@@ -591,6 +576,7 @@ namespace llaminar2
                                    ? config.omp_threads_per_rank
                                    : std::max(1, topology.cores_per_socket);
         const bool use_pe_mapping =
+            config.hostfile.empty() &&
             config.bind_to_socket &&
             config.map_by_socket &&
             pe_threads > 1;
@@ -627,6 +613,9 @@ namespace llaminar2
         // Optional explicit CPU affinity set
         if (!config.cpu_set.empty())
         {
+            if (!config.hostfile.empty())
+                throw std::invalid_argument(
+                    "A launcher-local CPU set cannot be applied to a hostfile cluster");
             cmd.push_back("--cpu-set");
             cmd.push_back(config.cpu_set);
         }
@@ -652,6 +641,8 @@ namespace llaminar2
         cmd.push_back("btl_vader_single_copy_mechanism");
         cmd.push_back("none");
 
+        appendDiagnosticEnvironment(cmd);
+
         // Add original program and its arguments
         // argv[0] is the program path
         cmd.push_back(argv[0]);
@@ -664,14 +655,13 @@ namespace llaminar2
             // Skip bootstrap-specific arguments (they're already processed)
             if (arg == "--mpi-bootstrap" ||
                 arg.rfind("--mpi-procs=", 0) == 0 ||
-                arg.rfind("--hostfile=", 0) == 0 ||
                 arg == "--mpi-dry-run")
             {
                 continue;
             }
 
             // Handle arguments with separate values
-            if (arg == "--mpi-procs" || arg == "--hostfile")
+            if (arg == "--mpi-procs")
             {
                 ++i; // Skip the value too
                 continue;
@@ -692,7 +682,8 @@ namespace llaminar2
                                     const CPUTopology &topology)
     {
         // Configure OpenMP environment before exec (inherited by child processes)
-        configureOpenMPEnvironment(topology, config);
+        if (config.hostfile.empty())
+            configureOpenMPEnvironment(topology, config);
         configureLauncherEnvironment();
 
         // Build command
@@ -757,14 +748,21 @@ namespace llaminar2
                               ? config.omp_threads_per_rank
                               : topology.cores_per_socket;
 
-        std::cout << "MPI: " << num_procs << " process(es)";
+        std::cout << "MPI: ";
+        if (!config.hostfile.empty() && config.num_procs <= 0)
+            std::cout << "hostfile-defined slots";
+        else
+            std::cout << num_procs << " process(es)";
         if (!config.hostfile.empty())
         {
             std::cout << " (hostfile: " << config.hostfile << ")";
         }
         std::cout << std::endl;
 
-        std::cout << "OpenMP: " << omp_threads << " threads/rank, "
+        std::cout << "OpenMP: "
+                  << (config.hostfile.empty() ? std::to_string(omp_threads)
+                                               : "rank-local physical-core count")
+                  << " threads/rank, "
                   << "places=" << config.omp_places << ", "
                   << "bind=" << config.omp_proc_bind << std::endl;
 

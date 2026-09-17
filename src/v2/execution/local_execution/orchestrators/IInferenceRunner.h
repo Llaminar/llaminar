@@ -4674,7 +4674,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Admit one grouped generation response ledger on the device.
+         * @brief Admit one ordinary or speculative response ledger on the device.
          *
          * GPU implementations initialize persistent response-token and control
          * rows exactly once after prefill.  Every later verifier transaction
@@ -4716,7 +4716,7 @@ namespace llaminar2
         /**
          * @brief Compose the exact policy-complete device generation executable.
          *
-         * The first externally orchestrated transaction must already have
+         * For speculative generation, the first externally orchestrated transaction must already have
          * committed its resident response/state rows, and every child graph in
          * the family must already own a strict monolithic executable. In MoE
          * domains this method also owns the first completed maintenance
@@ -4733,8 +4733,12 @@ namespace llaminar2
          * live state on the host, or recover through segmented/eager execution.
          *
          * @param request_count Number of admitted resident controller rows.
-         * @param draft_depth Fixed depth, or maximum capture depth for a dynamic
-         *        child family. The verifier child owns `draft_depth + 1` rows.
+         * Ordinary generation composes the unsampled prefill boundary itself;
+         * admission retains its exact sampling law and request seed bank.
+         *
+         * @param draft_depth Zero for ordinary generation; otherwise fixed depth,
+         *        or maximum capture depth for a dynamic child family. The
+         *        speculative verifier child owns `draft_depth + 1` rows.
          * @param topology Typed fixed/dynamic depth topology already selected
          *        before admission. CUDA embeds it in a conditional parent;
          *        HIP retains every legal branch and captures only its immutable

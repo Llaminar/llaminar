@@ -46,6 +46,18 @@ namespace llaminar2
     class CollectiveMemoryEstimator final
     {
     public:
+        /**
+         * @brief Exact native pipeline allocation; activation banks are arena-owned.
+         * @param backend Resolved homogeneous GPU collective implementation.
+         * @return One fence word per participant, without TP conversion scratch.
+         * @throws std::invalid_argument for a non-native or unresolved backend.
+         */
+        [[nodiscard]] static std::size_t nativePipelineBoundaryBytes(CollectiveBackendType backend)
+        {
+            if (backend != CollectiveBackendType::NCCL && backend != CollectiveBackendType::RCCL)
+                throw std::invalid_argument("Native pipeline memory requires NCCL or RCCL");
+            return sizeof(std::int32_t);
+        }
         /** Guard retained after the maximum logical FP16 payload. */
         static constexpr std::size_t kFP16ScratchGuardBytes = 4096u;
 
@@ -149,7 +161,7 @@ namespace llaminar2
                 .fp16_scratch_elements = fp16_elements,
                 .fp16_scratch_bytes = fp16_bytes,
                 .graph_capture_boundary_bytes =
-                    owns_native_gpu_scratch ? sizeof(std::int32_t) : 0u,
+                    owns_native_gpu_scratch ? nativePipelineBoundaryBytes(backend) : 0u,
             };
         }
     };

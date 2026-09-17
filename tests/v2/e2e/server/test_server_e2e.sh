@@ -13,6 +13,9 @@
 # their ordered requests and serial-control identity come from the typed matrix.
 # GPU capture/replay certification belongs to graph_capture_perf_policy.py;
 # the shell does not reinterpret retained parents as legacy full-graph counters.
+# Explicit cross-host cases additionally prove distinct physical MPI hosts and
+# matched payload/completed CPU expert work. Cloud/image/cleanup certification
+# belongs to the outer runner; this observer never provisions infrastructure.
 #
 # Each backend test:
 #   Every MPI rank exports its own evidence; after shutdown the harness requires
@@ -213,6 +216,9 @@ OVERRIDE_BACKENDS=""
 SERVER_ARGS_FILE=""
 GENERATION_CONFIG_FILE=""
 GENERATION_CONTROL_FILE=""
+GENERATION_EXPECTED_TOKENS_FILE=""
+CROSS_HOST_CONFIG_FILE=""
+CROSS_HOST_CASE=""
 declare -a CANONICAL_SERVER_ARGS=()
 
 show_usage() {
@@ -232,6 +238,11 @@ Container options:
 Canonical generation diagnostics (not the full E2E suite):
   --generation-configuration          Typed exported cell, with canonical requests
   --generation-control               Completed serial observations; required for MTP
+  --generation-expected-tokens       Read-only reviewed serial-token projection (exclusive with control)
+
+Canonical cross-host evidence (additive to the HTTP checks):
+  --cross-host-configuration           Typed exported source cell, including remote eligibility
+  --cross-host-case                    Exact emitted remote scenario ID
 
 Environment:
   LLAMINAR_E2E_CONTAINER_IMAGE        Docker image to run instead of the local binary
@@ -273,17 +284,41 @@ while [[ $# -gt 0 ]]; do
         --server-args-file) SERVER_ARGS_FILE="$2"; shift 2 ;;
         --generation-configuration) GENERATION_CONFIG_FILE="$2"; shift 2 ;;
         --generation-control) GENERATION_CONTROL_FILE="$2"; shift 2 ;;
+        --generation-expected-tokens) GENERATION_EXPECTED_TOKENS_FILE="$2"; shift 2 ;;
+        --cross-host-configuration) CROSS_HOST_CONFIG_FILE="$2"; shift 2 ;;
+        --cross-host-case) CROSS_HOST_CASE="$2"; shift 2 ;;
         --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
+if [[ -n "$CROSS_HOST_CONFIG_FILE" || -n "$CROSS_HOST_CASE" ]]; then
+    if [[ -z "$CROSS_HOST_CONFIG_FILE" || -z "$CROSS_HOST_CASE" || -z "$SERVER_ARGS_FILE" ||
+          ${#SUITES[@]} -ne 1 || "$PERF_STATS_ENABLED" != "1" || -n "$GENERATION_CONFIG_FILE" ]]; then
+        echo "Cross-host evidence requires one canonical argv suite, configuration, exact case and PerfStats" >&2
+        exit 1
+    fi
+    # Validate eligibility before starting a server. Passing this explicit file
+    # cannot turn an arbitrary host-count string into a canonical remote cell.
+    python3 - "$REPO_ROOT/scripts/ci" "$CROSS_HOST_CONFIG_FILE" "$CROSS_HOST_CASE" <<'PY'
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+from model_parity_inventory import select_cross_host_scenario_from_manifest
+select_cross_host_scenario_from_manifest(json.load(open(sys.argv[2])), sys.argv[3])
+PY
+fi
+
 if [[ -n "$GENERATION_CONFIG_FILE" ]]; then
+    if [[ -n "$GENERATION_CONTROL_FILE" && -n "$GENERATION_EXPECTED_TOKENS_FILE" ]]; then
+        echo "Generation requires exactly one expected-token authority" >&2
+        exit 1
+    fi
     if [[ -z "$SERVER_ARGS_FILE" || ${#SUITES[@]} -ne 1 || "${SUITES[0]}" == *e2e-certification* ]]; then
         echo "Generation diagnostics require one canonical argv suite and cannot claim E2E certification" >&2
         exit 1
     fi
-elif [[ -n "$GENERATION_CONTROL_FILE" ]]; then
+elif [[ -n "$GENERATION_CONTROL_FILE" || -n "$GENERATION_EXPECTED_TOKENS_FILE" ]]; then
     echo "A generation control requires its canonical configuration" >&2
     exit 1
 fi
@@ -857,13 +892,9 @@ start_server_process() {
     fi
     local nvidia_mode="none"
     local needs_nvidia="0"
-    # Image linkage and request placement are different contracts. A full
-    # shared-core image needs the real NVIDIA loader even for CPU/ROCm cells;
-    # supplying that driver must not rewrite the typed inference topology.
-    local image_needs_nvidia
-    image_needs_nvidia="$(python3 "${REPO_ROOT}/scripts/ci/docker_paths.py" \
-        --cuda-driver-required "$CONTAINER_IMAGE")"
-    if docker_args_need_cuda "${args_ref[@]}" || [[ "$image_needs_nvidia" == yes ]]; then
+    # The full image loads on CPU/ROCm-only hosts without an NVIDIA driver.
+    # Driver/device injection follows request intent, never the build's label.
+    if docker_args_need_cuda "${args_ref[@]}"; then
         needs_nvidia="1"
     fi
 
@@ -945,11 +976,6 @@ start_server_process() {
     ACTIVE_LOG_FOLLOW_PIDS+=("$log_pid")
 
     STARTED_SERVER_HANDLE="docker:${container_id}:${log_pid}"
-}
-
-is_prefix_cache_case() {
-    local extra_flags="$1"
-    [[ " ${extra_flags} " == *" --prefix-cache "* ]]
 }
 
 is_mtp_case() {
@@ -1974,13 +2000,13 @@ validate_perf_stats() {
     fi
 
     local validation
-    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" "$GENERATION_CONFIG_FILE" "$LOG_DIR/generation/observations.json" "$REPO_ROOT/scripts/ci" <<'PY'
+    validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" "$GENERATION_CONFIG_FILE" "$LOG_DIR/generation/observations.json" "$REPO_ROOT/scripts/ci" "$CROSS_HOST_CONFIG_FILE" "$CROSS_HOST_CASE" <<'PY'
 import json
 from pathlib import Path
-import shlex
 import sys
 
 path, backend, extra_flags, long_context_run, suite_options, policy_module_dir, generation_config, generation_observations, generation_module_dir = sys.argv[1:10]
+cross_host_config, cross_host_case = sys.argv[10:12]
 sys.path.insert(0, policy_module_dir)
 
 from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
@@ -2000,19 +2026,13 @@ from request_input_lifetime_perf_policy import (
 from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validate_memory_authority
 from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
+from server_execution_contract import validate_server_execution_contract
 
-is_gpu = backend.startswith(("cuda:", "rocm:")) or backend in {"tp", "pp"}
-is_mtp = f" {extra_flags} ".find(" --mtp ") >= 0
 suite_option_set = {
     option.strip()
     for option in suite_options.split(",")
     if option.strip()
 }
-expect_prefill_phase = (
-    is_gpu
-    and (long_context_run == "true" or "generation-regression" in suite_option_set)
-    and "no-prefill-graph-buckets" not in suite_option_set
-)
 require_prefill_capture = (
     "require-prefill-graph-capture" in suite_option_set
     or "prefill-graph-probe" in suite_option_set
@@ -2023,11 +2043,6 @@ require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_
 require_stochastic_mtp = "stochastic-mtp-probe" in suite_option_set
 require_cpu_fa2_context_parallel = (
     "require-cpu-fa2-context-parallel" in suite_option_set
-)
-expect_decode_replay = (
-    is_mtp
-    or long_context_run == "true"
-    or "require-decode-graph-replay" in suite_option_set
 )
 
 try:
@@ -2045,15 +2060,44 @@ if not isinstance(records, list):
 
 try:
     validate_memory_authority(data)
+    if cross_host_config:
+        sys.path.insert(0, generation_module_dir)
+        from model_parity_inventory import select_cross_host_scenario_from_manifest
+        from production_artifacts import write_json
+        from cross_host_expert_overlay_perf_policy import validate_cross_host_expert_execution
+        scenario = select_cross_host_scenario_from_manifest(
+            json.loads(Path(cross_host_config).read_text()), cross_host_case)
+        remote_proof = validate_cross_host_expert_execution(data, scenario["topology"])
+        # Retain a compact observer result beside raw per-rank evidence. It is
+        # not a standalone certificate and cannot waive later HTTP/graph gates.
+        write_json(Path(path).with_suffix(".cross-host.json"),
+                   {"case": cross_host_case, "scenario": scenario, "execution": remote_proof})
 except ValueError as error:
     print(f"FAIL: {error}")
     sys.exit(0)
 
+try:
+    execution = validate_server_execution_contract(data)
+except ValueError as error:
+    print(f"FAIL: {error}")
+    sys.exit(0)
+features = execution.features
+is_gpu, is_mtp = execution.uses_gpu, features.mtp
+expect_prefill_phase = (
+    is_gpu
+    and (long_context_run == "true" or "generation-regression" in suite_option_set)
+    and "no-prefill-graph-buckets" not in suite_option_set
+)
+expect_decode_replay = (
+    is_mtp
+    or long_context_run == "true"
+    or "require-decode-graph-replay" in suite_option_set
+)
+
 if is_gpu:
     graph_capture_validation = validate_graph_capture_policy(
         records,
-        backend,
-        extra_flags,
+        execution.device_kinds,
         require_prefill_lifecycle=expect_prefill_phase,
         decode_requirement=(DecodeGraphRequirement.REPLAY if expect_decode_replay
                             else DecodeGraphRequirement.CAPTURE),
@@ -2064,8 +2108,7 @@ if is_gpu:
 
     flash_attention_validation = validate_flash_attention_plan_policy(
         records,
-        backend,
-        extra_flags,
+        execution.attention_device_kinds,
     )
     if flash_attention_validation.error:
         print(f"FAIL: {flash_attention_validation.error}")
@@ -2083,7 +2126,7 @@ if is_gpu:
         sys.exit(0)
 
 if require_cpu_fa2_context_parallel:
-    if not backend.startswith("cpu"):
+    if execution.device_kinds != {"cpu"}:
         print(
             "FAIL: CPU FA2 context-parallel probe requires an explicit CPU backend"
         )
@@ -2153,36 +2196,8 @@ def max_tag_value(key, names=None, domain=None, required_tags=None):
         maximum = max(maximum, numeric(record_tags.get(key)))
     return maximum
 
-def flag_value(flag):
-    try:
-        tokens = shlex.split(extra_flags)
-    except ValueError:
-        tokens = extra_flags.split()
-    for idx, token in enumerate(tokens):
-        if token == flag and idx + 1 < len(tokens):
-            return tokens[idx + 1]
-        if token.startswith(flag + "="):
-            return token.split("=", 1)[1]
-    return None
-
-def flag_values(flag):
-    try:
-        tokens = shlex.split(extra_flags)
-    except ValueError:
-        tokens = extra_flags.split()
-    values = []
-    for idx, token in enumerate(tokens):
-        if token == flag and idx + 1 < len(tokens):
-            values.append(tokens[idx + 1])
-        elif token.startswith(flag + "="):
-            values.append(token.split("=", 1)[1])
-    return values
-
-uses_current_batch_llep = any(
-    "routed_prefill_assignment=least-loaded-resident" in domain
-    for domain in flag_values("--moe-routed-expert-domain")
-)
-residency_maintenance_mode = flag_value("--moe-residency-maintenance")
+uses_current_batch_llep = features.current_batch_llep
+residency_maintenance_mode = features.residency_maintenance
 uses_dynamic_residency_maintenance = residency_maintenance_mode == "dynamic"
 
 if uses_current_batch_llep and residency_maintenance_mode != "off":
@@ -2195,8 +2210,7 @@ if uses_current_batch_llep and residency_maintenance_mode != "off":
 expect_shared_moe_route_scratch = (
     is_gpu
     and is_mtp
-    and flag_value("--moe-routed-expert-placement")
-    == "tiered-overlay"
+    and features.expert_overlay
 )
 if expect_shared_moe_route_scratch:
     route_scratch_error = validate_moe_route_scratch_policy(records)
@@ -2215,7 +2229,7 @@ if suite_option_set.intersection({"e2e-certification", "generation-regression"})
     except (KeyError, ValueError):
         print("FAIL: E2E certification requires canonical typed movement evidence")
         sys.exit(0)
-    runtime_feature_error = validate_runtime_feature_policy(records, extra_flags, required_movement)
+    runtime_feature_error = validate_runtime_feature_policy(records, features, required_movement)
     if runtime_feature_error:
         print(f"FAIL: {runtime_feature_error}")
         sys.exit(0)
@@ -2283,10 +2297,10 @@ if require_stochastic_mtp:
     if not is_gpu or not is_mtp:
         print("FAIL: stochastic MTP probe requires a GPU MTP cell")
         sys.exit(0)
-    if flag_value("--mtp-verify-mode") != "speculative-sampling":
+    if features.mtp_verify_mode != "speculative-sampling":
         print("FAIL: stochastic MTP probe requires --mtp-verify-mode speculative-sampling")
         sys.exit(0)
-    if flag_value("--mtp-depth-policy") != "dynamic":
+    if features.mtp_depth_policy != "dynamic":
         print("FAIL: stochastic MTP probe requires the production dynamic-depth controller")
         sys.exit(0)
     if record_value_sum(("stochastic_accept_tests",), "mtp") <= 0.0:
@@ -2362,16 +2376,8 @@ if require_stochastic_mtp:
     if record_value_sum(("depth_policy_windows",), "mtp") <= 0.0:
         print("FAIL: stochastic dynamic-depth MTP emitted no controller window")
         sys.exit(0)
-    try:
-        expected_minimum_depth = int(
-            flag_value("--mtp-min-draft-tokens") or "0"
-        )
-        expected_maximum_depth = int(
-            flag_value("--mtp-max-draft-tokens") or "0"
-        )
-    except ValueError:
-        print("FAIL: stochastic GPU MTP has malformed dynamic depth bounds")
-        sys.exit(0)
+    expected_minimum_depth = features.mtp_min_depth
+    expected_maximum_depth = features.mtp_max_depth
     if native_generation_parent:
         device_generation_validation = (
             validate_cuda_dynamic_mtp_device_generation_policy(
@@ -2399,7 +2405,7 @@ if require_prefix_rebalance_clear:
     if not is_gpu:
         print("FAIL: prefix-cache rebalance clear probe requires a GPU backend")
         sys.exit(0)
-    if " --prefix-cache " not in f" {extra_flags} ":
+    if not features.prefix_cache:
         print("FAIL: prefix-cache rebalance clear probe requires --prefix-cache")
         sys.exit(0)
     if not uses_dynamic_residency_maintenance and not uses_current_batch_llep:
@@ -2559,9 +2565,9 @@ if require_moe_rebalance_movement:
         sys.exit(0)
 
     if uses_current_batch_llep:
-        if "cuda:" in extra_flags:
+        if execution.device_kinds == {"cuda"}:
             expected_allgather_primitive = "ncclAllGather"
-        elif "rocm:" in extra_flags:
+        elif execution.device_kinds == {"rocm"}:
             expected_allgather_primitive = "rcclAllGather"
         else:
             print("FAIL: LLEP movement probe could not identify its homogeneous GPU collective backend")
@@ -3533,6 +3539,9 @@ run_backend_tests() {
         if [[ -n "$GENERATION_CONTROL_FILE" ]]; then
             generation_args+=(--control "$GENERATION_CONTROL_FILE")
         fi
+        if [[ -n "$GENERATION_EXPECTED_TOKENS_FILE" ]]; then
+            generation_args+=(--expected-tokens "$GENERATION_EXPECTED_TOKENS_FILE")
+        fi
         if python3 "$REPO_ROOT/scripts/ci/generation_regression_http.py" "${generation_args[@]}"; then
             pass "[${tag}] Canonical generation token probes"
         else
@@ -3565,16 +3574,14 @@ run_backend_tests() {
     local response_format_sample="$LAST_RESPONSE"
 
     # ─── Prefix Cache Probe ───────────────────────────────────────────
-    # Keep seed, different-answer and exact-repeat requests on the same public
-    # HTTP surface. Certification additionally requires actual restore counters.
-    if is_prefix_cache_case "$extra_flags"; then
-        run_prefix_cache_checks "$tag" "$port" "$max_tokens" "$thinking_model"
-    fi
+    # Repeated/prefix-related requests are valid on every service. Always
+    # exercise them, including auto selection and saved configurations; CLI
+    # spelling must not decide whether the workload reaches the runtime cache.
+    # The admitted runtime policy separately requires actual restore evidence.
+    run_prefix_cache_checks "$tag" "$port" "$max_tokens" "$thinking_model"
 
     if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
-        if ! is_prefix_cache_case "$extra_flags"; then
-            fail "[${tag}] Prefix-cache rebalance clear probe requested without --prefix-cache"
-        elif ! is_gpu_backend "$backend"; then
+        if ! is_gpu_backend "$backend"; then
             fail "[${tag}] Prefix-cache rebalance clear probe requested for non-GPU backend ${backend}"
         else
             run_prefix_cache_rebalance_clear_probe "$tag" "$port" "$extra_flags"

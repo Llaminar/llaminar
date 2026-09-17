@@ -6,6 +6,9 @@
  * over the production private communicator.  The tests also inject a remote
  * physical failure and a divergent transaction identity to prove that neither
  * can become a publishable ExpertOverlay epoch.
+ * Projection proofs also use production-selected/reordered communicators:
+ * process-environment attributes belong to WORLD, but payload ranks and all
+ * collective operations must stay inside the admitted execution membership.
  */
 
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
@@ -1651,11 +1654,16 @@ namespace llaminar2::test
         EXPECT_EQ(stats.mpi_failures, 0u);
     }
 
-    TEST(
-        Test__MoEOverlayMPIResidencyConsensus,
-        BidirectionalRemoteCpuProjectionLanesMoveExactFinalBytesWithoutBlocking)
+    /**
+     * @brief Exercise byte-exact bidirectional lanes in the supplied namespace.
+     * @param context Admitted two-rank membership, not necessarily WORLD order.
+     *
+     * Both the direct and selected-context tests use this entire proof. A
+     * constructor-only smoke test would miss accidental WORLD payload traffic,
+     * lane reuse, abort/drain and final publication after reordered admission.
+     */
+    void proveBidirectionalRemoteCpuProjection(const std::shared_ptr<MPIContext> &context)
     {
-        auto context = worldContext();
         if (!requireTwoRanks(*context))
             GTEST_SKIP() << "Remote projection data plane requires two ranks";
 
@@ -1935,6 +1943,33 @@ namespace llaminar2::test
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
         EXPECT_EQ(stats.blocking_synchronizations, 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        BidirectionalRemoteCpuProjectionLanesMoveExactFinalBytesWithoutBlocking)
+    {
+        proveBidirectionalRemoteCpuProjection(worldContext());
+    }
+
+    /** @test Selected and reordered execution scopes retain the full lane contract. */
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        SelectedExecutionRemoteProjectionLanesRemainByteExactWithoutWorldTraffic)
+    {
+        auto discovery = worldContext();
+        if (!requireTwoRanks(*discovery))
+            GTEST_SKIP() << "Selected remote projection requires two discovery ranks";
+        for (const auto &order : {std::vector<int>{0, 1}, std::vector<int>{1, 0}})
+        {
+            SCOPED_TRACE(order.front());
+            auto result = MPIContextFactory::selectRanks(discovery, order);
+            const auto *active = std::get_if<std::shared_ptr<MPIContext>>(&result);
+            ASSERT_NE(active, nullptr);
+            ASSERT_NE((*active)->communicator(), MPI_COMM_WORLD);
+            EXPECT_EQ((*active)->rank(), order.front() == 0 ? discovery->rank() : 1 - discovery->rank());
+            proveBidirectionalRemoteCpuProjection(*active);
+        }
     }
 
     TEST(

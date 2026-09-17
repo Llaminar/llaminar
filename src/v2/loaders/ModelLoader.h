@@ -133,6 +133,12 @@ namespace llaminar2
     };
 
     /**
+     * @brief Resolve a supported native GGUF weight type, including floating point.
+     * @throws std::invalid_argument for runtime-only or unsupported source formats.
+     */
+    TensorType ggufToTensorType(GGUFTensorType type);
+
+    /**
      * @brief GGUF tensor metadata
      */
     struct GGUFTensorInfo

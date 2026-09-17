@@ -1,6 +1,12 @@
 /**
  * @file MTPSpeculativeStatePublicationStage.cpp
  * @brief Implementation of captured device-owned MTP accepted-state publication.
+ *
+ * An immutable authority separates acceptance/response decisions from local
+ * state publication. Pipeline followers receive an ordered committed command;
+ * they reuse the same KV, routing-history and recurrent-state publishers without
+ * a sampler, shifted predictor or host shadow. Validation precedes every enqueue
+ * so an accidental authority mix cannot partially mutate the model.
  */
 
 #include "MTPSpeculativeStatePublicationStage.h"
@@ -218,21 +224,53 @@ namespace llaminar2
             params_.max_state_commit_rows < 0 ||
             params_.max_state_commit_rows >
                 params_.verifier_rows_per_request ||
-            !params_.outcome_tokens_device ||
-            !params_.outcome_meta_device ||
-            params_.outcome_token_stride <= 0 ||
-            params_.outcome_meta_stride <= 0 ||
-            !params_.base_cached_tokens_device ||
             !params_.accepted_restore_rows_device ||
             !params_.target_cached_tokens_device ||
             !params_.accepted_state_counts_device ||
-            !params_.publication_ok_flags_device ||
-            !params_.next_condition_tokens_device ||
-            !params_.all_drafts_accepted_flags_device ||
-            !params_.stopped_flags_device ||
-            !params_.next_verifier_condition_tokens_device)
+            !params_.publication_ok_flags_device)
         {
-            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Incomplete compact-outcome or publication metadata binding");
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Incomplete accepted-state publication geometry or metadata");
+            return false;
+        }
+        switch (params_.authority)
+        {
+        case Authority::PipelineFollower:
+            // A follower borrows only committed metadata. Reject unused owner
+            // bindings rather than accepting a second sampler/controller which
+            // happens not to be called by today's implementation.
+            if (params_.outcome_tokens_device || params_.outcome_meta_device ||
+                params_.outcome_token_stride || params_.outcome_meta_stride ||
+                params_.base_cached_tokens_device || params_.max_state_commit_rows ||
+                params_.next_condition_tokens_device || params_.all_drafts_accepted_flags_device ||
+                params_.stopped_flags_device || params_.next_verifier_condition_tokens_device ||
+                params_.next_sidecar_condition_tokens_device || params_.next_sidecar_position_ids_device ||
+                params_.generation_response_tokens_device || params_.generation_response_token_stride ||
+                params_.generation_control_device || params_.generation_control_stride ||
+                params_.verifier_input_tokens_device || params_.verifier_input_token_stride ||
+                params_.committed_verifier_identity_device || params_.publish_shifted_kv ||
+                !params_.shifted_kv_caches.empty() || params_.shifted_target_cached_tokens_device ||
+                params_.shifted_accepted_state_counts_device || params_.penalty_policy_device ||
+                params_.generated_token_counts_device || params_.vocab_size)
+            {
+                LOG_ERROR("[MTPSpeculativeStatePublicationStage] Pipeline follower may not bind outcome, response, sidecar or penalty authority");
+                return false;
+            }
+            break;
+        case Authority::CompactOutcome:
+        case Authority::BoundedGeneration:
+            if (!params_.outcome_tokens_device || !params_.outcome_meta_device ||
+                params_.outcome_token_stride <= 0 || params_.outcome_meta_stride <= 0 ||
+                !params_.base_cached_tokens_device || !params_.next_condition_tokens_device ||
+                !params_.all_drafts_accepted_flags_device || !params_.stopped_flags_device ||
+                !params_.next_verifier_condition_tokens_device)
+            {
+                LOG_ERROR("[MTPSpeculativeStatePublicationStage] Outcome authority has incomplete compact-outcome bindings");
+                return false;
+            }
+            break;
+        case Authority::Unbound:
+        default:
+            LOG_ERROR("[MTPSpeculativeStatePublicationStage] Publication requires an explicit valid authority");
             return false;
         }
         if (static_cast<int>(params_.main_kv_bindings.size()) !=
@@ -248,7 +286,7 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Main-KV checkpoint cardinality does not match request geometry");
             return false;
         }
-        if (params_.generation_controller_owned &&
+        if (params_.authority == Authority::BoundedGeneration &&
             (!params_.generation_response_tokens_device ||
              params_.generation_response_token_stride <= 0 ||
              !params_.generation_control_device ||
@@ -278,7 +316,7 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Shifted-KV publication has incomplete persistent bindings");
             return false;
         }
-        if (params_.request_count == 1 &&
+        if (params_.authority != Authority::PipelineFollower && params_.request_count == 1 &&
             (!params_.penalty_policy_device ||
              !params_.generated_token_counts_device ||
              params_.vocab_size <= 0))
@@ -509,16 +547,13 @@ namespace llaminar2
         return true;
     }
 
-    bool MTPSpeculativeStatePublicationStage::execute(IDeviceContext *ctx)
+    bool MTPSpeculativeStatePublicationStage::publishAcceptanceMetadata(void *stream) const
     {
-        if (!ensureContext(
-                ctx,
-                "MTPSpeculativeStatePublicationStage") ||
-            !validate())
-        {
-            return false;
-        }
-        void *const stream = requireGPUStream();
+        // The enclosing native collective is the follower's producer edge.
+        // Re-deriving here could publish more rows than the tail's clipped
+        // response budget accepted, or apply its decision twice.
+        if (params_.authority == Authority::PipelineFollower)
+            return true;
 
         /*
          * The first kernel joins response visibility and state visibility.  A
@@ -529,7 +564,7 @@ namespace llaminar2
          * the verifier graph.
          */
         const bool metadata_enqueued =
-            params_.generation_controller_owned
+            params_.authority == Authority::BoundedGeneration
                 ? params_.backend
                       ->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
                           params_.outcome_tokens_device,
@@ -583,11 +618,20 @@ namespace llaminar2
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Response/state metadata transaction failed to enqueue");
             return false;
         }
+        return true;
+    }
 
-        if (!publishMoEHistograms(stream) ||
+    bool MTPSpeculativeStatePublicationStage::execute(IDeviceContext *ctx)
+    {
+        if (!ensureContext(ctx, "MTPSpeculativeStatePublicationStage") || !validate())
+            return false;
+        void *const stream = requireGPUStream();
+
+        if (!publishAcceptanceMetadata(stream) ||
+            !publishMoEHistograms(stream) ||
             !publishMainKV(stream) ||
-            !publishShiftedKV(stream) ||
-            !publishPenaltyHistory(stream) ||
+            (params_.authority != Authority::PipelineFollower &&
+                (!publishShiftedKV(stream) || !publishPenaltyHistory(stream))) ||
             !publishVerifierState(stream))
         {
             return false;
@@ -607,7 +651,8 @@ namespace llaminar2
              {"moe_histogram_publishers",
               std::to_string(params_.moe_histogram_publishers.size())},
              {"controller_owned",
-              params_.generation_controller_owned ? "true" : "false"}});
+              params_.authority == Authority::BoundedGeneration ? "true" : "false"},
+             {"publication_authority", std::to_string(static_cast<int>(params_.authority))}});
         return true;
     }
 
@@ -616,14 +661,14 @@ namespace llaminar2
         const size_t request_rows =
             static_cast<size_t>(std::max(0, params_.request_count));
         const size_t metadata_words =
-            request_rows * 8U * sizeof(int32_t);
+            request_rows * (params_.authority == Authority::PipelineFollower ? 4U : 8U) * sizeof(int32_t);
         const size_t shifted_words =
             params_.publish_shifted_kv
                 ? request_rows * 3U *
                       params_.shifted_kv_caches.size() * sizeof(int32_t)
                 : 0U;
         const size_t committed_identity_bytes =
-            params_.generation_controller_owned
+            params_.authority == Authority::BoundedGeneration
                 ? request_rows *
                       sizeof(
                           sampling_math::
@@ -650,9 +695,7 @@ namespace llaminar2
         info.addScalarInt(
             "max_state_commit_rows",
             params_.max_state_commit_rows);
-        info.addScalarBool(
-            "generation_controller_owned",
-            params_.generation_controller_owned);
+        info.addScalarInt("publication_authority", static_cast<int>(params_.authority));
         info.addScalarBool(
             "publish_shifted_kv",
             params_.publish_shifted_kv);
@@ -663,6 +706,11 @@ namespace llaminar2
     MTPSpeculativeStatePublicationStage::bufferContract() const
     {
         StageBufferContract contract;
+        // Committed metadata and local cache/state bindings are persistent raw
+        // addresses, not sampler arena slots. A follower must not reserve dummy
+        // vocabulary, response or predictor buffers to satisfy this contract.
+        if (params_.authority == Authority::PipelineFollower)
+            return contract;
         contract.addInput(
             BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS,
             "INT32");
@@ -672,7 +720,7 @@ namespace llaminar2
         contract.addPreallocatedOutput(
             BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,
             "INT32");
-        if (params_.generation_controller_owned)
+        if (params_.authority == Authority::BoundedGeneration)
         {
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_RESPONSE_TOKENS,
@@ -737,8 +785,7 @@ namespace llaminar2
                    other.next_sidecar_condition_tokens_device &&
                self.next_sidecar_position_ids_device ==
                    other.next_sidecar_position_ids_device &&
-               self.generation_controller_owned ==
-                   other.generation_controller_owned &&
+               self.authority == other.authority &&
                self.generation_response_tokens_device ==
                    other.generation_response_tokens_device &&
                self.generation_response_token_stride ==

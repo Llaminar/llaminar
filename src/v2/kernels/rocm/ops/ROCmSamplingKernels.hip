@@ -20,6 +20,7 @@
 #include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../common/SamplingMath.h"
+#include "../../common/GenerationLogicalState.h"
 
 // Maximum k supported by the kernel (limited by shared memory and registers)
 constexpr int TOPK_MAX_K = 256;
@@ -1727,6 +1728,14 @@ __global__ void rocm_topk_topp_processed_logits_batched_f32_kernel(
     }
 }
 
+/**
+ * @brief Draw from one compact support while keeping seed and position device-owned.
+ *
+ * Request admission may replace seed bytes behind the retained pointer. This
+ * kernel preserves the scalar seed/offset sampling law and rejects zero seed
+ * data with an invalid token. Only the bounded compact support is serial;
+ * full-vocabulary preparation is performed by the preceding parallel kernels.
+ */
 __global__ void rocm_sample_distribution_f32_kernel(
     const int *__restrict__ token_ids,
     const float *__restrict__ probs,
@@ -1736,10 +1745,21 @@ __global__ void rocm_sample_distribution_f32_kernel(
     const int *__restrict__ threshold_position,
     int threshold_position_offset,
     int *__restrict__ out_token,
-    float *__restrict__ out_probability)
+    float *__restrict__ out_probability,
+    const uint64_t *__restrict__ threshold_seed_device)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0)
         return;
+
+    // Admission publishes seed data once; retained graphs read it on their
+    // exact sampling stream. A malformed seed must not become another RNG law.
+    const uint64_t seed = threshold_seed_device ? *threshold_seed_device : threshold_seed;
+    if (threshold_seed_device && seed == 0)
+    {
+        *out_token = -1;
+        if (out_probability) *out_probability = 0.0F;
+        return;
+    }
 
     /*
      * The request-batched resident lane reads its mutable logical position
@@ -1749,7 +1769,7 @@ __global__ void rocm_sample_distribution_f32_kernel(
     const float effective_threshold =
         threshold_position
             ? llaminar2::sampling_math::mtp_spec_threshold_from_seed(
-                  threshold_seed,
+                  seed,
                   *threshold_position + threshold_position_offset,
                   0 /* MTPSpecStochasticDrawPurpose::Sample */)
             : threshold;
@@ -5045,37 +5065,18 @@ __global__ void rocm_prepare_mtp_verifier_controlled_row_kernel(
 }
 
 /**
- * @brief Publish the first device-owned logical rows from terminal prefill samples.
+ * @brief Initialize one typed frontier without manufacturing a sampled token.
  *
- * Request admission and sampling have already published prompt positions and
- * token identities to device memory. One lane reads those authoritative rows and
- * fills every first-publication field. `target_positions` may alias
- * `out_target_positions`, so neither parameter is restrict-qualified.
+ * Each request has a unique writer. The shared contract reads its source
+ * position before writes, including when that position row is reused in place.
+ * Unsampled logits publish a valid position and an explicitly absent condition.
  */
-__global__ void rocm_initialize_mtp_device_logical_state_kernel(
-    const int32_t *__restrict__ sampled_tokens,
-    const int32_t *target_positions,
-    int request_count,
-    int32_t *__restrict__ out_base_cached_tokens,
-    int32_t *out_target_positions,
-    int32_t *__restrict__ out_accepted_state_counts,
-    int32_t *__restrict__ out_next_condition_tokens,
-    int32_t *__restrict__ out_all_drafts_accepted_flags,
-    int32_t *__restrict__ out_stopped_flags,
-    int32_t *__restrict__ out_publication_ok_flags)
+__global__ void rocm_initialize_generation_logical_state_kernel(
+    llaminar2::GenerationLogicalStateInitialization initialization)
 {
-    const int request = blockIdx.x * blockDim.x + threadIdx.x;
-    if (request >= request_count)
-        return;
-
-    const int position = target_positions[request];
-    out_base_cached_tokens[request] = position;
-    out_target_positions[request] = position;
-    out_accepted_state_counts[request] = 0;
-    out_next_condition_tokens[request] = sampled_tokens[request];
-    out_all_drafts_accepted_flags[request] = 0;
-    out_stopped_flags[request] = 0;
-    out_publication_ok_flags[request] = 1;
+    const unsigned request = blockIdx.x * blockDim.x + threadIdx.x;
+    if (request < static_cast<unsigned>(initialization.request_count))
+        (void)initialization.initializeRequest(static_cast<int>(request));
 }
 
 // ============================================================================
@@ -5751,6 +5752,7 @@ bool rocmOps_speculative_verify_distribution_f32(
     return true;
 }
 
+/** @brief Reject ambiguous draw sources and enqueue on the exact non-null HIP stream. */
 bool rocmOps_sample_distribution_f32(
     const int *token_ids,
     const float *probs,
@@ -5762,10 +5764,12 @@ bool rocmOps_sample_distribution_f32(
     const int *threshold_position,
     int threshold_position_offset,
     int device_idx,
-    void *stream)
+    void *stream,
+    const uint64_t *threshold_seed_device)
 {
     if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token ||
-        !stream || (threshold_position && threshold_seed == 0))
+        !stream || (threshold_position && threshold_seed == 0 && !threshold_seed_device) ||
+        (threshold_seed_device && (!threshold_position || threshold_seed != 0)))
         return false;
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -5781,7 +5785,8 @@ bool rocmOps_sample_distribution_f32(
         threshold_position,
         threshold_position_offset,
         out_token,
-        out_probability);
+        out_probability,
+        threshold_seed_device);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -8098,60 +8103,23 @@ bool rocmOps_prepare_mtp_verifier_controlled_row(
     return true;
 }
 
-/**
- * @brief Enqueue first-publication metadata from request-batched prefill.
- */
-bool rocmOps_initialize_mtp_device_logical_state(
-    const int32_t *sampled_tokens,
-    const int32_t *target_positions,
-    int request_count,
-    int32_t *out_base_cached_tokens,
-    int32_t *out_target_positions,
-    int32_t *out_accepted_state_counts,
-    int32_t *out_next_condition_tokens,
-    int32_t *out_all_drafts_accepted_flags,
-    int32_t *out_stopped_flags,
-    int32_t *out_publication_ok_flags,
-    int device_idx,
-    void *stream)
+/** @brief Enqueue all initial frontier rows, with one exclusive lane per request. */
+bool rocmOps_initialize_generation_logical_state(
+    const llaminar2::GenerationLogicalStateInitialization &initialization,
+    int device_idx, void *stream)
 {
-    if (!sampled_tokens ||
-        !target_positions ||
-        request_count <= 0 ||
-        !out_base_cached_tokens ||
-        !out_target_positions ||
-        !out_accepted_state_counts ||
-        !out_next_condition_tokens ||
-        !out_all_drafts_accepted_flags ||
-        !out_stopped_flags ||
-        !out_publication_ok_flags ||
-        !stream)
-    {
+    if (!stream || !initialization.valid())
         return false;
-    }
-
     llaminar2::HipDeviceGuard::setDevice(device_idx);
-    hipLaunchKernelGGL(
-        rocm_initialize_mtp_device_logical_state_kernel,
-        dim3(1), dim3(64), 0,
-        static_cast<hipStream_t>(stream),
-        sampled_tokens,
-        target_positions,
-        request_count,
-        out_base_cached_tokens,
-        out_target_positions,
-        out_accepted_state_counts,
-        out_next_condition_tokens,
-        out_all_drafts_accepted_flags,
-        out_stopped_flags,
-        out_publication_ok_flags);
-
+    constexpr unsigned threads = 64;
+    const unsigned blocks = 1u + (static_cast<unsigned>(initialization.request_count) - 1u) / threads;
+    hipLaunchKernelGGL(rocm_initialize_generation_logical_state_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream), initialization);
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
-        fprintf(stderr,
-                "ROCm MTP device logical-state initialization failed: %s\n",
-                hipGetErrorString(err));
+        fprintf(stderr, "ROCm generation logical-state initialization failed: %s\n",
+            hipGetErrorString(err));
         return false;
     }
     return true;

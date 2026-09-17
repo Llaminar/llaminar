@@ -9,6 +9,7 @@ behavioral oracle; mathematical parity remains a separate, complementary gate.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import time
 
 import run_production_parity_campaigns as parity
 from production_artifacts import digest, image_identity
+from docker_paths import validate_attached_execution
 from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -76,6 +78,7 @@ def validate_long_context_evidence(directory: Path, profile: dict) -> None:
     evidence = json.loads((directory / "long_context_results.json").read_text())
     if (evidence.get("schema") != 1 or evidence.get("tier") != "full"
             or evidence.get("complete") is not True
+            or evidence.get("active_check") is not None
             or len(evidence.get("results", [])) != 8
             or not all(row.get("passed") is True for row in evidence["results"])):
         raise ValueError("missing or failed full long-context evidence")
@@ -84,18 +87,43 @@ def validate_long_context_evidence(directory: Path, profile: dict) -> None:
             raise ValueError(f"long-context evidence has wrong {field}")
 
 
-def run_server_harness(command: list[str], environment: dict[str, str], log) -> int:
-    """Bound one exact HTTP cell and retire its full server/MPI process group.
+@dataclass(frozen=True)
+class E2ECellBudget:
+    """One immutable deadline shared by plan preparation and HTTP execution.
 
-    The canonical ten-minute cell watchdog includes server startup and checks.
-    A request timeout cannot bound a stuck launcher or shutdown. Reuse the
-    parity driver's existing process-group retirement protocol.
+    The server's readiness window starts with serve, not a preceding plan MPI
+    job. That distinction must never grant a fresh overall cell timeout.
+    Infrastructure staging precedes this budget; all frontend phases share it.
     """
+
+    _deadline: float = field(init=False, default_factory=lambda:
+                            time.monotonic() + parity.EXACT_CELL_TIMEOUT_SECONDS)
+
+    def remaining_seconds(self) -> float:
+        """Return the unspent canonical budget; an expired phase cannot launch."""
+        return max(0.0, self._deadline - time.monotonic())
+
+
+def run_e2e_process(command: list[str], environment: dict[str, str], log,
+                    *, budget: E2ECellBudget | None = None) -> int:
+    """Run one frontend phase within its cell's shared process-group watchdog.
+
+    Single-phase callers receive the usual fifteen-minute budget. Multi-phase
+    callers retain one budget across planning, startup, checks and shutdown.
+    Process creation also consumes that budget; no phase resets the deadline.
+    """
+    budget = budget if budget is not None else E2ECellBudget()
+    if budget.remaining_seconds() <= 0:
+        return 124
     with subprocess.Popen(command, cwd=ROOT, env=environment,
                           stdout=log, stderr=subprocess.STDOUT,
                           start_new_session=True) as process:
         try:
-            return process.wait(timeout=parity.EXACT_CELL_TIMEOUT_SECONDS)
+            remaining = budget.remaining_seconds()
+            if remaining <= 0:
+                parity._terminate_process_group(process)
+                return 124
+            return process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             parity._terminate_process_group(process)
             return 124
@@ -152,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.container_image:
         # Pin tags once so every server and its report describe identical bytes.
         args.container_image = image_identity(args.container_image)["id"]
+        validate_attached_execution(args.container_image)
     if not args.container_image:
         cache = args.binary.resolve().parent / "CMakeCache.txt"
         if not cache.is_file() or not re.search(r"^CMAKE_BUILD_TYPE:STRING=Release$", cache.read_text(), re.M):
@@ -196,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[model-parity-e2e] {index}/{len(selected)} RUN {exact}", flush=True)
                 cell_started = time.monotonic()
                 with (artifact_dir / "harness.log").open("w") as log:
-                    return_code = run_server_harness(command,
+                    return_code = run_e2e_process(command,
                         certification_environment(record["e2e"], artifact_dir), log)
                 evidence_error = None
                 if return_code == 0:

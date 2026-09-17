@@ -1,3 +1,11 @@
+/**
+ * @file WeightMemoryEstimator.h
+ * @brief Typed weight-residency and prepared-representation BOM inputs.
+ *
+ * WeightShardGeometry supplies the logical participant shape. This estimator
+ * applies the canonical format/representation contracts and contributes counts
+ * only; PhysicalMemoryAuthority remains the sole admission and allocation ledger.
+ */
 #pragma once
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
@@ -10,6 +18,25 @@ namespace llaminar2
 {
 
     struct ModelMemoryProfile;
+
+    /**
+     * @brief Global weight uses retained beside a participant's layer interval.
+     *
+     * A layer range alone cannot describe a pipeline endpoint or an MTP-only
+     * replica. These are physical weight uses, not execution authority: a
+     * terminal MTP stage also needs a token lookup table and therefore uses
+     * EmbeddingAndTerminal without becoming the main model's entry stage.
+     * Shared global constants remain resident except in LayersOnly, which is
+     * the exact predictor-layer contribution used by a separately admitted set.
+     */
+    enum class WeightComponentScope
+    {
+        EmbeddingAndTerminal,
+        Embedding,
+        Terminal,
+        Intermediate,
+        LayersOnly,
+    };
 
     /**
      * @brief Typed device-residency contract used by preflight weight sizing.
@@ -72,6 +99,7 @@ namespace llaminar2
         [[nodiscard]] size_t layerCount() const noexcept { return selected_by_layer_.size(); }
 
     private:
+        /** @brief Validate and retain a complete immutable expert-residency selection. */
         DeviceWeightResidency(
             Kind kind,
             int model_expert_count,
@@ -82,6 +110,7 @@ namespace llaminar2
         std::vector<int> selected_by_layer_;
     };
 
+    /** @brief Immutable-at-publication byte totals, never a live allocation ledger. */
     struct WeightEstimate
     {
         size_t native_bytes = 0; // As stored in GGUF
@@ -94,6 +123,7 @@ namespace llaminar2
         size_t tied_lm_head_bytes = 0;
     };
 
+    /** @brief Metadata-only native/prepared weight sizing for the canonical BOM. */
     class WeightMemoryEstimator
     {
     public:
@@ -116,6 +146,8 @@ namespace llaminar2
          * @param residency Exact full/continuation/expert-only residency view.
          * @param tensor_parallel_assignment Exact rank-local TP assignment when
          *        the production topology has one.
+         * @param components Global lookup/projection uses actually materialized
+         *        by this participant; independent of source aliases and layers.
          * @return Native-source and prepared-device byte inventory.
          */
         static WeightEstimate estimate(
@@ -127,7 +159,8 @@ namespace llaminar2
             int last_layer = -1, // -1 = all layers
             const DeviceWeightResidency &residency = {},
             const std::optional<DeviceShardingAssignment>
-                &tensor_parallel_assignment = std::nullopt
+                &tensor_parallel_assignment = std::nullopt,
+            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal
         );
 
         /// Bytes per weight element for native (GGUF on-disk) format.

@@ -1,6 +1,11 @@
 /**
  * @file ComputeStageBase.cpp
  * @brief Implementation of ComputeStageBase
+ *
+ * Stage classification is shared by capture planning, dependency scheduling
+ * and diagnostics. Native pipeline exchanges remain explicit collectives;
+ * their stream and publication ownership follow the same checked GPU-stage
+ * contract as arithmetic operations, never ambient default-stream state.
  */
 
 #include "IComputeStage.h"
@@ -172,6 +177,8 @@ namespace llaminar2
             return "ALLREDUCE";
         case ComputeStageType::ROOTED_COLLECTIVE:
             return "ROOTED_COLLECTIVE";
+        case ComputeStageType::PIPELINE_ACTIVATION_EXCHANGE:
+            return "PIPELINE_ACTIVATION_EXCHANGE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
         case ComputeStageType::ALLGATHER_V:
@@ -242,6 +249,10 @@ namespace llaminar2
             return "MTP_VERIFIER_PREPARATION";
         case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:
             return "MTP_STOCHASTIC_TARGET_DISTRIBUTION";
+        case ComputeStageType::ORDINARY_GENERATION_SAMPLING:
+            return "ORDINARY_GENERATION_SAMPLING";
+        case ComputeStageType::DECODE_POSITION_SNAPSHOT:
+            return "DECODE_POSITION_SNAPSHOT";
         case ComputeStageType::MTP_VERIFIER_OUTCOME:
             return "MTP_VERIFIER_OUTCOME";
         case ComputeStageType::MTP_STOCHASTIC_SERIAL_OUTCOME:

@@ -14,11 +14,14 @@
 
 #include "app/MPIBootstrapPhase.h"
 #include "backends/HardwareInventory.h"
+#include "backends/cuda/CUDADriverApi.h"
+#include "planning/ClusterInventoryGatherer.h"
 #include "utils/DebugEnv.h"
 
 #include <cuda.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
@@ -31,17 +34,51 @@ using namespace llaminar2;
 namespace
 {
     /**
+     * @brief Exercise quiet production discovery and its canonical publication.
+     * @return The manager-owned observation, valid until explicit reinitialization.
+     *
+     * The old hardware() accessor always returned null. Prove publication for
+     * each backend policy and that cluster discovery reuses it without a second
+     * driver enumeration. Real driver checks below remain the isolation oracle.
+     */
+    const HardwareInventory &publishedInventory()
+    {
+        auto &manager = DeviceManager::instance();
+        manager.initialize(-1, false);
+        const auto *observed = manager.hardware();
+        if (!observed) throw std::runtime_error("DeviceManager did not publish hardware");
+        const auto cluster_owner = gatherClusterInventory(nullptr);
+        const auto &cluster = *cluster_owner;
+        EXPECT_EQ(manager.hardware(), observed);
+        EXPECT_EQ(cluster.world_size, 1);
+        EXPECT_EQ(cluster.total_gpus, observed->cuda_device_count() + observed->rocm_device_count());
+        EXPECT_EQ(cluster.ranks.front().cpu.memory_bytes, observed->cpuDevice().total_memory_bytes);
+        for (const auto &gpu : cluster.ranks.front().gpus)
+        {
+            EXPECT_FALSE(gpu.uuid.empty());
+            const auto &devices = gpu.type == DeviceType::CUDA
+                ? observed->cuda_devices : observed->rocm_devices;
+            const auto found = std::find_if(devices.begin(), devices.end(),
+                [&](const ComputeDevice &device) { return device.device_id == gpu.local_device_id; });
+            if (found == devices.end())
+                throw std::runtime_error("Published GPU absent from hardware observation");
+            EXPECT_EQ(gpu.uuid, found->uuid);
+        }
+        return *observed;
+    }
+
+    /**
      * @brief Snapshot every CUDA device's primary-context activity bit.
      * @return One activity bit per driver-visible CUDA device.
      */
     std::vector<int> cudaPrimaryContextActivity()
     {
-        const CUresult init_result = cuInit(0);
+        const CUresult init_result = llaminar2::CUDADriverApi::instance().init(0);
         if (init_result != CUDA_SUCCESS)
             return {};
 
         int count = 0;
-        if (cuDeviceGetCount(&count) != CUDA_SUCCESS || count <= 0)
+        if (llaminar2::CUDADriverApi::instance().deviceGetCount(&count) != CUDA_SUCCESS || count <= 0)
             return {};
 
         std::vector<int> activity;
@@ -49,11 +86,11 @@ namespace
         for (int ordinal = 0; ordinal < count; ++ordinal)
         {
             CUdevice device = 0;
-            EXPECT_EQ(cuDeviceGet(&device, ordinal), CUDA_SUCCESS);
+            EXPECT_EQ(llaminar2::CUDADriverApi::instance().deviceGet(&device, ordinal), CUDA_SUCCESS);
             unsigned int flags = 0;
             int active = 0;
             EXPECT_EQ(
-                cuDevicePrimaryCtxGetState(device, &flags, &active),
+                llaminar2::CUDADriverApi::instance().devicePrimaryCtxGetState(device, &flags, &active),
                 CUDA_SUCCESS);
             activity.push_back(active);
         }
@@ -126,7 +163,7 @@ TEST(Test__HardwareInventoryBackendIsolation,
 
     // This is the exact authority used by ClusterInventoryGatherer and
     // MPITopology. ROCm discovery remains real while CUDA must be unreachable.
-    const HardwareInventory inventory = HardwareInventory::detect();
+    const auto &inventory = publishedInventory();
     EXPECT_TRUE(inventory.cuda_devices.empty());
     ASSERT_FALSE(inventory.rocm_devices.empty())
         << "ROCm integration hardware is required for this preflight";
@@ -145,7 +182,7 @@ TEST(Test__HardwareInventoryBackendIsolation,
 
     // CUDA discovery remains real; a linked ROCm implementation must neither
     // enumerate devices nor open its process-level KFD runtime state.
-    const HardwareInventory inventory = HardwareInventory::detect();
+    const auto &inventory = publishedInventory();
     ASSERT_FALSE(inventory.cuda_devices.empty())
         << "CUDA integration hardware is required for this preflight";
     EXPECT_TRUE(inventory.rocm_devices.empty());
@@ -170,7 +207,7 @@ TEST(Test__HardwareInventoryBackendIsolation,
     ASSERT_EQ(bootstrap.execute(config, 0, nullptr).action,
               BootstrapResult::Action::CONTINUE);
 
-    const HardwareInventory inventory = HardwareInventory::detect();
+    const auto &inventory = publishedInventory();
     EXPECT_TRUE(inventory.cuda_devices.empty());
     EXPECT_TRUE(inventory.rocm_devices.empty());
     expectEveryCudaPrimaryContextInactive(cudaPrimaryContextActivity());

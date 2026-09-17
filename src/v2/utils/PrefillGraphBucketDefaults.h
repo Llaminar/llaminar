@@ -14,28 +14,38 @@
 #include <array>
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
 {
 
     /**
-     * @brief Canonical graph-prefill bucket sizes used by runtime graph capture
-     * and GEMM/GEMV dispatch training.
+     * @brief Full canonical graph-prefill inventory for explicit configuration
+     * and GEMM/GEMV dispatch training, independent of the serving default cap.
      */
-    inline constexpr size_t kDefaultPrefillGraphBucketCount =
+    inline constexpr size_t kSupportedPrefillGraphBucketCount =
         size_t{0}
 #define LLAMINAR_PREFILL_GRAPH_BUCKET(rows) +size_t{1}
 #include "utils/PrefillGraphBuckets.def"
 #undef LLAMINAR_PREFILL_GRAPH_BUCKET
         ;
 
-    inline constexpr std::array<int, kDefaultPrefillGraphBucketCount>
-        kDefaultPrefillGraphBucketSizes = {
+    inline constexpr std::array<int, kSupportedPrefillGraphBucketCount>
+        kSupportedPrefillGraphBucketSizes = {
 #define LLAMINAR_PREFILL_GRAPH_BUCKET(rows) rows,
 #include "utils/PrefillGraphBuckets.def"
 #undef LLAMINAR_PREFILL_GRAPH_BUCKET
     };
+
+    /**
+     * @brief Default maximum prefill rows, independent of the KV context limit.
+     *
+     * Long prompts reuse these smaller captured chunks. Larger shapes remain
+     * supported and trained, but must be requested instead of consuming the
+     * default activation/workspace budget on every serving instance.
+     */
+    inline constexpr int kDefaultPrefillGraphMaxBucketSize = 512;
 
     /**
      * @brief Default number of resident prefill forward-graph identities.
@@ -64,21 +74,22 @@ namespace llaminar2
     static_assert(
         kDefaultPrefillGraphMaxCachedEntries -
                 kExpertOverlayPrefillGraphIdentityReserve <=
-            kDefaultPrefillGraphBucketCount,
+            kSupportedPrefillGraphBucketCount,
         "The default overlay segment requires enough canonical buckets");
 
     /**
      * @brief Default maximum physical rows in one ExpertOverlay prefill segment.
      *
      * Select the largest canonical bucket whose complete lower bucket ladder
-     * fits beside the reserved runtime identities. This couples the default
-     * segment envelope to the cache and bucket sources of truth instead of a
-     * duplicated row literal. Users may still tune the limit explicitly.
+     * fits beside the reserved runtime identities and does not exceed the
+     * default serving cap. Users may still tune the segment limit explicitly.
      */
     inline constexpr int kDefaultExpertOverlayPrefillSegmentRows =
-        kDefaultPrefillGraphBucketSizes
-            [kDefaultPrefillGraphMaxCachedEntries -
-             kExpertOverlayPrefillGraphIdentityReserve - size_t{1}];
+        std::min(
+            kDefaultPrefillGraphMaxBucketSize,
+            kSupportedPrefillGraphBucketSizes
+                [kDefaultPrefillGraphMaxCachedEntries -
+                 kExpertOverlayPrefillGraphIdentityReserve - size_t{1}]);
 
     /**
      * @brief Runtime verifier depths certified by the default NativeVNNI sweep.
@@ -211,23 +222,53 @@ namespace llaminar2
             k);
     }
 
-    inline std::vector<int> defaultPrefillGraphBucketSizes()
+    /** @brief Return the complete bucket inventory for training and coverage. */
+    inline std::vector<int> supportedPrefillGraphBucketSizes()
     {
-        return {kDefaultPrefillGraphBucketSizes.begin(),
-                kDefaultPrefillGraphBucketSizes.end()};
+        return {kSupportedPrefillGraphBucketSizes.begin(),
+                kSupportedPrefillGraphBucketSizes.end()};
     }
 
+    /**
+     * @brief Resolve the canonical bucket ladder for a serving row limit.
+     * @param max_rows Positive maximum rows in one captured prefill chunk.
+     * @return Ordered unique buckets ending at exactly max_rows.
+     * @throws std::invalid_argument If max_rows is not positive.
+     *
+     * Include an explicit non-grid endpoint, even below the smallest canonical
+     * bucket. A requested cap must not round up and quietly allocate more VRAM.
+     */
+    inline std::vector<int> prefillGraphBucketSizes(int max_rows)
+    {
+        if (max_rows <= 0)
+            throw std::invalid_argument("Prefill maximum bucket size must be positive");
+        const auto end = std::upper_bound(
+            kSupportedPrefillGraphBucketSizes.begin(),
+            kSupportedPrefillGraphBucketSizes.end(), max_rows);
+        std::vector<int> buckets(kSupportedPrefillGraphBucketSizes.begin(), end);
+        if (buckets.empty() || buckets.back() != max_rows)
+            buckets.push_back(max_rows);
+        return buckets;
+    }
+
+    /** @brief Return the bounded serving defaults, not the training inventory. */
+    inline std::vector<int> defaultPrefillGraphBucketSizes()
+    {
+        return prefillGraphBucketSizes(kDefaultPrefillGraphMaxBucketSize);
+    }
+
+    /** @brief Keep grouped-verifier and full prefill coverage regardless of serving defaults. */
     inline std::vector<int> defaultNativeVNNIDispatchTrainingRows()
     {
         std::vector<int> rows;
         rows.reserve(kDefaultNativeVNNISmallMRows.size() +
-                     kDefaultPrefillGraphBucketSizes.size());
+                     kSupportedPrefillGraphBucketSizes.size());
         rows.insert(rows.end(),
                     kDefaultNativeVNNISmallMRows.begin(),
                     kDefaultNativeVNNISmallMRows.end());
         rows.insert(rows.end(),
-                    kDefaultPrefillGraphBucketSizes.begin(),
-                    kDefaultPrefillGraphBucketSizes.end());
+                    kSupportedPrefillGraphBucketSizes.begin(),
+                    kSupportedPrefillGraphBucketSizes.end());
         return rows;
     }
 

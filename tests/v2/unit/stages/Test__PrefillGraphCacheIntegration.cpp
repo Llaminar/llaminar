@@ -452,7 +452,6 @@ namespace
         IDeviceContext *getDeviceContext(DeviceId) override { return nullptr; }
         IWorkerGPUContext *getWorkerGPUContext(DeviceId) override { return nullptr; }
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override { return {}; }
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int) override { return true; }
         bool publishForwardResultAtBoundary(
             const ForwardOutput &,

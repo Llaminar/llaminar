@@ -6,7 +6,9 @@
  * staged, preserve one frozen transaction through arbitrary backpressure, and
  * prove static immobility without ever invoking the physical transport. These
  * tests control each event edge independently so accidental synchronous or
- * inference-thread progress cannot make them pass.
+ * inference-thread progress cannot make them pass. Shutdown is forced at each
+ * active phase: closing proposal admission must not erase ownership of an
+ * already-started wave or release its old-reader and abort obligations.
  */
 
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
@@ -15,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +25,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -343,6 +347,23 @@ namespace llaminar2::test
                     owner_->cv_.notify_all();
                 }
 
+                /**
+                 * @brief Poll the independent unpublished-cleanup event.
+                 * @param error Unused: this fixture injects pending completion.
+                 * @return Ready only after the test releases the abort event.
+                 */
+                MoEOverlayResidencyWaveProgress pollAbort(
+                    std::string *error) noexcept override
+                {
+                    if (error)
+                        error->clear();
+                    std::lock_guard<std::mutex> lock(owner_->mutex_);
+                    ++owner_->abort_polls_;
+                    return owner_->abort_ready_
+                               ? MoEOverlayResidencyWaveProgress::Ready
+                               : MoEOverlayResidencyWaveProgress::Pending;
+                }
+
                 /** @brief Record lease-safe retirement on the worker. */
                 void retirePrevious() noexcept override
                 {
@@ -366,6 +387,7 @@ namespace llaminar2::test
                 int publication_begins = 0;
                 int publication_polls = 0;
                 int aborts = 0;
+                int abort_polls = 0;
                 int retirements = 0;
                 uint64_t first_generation = 0;
                 const DecodeExpertHistogramWindow *first_window = nullptr;
@@ -442,6 +464,13 @@ namespace llaminar2::test
                 cv_.notify_all();
             }
 
+            /** @brief Release or hold the unpublished-wave cleanup event. */
+            void setAbortReady(bool ready)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                abort_ready_ = ready;
+            }
+
             /** @brief Enable the exact inactive-bank preparation event. */
             void setPrepareReady(bool ready)
             {
@@ -479,6 +508,7 @@ namespace llaminar2::test
                     .publication_begins = publication_begins_,
                     .publication_polls = publication_polls_,
                     .aborts = aborts_,
+                    .abort_polls = abort_polls_,
                     .retirements = retirements_,
                     .first_generation = first_generation_,
                     .first_window = first_window_,
@@ -492,6 +522,7 @@ namespace llaminar2::test
             std::condition_variable cv_;
             bool start_enabled_ = true;
             bool defer_during_stage_ = false;
+            bool abort_ready_ = true;
             bool stage_ready_ = false;
             bool prepare_ready_ = false;
             bool publication_ready_ = false;
@@ -504,6 +535,7 @@ namespace llaminar2::test
             int publication_begins_ = 0;
             int publication_polls_ = 0;
             int aborts_ = 0;
+            int abort_polls_ = 0;
             int retirements_ = 0;
             uint64_t first_generation_ = 0;
             const DecodeExpertHistogramWindow *first_window_ = nullptr;
@@ -1543,6 +1575,171 @@ namespace llaminar2::test
 
         service->stopAndDrain(
             MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+    }
+
+    /**
+     * @brief Stop at every admitted-wave phase without orphaning its owner.
+     *
+     * Real HTTP shutdown can meet any of these states. Held completion events
+     * make each interleaving deterministic, and an old reader proves that
+     * publication alone cannot finish the drain. No wall-clock sleep chooses
+     * the race, and all held resources are released before joining the worker.
+     */
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        LocalShutdownPreservesActiveWaveOwnershipThroughReaderRetirement)
+    {
+        using State = MoEOverlayMaintenanceState;
+        for (const auto boundary : std::array{
+                 State::Staging,
+                 State::Preparing,
+                 State::AwaitingGraphSequenceBoundary,
+                 State::Publishing})
+        {
+            SCOPED_TRACE(static_cast<int>(boundary));
+            auto histogram = fullMovementHistogram();
+            auto authority = dynamicAuthority(histogram.get());
+            auto transport = std::make_shared<ControlledTransport>();
+            auto old_ticket = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_ticket.has_value());
+            std::optional<MoEOverlayResidencyAuthority::TicketLease> sequence;
+            if (boundary == State::AwaitingGraphSequenceBoundary)
+            {
+                sequence = authority->tryAcquireGraphSequenceSnapshot();
+                ASSERT_TRUE(sequence.has_value());
+            }
+            transport->setStageReady(boundary != State::Staging);
+            transport->setPrepareReady(
+                boundary == State::AwaitingGraphSequenceBoundary ||
+                boundary == State::Publishing);
+            auto service = startService(authority, transport);
+
+            // Use non-fatal assertions after start: every held event and lease
+            // must still be released if a broken implementation misses a state.
+            EXPECT_TRUE(waitUntil([&] { return service->state() == boundary; }));
+            EXPECT_TRUE(authority->hasActiveBackgroundWave());
+            recordObservedPrefillBatch(
+                *histogram, 0, std::vector<uint64_t>{4, 200, 6, 180, 2, 8});
+
+            const auto notifications = service->stats().notifications;
+            std::atomic<bool> drained{false};
+            std::jthread stopper([&]
+            {
+                service->stopAndDrain(
+                    MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+                drained.store(true, std::memory_order_release);
+            });
+            // stopAndDrain publishes its notification after closing admission.
+            // Two later polls cover even a poll already in flight at that edge.
+            EXPECT_TRUE(waitUntil([&]
+            { return service->stats().notifications > notifications; }));
+            const auto polls = service->stats().poll_iterations;
+            EXPECT_TRUE(waitUntil([&]
+            { return service->stats().poll_iterations >= polls + 2; }));
+            EXPECT_FALSE(drained.load(std::memory_order_acquire));
+            EXPECT_TRUE(service->healthy()) << service->failureMessage();
+            EXPECT_TRUE(authority->hasActiveBackgroundWave());
+            EXPECT_EQ(authority->snapshot()->epoch, 1u);
+
+            transport->setStageReady(true);
+            transport->setPrepareReady(true);
+            transport->setPublicationReady(true);
+            sequence.reset();
+            service->notifyMaintenanceProgress();
+            EXPECT_TRUE(waitUntil([&]
+            { return authority->snapshot()->epoch == 2u; }));
+            EXPECT_FALSE(drained.load(std::memory_order_acquire))
+                << "The old reader still owns its immutable weight bank";
+            EXPECT_EQ(authority->pendingRetirementCount(), 1u);
+            old_ticket.reset();
+            service->notifyMaintenanceProgress();
+            stopper.join();
+
+            EXPECT_TRUE(drained.load(std::memory_order_acquire));
+            EXPECT_TRUE(service->healthy()) << service->failureMessage();
+            EXPECT_EQ(service->state(), State::Stopped);
+            EXPECT_EQ(service->stats().committed_waves, 1u);
+            EXPECT_EQ(service->stats().fatal_failures, 0u);
+            EXPECT_EQ(authority->pendingRetirementCount(), 0u);
+            EXPECT_EQ(authority->pendingAbortCount(), 0u);
+            EXPECT_FALSE(authority->hasActiveBackgroundWave());
+            EXPECT_EQ(transport->observations().waves_started, 1);
+            EXPECT_EQ(transport->observations().retirements, 1);
+            EXPECT_EQ(authority->stats().checks, 1u)
+                << "Shutdown must not consume the queued successor window";
+            EXPECT_EQ(histogram->activationCount(0, 1), 200u);
+        }
+    }
+
+    /** @brief An unstarted local proposal can be discarded without transport. */
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        LocalShutdownDiscardsUnstagedProposalWithoutStartingMovement)
+    {
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStartEnabled(false);
+        auto service = startService(authority, transport);
+        EXPECT_TRUE(waitUntil([&]
+        { return service->stats().deferred_attempts > 0; }));
+        service->stopAndDrain(
+            MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+        EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Stopped);
+        EXPECT_EQ(transport->observations().waves_started, 0);
+        EXPECT_EQ(service->stats().committed_waves, 0u);
+        EXPECT_EQ(authority->snapshot()->epoch, 1u);
+        EXPECT_FALSE(authority->hasActiveBackgroundWave());
+    }
+
+    /**
+     * @brief A started wave deferred during drain keeps its abort until ready.
+     *
+     * Deferred means the exact physical attempt was abandoned, not that its
+     * cleanup completed. Shutdown discards only the resulting local retry
+     * intent and continues polling the already-owned asynchronous abort.
+     */
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        LocalShutdownDrainsDeferredWaveAbortWithoutRetry)
+    {
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setAbortReady(false);
+        auto service = startService(authority, transport);
+        EXPECT_TRUE(waitUntil([&]
+        { return transport->observations().stage_polls > 0; }));
+        const auto notifications = service->stats().notifications;
+        std::atomic<bool> drained{false};
+        std::jthread stopper([&]
+        {
+            service->stopAndDrain(
+                MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+            drained.store(true, std::memory_order_release);
+        });
+        EXPECT_TRUE(waitUntil([&]
+        { return service->stats().notifications > notifications; }));
+        transport->setDeferDuringStage(true);
+        service->notifyMaintenanceProgress();
+        EXPECT_TRUE(waitUntil([&]
+        { return transport->observations().abort_polls > 0; }));
+        EXPECT_EQ(authority->pendingAbortCount(), 1u);
+        EXPECT_FALSE(drained.load(std::memory_order_acquire));
+        EXPECT_EQ(authority->snapshot()->epoch, 1u);
+        transport->setAbortReady(true);
+        service->notifyMaintenanceProgress();
+        stopper.join();
+
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+        EXPECT_EQ(service->stats().fatal_failures, 0u);
+        EXPECT_EQ(service->stats().committed_waves, 0u);
+        EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Stopped);
+        EXPECT_EQ(transport->observations().begin_calls, 1);
+        EXPECT_EQ(transport->observations().aborts, 1);
+        EXPECT_EQ(authority->pendingAbortCount(), 0u);
+        EXPECT_FALSE(authority->hasActiveBackgroundWave());
     }
 
     TEST(

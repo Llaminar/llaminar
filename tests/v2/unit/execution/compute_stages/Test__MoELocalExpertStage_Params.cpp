@@ -9,15 +9,72 @@
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "utils/CPUExecutionTestGeometry.h"
 
 #include <gtest/gtest.h>
 
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <limits>
 
 namespace llaminar2::test
 {
+    /** @test Empty CPU banks declare the exact named scratch for future arrivals. */
+    TEST(Test__MoELocalExpertStage_Params, EmptyCPUResidencyDeclaresSourceWorkspace)
+    {
+        for (const auto format : {TensorType::FP32, TensorType::FP16, TensorType::BF16,
+                                 TensorType::Q8_0, TensorType::Q6_K, TensorType::IQ2_S})
+        for (const uint32_t row_tile : {2u, 4u})
+        for (const int workers : {1, 3, 28})
+        {
+            SCOPED_TRACE(tensorTypeName(format));
+            auto geometry = kSyntheticCPUExecutionGeometry;
+            geometry.maximum_native_row_tile = row_tile;
+            MoELocalExpertStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.num_experts = 8;
+            params.top_k = 3;
+            params.d_model = 4096;
+            params.expert_intermediate = 256;
+            params.expert_weight_resolution_policy = MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly;
+            params.cpu_workspace_source = MoELocalExpertStage::CPUExpertWorkspaceSource{
+                .gate = format, .up = TensorType::BF16, .down = format,
+                .workers = workers, .execution = geometry};
+            MoELocalExpertStage stage(params);
+            auto expected = cpuSwiGLUWorkspaceRequirements(15 * 3, 256);
+            for (const auto [n, k] : {std::pair{256, 4096}, std::pair{4096, 256}})
+                expected.merge(CPUProjectionWorkspaceContract::sourceNative(format,
+                    {.rows = 15 * 3, .n = n, .k = k, .workers = workers, .execution = geometry,
+                     .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+            const auto actual = stage.getWorkspaceRequirements(15);
+            ASSERT_EQ(actual.buffers.size(), expected.buffers.size());
+            for (const auto &buffer : expected.buffers)
+            {
+                const auto *found = actual.find(buffer.name);
+                ASSERT_NE(found, nullptr);
+                EXPECT_EQ(found->size_bytes, buffer.size_bytes);
+            }
+        }
+    }
+
+    /** @test Missing source metadata and unrepresentable route geometry fail during setup. */
+    TEST(Test__MoELocalExpertStage_Params, EmptyCPUWorkspaceRejectsMissingSourceOrOverflow)
+    {
+        MoELocalExpertStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.num_experts = 8;
+        params.top_k = 3;
+        params.d_model = 4096;
+        params.expert_intermediate = 256;
+        params.expert_weight_resolution_policy = MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly;
+        MoELocalExpertStage stage(params);
+        EXPECT_THROW(stage.getWorkspaceRequirements(1), std::logic_error);
+        EXPECT_THROW(stage.getWorkspaceRequirements(std::numeric_limits<int>::max()), std::overflow_error);
+    }
+
     namespace
     {
         template <typename, typename = void>

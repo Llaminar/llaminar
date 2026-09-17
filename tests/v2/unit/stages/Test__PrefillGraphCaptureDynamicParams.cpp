@@ -31,6 +31,7 @@
 #include "backends/DeviceId.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/PreparedWeightTestHarness.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 #include "utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
@@ -1059,6 +1060,7 @@ namespace
         all_params.prepared_store = prepared_lm_head.store.get();
 
         LMHeadStage all_positions(all_params);
+        test::CPUStageTestWorkspace all_workspace(all_positions, seq_len);
         ASSERT_TRUE(all_positions.execute(nullptr));
 
         for (int row = 0; row < seq_len; ++row)
@@ -1074,6 +1076,7 @@ namespace
             split_params.effective_last_row_idx = row;
 
             LMHeadStage split_row(split_params);
+            test::CPUStageTestWorkspace split_workspace(split_row, 1);
             ASSERT_TRUE(split_row.execute(nullptr));
 
             const std::vector<float> reference = logitsRow(*split_logits, 0, vocab_size);

@@ -12,6 +12,985 @@ every intermediate tensor still matches HF.
 
 ## Completion audit — September 12
 
+### Latest continuation — September 14: individual acquisition complete
+
+**175/175 serial controls and 335/335 MTP comparisons are green: 510/510.**
+The final unseen-only batch completes all 49 cells, with its unchanged shared
+651-Unit/170-preflight receipt. This finishes Qwen36 and Ornith dual-ROCm
+Static/Dynamic × Ordinal/Random matrices, then all five MTP policies for
+single-ROCm Qwen36, Ornith and Qwen38 dense. The acquisition auditor reports
+`acquisition_complete=true`, zero unseen cells and zero unresolved failures.
+It deliberately retains `certification_eligible=false`: these are additive
+native acquisitions across source revisions, not an immutable Docker/image
+certificate. No new runtime fix or threshold change was needed in this batch.
+
+The protected binaries are now released for a coordinated rebuild of the
+separately developed orchestration changes and complete Unit/preflight gate.
+Automatic candidate ranking/apply wiring, approved generation-corpus integration,
+and independent AVX512/AVX2 Docker E2E/benchmark certificates remain unfinished.
+
+### Previous continuation — September 13: unseen MTP proof
+
+**Latest result: 304/335 MTP cells pass; 31 remaining.**
+The unseen-only batch adds 73 passes before stopping at Qwen36 dual-ROCm
+Dynamic/Ordinal depth 1. An exact isolated retry fails at the same transaction
+11. The hosted selector wrongly submitted the next body before the completed
+body's due maintenance tail; a second defect replaced the original budget
+error with a later geometry error. See the
+[lifecycle audit and focused proofs](hosted-mtp-maintenance-continuation.md).
+The new ordering probe passes twenty resets per depth/terminal case on both
+vendors. The new first-error GPU probe fails on both old binaries, confirming
+that regression independently. Rebuilt runtime prerequisites pass 651 Units
+and 170 production preflight tests. The exact full-model retry passes in
+68.998s with all four original 384-token responses serial-exact, all harness
+checks and clean teardown. All nineteen additional fresh processes pass;
+the first pass counts toward twenty. Unseen-only acquisition now resumes in
+`native-journal-mtp-unseen-after-hosted-tail-01` with the same shared receipt.
+Its first eighteen unseen cells pass. Qwen36 dual-ROCm now completes every
+Static/Dynamic × Ordinal/Random × depth policy. Ornith dual-ROCm Static/Ordinal
+depths 1/2/3/15 also pass; its dynamic-depth cell is running. The audit snapshot
+after seventeen of these passes finds no unresolved failed cell. These remain
+native individual acquisitions, not a complete Docker/image certificate.
+
+Earlier acquisition history:
+
+All 175 serial controls remain green. The repaired dual-CUDA depth-2 cell
+passes twenty fresh canonical HTTP processes, with eighty original exact
+384-token responses and all eight harness checks per run. The complete shared
+gate passes 650 Unit and 168 production preflight tests. The unseen-only batch
+`native-journal-mtp-unseen-after-shifted-metadata-01` then passes all eighteen
+previously unseen Qwen 3.6 dual-CUDA cells, completing this topology's twenty
+MTP cases across both movement modes, both placements and every depth policy.
+All twenty Ornith dual-CUDA cells and all five Qwen 3.6 single-CUDA MTP policies
+then pass too. All five Qwen 3.8 dense single-CUDA MTP policies, all twenty
+Qwen122B CUDA2/ROCm4 cases, and all five Qwen36 dual-ROCm Static/Ordinal policies
+also pass with the same shared receipt, before the Dynamic/Ordinal failure.
+
+The preceding unseen batch stopped on Qwen 3.6 35B IQ3S dual-CUDA LocalTP
+Static/Ordinal depth 2. The first two original 384-token responses are exact;
+the partial-prefix request then stalled. Before any debugger attachment both
+GPUs were busy, and a host stack subsequently located the wait in
+`DeviceGraphOrchestrator::finishDeviceResidentGeneration()` at the terminal
+CUDA event. CUDA-GDB attachment failed internally and the process then
+segfaulted; that crash is potentially debugger-induced, not established as the
+original defect. The original complete failed receipt remains preserved.
+
+An unchanged, debugger-free retry in
+`native-journal-qwen36-cuda2-d2-reattempt-01` completes the first three original
+responses exactly in 3.520/2.756/3.008s, then stalls on the fourth/full-prefix
+request. A read-only host-stack observation confirms the same terminal event
+wait. This establishes a repeatable hang at varying request boundaries, not a
+deterministic token mismatch or a maintenance/shutdown failure. The retry
+ends at its unchanged 600-second watchdog. No increased timeout
+is installed. A subsequent disposable user-triggered CUDA core-dump attempt
+failed in NVIDIA's debugger machinery (the offline reader reports zero devices)
+and provoked launch failure/abort; it does not identify the original hang.
+
+```mermaid
+flowchart TD
+    A[HTTP request admission and ordered reset] --> B[Full or partial prefix restore]
+    B --> C[Publish per-device request and MTP state]
+    C --> D[Launch every retained participant parent]
+    D --> E[Device-controlled WHILE: draft, verifier, NCCL collectives, commit]
+    E -->|more tokens| E
+    E -->|complete| F[Terminal event and result bridge]
+    F --> G[Validate mirrored results and harvest prefix]
+    G --> A
+    H[Observed host stall: completion event never becomes ready] -.-> F
+    I[Observed: matched controllers; sidecar participants stall at different collective nodes] -.-> E
+```
+
+The focused NCCL preflight previously proved retained-parent recording re-entry
+with an empty conditional, not repeated collectives inside WHILE across request
+resets. Added `V2_Integration_CUDA_NCCLNativeWhileRequestReplay` to the canonical
+preflight list: four NCCL body fragments, a production device commit clock,
+twenty resets with varying loop budgets, alternate submission order, and checks
+on both devices. The test now passes twenty independent CTest runs (400 request
+resets) in 55.65s. Its first version incorrectly inspected a non-root reduction
+output; the corrected test explicitly broadcasts the root result before both
+participants advance. This was a test defect, not the server's root cause.
+The configuration-parser and prefill-bucket-default Unit suites also pass after
+rebuilding, including the user's configurable maximum and inherited MPI policy.
+These targeted results do not yet close the model hang. An ignored disposable
+LD_PRELOAD probe observes the existing predicate's controller binding and reads
+both device rows only after a terminal wait stalls; it changes no device state
+or production code, and its results cannot certify a cell.
+The successful read-only probe (`...-probe-04`) finds identical healthy
+46-word generation controllers on both GPUs: response count 3, remaining 381,
+transaction count 1, depth 2, and no error. Both epoch records report successful
+Acquire with epoch 1/selector 3, one reader and no acquisition in flight. The
+fragment-marker follow-up (`...-probe-05`) stops at entry to fragment 1, the
+full sidecar, on both GPUs. Thus this reproduction is after epoch admission and
+before draft publication/verifier/commit, not a divergence of the observed
+controller words. The probe's earlier metadata-query variants polluted CUDA's
+last-error state and are explicitly non-evidence for a runtime defect.
+The small regression now alternates standalone captured first transactions
+with retained-parent execution. This stronger version also passes twenty
+independent runs (400 request resets), in 53.73s. Node-level markers in the
+disposable model probe (`...-probe-06`) find GPU 1 blocked at full-sidecar node 2
+while GPU 0 reaches node 38; both are driver-owned collective kernels. The
+markers preserve every original dependency and reset on each iteration.
+Controller and epoch records still agree. Exact collective naming and capture
+identity/order are the next checks; no runtime fix is claimed.
+The final expanded test adds the ordinary all-reduce surface, rooted reduction
+and broadcast at widths 1/257/2048/32768. It passes twenty independent runs
+(400 request resets) in 65.26s. This includes alternating source-capture first
+transactions and retained-parent replay, but has not reproduced the model hang.
+Driver-API inventory in `...-probe-11` authenticates matching sidecar collective
+descriptors: the first kernel is the NCCL AllReduce entrypoint, followed by
+the routed reduction and final-row broadcast. Both participants have matching
+channel masks, work geometry and root. The library can dispatch a different
+protocol through its work descriptor, so its kernel symbol alone is not a
+complete algorithm/protocol identity. Read-only channel observations remain
+stable and cross-peer send/receive steps agree (channel 0: 23986 and 24624;
+channel 1: 22826 and 23832). These observations rule out a simple captured
+size mismatch, not a missing/duplicate launch or dependency. Native source
+graph submission/reuse is the next diagnostic boundary. None of these probes
+changes the production library, precision, model, timeout or certified ledger.
+The next ignored probe (`...-probe-12`) records actual source-executable
+submissions. Both GPUs submit identical collective signatures in the same
+sequence: full sidecar, chained sidecar, grouped verifier, two shifted-KV
+graphs, then the retained conditional parent. The second request reuses the
+same executable handles and stalls after parent submission 13. Thus no missing
+host graph launch or source-executable replacement has been observed. The next
+audit should reconstruct exact event-record/wait edges across these distinct
+streams, especially the last shifted-KV graph to parent handoff; matching host
+submission order alone is not a GPU happens-before proof. The disposable
+120-second diagnostic deadline is not a replacement for the unchanged
+600-second canonical cell watchdog.
+The read-only full acquisition audit, including the clean failed retry,
+revalidates all 175 controls and 211 MTP passes in 10.040s, with exactly one
+unresolved canonical cell and 123 unseen. None of the diagnostic processes is
+included in that coverage ledger.
+The event-clock probes (`...-probe-13` and `...-probe-14`) locate an actual
+missing dependency on request reuse. Submission 11 (first shifted-KV graph)
+publishes both its shifted-KV event and transaction event. Metadata admission
+waits on both on a separate setup stream, but consumes the shifted-KV handoff.
+The later mailbox row-selector uses the verifier stream and therefore finds
+no remaining reader publication to acquire. Submission 12 and parent 13 have
+no happens-before path from submission 11. First-use graph construction had
+incidentally supplied that edge; retained replay exposes its absence.
+
+```mermaid
+flowchart LR
+    K1[First shifted-KV graph reads mailbox] --> P[Publish reader-completion event]
+    P --> M[Metadata stream: observe without consuming]
+    P --> W[Mailbox writer stream: acquire and consume]
+    W --> S[Select new hidden rows and publish mailbox]
+    S --> K2[Second shifted-KV graph]
+    K2 --> C[Join retained generation parent]
+    M -. pointer and lease validation only .-> K2
+```
+
+The shared production fix changes all seven shifted-commit metadata entry
+points to the existing const observation API. Actual sidecar/mailbox writers
+retain the consuming API; there is no new event, stream, host wait, graph
+recapture, precision change or backend-specific branch. A model-free held-reader
+regression covers metadata observation on a third stream before the actual
+mailbox writer, twenty retained replays and byte preservation on both CUDA and
+ROCm. Both already-registered graph-capture suites belong to preflight. The
+source-policy gate checks that commit metadata cannot consume the writer edge.
+The focused regression passes twenty fresh process runs per backend (800 held
+reader interleavings total) in 72.58s, and the focused source-policy Unit suite
+passes. Integration and Release builds succeed. The first uninstrumented
+Release diagnostic completes all four original 384-token responses exactly in
+3.761/2.753/3.126/2.890s and exits cleanly with all VRAM released. Its direct
+harness invocation omitted `LLAMINAR_E2E_MOVEMENT_EVIDENCE`, so the harness
+correctly reports 7/8 rather than certifying the cell. This is a successful
+runtime reproduction check, not a ledger pass. The first prerequisite refresh
+found one stale device-free fixture: the 4,080-token checkpoint-boundary test
+used a mock without chunk scheduling, which conflicts with the new 512-row
+serving default. The mock now executes the production chunk plan and asserts
+that only real rows advance its cursor; every original CPU/CUDA/ROCm boundary
+assertion remains. All 156 tests in that fixture and its focused preflight
+registration pass. The replacement shared refresh at
+`native-generation-shifted-metadata-prerequisites-02` passes all 650 Unit tests
+and all 168 preflight tests in 686.395s, including a 75.25s Unit phase and
+610.45s preflight phase. The canonical model runs `...-fixed-01` through
+`...-fixed-20` then all pass, with eighty exact original responses, full prefix
+and captured-parent evidence, empty Static movement journals, clean logs and
+shutdown, and zero retained VRAM. Cell time ranges from 37.746 to 39.354s
+(median 38.648s; sum 771.321s). Every repeat reuses the same 818-test receipt
+and persistent tmpfs model. The read-only whole acquisition audit admits only
+the final repeat, avoids counting duplicate passes, and confirms 175/175
+controls plus 212/335 MTP cells, no unresolved failures and 123 unseen in
+10.146s. These are acquisition/stability proofs, not image certificates.
+
+Existing acquisition coverage is preserved; the user's configurable prefill
+cap does not invalidate those completed runs.
+
+The complete Qwen 3.6 dual-CUDA continuation is green. Static/Ordinal
+depths 3/15/adaptive pass in 39.352/57.362/48.480s. Dynamic/Ordinal
+depths 1/2/3/15/adaptive pass in 41.462/41.811/42.814/62.530/53.399s.
+Static/Random passes in 42.666/43.415/44.167/61.627/52.644s;
+Dynamic/Random in 46.417/47.282/47.630/66.588/57.511s. All seventy-two
+original responses from these eighteen new cells are serial-exact and every
+independent harness check passes. Each Dynamic final journal contains 108
+device-owned participant-placement edges; Static journals remain empty.
+Adaptive limits are 1–15, with 162 policy updates in the last Static response
+and 134 in the last Dynamic response. No observer, precision, prompt or
+movement gate was loosened.
+
+Ornith's twenty dual-CUDA cases also pass all eighty original exact responses
+and independent harness checks. In depth order 1/2/3/15/adaptive,
+Static/Ordinal takes 42.264/44.321/44.819/68.094/56.706s;
+Dynamic/Ordinal 45.331/47.983/47.434/72.470/61.082s;
+Static/Random 44.526/46.124/47.480/71.109/59.622s;
+Dynamic/Random 48.532/50.640/51.642/75.468/63.332s.
+Every Dynamic final journal contains 108 device-owned participant-placement
+edges; Static remains empty. Adaptive bounds remain 1–15, with 170 updates in
+the final Static response and 142 in Dynamic. The unchanged driver now admits
+the previously unseen single-CUDA Qwen 3.6 family. All cells continue using
+the one 818-test receipt and persistent tmpfs models. The broader acquisition,
+reviewed-corpus cutover and both image certificates remain incomplete.
+
+Qwen 3.6 single-CUDA depths 1/2/3/15/adaptive pass in
+22.348/22.246/22.948/38.648/25.300s, retaining every original exact response
+and all independent harness checks. The driver advances directly to the
+previously unseen Qwen 3.8 dense single-CUDA family, without replaying any
+older green cell or rerunning prerequisites.
+
+The preceding local shutdown fix remains independently proven:
+CUDA1/CPU1 rank-local Dynamic/Ordinal depth 2 passes the
+complete original HTTP cell in 207.942s after the local shutdown ownership fix.
+All four 384-token responses are serial-exact; all eight independent harness
+checks pass, including clean logs, physical movement and VRAM release. The
+focused regression passed 20 repetitions; the refreshed shared receipt passes
+650 Unit and 167 production preflight tests. The unseen-only run
+`native-journal-mtp-unseen-after-local-drain-01` passes depth 3 in 219.823s,
+with all four original 384-token streams serial-exact and all independent
+prefix, graph, movement, log and teardown checks green. Depth 15 then passes
+in 439.805s and adaptive depth in 238.194s, completing this topology's entire
+Dynamic/Ordinal MTP family. Static/Random depths 1/2/3/15/adaptive then pass in
+186.485/198.318/208.200/442.751/233.111s, with all twenty original 384-token streams serial-exact,
+empty authoritative movement journals, prefix/captured-graph evidence and clean
+teardown. Its adaptive controller retains bounds 1–15 and 162/153 updates on
+the two workloads. The driver has advanced to the previously unseen
+Dynamic/Random family: depths 1/2/3/15/adaptive pass in
+196.827/213.845/227.335/451.655/245.368s, with every original stream serial-exact
+and all independent harness checks green. The first three final journals
+contain 864/960/864 tier-residency edges; depth 15 retains 2,528. Adaptive bounds
+remain 1–15 with real policy updates. All 20 MTP cells for CUDA1/CPU1 are now
+individually green, matching the complete CUDA1/CPU2 and CUDA2/CPU2 families.
+ROCm1/CPU2 Static/Ordinal depths 1/2/3/15/adaptive then pass in
+148.082/155.219/164.075/336.245/170.512s.
+All original streams remain exact; prefix/captured-path evidence, empty
+movement journals, clean two-rank shutdown and full VRAM release pass.
+The five-cell family is individually green. Independent saved-observation
+validation confirms all twenty original 384-token responses. Adaptive bounds
+remain 1–15 with 164/157 policy updates on the two workloads; fixed depth 15
+executes 2,595 draft steps and accepts 210 drafts per response. Both latest
+cells pass all eight independent harness checks and return GPU VRAM from
+40 MiB to the same 40 MiB baseline. The exact-ID inventory audit finds no
+duplicate passes or configuration mismatches. ROCm1/CPU2 Dynamic/Ordinal
+depths 1/2/3/15/adaptive then pass in
+164.900/171.482/181.239/352.470/186.031s, retaining all twenty original
+serial-exact 384-token responses and complete independent harness checks.
+Final journals contain tier/participant/combined edge counts of
+834/188/84, 882/132/96, 1,004/132/60, 1,820/498/204 and 860/238/117
+respectively, proving both movement objectives. Adaptive bounds remain 1–15
+with 164/157 policy updates on the two workloads. All ten Ordinal MTP cells
+for ROCm1/CPU2 are individually green across Static and Dynamic placement.
+Its Static/Random depths 1/2/3/15/adaptive then pass in
+154.864/158.659/168.618/337.743/170.689s. All twenty original responses are
+serial-token-exact, authoritative movement journals remain empty, and the
+complete prefix, captured-execution and teardown harness passes every cell.
+Adaptive bounds remain 1–15 with 164/157 policy updates. Thus 15/20 MTP cells
+for ROCm1/CPU2 are individually green. Dynamic/Random depths 1/2/3/15/adaptive
+then pass in 172.719/174.058/183.639/355.958/188.444s. All twenty original
+384-token responses remain serial-exact, every complete harness passes, and
+both movement objectives execute. Final journals contain tier/participant/
+combined edge counts of 852/196/45, 856/168/81, 892/138/72, 1,874/492/213
+and 830/176/108. Adaptive bounds remain 1–15 with 164/157 policy updates.
+All **20 ROCm1/CPU2 MTP cells** are individually green, joining the three
+complete CUDA/CPU topology families. ROCm2/CPU2 Static/Ordinal depths
+1/2/3/15/adaptive then pass in 176.736/180.290/186.327/312.773/194.906s.
+All twenty original 384-token responses are serial-exact, every authoritative
+movement journal is empty, and all complete harness checks pass. Adaptive
+bounds remain 1–15 with 177/157 policy updates on the two workloads. Depth 15
+executes 2,460/2,325 draft steps and accepts 219/228 drafts. The exact-ID
+coverage audit confirms 135 unique canonical MTP passes without duplicate
+passes or unresolved native reds. ROCm2/CPU2 Dynamic/Ordinal depth 1 then
+passes in 205.818s with all four original 384-token responses serial-exact and
+the complete harness green. Its final journal contains 1,026 tier-residency,
+66 participant-placement and 568 combined edges, proving both movement axes.
+Depths 2/3/15/adaptive then pass in 211.033/216.909/341.155/222.380s.
+Every original response is serial-exact and the complete harness passes.
+Their final tier/participant/combined edge counts are 1,006/56/590,
+1,056/70/495, 1,766/308/736 and 1,090/116/521. Adaptive bounds remain
+1–15 with 177/157 policy updates. All ten ROCm2/CPU2 Ordinal MTP cells are
+individually green. Static/Random depths 1 and 2 then pass in
+179.491/182.147s, with all eight original 384-token responses serial-exact,
+empty movement journals and complete harness checks. Depths 3/15/adaptive then
+pass in 187.117/311.856/194.399s with the same complete proof. All twenty
+original responses are serial-exact. Adaptive bounds remain 1–15 with 177/157
+policy updates. The complete Static/Random family is individually green;
+Dynamic/Random depths 1/2 then pass in 209.427/212.771s. All eight original
+384-token responses are serial-exact and the complete harness passes. Final
+tier/participant/combined journal counts are 1,136/28/620 and 1,124/34/596,
+proving both movement objectives. Depths 3/15/adaptive then pass in
+218.342/344.114/228.956s. Every original response remains serial-exact and
+the complete harness passes. Final tier/participant/combined journal counts
+are 1,064/34/683, 2,000/262/918 and 1,312/72/641. Adaptive depth retains
+bounds 1–15 with 177/157 policy updates on the two workloads. All **20
+ROCm2/CPU2 MTP cells** are individually green, completing the fifth full
+122B GPU/CPU topology family. The driver has advanced to the unseen
+ROCm3/CPU2 Static/Ordinal depth-1 cell. The read-only full-response audit
+also independently validated all 175 controls and the preceding 149 MTP
+passes in 15.999s, with no unresolved reds; the final adaptive cell has
+subsequently passed the same saved-response/control validator.
+No runtime change or prerequisite rerun was needed for these groups.
+The independently tested outer
+CI mount-admission correction below does not change this admitted native run.
+Its reused prerequisite cost is zero; no runtime change or new gate run was
+needed for the complete Static/Random or Dynamic/Random families.
+Corpus approval and Docker certification remain pending.
+
+The subsequent turn interruption stopped the driver and server processes; this
+was verified by the missing unified process handle and an empty live process
+inventory, not inferred from stale logs. ROCm3/CPU2 Static/Ordinal depth 1
+retains four completed HTTP responses and an 8/8 harness summary, but no outer
+driver result was committed. It therefore remains uncounted and will be the
+first retried cell. The original report and artifacts are not rewritten.
+The full saved-response audit still passes 175 controls and 150 MTP cells in
+8.841s, with no unresolved native reds. A new canonical prerequisite run at
+`native-generation-qwen2-allowances-prerequisites-01` refreshes the receipt
+after the approved numerical-test rebuild. All 650 Unit tests pass in 73.37s
+and all 167 Integration preflight tests pass in 607.55s (771.006s including
+build preparation). The three approved exact Qwen2 HF retries then pass with
+all eight CSVs per cell; detailed evidence is below. The resumed
+`native-journal-mtp-unseen-after-qwen2-allowances-01` selects only the 185
+remaining MTP cells, starting with the interrupted uncommitted ROCm3/CPU2
+depth-1 cell. It reuses this fresh receipt and all seven selected GGUFs from
+tmpfs, with zero copied bytes. This interruption does not justify replaying
+previously green cohorts. Its fresh ROCm3/CPU2 Static/Ordinal depth-1 cell
+passes in 187.570s with all 1,536 serial-exact tokens, an empty movement
+journal, the complete 8/8 harness and VRAM returning to its 40 MiB baseline.
+Depths 2 and 3 then pass in 191.153/194.513s with every original response exact,
+empty Static movement journals and the complete independent harness green.
+Depth 15 then passes in 303.296s with all four original serial-exact streams,
+empty movement journals and complete harness/teardown evidence. Adaptive depth
+then passes in 204.985s with all original responses exact, bounds 1–15 and
+164/166 policy updates on the two workloads. The entire ROCm3/CPU2
+Static/Ordinal family is individually green. Dynamic/Ordinal depth 1 then
+passes in 229.968s with all four original responses serial-exact, complete
+harness/teardown checks, and final tier/participant/combined journal counts
+of 992/120/401. Both movement axes are proven; this is not a matched speedup
+benchmark. Dynamic/Ordinal depths 2 and 3 then pass in 229.984/233.690s,
+with all eight original 384-token responses exact and every complete harness
+check green. Final tier/participant/combined edge counts are 902/76/459 and
+938/78/396. Depth 15 then passes in 350.839s and adaptive depth in 245.420s.
+All original responses remain exact, both movement objectives execute, and
+every complete harness check passes. Final tier/participant/combined journal
+counts are 1,714/356/370 and 1,058/120/408. Adaptive bounds remain 1–15
+with 164/166 policy updates on the two workloads. All ten ROCm3/CPU2
+Ordinal MTP cells are individually green across Static and Dynamic movement.
+Static/Random depths 1 and 2 then pass in 198.714/196.421s with all eight
+original 384-token responses exact, empty movement journals and complete
+harness/teardown checks. Static/Random depths 3 and 15 then pass in
+200.319/305.105s with every original response exact, empty movement journals
+and complete harness checks. Adaptive depth then passes in 213.251s,
+with every original response exact, no movement, bounds 1–15 and 164/166
+policy updates. Static/Random is complete. Dynamic/Random depth 1 then
+passes in 234.066s with every original response exact, the full harness green
+and 1,244/36/435 final tier/participant/combined journal edges. Depths 2/3
+then pass in 236.122/239.801s with all original responses exact, complete
+harness checks and final tier/participant/combined edges of 1,312/42/455
+and 1,184/32/484. Depth 15 then passes in 350.789s and adaptive depth in
+251.770s, retaining every original exact response and complete harness check.
+Final tier/participant/combined journal counts are 2,066/324/586 and
+1,418/86/452. Adaptive bounds remain 1–15 with 164/166 policy updates.
+All **20 ROCm3/CPU2 MTP cells** are individually green, completing the sixth
+full 122B GPU/CPU topology family. The driver has advanced to unseen
+ROCm4/CPU2 Static/Ordinal: depths 1/2/3/15/adaptive pass in
+200.682/198.210/199.563/282.448/212.993s. All twenty original 384-token
+responses are exact, movement journals remain empty, and complete harness/
+teardown checks pass. Adaptive bounds remain 1–15 with 153/148 policy updates
+on the two workloads. The complete Static/Ordinal family is individually
+green. Dynamic/Ordinal depth 1 then passes in 262.293s with all original
+responses exact and complete harness checks. Its final journal contains
+1,046 tier-residency, 74 participant-placement and 107 combined edges,
+proving both movement objectives. Depths 2 and 3 then pass in
+261.630/251.378s with every original response exact and all complete harness
+checks green. Final tier/participant/combined journal counts are 962/60/109
+and 934/74/129. Depth 15 and adaptive depth then pass in 342.316/267.864s
+with all original exact streams and full harness checks. Final tier/participant/
+combined journal counts are 1,244/352/121 and 1,052/168/93. Adaptive retains
+bounds 1–15 with 153/148 policy updates. All ten ROCm4/CPU2 Ordinal MTP cells
+are individually green across Static and Dynamic movement. Static/Random
+depths 1/2 then pass in 212.640/215.307s with all eight original 384-token
+responses exact, empty movement journals and full harness checks. Depths 3/15
+then pass in 224.841/284.762s with all original exact responses, empty
+movement journals and complete harness checks. Adaptive then passes in
+227.177s, with every original response exact, no movement, bounds 1–15 and
+153/148 policy updates. Static/Random is complete; Dynamic/Random depth 1
+then passes in 277.379s with all original exact streams, complete harness
+checks and 1,188/58/220 final tier/participant/combined journal edges.
+Depth 2 passes in 265.607s with the same complete proof and 1,076/48/170
+final journal edges. Depths 3/15 then pass in 269.783/344.945s with all
+original exact streams, complete harness checks and final tier/participant/
+combined journal counts of 1,098/44/171 and 1,704/314/191. Adaptive then
+passes in 282.797s with all original exact streams and complete harness checks.
+Its final journal contains 1,236/138/216 tier/participant/combined edges;
+bounds remain 1–15 with 153/148 policy updates. All **20 ROCm4/CPU2 MTP
+cells** are individually green, completing the seventh full 122B GPU/CPU
+topology family. ROCm1/CPU1 rank-local Static/Ordinal depths 1/2 then pass
+in 191.276/203.472s with all eight original 384-token responses exact,
+empty movement journals and complete harness checks. Depth 3 then passes
+in 220.130s with the same complete proof. Depth 15 then passes in 472.126s
+with all four original exact streams, no movement and complete harness/
+teardown checks. Adaptive then passes in 217.918s with all original exact
+responses, no movement, bounds 1–15 and 164/157 controller updates. The
+complete Static/Ordinal MTP family is individually green. Dynamic/Ordinal
+depths 1/2 then pass in 206.421/224.080s with all original exact streams,
+complete harness checks and 768/864 final tier-residency edges. The production
+topology declares only tier residency: each tier has one participant, so no
+within-tier placement axis is available. The shared observer validates every
+declared axis without inventing another topology policy. Depth 3 then passes
+in 237.466s with all original exact streams, 864 final tier-residency edges
+and complete harness checks. Depth 15 and adaptive depth then pass in
+490.823/244.203s with all original exact streams, complete harness checks
+and 1,638/768 final tier-residency edges. Adaptive retains bounds 1–15
+with 164/157 controller updates. All ten ROCm1/CPU1 Ordinal MTP cells are
+individually green across Static and Dynamic movement. Static/Random depths
+1/2/3 then pass in 189.673/205.602/222.891s with all original exact streams,
+empty movement journals and complete harness checks. Depth 15 and adaptive
+then pass in 473.716/220.650s with all original exact streams, no movement
+and complete harness checks. Adaptive retains bounds 1–15 with 164/157
+controller updates. Static/Random is complete. Dynamic/Random depths 1/2/3
+then pass in 209.247/222.772/239.261s with all twelve original 384-token
+responses serial-exact, complete harness checks and 576/768/768 final
+tier-residency edges. Depth 15 and adaptive then pass in 499.928/245.152s
+with all eight original exact streams, complete harness checks and 1,416/768
+final tier-residency edges. Adaptive retains bounds 1–15 in all four responses
+with 164/157 controller updates. All **20 ROCm1/CPU1 MTP cells** are now
+individually green, completing the eighth full 122B GPU/CPU topology family.
+The shared saved-response validators recheck all twenty cells against their
+original serial controls and production-declared movement contracts.
+Qwen 3.6 35B IQ3S dual-CUDA LocalTP Static/Ordinal depth 1 then passes in
+41.165s; its four original 384-token responses remain serial-exact, movement
+is empty and complete harness checks pass. Depth 2 subsequently stalls as
+described above. Before that failure, a read-only audit
+independently revalidated all 175 controls and all 211 MTP passes in 10.529s,
+with no unresolved failures, duplicate passes or configuration mismatches.
+One hundred and fourteen subsequent individual MTP
+cells have passed since the last local shutdown fix without another runtime
+change; that is regression evidence, not completion of the remaining matrix.
+The earlier uncommitted depth-1 attempt remains
+untouched and uncounted; the new driver result is its first recorded pass.
+An additional read-only review of all 30 completed adaptive-depth cells checks
+all 120 responses: every response retains limits 1–15 and positive policy
+updates (17,850 updates total). This is saved runtime evidence, not the pending
+producer-bound admission validator or an image certificate.
+
+During acquisition the user added `--prefill-max-bucket-size`, a 512-row serving
+default and separate full training/coverage bucket inventory. These source edits
+are preserved. Per the user's explicit direction, they do not invalidate any
+completed coverage or restart the campaign. The live driver continues on its
+already-built Release binary and original canonical manifest. At the next
+rebuild, validate the new option/default through the parser, planning and graph
+regressions and refresh the shared Unit/preflight receipt once before admitting
+that rebuilt runtime. Retain original run provenance and all existing passes;
+new image certificates must still describe the image actually executed.
+The source-only `test_native_vnni_prefill_matrix.py` suite passes all 13 tests
+in 0.025s, including the new check that the compact serving cap preserves the
+complete 4096-row training inventory. This focused check does not rebuild the
+live runtime or rerun the amortized prerequisite gate.
+
+The five CUDA1/CPU1 Dynamic/Ordinal policies complete in
+194.887/207.942/219.823/439.805/238.194s for depths 1/2/3/15/adaptive. All
+twenty original 384-token responses are serial-exact, and every complete cell
+passes independent prefix, captured-graph, physical-movement, log and teardown
+checks. Depth 15's final journal contains 2,864 tier-residency edges; its first
+response proves 2,415 draft steps, 161 verifier transactions and 222 accepted
+drafts. Adaptive responses retain bounds 1–15 with positive policy updates.
+No implementation change or prerequisite rerun was needed for the two latest
+cells. These are individual native production proofs, not an approved corpus
+or either shipping-image certificate.
+
+The repaired
+122B CUDA1/CPU2 Static/Ordinal depth-1 cell passes the complete original HTTP
+probe in 162.758s (`native-journal-mtp-122b-cuda1-cpu2-d1-boundary-01`). All
+1,536 tokens match serial controls exactly; full/partial prefix, Static movement,
+captured-graph evidence, clean shutdown and complete VRAM release pass (8/8
+independent harness checks). Both admission and evidence failures below are
+closed. The next run, `native-journal-mtp-unseen-after-boundary-01`, selects
+only the remaining 284 exact IDs from the canonical manifest, excludes the 51
+individual greens, reuses the current 650-Unit/166-preflight receipt and stops
+at the first red. No model cell is considered an image/corpus certificate.
+
+That unseen-only run has additionally passed the same Static/Ordinal topology
+at depths 2 (174.243s), 3 (179.875s) and 15 (374.406s). Every cell completes its
+four original 384-token serial-exact responses and all independent harness
+checks. Depth 15 really executes fifteen-draft transactions: its first request
+reports 2,415 draft steps, 161 verifier transactions and 222 accepted drafts.
+Dynamic depth also passes all four original 384-token exact streams and the
+independent harness: request times are 37.323/34.626/35.041/33.712s. Its first
+request reports adaptive bounds 1–15 and 162 policy updates. The complete
+Static/Ordinal MTP family for this topology is now individually green. The driver
+then advanced to **Dynamic expert movement / Ordinal / MTP depth 1**, not another
+Static rerun. The prerequisite reuse cost was zero; that unseen-only driver
+later stopped at the local shutdown failure described below.
+
+The following Dynamic/Ordinal family is now also green, without another code
+change or prerequisite rerun: depths 1/2/3/15/dynamic complete in
+172.038/183.085/187.615/380.119/211.893s. All twenty original requests match
+their serial controls exactly (7,680 completion tokens), and every complete
+cell passes graph, prefix, movement-transport and clean-shutdown checks.
+Authoritative journals prove both tier-residency and participant-placement
+objectives, including combined edges. Dynamic depth retains bounds 1–15 with
+162/153 observed policy updates on its two workloads while experts move.
+The entire Static/Dynamic **Ordinal** MTP family for CUDA1/CPU2 is therefore
+individually green. The unseen-only driver then advanced to **Static /
+Random / MTP depth 1**.
+
+The complete Static/Random family also passes all five MTP policies with four
+original serial-exact 384-token responses each, zero authoritative movement,
+prefix restoration, captured execution and clean teardown. Fixed depths
+1/2/3/15 complete in 173.583/175.021/180.685/376.347s. No runtime edit or
+prerequisite rerun was needed. Its adaptive-depth cell completes in 202.540s.
+The driver then advanced to **Dynamic / Random / MTP depth 1**.
+
+Dynamic/Random also completes the five policies in
+175.140/186.960/192.593/380.197/214.006s. All twenty responses are serial-exact,
+and the independent harness verifies both movement objectives, prefix restores,
+captured execution and clean shutdown. Adaptive bounds remain 1–15 with real
+162/153 policy updates while both objectives execute. No further runtime fix
+or prerequisite rerun was needed. Thus all **20 MTP cells** for the 122B
+CUDA1/CPU2 topology are individually green: Static/Dynamic × Ordinal/Random ×
+depths 1/2/3/15/dynamic. The driver then advanced to **CUDA2/CPU2 / Static /
+Ordinal / MTP depth 1**.
+
+CUDA2/CPU2 Static/Ordinal now also passes all five MTP policies, including its
+two-GPU continuation domain and CPU expert followers. Depths 1/2/3/15/dynamic
+complete in 195.023/188.570/193.990/381.834/215.718s. Every original response is
+serial-token-exact and each cell passes the independent prefix, captured-graph,
+Static no-movement and teardown checks. Adaptive bounds remain 1–15, with
+163/152 policy updates on the two workloads. No runtime edit or prerequisite
+rerun was needed. The driver then advanced to **CUDA2/CPU2 / Dynamic /
+Ordinal / MTP depth 1**.
+
+CUDA2/CPU2 Dynamic/Ordinal also passes all five policies, in
+205.617/201.702/209.040/375.493/231.157s. All twenty original 384-token responses
+match their serial controls exactly. Independent graph, prefix, physical
+movement and teardown checks pass for every cell. Depth 15 executes real
+fifteen-draft transactions; adaptive depth retains bounds 1–15 and reports
+163/152 policy updates on its two workloads. Its final journal contains 771
+combined, 1,416 tier-residency and 80 participant-placement edges. These are
+correctness/path witnesses, not a matched movement-speedup benchmark.
+No runtime change or prerequisite rerun was required for this group. Both
+Static and Dynamic **Ordinal** MTP families for CUDA2/CPU2 are individually
+green. The driver then advanced to **CUDA2/CPU2 / Static / Random / MTP
+depth 1**.
+
+CUDA2/CPU2 Static/Random now completes all five policies in
+196.201/190.623/197.464/383.641/217.976s. All twenty original responses are
+serial-token-exact. Every cell passes the independent prefix, captured-graph,
+Static no-movement and clean-teardown checks. Adaptive bounds remain 1–15,
+with 163/152 policy updates on the two workloads and empty movement journals.
+No implementation change or prerequisite rerun was needed. The driver then
+advanced to **CUDA2/CPU2 / Dynamic / Random / MTP depth 1**.
+
+CUDA2/CPU2 Dynamic/Random also completes all five policies in
+210.810/204.967/214.114/382.661/233.881s. Every original response is
+serial-token-exact; the independent prefix, captured-graph, physical-movement
+and teardown checks pass in every cell. Both movement objectives execute.
+Adaptive depth retains bounds 1–15 and records 163/152 policy updates on the
+two workloads. No new runtime fix or prerequisite rerun was needed. All **20
+MTP cells for CUDA2/CPU2** are therefore individually green, matching the
+complete CUDA1/CPU2 MTP matrix. The driver then advanced to **CUDA1/CPU1 /
+rank-local overlay / Static / Ordinal / MTP depth 1**.
+
+CUDA1/CPU1 rank-local Static/Ordinal also passes all five policies, in
+180.666/195.358/207.304/436.957/229.373s. All twenty original 384-token responses
+match serial controls exactly; every cell passes prefix, captured-graph,
+Static no-movement and clean-teardown checks. Fixed depth 15 completes within
+the unchanged 600-second watchdog. Adaptive depth retains bounds 1–15 with
+162/153 policy updates on the two workloads. No runtime fix or prerequisite
+rerun was needed. The next cell was **CUDA1/CPU1 / rank-local overlay /
+Dynamic / Ordinal / MTP depth 1**. An exact-ID/configuration audit finds 95
+unique passing MTP cells, no duplicate passes and no inventory mismatches.
+Overall evidence is 175 serial-control passes and 95 MTP passes, not a completed
+canonical matrix or either Docker certificate.
+
+#### Local shutdown ownership audit — September 13
+
+CUDA1/CPU1 rank-local Dynamic/Ordinal depth 1 passes in 194.887s. The next
+depth-2 cell stops the unseen batch after 210.396s. All 1,536 completion IDs
+are serial-exact, prefix probes pass, the process exits zero, and GPU VRAM
+returns from 22,440 MiB of backend use to its original 2 MiB. The final harness
+rejects two ERROR log entries: the maintenance service reports active work
+that its retained transaction no longer owns, then the runner reports the
+failed maintenance drain. This is a real shutdown protocol failure, not a
+numerical or VRAM-release failure. The evidence remains in
+`native-journal-mtp-unseen-after-boundary-01`.
+
+`run()` previously cleared every process-local retained transaction when stop
+was observed. Its comment described only an unstaged deferred proposal, but
+the assignment also cleared `Active`. The next `advanceBackground()` correctly
+reported the still-active physical wave; `pollOnce()` then treated that wave
+as an ownership violation. Existing local tests stopped after publication;
+the explicit in-flight shutdown test covered a distributed proposal, whose
+publisher prevented the bad clear. The new local test forces all four active
+phases and reproduces the same error deterministically. An independently held
+abort also reproduces it, while the genuinely unstaged cancellation case passes.
+
+The repair removes shutdown's transaction mutation and consolidates the two
+local cancellation sites in the existing `ReadyToStage` admission method:
+
+```mermaid
+flowchart TD
+    P[Frozen proposal: ReadyToStage] --> A{Local stop observed at admission?}
+    A -- yes --> E[Discard unstaged proposal: Empty]
+    A -- no or distributed obligation --> B[beginApply]
+    B -- Started --> S
+    B -- Deferred --> P
+    subgraph Active[Same authority-owned wave before and after shutdown]
+        S[Staging] --> R[Preparing]
+        R --> G[Await graph-sequence readers]
+        G --> U[Selector publication]
+    end
+    U --> C[Published: count commit and release retained intent]
+    S -- Deferred attempt --> Q[Authority retains asynchronous abort]
+    Q --> P
+    X[Shutdown closes new proposals] --> A
+    X -. continue polling the current phase .-> Active
+    C --> L[Retire old bank after exact readers drain]
+    E --> D[Drain existing aborts and retirements]
+    L --> D
+    D --> Z[Stopped]
+```
+
+There is no new lifecycle flag, controller, transfer, graph operation or
+inference-time wait. The original distributed obligations remain executable
+after stop. Tests also keep an old reader alive across publication, leave a
+successor histogram queued, and hold asynchronous abort completion: shutdown
+must join owned work without admitting a successor. The three focused cases
+are registered as `V2_Integration_ExpertOverlayLocalMaintenanceDrain` in the
+production preflight gate, in addition to their existing Unit binary. The old
+implementation fails the active/abort cases in 6 ms. The corrected focused
+preflight and existing maintenance Unit suite pass; twenty consecutive focused
+preflight runs pass in 10.58s. Release rebuild is complete. The full Unit gate
+passes 650/650 in 74.14s, and production preflight passes 167/167 in 615.24s,
+including the existing distributed residency-consensus regression. Their
+combined receipt costs 719.058s including executable relinking.
+
+The exact original retry, `native-journal-mtp-cuda1-cpu1-d2-local-drain-01`,
+passes all eight independent harness checks in 207.942s. Its four requests
+take 37.633/37.112/36.635/30.866s and retain all 1,536 serial-exact completion
+IDs. The final immutable journal contains 1,048 tier-residency edges: this
+one-participant-per-tier topology has no within-tier placement axis. Stochastic
+verification really executes at depth 2 and accepts drafts. Shutdown logs are
+clean and GPU release passes. The unchanged tmpfs corpus supplies all four
+shards with zero copy bytes; no model, prompt, threshold or watchdog changed.
+
+The single-CPU Qwen3.8 dense depth-15 timeout is closed by the complete
+584.379s PASS described below. Its next unseen dynamic-depth cell also passes:
+321.940s for the complete cell, with four original requests at 77.547s,
+73.128s, 75.244s and 74.114s. All 1,536 completion IDs match the serial controls
+exactly. Full and partial prefix restore pass, and the adaptive controller
+reports bounds 1–15 with 85/101 real policy updates for the two workloads.
+Shutdown and the independent harness checks pass. Evidence is retained in
+`native-journal-mtp-unseen-dense-dynamic-01`.
+
+The next unseen Qwen122B CUDA1/CPU2 Static/Ordinal MTP depth-1 cell fails in
+`native-journal-mtp-unseen-122b-cuda1-cpu2-d1-01`. Readiness passes, then the first
+stochastic decode command is rejected by `mtpDecodeHardFailureReason`: its
+MPI-world-size guard treats expert followers as full-model vocabulary peers.
+The continuation coordinator already owns graph sequences, while followers
+execute expert transactions without a sampler. This is an admission mismatch,
+not the preceding CPU throughput failure. MPI abort explains the subsequent
+missing HTTP response, GPU usage and rank-zero PerfStats artifacts.
+
+The earlier node-overlay HF lane installs `referenceGreedySamplingPolicy()`
+(temperature zero, argmax reference). This particular guard executes only for
+non-greedy speculative sampling, which the seeded public HTTP workload now
+exercises. Earlier greedy numerical greens therefore did not cover this
+admission branch; no prior stochastic PASS for this exact cell is being
+reclassified as a regression.
+
+The latest ledger is **50 passed, one encountered red, 284 unseen**; all 175
+serial controls remain green. These are diagnostic observations, not an
+approved token corpus or an image certificate. That run reused the unchanged
+650-Unit/165-preflight receipt; the new admission implementation will require
+focused regressions, rebuilt binaries and one refreshed prerequisite gate.
+No earlier green cohort is rerun to reach the failing cell.
+
+The ownership audit keeps the existing lifecycle; it does not add another
+acknowledgement, host distribution or per-token collective:
+
+```mermaid
+flowchart TD
+    R[Ready runner and admitted stochastic request] --> A[Classify installed rank participation]
+    A --> C[ExpertOverlay continuation: full local vocabulary owner]
+    A --> T[Full-model peers: graph-gathered CPU vocabulary]
+    A --> F[Expert follower: cannot own a verifier]
+    C --> V[Resident draft and grouped target verifier]
+    T --> V
+    F --> E[Fatal ownership diagnostic]
+    C --> K[Existing retained transaction tickets]
+    K --> X[Expert-only follower graph]
+    X --> V
+    V --> P[Existing accepted-state and output publication]
+    P --> D[Terminal result and command retirement]
+```
+
+The extracted production check retains the actual runner's resource probes:
+single GPU continuation requires resident stochastic verification/publication;
+local TP additionally requires mirrored full-vocabulary heads. CUDA and ROCm
+share the check. General GPU GlobalTP and uncoordinated MPI remain unsupported.
+The regression first runs against the extracted old rejection before installing
+the role-aware correction. Complete 384-token HTTP proof remains necessary.
+
+The extracted old guard reproduces the rejection on all eight CUDA/ROCm
+continuation shapes (one/two/four/eight local participants). The corrected
+production check passes its four functional cases twenty consecutive times;
+incomplete resident verifier/publisher, missing mirrored head, expert follower
+and unsupported collective-peer contracts remain rejected. Four related Unit
+registrations (verifier policy, MPI coordination, prefill/decode transition,
+overlay transactions) also pass. Both Integration and Release rebuilds succeed.
+The exact original four-request retry is now
+`native-journal-mtp-122b-cuda1-cpu2-d1-owner-01`, first running a fresh complete
+Unit/preflight transaction. Its new ownership integration registration is in
+preflight. No completed model-cell pass is claimed from policy tests alone.
+
+The refreshed complete gate passes **650 Unit + 166 production-preflight**
+registrations, 781.426s including rebuild. Its receipt is
+`native-journal-mtp-122b-cuda1-cpu2-d1-owner-01/preflight/prerequisites.json`.
+The Release retry completed all four requests in 162.053s, with 1,536/1,536
+serial-token-exact outputs, full/partial prefix restores, an empty Static
+movement journal and clean shutdown. It remains red solely on the independent
+graph-boundary check: the sidecar and verifier's transaction-zero records omit
+`ticket_service_units` and `boundary_authority`. Their executable and replay
+records contain the correct physical inventory. Request times are 28.645s,
+25.405s, 26.687s and 25.321s; all four model shards remain tmpfs cache hits.
+
+#### Retained parent evidence audit
+
+The two supported initial-submission policies reach different existing emitters:
+
+```mermaid
+flowchart TD
+    C[Capture graph-only children and concurrent service program] --> P[Compose and instantiate one native parent]
+    P --> S[MaterializeWithoutLaunch: seal cache without execution]
+    P --> I[CaptureInstantiateAndLaunch: submit parent and CPU service]
+    S --> E[Executor first submission]
+    I --> T[Controller transaction-zero evidence]
+    E --> U[Executor transaction-zero evidence]
+    T --> R[Sealed cache replay]
+    U --> R
+    R --> V[Executor replay evidence]
+    T --> B[Common physical-boundary tag projection]
+    U --> B
+    V --> B
+```
+
+The capture controller's first-use record used an older partial schema. The
+existing GPU preflight covered only setup-only materialization, whose later
+first submission goes through the already-correct executor. A new fresh-fixture
+first-use case reproduces the missing tags on **both CUDA and ROCm**, while the
+existing setup-only case stays green. The fix shares one pure tag projection
+of the actual composition/service inventory across the three canonical record
+sites. It adds no lifecycle state, graph work, transfer or synchronization.
+The observer remains strict; its new MTP-family regression proves that ordinary
+decode, setup and replay evidence cannot mask a missing first-use inventory.
+All 132 observer tests pass. Both native first-submission policies pass twenty
+consecutive CTest repetitions per backend (51.13s total). The refreshed complete
+Unit gate passes 650/650 in 75.73s; all 166 preflight registrations pass in
+610.77s. The combined receipt takes 714.671s including relinking the complete
+gate inventory. The exact original HTTP retry is running in
+`native-journal-mtp-122b-cuda1-cpu2-d1-boundary-01`, with all four tmpfs shards
+reused and zero copy bytes. Subsequent unchanged cells reuse this receipt.
+Existing preflight
+registrations include the new functional test automatically.
+
+### Depth-15 timeout investigation and closure — September 13
+
+`native-journal-mtp-comparisons-01` has stopped at cell 49, the single-CPU
+Qwen3.8 dense 27B IQ4_XS / FP32-activation / FP16-KV / depth-15 cell. The first
+48 MTP comparisons pass; 286 are unseen. All 175 serial controls remain green.
+This is not a complete campaign or an image certificate.
+
+The exact-cell watchdog returned 124 after 603.075s. Its first two original
+384-token requests completed in 209.050s and 203.613s; the third was still
+computing when the 600s process-group watchdog fired. Subsequent shutdown and
+missing-PerfStats failures are timeout aftermath, not independently established
+lifetime defects. The current task is a separate CPU performance-counter/sample
+profile of one unchanged request, followed by an economical implementation fix
+and the complete original four-request cell. Neither the timeout nor the
+canonical request length is being relaxed. Resume unseen cells after targeted
+closure, without rerunning the first 48 merely to reach this point again.
+
+This timeout also exposed a reporting defect: a hard kill could erase completed
+responses because the HTTP reporter persisted them only in `finally`. It now
+atomically checkpoints each completed response before validation or the next
+request. Partial evidence remains explicitly incomplete and cannot certify a
+cell. A real child-process/SIGKILL regression fails before the change and passes
+after it; all four relevant framework CTest groups pass. This reporting-only
+change does not affect inference arithmetic or runtime policy.
+
+The reporting hard-kill regression subsequently passed 20 consecutive runs.
+The CPU profile completed its original request in 210.682s, returned all 384
+serial-exact tokens, and shut down cleanly. The fixed depth-15 policy performed
+2,599 draft steps and verified 2,775 rows in 176 grouped verifier transactions,
+accepting 208 drafts. This is genuine expensive inference, not a stuck teardown.
+Production timers attribute 157.120s to verification and 44.908s to drafting;
+85.528s belongs to the fused two-projection verifier family. The overlapping
+timers are not additive. A separate 45-second CPU sample attributes roughly
+75% of cycles to quantized matrix kernels, about 10% to libgomp, and much less
+to GDN/other work. Prepared/anonymous memory is correctly first-touched on NUMA
+node 0 and the normal bootstrap selects 28 physical-core workers.
+
+An inlining candidate removes per-block AVX-512 contribution-helper calls and
+their vector stack traffic while preserving the explicit arithmetic boundaries.
+At M=16, the focused IQ4_XS and Q5_K samples improve around 10–12%; smaller rows
+and Q6_K are flat or slightly slower, so this is not a universal economy claim.
+All 126 compact format/row points (21 formats, M=2/3/4/8/16/31) remain byte
+exact. Independent scalar rounding oracles pass on the AVX512 build's AVX2 and
+AVX512 lanes, and in a separate actual AVX2 build. Existing grouped-all-format
+and GPU-aligned-expert one-block integration checks also pass. The independent
+oracles and the full CPU grouped-format integration group now join preflight;
+no performance test is added to that gate.
+
+The unprofiled candidate HTTP request takes 202.771s, retains every serial
+token and identical MTP counters, and shuts down normally. This modest gain
+does **not** resolve the four-request 600s timeout. The next isolated diagnostic
+compares real fused bundles with the same independent prepared projections
+called separately, including mixed codebooks, to distinguish kernel cost from
+production bundle scheduling. No new campaign cell is green from these partial
+request diagnostics. Full Unit/preflight refresh remains required after the
+kernel slice is settled; the previous build receipt cannot certify a changed
+runtime.
+
+The isolated two-projection benchmark reproduces a 2–3x bundle penalty with
+independent prepared matrices: roughly 5.3 ms versus 2.2 ms for IQ4_XS FFN,
+and 3.5 ms versus 1.2 ms for mixed Q5_K/IQ4_XS GDN. Both use the same Auto
+pairwise AVX-512 kernel and return serial-row-identical bytes. Separate
+profiling launches place 90–96% of sampled cycles in that same physical kernel,
+not orchestration. The fused workshare stripes adjacent row tiles over cores,
+whereas standalone contiguous assignment preserves private-cache B-panel
+reuse. The current candidate groups adjacent weight-sharing tasks without
+starving available workers; mixed-M sparse bundles retain cyclic balancing.
+
+An adjacent audit also found that fused N-major dispatch omitted the canonical
+cache-sized K continuation segments. Restoring them alone did not improve the
+observed pairwise workload; it is not being credited with closing this timeout.
+Its focused all-format regression now covers odd M, compact N tails, independent
+projection inputs and padded output strides in both ISA lanes. Those functional
+checks and the existing exhaustive fused-policy sweep join production preflight.
+The standalone fused timing diagnostic remains outside preflight. No additional
+campaign PASS is claimed until the original complete cell has actually passed.
+
+The locality candidate reduces the twelve-sample median FFN bundle from
+5351.185 to 2197.855 microseconds (2.43x), and the mixed-format GDN bundle from
+3565.275 to 1199.825 microseconds (2.97x). The AVX2 runtime lane also remains
+serial-byte-exact and comparable to its standalone grouped calls. Nine focused
+integration registrations pass, including both ISA cache-panel and exhaustive
+fused-schedule sweeps; the canonical preflight inventory now contains 164 tests.
+
+The unchanged Release HTTP request completes in 149.516s, versus its original
+209.050s campaign observation. All 214 prompt IDs, 384 completion IDs and terminal
+reason match; the MTP evidence remains identical (2599 drafts, 208 accepted,
+176 verifier transactions). Both samples are fresh prefix misses. Verification
+drops from 157.120s in the sampled original to 98.682s, while the fused M16
+two-projection family drops from 85.528s to 38.421s. These are overlapping
+attributions, not additive costs. Shutdown succeeds. This confirms a production
+inference improvement, but the full four-request 600s cell is still pending.
+
+The subsequent complete gate passes all 650 Unit and 164 production-preflight
+tests. Both exhaustive fused-policy ISA lanes also pass twenty repetitions.
+The exact complete cell nevertheless remains red: the unchanged watchdog
+returns 124 at 603.175s during request four. The first three requests are
+preserved and serial-exact at 149.215s, 144.457s and 147.329s; the full and partial
+prefix cases retain their restore obligations. Shutdown/missing-PerfStats errors
+follow watchdog termination. This is additional throughput work, not evidence
+of a newly established lifetime defect, and the ledger stays at 48 MTP passes,
+one failing cell and 286 unseen. The passed prerequisite receipt is retained in
+`native-journal-mtp-cell49-locality-01/preflight/prerequisites.json`.
+
+The narrow floating projection candidate replaces the FP32 kernel's arbitrary
+N >= 128 cutoff with a workshare-occupancy check. Four-row reuse is admitted
+only when grouping retains the available worker parallelism. The existing
+increasing-K arithmetic remains unchanged; its no-bias epilogue no longer adds
+an extra positive zero, preserving serial signed-zero bytes. FP16/BF16 weight
+companions already support narrow groups. A new functional preflight regression
+crosses column and row boundaries, odd thread counts, transpose layouts and
+epilogues for all three weight formats with FP32 activations.
+
+The focused floating and existing CPU grouped-all-format tests pass. In the
+unchanged fresh-prefix Release HTTP request, the narrow M16/N48/K5120 FP32
+projection attribution falls from 4.775s to 2.165s, with identical prompt and
+384 completion IDs and unchanged MTP counters. However, total request time is
+150.192s versus 149.516s: this is a component win, not demonstrated overall
+speedup or closure of the cell. No new full-cell attempt is justified by that
+sample alone. The wider quantized verifier schedules are the next bounded
+comparison; production dispatch remains Auto during this investigation. A fresh
+complete Unit/preflight receipt is required after settling these runtime changes.
+
+The explicit row-reuse experiment rejects WideRows for the dominant FFN shape:
+two launches remain serial-byte-exact but take about 3.1 ms versus 2.18 ms for
+Pairwise. No policy override or generated table is installed. Assembly instead
+shows AVX-512 activation-word packing using four byte expressions that consume
+XMM registers beside the live ZMM accumulators. It now delegates to the existing
+AVX2 integer-word sign-bit flip, which is exactly equivalent to adding 128 to
+each signed byte modulo 256. This affects shared activation preparation, not a
+Q8-only weight format, and leaves compensation and FP32 arithmetic untouched.
+
+The candidate FFN median is approximately 2.01 ms; the mixed Q5_K/IQ4_XS GDN
+bundle is approximately 1.11 ms. Both retain complete serial-byte equivalence.
+Separate current-binary CPU profiles show zero lost samples and the same hot
+physical kernel. The symmetric hot path has no vector accumulator stack traffic;
+the function's stack reservation decreases from 0x180 to 0xc0 bytes, but its
+unused asymmetric branch still has temporary spills, so this is not a universal
+zero-spill claim. An independent scalar word oracle covers every signed byte in
+each lane at all valid offsets and is included with both ISA preflight sweeps.
+Production-request and complete-cell evidence are still required.
+
+The strengthened floating test then exposes a separate epilogue contraction
+defect before another model launch: FP32 M=15/N=128/K=128, alpha=0.75,
+beta=-0.25 with bias differs by one ULP. Independent unscaled dots agree exactly
+at 0.93053305149078369. The serial output (-2294.745849609375) matches a rounded
+alpha product followed by bias addition; grouped output (-2294.74609375) matches
+a fused alpha-product/bias FMA. Nine other focused registrations pass, including
+all quantized formats and exhaustive activation-word checks on both ISA lanes.
+The new shared skinny epilogue preserves the rounded product using a register
+dependency, adds bias separately, and explicitly defines the beta FMA. It is
+used by the FP32, FP32x16 and homogeneous 16-bit skinny primitives; no-bias
+publication still avoids an extra +0. A scalar oracle checks both optional
+epilogue terms, signed zero and disabled previous-output reads. Full functional
+and production-request proof remains pending this latest fix.
+
+All ten focused integration registrations subsequently pass in 13.74s,
+including the independent epilogue oracle and the formerly failing bias case.
+The unchanged fresh-prefix Release request completes in 143.458s, retaining all
+214 prompt IDs, all 384 completion IDs, the terminal reason and every MTP
+counter; shutdown succeeds. This is a measured improvement over the 149–150s
+predecessor, not yet a complete-cell PASS. The canonical exact-cell rerun is
+`native-journal-mtp-cell49-signword-01`, with one fresh full Unit/preflight gate
+before its original four requests and unchanged 600-second watchdog. Prior
+48 MTP cells are not rerun to reach it.
+
+That fresh complete prerequisite gate passes all 650 Unit tests (74.78s) and
+all 165 production-preflight tests (611.81s). Build plus tests take 999.424s.
+The exact-cell retry then starts using the persistent tmpfs cache with zero
+copy bytes. Its completion and four-request evidence remain pending; the
+prerequisite PASS alone does not change the 48-pass MTP campaign tally.
+
+The complete cell subsequently **passes in 584.379s**, within its unchanged
+600-second watchdog. Its four original requests take 142.503s, 138.466s,
+140.879s and 140.083s. All 1,536 committed output tokens match their serial
+controls exactly; full and partial RAM prefix restores retain the required MTP,
+hybrid and terminal-state semantics. All eight HTTP harness checks pass,
+including clean shutdown, log and PerfStats evidence. The observation is
+complete, repeatable and serial-comparison-passed, but remains diagnostic and
+cannot certify an image or approve a token corpus. The 15.6-second watchdog
+margin is modest, not a broad economy-target or stress-stability certificate.
+
+The MTP ledger is now **49 passed, 286 unseen, no remaining encountered red**.
+The next unseen single-CPU Qwen3.8/FP16-KV dynamic-depth cell starts in
+`native-journal-mtp-unseen-dense-dynamic-01`, explicitly reusing the same passed
+815-test prerequisite receipt. No earlier green cohort is rerun.
+
 ### Current checkpoint — all 175 MTP-off HTTP controls pass
 
 The unchanged-build collection completed successfully: 175 unique canonical
@@ -46,6 +1025,481 @@ match and every prefix check passes. Its one refreshed prerequisite receipt,
 approved Q16 threshold changed. Other compressed-KV numerical reds remain
 unwaived. The requested source checkpoint is now ready; Actions is still
 disabled and no local evidence or corpus payload belongs in that commit.
+
+Checkpoint `1a4402109` is now pushed to `Llaminar/llaminar:develop` with
+`--no-verify` and `[skip ci]`, excluding generated artifacts and corpus data.
+Fresh discovery in `native-journal-mtp-inventory-01.json` exports all 510 cells
+at that commit; every cell record exactly matches the collection inventory.
+`native-journal-mtp-comparisons-01` now runs the 335 non-Off cells sequentially
+against the untouched `native-journal-all-controls-01` index, reusing the one
+refreshed prerequisite receipt. Its first Qwen3.6 dual-socket CPU overlay
+Static/Ordinal depth-1 cell passes in 183.770s: all four 384-token streams match
+serial, prefix and teardown pass, and actual speculative sampling accepts
+151/233 and 148/236 drafts for the two workloads. Follow the live report/log;
+do not restart the active batch, rebuild over it, approve the corpus, or treat
+partial MTP coverage as full certification.
+
+Both Qwen3.6 dual-socket CPU **ordinal-placement** cohorts now pass all five
+MTP policies, completing the first ten MTP comparisons. Every completed cell
+also passes an independent saved-response audit against its original serial
+control, prefix/runtime checks, terminal depth bounds against the exact
+C++-exported CLI configuration, and the journal-to-physical-transfer join.
+Whole-cell wall times and final model-lifetime movement receipts are:
+
+| MTP policy | Static seconds | Dynamic seconds | Dynamic waves / edges |
+|---|---:|---:|---:|
+| Depth 1 | 183.770 | 220.125 | 62 / 620 |
+| Depth 2 | 160.386 | 186.873 | 45 / 450 |
+| Depth 3 | 177.429 | 205.725 | 50 / 500 |
+| Depth 15 | 406.327 | 469.227 | 102 / 1,020 |
+| Dynamic depth | 223.559 | 259.495 | 68 / 680 |
+
+Static journals are empty. All Dynamic edges carry the participant-placement
+objective; this single-tier topology does not claim tier-residency coverage.
+Every journal has zero discarded evidence. The 40 requests / 15,360 committed
+tokens are identical across all ten policy combinations, not merely repeatable
+within each individual cell. Fixed-depth bounds match their requested depths.
+Both adaptive cells retain **min=1/max=15**, end at depth 2, and record
+111/111/123/123 policy updates with 186/186/179/179 accepted drafts across the
+four requests. Depth 15 accepts 203 drafts per request in both movement modes.
+
+The same batch then advanced to Static/Random depth 1. These cohorts required
+no new inference implementation, build, prerequisite run, workload change or
+threshold adjustment. These are functional acquisition wall times, not a Dynamic
+speedup claim; the aggressive movement profile is slower than Static here.
+An inventory-only audit also confirms all 335 MTP declarations carry explicit,
+coherent depth and retained graph-capacity values, including the full 1–15
+range in every dynamic-depth case. The validator gap below still needs its
+focused regression and installed enforcement before routine certification.
+
+The September 13 continuation also passes all five Static/Random policies in
+182.429s, 161.143s, 179.595s, 406.085s and 228.123s for depths 1, 2, 3, 15 and
+dynamic respectively. Independent saved-response audits prove all 20 requests
+/ 7,680 tokens serial-exact, empty Static journals and matching physical/path
+evidence. Fixed bounds match the declared policies; adaptive bounds remain
+1–15, with 111/111/123/123 policy updates. Accepted draft counts match the
+corresponding ordinal-placement cells, including 203 per request at depth 15.
+
+Dynamic/Random depths 1 and 2 subsequently pass in 215.246s and 187.928s:
+the first 17 MTP cells green, zero failures. Their independently joined journals
+prove 61 waves / 610 participant-placement edges and 47 waves / 470 edges,
+respectively, with no discarded evidence. All 68 requests / 26,112 committed
+tokens across the seventeen completed variants are exact across policies and
+placement orders, as well as against their original serial controls. The same
+live batch continued to Dynamic/Random depth 3. The isolated outer-CI changes
+below do not alter its generation driver, loaded inference build, configuration
+or prerequisite.
+
+The cohort is now complete: Dynamic/Random depths 3, 15 and dynamic pass in
+207.500s, 471.656s and 267.897s, with 52/520, 100/1,000 and 62/620 completed
+waves/edges. Independent audits of all twenty Qwen3.6 CPU variants verify
+80 requests / 30,720 committed tokens exact across every policy and placement,
+as well as against their original serial controls. All journals join completed
+physical transfers with no discarded evidence. The fourth adaptive cell also
+retains the declared 1–15 bounds and ends at depth 2 on all requests, with the
+same policy-update and accepted-draft counts as the other adaptive variants.
+
+The Ornith dual-socket CPU ordinal-placement cohort now passes all five MTP
+policies in both Static and Dynamic movement modes: the first 30 MTP cells green,
+zero failures. The same batch continued to Static/Random depth 1. Whole-cell acquisition
+times and final model-lifetime movement receipts are:
+
+| MTP policy | Static seconds | Dynamic seconds | Dynamic waves / edges | Accepted drafts per request: harbor / mountain |
+|---|---:|---:|---:|---:|
+| Depth 1 | 181.384 | 214.841 | 57 / 570 | 120 / 130 |
+| Depth 2 | 184.923 | 207.998 | 55 / 550 | 148 / 159 |
+| Depth 3 | 199.844 | 232.165 | 60 / 600 | 154 / 163 |
+| Depth 15 | 467.650 | 544.856 | 119 / 1,190 | 156 / 168 |
+| Dynamic depth | 219.645 | 267.106 | 68 / 680 | 136 / 148 |
+
+Every completed cell independently audits exact against its serial control and
+the preceding Static policies, including both repeats. The 40 requests / 15,360
+committed tokens are invariant across all ten Ornith configurations. Static
+journals are empty; all Dynamic edges advance participant placement and join
+completed physical transfers, with no discarded evidence. Fixed terminal bounds
+match their requested depths. Both adaptive cells retain the declared 1–15
+envelope, end at depth 2, and record 155/155/143/143 policy updates. Both
+depth-15 cells completed within the unchanged 600-second watchdog.
+No new inference build, repeated prerequisite run or numerical threshold change
+was needed. The same sequential batch, binaries and shared modules remain live;
+no corpus has been approved.
+
+All five Ornith Static/Random policies now pass in 182.938s, 181.049s,
+204.413s, 483.187s and 227.527s for depths 1, 2, 3, 15 and dynamic respectively:
+the first 35 MTP cells green, zero failures, followed by Dynamic/Random depth 1.
+Independent audits validate all twenty new requests against serial and
+the ordinal-placement cohort, including full/partial prefix behavior, exact
+requested depth bounds and empty Static journals/transport evidence. Accepted
+draft counts match their ordinal counterparts. The adaptive case retains 1–15
+bounds, ends at depth 2, and records 155/155/143/143 policy updates with
+136/136/148/148 accepted drafts. All 60 requests / 23,040 tokens across the
+fifteen completed Ornith variants are invariant across policy and owner order.
+No inference, shared validator, workload, threshold or prerequisite change was
+needed for this continuation.
+
+Ornith Dynamic/Random depths 1–3 pass. Their independent token/prefix/path
+audits match serial, Static and ordinal placement. Whole-cell times are
+213.633s, 207.188s and 235.567s; completed movement totals are 51/510, 45/450
+and 58/580 waves/participant-placement edges respectively. Every edge joins
+completed physical transport, no journal evidence is discarded, and accepted
+draft counts match the corresponding earlier policies. All 72 requests /
+27,648 tokens across the eighteen completed Ornith variants are invariant.
+Depth 15 also passes in 543.539s. All four requests retain
+the declared depth-15 bounds, accept 156/156/168/168 drafts and match serial
+and the preceding Ornith policies exactly. Its 114 waves / 1,140 completed
+participant-placement edges join physical transfers with no discarded evidence.
+The final dynamic-depth case passes in 272.537s: **40/335 MTP cells green,
+zero failures**. Independent audit joins 65 waves / 650 completed edges and
+verifies the requested 1–15 depth envelope. All four requests end at depth 2,
+record 155/155/143/143 updates and accept 136/136/148/148 drafts. All 80
+Ornith requests / 30,720 committed tokens are exact across its twenty variants
+and their original serial controls. The same live batch has started Qwen3.6
+single-CPU depth 1, without rebuilding or rerunning prerequisites.
+The next canonical groups are the Qwen3.6
+MoE and Qwen3.8 dense single-CPU MTP policies, followed by CPU+CUDA overlay cells; the schedule
+continues to come from the existing full inventory.
+
+The single-CPU Qwen3.6 cohort is complete: **45/335 MTP cells green, zero
+failures**, followed by Qwen3.8 dense 27B single-CPU depth 1 in the same batch.
+
+| MTP policy | Whole-cell seconds | Accepted drafts: harbor / mountain |
+|---|---:|---:|
+| Depth 1 | 134.189 | 151 / 144 |
+| Depth 2 | 131.759 | 188 / 182 |
+| Depth 3 | 146.115 | 195 / 196 |
+| Depth 15 | 360.083 | 204 / 200 |
+| Dynamic depth | 169.988 | 193 / 182 |
+
+Independent saved-response and transport audits prove all twenty 384-token
+requests serial-exact and equal across these policies, full/partial prefix
+restoration and empty movement journals. Fixed bounds match every declared
+depth. Dynamic bounds remain 1–15, with terminal depths 3/3/2/2 and completed
+policy updates 94/94/117/117. The local read-only helper
+`parity-results/audit_native_journal_mtp.py` retains those audit operations and
+joins the cell and its exact serial control to the canonical inventory, without
+altering observations or issuing a certificate. All 45 completed configurations
+still match the unchanged full inventory and its source revision.
+
+Qwen3.8 dense 27B single-CPU depths 1, 2 and 3 pass in 295.131s, 347.347s
+and 349.106s: **48/335 MTP cells green, zero failures**, followed by depth 15.
+Independent saved-response audits join the exact canonical records and serial
+controls, verify all twelve 384-token streams (also exact across the three depths),
+full/partial prefix restoration, requested fixed-depth bounds and empty
+movement/transport journals. Accepted drafts are 153/153/151/151 at depth 1
+and 194/194/191/191 at depth 2, then 206/206/201/201 at depth 3. Depths 2 and 3
+are slower than depth 1 for this acquisition workload;
+this is functional evidence, not a benchmark speedup claim. No inference
+or shared-validator change, model reload beyond normal per-cell setup, or
+repeated prerequisite run was introduced.
+
+The September 13 numerical CSV re-audit confirms the three separate Qwen2
+Q4_0 prefill reds: CPU/Q8-KV (cosine 0.998815, KL 0.00138603, Top-5 4/5),
+CUDA/Q8-KV (0.997842, 0.00317625, 4/5), and ROCm/TQ (0.997056, 0.00749205,
+4/5). All incremental decode rows satisfy their current gates, but CUDA matches
+four of five HF token IDs, not five; the earlier GPU attribution note is now
+explicit about that distinction. This is not a failure of the new serial/MTP
+exact-token comparisons. Full and partial prefix restore rows pass; fresh rows
+inherit the failing prefill checkpoint.
+
+The user approved the three scoped changes on September 13: Top-5 95% to
+80% for those cells, plus ROCm/TQ prefill KL 0.005 to 0.008. They are now
+declared in the Qwen2 single-device definitions and verified by fresh HF runs.
+Because the existing KL field also controlled incremental decode, an optional
+prefill-only budget preserves ROCm/TQ's 0.005 decode budget and every MTP
+budget. All other backend/KV declarations remain unchanged. Device-free
+regressions check phase isolation and exact precision-axis projection. The
+selected matrix and Unit target rebuilt successfully, and the complete
+`V2_Unit_ModelParityDefinition` case passes in 0.68s. A live metadata-only
+export confirms all 18 Qwen2 single-device runtime/generation configurations
+remain identical to the original inventory.
+
+After the complete 650-Unit/167-preflight refresh, the canonical individual
+runner passes all three exact cells in
+`qwen2-approved-kv-allowances-fresh-01/report.json`, retaining all eight
+required CSVs per cell. No request, precision, weight, reference or runtime
+configuration was changed. Both GGUFs and the v4 HF reference pack were reused.
+
+| Exact Q4_0 cell | Whole-cell seconds | Prefill cosine | Prefill KL | Top-5 |
+|---|---:|---:|---:|---:|
+| CPU / Q8_1 KV | 2.900 | 0.998723 | 0.00121178 | 4/5 |
+| CUDA / Q8_1 KV | 3.817 | 0.997842 | 0.00317625 | 4/5 |
+| ROCm / TQ KV | 3.448 | 0.997056 | 0.00749205 | 4/5 |
+
+Every prefill/decode checkpoint, all three prefix phases and the production-path
+contract pass. CUDA and ROCm both prove complete captured prefill/decode without
+segmentation. The existing incremental-decode rule is **cosine OR KL**, not a
+hard KL-only ceiling: maximum decode KL is 0.003345/0.0128285/0.0128286 and
+minimum cosine is 0.999042/0.998568/0.998471 for CPU/CUDA/ROCm respectively.
+That rule and its numerical limits were not changed. HF decode token matches
+remain 5/5, 4/5 and 5/5; they are not the serial/MTP generation equality gate.
+The previously approved CPU/Q16 proof remains separate. These three numerical
+reds are now individually closed, but neither the corpus nor a shipping image
+is approved by these local proofs.
+
+The resumed native HTTP batch retains the original Release runtime and inventory
+and uses the refreshed receipt above. The numerical test binaries do not change
+its requests or expected streams. Do not rerun prerequisites per cell.
+
+### September 13 — repeatable native acquisition audit
+
+`scripts/ci/audit_generation_acquisition.py` now joins explicit original reports
+to the canonical all-cell inventory through the existing inventory/serial
+relationship reader. Each counted pass revalidates its complete saved HTTP
+responses and compares immutable tokens with its original Off control. It
+retains failed later attempts, rejects duplicate passes, stale configurations,
+missing controls, incomplete responses and escaping artifact paths. Completed
+cells in an interrupted aggregate remain evidence; an unfinished cell does not.
+
+The initial real-data exercise checks all 175 controls and 139 then-completed
+MTP cells in 14.091s, with no unresolved failures. Only token traces remain
+resident after each observation is validated, avoiding accumulated movement
+journals or repeated control parsing. Source revisions are preserved as
+acquisition provenance, not rewritten: the controls span an earlier checkpoint
+whose complete configurations still agree. The audit explicitly remains
+unapproved and non-certifying, and never claims a fresh image/source proof.
+Eight focused device-free cases join the existing production-pipeline Unit
+test; both registered pipeline/E2E script gates pass in 1.53s. The audit does
+not change the live driver, validator, inference binary or admitted run.
+
+### September 13 — container mount admission hardening
+
+The outer pipeline's path translator accepted `/src/models/../outside.gguf`
+and produced `<selected-model-mount>/../outside.gguf`. `Path.relative_to()`
+checks a lexical prefix but does not reject parent traversal. Source metadata
+could therefore escape the selected model namespace before the stat-pin step.
+This was found with a device-free negative probe while the unchanged native
+MTP driver continued; it is not a model inference failure.
+
+`remap_manifest()` now requires canonical shard paths inside the installed
+mount and an absolute, resolved destination mount. It rejects parent traversal,
+normalized aliases, control characters and mount-only paths. The operation
+remains lexical because resolving a container path on the host would consult
+the wrong filesystem. All execution/workload fields and input records remain
+unchanged; existing shard pins and reviewed numerical provenance still own
+weight identity. No GGUF hashing or filesystem probing was added.
+
+Test-first negative cases produced 20 failing subcases before the repair.
+The complete **126-test** device-free pipeline suite now passes in 1.862s;
+registered `V2_Unit_ProductionPipeline` and `V2_Unit_ModelParityE2E` pass together
+in 2.48s. Added composition tests prove that translated inventories retain
+the reviewed serial tokens, reject a changed secondary-shard size and reject
+an escaped untagged shard in the real `run_variant()` build transition before
+stat admission. Docker/build processes alone are mocked. The new regressions
+are in the existing Unit registration, not a device or performance gate.
+
+Only the outer CI script, its device-free tests and docs changed in this slice.
+The admitted runtime, generation driver, helper modules, canonical inventory,
+controls and ongoing batch are unchanged. Their shared runtime prerequisite
+receipt is not rerun for these native cells. This local test result does not
+certify either Docker image or complete the generation-phase cutover below.
+
+### Remaining CI cutover audit — inventory binding installed, generation pending
+
+Inspection during the continuing MTP collection identifies these specific
+implementation boundaries. The September 13 inventory follow-on below is now
+implemented locally; the remaining generation cutover is not. Do not launch another expensive Docker
+certification run until the replacement routine gate actually owns them.
+
+| Boundary | Current source | Required cutover |
+|---|---|---|
+| Complete inventory | BUILD now exports `model_parity_inventory.py --scope all`, retains image/host copies, derives the exact E2E projection and pins every full-inventory shard. | Verify the changed discovery transition in both new ISA images after local cell closure; old images are not evidence for this implementation. |
+| Prerequisites | `run_production_prerequisites.py` now exposes the existing full gate as a model-free command for local or installed builder trees. Generation currently accepts only the local-build reuse path. | Wire the canonical receipt into one actual Unit/preflight execution per ISA image. Bind installed-test evidence to the matching source/test/runtime images; no skip switch or host-build receipt may certify a container. |
+| Expected streams | Collection/comparison remain non-certifying. `generation_corpus.py` now supplies a separately tested, read-only reviewed-pin consumer with full membership, shard/configuration, ISA and serial-token validation. It is not yet connected to the driver. | Complete acquisition/provenance review and explicit corpus publication, install the approved source pin, then connect routine generation to this consumer. Never bless a candidate's own output or quietly regenerate expected tokens. |
+| Dynamic-depth envelope | `validate_mtp_outcome()` verifies positive controller updates and internally coherent bounds, but not equality to the declared dynamic limits. An in-memory negative probe capped at 1 is accepted despite the canonical maximum being 15. | Add a focused rejection regression and authenticate the terminal bounds against the canonical configuration before certifying. Current completed dynamic responses independently audit to 1–15; this is a validator gap, not an observed runtime clamp. |
+| Container paths | The outer `remap_manifest()` now rejects noncanonical/escaping declarations; the approved-corpus consumer admits translated complete inventories through canonical shard pins. Diagnostic `GenerationCell.admit_control()` still deliberately requires exact saved configurations. | Connect the certifying generation mode to those existing inventory/corpus boundaries, without rewriting historical observation configurations or inventing another path/policy expander. A mount alias may change spelling, never model identity, workload, topology or policy. |
+| Routine execution | `Phase.PARITY` still launches the deep HF/CSV driver. | Replace the routine phase with full Release HTTP generation against the approved corpus; keep the deep mathematical command as an explicit diagnostic, not an automatic second path. |
+| Certification | `certificates()` still consumes numerical `parity.json`, now with exact full-inventory membership and tagged-projection checks; E2E and benchmarks require the complete tagged selection. | Join full generation membership, approved-corpus identity, prerequisite evidence, immutable image/ISA and manifest identity before packaging. Preserve the existing both-ISA E2E-before-benchmark barrier and certificate-layer readback. |
+
+The target dependency graph is deliberately small; every box must acquire real
+evidence, and no local control pass substitutes for an image-bound result:
+
+```mermaid
+flowchart TD
+    C[Full canonical C++ / CTest inventory] --> G[All HTTP generation cells]
+    C --> T[E2E-tagged projection]
+    C --> W[All declared model and shard identities]
+    W --> G
+    A[Explicit approved immutable token corpus] --> G
+    U[Unit and preflight in matching test image] --> G
+    R[Matching full-backend Release image] --> G
+    G --> E[Complete E2E suite per ISA]
+    T --> E
+    E --> J[Both AVX512 and AVX2 E2E suites green]
+    J --> B[Tagged Release benchmarks per ISA]
+    B --> P[Image-bound certificates and packaging checks]
+```
+
+Focused device-free tests must reject E2E-only inventories masquerading as full
+coverage, missing/duplicate controls, changed workloads or sampling, unapproved
+or self-generated baselines, wrong source/image/ISA bindings, stale prerequisite
+receipts, model alias substitution, partial E2E benchmark admission and changed
+certificate payloads. Exercise the new pieces independently before the complete
+two-image script. Ordinary source builds and model-free gates still must not
+initialize the optional corpus submodule or fetch its LFS payloads.
+
+For the pending MTP-envelope check, export expected limits from the same typed
+C++ configuration that owns the CLI projection. Add this evidence contract to
+MTP-enabled records only; an Off record has no speculative envelope, so its
+existing serial-control configuration need not change. The consumer must reject
+missing or mismatched limits for fresh certifying MTP records, including a
+dynamic ceiling silently capped at one. Do not derive expectations from test
+names, parse CLI strings or trust the response's own bounds. Before using older
+MTP observations as acquisition provenance, explicitly revalidate their actual
+terminal limits against the new producer contract while preserving the original
+run/configuration evidence. That review must not relabel an old run as a fresh
+image execution. This is the cutover plan, not an installed validator change.
+
+### September 13 — full image inventory binding implemented independently
+
+The initial audit was read-only. Its inventory correction is now implemented
+in the outer pipeline, without changing the live generation driver, its shared
+modules, inference binaries, canonical workload, manifest or admitted batch.
+BUILD retains `container-all-cells.json`, translates only model paths into
+`all-cells.json`, and derives `manifest.json` from its existing E2E tags. Every
+declared shard is pinned before model admission and rechecked on resume.
+Certification authenticates the exact projection and exact completed numerical
+campaign/cell membership, not merely a positive count. This prepares the same
+inventory boundary for the later routine generation gate; it does not install
+that gate or approve a corpus.
+
+Test-first regressions reproduced the old E2E-only discovery and acceptance of
+incomplete inventory/count evidence. The implementation passes all **90**
+device-free pipeline tests in 1.040s. Both registered
+`V2_Unit_ProductionPipeline` and `V2_Unit_ModelParityE2E` pass together in
+1.66s. The real `run_variant()` build/resume transition is exercised with only
+external Docker/build operations mocked: it discovers without selectors, pins
+untagged model shards, retains all three manifests and rejects an untagged-shard
+change before resuming. Other negative cases cover malformed/duplicate cells,
+wrong source/scope, altered projections, missing/failed numerical aggregates,
+and same-sized but wrong exact selections. These tests remain in the existing
+Unit gate registration; no device or benchmark workload enters that gate.
+
+An independent metadata-only check on the actual 510-cell inventory produces
+exactly the canonical exporter's 13 tagged records and pins all 16 model shards.
+The old tagged-only manifest covered just seven, leaving nine untagged model
+files outside pipeline reuse checks. No GGUF payload was read or hashed.
+No Docker image has yet been built or certified from this change. Refresh the
+complete image-bound gates at the eventual source freeze; the continuing local
+MTP acquisition still uses its unchanged inference build and prerequisite.
+
+### September 13 — matching test/runtime image admission verified locally
+
+The builder previously declared only source identity, while runtime admission
+checked its ISA and backend set. Both output images now declare their distinct
+roles, source, CPU ISA, Release build and CUDA/ROCm enablement. Builder admission
+additionally rejects a skipped Integration installation. The typed image-pair
+check uses the requested shipping ISA, never the image's own label as its
+expected value. A bad builder fails before building the runtime; resume
+re-inspects both image IDs, labels and layer lists. Installed-test authentication
+and actual Unit/preflight execution remain mandatory independent obligations.
+
+All **95** pipeline Unit tests pass in 1.592s. The registered pipeline,
+ModelParityE2E and AcceleratorBuildTypeFlags groups pass together in 2.17s.
+The NativeVNNI dispatch-refresh runner also reports all 117 tests passing,
+including its per-ISA oneDNN/Docker build-cache check. Negative cases include
+missing/wrong labels for both roles and ISAs, swapped/shared image identities,
+skipped Integration builds and altered resume metadata. The producer label test
+checks that exported metadata references actual Docker build arguments rather
+than fixed values. These are device-free script tests; no new image build or
+certificate is claimed. Refresh the complete image-bound gates after the local
+matrix and pending generation cutover are ready.
+
+### September 13 — read-only approved-corpus consumer implemented
+
+`generation_corpus.py` adds the missing reader, without changing the running
+generation driver or any inference binary. `ApprovedCorpusPin` supplies the
+reviewed document identity and expected ISA from the eventual consuming source
+snapshot. `ApprovedGenerationCorpus` checks full inventory compatibility,
+complete model/shard declarations, numerical/serial/MTP provenance references,
+exact Off-control membership and every ordered continuous token stream. It
+stores immutable token tuples; no old movement, prefix or MTP receipt becomes
+today's runtime proof. The module has no collection, approval, repair, download
+or publication operation. No real corpus or source approval pin was created.
+
+Portable compatibility strips only model mount spelling and top-level source
+revision. It consumes canonical source stat pins to retain every shard filename
+and byte length, without hashing GGUFs. Serial/MTP binding additionally compares
+the full shard set: the same primary GGUF cannot hide a different secondary
+shard. Independent numerical proof remains necessary to establish model-content
+equivalence; filename/size metadata is not claimed to be that proof.
+
+All 13 new adversarial reader tests pass within the existing **108-test**
+pipeline Unit registration (6.018s). Pipeline, canonical inventory, E2E and
+movement-ledger Unit groups pass together in 6.62s. Cases reject unreviewed or
+changed payloads, wrong ISA, changed runtime/request policy, missing/extra or
+ambiguous shards, MTP-specific answers, incomplete provenance, reordered or
+nonrepeatable requests, token-383 corruption and short EOS evidence. Missing
+files and LFS pointers fail without download or writes. Both ISA pins are
+exercised, and returned token maps cannot mutate the admitted expectations.
+
+A metadata-only audit of the actual inventory validates all **510 cells,
+175 serial controls and 16 model shards**, including unchanged portable identity
+under a different mount, inode/stat instance and source revision. Original
+observations remain untouched. The acquisition publisher, approved pin,
+generation-driver cutover and real per-image certification are still pending;
+these reader tests do not substitute for any of them.
+
+The source-selection boundary is now implemented as `load_reviewed()`. It
+reads a fixed catalog path inside the admitted source snapshot, selects the
+explicit shipping ISA and loads only that entry's materialized payload from
+the separately mounted corpus root. Candidate-side pins, wrong/missing ISA
+approvals, malformed catalog metadata, noncanonical relative paths and
+symlinks escaping either admitted root fail before token admission. No real
+catalog, pin or approved corpus was created.
+
+Five additional regressions verify that boundary, including both independent
+ISA approvals and no writes/downloads when the other ISA's payload is missing.
+All **118** pipeline Unit tests pass in 0.871s; the pipeline, campaign,
+inventory and E2E registered Unit groups pass together in 3.61s. The live
+generation scripts and inference binaries remain unchanged.
+
+The consumer now binds each expectation lookup to the complete current
+configuration rather than accepting only a cell ID. Its immutable admission
+digest rejects a same-named cell with changed model path, topology, sampler,
+movement or MTP policy, and mutation of the caller's original inventory cannot
+change the admitted contract. A different model mount still works through full
+inventory admission, not an implicit per-cell alias. The new negative
+regression and all **119** pipeline Unit tests pass (0.772s); all four relevant
+framework CTest groups pass together in 3.57s. This isolated reader change does
+not alter the running acquisition validator.
+
+### September 13 — standalone canonical prerequisite entrypoint verified
+
+The runtime HTTP driver belongs on the host so it can launch the tested
+Release image, while Unit/preflight belongs inside the corresponding builder.
+`run_production_prerequisites.py` exposes that model-free transaction without
+copying the inventories or gate state machine. It calls the existing
+`run_production_parity_preflight()` authority, which owns build/installation
+authentication, both complete CTest phases, the receipt and XML/log evidence.
+No nested Docker socket, extra model staging, receipt synthesis or skip path
+is added. The eventual outer generation transition still needs to bind the
+installed receipt to its admitted builder/source/ISA; it is not wired yet.
+
+Five new entrypoint regressions exercise real canonical gate transitions with
+only external operations mocked. Both local and installed paths execute full
+Unit then Integration preflight; local builds both CMake gate targets, while
+installed execution validates the sealed inventory instead. Wrong/missing
+installed receipts fail without trying an incremental rebuild. Existing output
+is preserved, failed return codes propagate, and selectors/skip switches reject.
+The actual CLI help/import smoke test also passes.
+
+All **113** pipeline Unit tests pass in 1.069s and all **72** campaign-framework
+tests pass in 3.120s. Together with inventory/E2E tests, the four registered
+groups pass in 3.57s. This is device-free implementation verification, not a
+new full live prerequisite receipt or Docker certificate. The active generation
+batch's prerequisite has not been rerun.
+
+### September 13 — frozen host-script phase boundary regression
+
+The outer pipeline already launches E2E and benchmark drivers from each ISA's
+admitted `source/` snapshot, while model-free tests execute inside the matching
+builder. A new device-free regression exercises the real phase transitions
+with external execution mocked: both ISAs must use those archived script paths,
+the immutable runtime image and exact projected manifest; changing source during
+E2E prevents the next benchmark phase. No production implementation change was
+needed for this boundary. Mock reports prove scheduling, not an image pass.
+All **120** pipeline Unit tests and the four relevant framework CTest groups
+pass, the latter in 2.71s. The live generation batch is unchanged.
 
 ### Native terminal archive and runner forwarding — all ten native controls green
 

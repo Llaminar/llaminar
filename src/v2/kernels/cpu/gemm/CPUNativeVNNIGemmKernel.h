@@ -2,29 +2,15 @@
  * @file CPUNativeVNNIGemmKernel.h
  * @brief ITensorGemm implementation for CPU NativeVNNI GEMM/GEMV.
  *
- * This kernel keeps weights in their native quantized format (Q4_0, IQ4_NL, etc.)
- * and decodes blocks inline during computation using AVX-512 VNNI (vpdpbusd).
- *
- * ## Comparison with CPUQuantisedGemmKernel
- *
- * | Aspect | CPUQuantisedGemmKernel | CPUNativeVNNIGemmKernel |
- * |--------|--------------------|-----------------------|
- * | Weight packing | Decode to INT8 at pack time | Keep native bytes, decode at runtime |
- * | Weight memory | 1 byte/element | 0.5 byte/element (Q4_0) |
- * | GEMV bandwidth | 2× memory traffic | 1× memory traffic |
- * | Decode cost | Zero (pre-decoded) | Small (nibble unpack) |
- * | Best for | M>1 (compute-bound) | M=1 (memory-bound GEMV) |
- *
- * ## Supported Formats (Phase 1)
- *
- * - Q4_0: Simple symmetric 4-bit (16 byte payload / 32 elements)
- * - IQ4_NL: Non-linear 4-bit with LUT (16 byte payload / 32 elements)
- *
- * Additional formats can be added by implementing decode_native_block() cases
- * in CPUNativeVNNIGemv.h.
+ * Immutable prepared weights use the canonical NativeVNNI format registry and
+ * AVX2/AVX512 runtime dispatch. Serial decode and grouped verification retain
+ * their explicit numerical policy and reduction order. A shared prepared
+ * engine never retains another participant's workspace binding: the owning
+ * stage supplies admitted activation scratch with each invocation.
  */
 
 #pragma once
+#include "CPUProjectionWorkspaceContract.h"
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
@@ -35,6 +21,7 @@
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 
 #include <atomic>
 
@@ -76,7 +63,8 @@ namespace llaminar2::cpu::native_vnni
         int previous_ = 0; ///< Scope value restored at transaction completion.
     };
 
-    class CPUNativeVNNIGemmKernel : public ITensorGemm
+    /** @brief Prepared quantized weights with participant-owned invocation scratch. */
+    class CPUNativeVNNIGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
     {
     public:
         /**
@@ -141,6 +129,36 @@ namespace llaminar2::cpu::native_vnni
         }
 
         ~CPUNativeVNNIGemmKernel() override = default;
+
+        /**
+         * @brief Declare the input bank without retaining a participant binding.
+         * @param m Maximum simultaneous input rows for this projection.
+         * @param k Explicit K geometry, or zero to use the prepared matrix width.
+         * @return Q8 and ordered-partial banks, plus the optional rotated input tile.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int = 0, int k = 0) const override
+        {
+            const int columns = k > 0 ? k : packed_.K;
+            auto requirements = CPUProjectionWorkspaceContract::prepared(packed_.preparedFootprint(),
+                packed_.codebook_id, {.rows = m, .n = packed_.N, .k = packed_.K,
+                    .serial_n = cpuNativeVNNISerialEquivalentPolicyN(packed_.N),
+                    .workers = nativeVNNIInvocationWorkerCount(),
+                    .execution = CPUExecutionGeometry::local(), .numerical_policy = numerical_policy_});
+            // An explicit wider input bank may be shared with another serial
+            // projection; it cannot shrink this engine's physical requirement.
+            if (columns != packed_.K) requirements.merge(cpuProjectionQ8WorkspaceRequirements(m, columns));
+            if (activation_rotation_)
+                requirements.merge(cpuProjectionFP32WorkspaceRequirements(kCPUProjectionRotation, m, columns));
+            return requirements;
+        }
+
+        /** @brief Preserve the beta addend only when the owning stage selects accumulation. */
+        void appendOutputAccumulationWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, int n) const override
+        {
+            requirements.merge(cpuProjectionFP32WorkspaceRequirements(
+                kCPUProjectionProduct, m, n > 0 ? n : packed_.N));
+        }
 
         // -------------------------------------------------------------------
         // ITensorKernel interface
@@ -240,10 +258,14 @@ namespace llaminar2::cpu::native_vnni
             float *C_data = C->mutable_data();
 
             // Apply activation rotation for kurtosis reduction (if configured)
-            A_data = maybe_rotate_activation(A_data, m, k);
+            const auto activation_storage = q8Workspace(workspace, m, k);
+            const auto product_storage = productWorkspace(workspace, m, n, beta);
+            const auto partial_storage = partialWorkspace(workspace, m);
+            A_data = maybe_rotate_activation(A_data, m, k, workspace);
 
             multiply_native_vnni_with_epilogue(
-                packed_, A_data, C_data, m, n, alpha, beta);
+                packed_, A_data, C_data, m, n, alpha, beta,
+                activation_storage, product_storage, partial_storage);
 
             // Apply bias epilogue: C[m, j] += bias[j]
             if (bias)
@@ -426,13 +448,10 @@ namespace llaminar2::cpu::native_vnni
 
             // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
 
-            // Prepared CPU expert engines are shared across graph participants in
-            // LocalTP. Keep per-call scratch thread-local so concurrent users do
-            // not race on mutable engine state.
-            thread_local AlignedVector<float> swiglu_scratch_tls;
-            const size_t needed = input_size;
-            if (swiglu_scratch_tls.size() < needed)
-                swiglu_scratch_tls.resize_uninitialized(needed);
+            // Participants can share weights, but never this live intermediate.
+            // The arena owns the admitted tile before inference starts.
+            auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
+                workspace, kCPUSwiGLUInput, input_size);
 
             // M=1 decode: use serial SwiGLU to avoid OMP fork/join overhead.
             // For MoE experts with intermediate=512, the 512-element SwiGLU
@@ -445,7 +464,7 @@ namespace llaminar2::cpu::native_vnni
                     primitives::compute_swiglu_gpu_aligned_expert_serial(
                         gate_fp32,
                         up_fp32,
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         static_cast<int>(input_size));
                 }
                 else
@@ -453,7 +472,7 @@ namespace llaminar2::cpu::native_vnni
                     primitives::compute_swiglu_gpu_aligned_expert(
                         gate_fp32,
                         up_fp32,
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         static_cast<int>(input_size));
                 }
             }
@@ -462,7 +481,7 @@ namespace llaminar2::cpu::native_vnni
                 primitives::compute_swiglu_serial(
                     gate_fp32,
                     up_fp32,
-                    swiglu_scratch_tls.data(),
+                    swiglu_scratch.data(),
                     static_cast<int>(input_size));
             }
             else
@@ -470,15 +489,17 @@ namespace llaminar2::cpu::native_vnni
                 primitives::compute_swiglu(
                     gate_fp32,
                     up_fp32,
-                    swiglu_scratch_tls.data(),
+                    swiglu_scratch.data(),
                     static_cast<int>(input_size));
             }
 
             // Apply activation rotation for kurtosis reduction (if configured)
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), m, k, workspace);
 
             multiply_native_vnni_with_epilogue(
-                packed_, gemm_input, output_fp32, m, n, alpha, beta);
+                packed_, gemm_input, output_fp32, m, n, alpha, beta,
+                q8Workspace(workspace, m, k), productWorkspace(workspace, m, n, beta),
+                partialWorkspace(workspace, m));
             return true;
         }
 
@@ -539,9 +560,8 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            thread_local AlignedVector<float> swiglu_scratch_tls;
-            if (swiglu_scratch_tls.size() < input_size)
-                swiglu_scratch_tls.resize_uninitialized(input_size);
+            auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
+                workspace, kCPUSwiGLUInput, input_size);
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
@@ -552,7 +572,7 @@ namespace llaminar2::cpu::native_vnni
                 primitives::compute_swiglu_gpu_aligned_expert(
                     gate_fp32,
                     up_fp32,
-                    swiglu_scratch_tls.data(),
+                    swiglu_scratch.data(),
                     static_cast<int>(input_size));
             }
             else
@@ -560,7 +580,7 @@ namespace llaminar2::cpu::native_vnni
                 primitives::compute_swiglu(
                     gate_fp32,
                     up_fp32,
-                    swiglu_scratch_tls.data(),
+                    swiglu_scratch.data(),
                     static_cast<int>(input_size));
             }
             recordVerifierTiming(
@@ -571,17 +591,14 @@ namespace llaminar2::cpu::native_vnni
                 k,
                 1);
 
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch.data(), m, k, workspace);
             const int K_blocks = (k + 31) / 32;
-            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
-            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
-            if (shared_q8_tls.size() < shared_q8_blocks)
-                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            auto shared_q8 = q8Workspace(workspace, m, k);
             perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                       : PerfStatsCollector::Clock::time_point{};
             quantize_activations_to_q8_1(
                 gemm_input,
-                shared_q8_tls.data(),
+                shared_q8.data(),
                 m,
                 k,
                 K_blocks,
@@ -598,8 +615,9 @@ namespace llaminar2::cpu::native_vnni
                                       : PerfStatsCollector::Clock::time_point{};
             gemm_native_vnni_preq_decode_equivalent_rows(
                 packed_,
-                shared_q8_tls.data(),
+                shared_q8.data(),
                 output_fp32,
+                partialWorkspace(workspace, m),
                 m,
                 n);
             recordVerifierTiming(
@@ -690,17 +708,13 @@ namespace llaminar2::cpu::native_vnni
                     return false;
             }
 
-            input_data = maybe_rotate_activation(input_data, m, k);
+            input_data = maybe_rotate_activation(input_data, m, k, workspace);
             const int K_blocks = (k + Q8_1Block::BLOCK_SIZE - 1) /
                                  Q8_1Block::BLOCK_SIZE;
-            const size_t required_blocks =
-                static_cast<size_t>(m) * static_cast<size_t>(K_blocks);
-            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
-            if (shared_q8_tls.size() < required_blocks)
-                shared_q8_tls.resize_uninitialized(required_blocks);
+            auto shared_q8 = q8Workspace(workspace, m, k);
             quantize_activations_to_q8_1(
                 input_data,
-                shared_q8_tls.data(),
+                shared_q8.data(),
                 m,
                 k,
                 K_blocks,
@@ -719,8 +733,9 @@ namespace llaminar2::cpu::native_vnni
                     };
                 }
                 gemv_native_vnni_fused_preq(
-                    shared_q8_tls.data(),
+                    shared_q8.data(),
                     descriptors.data(),
+                    fusedPartialWorkspace(workspace),
                     static_cast<int>(projections.size()));
                 return true;
             }
@@ -729,8 +744,9 @@ namespace llaminar2::cpu::native_vnni
             {
                 gemm_native_vnni_preq(
                     vnni_kernels[i]->packed_,
-                    shared_q8_tls.data(),
+                    shared_q8.data(),
                     outputs[i],
+                    vnni_kernels[i]->partialWorkspace(workspace, m),
                     m,
                     projections[i].n);
                 if (biases[i])
@@ -834,16 +850,13 @@ namespace llaminar2::cpu::native_vnni
                 PerfStatsCollector::isDomainEnabled("kernel");
             auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                            : PerfStatsCollector::Clock::time_point{};
-            input_data = maybe_rotate_activation(input_data, m, k);
+            input_data = maybe_rotate_activation(input_data, m, k, workspace);
 
             const int K_blocks = (k + 31) / 32;
-            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
-            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
-            if (shared_q8_tls.size() < shared_q8_blocks)
-                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            auto shared_q8 = q8Workspace(workspace, m, k);
             quantize_activations_to_q8_1(
                 input_data,
-                shared_q8_tls.data(),
+                shared_q8.data(),
                 m,
                 k,
                 K_blocks,
@@ -888,8 +901,9 @@ namespace llaminar2::cpu::native_vnni
                 perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                           : PerfStatsCollector::Clock::time_point{};
                 if (gemm_native_vnni_fused_verifier_rows_preq(
-                        shared_q8_tls.data(),
+                        shared_q8.data(),
                         fused_descs.data(),
+                        fusedPartialWorkspace(workspace),
                         static_cast<int>(projections.size()),
                         m,
                         K_blocks))
@@ -943,8 +957,9 @@ namespace llaminar2::cpu::native_vnni
                                           : PerfStatsCollector::Clock::time_point{};
                 gemm_native_vnni_preq_decode_equivalent_rows(
                     vnni->packed_,
-                    shared_q8_tls.data(),
+                    shared_q8.data(),
                     out_data,
+                    vnni->partialWorkspace(workspace, m),
                     m,
                     proj.n);
                 recordVerifierTiming(
@@ -1022,13 +1037,15 @@ namespace llaminar2::cpu::native_vnni
          * @param descriptors Complete projection set for one layer phase.
          * @param descriptor_count Number of valid entries in @p descriptors.
          * @param k Shared logical activation width.
+         * @param partial_storage Admitted invocation bank shared by every team worker.
          * @return `true` after every projection completes; `false` when the
          *         explicit eager/unrotated NativeVNNI contract is invalid.
          */
         static bool multiply_batched_preq_decode_equivalent(
             const BatchedPrequantizedProjectionDesc *descriptors,
             int descriptor_count,
-            int k)
+            int k,
+            std::span<float> partial_storage)
         {
             if (!descriptors || descriptor_count <= 0 ||
                 descriptor_count > kMaxBatchedPrequantizedProjections ||
@@ -1093,6 +1110,7 @@ namespace llaminar2::cpu::native_vnni
             if (!gemm_native_vnni_fused_verifier_rows_preq(
                     nullptr,
                     fused_descriptors.data(),
+                    partial_storage,
                     descriptor_count,
                     /*default_rows unused by explicit descriptors=*/1,
                     blocks_per_row))
@@ -1151,6 +1169,7 @@ namespace llaminar2::cpu::native_vnni
          * @param activation_blocks_per_row Q8_1 blocks in one SwiGLU row.
          * @param down_descriptors Down projections for all local experts.
          * @param down_count Number of valid down descriptors.
+         * @param partial_storage Admitted bank reused only after each phase's readers retire.
          * @return `true` only when every team participant completes every phase.
          */
         static bool execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
@@ -1164,7 +1183,8 @@ namespace llaminar2::cpu::native_vnni
             int intermediate,
             int activation_blocks_per_row,
             const BatchedPrequantizedProjectionDesc *down_descriptors,
-            int down_count)
+            int down_count,
+            std::span<float> partial_storage)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1223,7 +1243,7 @@ namespace llaminar2::cpu::native_vnni
                 if (!multiply_batched_preq_decode_equivalent(
                         gate_up_descriptors,
                         gate_up_count,
-                        hidden_width))
+                        hidden_width, partial_storage))
                 {
                     transaction_ok.store(false, std::memory_order_relaxed);
                 }
@@ -1240,7 +1260,7 @@ namespace llaminar2::cpu::native_vnni
                 if (!multiply_batched_preq_decode_equivalent(
                         down_descriptors,
                         down_count,
-                        intermediate))
+                        intermediate, partial_storage))
                 {
                     transaction_ok.store(false, std::memory_order_relaxed);
                 }
@@ -1295,12 +1315,14 @@ namespace llaminar2::cpu::native_vnni
          * @param m Number of gathered route rows. Runtime M is bounded only by
          *          the caller's declared graph and scratch capacity.
          * @param k FP32 logical width represented by each Q8_1 row.
+         * @param partial_storage Caller-owned admitted partial bank for the complete bundle.
          */
         bool multiply_fused_router_q8_hidden_grouped_decode_equivalent(
             const Q8_1Block *input_q8,
             const std::vector<TensorProjectionDesc> &projections,
             int m,
-            int k)
+            int k,
+            std::span<float> partial_storage)
         {
             constexpr size_t kMaxRouterQ8Projections = 16u;
             if (!valid_ || !input_q8 || m < 1 || k <= 0 ||
@@ -1365,6 +1387,7 @@ namespace llaminar2::cpu::native_vnni
                 gemv_native_vnni_fused_preq(
                     input_q8,
                     descriptors.data(),
+                    partial_storage,
                     static_cast<int>(projections.size()));
             }
             else
@@ -1389,6 +1412,7 @@ namespace llaminar2::cpu::native_vnni
                 if (!gemm_native_vnni_fused_verifier_rows_preq(
                         input_q8,
                         descriptors.data(),
+                        partial_storage,
                         static_cast<int>(projections.size()),
                         m,
                         K_blocks))
@@ -1425,7 +1449,7 @@ namespace llaminar2::cpu::native_vnni
 
         bool multiply_fused_expert_down(
             const FusedExpertDownDesc *descs, int num_descs,
-            int m, int k) override
+            int m, int k, DeviceWorkspaceManager *workspace = nullptr) override
         {
             if (!descs || m != 1 || num_descs < 1 ||
                 num_descs > kMaxBatchedPrequantizedProjections || k <= 0)
@@ -1446,33 +1470,41 @@ namespace llaminar2::cpu::native_vnni
 
             // Quantize each expert's FP32 input to Q8_1
             // Use a contiguous buffer for all experts' Q8_1 blocks
-            thread_local AlignedVector<Q8_1Block> multi_q8_tls;
-            const size_t total_blocks = static_cast<size_t>(num_descs) * K_blocks;
-            if (multi_q8_tls.size() < total_blocks)
-                multi_q8_tls.resize_uninitialized(total_blocks);
+            auto multi_q8 = q8Workspace(workspace, num_descs, k);
 
-            for (int i = 0; i < num_descs; ++i)
-            {
-                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(
-                    descs[i].kernel);
-                Q8_1Block *A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
-                const float *input_data = descs[i].input;
-                int kb = 0;
+            auto quantize_inputs = [&]() {
+                for (int i = 0; i < num_descs; ++i)
+                {
+                    auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(
+                        descs[i].kernel);
+                    Q8_1Block *A_q8 = multi_q8.data() + static_cast<size_t>(i) * K_blocks;
+                    const float *input_data = descs[i].input;
+                    int kb = 0;
 #if defined(__AVX512F__)
-                for (; kb + 1 < K_blocks; kb += 2)
-                    quantizeTwoActivationBlocks(
-                        input_data + kb * 32,
-                        A_q8[kb],
-                        A_q8[kb + 1],
-                        vnni->numerical_policy_);
+                    for (; kb + 1 < K_blocks; kb += 2)
+                        quantizeTwoActivationBlocks(
+                            input_data + kb * 32,
+                            A_q8[kb],
+                            A_q8[kb + 1],
+                            vnni->numerical_policy_);
 #endif
-                for (; kb < K_blocks; ++kb)
-                    quantizeActivationBlock(
-                        input_data + kb * 32,
-                        A_q8[kb],
-                        std::min(32, k - kb * 32),
-                        vnni->numerical_policy_);
+                    for (; kb < K_blocks; ++kb)
+                        quantizeActivationBlock(
+                            input_data + kb * 32,
+                            A_q8[kb],
+                            std::min(32, k - kb * 32),
+                            vnni->numerical_policy_);
+                }
+            };
+            // One retained team shares the complete distinct-input bank.
+            // Publish it once, then let every worker enter the fused launcher.
+            if (omp_in_parallel())
+            {
+#pragma omp single
+                { quantize_inputs(); }
             }
+            else
+                quantize_inputs();
 
             std::array<FusedGemvMultiInputDesc,
                        kMaxBatchedPrequantizedProjections>
@@ -1481,7 +1513,7 @@ namespace llaminar2::cpu::native_vnni
             {
                 auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
                 auto &d = mi_descs[static_cast<size_t>(i)];
-                d.A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
+                d.A_q8 = multi_q8.data() + static_cast<size_t>(i) * K_blocks;
                 d.packed = &vnni->packed_;
                 d.output = descs[i].output;
                 d.N = descs[i].n;
@@ -1490,6 +1522,7 @@ namespace llaminar2::cpu::native_vnni
             // Single OMP region with nowait between expert projections
             gemv_fused_multi_input_preq(
                 mi_descs.data(),
+                    fusedPartialWorkspace(workspace),
                 num_descs);
 
             if (PerfStatsCollector::isDomainEnabled("kernel"))
@@ -1510,6 +1543,33 @@ namespace llaminar2::cpu::native_vnni
         }
 
     private:
+        /** @return The invocation's declared slab; the fused plan checks its used prefix. */
+        static std::span<float> fusedPartialWorkspace(DeviceWorkspaceManager *workspace)
+        {
+            return CPUInvocationWorkspace::available<float>(workspace, kCPUProjectionPartials);
+        }
+        /** @return The nonzero-beta product bank; zero-beta execution borrows no extra bytes. */
+        static std::span<float> productWorkspace(DeviceWorkspaceManager *workspace, int rows, int columns, float beta)
+        {
+            if (beta == 0.f) return {};
+            return CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionProduct,
+                CPUInvocationWorkspace::multiply(static_cast<size_t>(rows), static_cast<size_t>(columns)));
+        }
+
+        /** @return Shared producer/reducer storage from this invocation's arena. */
+        std::span<float> partialWorkspace(DeviceWorkspaceManager *workspace, int rows) const
+        {
+            return CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionPartials,
+                nativeVNNIProjectionPartialFloats(packed_, rows));
+        }
+
+        /** @brief Borrow the complete input bank before any quantizer writes to it. */
+        static std::span<Q8_1Block> q8Workspace(DeviceWorkspaceManager *workspace, int rows, int columns)
+        {
+            return CPUInvocationWorkspace::require<Q8_1Block>(workspace, kCPUProjectionQ8,
+                cpuProjectionQ8Blocks(rows, columns));
+        }
+
         CPUNativeVNNIPackedWeights packed_;
         bool valid_ = false;
 
@@ -1521,25 +1581,44 @@ namespace llaminar2::cpu::native_vnni
          * @brief Optional block-diagonal activation transform paired with weights.
          *
          * The pointer is immutable after construction and is shared safely by
-         * concurrent callers. Scratch storage remains caller-thread local.
+         * concurrent callers. Each participant supplies its own admitted scratch.
          */
         const ActivationRotation *activation_rotation_ = nullptr;
 
-        /// Apply rotation to FP32 activation data, returns pointer to rotated data.
-        /// If no rotation is configured, returns the original pointer unchanged.
-        const float *maybe_rotate_activation(const float *input, int m, int k) const
+        /**
+         * @brief Copy and rotate each input row exactly once into borrowed storage.
+         * @param input Immutable source; never modified by this projection.
+         * @param m Simultaneously live rows.
+         * @param k Logical row width paired with the prepared rotation.
+         * @param workspace Participant-owned storage declared by this engine.
+         * @return Original input for an unrotated engine, otherwise the rotated bank.
+         *
+         * Copy and rotation share one row owner. Existing OpenMP teams enter
+         * the same workshare and its completion barrier publishes the full bank
+         * before quantization. A standalone single row needs no extra team.
+         */
+        const float *maybe_rotate_activation(const float *input, int m, int k, DeviceWorkspaceManager *workspace) const
         {
             if (!activation_rotation_)
                 return input;
 
             const size_t len = static_cast<size_t>(m) * k;
-            thread_local AlignedVector<float> rotation_scratch_tls;
-            if (rotation_scratch_tls.size() < len)
-                rotation_scratch_tls.resize_uninitialized(len);
-
-            std::memcpy(rotation_scratch_tls.data(), input, len * sizeof(float));
-            activation_rotation_->rotate_rows_inplace(rotation_scratch_tls.data(), m, k);
-            return rotation_scratch_tls.data();
+            auto rotated = CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, len);
+            auto rotate_row = [&](int row) {
+                float *destination = rotated.data() + static_cast<size_t>(row) * k;
+                std::memcpy(destination, input + static_cast<size_t>(row) * k, static_cast<size_t>(k) * sizeof(float));
+                activation_rotation_->rotate_inplace(destination, k);
+            };
+            if (m == 1 && !omp_in_parallel()) rotate_row(0);
+            else
+            {
+                auto work = [&]() {
+#pragma omp for schedule(static)
+                    for (int row = 0; row < m; ++row) rotate_row(row);
+                };
+                OMP_WORKSHARE_REGION(work);
+            }
+            return rotated.data();
         }
 
         /**

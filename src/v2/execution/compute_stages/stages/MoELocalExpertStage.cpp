@@ -17,6 +17,8 @@
 #include "MoELocalExpertStage.h"
 
 #include "MoEExpertComputeStage.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
@@ -962,6 +964,19 @@ namespace llaminar2
     MoELocalExpertStage::MoELocalExpertStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.device_id.is_cpu() && !params_.cpu_workspace_source &&
+            params_.gate_exps && params_.up_exps && params_.down_exps)
+        {
+            // A directly declared parent supplies source identity even before
+            // its engines are prepared. Registry-only followers without raw
+            // parents must receive this immutable declaration from the loader.
+            params_.cpu_workspace_source = CPUExpertWorkspaceSource{
+                .gate = params_.gate_exps->native_type(),
+                .up = params_.up_exps->native_type(),
+                .down = params_.down_exps->native_type(),
+                .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),
+                .execution = CPUExecutionGeometry::local()};
+        }
         if (!params_.input_rows && params_.input_rows_lifetime)
             params_.input_rows = params_.input_rows_lifetime.get();
         if (!params_.output_rows && params_.output_rows_lifetime)
@@ -1305,6 +1320,7 @@ namespace llaminar2
             std::make_unique<MoEExpertComputeStage>(
                 std::move(compute_params));
         retained_cpu_compute_stage_->releaseRawExpertWeights();
+        retained_cpu_compute_stage_->bindWorkspace(bound_workspace_);
         if (!retained_cpu_compute_stage_->bindSparseOverlayInvocation(
                 MoEExpertComputeStage::SparseOverlayInvocation{
                     .input = compact_hidden_.get(),
@@ -4556,12 +4572,20 @@ namespace llaminar2
 
     WorkspaceRequirements MoELocalExpertStage::getWorkspaceRequirements(int m, int n, int k) const
     {
+        const size_t hinted_compact_rows = checkedMultiply(
+            static_cast<size_t>(std::max(1, m)),
+            static_cast<size_t>(std::max(1, params_.top_k)),
+            "workspace compact row capacity");
+        if (hinted_compact_rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            (params_.input_rows && params_.input_rows->entry_capacity >
+                static_cast<size_t>(std::numeric_limits<int>::max())))
+            throw std::overflow_error("Local expert workspace compact rows exceed integer geometry");
         const int compact_rows_from_sparse_payload =
             params_.input_rows
                 ? static_cast<int>(std::max<size_t>(params_.input_rows->entry_capacity, 1u))
                 : 0;
         const int compact_rows_from_graph_hint =
-            std::max(1, m) * std::max(1, params_.top_k);
+            static_cast<int>(hinted_compact_rows);
         const int max_compact_rows =
             std::max(compact_rows_from_sparse_payload, compact_rows_from_graph_hint);
 
@@ -4626,6 +4650,40 @@ namespace llaminar2
         mergeGemmRequirements(params_.prepared_down_gemm,
                               params_.d_model,
                               params_.expert_intermediate);
+        if (params_.device_id.is_cpu())
+        {
+            reqs.merge(cpuSwiGLUWorkspaceRequirements(
+                max_compact_rows, params_.expert_intermediate));
+            if (params_.cpu_workspace_source)
+            {
+                // Price future arrivals with the same metadata contract as
+                // admission. Width alone cannot determine ordered K partials,
+                // and floating experts do not need a quantized activation bank.
+                const auto &source = *params_.cpu_workspace_source;
+                const auto mergeSource = [&](TensorType format, int outputs, int inputs)
+                {
+                    reqs.merge(CPUProjectionWorkspaceContract::sourceNative(format,
+                        {.rows = max_compact_rows, .n = outputs, .k = inputs,
+                         .workers = source.workers, .execution = source.execution,
+                         .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+                };
+                mergeSource(source.gate, params_.expert_intermediate, params_.d_model);
+                mergeSource(source.up, params_.expert_intermediate, params_.d_model);
+                mergeSource(source.down, params_.d_model, params_.expert_intermediate);
+            }
+            else if (params_.expert_weight_resolution_policy == ExpertWeightResolutionPolicy::RegistryOnly)
+            {
+                const auto hasEngine = [](const std::vector<ITensorGemm *> &engines)
+                {
+                    return std::any_of(engines.begin(), engines.end(),
+                        [](const ITensorGemm *engine) { return engine != nullptr; });
+                };
+                if (!hasEngine(params_.prepared_gate_gemm) ||
+                    !hasEngine(params_.prepared_up_gemm) || !hasEngine(params_.prepared_down_gemm))
+                    throw std::logic_error(
+                        "Registry-only CPU expert workspace needs source metadata when its prepared bank is empty");
+            }
+        }
 
         (void)n;
         (void)k;
@@ -4634,6 +4692,8 @@ namespace llaminar2
 
     void MoELocalExpertStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->bindWorkspace(workspace);
         auto bindAll = [workspace](const std::vector<ITensorGemm *> &engines)
         {
             for (auto *gemm : engines)
@@ -4659,6 +4719,8 @@ namespace llaminar2
 
     void MoELocalExpertStage::unbindWorkspace()
     {
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->unbindWorkspace();
         auto unbindAll = [](const std::vector<ITensorGemm *> &engines)
         {
             for (auto *gemm : engines)

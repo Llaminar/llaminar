@@ -42,6 +42,8 @@ namespace llaminar2
         {
             std::vector<ProjectionSpec> allocation_specs;
             size_t max_wire_payload_bytes = 0;
+            /// Immutable raw alias capacity, independent of a slot's occupant.
+            DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
         };
 
         /**
@@ -84,7 +86,7 @@ namespace llaminar2
          *
          * @param layer_weight_manifest Contiguous gate/up/down model manifest.
          * @return Cross-layer allocation and wire-capacity union.
-         * @throws std::invalid_argument for floating, malformed, or
+         * @throws std::invalid_argument for malformed, mixed projection, or
          *         uncatalogued projection formats.
          */
         static FormatProfile profileForLayerWeightManifest(

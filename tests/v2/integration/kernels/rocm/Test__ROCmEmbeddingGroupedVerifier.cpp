@@ -16,9 +16,11 @@
 
 #include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
 #include "tensors/Tensors.h"
+#include "tensors/TensorSlice.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../utils/EmbeddingVerifierFormats.h"
@@ -33,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -180,10 +183,26 @@ namespace
     /**
      * @brief Exercise one table format through grouped and serial production calls.
      */
+    enum class SourceView { Direct, NestedVocabularyShard };
+
+    /** @brief Release only this test's retained native graph after its stream joins. */
+    struct CapturedEmbeddingGraph
+    {
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t executable = nullptr;
+        ~CapturedEmbeddingGraph()
+        {
+            if (executable) (void)hipGraphExecDestroy(executable);
+            if (graph) (void)hipGraphDestroy(graph);
+        }
+    };
+
+    /** @brief Compare a direct or wrapped source on its real captured device path. */
     void runFormat(
         const EmbeddingVerifierFormatCase &format,
         uint32_t seed,
-        hipStream_t stream)
+        hipStream_t stream,
+        SourceView source_view = SourceView::Direct)
     {
         constexpr int vocab_size = 67;
         constexpr int d_model = 256;
@@ -198,11 +217,36 @@ namespace
         ASSERT_NE(embedding_table, nullptr);
         ASSERT_STREQ(tensorTypeName(embedding_table->native_type()), format.label);
 
+        std::vector<float> floating_reference;
+        if (!format.prepared_embed_q8)
+        {
+            floating_reference.resize(vocab_size * d_model);
+            embedding_table->to_fp32(floating_reference.data());
+        }
+        const int vocab_offset = source_view == SourceView::NestedVocabularyShard ? 17 : 0;
+        if (source_view == SourceView::NestedVocabularyShard)
+        {
+            // The backing table is already a vocabulary shard. Nested wrappers
+            // preserve its bytes and cannot create an INT8 unpack capability.
+            SliceMetadata metadata;
+            metadata.mode = SliceMode::ROW_PARALLEL;
+            metadata.original_rows = vocab_size + vocab_offset;
+            metadata.original_cols = d_model;
+            metadata.slice_start = vocab_offset;
+            metadata.slice_end = vocab_offset + vocab_size;
+            metadata.inner_is_presliced = true;
+            embedding_table = std::make_unique<TensorSlice>(std::move(embedding_table), metadata);
+            embedding_table = std::make_unique<TensorSlice>(std::move(embedding_table), metadata);
+            for (auto &token : tokens) token += vocab_offset;
+        }
+        ASSERT_EQ(IINT8Unpackable::fromTensor(embedding_table.get()) != nullptr,
+                  format.prepared_embed_q8);
+
         std::shared_ptr<PreparedEmbeddingHandle> prepared;
         if (format.prepared_embed_q8)
         {
             prepared = KernelFactory::prepareEmbeddingHandleLocal(
-                embedding_table.get(), d_model, device);
+                embedding_table.get(), d_model, device, vocab_offset, vocab_size + vocab_offset);
             ASSERT_NE(prepared, nullptr) << format.label;
             ASSERT_NE(prepared->weights, nullptr) << format.label;
             ASSERT_NE(prepared->weights->device_data, nullptr) << format.label;
@@ -225,6 +269,7 @@ namespace
 
         ROCmEmbeddingKernelT kernel(0);
         kernel.setGPUStream(stream);
+        kernel.setVocabRange(vocab_offset, vocab_size);
         if (prepared)
             kernel.setPreparedEmbeddingHandle(prepared.get());
 
@@ -246,8 +291,27 @@ namespace
 
             PerfStatsCollector::reset();
             kernel.setDynamicDeviceTokenIds(device_tokens.get(), verifier_rows);
-            ASSERT_TRUE(kernel.apply_tensor(
-                embedding_table.get(), nullptr, verifier_rows, d_model, &grouped_output, nullptr, 0));
+            CapturedEmbeddingGraph captured;
+            const bool capture = source_view == SourceView::NestedVocabularyShard;
+            std::optional<GraphCaptureGuard> capture_guard;
+            if (capture) capture_guard.emplace();
+            if (capture)
+                ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal),
+                          hipSuccess);
+            const bool applied = kernel.apply_tensor(
+                embedding_table.get(), nullptr, verifier_rows, d_model, &grouped_output, nullptr, 0);
+            // End recording before asserting so a rejected operation cannot
+            // leave the stream recording during test-fixture destruction.
+            if (capture)
+                ASSERT_EQ(hipStreamEndCapture(stream, &captured.graph), hipSuccess);
+            ASSERT_TRUE(applied);
+            capture_guard.reset();
+            if (capture)
+            {
+                ASSERT_EQ(hipGraphInstantiate(&captured.executable, captured.graph,
+                          nullptr, nullptr, 0), hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(captured.executable, stream), hipSuccess);
+            }
 
             std::vector<float> grouped(
                 static_cast<size_t>(verifier_rows) * d_model);
@@ -279,6 +343,17 @@ namespace
 
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             expectByteExact(grouped, serial, std::string(format.label) + " ROCm embedding");
+            if (!floating_reference.empty())
+            {
+                std::vector<float> expected(grouped.size());
+                for (int row = 0; row < verifier_rows; ++row)
+                    std::memcpy(expected.data() + row * d_model,
+                                floating_reference.data() + (tokens[row] - vocab_offset) * d_model,
+                                d_model * sizeof(float));
+                // A grouped/serial comparison alone would accept both paths
+                // returning zeros. Check against the untouched source bytes.
+                expectByteExact(grouped, expected, std::string(format.label) + " native source");
+            }
             expectGroupedCounter(
                 format.label,
                 verifier_rows,
@@ -317,9 +392,21 @@ TEST_F(Test__ROCmEmbeddingGroupedVerifier,
     }
 }
 
-/**
- * @brief Prove the removed lazy workspace-repack route cannot execute.
- */
+/** @brief Every format preserves its representation through captured TP wrappers. */
+TEST_F(Test__ROCmEmbeddingGroupedVerifier, NestedVocabularySlicesPreserveCapturedRepresentation)
+{
+    ScopedHipStream stream;
+    ASSERT_TRUE(stream.create());
+    ScopedPerfStats perfstats;
+    uint32_t seed = 9200;
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        runFormat(format, seed++, stream.get(), SourceView::NestedVocabularyShard);
+    }
+}
+
+/** @brief Prove the removed lazy workspace-repack route cannot execute. */
 TEST_F(Test__ROCmEmbeddingGroupedVerifier,
        QuantizedExecutionRequiresMatchingPreparedDeviceWeights)
 {

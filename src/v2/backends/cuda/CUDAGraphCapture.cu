@@ -7,6 +7,9 @@
  * nodes, and nested conditionals cannot be cloned into transaction bodies.
  * Retained ordered timelines instead record fragments directly in their final
  * parent, preserving conditional handle identity without cloning or recapture.
+ * The same timeline may import an independently recorded complete graph, such
+ * as a persistent collective. Open or foreign fragment views remain invalid;
+ * only fragments belonging to this owner may reuse its in-place frontiers.
  * Cloned conditional-body compositions authenticate source graphs recursively.
  * Ordering must be expressed by the graph's native dependency edges at the
  * producer; graph composition never rewrites a captured lifecycle after the
@@ -19,6 +22,7 @@
 #ifdef HAVE_CUDA
 
 #include "CUDAGraphCapture.h"
+#include "CUDADriverApi.h"
 #include "../NativeParallelGraphBranch.h"
 #include "../../utils/Logger.h"
 
@@ -884,8 +888,8 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const char *description = nullptr;
-            (void)cuGetErrorName(status, &name);
-            (void)cuGetErrorString(status, &description);
+            (void)llaminar2::CUDADriverApi::instance().getErrorName(status, &name);
+            (void)llaminar2::CUDADriverApi::instance().getErrorString(status, &description);
             return std::string(name ? name : "CUDA_ERROR_UNKNOWN") +
                    " (" + (description ? description : "no description") + ")";
         }
@@ -918,7 +922,7 @@ namespace llaminar2
         {
             size_t node_count = 0;
             CUresult status = selected_nodes ? CUDA_SUCCESS :
-                cuGraphGetNodes(graph, nullptr, &node_count);
+                llaminar2::CUDADriverApi::instance().graphGetNodes(graph, nullptr, &node_count);
             if (status != CUDA_SUCCESS)
             {
                 error = "cuGraphGetNodes(count) failed at " + graph_path +
@@ -932,7 +936,7 @@ namespace llaminar2
                     nodes.push_back(reinterpret_cast<CUgraphNode>(node));
             if (node_count > 0)
             {
-                status = cuGraphGetNodes(graph, nodes.data(), &node_count);
+                status = llaminar2::CUDADriverApi::instance().graphGetNodes(graph, nodes.data(), &node_count);
                 if (status != CUDA_SUCCESS)
                 {
                     error = "cuGraphGetNodes(nodes) failed at " + graph_path +
@@ -947,7 +951,7 @@ namespace llaminar2
                 const std::string node_path =
                     graph_path + "/node[" + std::to_string(node_index) + "]";
                 CUgraphNodeType type = CU_GRAPH_NODE_TYPE_EMPTY;
-                status = cuGraphNodeGetType(nodes[node_index], &type);
+                status = llaminar2::CUDADriverApi::instance().graphNodeGetType(nodes[node_index], &type);
                 if (status != CUDA_SUCCESS)
                 {
                     error = "cuGraphNodeGetType failed at " + node_path +
@@ -958,7 +962,7 @@ namespace llaminar2
                 if (type == CU_GRAPH_NODE_TYPE_KERNEL)
                 {
                     CUDA_KERNEL_NODE_PARAMS params{};
-                    status = cuGraphKernelNodeGetParams(
+                    status = llaminar2::CUDADriverApi::instance().graphKernelNodeGetParams(
                         nodes[node_index], &params);
                     if (status != CUDA_SUCCESS)
                     {
@@ -977,15 +981,15 @@ namespace llaminar2
                         function = params.func;
                         function_identity =
                             reinterpret_cast<uintptr_t>(params.func);
-                        name_status = cuFuncGetName(&driver_name, params.func);
+                        name_status = llaminar2::CUDADriverApi::instance().funcGetName(&driver_name, params.func);
                     }
 #if CUDA_VERSION >= 12000
                     else if (params.kern != nullptr)
                     {
                         function_identity =
                             reinterpret_cast<uintptr_t>(params.kern);
-                        name_status = cuKernelGetName(&driver_name, params.kern);
-                        status = cuKernelGetFunction(&function, params.kern);
+                        name_status = llaminar2::CUDADriverApi::instance().kernelGetName(&driver_name, params.kern);
+                        status = llaminar2::CUDADriverApi::instance().kernelGetFunction(&function, params.kern);
                         if (status != CUDA_SUCCESS || function == nullptr)
                         {
                             error = "cuKernelGetFunction failed at " +
@@ -1010,7 +1014,7 @@ namespace llaminar2
                             const char *attribute_name,
                             int &value) -> bool
                     {
-                        status = cuFuncGetAttribute(
+                        status = llaminar2::CUDADriverApi::instance().funcGetAttribute(
                             &value,
                             attribute,
                             function);
@@ -1061,7 +1065,7 @@ namespace llaminar2
                         return false;
                     }
                     int max_active_blocks_per_sm = 0;
-                    status = cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    status = llaminar2::CUDADriverApi::instance().occupancyMaxActiveBlocksPerMultiprocessor(
                         &max_active_blocks_per_sm,
                         function,
                         static_cast<int>(captured_block_threads),
@@ -1105,7 +1109,7 @@ namespace llaminar2
                 if (type == CU_GRAPH_NODE_TYPE_GRAPH)
                 {
                     CUgraph child_graph = nullptr;
-                    status = cuGraphChildGraphNodeGetGraph(
+                    status = llaminar2::CUDADriverApi::instance().graphChildGraphNodeGetGraph(
                         nodes[node_index], &child_graph);
                     if (status != CUDA_SUCCESS || child_graph == nullptr)
                     {
@@ -1211,6 +1215,74 @@ namespace llaminar2
     namespace
     {
         /**
+         * @brief Validate unconditional arrivals without consulting stale device state.
+         * @param owner Destination's immutable device/context identity.
+         * @param fragments Ordered participant-local command producers/receivers.
+         * @return True when every entry is a legal nonempty captured device graph.
+         *
+         * Arrival uses the same structural restrictions as a loop body, so this
+         * phase cannot smuggle host callbacks or host/device copies into replay.
+         */
+        bool validateLoopEntry(const CUDAGraphCapture &owner,
+            std::span<const DeviceControlledLoopEntryFragment> fragments)
+        {
+            for (size_t index = 0; index < fragments.size(); ++index)
+            {
+                const auto &fragment = fragments[index];
+                const auto *source = dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
+                if (!fragment.valid() || !source || source == &owner ||
+                    source->deviceOrdinal() != owner.deviceOrdinal() ||
+                    !source->graph() || source->nodeCount() == 0)
+                {
+                    LOG_ERROR("[CUDAGraphCapture] Invalid unconditional loop entry"
+                              << " index=" << index
+                              << " name=" << (fragment.name ? fragment.name : "<unnamed>"));
+                    return false;
+                }
+                if (!validateCudaConditionalBodyFragmentGraph(
+                        source->graph(), fragment.name, index, "entry"))
+                    return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Authenticate once-only initialization before replacing native graph ownership.
+         * @param owner Destination's immutable device/context identity.
+         * @param fragments Borrowed producers preceding the first WHILE admission.
+         * @return True only when every child is a nonempty compatible recorded graph.
+         *
+         * Use the same node restrictions as the repeated transaction: setup may
+         * not hide host callbacks, transfers or an external event dependency.
+         * Empty initialization is the existing MTP continuation program.
+         */
+        bool validateLoopInitialization(
+            const CUDAGraphCapture &owner,
+            std::span<const DeviceControlledLoopFragment> fragments)
+        {
+            for (size_t index = 0; index < fragments.size(); ++index)
+            {
+                const auto &fragment = fragments[index];
+                const auto *source = dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
+                if (!fragment.valid() ||
+                    fragment.execution == DeviceControlledLoopFragmentExecution::IfDeviceSelectorAtLeast ||
+                    !source || source == &owner ||
+                    source->deviceOrdinal() != owner.deviceOrdinal() ||
+                    !source->graph() || source->nodeCount() == 0)
+                {
+                    LOG_ERROR("[CUDAGraphCapture] Invalid once-only loop initialization"
+                              << " index=" << index
+                              << " name=" << (fragment.name ? fragment.name : "<unnamed>"));
+                    return false;
+                }
+                if (!validateCudaConditionalBodyFragmentGraph(
+                        source->graph(), fragment.name, index, "initialization"))
+                    return false;
+            }
+            return true;
+        }
+
+        /**
          * @brief Result of lowering one typed transaction fragment.
          *
          * CUDA reports failures through an error code, while a malformed
@@ -1230,6 +1302,37 @@ namespace llaminar2
                 return error == cudaSuccess && operation == nullptr && tail;
             }
         };
+
+        /**
+         * @brief Append arrivals before any controller predicate in the native parent.
+         * @param graph Native parent under construction.
+         * @param dependency Optional completed local-initialization node.
+         * @param fragments Already validated unconditional recordings in producer order.
+         * @return Final dependency, unchanged when entry is empty.
+         *
+         * A normal child node preserves the complete collective DAG without
+         * wrapping a conditional graph in another graph (CUDA forbids that).
+         * Empty entry adds no nodes. Callers check error, not succeeded(), since
+         * its null dependency deliberately denotes the original root predicate.
+         */
+        DeviceControlledFragmentAppendResult appendLoopEntry(cudaGraph_t graph, cudaGraphNode_t dependency,
+            std::span<const DeviceControlledLoopEntryFragment> fragments)
+        {
+            DeviceControlledFragmentAppendResult result{.tail = dependency};
+            for (const auto &fragment : fragments)
+            {
+                const auto *source = static_cast<const CUDAGraphCapture *>(fragment.capture);
+                const cudaGraphNode_t dependency = result.tail;
+                result.error = cudaGraphAddChildGraphNode(&result.tail, graph,
+                    dependency ? &dependency : nullptr, dependency ? 1 : 0, source->graph());
+                if (result.error != cudaSuccess)
+                {
+                    result.operation = "cudaGraphAddChildGraphNode(unconditional loop entry)";
+                    return result;
+                }
+            }
+            return result;
+        }
 
         /**
          * @brief Append one typed fragment to a native conditional transaction.
@@ -1360,6 +1463,132 @@ namespace llaminar2
                 result.operation =
                     "cudaGraphAddChildGraphNode(fragment IF body)";
             }
+            return result;
+        }
+
+        /**
+         * @brief Place local once-only work behind its own admission decision.
+         * @param graph Parent owning the predicate's native conditional handle.
+         * @param entry_predicate First device health/completion check, already in graph.
+         * @param predicate Canonical device-owned request rows and field geometry.
+         * @param predicate_params Local authority's device-owned predicate kernel.
+         * @param fragments Authenticated initialization producers and device-word guards.
+         * @return Completed initialization IF, before the unconditional arrival.
+         *
+         * Terminal or corrupt input executes no sampler or model work. A valid
+         * prefill sample may itself make the request terminal. Its subsequent
+         * command exchange must still execute; the caller appends that exchange
+         * and only then re-evaluates whether model work is permitted.
+         */
+        DeviceControlledFragmentAppendResult appendGuardedLoopInitialization(
+            cudaGraph_t graph, cudaGraphNode_t entry_predicate,
+            const DeviceControlledLoopPredicate &predicate,
+            const cudaKernelNodeParams &predicate_params,
+            std::span<const DeviceControlledLoopFragment> fragments)
+        {
+            DeviceControlledFragmentAppendResult result{.tail = entry_predicate};
+            if (fragments.empty())
+                return result;
+
+            // CUDA requires one native handle per conditional node. Both
+            // predicates read the same request authority, but the once-only IF
+            // must not alias the WHILE's native scheduling handle. Retarget the
+            // entry node before instantiation; the later recheck and loop-tail
+            // predicate continue to publish the original WHILE handle.
+            cudaGraphConditionalHandle initialization_condition = 0;
+            result.error = cudaGraphConditionalHandleCreate(
+                &initialization_condition, graph, 0, cudaGraphCondAssignDefault);
+            if (result.error != cudaSuccess)
+            {
+                result.operation = "cudaGraphConditionalHandleCreate(initialization IF)";
+                return result;
+            }
+            const int *control_rows = predicate.control_rows_device;
+            int control_stride = predicate.control_stride;
+            int request_count = predicate.request_count;
+            int healthy_index = predicate.healthy_index;
+            int complete_index = predicate.complete_index;
+            void *initialization_arguments[] = {
+                &initialization_condition, &control_rows, &control_stride,
+                &request_count, &healthy_index, &complete_index};
+            cudaKernelNodeParams initialization_predicate = predicate_params;
+            initialization_predicate.kernelParams = initialization_arguments;
+            result.error = cudaGraphKernelNodeSetParams(
+                entry_predicate, &initialization_predicate);
+            if (result.error != cudaSuccess)
+            {
+                result.operation = "cudaGraphKernelNodeSetParams(initialization predicate)";
+                return result;
+            }
+            cudaGraphNodeParams initialization_params{};
+            initialization_params.type = cudaGraphNodeTypeConditional;
+            initialization_params.conditional.handle = initialization_condition;
+            initialization_params.conditional.type = cudaGraphCondTypeIf;
+            initialization_params.conditional.size = 1;
+            cudaGraphNode_t initialization_node = nullptr;
+            result.error = cudaGraphAddNode(&initialization_node, graph,
+                &entry_predicate, nullptr, 1, &initialization_params);
+            if (result.error != cudaSuccess ||
+                !initialization_params.conditional.phGraph_out ||
+                !initialization_params.conditional.phGraph_out[0])
+            {
+                if (result.error == cudaSuccess)
+                    result.error = cudaErrorInvalidValue;
+                result.operation = "cudaGraphAddNode(guarded initialization)";
+                return result;
+            }
+            cudaGraphNode_t tail = nullptr;
+            for (const auto &fragment : fragments)
+            {
+                const auto appended = appendDeviceControlledFragment(
+                    initialization_params.conditional.phGraph_out[0], tail,
+                    fragment, *static_cast<const CUDAGraphCapture *>(fragment.capture));
+                if (!appended.succeeded())
+                    return appended;
+                tail = appended.tail;
+            }
+            result.tail = initialization_node;
+            return result;
+        }
+
+        /**
+         * @brief Lower the single shared initialization/arrival/admission lifecycle.
+         * @param graph Parent owning all native conditional handles.
+         * @param predicate Participant-local authority or received command layout.
+         * @param predicate_params WHILE condition publisher for that layout.
+         * @param program Borrowed local initialization, mandatory arrival and body.
+         * @return Final loop-entry predicate, or a precise construction error.
+         *
+         * Followers with no local initialization read no predicate until the
+         * command has arrived. A tail samples first when admitted, but always
+         * sends the resulting command, including EOS and terminal replays.
+         * Empty arrival has exactly the former single-device node inventory.
+         */
+        DeviceControlledFragmentAppendResult appendLoopPrelude(cudaGraph_t graph,
+            const DeviceControlledLoopPredicate &predicate,
+            const cudaKernelNodeParams &predicate_params,
+            const DeviceControlledLoopProgram &program)
+        {
+            DeviceControlledFragmentAppendResult result;
+            if (!program.initialization.empty())
+            {
+                result.error = cudaGraphAddKernelNode(&result.tail, graph, nullptr, 0, &predicate_params);
+                if (result.error != cudaSuccess)
+                {
+                    result.operation = "cudaGraphAddKernelNode(local initialization admission)";
+                    return result;
+                }
+                result = appendGuardedLoopInitialization(graph, result.tail, predicate,
+                    predicate_params, program.initialization);
+                if (!result.succeeded()) return result;
+            }
+            result = appendLoopEntry(graph, result.tail, program.entry);
+            if (result.error != cudaSuccess) return result;
+            const cudaGraphNode_t dependency = result.tail;
+            result.error = cudaGraphAddKernelNode(&result.tail, graph,
+                dependency ? &dependency : nullptr, dependency ? 1 : 0, &predicate_params);
+            if (result.error != cudaSuccess)
+                result.operation = "cudaGraphAddKernelNode(post-arrival loop predicate)";
             return result;
         }
     }
@@ -1545,6 +1774,8 @@ namespace llaminar2
             throw std::invalid_argument(
                 "CUDAGraphCapture requires an explicit stream and CUDA ordinal");
         }
+        // Direct graph users also prepare native metadata before recording.
+        (void)CUDADriverApi::instance();
     }
 
     CUDAGraphCapture::~CUDAGraphCapture() { reset(); }
@@ -2127,14 +2358,22 @@ namespace llaminar2
                 return false;
             }
             fragments[index] = fragment;
-            if (fragment->timeline_recording_ != timeline_recording_)
-                return false;
-            if (timeline_recording_ &&
-                (fragment->timeline_recording_ != timeline_recording_ ||
-                 fragment->recording_role_ != RecordingRole::Fragment ||
+            const bool owned_fragment = timeline_recording_ &&
+                fragment->timeline_recording_ == timeline_recording_;
+            if (owned_fragment &&
+                (fragment->recording_role_ != RecordingRole::Fragment ||
                  fragment->fragment_state_ != FragmentState::Recorded ||
                  !recorded_fragments.insert(fragment).second))
                 return false;
+            if (!owned_fragment &&
+                (fragment->recording_role_ != RecordingRole::Owner ||
+                 (fragment->timeline_recording_ &&
+                  fragment->timeline_recording_->state != OrderedTimelineRecording::State::Sealed)))
+            {
+                LOG_ERROR("[CUDAGraphCapture] Timeline import requires a complete source owner"
+                          << " index=" << index << " name=" << step.name);
+                return false;
+            }
         }
 
         if (timeline_recording_ &&
@@ -2204,7 +2443,7 @@ namespace llaminar2
             if (step.kind ==
                 GPUOrderedTimelineStepKind::CapturedFragment)
             {
-                if (timeline_recording_)
+                if (timeline_recording_ && fragments[index]->timeline_recording_ == timeline_recording_)
                 {
                     const auto *fragment = fragments[index];
                     if (tail)
@@ -2456,9 +2695,10 @@ namespace llaminar2
 
     /** @copydoc IGPUGraphCapture::buildDeviceControlledWhileLoop */
     bool CUDAGraphCapture::buildDeviceControlledWhileLoop(
-        std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+        const DeviceControlledLoopProgram &program,
         const DeviceControlledLoopPredicate &predicate)
     {
+        const auto ordered_body_fragments = program.iteration;
         if (timeline_recording_ || recording_role_ != RecordingRole::Owner)
             return false;
 #if CUDART_VERSION < 12030
@@ -2477,6 +2717,9 @@ namespace llaminar2
                       << " predicate_valid=" << predicate.valid());
             return false;
         }
+        if (!validateLoopEntry(*this, program.entry) ||
+            !validateLoopInitialization(*this, program.initialization))
+            return false;
 
         size_t transaction_node_count = 0;
         std::vector<const CUDAGraphCapture *> validated_fragments;
@@ -2586,15 +2829,9 @@ namespace llaminar2
         predicate_params.kernelParams = kernel_args;
         predicate_params.extra = nullptr;
 
-        cudaGraphNode_t initial_predicate_node = nullptr;
-        error = cudaGraphAddKernelNode(
-            &initial_predicate_node,
-            graph_,
-            nullptr,
-            0,
-            &predicate_params);
-        if (error != cudaSuccess)
-            return fail("cudaGraphAddKernelNode(initial loop predicate)", error);
+        const auto prelude = appendLoopPrelude(graph_, predicate, predicate_params, program);
+        if (!prelude.succeeded()) return fail(prelude.operation, prelude.error);
+        const cudaGraphNode_t initial_predicate_node = prelude.tail;
 
         cudaGraphNodeParams conditional_params{};
         conditional_params.type = cudaGraphNodeTypeConditional;
@@ -2660,6 +2897,7 @@ namespace llaminar2
         node_count_ = count;
         LOG_DEBUG("[CUDAGraphCapture] Built device-controlled WHILE graph"
                   << " parent_nodes=" << node_count_
+                  << " initialization_fragments=" << program.initialization.size()
                   << " fragments=" << ordered_body_fragments.size()
                   << " conditional_fragments=" << conditional_fragment_count
                   << " transaction_nodes=" << transaction_node_count
@@ -2669,10 +2907,11 @@ namespace llaminar2
     }
 
     bool CUDAGraphCapture::buildDeviceControlledSelectorWhileLoop(
-        std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+        const DeviceControlledLoopProgram &program,
         const DeviceControlledLoopPredicate &predicate,
         const DeviceControlledLoopSelector &selector_policy)
     {
+        const auto ordered_body_fragments = program.iteration;
         if (timeline_recording_ || recording_role_ != RecordingRole::Owner)
             return false;
 #if CUDART_VERSION < 12030
@@ -2810,6 +3049,9 @@ namespace llaminar2
             LOG_ERROR("[CUDAGraphCapture] Selector/WHILE transaction has no selector-gated prefix groups");
             return false;
         }
+        if (!validateLoopEntry(*this, program.entry) ||
+            !validateLoopInitialization(*this, program.initialization))
+            return false;
 
         reset();
         cudaError_t error = cudaGraphCreate(&graph_, 0);
@@ -2861,17 +3103,9 @@ namespace llaminar2
         predicate_params.kernelParams = predicate_args;
         predicate_params.extra = nullptr;
 
-        cudaGraphNode_t initial_predicate_node = nullptr;
-        error = cudaGraphAddKernelNode(
-            &initial_predicate_node,
-            graph_,
-            /*dependencies=*/nullptr,
-            /*numDependencies=*/0,
-            &predicate_params);
-        if (error != cudaSuccess)
-            return fail(
-                "cudaGraphAddKernelNode(initial WHILE predicate)",
-                error);
+        const auto prelude = appendLoopPrelude(graph_, predicate, predicate_params, program);
+        if (!prelude.succeeded()) return fail(prelude.operation, prelude.error);
+        const cudaGraphNode_t initial_predicate_node = prelude.tail;
 
         cudaGraphNodeParams while_params{};
         while_params.type = cudaGraphNodeTypeConditional;

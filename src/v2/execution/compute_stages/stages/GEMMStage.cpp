@@ -24,6 +24,23 @@
 
 namespace llaminar2
 {
+    WorkspaceRequirements GEMMStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        const int rows = std::max({1, m, params_.m});
+        auto requirements = IWorkspaceConsumerStage::getWorkspaceRequirements(rows, n, k);
+        // Execution selects the transform from the gate operand. The legacy
+        // diagnostic flag is not an independent source of operation intent.
+        if (params_.gate_input)
+            if (auto *consumer = const_cast<GEMMStage *>(this)->getKernelAsWorkspaceConsumer())
+                consumer->appendSwiGLUWorkspaceRequirements(
+                    requirements, rows, params_.k > 0 ? params_.k : k);
+        if (params_.beta != 0.0f)
+            if (auto *consumer = const_cast<GEMMStage *>(this)->getKernelAsWorkspaceConsumer())
+                consumer->appendOutputAccumulationWorkspaceRequirements(
+                    requirements, rows, params_.n > 0 ? params_.n : n);
+        return requirements;
+    }
+
     namespace
     {
         bool validateMatrixExtent(

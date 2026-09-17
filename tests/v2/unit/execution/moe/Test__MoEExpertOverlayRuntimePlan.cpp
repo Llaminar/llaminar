@@ -314,6 +314,7 @@ namespace llaminar2::test
             return plan;
         }
 
+        /** @brief A physical fixture GPU with a stable identity across rank views. */
         DeviceInfo syntheticGpu(
             DeviceType type,
             int ordinal,
@@ -322,6 +323,7 @@ namespace llaminar2::test
             DeviceInfo result;
             result.type = type;
             result.local_device_id = ordinal;
+            result.uuid = "fixture-" + std::to_string(static_cast<int>(type)) + "-" + std::to_string(ordinal);
             result.numa_node = numa_node;
             result.memory_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
             result.free_memory_bytes = result.memory_bytes;
@@ -342,6 +344,7 @@ namespace llaminar2::test
                 rank_inventory.rank = rank;
                 rank_inventory.node_id = 0;
                 rank_inventory.local_rank = rank;
+                rank_inventory.cpu.numa_node = rank;
                 rank_inventory.hostname = "test-node";
                 rank_inventory.cpu.type = DeviceType::CPU;
                 rank_inventory.cpu.local_device_id = 0;
@@ -400,6 +403,7 @@ namespace llaminar2::test
             rank.rank = 0;
             rank.node_id = 0;
             rank.local_rank = 0;
+            rank.cpu.numa_node = 0;
             rank.hostname = "test-node";
             rank.cpu.type = DeviceType::CPU;
             rank.cpu.local_device_id = 0;
@@ -430,6 +434,7 @@ namespace llaminar2::test
                 rank.rank = world_rank;
                 rank.node_id = 0;
                 rank.local_rank = world_rank;
+                rank.cpu.numa_node = world_rank;
                 rank.hostname = "test-node";
                 rank.cpu.type = DeviceType::CPU;
                 rank.cpu.local_device_id = 0;
@@ -539,20 +544,18 @@ namespace llaminar2::test
         EXPECT_TRUE(cpu_domain->participants[0].owned_by_current_rank);
         EXPECT_EQ(cpu_domain->participants[1].world_rank, 1);
         EXPECT_FALSE(cpu_domain->participants[1].owned_by_current_rank);
-        EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
-        EXPECT_FALSE(cpu_domain->multi_participant_execution_pending);
-        EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
-        EXPECT_TRUE(cpu_domain->domain_scoped_collective_context_ready);
+        EXPECT_NO_THROW(rocm_domain->validateContinuationCollectiveRuntime());
+        EXPECT_NO_THROW(cpu_domain->validateContinuationCollectiveRuntime());
         EXPECT_TRUE(rocm_domain->local_reachable_for_mvp);
 
         const std::string diagnostics = runtime_plan->diagnostics();
         EXPECT_NE(diagnostics.find("continuation_device=ROCm:0"), std::string::npos);
         EXPECT_EQ(diagnostics.find("multi_participant_execution_pending=true"), std::string::npos);
-        EXPECT_NE(diagnostics.find("collective_context=ready"), std::string::npos);
+        EXPECT_EQ(diagnostics.find("collective_context="), std::string::npos);
         EXPECT_NE(diagnostics.find("routed_rebalance=overlay_routed_cpu_cold"), std::string::npos);
     }
 
-    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPApportionedRoutedComputeIsGraphNativeReady)
+    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPApportionedDomainAdmitsContinuationCollective)
     {
         auto plan = layoutAPlan();
         plan->domains[0].routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -564,19 +567,17 @@ namespace llaminar2::test
         ASSERT_NE(rocm_domain, nullptr);
         EXPECT_EQ(rocm_domain->scope, ExecutionDomainScope::RANK_LOCAL);
         EXPECT_EQ(rocm_domain->routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
-        EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
-        EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
-        EXPECT_TRUE(rocm_domain->pending_reason.empty());
+        EXPECT_NO_THROW(rocm_domain->validateContinuationCollectiveRuntime());
 
         const std::string diagnostics = runtime_plan->diagnostics();
         EXPECT_NE(diagnostics.find("rocm_hot"), std::string::npos) << diagnostics;
         EXPECT_EQ(diagnostics.find("multi_participant_execution_pending=true"),
                   std::string::npos) << diagnostics;
-        EXPECT_NE(diagnostics.find("collective_context=ready"), std::string::npos)
+        EXPECT_EQ(diagnostics.find("collective_context="), std::string::npos)
             << diagnostics;
     }
 
-    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPReplicatedRoutedComputeIsGraphNativeReady)
+    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPReplicatedDomainAdmitsContinuationCollective)
     {
         auto plan = layoutAPlan();
         plan->domains[0].routed_compute_policy =
@@ -591,16 +592,14 @@ namespace llaminar2::test
         EXPECT_EQ(
             rocm_domain->routed_compute_policy,
             RoutedExpertComputePolicy::Replicated);
-        EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
-        EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
-        EXPECT_TRUE(rocm_domain->pending_reason.empty());
+        EXPECT_NO_THROW(rocm_domain->validateContinuationCollectiveRuntime());
 
         const std::string diagnostics = runtime_plan->diagnostics();
         EXPECT_EQ(
             diagnostics.find("multi_participant_execution_pending=true"),
             std::string::npos)
             << diagnostics;
-        EXPECT_NE(diagnostics.find("collective_context=ready"), std::string::npos)
+        EXPECT_EQ(diagnostics.find("collective_context="), std::string::npos)
             << diagnostics;
     }
 
@@ -638,10 +637,8 @@ namespace llaminar2::test
         const auto &cold_domain = runtime_plan->domainForTier(2);
         EXPECT_EQ(warm_domain.name, "rocm_warm");
         EXPECT_EQ(cold_domain.name, "cpu_cold");
-        EXPECT_FALSE(warm_domain.multi_participant_execution_pending);
-        EXPECT_FALSE(cold_domain.multi_participant_execution_pending);
-        EXPECT_TRUE(warm_domain.domain_scoped_collective_context_ready);
-        EXPECT_TRUE(cold_domain.domain_scoped_collective_context_ready);
+        EXPECT_EQ(warm_domain.participants.size(), 2u);
+        EXPECT_EQ(cold_domain.participants.size(), 2u);
     }
 
     TEST(Test__MoEExpertOverlayRuntimePlan, InvalidRemoteContinuationFailsBeforeGraphExecution)
@@ -1034,6 +1031,51 @@ namespace llaminar2::test
             OverlayRankRole::CpuFallbackParticipant));
     }
 
+    TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingUsesObservedAffinityForBothGPUVendors)
+    {
+        auto requested = rankAgnosticThreeTierPlan();
+        auto inventory = syntheticTwoSocketInventory(0, 1);
+        // Every rank sees both GPUs, but communicator order opposes physical
+        // locality. Vendor and ordinal cannot imply the owning CPU socket.
+        inventory.ranks[0].cpu.numa_node = 7;
+        inventory.ranks[1].cpu.numa_node = 3;
+        for (auto &rank : inventory.ranks)
+            rank.gpus = {syntheticGpu(DeviceType::CUDA, 0, 3),
+                         syntheticGpu(DeviceType::ROCm, 0, 7)};
+        requested->domains[2].participants = {
+            GlobalDeviceAddress::cpu(7), GlobalDeviceAddress::cpu(3)};
+        const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory);
+        EXPECT_EQ(resolved->domains[0].owner_rank, 1);
+        EXPECT_EQ(resolved->domains[1].owner_rank, 0);
+        EXPECT_EQ(resolved->domains[2].world_ranks, (std::vector<int>{0, 1}));
+        EXPECT_EQ(resolved->domains[2].participants[0].numa_node, 7);
+        EXPECT_EQ(resolved->domains[2].participants[1].numa_node, 3);
+
+        // Explicit rank pinning must reject a different physical CPU node.
+        requested->domains[2].world_ranks = {1, 0};
+        EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory),
+                     std::invalid_argument);
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, UnqualifiedCPUOrderUsesPhysicalNodesNotRankOrdinals)
+    {
+        auto requested = rankAgnosticThreeTierPlan();
+        auto inventory = syntheticTwoSocketInventory(0, 1);
+        inventory.ranks[0].cpu.numa_node = 7;
+        inventory.ranks[1].cpu.numa_node = 3;
+        requested->domains[2].participants = {
+            GlobalDeviceAddress::cpu(-1), GlobalDeviceAddress::cpu(-1)};
+        const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory);
+        EXPECT_EQ(resolved->domains[2].world_ranks, (std::vector<int>{1, 0}));
+        EXPECT_EQ(resolved->domains[2].participants[0].numa_node, 3);
+        EXPECT_EQ(resolved->domains[2].participants[1].numa_node, 7);
+
+        // Missing physical observations must not reconstruct node IDs from ranks.
+        for (auto &rank : inventory.ranks) rank.cpu.numa_node = -1;
+        EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory),
+                     std::invalid_argument);
+    }
+
     TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingKeepsLocalTPRankLocal)
     {
         const auto requested = rankAgnosticLocalCudaTPPlan();
@@ -1094,8 +1136,7 @@ namespace llaminar2::test
                 participant.local_device,
                 DeviceId::cuda(static_cast<int>(participant_index)));
         }
-        EXPECT_TRUE(runtime_domain->domain_scoped_collective_context_ready);
-        EXPECT_FALSE(runtime_domain->multi_participant_execution_pending);
+        EXPECT_NO_THROW(runtime_domain->validateContinuationCollectiveRuntime());
 
         OrchestrationConfig installed = OrchestrationConfig::defaults();
         installed.moe_routed_expert_plan = requested;
@@ -1193,6 +1234,107 @@ namespace llaminar2::test
         EXPECT_EQ(
             config.moe_routed_expert_plan->domains[1].world_ranks,
             (std::vector<int>{0, 0, 1, 1}));
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, RemoteCPUPoolScopeUsesPhysicalHostsNotRankCount)
+    {
+        // Exercise the two requested cluster shapes without initializing MPI:
+        // one continuation GPU and one/two CPU experts on distinct hosts.
+        for (DeviceType continuation_backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (int cpu_count : {1, 2})
+        {
+            SCOPED_TRACE(deviceTypeToString(continuation_backend));
+            SCOPED_TRACE(cpu_count);
+            ClusterInventory inventory;
+            inventory.world_size = cpu_count + 1;
+            auto requested = std::make_shared<MoERoutedExpertPlacementPlan>();
+            requested->enabled = true;
+            requested->topology = RoutedExpertPlacementTopology::TieredOverlay;
+            requested->continuation_domain = "continuation";
+            requested->shared_expert_domain = "continuation";
+            requested->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            RoutedExpertDomain gpu;
+            gpu.name = "continuation";
+            gpu.scope = ExecutionDomainScope::AUTO;
+            gpu.participants = {continuation_backend == DeviceType::CUDA
+                ? GlobalDeviceAddress::cuda(0, 0, "node-0")
+                : GlobalDeviceAddress::rocm(0, 0, "node-0")};
+            gpu.world_ranks = {0};
+            RoutedExpertDomain cpu;
+            cpu.name = "offload";
+            cpu.scope = ExecutionDomainScope::AUTO;
+            cpu.backend = CollectiveBackendType::MPI;
+            for (int rank = 0; rank <= cpu_count; ++rank)
+            {
+                RankInventory observed;
+                observed.rank = rank;
+                observed.node_id = rank;
+                observed.local_rank = 0;
+                observed.hostname = "node-" + std::to_string(rank);
+                observed.cpu.type = DeviceType::CPU;
+                observed.cpu.numa_node = 0;
+                if (rank == 0)
+                    observed.gpus = {syntheticGpu(continuation_backend, 0, 0)};
+                else
+                {
+                    cpu.participants.push_back(GlobalDeviceAddress::cpu(0, observed.hostname));
+                    cpu.world_ranks.push_back(rank);
+                }
+                inventory.ranks.push_back(std::move(observed));
+            }
+            inventory.buildNodeAggregations();
+            requested->domains = {gpu, cpu};
+            requested->routed_tiers = {tier("preferred", "continuation", 0),
+                                       tier("capacity", "offload", 1, true)};
+            const auto bound = bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory);
+            EXPECT_EQ(bound->domains[0].scope, ExecutionDomainScope::SINGLE);
+            EXPECT_EQ(bound->domains[1].scope, cpu_count == 1
+                ? ExecutionDomainScope::SINGLE : ExecutionDomainScope::GLOBAL);
+            EXPECT_EQ(bound->domains[1].world_ranks, cpu.world_ranks);
+            EXPECT_EQ(bound->domains[1].participants, cpu.participants);
+            // Applying the saved physical plan must preserve its scope.
+            const auto applied = bindMoEExpertOverlayPlanToClusterInventory(*bound, inventory);
+            EXPECT_EQ(applied->domains[1].scope, bound->domains[1].scope);
+            // Independent remote expert followers need rank-batched sparse
+            // execution, not a continuation-domain TP helper. Resolving their
+            // descriptors must not label the installed path as pending.
+            for (int observer = 0; observer <= cpu_count; ++observer)
+            {
+                const auto runtime = resolveMoEExpertOverlayRuntimePlan(applied,
+                    {.current_world_rank = observer, .validate_mvp_root_reachability = false});
+                const auto execution = buildMoEExpertOverlayExecutionPlan(*runtime, cpu_count + 1);
+                EXPECT_EQ(runtime->diagnostics().find("multi_participant_execution_pending=true"),
+                          std::string::npos) << runtime->diagnostics();
+                EXPECT_EQ(runtime->diagnostics().find("collective_context="), std::string::npos);
+                EXPECT_NO_THROW(runtime->continuationDomain().validateContinuationCollectiveRuntime());
+                const auto *offload = runtime->domainForName("offload");
+                ASSERT_NE(offload, nullptr);
+                if (cpu_count > 1)
+                {
+                    // A supported sparse pool does not become a supported
+                    // dense continuation collective just by being resolved.
+                    EXPECT_THROW(offload->validateContinuationCollectiveRuntime(), std::runtime_error);
+                }
+                for (int peer = 1; peer <= cpu_count; ++peer)
+                {
+                    const auto *rank = execution.rankPlanFor(peer);
+                    ASSERT_NE(rank, nullptr);
+                    EXPECT_TRUE(rank->usesExpertTransactionFollower());
+                    EXPECT_FALSE(rank->ownsContinuationGraph());
+                    EXPECT_TRUE(rank->hasLocalDevice(DeviceId::cpu()));
+                }
+            }
+            if (cpu_count == 2)
+            {
+                requested->domains[1].scope = ExecutionDomainScope::NODE_LOCAL;
+                EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory),
+                             std::invalid_argument);
+                requested->domains[1].scope = ExecutionDomainScope::GLOBAL;
+                requested->domains[1].backend = CollectiveBackendType::UPI;
+                EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory),
+                             std::invalid_argument);
+            }
+        }
     }
 
     TEST(

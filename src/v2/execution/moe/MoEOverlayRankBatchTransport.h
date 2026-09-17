@@ -14,6 +14,9 @@
  * container in the inference path.  Participants are always serialized in
  * ascending global participant-id order so return accumulation can retain the
  * model's canonical arithmetic order regardless of device completion order.
+ * Empty rank batches still dispatch authenticated identities, but carry no
+ * numerical return dependency. Graph lifetime is retired separately by the
+ * inference transaction controller's exact follower-completion receipt.
  */
 
 #pragma once
@@ -160,6 +163,9 @@ namespace llaminar2
             return participant_ids_;
         }
 
+        /** @return Graph-bound return arithmetic, including empty contributions. */
+        MoEOverlayReturnLayout returnLayout() const noexcept { return return_layout_; }
+
         /** @return Maximum encoded byte count accepted by the receive buffer. */
         size_t wireCapacityBytes() const noexcept
         {
@@ -254,6 +260,7 @@ namespace llaminar2
         size_t max_total_entries_ = 0;
         int d_model_ = 0;
         int top_k_ = 0;
+        MoEOverlayReturnLayout return_layout_;
         std::vector<std::byte> send_buffer_;
         std::vector<std::byte> receive_buffer_;
     };
@@ -442,7 +449,7 @@ namespace llaminar2
          * On the source rank, `outbound` must contain every participant and
          * `inbound` must be empty. The target rank supplies the inverse. Source
          * completion means the encoded bytes have been handed to a stable
-         * transport slot and the matching return receive has been posted; it
+         * transport slot and any needed numerical receive has been posted; it
          * does not mean the peer has consumed the packet.
          */
         MoEOverlayCollectiveResult exchangeDispatch(
@@ -456,7 +463,9 @@ namespace llaminar2
          * The target rank publishes every participant result; the continuation
          * source rank receives all results into canonical participant views.
          * Target completion means the immutable return bytes are retained by a
-         * transport slot until MPI reports completion.
+         * transport slot until MPI reports completion. An authenticated empty
+         * dispatch produces an empty numerical contribution locally without a
+         * return RPC. Neither outcome substitutes for graph retirement.
          */
         MoEOverlayCollectiveResult exchangeReturn(
             const MoEOverlayRankBatchKey &key,
@@ -491,6 +500,40 @@ namespace llaminar2
         }
 
     private:
+        /** @brief A numerical result may require peer payload or no arithmetic at all. */
+        enum class NumericalReturnKind : uint8_t { PeerPayload, EmptyContribution };
+
+        /** @brief One exact dispatch owns its return requirement until consumption. */
+        struct PendingReturn
+        {
+            MoEOverlayRankBatchKey dispatch_key;
+            NumericalReturnKind kind = NumericalReturnKind::PeerPayload;
+            MPI_Request receive = MPI_REQUEST_NULL;
+        };
+
+        /** @brief Immutable metadata copied from authenticated dispatch, never borrowed. */
+        struct ReturnIdentity
+        {
+            uint64_t residency_epoch = 0;
+            int32_t source_participant = -1;
+            int32_t target_participant = -1;
+            int32_t d_model = 0;
+        };
+
+        /** @brief Snapshot authenticated participant identities and the numerical obligation. */
+        template <typename Row>
+        void rememberDispatch(
+            const MoEOverlayRankBatchKey &key, std::span<Row *const> rows);
+
+        /** @brief Validate every empty destination before publishing any local metadata. */
+        bool publishEmptyReturn(
+            const MoEOverlayRankBatchKey &key,
+            std::span<MoEOverlayReturnRows *const> rows, std::string *error);
+
+        /** @brief Reject an expert result that contradicts its authenticated empty dispatch. */
+        bool validateEmptyReturn(
+            std::span<const MoEOverlayReturnRows *const> rows, std::string *error) const;
+
         /** @brief One fixed envelope allocation and its exact live MPI request. */
         struct AsynchronousSendSlot
         {
@@ -535,9 +578,10 @@ namespace llaminar2
         std::vector<AsynchronousSendSlot> return_send_slots_;
         size_t next_dispatch_send_slot_ = 0;
         size_t next_return_send_slot_ = 0;
-        /** Source posts the matching return receive before dispatch leaves. */
-        MPI_Request pending_return_receive_ = MPI_REQUEST_NULL;
-        std::optional<MoEOverlayRankBatchKey> pending_return_dispatch_key_;
+        /** Payload receives exist only for nonempty numerical obligations. */
+        std::optional<PendingReturn> pending_return_;
+        /** Fixed participant metadata, copied before caller-owned views can be reused. */
+        std::vector<ReturnIdentity> return_identities_;
         /** Reject accidental concurrent reuse of the one shared wire buffer. */
         std::atomic_flag in_flight_ = ATOMIC_FLAG_INIT;
     };

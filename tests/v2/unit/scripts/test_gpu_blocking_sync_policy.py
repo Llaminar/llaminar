@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import dataclasses
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from check_gpu_blocking_sync_policy import (  # noqa: E402
+    ALLOWANCES,
     Allowance,
     scan_file,
     validate,
@@ -142,6 +144,29 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
             self.assertEqual(len(failures), 1)
             self.assertIn("unapproved backend_event", failures[0])
             self.assertIn("hostResultBoundary", failures[0])
+
+    def test_pipeline_terminal_allowance_cannot_escape_into_dispatch(self) -> None:
+        """The production pipeline budget names one terminal site, not its class."""
+        allowance, = (
+            entry for entry in ALLOWANCES
+            if entry.path.endswith("/PipelineDeviceGeneration.cpp")
+        )
+        self.assertEqual(allowance.caller, "PipelineDeviceGeneration::finish")
+        self.assertEqual(allowance.kind, "backend_event")
+        self.assertEqual(allowance.category, "host_result")
+        self.assertEqual(allowance.count, 1)
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("finish", 1, True), ("finish", 2, False),
+            ("launch", 1, False), ("prefill", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void PipelineDeviceGeneration::{caller}() {{"
+                    + "backend->waitForEvent(event, 0);" * count + "}"
+                )
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
     def test_synchronous_backend_wrapper_is_charged_to_its_caller(self) -> None:
         temporary, root = self.make_repo(

@@ -17,6 +17,8 @@
  * distributions, so peaked argmax fixtures cannot conceal a different RNG key.
  * Penalty ownership is checked independently: CPU stochastic distribution
  * construction must see unmodified logits and apply history exactly once.
+ * Long checkpoint-boundary prompts use the production chunk planner in the
+ * device-free runner, so serving bucket defaults cannot bypass that coverage.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -27,9 +29,11 @@
 
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/mtp/MTPSpecStateContract.h"
@@ -259,6 +263,46 @@ namespace
                     shiftedTargetForMainTokens(position_);
             }
 
+            return true;
+        }
+
+        /** @brief This device-free runner can advance real rows across prefill chunks. */
+        bool supportsPrefillChunkSchedule(int seq_len) const override
+        {
+            return seq_len > 0;
+        }
+
+        /**
+         * @brief Execute the admitted schedule without counting bucket padding as KV.
+         * @param tokens Original prompt or suffix, beginning at the schedule start.
+         * @param seq_len Number of real input tokens.
+         * @param policy Production scheduler geometry and logical starting position.
+         * @param pad_token_id Unused: the mock executes no padded device arithmetic.
+         * @param allow_padded_execution Unused: only real rows advance mock state.
+         * @return False for inconsistent admission or a failed mock forward.
+         *
+         * Record each real chunk through the same forward history as short
+         * prefills. The final logits and shifted cursor remain prefill outputs,
+         * not decode outputs merely because several forwards were necessary.
+         */
+        bool forwardPrefillChunkSchedule(
+            const int *tokens, int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int /*pad_token_id*/, bool /*allow_padded_execution*/) override
+        {
+            if (!tokens || seq_len != policy.real_token_count ||
+                position_ != policy.real_token_start)
+                return false;
+            const auto schedule = planPrefillChunkSchedule(policy);
+            if (!schedule)
+                return false;
+            for (const auto &chunk : schedule.chunks)
+                if (!forward(tokens + chunk.token_offset - policy.real_token_start,
+                             chunk.real_count))
+                    return false;
+            setupPrefillLogits();
+            if (mtp_enabled_)
+                mtp_shifted_cached_tokens_ = shiftedTargetForMainTokens(position_);
             return true;
         }
 
@@ -4843,7 +4887,8 @@ namespace
             device_generation_materialized_ =
                 terminal_ledger_ready &&
                 request_count == last_device_generation_request_count_ &&
-                request_count > 0 && draft_depth > 0 &&
+                request_count > 0 && (last_device_generation_depth_policy_.isOrdinary()
+                    ? draft_depth == 0 : draft_depth > 0) &&
                 (topology == DeviceGenerationLoopTopology::FixedDepth ||
                  topology == DeviceGenerationLoopTopology::DynamicDepth) &&
                 isValidDeviceGenerationSamplingMode(sampling_mode);
@@ -4955,6 +5000,14 @@ namespace
                 return false;
             out_result->device = primary_device_;
             out_result->requests = device_generation_terminals_;
+            if (last_device_generation_depth_policy_.isOrdinary())
+            {
+                // The real ordinary sampler publishes this mailbox itself.
+                // A device-free protocol test models that publication, never
+                // a host fallback implementation or GPU arithmetic.
+                resident_logical_state_valid_ = true;
+                resident_logical_state_request_count_ = last_device_generation_request_count_;
+            }
             device_generation_launched_ = false;
             device_generation_admitted_ = false;
             if (device_resident_generation_sequence_enabled_)
@@ -9069,7 +9122,7 @@ namespace
         EXPECT_EQ(step1.tokens[0], MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, GPUDecodeSamplingFailureDoesNotUseHostLogits)
+    TEST_F(Test__PrefillDecodeTransition, GPUDecodeCaptureFailureDoesNotUseHostLogits)
     {
         auto [runner, mock] = createRunner(
             /*mtp_enabled=*/false,
@@ -9084,10 +9137,60 @@ namespace
 
         GenerationResult step = runner->decodeStep();
         EXPECT_FALSE(step.success());
-        EXPECT_THAT(step.error, HasSubstr("GPU decode sampling failed"));
-        EXPECT_THAT(step.error, HasSubstr("host logits sampling is CPU-only"));
-        EXPECT_EQ(mock->sampleMainLogitsCount(), 1);
+        EXPECT_THAT(step.error, HasSubstr("could not compose the complete captured model and sampler"));
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 1);
         EXPECT_TRUE(step.tokens.empty());
+    }
+
+    /** Ordinary GPU callers return one terminal response, not a host-token loop. */
+    TEST_F(Test__PrefillDecodeTransition, OrdinaryGPUResponseUsesCapturedAdmissionAndContinuation)
+    {
+        using Leading = sampling_math::DeviceGenerationLeadingRowDisposition;
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (bool greedy : {false, true})
+            {
+                auto [runner, mock] = createRunner(false, true, {}, nullptr, false, false, device);
+                mock->enableDeviceResidentGenerationSequence({
+                    {.tokens = {2, 3, 4}, .next_leading_row_disposition = Leading::AlreadyEmitted,
+                     .transaction_count = 3, .published_state_commit_count = 2},
+                    {.tokens = {5}, .next_leading_row_disposition = Leading::AlreadyEmitted,
+                     .transaction_count = 1, .published_state_commit_count = 1}});
+                SamplingParams law;
+                law.temperature = greedy ? 0.0F : 0.8F;
+                law.top_k = 4;
+                law.seed = 0xFE000001u;
+                runner->setSamplingParams(law);
+                ASSERT_TRUE(runner->prefill({1, 2, 3}));
+                const auto first = decodeWithBudget(runner, 3);
+                ASSERT_TRUE(first.success()) << first.error;
+                EXPECT_THAT(first.tokens, ElementsAre(2, 3, 4));
+                const auto next = decodeWithBudget(runner, 1);
+                ASSERT_TRUE(next.success()) << next.error;
+                EXPECT_THAT(next.tokens, ElementsAre(5));
+                EXPECT_TRUE(mock->lastDeviceGenerationDepthPolicy().isOrdinary());
+                EXPECT_EQ(mock->lastDeviceGenerationDraftDepth(), 0);
+                EXPECT_EQ(mock->lastDeviceGenerationSamplingMode(), greedy
+                    ? DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic);
+                EXPECT_THAT(mock->deviceGenerationAdmissionDispositions(),
+                    ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted));
+                EXPECT_EQ(mock->forwardCallCount(), 1);
+                EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
+            }
+    }
+
+    /** Bad terminal row accounting must not publish a response or admit continuation. */
+    TEST_F(Test__PrefillDecodeTransition, OrdinaryGPURejectsFalseTerminalCommitCount)
+    {
+        auto [runner, mock] = createRunner(false, true, {}, nullptr, false, false, DeviceId::cuda(0));
+        mock->enableDeviceResidentGeneration({.tokens = {2},
+            .next_leading_row_disposition = sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted,
+            .transaction_count = 1, .published_state_commit_count = 1});
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        const auto result = decodeWithBudget(runner, 1);
+        EXPECT_FALSE(result.success());
+        EXPECT_THAT(result.error, HasSubstr("terminal response or model-row accounting"));
+        EXPECT_TRUE(result.tokens.empty());
     }
 
     /**
@@ -15988,7 +16091,13 @@ namespace
         global_config.rank = 0;
         global_config.world_size = 2;
         global_config.mpi_ctx = mpi.get();
-        global_config.rank_runner = std::move(child);
+        const auto local_plan = GlobalPPRankPlanBuilder::build(global_config.topology, 0);
+        StageRunnerEntry entry;
+        entry.action = *local_plan.executeStages().front();
+        entry.stage_id = entry.action.stage_id;
+        entry.domain_name = entry.action.domain_name;
+        entry.runner = std::move(child);
+        global_config.stage_runners.push_back(std::move(entry));
         global_config.vocab_size = MockInferenceRunner::VOCAB_SIZE;
         global_config.d_model = 16;
         global_config.architecture_name = "mock";
@@ -16057,7 +16166,13 @@ namespace
         global_config.rank = 0;
         global_config.world_size = 2;
         global_config.mpi_ctx = mpi.get();
-        global_config.rank_runner = std::move(child);
+        const auto local_plan = GlobalPPRankPlanBuilder::build(global_config.topology, 0);
+        StageRunnerEntry entry;
+        entry.action = *local_plan.executeStages().front();
+        entry.stage_id = entry.action.stage_id;
+        entry.domain_name = entry.action.domain_name;
+        entry.runner = std::move(child);
+        global_config.stage_runners.push_back(std::move(entry));
         global_config.vocab_size = MockInferenceRunner::VOCAB_SIZE;
         global_config.d_model = 16;
         global_config.architecture_name = "mock";
@@ -17314,6 +17429,17 @@ namespace
                     mock->enableDeviceResidentMTPSpecStatePublication();
                 }
                 ASSERT_TRUE(runner->prefill(std::vector<int32_t>(4080, 1)));
+                // The serving cap may split this prompt. Every chunk must
+                // advance only real rows, retaining the exact 4080/4096 edge.
+                int admitted_rows = 0;
+                for (const auto &chunk : mock->forwardHistory())
+                {
+                    EXPECT_LE(chunk.size(), static_cast<std::size_t>(
+                        debugEnv().execution.prefill_graph_bucket_sizes.back()));
+                    admitted_rows += static_cast<int>(chunk.size());
+                }
+                EXPECT_EQ(admitted_rows, 4080);
+                EXPECT_EQ(mock->get_position(), 4080);
                 runner->setDecodeStepTokenBudget(1);
                 for (int position = 4080; position < 4096; ++position)
                 {

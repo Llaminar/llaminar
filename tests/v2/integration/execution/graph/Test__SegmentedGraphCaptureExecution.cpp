@@ -17,7 +17,12 @@
  * 5. Small auxiliary graph families certify aggregate native-pool growth over
  *    cold and warm lifetimes without attributing a pool slab to one sibling.
  * 6. The sealed CPU-service inventory is exported with its GPU parent and only
- *    successful initial/repeat submissions, on both CUDA and ROCm.
+ *    successful initial/repeat submissions, on both CUDA and ROCm, whether the
+ *    first invocation materializes only or also launches the MTP transaction.
+ * 7. A typed heterogeneous transaction arms its launch dependency exactly once
+ *    after readiness materialization and on replay, never while recording.
+ * 8. Capture, initial submission and replay preserve an exact executable-family
+ *    evidence identity; sibling setup variants cannot borrow one another's work.
  */
 
 #include <gtest/gtest.h>
@@ -591,6 +596,16 @@ namespace
 class CachedGraphReplayExecutionTest : public ::testing::Test
 {
 protected:
+    /**
+     * @brief Exercise CPU-ticket retirement and evidence across both first-use policies.
+     * @param initial_submission Whether setup also submits transaction zero.
+     *
+     * Each caller gets a fresh fixture: a previously materialized cache would
+     * bypass the capture controller's distinct first-launch publication path.
+     */
+    void expectRetainedParentTicketLifecycle(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission);
+
     IWorkerGPUContext *gpu_ctx_ = nullptr;
     std::unique_ptr<IDeviceContext> device_ctx_;
     GraphArenaTestHarness graph_arena_;
@@ -1204,6 +1219,7 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
         result, num_elements, segment_cache.capture_stream);
 }
 
+/** @brief Retain exact captured ticket units and their evidence across requests. */
 TEST_F(CachedGraphReplayExecutionTest,
        HeterogeneousTicketSegmentsReuseCapturedBucketAcrossLogicalLengths)
 {
@@ -1397,6 +1413,18 @@ TEST_F(CachedGraphReplayExecutionTest,
         device);
     graph.addDependency("cpu_ticket_participant", "ticket_publish");
     graph.addDependency("ticket_consume", "cpu_ticket_participant");
+    // The transport inside a manual unit may be local CPU service or MPI.
+    // Both require the same explicit producer/terminal contract before setup
+    // seals the graph. An ordinary segmented graph cannot own a launch hook.
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_publish", {.identity = "ticket_producer"});
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        {.identity = "ticket_terminal",
+         .disposition = GraphHeterogeneousTicketUnitDisposition::TransactionTerminal});
 
     GraphExecutorConfig exec_config;
     exec_config.enable_validation = false;
@@ -1406,8 +1434,23 @@ TEST_F(CachedGraphReplayExecutionTest,
     void *dispatch_stream = gpu_ctx_->defaultStream();
     ASSERT_NE(dispatch_stream, nullptr);
 
+    std::vector<DeviceGraphExecutor::GraphExecutableLaunchPhase> launch_phases;
+    // Both physical variants deliberately share a semantic MTP context, as
+    // setup and live verifier graphs do in the public cross-host server.
+    segment_cache.perf_context = "main_verifier";
+    const DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&](DeviceGraphExecutor::GraphExecutableLaunchPhase phase, void *stream)
+    {
+        EXPECT_NE(stream, nullptr);
+        EXPECT_EQ(launch_phases.size(), manual_probe->callCount())
+            << "Arm once, before the manual service consumes this transaction";
+        launch_phases.push_back(phase);
+        return stream != nullptr;
+    };
+
     const auto execute_with_cache = [&graph,
                                      &executor,
+                                     &launch_dependency,
                                      this,
                                      dispatch_stream](
                                         DeviceGraphExecutor::GraphSegmentCache &cache,
@@ -1427,7 +1470,8 @@ TEST_F(CachedGraphReplayExecutionTest,
             {},
             DeviceGraphExecutor::GraphReplayPlanPolicy::
                 AllowHeterogeneousBoundarySegmentation,
-            {},
+            initial_submission == DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch
+                ? DeviceGraphExecutor::GraphLaunchDependencyHook{} : launch_dependency,
             {},
             {},
             initial_submission);
@@ -1440,9 +1484,10 @@ TEST_F(CachedGraphReplayExecutionTest,
                 CaptureInstantiateAndLaunch);
     };
 
-    const auto expect_output = [&](int logical_rows, float base)
+    const auto expect_output = [&](
+        const DeviceGraphExecutor::GraphSegmentCache &cache, int logical_rows, float base)
     {
-        ASSERT_TRUE(output->ensureOnHost(segment_cache.capture_stream));
+        ASSERT_TRUE(output->ensureOnHost(cache.capture_stream));
         for (int row = 0; row < logical_rows; ++row)
         {
             const float bias =
@@ -1486,7 +1531,9 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_TRUE(ticket_storage->hasCapturedPublicationContract());
     ASSERT_EQ(manual_probe->callCount(), 1u);
     EXPECT_EQ(manual_probe->observedRows(0), 3);
-    expect_output(/*logical_rows=*/3, /*base=*/1.0f);
+    ASSERT_EQ(launch_phases.size(), 1u);
+    EXPECT_EQ(launch_phases.back(), DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction);
+    expect_output(segment_cache, /*logical_rows=*/3, /*base=*/1.0f);
 
     fill_transaction(/*logical_rows=*/1, /*base=*/4.0f);
     ASSERT_TRUE(hidden->ensureOnDevice(device, segment_cache.capture_stream));
@@ -1510,10 +1557,12 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_EQ(segment_cache.segments[2].capture.get(), consume_capture);
     ASSERT_EQ(manual_probe->callCount(), 2u);
     EXPECT_EQ(manual_probe->observedRows(1), 1);
+    ASSERT_EQ(launch_phases.size(), 2u);
+    EXPECT_EQ(launch_phases.back(), DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay);
     EXPECT_EQ(ticket_storage->ticket().header, ticket_header);
     EXPECT_EQ(ticket_storage->ticket().hidden_rows_fp32, ticket_hidden);
     EXPECT_EQ(ticket_storage->ticket().return_rows_fp32, ticket_return);
-    expect_output(/*logical_rows=*/1, /*base=*/4.0f);
+    expect_output(segment_cache, /*logical_rows=*/1, /*base=*/4.0f);
 
     /*
      * Server readiness seals every graph before request admission. Reset the
@@ -1525,6 +1574,7 @@ TEST_F(CachedGraphReplayExecutionTest,
     ASSERT_FALSE(ticket_storage->ticket().returnPayloadReady());
     graph.reset();
     DeviceGraphExecutor::GraphSegmentCache setup_cache;
+    setup_cache.perf_context = segment_cache.perf_context;
     ASSERT_TRUE(execute_with_cache(
         setup_cache,
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
@@ -1535,6 +1585,65 @@ TEST_F(CachedGraphReplayExecutionTest,
         DeviceGraphExecutor::GraphSegmentCache::
             ExecutableSubmissionState::MaterializedUnlaunched);
     EXPECT_EQ(setup_cache.successful_submission_count, 0u);
+    ASSERT_NE(setup_cache.evidence_family, 0u);
+    ASSERT_NE(segment_cache.evidence_family, 0u);
+    EXPECT_NE(setup_cache.evidence_family, segment_cache.evidence_family);
+    const auto setup_family = setup_cache.evidence_family;
+    EXPECT_EQ(launch_phases.size(), 2u)
+        << "Setup cannot arm a remote follower or launch its transaction";
+
+    // Reproduce the server's readiness-to-first-request edge: installing the
+    // hook after materialization must retain both native executable identities.
+    const auto *const setup_producer = setup_cache.segments.front().capture.get();
+    const auto *const setup_consumer = setup_cache.segments.back().capture.get();
+    for (const auto phase : {
+             DeviceGraphExecutor::GraphExecutableLaunchPhase::InitialTransaction,
+             DeviceGraphExecutor::GraphExecutableLaunchPhase::SteadyReplay})
+    {
+        graph.reset();
+        ASSERT_TRUE(execute_with_cache(
+            setup_cache,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch));
+        EXPECT_EQ(launch_phases.back(), phase);
+        EXPECT_EQ(launch_phases.size(), manual_probe->callCount());
+        EXPECT_EQ(setup_cache.segments.front().capture.get(), setup_producer);
+        EXPECT_EQ(setup_cache.segments.back().capture.get(), setup_consumer);
+        expect_output(setup_cache, /*logical_rows=*/1, /*base=*/4.0f);
+    }
+    EXPECT_EQ(launch_phases.size(), 4u);
+    EXPECT_EQ(setup_cache.evidence_family, setup_family);
+    for (const auto *cache : {&segment_cache, &setup_cache})
+    {
+        const auto family = std::to_string(cache->evidence_family);
+        for (const auto &unit : cache->segments)
+            EXPECT_EQ(unit.evidence_family, cache->evidence_family);
+        std::unordered_set<std::string> captured, replayed;
+        double initial = 0.0;
+        for (const auto &record : PerfStatsCollector::snapshot({"forward_graph"}))
+        {
+            if (record.name != "segmented_graph_capture_executable_nodes" &&
+                record.name != "segmented_replay_segments" &&
+                record.name != "materialized_graph_transaction_zero_launches")
+                continue;
+            ASSERT_TRUE(record.tags.contains("executable_family"));
+            if (record.tags.at("executable_family") != family)
+                continue;
+            EXPECT_EQ(record.device, device.toString());
+            EXPECT_EQ(record.tags.at("context"), "main_verifier");
+            if (record.name == "segmented_graph_capture_executable_nodes")
+            {
+                EXPECT_GT(record.value, 0.0);
+                captured.insert(record.tags.at("first_stage"));
+            }
+            else if (record.name == "materialized_graph_transaction_zero_launches")
+                initial += record.value;
+            else if (record.tags.at("type") == "capturable")
+                replayed.insert(record.tags.at("first_stage"));
+        }
+        EXPECT_EQ(captured.size(), 2u);
+        EXPECT_EQ(captured, replayed);
+        EXPECT_EQ(initial, cache == &setup_cache ? 1.0 : 0.0);
+    }
 }
 
 /**
@@ -1936,8 +2045,8 @@ TEST_F(CachedGraphReplayExecutionTest,
  * different payloads proves that neither graph execution nor ticket contents
  * were frozen in setup.
  */
-TEST_F(CachedGraphReplayExecutionTest,
-       RetainedParentOverlapsCanonicalCPUTicketService)
+void CachedGraphReplayExecutionTest::expectRetainedParentTicketLifecycle(
+    DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
@@ -2235,16 +2344,17 @@ TEST_F(CachedGraphReplayExecutionTest,
         EXPECT_EQ(replays, expected_replays);
     };
 
-    ASSERT_TRUE(execute(
-        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
-            MaterializeWithoutLaunch));
+    const std::size_t initial_calls = initial_submission ==
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch
+            ? 0u : 1u;
+    ASSERT_TRUE(execute(initial_submission));
     ASSERT_NE(segment_cache.retained_parent_capture, nullptr);
     EXPECT_TRUE(segment_cache.retained_parent_capture->hasExecutable());
     EXPECT_STREQ(
         DeviceGraphCaptureController::replayModeName(segment_cache),
         "retained_parent");
-    EXPECT_EQ(first_manual_probe->callCount(), 0u);
-    EXPECT_EQ(second_manual_probe->callCount(), 0u);
+    EXPECT_EQ(first_manual_probe->callCount(), initial_calls);
+    EXPECT_EQ(second_manual_probe->callCount(), initial_calls);
     EXPECT_EQ(composer_calls, 1u);
     ASSERT_EQ(
         segment_cache.retained_composed_parent_replay
@@ -2253,16 +2363,18 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_EQ(
         segment_cache.retained_composed_parent_replay.child_unit_count,
         3u);
-    expect_boundary_evidence(0.0, 0.0);
+    expect_boundary_evidence(static_cast<double>(initial_calls), 0.0);
+    if (initial_calls != 0u)
+        expect_payload(1000.0f);
 
     graph.reset();
     ASSERT_TRUE(execute(
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
             CaptureInstantiateAndLaunch));
-    ASSERT_EQ(first_manual_probe->callCount(), 1u);
-    ASSERT_EQ(second_manual_probe->callCount(), 1u);
-    expect_payload(1000.0f);
-    expect_boundary_evidence(1.0, 0.0);
+    ASSERT_EQ(first_manual_probe->callCount(), initial_calls + 1u);
+    ASSERT_EQ(second_manual_probe->callCount(), initial_calls + 1u);
+    expect_payload(1000.0f * static_cast<float>(initial_calls + 1u));
+    expect_boundary_evidence(1.0, static_cast<double>(initial_calls));
     EXPECT_FALSE(first_ticket_storage->payloadReady());
     EXPECT_FALSE(second_ticket_storage->payloadReady());
 
@@ -2270,13 +2382,27 @@ TEST_F(CachedGraphReplayExecutionTest,
     ASSERT_TRUE(execute(
         DeviceGraphExecutor::GraphInitialSubmissionPolicy::
             CaptureInstantiateAndLaunch));
-    ASSERT_EQ(first_manual_probe->callCount(), 2u);
-    ASSERT_EQ(second_manual_probe->callCount(), 2u);
+    ASSERT_EQ(first_manual_probe->callCount(), initial_calls + 2u);
+    ASSERT_EQ(second_manual_probe->callCount(), initial_calls + 2u);
     EXPECT_EQ(composer_calls, 1u);
-    expect_payload(2000.0f);
-    expect_boundary_evidence(1.0, 1.0);
+    expect_payload(1000.0f * static_cast<float>(initial_calls + 2u));
+    expect_boundary_evidence(1.0, static_cast<double>(initial_calls + 1u));
     EXPECT_FALSE(first_ticket_storage->payloadReady());
     EXPECT_FALSE(second_ticket_storage->payloadReady());
+}
+
+TEST_F(CachedGraphReplayExecutionTest,
+       RetainedParentOverlapsCanonicalCPUTicketService)
+{
+    expectRetainedParentTicketLifecycle(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch);
+}
+
+TEST_F(CachedGraphReplayExecutionTest,
+       RetainedParentInitialLaunchPublishesCanonicalCPUTicketService)
+{
+    expectRetainedParentTicketLifecycle(
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch);
 }
 
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)

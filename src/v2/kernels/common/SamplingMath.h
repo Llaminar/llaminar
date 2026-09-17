@@ -956,8 +956,9 @@ namespace llaminar2::sampling_math
             control[kDeviceGenerationControlOk] = 0;
             control[kDeviceGenerationControlRequestComplete] = 1;
             control[kDeviceGenerationControlTransactionCommitBudget] = 0;
-            control[kDeviceGenerationControlErrorCode] =
-                static_cast<int>(error);
+            if (control[kDeviceGenerationControlErrorCode] ==
+                static_cast<int>(DeviceGenerationError::None))
+                control[kDeviceGenerationControlErrorCode] = static_cast<int>(error);
         }
         return false;
     }
@@ -1250,6 +1251,75 @@ namespace llaminar2::sampling_math
             return requests > 0 && requests <= request_capacity && context_capacity > 0 &&
                    cached_tokens && next_condition_tokens && stopped_flags && publication_ok_flags;
         }
+
+        /** @return Exact captured address/geometry identity, excluding live contents. */
+        bool operator==(const OrdinaryGenerationFrontier &) const = default;
+    };
+
+    /**
+     * @brief Borrowed request-admitted stop tokens, checked by the publisher itself.
+     *
+     * A zero stride shares one immutable policy row. A positive stride selects
+     * independent request rows. Unused entries are -1; an empty policy needs no
+     * allocation. This removes a separate stop-flag producer and its event edge.
+     */
+    struct OrdinaryGenerationStopTokens
+    {
+        const int32_t *tokens = nullptr; ///< Persistent device row, or CPU-owner row in unit tests.
+        int count = 0; ///< Entries per row, including any -1 padding.
+        int request_stride = 0; ///< INT32 entries between request rows; zero means shared.
+
+        /** @return Whether the immutable row geometry can be safely traversed. */
+        LLAMINAR_SAMPLING_HD bool valid() const
+        {
+            return count >= 0 && count <= kSpeculativeBatchMaxStopTokens &&
+                   (count == 0 || tokens) &&
+                   (request_stride == 0 || request_stride >= count);
+        }
+
+        /** @return One for a stop, zero otherwise, or -1 for malformed policy data. */
+        LLAMINAR_SAMPLING_HD int evaluate(size_t request, int token) const
+        {
+            int stopped = 0;
+            for (int index = 0; index < count; ++index)
+            {
+                const int candidate = tokens[request * request_stride + index];
+                if (candidate < -1)
+                    return -1; // Validate the entire row, even after a match.
+                if (candidate >= 0 && candidate == token)
+                    stopped = 1;
+            }
+            return stopped;
+        }
+
+        /** @return Exact policy binding, not a comparison of request data. */
+        bool operator==(const OrdinaryGenerationStopTokens &) const = default;
+    };
+
+    /**
+     * @brief Borrowed generated-token counts with one independent owner per request.
+     *
+     * The existing arena histogram is the authority used by repetition penalties.
+     * A request's publication lane is its sole writer, so committing a token
+     * requires neither atomics nor a vocabulary-wide scan. Padded row strides
+     * are allowed, but different requests may never alias the same histogram.
+     */
+    struct OrdinaryGenerationHistory
+    {
+        int32_t *counts = nullptr; ///< Arena-owned INT32 counts, reset at request admission.
+        int vocab_size = 0; ///< Legal sampled token range, independent of response capacity.
+        int request_stride = 0; ///< INT32 entries between exclusively owned history rows.
+        int request_capacity = 0; ///< Admitted physical row capacity, not active requests.
+
+        /** @return Whether each request has a complete, non-overlapping vocabulary row. */
+        LLAMINAR_SAMPLING_HD bool validFor(int requests) const
+        {
+            return counts && vocab_size > 0 && request_stride >= vocab_size &&
+                   requests > 0 && requests <= request_capacity;
+        }
+
+        /** @return Exact captured storage identity; count contents remain device state. */
+        bool operator==(const OrdinaryGenerationHistory &) const = default;
     };
 
     /**
@@ -1263,25 +1333,30 @@ namespace llaminar2::sampling_math
     struct OrdinaryGenerationPublication
     {
         int request_count = 0;
-        const int32_t *sampled_tokens = nullptr;
-        const int32_t *stopped_flags = nullptr;
+        int32_t *sampled_tokens = nullptr; ///< Sampler-owned scratch; publication only reads it.
+        OrdinaryGenerationStopTokens stop_tokens;
         OrdinaryGenerationSampleSource source = OrdinaryGenerationSampleSource::PrefillLogits;
         int32_t *response_tokens = nullptr;
         int response_token_stride = 0;
         int *control = nullptr;
         int control_stride = 0;
         OrdinaryGenerationFrontier frontier;
+        OrdinaryGenerationHistory history;
 
         /** @return Whether all immutable bindings describe a complete publication. */
         LLAMINAR_SAMPLING_HD bool valid() const
         {
-            return request_count > 0 && sampled_tokens && stopped_flags &&
+            return request_count > 0 && sampled_tokens && stop_tokens.valid() &&
                    response_tokens && response_token_stride > 0 && control &&
                    control_stride >= kDeviceGenerationControlCount &&
                    frontier.validFor(request_count) &&
+                   history.validFor(request_count) &&
                    (source == OrdinaryGenerationSampleSource::PrefillLogits ||
                     source == OrdinaryGenerationSampleSource::DecodeLogits);
         }
+
+        /** @return Complete captured publication identity; device values remain replay inputs. */
+        bool operator==(const OrdinaryGenerationPublication &) const = default;
     };
 
     /**
@@ -1403,7 +1478,7 @@ namespace llaminar2::sampling_math
         const int position = frontier.cached_tokens[request];
         const bool decode = publication.source == OrdinaryGenerationSampleSource::DecodeLogits;
         // Subtract before incrementing: malformed INT_MAX positions cannot wrap.
-        // The sampler may already write directly into the next-token/stop rows.
+        // A scalar producer may already write directly into the next-token row.
         // The control ledger, not their pre-publication contents, owns whether
         // a condition was consumed. This permits reuse without staging copies.
         if (frontier.publication_ok_flags[request] != 1 ||
@@ -1426,13 +1501,28 @@ namespace llaminar2::sampling_math
             return true;
         }
 
-        const int stopped = publication.stopped_flags[request];
-        if (stopped != 0 && stopped != 1)
+        const int sampled = publication.sampled_tokens[request];
+        const auto &history = publication.history;
+        // Validate before indexing, and before committing any visible response
+        // or frontier. A corrupt count must not overflow or leave a response
+        // that its subsequent penalty consumer cannot account for.
+        if (sampled < 0 || sampled >= history.vocab_size)
         {
             frontier.publication_ok_flags[request] = 0;
             return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
         }
-        const int sampled = publication.sampled_tokens[request];
+        int32_t *const count = history.counts + request * history.request_stride + sampled;
+        if (*count < 0 || *count == INT32_MAX)
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
+        }
+        const int stopped = publication.stop_tokens.evaluate(request, sampled);
+        if (stopped < 0)
+        {
+            frontier.publication_ok_flags[request] = 0;
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidOrdinarySample);
+        }
         if (!append_ordinary_sample_to_device_generation(
                 sampled, stopped != 0, publication.source,
                 publication.response_tokens + request * publication.response_token_stride,
@@ -1441,6 +1531,9 @@ namespace llaminar2::sampling_math
             frontier.publication_ok_flags[request] = 0;
             return false;
         }
+        // EOS is an emitted token too. Terminal replay returned above and
+        // forward-only consumption emits nothing, so neither can double count.
+        ++*count;
         frontier.cached_tokens[request] = position + (decode ? 1 : 0);
         frontier.next_condition_tokens[request] = sampled;
         frontier.stopped_flags[request] = stopped;
@@ -1474,10 +1567,8 @@ namespace llaminar2::sampling_math
         {
             if (control)
             {
-                control[kDeviceGenerationControlOk] = 0;
-                control[kDeviceGenerationControlErrorCode] =
-                    static_cast<int>(DeviceGenerationError::InvalidController);
-                control[kDeviceGenerationControlTransactionCommitBudget] = 0;
+                fail_device_generation_control(
+                    control, DeviceGenerationError::InvalidController);
             }
             return 0;
         }

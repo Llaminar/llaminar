@@ -33,6 +33,7 @@
  * - `LLAMINAR_CPU_THREAD_SCALING_ITERS`
  */
 
+#include "../../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <omp.h>
 
@@ -280,6 +281,7 @@ TEST(Perf__CPUNativeVNNIThreadScaling, ProductionAutoRoutes)
                     selectVerifierRowsPolicy(packed, regime.m, n, k));
             }
 
+            NativeVNNITestPartialStorage partial_storage(packed, regime.m);
             const auto launch = [&]()
             {
                 if (regime.m == 1)
@@ -287,7 +289,7 @@ TEST(Perf__CPUNativeVNNIThreadScaling, ProductionAutoRoutes)
                     gemv_native_vnni_preq(
                         packed,
                         activations.data(),
-                        output.data(),
+                        output.data(), partial_storage.span(),
                         ISAPath::AUTO,
                         DecodeSchedulePolicy::Auto);
                     return;
@@ -297,7 +299,7 @@ TEST(Perf__CPUNativeVNNIThreadScaling, ProductionAutoRoutes)
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         packed,
                         activations.data(),
-                        output.data(),
+                        output.data(), partial_storage.span(),
                         regime.m,
                         n,
                         ISAPath::AUTO,
@@ -307,7 +309,7 @@ TEST(Perf__CPUNativeVNNIThreadScaling, ProductionAutoRoutes)
                 gemm_native_vnni_preq(
                     packed,
                     activations.data(),
-                    output.data(),
+                    output.data(), partial_storage.span(),
                     regime.m,
                     n,
                     ISAPath::AUTO,

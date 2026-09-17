@@ -105,6 +105,7 @@
         "--gpus=all"
     ],
     "containerEnv": {
+        "DOCKER_HOST": "unix:///var/run/docker-host.sock",
         "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
         "HSA_OVERRIDE_GFX_VERSION": "9.0.6",
         "CCACHE_DIR": "/home/vscode/.ccache",

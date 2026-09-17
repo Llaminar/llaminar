@@ -5,12 +5,15 @@
  * Named-domain runners own participant-local execution; this layer joins
  * their immutable request results. Prefix coordination preserves the epoch
  * selected by each lookup rather than relabeling it from later live state.
+ * One explicit stage registry owns every runner; remote endpoints cannot be
+ * replaced by an anonymous rank runner or the nearest local layer scope.
  *
  * @author David Sanftenberg
  * @date April 2026
  */
 
 #include "GlobalOrchestrator.h"
+#include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../global_pp/GlobalPPRankPlanBuilder.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../tensors/TensorClasses.h"
@@ -27,6 +30,12 @@
 
 namespace llaminar2
 {
+    const ILocalTPContext *StageRunnerEntry::localTPContext() const noexcept
+    {
+        const auto *rank_runner = dynamic_cast<const IRankOrchestrator *>(runner.get());
+        return rank_runner ? rank_runner->localTPContext() : nullptr;
+    }
+
     namespace
     {
         struct ParsedLayerSnapshotKey
@@ -174,6 +183,8 @@ namespace llaminar2
         {
             entry.domain_name = entry.action.domain_name;
         }
+        if (entry.domain_name != entry.action.domain_name)
+            throw std::invalid_argument("StageRunnerRegistry: domain name/action mismatch");
 
         for (const auto &existing : entries_)
         {
@@ -181,28 +192,22 @@ namespace llaminar2
             {
                 throw std::invalid_argument("StageRunnerRegistry: duplicate stage_id");
             }
+            if ((existing.action.has_embedding && entry.action.has_embedding) ||
+                (existing.action.has_lm_head && entry.action.has_lm_head))
+                throw std::invalid_argument("StageRunnerRegistry: duplicate pipeline endpoint owner");
         }
 
         entries_.push_back(std::move(entry));
     }
 
-    void StageRunnerRegistry::setCompatibilityRunner(std::unique_ptr<IInferenceRunner> runner)
-    {
-        if (!runner)
-        {
-            throw std::invalid_argument("StageRunnerRegistry: compatibility runner is required");
-        }
-        compatibility_runner_ = std::move(runner);
-    }
-
     bool StageRunnerRegistry::empty() const
     {
-        return entries_.empty() && !compatibility_runner_;
+        return entries_.empty();
     }
 
     size_t StageRunnerRegistry::size() const
     {
-        return entries_.size() + (compatibility_runner_ ? 1u : 0u);
+        return entries_.size();
     }
 
     bool StageRunnerRegistry::hasRunnerForStage(int stage_id) const
@@ -267,7 +272,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::runnerForStage(int stage_id) const
@@ -279,7 +284,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::runnerForDomain(const std::string &domain_name)
@@ -309,7 +314,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return defaultRunner();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::pipelineHeadRunner() const
@@ -321,7 +326,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return defaultRunner();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::pipelineTailRunner()
@@ -333,7 +338,7 @@ namespace llaminar2
                 return entry_it->runner.get();
             }
         }
-        return lastLocalRunner();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::pipelineTailRunner() const
@@ -345,7 +350,7 @@ namespace llaminar2
                 return entry_it->runner.get();
             }
         }
-        return lastLocalRunner();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::defaultRunner()
@@ -354,7 +359,7 @@ namespace llaminar2
         {
             return entries_.front().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::defaultRunner() const
@@ -363,7 +368,7 @@ namespace llaminar2
         {
             return entries_.front().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::lastLocalRunner()
@@ -372,7 +377,7 @@ namespace llaminar2
         {
             return entries_.back().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::lastLocalRunner() const
@@ -381,7 +386,7 @@ namespace llaminar2
         {
             return entries_.back().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     void StageRunnerRegistry::clearCacheAll()
@@ -389,11 +394,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->resetInferenceState(
-                InferenceStateResetRequest::requestBoundary("global-stage-registry"));
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->resetInferenceState(
                 InferenceStateResetRequest::requestBoundary("global-stage-registry"));
         }
     }
@@ -405,8 +405,7 @@ namespace llaminar2
             if (!entry.runner || !entry.runner->purgePrefixCache())
                 return false;
         }
-        return !compatibility_runner_ ||
-               compatibility_runner_->purgePrefixCache();
+        return true;
     }
 
     bool StageRunnerRegistry::configureMTPRequestStopTokensAll(
@@ -434,16 +433,6 @@ namespace llaminar2
             }
         }
 
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            if (!compatibility_runner_->configureMTPRequestStopTokens(stop_tokens))
-            {
-                throw std::runtime_error(
-                    "MTP request stop-token configuration was rejected by the "
-                    "global compatibility runner");
-            }
-        }
 
         if (!saw_runner)
         {
@@ -479,16 +468,6 @@ namespace llaminar2
             }
         }
 
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            if (!compatibility_runner_->configureMTPRequestPenaltyPolicy(policy))
-            {
-                throw std::runtime_error(
-                    "MTP request penalty-policy configuration was rejected by "
-                    "the global compatibility runner");
-            }
-        }
 
         if (!saw_runner)
         {
@@ -505,10 +484,6 @@ namespace llaminar2
         {
             entry.runner->setSkipLogitsGatherDecode(skip);
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSkipLogitsGatherDecode(skip);
-        }
     }
 
     void StageRunnerRegistry::setSkipLogitsGatherPrefillAll(bool skip)
@@ -516,10 +491,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->setSkipLogitsGatherPrefill(skip);
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSkipLogitsGatherPrefill(skip);
         }
     }
 
@@ -529,10 +500,6 @@ namespace llaminar2
         {
             entry.runner->setSuppressTimeline(suppress);
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSuppressTimeline(suppress);
-        }
     }
 
     void StageRunnerRegistry::setAccumulatePrefillAll(bool accumulate)
@@ -541,10 +508,6 @@ namespace llaminar2
         {
             entry.runner->setAccumulatePrefill(accumulate);
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setAccumulatePrefill(accumulate);
-        }
     }
 
     void StageRunnerRegistry::flushStageTimelineAll()
@@ -552,10 +515,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->flushStageTimeline();
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->flushStageTimeline();
         }
     }
 
@@ -566,14 +525,6 @@ namespace llaminar2
         {
             saw_runner = true;
             if (!entry.runner->supportsChainedMTPDrafts())
-            {
-                return false;
-            }
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            if (!compatibility_runner_->supportsChainedMTPDrafts())
             {
                 return false;
             }
@@ -589,11 +540,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->forwardMTP(draft_condition_token) && ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->forwardMTP(draft_condition_token) && ok;
         }
         return saw_runner && ok;
     }
@@ -612,14 +558,6 @@ namespace llaminar2
                      position_id) &&
                  ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->forwardMTPFromLastDraft(
-                     draft_condition_token,
-                     position_id) &&
-                 ok;
-        }
         return saw_runner && ok;
     }
 
@@ -634,15 +572,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->commitMTPShiftedRowsFromLastForward(
-                     tokens,
-                     token_count,
-                     already_appended_tokens) &&
-                 ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->commitMTPShiftedRowsFromLastForward(
                      tokens,
                      token_count,
                      already_appended_tokens) &&
@@ -675,19 +604,6 @@ namespace llaminar2
                      already_appended_shifted_kv_tokens) &&
                  ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->commitMTPShiftedRowsFromPartialForward(
-                     tokens,
-                     token_count,
-                     already_appended_tokens,
-                     main_forward_token_count,
-                     allow_speculative_discard,
-                     position_offset_override,
-                     already_appended_shifted_kv_tokens) &&
-                 ok;
-        }
         return saw_runner && ok;
     }
 
@@ -703,16 +619,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->commitMTPShiftedRowFromCurrentTerminalHidden(
-                     token,
-                     already_appended_tokens,
-                     allow_speculative_discard,
-                     position_offset_override) &&
-                 ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
                      token,
                      already_appended_tokens,
                      allow_speculative_discard,
@@ -756,10 +662,6 @@ namespace llaminar2
         {
             commit_runner(*entry.runner);
         }
-        if (compatibility_runner_)
-        {
-            commit_runner(*compatibility_runner_);
-        }
         return saw_runner && ok &&
                participant_index == checkpoint.participant_snapshots.size();
     }
@@ -772,11 +674,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->setComputeAllPositionLogits(enabled) && ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->setComputeAllPositionLogits(enabled) && ok;
         }
         return saw_runner && ok;
     }
@@ -795,14 +692,6 @@ namespace llaminar2
                      row_count) &&
                  ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->setComputeRowIndexedAllPositionLogits(
-                     enabled,
-                     row_count) &&
-                 ok;
-        }
         return saw_runner && ok;
     }
 
@@ -816,11 +705,6 @@ namespace llaminar2
             saw_runner = true;
             ok = entry.runner->setMTPSpecVerifierInputPlan(plan) && ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->setMTPSpecVerifierInputPlan(plan) && ok;
-        }
         return saw_runner && ok;
     }
 
@@ -829,10 +713,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->clearMTPSpecVerifierInputPlan();
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->clearMTPSpecVerifierInputPlan();
         }
     }
 
@@ -849,18 +729,6 @@ namespace llaminar2
             std::string local_error;
             const bool runner_ok =
                 entry.runner->publishGroupedDecodeEquivalentMTPSpecStateBatch(
-                    plans,
-                    &local_error);
-            if (!runner_ok && first_error.empty())
-                first_error = local_error;
-            ok = runner_ok && ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            std::string local_error;
-            const bool runner_ok =
-                compatibility_runner_->publishGroupedDecodeEquivalentMTPSpecStateBatch(
                     plans,
                     &local_error);
             if (!runner_ok && first_error.empty())
@@ -885,11 +753,6 @@ namespace llaminar2
             saw_runner = true;
             ok = entry.runner && entry.runner->ensureMTPCheckpointTerminalHidden() && ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->ensureMTPCheckpointTerminalHidden() && ok;
-        }
         return saw_runner && ok;
     }
 
@@ -899,10 +762,6 @@ namespace llaminar2
         for (const auto &entry : entries_)
         {
             epoch = std::max(epoch, entry.runner->moePlacementEpoch());
-        }
-        if (compatibility_runner_)
-        {
-            epoch = std::max(epoch, compatibility_runner_->moePlacementEpoch());
         }
         return epoch;
     }
@@ -914,10 +773,6 @@ namespace llaminar2
         {
             epoch = std::max(epoch, entry.runner->moeRuntimeMovementEpoch());
         }
-        if (compatibility_runner_)
-        {
-            epoch = std::max(epoch, compatibility_runner_->moeRuntimeMovementEpoch());
-        }
         return epoch;
     }
 
@@ -925,7 +780,6 @@ namespace llaminar2
         const std::vector<int32_t> &tokens)
     {
         last_prefix_hits_.clear();
-        compatibility_prefix_hit_.reset();
 
         std::vector<PrefixParticipantLookup> participants;
         int block_size = 0;
@@ -943,19 +797,6 @@ namespace llaminar2
                 PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally));
             last_prefix_hits_.push_back(std::move(hit));
         }
-        if (compatibility_runner_)
-        {
-            PrefixLookupResult hit = compatibility_runner_->lookupPrefix(tokens);
-            if (block_size <= 0 && hit.block_size > 0)
-                block_size = hit.block_size;
-            participants.push_back(makePrefixParticipantLookup(
-                participant_id,
-                compatibility_runner_->primaryDeviceId(),
-                hit,
-                "compatibility",
-                PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally));
-            compatibility_prefix_hit_ = std::move(hit);
-        }
 
         if (participants.empty())
             return {};
@@ -972,17 +813,13 @@ namespace llaminar2
                 aggregate.blocks = candidate.clampedTo(common_tokens).blocks;
                 return true;
             };
-            bool copied = false;
             for (const auto &hit : last_prefix_hits_)
             {
                 if (copy_representative(hit))
                 {
-                    copied = true;
                     break;
                 }
             }
-            if (!copied && compatibility_prefix_hit_)
-                copy_representative(*compatibility_prefix_hit_);
         }
         return aggregate;
     }
@@ -994,9 +831,7 @@ namespace llaminar2
         const int common_tokens = std::max(0, hit.cached_tokens);
         if (common_tokens <= 0)
             return true;
-        if (last_prefix_hits_.size() != entries_.size() ||
-            static_cast<bool>(compatibility_prefix_hit_) !=
-                static_cast<bool>(compatibility_runner_))
+        if (last_prefix_hits_.size() != entries_.size())
         {
             return false;
         }
@@ -1014,19 +849,6 @@ namespace llaminar2
                 return false;
             }
         }
-        if (compatibility_runner_)
-        {
-            PrefixLookupResult child_hit =
-                compatibility_prefix_hit_->clampedTo(common_tokens);
-            child_hit.restore_model_runtime_state = hit.restore_model_runtime_state;
-            child_hit.restore_hybrid_state_for_suffix_prefill =
-                hit.restore_hybrid_state_for_suffix_prefill;
-            if (!compatibility_runner_->populatePrefix(child_hit, seq_idx))
-            {
-                clearCacheAll();
-                return false;
-            }
-        }
         return true;
     }
 
@@ -1036,9 +858,7 @@ namespace llaminar2
         int prompt_token_count)
     {
         if (!admission.cache_enabled || !admission.supported ||
-            last_prefix_hits_.size() != entries_.size() ||
-            static_cast<bool>(compatibility_prefix_hit_) !=
-                static_cast<bool>(compatibility_runner_))
+            last_prefix_hits_.size() != entries_.size())
         {
             return false;
         }
@@ -1050,15 +870,6 @@ namespace llaminar2
             saw_runner = true;
             ok = entries_[index].runner->harvestPrefix(
                      last_prefix_hits_[index],
-                     tokens,
-                     prompt_token_count) &&
-                 ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->harvestPrefix(
-                     *compatibility_prefix_hit_,
                      tokens,
                      prompt_token_count) &&
                  ok;
@@ -1075,9 +886,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (last_prefix_hits_.size() != entries_.size() ||
-            static_cast<bool>(compatibility_prefix_hit_) !=
-                static_cast<bool>(compatibility_runner_))
+        if (last_prefix_hits_.size() != entries_.size())
         {
             return false;
         }
@@ -1090,20 +899,16 @@ namespace llaminar2
                 return false;
             }
         }
-        return !compatibility_runner_ ||
-               compatibility_runner_->restorePrefixTerminalState(
-                   compatibility_prefix_hit_->clampedTo(common_tokens));
+        return true;
     }
 
     PrefixRuntimeStateSnapshot StageRunnerRegistry::prefixStateProbeAll(
         const PrefixProbeCapturePolicy &capture_policy) const
     {
         std::vector<PrefixRuntimeStateSnapshot> children;
-        children.reserve(entries_.size() + (compatibility_runner_ ? 1u : 0u));
+        children.reserve(entries_.size());
         for (const auto &entry : entries_)
             children.push_back(entry.runner->prefixStateProbe(capture_policy));
-        if (compatibility_runner_)
-            children.push_back(compatibility_runner_->prefixStateProbe(capture_policy));
         if (children.empty())
             return {};
         if (children.size() == 1u)
@@ -1329,10 +1134,6 @@ namespace llaminar2
             if (!capture_runner(*entry.runner))
                 return {};
         }
-        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
-        {
-            return {};
-        }
         if (!saw_runner || !have_common_tokens)
         {
             return {};
@@ -1394,10 +1195,6 @@ namespace llaminar2
             if (!capture_runner(*entry.runner))
                 return {};
         }
-        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
-        {
-            return {};
-        }
         if (!saw_runner || !have_common_tokens)
         {
             return {};
@@ -1441,10 +1238,6 @@ namespace llaminar2
         {
             restore_runner(*entry.runner);
         }
-        if (compatibility_runner_)
-        {
-            restore_runner(*compatibility_runner_);
-        }
 
         return saw_runner && ok && participant_index == snapshot.participant_snapshots.size();
     }
@@ -1457,11 +1250,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
         }
         return saw_runner && ok;
     }
@@ -1476,13 +1264,6 @@ namespace llaminar2
             if (!reason.empty())
                 return reason;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            std::string reason = compatibility_runner_->mtpDecodeUnsupportedReason();
-            if (!reason.empty())
-                return reason;
-        }
         return saw_runner ? std::string{} : "MTP decode requires a global stage runner";
     }
 
@@ -1491,10 +1272,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->enableSnapshotCapture(output_dir);
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->enableSnapshotCapture(output_dir);
         }
     }
 
@@ -1539,8 +1316,6 @@ namespace llaminar2
                 stage_keys.end());
             entry.runner->setSnapshotCaptureFilter(stage_keys);
         }
-        if (compatibility_runner_)
-            compatibility_runner_->setSnapshotCaptureFilter(keys);
     }
 
     void StageRunnerRegistry::disableSnapshotCaptureAll()
@@ -1549,10 +1324,6 @@ namespace llaminar2
         {
             entry.runner->disableSnapshotCapture();
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->disableSnapshotCapture();
-        }
     }
 
     void StageRunnerRegistry::clearSnapshotsAll()
@@ -1560,10 +1331,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->clearSnapshots();
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->clearSnapshots();
         }
     }
 
@@ -1595,10 +1362,6 @@ namespace llaminar2
                     }
                 }
             }
-        }
-        if (compatibility_runner_)
-        {
-            return compatibility_runner_->getSnapshot(key, out_size);
         }
         out_size = 0;
         return nullptr;
@@ -1633,10 +1396,6 @@ namespace llaminar2
                 }
             }
         }
-        if (compatibility_runner_)
-        {
-            return compatibility_runner_->getSnapshotWithShape(key);
-        }
         return {};
     }
 
@@ -1661,10 +1420,6 @@ namespace llaminar2
                 key = globalizeStageSnapshotKey(entry, key);
             }
             append_unique(runner_keys);
-        }
-        if (compatibility_runner_)
-        {
-            append_unique(compatibility_runner_->getSnapshotKeys());
         }
         return keys;
     }
@@ -1916,20 +1671,35 @@ namespace llaminar2
         // Build this rank's execution plan from topology
         rank_plan_ = GlobalPPRankPlanBuilder::build(config_.topology, config_.rank);
 
+        const auto local_actions = rank_plan_.executeStages();
         for (auto &entry : config_.stage_runners)
         {
+            const auto expected = std::find_if(local_actions.begin(), local_actions.end(),
+                [&](const auto *action) { return action->stage_id == entry.stage_id; });
+            if (expected == local_actions.end() ||
+                entry.action.stage_id != (*expected)->stage_id ||
+                entry.action.role != RankStageAction::Role::EXECUTE ||
+                entry.action.first_layer != (*expected)->first_layer ||
+                entry.action.last_layer != (*expected)->last_layer ||
+                entry.action.has_embedding != (*expected)->has_embedding ||
+                entry.action.has_lm_head != (*expected)->has_lm_head ||
+                entry.action.domain_name != (*expected)->domain_name)
+                throw std::invalid_argument("GlobalOrchestrator: stage runner does not match this rank's topology action");
+            // A runner cannot claim a different local layer interval from the
+            // action that routes its activations and determines terminal authority.
+            if (entry.pp_stage_config &&
+                (entry.pp_stage_config->first_layer != (*expected)->first_layer ||
+                 entry.pp_stage_config->last_layer != (*expected)->last_layer + 1 ||
+                 entry.pp_stage_config->has_embedding != (*expected)->has_embedding ||
+                 entry.pp_stage_config->has_lm_head != (*expected)->has_lm_head))
+                throw std::invalid_argument("GlobalOrchestrator: stage runner scope disagrees with its topology action");
             stage_runners_.add(std::move(entry));
         }
         config_.stage_runners.clear();
 
-        if (config_.rank_runner)
-        {
-            stage_runners_.setCompatibilityRunner(std::move(config_.rank_runner));
-        }
-
         if (stage_runners_.empty())
         {
-            throw std::invalid_argument("GlobalOrchestrator: rank_runner or stage_runners is required");
+            throw std::invalid_argument("GlobalOrchestrator: explicit stage runners are required");
         }
 
         for (const auto *action : rank_plan_.executeStages())

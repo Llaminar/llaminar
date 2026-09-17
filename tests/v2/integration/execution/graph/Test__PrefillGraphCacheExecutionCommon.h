@@ -21,9 +21,14 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/BackendManager.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/compute_stages/stages/OrdinaryGenerationSamplingStage.h"
 #include "execution/compute_stages/stages/RoPEStage.h"
+#include "execution/mtp/DeviceGenerationContract.h"
+#include "execution/mtp/DeviceGenerationGraphProgram.h"
+#include "execution/mtp/HostedDeviceGenerationLifecycle.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
@@ -37,6 +42,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -527,6 +533,24 @@ namespace
             ComputeGraph graph;
             graph.addNode("gpu_residual_add_probe", std::move(stage), device_);
 
+            if (embedding_table_)
+            {
+                // The production embedding is the producer of HIDDEN_STATE;
+                // no host token upload or test copy substitutes for this edge.
+                EmbeddingStage::Params embedding;
+                embedding.device_id = device_;
+                embedding.embed_table = embedding_table_;
+                embedding.token_ids_device = input.token_ids_device;
+                embedding.output = input_ptr;
+                embedding.num_tokens = input.seq_len;
+                embedding.d_model = kHiddenDim;
+                embedding.vocab_size = static_cast<int>(embedding_table_->rows());
+                embedding.output_buffer_id = BufferId::HIDDEN_STATE;
+                graph.addNode("resident_embedding",
+                    std::make_unique<EmbeddingStage>(embedding), device_);
+                graph.addDependency("gpu_residual_add_probe", "resident_embedding");
+            }
+
             if (use_kv_append_probe_)
             {
                 FP32Tensor *k_ptr = k_tensor_;
@@ -633,11 +657,6 @@ namespace
         bool workerGPUContextUsesProcessPool(DeviceId device) const override
         {
             return device == device_ && device.is_gpu();
-        }
-
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
-        {
-            return {{device_, ctx_}};
         }
 
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph, int workspace_seq_len) override
@@ -925,6 +944,13 @@ namespace
                        : nullptr;
         }
 
+        /** @brief Reset real cache data on its exact fixture stream, preserving captured addresses. */
+        bool resetKVCacheProbeForTesting(void *stream)
+        {
+            return kv_cache_ && stream && kv_cache_->resetRequestState(
+                IKVCache::StateResetContext::testReinitialization(stream, "resident-generation-reset"));
+        }
+
         /**
          * @brief Set the logical capacity of the lazily-created KV probe.
          *
@@ -946,6 +972,20 @@ namespace
 
         /// @brief Enable the real GPU RoPE dynamic-position consumer.
         void setUseRoPEProbe(bool enabled) { use_rope_probe_ = enabled; }
+
+        /**
+         * @brief Bind a real embedding producer before any graph is built.
+         * @param table Fixture-owned immutable weights outliving every cached graph.
+         * @return False for a late rebind or incompatible hidden geometry.
+         */
+        bool bindEmbeddingTable(FP32Tensor &table)
+        {
+            if (build_calls != 0 || embedding_table_ ||
+                table.rows() == 0 || table.cols() != kHiddenDim)
+                return false;
+            embedding_table_ = &table;
+            return true;
+        }
 
         /// @brief Make chunk maintenance emulate a placement-changing rebalance.
         void setPlacementChangingMaintenance(
@@ -978,6 +1018,18 @@ namespace
             if (!residual_tensor_->ensureOnDevice(device_, stream))
                 return false;
             TransferEngine::publishDeviceWrite(residual_tensor_, device_, stream);
+            return true;
+        }
+
+        /** @brief Publish fixture-owned K/V inputs before setup-only append capture. */
+        bool admitProbeKVInputs(void *stream)
+        {
+            for (auto *tensor : {k_tensor_, v_tensor_})
+            {
+                if (!tensor->ensureOnDevice(device_, stream))
+                    return false;
+                TransferEngine::publishDeviceWrite(tensor, device_, stream);
+            }
             return true;
         }
 
@@ -1213,6 +1265,7 @@ namespace
         uint64_t topology_delta_on_maintenance_ = 0;
         ForwardExecutionEngine *engine_to_clear_on_maintenance_ = nullptr;
         FP32Tensor *input_tensor_ = nullptr;
+        FP32Tensor *embedding_table_ = nullptr; ///< Optional borrowed producer weights, never a second token authority.
         FP32Tensor *residual_tensor_ = nullptr;
         FP32Tensor *residual_output_tensor_ = nullptr;
         FP32Tensor *selected_row_tensor_ = nullptr;
@@ -1393,7 +1446,6 @@ namespace
 
             ForwardExecutionEngine::Config engine_config;
             engine_config.cache_config.enabled = true;
-            engine_config.has_unified_pp = false;
             engine_ = std::make_unique<ForwardExecutionEngine>(std::move(engine_config), *executor_);
             host_ = std::make_unique<PrefillGraphCacheTestHost>(
                 device_,
@@ -1482,6 +1534,7 @@ namespace
                 *host_);
         }
 
+        std::unique_ptr<FP32Tensor> embedding_table_; ///< Destroyed after all native graph/arena owners, even on assertion failure.
         test::GraphArenaTestHarness graph_arena_;
         DeviceId device_ = DeviceId::cpu();
         std::unique_ptr<IDeviceContext> device_ctx_;
@@ -1489,6 +1542,8 @@ namespace
         std::unique_ptr<ForwardExecutionEngine> engine_;
         std::unique_ptr<PrefillGraphCacheTestHost> host_;
     };
+
+#include "Test__ResidentOrdinaryForwardCommon.inc"
 
     /**
      * @brief Setup-only PP graphs consume new ingress bytes on their first replay.
@@ -1670,6 +1725,388 @@ namespace
                 engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
         }
         EXPECT_EQ(host_->committed_forward_output_calls, 6);
+    }
+
+    /**
+     * @brief Export and compose a real native child without an initial inference run.
+     *
+     * The same capture address survives twenty request resets. The retained
+     * parent, rather than a preparatory forward call, performs the arithmetic;
+     * its output is observed only after publishing the exact completion edge.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, UnlaunchedDecodeChildComposesAcrossRequestResets)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{139});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            ASSERT_NE(stream, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            ForwardInput input;
+            input.token_ids_device = static_cast<const int32_t *>(tokens->gpu_data_ptr());
+            input.position_ids_device = static_cast<const int32_t *>(positions->gpu_data_ptr());
+            input.position_offset = 139;
+            input.batch_size = 1;
+            input.seq_len = 1;
+            input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            const auto observations = engine_->replayCacheObservations(1);
+            ASSERT_EQ(observations.size(), 1u);
+            std::string error;
+            const auto child = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+            ASSERT_TRUE(child.has_value()) << error;
+            ASSERT_TRUE(engine_->retainedDecodeGraph(observations.front().signature, &error)) << error;
+            ASSERT_NE(child->capture, nullptr);
+            EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            EXPECT_EQ(host_->sync_logits_calls, 0);
+            auto parent = worker->createGraphCapture(stream);
+            const GPUOrderedTimelineStep steps[] = {{
+                .name = "unlaunched production forward", .capture = child->capture}};
+            ASSERT_TRUE(parent && parent->buildOrderedTimelineTransaction(steps));
+            ASSERT_TRUE(parent->instantiate());
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                // Address-only setup never uploads live activation bytes. An
+                // upstream producer admits each request before the retained
+                // child consumes it, without changing any captured address.
+                auto *payload = upstream.mutable_data();
+                for (int i = 0; i < kHiddenDim; ++i)
+                    payload[i] = static_cast<float>(request * 4) +
+                                 static_cast<float>(i % 17) * 0.125f;
+                ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+                // The setup call reuses immutable topology; it must neither
+                // execute nor replace the child borrowed by the retained parent.
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto retained = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+                ASSERT_TRUE(retained.has_value()) << error;
+                EXPECT_EQ(retained->capture, child->capture);
+                ASSERT_TRUE(parent->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                const auto *actual = static_cast<FP32Tensor *>(output.logits)->data();
+                for (int i = 0; i < kHiddenDim; ++i)
+                    ASSERT_FLOAT_EQ(actual[i], payload[i] + 0.25f +
+                                                  static_cast<float>(i % 13) * 0.0625f);
+                EXPECT_EQ(host_->build_calls, 1);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+            }
+        });
+    }
+
+    /**
+     * @brief Retained children keep their own resident RoPE input across request resets.
+     *
+     * Two equal-shape production forwards differ only by their position-row
+     * address. Each must keep its own executable. Poisoning the other bank
+     * proves that a retained parent reads the address it actually captured,
+     * while twenty resets prove content changes do not cause recapture.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, ResidentPositionOwnersRetainDistinctChildren)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        host_->setUseRoPEProbe(true);
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        std::array<INT32Tensor *, 2> positions{
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::REQUEST_POSITION_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{2}),
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::MTP_POSITION_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{17})};
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            std::fill_n(upstream.mutable_data(), kHiddenDim, 0.5f);
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            for (auto *row : positions) {
+                ASSERT_TRUE(row->ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(row, device_, stream);
+            }
+            ForwardInput input;
+            input.token_ids_device = tokens->gpu_data_ptr();
+            input.position_offset = 1;
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            std::array<ForwardGraphSignature, 2> signatures;
+            std::array<const IGPUGraphCapture *, 2> children{};
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> parents;
+            std::array<std::vector<float>, 2> expected;
+            std::string error;
+            for (int owner = 0; owner < 2; ++owner) {
+                input.position_ids_device = positions[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto observations = engine_->replayCacheObservations(1);
+                ASSERT_EQ(observations.size(), static_cast<size_t>(owner + 1));
+                for (const auto &observation : observations)
+                    if (owner == 0 || observation.signature != signatures[0])
+                        signatures[owner] = observation.signature;
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                children[owner] = child->capture;
+                parents[owner] = worker->createGraphCapture(stream);
+                const GPUOrderedTimelineStep steps[] = {{.name = "resident position owner", .capture = child->capture}};
+                ASSERT_TRUE(parents[owner] && parents[owner]->buildOrderedTimelineTransaction(steps));
+                ASSERT_TRUE(parents[owner]->instantiate() && parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                expected[owner] = captureProbeOutputPrefix(*host_, kHiddenDim);
+            }
+            ASSERT_GT(maxAbsDiff(expected[0], expected[1]), 1.0e-3);
+            EXPECT_NE(children[0], children[1]);
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                const int owner = request % 2;
+                const int32_t live = owner == 0 ? 2 : 17;
+                const int32_t poison = 1000 + request;
+                ASSERT_TRUE(backend->hostToDevice(positions[owner]->gpu_data_ptr(), &live,
+                    sizeof(live), device_.gpu_ordinal(), stream));
+                ASSERT_TRUE(backend->hostToDevice(positions[1 - owner]->gpu_data_ptr(), &poison,
+                    sizeof(poison), device_.gpu_ordinal(), stream));
+                input.position_ids_device = positions[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                EXPECT_EQ(child->capture, children[owner]);
+                ASSERT_TRUE(parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                EXPECT_EQ(captureProbeOutputPrefix(*host_, kHiddenDim), expected[owner]);
+                EXPECT_EQ(host_->build_calls, 2);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+            }
+        });
+    }
+
+    /**
+     * @brief Real embedding children retain token owners without a host replay prelude.
+     *
+     * Each owner is captured once, then only its native parent is launched.
+     * Alternating distinct token banks and poisoning the inactive bank catches
+     * both a missing cache identity and embedding-kernel pointer aliasing. The
+     * exact CPU oracle uses binary fractions, not a previous device result.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, ResidentTokenOwnersRetainDistinctEmbeddingChildren)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        constexpr int vocab = 64;
+        embedding_table_ = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{vocab, kHiddenDim});
+        auto *weights = embedding_table_->mutable_data();
+        for (int token = 0; token < vocab; ++token)
+            for (int col = 0; col < kHiddenDim; ++col)
+                weights[token * kHiddenDim + col] =
+                    static_cast<float>(token) + static_cast<float>(col) * 0.125f;
+        ASSERT_TRUE(host_->bindEmbeddingTable(*embedding_table_));
+        host_->enableDeferredDecodeProbe();
+        std::array<INT32Tensor *, 2> tokens{
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::REQUEST_TOKEN_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{2}),
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::MTP_CONDITION_TOKEN,
+                std::vector<size_t>{1}, std::vector<int32_t>{17})};
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{1});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(embedding_table_->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(embedding_table_.get(), device_, stream);
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            for (auto *row : tokens) {
+                ASSERT_TRUE(row->ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(row, device_, stream);
+            }
+            ForwardInput input;
+            input.position_ids_device = positions->gpu_data_ptr();
+            input.position_offset = 1;
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            std::array<ForwardGraphSignature, 2> signatures;
+            std::array<const IGPUGraphCapture *, 2> children{};
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> parents;
+            std::string error;
+            for (int owner = 0; owner < 2; ++owner) {
+                input.token_ids_device = tokens[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto observations = engine_->replayCacheObservations(1);
+                ASSERT_EQ(observations.size(), static_cast<size_t>(owner + 1));
+                for (const auto &observation : observations)
+                    if (observation.signature.device_token_ids == input.token_ids_device)
+                        signatures[owner] = observation.signature;
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                children[owner] = child->capture;
+                parents[owner] = worker->createGraphCapture(stream);
+                const GPUOrderedTimelineStep steps[] = {{.name = "resident token owner", .capture = child->capture}};
+                ASSERT_TRUE(parents[owner] && parents[owner]->buildOrderedTimelineTransaction(steps));
+                ASSERT_TRUE(parents[owner]->instantiate());
+            }
+            EXPECT_NE(children[0], children[1]);
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                const int owner = request % 2;
+                const int32_t live = request + 1, poison = vocab - 1;
+                ASSERT_TRUE(backend->hostToDevice(tokens[owner]->gpu_data_ptr(), &live,
+                    sizeof(live), device_.gpu_ordinal(), stream));
+                ASSERT_TRUE(backend->hostToDevice(tokens[1 - owner]->gpu_data_ptr(), &poison,
+                    sizeof(poison), device_.gpu_ordinal(), stream));
+                // Deliberately no engine invocation or dynamic-param update:
+                // a complete generation parent must consume its resident row.
+                ASSERT_TRUE(parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                const auto actual = captureProbeOutputPrefix(*host_, kHiddenDim);
+                ASSERT_EQ(actual.size(), static_cast<size_t>(kHiddenDim));
+                for (int col = 0; col < kHiddenDim; ++col)
+                    EXPECT_FLOAT_EQ(actual[col], static_cast<float>(live) +
+                        static_cast<float>(col) * 0.125f +
+                        0.25f + static_cast<float>(col % 13) * 0.0625f);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+                const auto retained = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(retained.has_value()) << error;
+                EXPECT_EQ(retained->capture, children[owner]);
+                EXPECT_EQ(host_->build_calls, 2);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            }
+        });
+    }
+
+    /**
+     * @brief A retained decode child snapshots live KV on every launch, without a host prelude.
+     *
+     * The real append kernel advances the canonical cache count. Its next
+     * iteration must snapshot that new count before any model root can mutate
+     * it. Only the parent is launched after setup: no engine call refreshes
+     * dynamic parameters or positions between the twenty native replays.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, DecodePositionSnapshotIsInsideRetainedChild)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        host_->setUseKVAppendProbe(true);
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{-77});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->initializeKVCacheProbeForTesting());
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(host_->admitProbeKVInputs(stream));
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            ForwardInput input;
+            input.token_ids_device = tokens->gpu_data_ptr();
+            input.position_ids_device = positions->gpu_data_ptr();
+            input.position_offset = 1; // History-bearing geometry, never the live position authority.
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.device_decode_position = DeviceDecodePositionBinding{
+                backend, host_->kvSequenceCachedTokensDeviceForTesting(),
+                static_cast<int32_t *>(positions->gpu_data_ptr())};
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            const auto observations = engine_->replayCacheObservations(1);
+            ASSERT_EQ(observations.size(), 1u);
+            EXPECT_EQ(observations.front().signature.device_decode_position, input.device_decode_position);
+            std::string error;
+            const auto child = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+            ASSERT_TRUE(child.has_value()) << error;
+            auto parent = worker->createGraphCapture(stream);
+            const GPUOrderedTimelineStep steps[] = {{
+                .name = "decode with in-graph KV snapshot", .capture = child->capture}};
+            ASSERT_TRUE(parent && parent->buildOrderedTimelineTransaction(steps));
+            ASSERT_TRUE(parent->instantiate());
+            int32_t observed = 0;
+            ASSERT_TRUE(backend->deviceToHost(&observed, positions->gpu_data_ptr(), sizeof(observed),
+                device_.gpu_ordinal(), stream));
+            ASSERT_EQ(observed, -77) << "Setup-only recording must not execute the position snapshot.";
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                SCOPED_TRACE(replay);
+                ASSERT_TRUE(parent->launch());
+                ASSERT_TRUE(backend->deviceToHost(&observed, positions->gpu_data_ptr(), sizeof(observed),
+                    device_.gpu_ordinal(), stream));
+                ASSERT_EQ(observed, replay) << "Snapshot must precede this replay's actual KV append.";
+                EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(stream), replay + 1);
+                EXPECT_EQ(host_->build_calls, 1);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            }
+        });
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ExactBucketWarmupCaptureReplayLifecycle)
@@ -2377,8 +2814,8 @@ namespace
             host_->placement_epoch,
             input.sequence_lengths_device);
         auto device_chunk_signature = signature;
-        device_chunk_signature.uses_device_token_ids = true;
-        device_chunk_signature.uses_device_position_ids = true;
+        device_chunk_signature.device_token_ids = chunk_token_bank->gpu_data_ptr();
+        device_chunk_signature.device_position_ids = chunk_position_bank->gpu_data_ptr();
         device_chunk_signature.position_policy =
             ForwardPositionPolicy::ExplicitRows;
         device_chunk_signature.device_prefill_chunk_capture_identity =

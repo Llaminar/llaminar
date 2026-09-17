@@ -1,6 +1,13 @@
 /**
  * @file MoEOverlayMPIRemoteProjectionTransport.cpp
  * @brief Event-free CPU endpoints and non-blocking MPI projection progression.
+ *
+ * Each transport duplicates its admitted execution communicator, preallocates
+ * its bounded projection lanes, and progresses private requests without
+ * inference-thread waits. Message ranks belong to that selected namespace.
+ * Immutable World-model environment limits are read from MPI_COMM_WORLD, where
+ * MPI publishes them; splitting a communicator does not copy those attributes.
+ * Reading that local metadata never sends payloads or collectives on WORLD.
  */
 
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
@@ -1473,14 +1480,23 @@ namespace llaminar2
 
         int flag = 0;
         int *tag_upper_bound = nullptr;
+        // MPI_Init_thread installs World-model environment attributes on
+        // MPI_COMM_WORLD. Auto/plan-apply execution uses MPI_Comm_split, whose
+        // communicator need not carry MPI_TAG_UB, even if it retains every
+        // rank. Query the process environment's authority, not the payload
+        // namespace. This is a local startup inquiry, not a WORLD collective;
+        // all actual lane traffic below remains on the private selected comm.
         const int attr_result = MPI_Comm_get_attr(
-            config_.mpi_context->communicator(),
+            MPI_COMM_WORLD,
             MPI_TAG_UB,
             &tag_upper_bound,
             &flag);
-        if (attr_result != MPI_SUCCESS || !flag || !tag_upper_bound)
+        if (attr_result != MPI_SUCCESS)
             throw std::runtime_error(
                 mpiError("MPI_Comm_get_attr(MPI_TAG_UB)", attr_result));
+        if (!flag || !tag_upper_bound || *tag_upper_bound < 32767)
+            throw std::runtime_error(
+                "MPI World environment omitted a valid MPI_TAG_UB (minimum 32767)");
         impl_->tag_upper_bound = *tag_upper_bound;
         if (*projection_lane_count - 1u >
             static_cast<std::size_t>(impl_->tag_upper_bound))

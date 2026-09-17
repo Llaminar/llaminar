@@ -7,9 +7,10 @@
  * - FP16 weights × FP16 activations → FP32 output
  * - BF16 weights × BF16 activations → FP32 output
  *
- * For quantized weight GEMM (Q4_0, Q8_0, Q8_1, etc.), use CPUQuantisedGemmKernel.
+ * Quantized weights use CPUNativeVNNIGemmKernel's canonical packed layout.
  * Service-measurement execution handles may alias an existing prepared
- * engine's immutable tensor while retaining independent workspace bindings.
+ * engine's immutable tensor. Each invocation receives participant-owned
+ * SwiGLU scratch; shared prepared engines retain no mutable arena binding.
  *
  * @author David Sanftenberg
  * @date 2025-11-26
@@ -43,7 +44,8 @@
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../common/FloatingExpertNumericalContract.h"
-#include "../CPUKernelBase.h"
+#include "../../common/FloatingOutputPartitionScope.h"
+#include "../CPUInvocationWorkspace.h"
 #include "../primitives/SwiGLUPrimitives.h"
 #include "../primitives/SoftmaxPrimitives_New.h"
 
@@ -73,6 +75,62 @@ namespace llaminar2
 
         // ========== OneDNN GEMM Primitives ==========
 
+        /**
+         * @brief Publish a skinny-matmul element with row-independent rounding.
+         *
+         * Serial decode rounds alpha*dot before adding bias. A vectorized
+         * grouped epilogue may otherwise contract those two operations while
+         * the scalar epilogue does not. Keep that product in a register across
+         * an explicit compiler boundary, then apply the beta contribution as
+         * one explicit FMA. No bias means no extra +0, preserving signed zero.
+         *
+         * @param dot Completed ordered dot product.
+         * @param alpha Dot-product multiplier.
+         * @param beta Previous-output multiplier; zero suppresses its read.
+         * @param previous Address of the existing output element.
+         * @param bias Optional address of this column's additive bias.
+         * @return Exactly rounded output, independent of physical row grouping.
+         */
+        inline float completeSkinnyMatmulValue(float dot, float alpha, float beta,
+                                               const float *previous, const float *bias = nullptr)
+        {
+            float value = alpha * dot;
+            if (bias)
+            {
+#if defined(__GNUC__) || defined(__clang__)
+                asm volatile("" : "+x"(value));
+#else
+                volatile float rounded = value;
+                value = rounded;
+#endif
+                value += *bias;
+            }
+            if (beta != 0.0f)
+                value = std::fma(beta, *previous, value);
+            return value;
+        }
+
+        /**
+         * @brief Multiply small FP32 matrices in serial-decode arithmetic order.
+         *
+         * Independent row accumulators share a weight row when the resulting
+         * task grid still occupies the available OpenMP team. No K reduction
+         * is vectorized or repartitioned, so grouping changes reuse rather
+         * than the numerical contract. Narrow GDN projections obey the same
+         * rule as wide matrices instead of an unrelated column-count cutoff.
+         *
+         * @param A Row-major M-by-K input.
+         * @param B N-by-K weights when transposed, otherwise K-by-N.
+         * @param C Row-major M-by-N result, also read when beta is nonzero.
+         * @param M Input rows, including zero-sized work.
+         * @param N Output columns, including zero-sized work.
+         * @param K Dot-product length; zero retains the epilogue semantics.
+         * @param transpose_B Whether each output column has a contiguous weight row.
+         * @param alpha Multiplier applied after the complete ordered dot product.
+         * @param beta Multiplier of the preceding output, zero disables its read.
+         * @param bias Optional N-element bias added before the beta contribution.
+         * @return False for invalid dimensions or pointers; true after publication.
+         */
         inline bool run_fp32_skinny_matmul(const float *A,
                                            const float *B,
                                            float *C,
@@ -105,11 +163,17 @@ namespace llaminar2
              * vector reduction because changing K reduction order would risk
              * recurrent-state drift in GDN/short-conv publication.
              */
-            if (transpose_B && M >= 2 && N >= 128)
+            constexpr int kVerifierRowTile = 4;
+            const int row_tiles = (M + kVerifierRowTile - 1) / kVerifierRowTile;
+            const int workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads();
+            const int64_t scalar_tasks = static_cast<int64_t>(M) * N;
+            const int64_t grouped_tasks = static_cast<int64_t>(row_tiles) * N;
+            // Reuse is economical only if it does not discard useful worker
+            // parallelism. This admits narrow MTP projections such as N=48,
+            // while retaining the fine grid for truly undersubscribed work.
+            if (transpose_B && M >= 2 &&
+                grouped_tasks >= std::min<int64_t>(scalar_tasks, workers))
             {
-                constexpr int kVerifierRowTile = 4;
-                const int row_tiles =
-                    (M + kVerifierRowTile - 1) / kVerifierRowTile;
                 auto grouped_column_work = [&]()
                 {
 #pragma omp for collapse(2) schedule(static)
@@ -195,16 +259,13 @@ namespace llaminar2
                                 accumulators[3] = acc3;
                             }
 
-                            const float bias_value = bias ? bias[col] : 0.0f;
                             for (int tile_row = 0; tile_row < tile_rows; ++tile_row)
                             {
                                 const size_t output_index =
                                     static_cast<size_t>(first_row + tile_row) * N + col;
-                                float value =
-                                    alpha * accumulators[tile_row] + bias_value;
-                                if (beta != 0.0f)
-                                    value += beta * C[output_index];
-                                C[output_index] = value;
+                                C[output_index] = completeSkinnyMatmulValue(
+                                    accumulators[tile_row], alpha, beta, C + output_index,
+                                    bias ? bias + col : nullptr);
                             }
                         }
                     }
@@ -234,12 +295,9 @@ namespace llaminar2
                                 acc += a_row[kk] * B[static_cast<size_t>(kk) * N + col];
                         }
 
-                        float value = alpha * acc;
-                        if (bias)
-                            value += bias[col];
-                        if (beta != 0.0f)
-                            value += beta * C[static_cast<size_t>(row) * N + col];
-                        C[static_cast<size_t>(row) * N + col] = value;
+                        float *output = C + static_cast<size_t>(row) * N + col;
+                        *output = completeSkinnyMatmulValue(acc, alpha, beta, output,
+                            bias ? bias + col : nullptr);
                     }
                 }
             };
@@ -317,10 +375,8 @@ namespace llaminar2
                         {
                             const size_t output_index =
                                 static_cast<size_t>(first_row + tile_row) * N + col;
-                            float value = alpha * accumulators[tile_row];
-                            if (beta != 0.0f)
-                                value += beta * C[output_index];
-                            C[output_index] = value;
+                            C[output_index] = completeSkinnyMatmulValue(
+                                accumulators[tile_row], alpha, beta, C + output_index);
                         }
                     }
                 }
@@ -437,10 +493,8 @@ namespace llaminar2
                         {
                             const size_t output_index =
                                 static_cast<size_t>(first_row + tile_row) * N + col;
-                            float value = alpha * accumulators[tile_row];
-                            if (beta != 0.0f)
-                                value += beta * C[output_index];
-                            C[output_index] = value;
+                            C[output_index] = completeSkinnyMatmulValue(
+                                accumulators[tile_row], alpha, beta, C + output_index);
                         }
                     }
                 }
@@ -2090,7 +2144,7 @@ namespace llaminar2
          *
          * For quantized weight GEMM, use CPUQuantisedGemmKernel instead.
          */
-        class FloatingPointGemmKernel : public ITensorGemm, public CPUKernelBase
+        class FloatingPointGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
         {
         private:
             /**
@@ -2206,7 +2260,8 @@ namespace llaminar2
                 : weight_tensor_lifetime_(
                       cloneExpertExecutionStorage(weight_tensor, placement)),
                   weight_tensor_(weight_tensor_lifetime_.get()),
-                  numerical_policy_(numerical_policy)
+                  numerical_policy_(numerical_policy),
+                  owned_weight_bytes_(weight_tensor_lifetime_->size_bytes())
             {
                 validateBoundWeight();
             }
@@ -2217,9 +2272,9 @@ namespace llaminar2
              * @brief Fork execution bindings while retaining the exact prepared tensor.
              *
              * The aliasing shared pointer pins the source engine, not a copied
-             * or repacked tensor. CPUKernelBase is default-constructed, so its
-             * workspace cannot be inherited from or rebound on the serving
-             * engine. Arithmetic policy is immutable and is preserved exactly.
+             * or repacked tensor. Scratch is supplied by each invocation, never
+             * retained or rebound on the serving engine. Arithmetic policy is
+             * immutable and is preserved exactly.
              *
              * @param source Fully prepared CPU floating-point expert engine.
              * @throws std::invalid_argument For a missing source or tensor.
@@ -2235,6 +2290,36 @@ namespace llaminar2
                 validateBoundWeight();
             }
 
+            /**
+             * @return Bound output width, or zero for an unbound diagnostic kernel.
+             *
+             * Preparation and workspace admission consume the same tensor
+             * geometry as execution. Service views retain that tensor through
+             * their source lease; they do not carry a second geometry cache.
+             */
+            int get_n() const override
+            {
+                return weight_tensor_ ? static_cast<int>(weight_tensor_->rows()) : 0;
+            }
+
+            /** @return Bound input width used to size the invocation's SwiGLU tile. */
+            int get_k() const override
+            {
+                return weight_tensor_ ? static_cast<int>(weight_tensor_->cols()) : 0;
+            }
+
+            /**
+             * @brief Require the per-column serial reduction for a mirrored output.
+             * @param actual_columns Prepared physical N.
+             * @param serial_columns Regular TP shard width, at most physical N.
+             * @return Thread-local scope; shared prepared engines remain immutable.
+             */
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOutputPartitionEquivalenceScope(int actual_columns, int serial_columns) override
+            {
+                return FloatingOutputPartitionScope::begin(*this, actual_columns, serial_columns);
+            }
+
             /** @brief Export the engine's exact live row-major CPU weights. */
             bool exportContiguousFloatingPointWeights(
                 ContiguousFloatingPointWeightDescriptor &out) const override
@@ -2245,8 +2330,8 @@ namespace llaminar2
                 out = {
                     .data = weight_tensor_->raw_data(),
                     .type = weight_type_,
-                    .n = static_cast<int>(weight_tensor_->rows()),
-                    .k = static_cast<int>(weight_tensor_->cols()),
+                    .n = get_n(),
+                    .k = get_k(),
                     .bytes = weight_tensor_->size_bytes(),
                 };
                 return out.valid();
@@ -2276,6 +2361,18 @@ namespace llaminar2
             bool canReleaseSourceWeightTensor() const override
             {
                 return weight_tensor_lifetime_ != nullptr;
+            }
+
+            /**
+             * @return Bytes allocated by this prepared engine, without counting
+             *         borrowed dense tensors or shared execution views twice.
+             *
+             * The authority owns admission and claims; this immutable allocation
+             * geometry only verifies the constructor consumed its planned BOM.
+             */
+            size_t packedWeightBytes() const override
+            {
+                return owned_weight_bytes_;
             }
 
             /**
@@ -2392,7 +2489,12 @@ namespace llaminar2
                             beta,
                             bias_ptr);
                     }
-                    // OneDNN FP32 matmul supports fused bias natively
+                    // A replicated head must not let a changed physical N pick
+                    // another oneDNN reduction. Keep the serial per-column tree.
+                    if (FloatingOutputPartitionScope::requiresFixedColumns(*this, n))
+                        return run_fp32_skinny_matmul(
+                            A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
+                    // OneDNN FP32 matmul supports fused bias natively.
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
@@ -2616,7 +2718,12 @@ namespace llaminar2
                             beta,
                             bias_ptr);
                     }
-                    // OneDNN FP32 matmul supports fused bias natively
+                    // A replicated head must not let a changed physical N pick
+                    // another oneDNN reduction. Keep the serial per-column tree.
+                    if (FloatingOutputPartitionScope::requiresFixedColumns(*this, n))
+                        return run_fp32_skinny_matmul(
+                            A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
+                    // OneDNN FP32 matmul supports fused bias natively.
                     return run_onednn_fp32_matmul(A_data, B_data, C_data, m, n, k, transpose_B, alpha, beta, bias_ptr);
                 }
 
@@ -2763,7 +2870,7 @@ namespace llaminar2
              * false here used to make every ordinary FP32 shared-expert stage
              * fail after fallbacks were correctly removed from the stage.
              *
-             * The implementation materializes one reusable thread-local SwiGLU
+             * The implementation materializes one admitted invocation-owned SwiGLU
              * tile and then dispatches the down projection by weight format.
              * M=1 uses the skinny kernel used by serial decode. FP32 M>1 uses
              * oneDNN's matrix path, while FP16/BF16 retain the mixed-input
@@ -2818,9 +2925,8 @@ namespace llaminar2
                     return false;
                 }
 
-                thread_local std::vector<float> swiglu_scratch_tls;
-                if (swiglu_scratch_tls.size() < input_elements)
-                    swiglu_scratch_tls.resize(input_elements);
+                auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
+                    workspace, kCPUSwiGLUInput, input_elements);
                 if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                 {
                     /*
@@ -2831,12 +2937,12 @@ namespace llaminar2
                      */
                     for (std::size_t index = 0; index < input_elements; ++index)
                     {
-                        swiglu_scratch_tls[index] =
+                        swiglu_scratch[index] =
                             floating_expert_numerical_contract::swigluValue(
                                 gate_data[index], up_data[index]);
                     }
                     return runGPUAlignedExpertDownProjection(
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         out_data,
                         m,
                         n,
@@ -2849,7 +2955,7 @@ namespace llaminar2
                     primitives::compute_swiglu_serial(
                         gate_data,
                         up_data,
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         static_cast<int>(input_elements));
                 }
                 else
@@ -2857,7 +2963,7 @@ namespace llaminar2
                     primitives::compute_swiglu(
                         gate_data,
                         up_data,
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         static_cast<int>(input_elements));
                 }
 
@@ -2867,7 +2973,7 @@ namespace llaminar2
                     if (m == 1)
                     {
                         return run_fp32_skinny_matmul(
-                            swiglu_scratch_tls.data(),
+                            swiglu_scratch.data(),
                             weight_tensor_->data(),
                             out_data,
                             m,
@@ -2879,7 +2985,7 @@ namespace llaminar2
                             nullptr);
                     }
                     return run_onednn_fp32_matmul(
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         weight_tensor_->data(),
                         out_data,
                         m,
@@ -2895,7 +3001,7 @@ namespace llaminar2
                     const auto *weights =
                         dynamic_cast<const FP16Tensor *>(weight_tensor_);
                     return weights && run_fp32xfp16_skinny_matmul(
-                                          swiglu_scratch_tls.data(),
+                                          swiglu_scratch.data(),
                                           weights->typed_data(),
                                           out_data,
                                           m,
@@ -2911,7 +3017,7 @@ namespace llaminar2
                     const auto *weights =
                         dynamic_cast<const BF16Tensor *>(weight_tensor_);
                     return weights && run_fp32xbf16_skinny_matmul(
-                                          swiglu_scratch_tls.data(),
+                                          swiglu_scratch.data(),
                                           weights->typed_data(),
                                           out_data,
                                           m,
@@ -2986,11 +3092,10 @@ namespace llaminar2
                     return false;
                 }
 
-                thread_local std::vector<float> swiglu_scratch_tls;
                 const size_t elements =
                     static_cast<size_t>(m) * static_cast<size_t>(k);
-                if (swiglu_scratch_tls.size() < elements)
-                    swiglu_scratch_tls.resize(elements);
+                auto swiglu_scratch = CPUInvocationWorkspace::require<float>(
+                    workspace, kCPUSwiGLUInput, elements);
                 const bool perf_enabled =
                     PerfStatsCollector::isDomainEnabled("kernel");
                 auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
@@ -2999,7 +3104,7 @@ namespace llaminar2
                 {
                     for (std::size_t index = 0; index < elements; ++index)
                     {
-                        swiglu_scratch_tls[index] =
+                        swiglu_scratch[index] =
                             floating_expert_numerical_contract::swigluValue(
                                 gate_data[index], up_data[index]);
                     }
@@ -3009,7 +3114,7 @@ namespace llaminar2
                     primitives::compute_swiglu(
                         gate_data,
                         up_data,
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         static_cast<int>(elements));
                 }
                 recordVerifierTiming(
@@ -3027,7 +3132,7 @@ namespace llaminar2
                 if (numerical_policy_ == NumericalPolicy::GPUAlignedExpert)
                 {
                     down_ok = runGPUAlignedExpertDownProjection(
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         out_data,
                         m,
                         n,
@@ -3042,7 +3147,7 @@ namespace llaminar2
                 else if (weight_type_ == TensorType::FP32)
                 {
                     down_ok = run_fp32_skinny_matmul(
-                        swiglu_scratch_tls.data(),
+                        swiglu_scratch.data(),
                         weight_tensor_->data(),
                         out_data,
                         m,
@@ -3058,7 +3163,7 @@ namespace llaminar2
                     const auto *weights_fp16 = dynamic_cast<const FP16Tensor *>(weight_tensor_);
                     dtype_tag = "fp16";
                     down_ok = weights_fp16 && run_fp32xfp16_skinny_matmul(
-                                                 swiglu_scratch_tls.data(),
+                                                 swiglu_scratch.data(),
                                                  weights_fp16->typed_data(),
                                                  out_data,
                                                  m,
@@ -3073,7 +3178,7 @@ namespace llaminar2
                     const auto *weights_bf16 = dynamic_cast<const BF16Tensor *>(weight_tensor_);
                     dtype_tag = "bf16";
                     down_ok = weights_bf16 && run_fp32xbf16_skinny_matmul(
-                                                 swiglu_scratch_tls.data(),
+                                                 swiglu_scratch.data(),
                                                  weights_bf16->typed_data(),
                                                  out_data,
                                                  m,
@@ -3166,6 +3271,15 @@ namespace llaminar2
             {
                 (void)mpi_ctx;
                 (void)workspace;
+
+                // Mirrored outputs use the same per-column primitive as the
+                // verifier, even during a multi-row ordinary prefill call.
+                if (std::any_of(projections.begin(), projections.end(), [](const auto &projection) {
+                        return projection.kernel && FloatingOutputPartitionScope::requiresFixedColumns(
+                            *projection.kernel, projection.n);
+                    }))
+                    return multiply_fused_verifier_rows_decode_equivalent(
+                        input, projections, m, k, mpi_ctx, workspace);
 
                 const bool mixed_fp32_activation =
                     input && input->native_type() == TensorType::FP32 &&
@@ -3402,7 +3516,9 @@ namespace llaminar2
                 (void)mpi_ctx;
                 (void)workspace;
 
-                if (!weight_tensor_ || !input || m <= 1 || k <= 0 || projections.empty())
+                // M=1 is also a valid verifier extent (no accepted drafts).
+                // It uses the same primitive, not a separate replay path.
+                if (!weight_tensor_ || !input || m < 1 || k <= 0 || projections.empty())
                 {
                     LOG_ERROR("[FloatingPointGemmKernel] grouped verifier projection rejected: weight="
                               << (weight_tensor_ != nullptr) << " input=" << (input != nullptr)
@@ -4299,6 +4415,7 @@ namespace llaminar2
             const TensorBase *weight_tensor_ = nullptr; ///< Exact tensor used by GEMM.
             TensorType weight_type_ = TensorType::FP32;
             NumericalPolicy numerical_policy_ = NumericalPolicy::BackendNative;
+            const size_t owned_weight_bytes_ = 0; ///< Zero for non-allocating execution views.
         };
 
     } // namespace gemm

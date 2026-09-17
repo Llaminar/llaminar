@@ -7,11 +7,14 @@
  * events, or an explicitly declared immutable host ticket.
  * Ticket evidence is authored by the logical lifecycle validator, before
  * retained-parent lowering changes the number of physical compiler units.
+ * Native parent evidence separately projects that physical inventory through
+ * the same schema used for deferred first launch and steady replay.
  */
 
 #include "DeviceGraphCaptureController.h"
 #include "GraphCaptureGuard.h"
 #include "GraphCaptureStageActivity.h"
+#include "RetainedParentPerfEvidence.h"
 
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
@@ -23,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1201,11 +1205,19 @@ namespace llaminar2
                 workload.live_mtp_request_batch_condition ? "true" : "false");
         }
 
+        /**
+         * @brief Join one physical unit to its setup-issued executable family.
+         * @param segment Captured or manual unit owned by that capture plan.
+         * @param perf_context Human-readable role, not an executable identity.
+         * @param workload Optional immutable geometry for timing attribution.
+         * @return Diagnostic tags; no replay decision consumes this metadata.
+         */
         PerfStatsCollector::Tags replaySegmentTags(const DeviceGraphExecutor::GraphSegment &segment,
                                                    const std::string &perf_context,
                                                    const DeviceGraphExecutor::GraphSegmentCache::ReplayWorkloadGeometry *workload = nullptr)
         {
             PerfStatsCollector::Tags tags{
+                {"executable_family", std::to_string(segment.evidence_family)},
                 {"type", segmentTypeName(segment)},
                 {"stage_count", std::to_string(segment.stage_names.size())}};
             if (!segment.stage_names.empty())
@@ -1219,6 +1231,11 @@ namespace llaminar2
             return tags;
         }
 
+        /**
+         * @brief Describe a complete cache without conflating sibling variants.
+         * @param cache Materialized capture plan and current diagnostic geometry.
+         * @return Family-qualified inventory tags for existing PerfStats rows.
+         */
         PerfStatsCollector::Tags replayCacheTags(const DeviceGraphExecutor::GraphSegmentCache &cache)
         {
             size_t stage_count = 0;
@@ -1240,6 +1257,7 @@ namespace llaminar2
                 type = "manual";
 
             PerfStatsCollector::Tags tags{
+                {"executable_family", std::to_string(cache.evidence_family)},
                 {"type", type},
                 {"segment_count", std::to_string(cache.segments.size())},
                 {"stage_count", std::to_string(stage_count)}};
@@ -1248,6 +1266,12 @@ namespace llaminar2
             return tags;
         }
 
+        /**
+         * @brief Preserve family identity while naming the native graph policy.
+         * @param cache Owner of all executable units being reported.
+         * @param mode Existing full-graph or heterogeneous-segment policy.
+         * @return Policy-qualified inventory without changing execution state.
+         */
         PerfStatsCollector::Tags replayCacheTags(const DeviceGraphExecutor::GraphSegmentCache &cache,
                                                  GraphReplayCaptureMode mode)
         {
@@ -1858,6 +1882,13 @@ namespace llaminar2
     {
         segment_cache.segments.clear();
         segment_cache.graph_replay_plan_policy = plan_policy;
+        // One setup-only identity joins capture, transaction zero and replay.
+        // Context names are semantic labels and can name several unused/live
+        // variants; pointers are unsuitable because allocator reuse aliases them.
+        static std::atomic<uint64_t> next_evidence_family{1};
+        segment_cache.evidence_family = next_evidence_family.fetch_add(1, std::memory_order_relaxed);
+        if (segment_cache.evidence_family == 0)
+            throw std::overflow_error("Graph executable evidence identity exhausted");
 
         const auto &order = graph.getExecutionOrder();
         const GraphNativeCaptureEnvelope native_capture_envelope =
@@ -2792,6 +2823,7 @@ namespace llaminar2
         for (auto &seg : segment_cache.segments)
         {
             seg.last_executed_step = 0;
+            seg.evidence_family = segment_cache.evidence_family;
         }
     }
 
@@ -4063,15 +4095,20 @@ namespace llaminar2
                 hooks.post_launch(segment, segment_cache.capture_stream);
         }
 
+        // First-use MTP may submit here instead of through the executor's
+        // setup-only path. Publish the same physical boundary only after both
+        // the parent launch and its concurrent CPU service have succeeded.
+        auto boundary_tags = retainedParentBoundaryTags(
+            segment_cache.perf_context, child_units->size(),
+            concurrent_service_segments);
+        boundary_tags.emplace("parent_nodes", std::to_string(parent->nodeCount()));
         PerfStatsCollector::addCounter(
             "forward_graph",
             "retained_parent_transaction_zero_launches",
             1.0,
             "decode",
             ctx->deviceId().toString(),
-            {{"context", segment_cache.perf_context},
-             {"child_units", std::to_string(child_units->size())},
-             {"parent_nodes", std::to_string(parent->nodeCount())}});
+            std::move(boundary_tags));
         segment_cache.retained_parent_capture = std::move(parent);
         LOG_DEBUG(
             "[DeviceGraphCaptureController] Retained parent composed+launched: "

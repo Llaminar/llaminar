@@ -1,0 +1,4 @@
+interface:
+  display_name: "Llaminar Testing"
+  short_description: "Run and diagnose Llaminar tests and certification gates"
+  default_prompt: "Use $llaminar-testing to select and run the appropriate Llaminar test gates, diagnose failures, and report the remaining certification work."

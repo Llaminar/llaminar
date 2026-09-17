@@ -129,9 +129,17 @@ namespace llaminar2::test::parity
         return out.str();
     }
 
+    /** @brief Placement projection, independent of the model's runtime policies. */
+    enum class ModelParityRuntimePlacementProjection
+    {
+        DeclaredCell,
+        AutomaticRemoteCPUOverlay,
+    };
+
     /**
      * @brief Project any canonical case onto the Release server's public CLI.
      * @param cell Existing expanded parity configuration, not a new matrix.
+     * @param placement Keep declared placement or request the tagged remote overlay.
      * @return Argument vector excluding executable, subcommand, model and port.
      * @throws std::invalid_argument for non-exportable state.
      *
@@ -140,9 +148,25 @@ namespace llaminar2::test::parity
      * numerical parity. Resolved runtime placements cannot be exported as
      * declarative startup intent.
      */
-    inline std::vector<std::string> modelParityServerArguments(const ModelParityCase &cell)
+    inline std::vector<std::string> modelParityServerArguments(
+        const ModelParityCase &cell,
+        ModelParityRuntimePlacementProjection placement = ModelParityRuntimePlacementProjection::DeclaredCell)
     {
-        const auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+        auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+        const bool automatic_remote = placement == ModelParityRuntimePlacementProjection::AutomaticRemoteCPUOverlay;
+        if (!automatic_remote && placement != ModelParityRuntimePlacementProjection::DeclaredCell)
+            throw std::invalid_argument("invalid model parity placement projection");
+        if (automatic_remote)
+        {
+            if (cell.remote_cpu_overlays.empty() || !cell.e2e_certification ||
+                cell.topology.kind != ModelParityTopologyKind::SingleDevice ||
+                cell.topology.participants.size() != 1 ||
+                (!cell.topology.participants.front().address.isCUDA() &&
+                 !cell.topology.participants.front().address.isROCm()))
+                throw std::invalid_argument("automatic remote projection requires a tagged single-GPU cell");
+            config.moe_rebalance = cell.dynamic_rebalance;
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+        }
         std::vector<std::string> args;
         const auto add = [&](const char *flag, const auto &value)
         {
@@ -150,17 +174,27 @@ namespace llaminar2::test::parity
             out << std::setprecision(9) << value;
             args.insert(args.end(), {flag, out.str()});
         };
-        add("--mpi-procs", cell.topology.mpi_ranks);
+        if (!automatic_remote) add("--mpi-procs", cell.topology.mpi_ranks);
         add("--activation-precision", config.activation_precision);
         add("--kv-cache-precision", config.kv_cache_precision);
-        add("--backend", collectiveBackendTypeToString(config.default_backend));
+        if (!automatic_remote) add("--backend", collectiveBackendTypeToString(config.default_backend));
         if (!config.tp_allreduce_precision_override.empty())
             add("--tp-allreduce-precision", config.tp_allreduce_precision_override);
         args.push_back("--prefix-cache");
         add("--prefix-cache-storage", "tiered");
         add("--prefix-cache-terminal-state", "auto");
 
-        if (cell.topology.isExpertOverlay())
+        if (automatic_remote)
+        {
+            // Both routes deliberately exercise default auto: no --auto flag,
+            // device map, local CPU indices or borrowed domain declaration.
+            // Provisioning binds the exact requested endpoints and hostfile;
+            // backend filters alone do not prove that remote work took place.
+            add("--only-backends", cell.topology.participants.front().address.isCUDA() ? "cuda,cpu" : "rocm,cpu");
+            add("--only-strategies", "expert-overlay");
+            add("--auto-hosts", "all");
+        }
+        else if (cell.topology.isExpertOverlay())
         {
             const auto &plan = *config.moe_routed_expert_plan;
             if (!plan.placements.empty() || !plan.initial_layer_order_overrides.empty() ||
@@ -285,6 +319,47 @@ namespace llaminar2::test::parity
     }
 
     /**
+     * @brief Expand remote-host declarations over both mandatory public routes.
+     * @param cell Existing selected source; model identity remains in its parent record.
+     * @param out Discovery stream, receiving a complete JSON array.
+     *
+     * A scenario declares intent, never claims that hardware was provisioned or
+     * a plan passed. Rank/host binding, remote expert rows and MPI payloads must
+     * be authenticated by the later live E2E phase. Local shared-memory traffic
+     * cannot satisfy its cross-host obligation.
+     */
+    inline void writeModelParityCrossHostE2E(const ModelParityCase &cell, std::ostream &out)
+    {
+        out << '[';
+        if (!cell.remote_cpu_overlays.empty())
+        {
+            const auto args = modelParityServerArguments(
+                cell, ModelParityRuntimePlacementProjection::AutomaticRemoteCPUOverlay);
+            bool first = true;
+            for (const auto &remote : cell.remote_cpu_overlays)
+                for (const auto route : kModelParityCrossHostFrontends)
+                {
+                    const auto route_name = std::string(modelParityCrossHostFrontendName(route));
+                    out << (first ? "" : ",") << "{\"schema\":1,\"id\":"
+                        << modelParityJsonString(cell.testName() + "_RemoteCPU" + std::to_string(remote.count()) + "_" + route_name)
+                        << ",\"frontend\":" << modelParityJsonString(route_name)
+                        << ",\"topology\":{\"kind\":\"cross-host-expert-overlay\",\"continuation_backend\":"
+                        << modelParityJsonString(cell.topology.participants.front().address.isCUDA() ? "cuda" : "rocm")
+                        << ",\"continuation_devices\":1,\"remote_cpu_hosts\":" << remote.count()
+                        << ",\"cpu_ranks_per_host\":1,\"execution_ranks\":" << remote.executionRanks()
+                        << ",\"continuation_priority\":0,\"remote_priority\":1}"
+                        << ",\"movement_evidence\":\"required\",\"owner_order\":\"ordinal\""
+                        << ",\"server_policy_args\":[";
+                    for (std::size_t i = 0; i < args.size(); ++i)
+                        out << (i ? "," : "") << modelParityJsonString(args[i]);
+                    out << "]}";
+                    first = false;
+                }
+        }
+        out << ']';
+    }
+
+    /**
      * @brief GoogleTest's ADL parameter printer is the discovery export boundary.
      * @param cell Typed parameter, also consumed by the numerical fixture.
      * @param out GoogleTest discovery stream; emits one complete JSON line.
@@ -348,7 +423,9 @@ namespace llaminar2::test::parity
         const auto args = modelParityServerArguments(cell);
         for (std::size_t i = 0; i < args.size(); ++i)
             *out << (i ? "," : "") << modelParityJsonString(args[i]);
-        *out << "]},\"e2e\":";
+        *out << "]},\"cross_host_e2e\":";
+        writeModelParityCrossHostE2E(cell, *out);
+        *out << ",\"e2e\":";
         if (!cell.e2e_certification) { *out << "null}"; return; }
         const auto &profile = *cell.e2e_certification;
         *out << "{\"context_length\":" << profile.context_length

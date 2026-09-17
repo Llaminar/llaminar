@@ -16,6 +16,7 @@
  */
 
 #include "CUDAFloatingPointGemmKernel.h"
+#include "CUDAFloatingPointGemmWorkspaceContract.h"
 #include "kernels/common/FloatingPointVerifierLaunch.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "CuBLASGemmKernel.h"
@@ -312,6 +313,12 @@ namespace llaminar2
                 return false;
             }
 
+            // Partition scopes cannot silently fall through to a different
+            // arithmetic implementation when a caller supplies another epilogue.
+            const bool fixed_columns = FloatingOutputPartitionScope::requiresFixedColumns(*this, n);
+            if (fixed_columns && (!transpose_B || alpha != 1.f || beta != 0.f || bias))
+                throw std::invalid_argument("Floating replicated output requires the fixed FP32 projection contract");
+
             // Get device pointers (caller must have data on GPU)
             const float *d_A = static_cast<const float *>(A->gpu_data_ptr());
             float *d_C = static_cast<float *>(C->gpu_data_ptr());
@@ -498,7 +505,7 @@ namespace llaminar2
                 alpha == 1.0f &&
                 beta == 0.0f &&
                 !d_bias &&
-                m == 1 &&
+                (m == 1 || fixed_columns) &&
                 n > 0 &&
                 k > 0 &&
                 d_weights_ &&
@@ -575,6 +582,9 @@ namespace llaminar2
                 return success;
             }
 
+            if (fixed_columns)
+                throw std::runtime_error("Floating replicated output requires explicit stream and prepared workspace");
+
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             cublas_kernel_->bindWorkspace(effective_workspace);
             if (d_bias)
@@ -641,7 +651,12 @@ namespace llaminar2
              * one launch evaluates the projection group with an M-independent
              * reduction order.
              */
-            if (precision_ != Precision::FP32)
+            const bool fixed_columns = std::any_of(projections.begin(), projections.end(),
+                [](const auto &projection) {
+                    return projection.kernel && FloatingOutputPartitionScope::requiresFixedColumns(
+                        *projection.kernel, projection.n);
+                });
+            if (precision_ != Precision::FP32 || m == 1 || fixed_columns)
             {
                 return multiply_fused_verifier_rows_decode_equivalent(
                     input, projections, m, k, nullptr, workspace);
@@ -1476,28 +1491,9 @@ namespace llaminar2
         {
             if (!cublas_kernel_)
                 return WorkspaceRequirements{};
-            WorkspaceRequirements reqs = cublas_kernel_->getWorkspaceRequirements(m, n, k);
-            const size_t pointer_array_bytes =
-                floating_gemm_abi::kMaxBatchedProjections *
-                sizeof(float *);
-            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS, pointer_array_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS, pointer_array_bytes, 256, true});
-            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS, pointer_array_bytes, 256, true});
             if (n == 0)
                 n = static_cast<int>(N_);
-            if (m > 0 && n > 0)
-            {
-                const size_t redirect_bytes =
-                    floating_gemm_abi::kMaxBatchedProjections *
-                    static_cast<size_t>(m) *
-                    static_cast<size_t>(n) *
-                    sizeof(float);
-                reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT,
-                                        redirect_bytes,
-                                        256,
-                                        true});
-            }
-            return reqs;
+            return floating_gemm_workspace::projectionRequirements(std::max(0, m), std::max(0, n));
         }
 
         void CUDAFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)

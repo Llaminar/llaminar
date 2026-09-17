@@ -16,6 +16,7 @@
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/WeightMemoryEstimator.h"
+#include "planning/WorkspaceMemoryEstimator.h"
 #include "config/BackendSelector.h"
 #include "utils/Logger.h"
 
@@ -32,6 +33,13 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Resolve an exact resource observation, preserving an exhausted device.
+         * @param inventory Rank-owned discovery or live admission observation.
+         * @param device Physical endpoint to price.
+         * @return Total and currently available bytes; zero available is legitimate.
+         * @throws std::invalid_argument for absent or inconsistent physical geometry.
+         */
         [[nodiscard]] std::pair<std::size_t, std::size_t> inventoryMemory(
             const RankInventory &inventory,
             DeviceId device)
@@ -47,17 +55,12 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "ExpertOverlay CPU capacity inventory reports zero memory");
                 }
-                if (inventory.cpu.free_memory_bytes == 0)
+                if (inventory.cpu.free_memory_bytes > total_bytes)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay CPU capacity inventory has no positive NUMA-local available-memory authority; provide a discovered endpoint before admitting CPU experts");
+                        "ExpertOverlay CPU available-memory observation exceeds physical capacity");
                 }
-                return {
-                    total_bytes,
-                    std::min(
-                        total_bytes,
-                        inventory.cpu.free_memory_bytes),
-                };
+                return {total_bytes, inventory.cpu.free_memory_bytes};
             }
             if (!device.is_gpu())
             {
@@ -73,7 +76,7 @@ namespace llaminar2
                 });
             if (found == inventory.gpus.end() ||
                 found->memory_bytes == 0 ||
-                found->free_memory_bytes == 0)
+                found->free_memory_bytes > found->memory_bytes)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay rank inventory has no positive memory record for " +
@@ -82,6 +85,7 @@ namespace llaminar2
             return {found->memory_bytes, found->free_memory_bytes};
         }
 
+        /** @return Canonical admission capacity after applying the explicit user ceiling. */
         [[nodiscard]] std::size_t usableMemory(
             std::size_t inventory_available,
             DeviceId device,
@@ -90,18 +94,16 @@ namespace llaminar2
             const auto &limit = device.is_cpu()
                                     ? input.max_cpu_memory_bytes
                                     : input.max_gpu_memory_bytes;
-            return limit.has_value()
-                       ? std::min(inventory_available, *limit)
-                       : inventory_available;
+            return PhysicalMemoryAuthority::admissionCapacity(inventory_available, limit);
         }
 
-        /** @brief Return the physical SM/CU count for capture-time policy. */
+        /** @brief Return the rank's admitted CPU workers or the GPU's physical SM/CU count. */
         [[nodiscard]] int inventoryComputeUnits(
             const RankInventory &inventory,
             DeviceId device)
         {
             if (device.is_cpu())
-                return inventory.cpu.compute_units;
+                return inventory.cpuWorkerThreads();
             const auto found = std::find_if(
                 inventory.gpus.begin(), inventory.gpus.end(),
                 [&](const auto &gpu)
@@ -490,6 +492,7 @@ namespace llaminar2
             }
             config.device_compute_units =
                 inventoryComputeUnits(inventory, device);
+            if (device.is_cpu()) config.cpu_execution = inventory.cpu_execution;
             if (device.is_gpu())
             {
                 config.graph_snapshot_memory =
@@ -541,6 +544,8 @@ namespace llaminar2
                     1,
                     resolveMTPRetainedTargetQueryRows(
                         rank_plan.runtime.mtp));
+            config.generation_request_capacity =
+                std::max(1, rank_plan.runtime.mtp.max_request_batch);
             config.mtp_terminal_logits_layout =
                 resolveMTPTerminalLogitsLayout(
                     total_shards > 1,
@@ -730,6 +735,10 @@ namespace llaminar2
         result.activation_channel_plan =
             std::move(activation_channel_plan);
         result.fixed_memory_plan = MemoryPlanner::plan(profile, configs);
+        // Retain the actual participant geometry for cost/work projection.
+        // Consumers must not reconstruct TP/PP ownership from rank counts or
+        // turn these fixed-BOM inputs into a second live allocation ledger.
+        result.device_inputs = std::move(configs);
 
         PhysicalMemoryPlanBuilder physical_plan_builder;
         for (const auto &device_plan : result.fixed_memory_plan.devices)
@@ -781,13 +790,24 @@ namespace llaminar2
             // Startup probes reuse one serial scratch family on each CPU
             // resource. Price it before automatic expert capacity fills RAM;
             // serving and probe workspaces are independent physical owners.
-            const size_t cpu_service_bytes = device.is_cpu() &&
+            size_t cpu_service_bytes = 0;
+            if (device.is_cpu() &&
                 endpoint_devices.contains(device) &&
-                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic
-                    ? MoEOverlayCPUServiceMeasurement::allocationBytes({
-                          .d_model = profile.d_model,
-                          .intermediate = profile.expert_feed_forward_length})
-                    : 0u;
+                rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+            {
+                // The setup producer observes one complete expert at a time.
+                // Keep original source-parent metadata, but price one route per
+                // input row through the same sparse-participant requirement factory.
+                auto singleton = profile;
+                singleton.expert_used_count = 1;
+                const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(singleton,
+                    {.device = device, .device_compute_units = inventory.cpuWorkerThreads(),
+                     .cpu_execution = inventory.cpu_execution,
+                     .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                     .first_layer = 0, .last_layer = profile.n_layers - 1});
+                cpu_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
+                    {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
+            }
             additions
                 .add(PhysicalMemoryOwner::ExecutionWorkspace, cpu_service_bytes)
                 // One host histogram/mailbox family per rank, regardless of

@@ -8,6 +8,7 @@
  * authority. Reversing stage owners prevents rank zero/last-rank heuristics.
  */
 #include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "utils/MPIContext.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -94,7 +95,14 @@ namespace llaminar2::test
             global.mpi_ctx = mpi.get();
             global.vocab_size = 4;
             global.d_model = 4;
-            global.rank_runner = std::make_unique<PipelineStage>(rank == tail);
+            const auto local_plan = GlobalPPRankPlanBuilder::build(global.topology, rank);
+            ASSERT_EQ(local_plan.executeStages().size(), 1u);
+            StageRunnerEntry entry;
+            entry.action = *local_plan.executeStages().front();
+            entry.stage_id = entry.action.stage_id;
+            entry.domain_name = entry.action.domain_name;
+            entry.runner = std::make_unique<PipelineStage>(rank == tail);
+            global.stage_runners.push_back(std::move(entry));
 
             RankExecutionPlan plan;
             plan.rank = rank;

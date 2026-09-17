@@ -347,8 +347,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
     const auto root = repoRoot();
     const std::unordered_set<std::string> sanctioned = {
         "src/v2/backends/ComputeBackend.cpp",
-        "src/v2/backends/benchmarks/CUDABenchmark.cu",
-        "src/v2/backends/benchmarks/ROCmBenchmark.cpp",
         "src/v2/backends/cuda/CUDABackend.cu",
         "src/v2/backends/cuda/CUDATensorValidation.cu",
         "src/v2/backends/rocm/ROCmBackend.cpp",
@@ -2734,7 +2732,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
         "bool DeviceGraphOrchestrator::publishAcceptedMTPSpecState(");
     const size_t publish_wait = publish_body.find("waitForPendingShiftedMTPKVReady");
     const size_t publication_launch =
-        publish_body.find("executeMTPSpeculativeStatePublicationCaptured");
+        publish_body.find("executeMTPStatePublicationGraph");
     ASSERT_NE(publish_wait, std::string::npos);
     ASSERT_NE(publication_launch, std::string::npos);
     EXPECT_LT(publish_wait, publication_launch)
@@ -2914,6 +2912,28 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
     const auto device_outcome_executable = stripCommentsAndStringLiterals(device_outcome_body);
     const auto partial_executable = stripCommentsAndStringLiterals(partial_body);
     const auto sidecar_executable = stripCommentsAndStringLiterals(sidecar_body);
+
+    // Metadata checks borrow on a setup stream; only the actual sidecar or
+    // mailbox writer may retire the publication on its execution stream. The
+    // matching CUDA/HIP held-reader proof tests the resulting event DAG.
+    const auto batch_condition_executable = stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::advanceMTPRequestBatchConditionOnDevice(",
+        "bool DeviceGraphOrchestrator::forwardMTPBatchFromDeviceResidentLogicalStateAndSampleGreedyToDeviceDraftSlots("));
+    for (const auto *body : {&batch_condition_executable,
+                             &sequential_executable,
+                             &initial_device_outcome_executable,
+                             &device_target_executable,
+                             &resident_logical_executable,
+                             &device_outcome_executable,
+                             &partial_executable})
+    {
+        EXPECT_NE(body->find("waitForPendingShiftedMTPKVReadyForObservation("),
+                  std::string::npos)
+            << "Shifted-cache metadata must preserve the writer's publication.";
+        EXPECT_EQ(body->find("waitForPendingShiftedMTPKVReady("), std::string::npos)
+            << "Metadata cannot consume an edge on an unrelated stream.";
+    }
 
     expectNeedleBefore(
         sequential_executable,
@@ -5412,6 +5432,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         source,
         "bool DeviceGraphOrchestrator::joinPublishedLiveStateHandoffs(",
         "void DeviceGraphOrchestrator::clearPendingLivePrefixMutationReady()");
+    const auto clear_prefix_mutation_body = sliceBetween(
+        source,
+        "void DeviceGraphOrchestrator::clearPendingLivePrefixMutationReady()",
+        "bool DeviceGraphOrchestrator::orderCheckpointMetadataPoolReuse(");
     const auto restored_transaction_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::recordRestoredDeviceResidentMTPTransaction(",
@@ -5460,6 +5484,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
     const auto compact_published_join =
         removeAsciiWhitespace(
             stripCommentsAndStringLiterals(published_join_body));
+    const auto compact_clear_prefix_mutation =
+        removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(clear_prefix_mutation_body));
     const auto compact_restored_transaction =
         removeAsciiWhitespace(
             stripCommentsAndStringLiterals(restored_transaction_body));
@@ -5539,6 +5566,13 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         compact_published_join.find(
             "clearPendingLivePrefixMutationReady();"),
         std::string::npos);
+    EXPECT_NE(
+        compact_clear_prefix_mutation.find(
+            "ready.valid||!ready.retained_payload_sources.empty()||!ready.retained_device_sources.empty()"),
+        std::string::npos)
+        << "A valid prefix-mutation event must survive consumption even when "
+           "the mutation owns no auxiliary payload aliases; otherwise the next "
+           "prefix archive can observe live GPU state before its producer.";
     EXPECT_EQ(
         compact_published_join.find("producer_stream==consumer_stream"),
         std::string::npos)
@@ -6605,7 +6639,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchStochasticOutcomeDiagnostic
 }
 
 /**
- * @brief Forbids backend event allocation from every resident-MTP hot path.
+ * @brief Forbids backend event allocation from resident-generation hot paths.
  *
  * Events are durable execution-graph edges, not per-token scratch objects.
  * Setup preallocates fixed readiness events and bounded response/timing pools;
@@ -6613,14 +6647,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RequestBatchStochasticOutcomeDiagnostic
  * list here makes a newly introduced event allocation fail the source policy
  * gate before it can become an intermittent graph-capture or latency defect.
  */
-TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedEvents)
+TEST(Test__GpuWorkspaceAllocationPolicy, ResidentGenerationHotPathsUseOnlyPreallocatedEvents)
 {
     const auto source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     const auto initialization_body = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
-            "bool DeviceGraphOrchestrator::initializePersistentMTPDeviceEvents()",
+            "bool DeviceGraphOrchestrator::initializePersistentDeviceGenerationEvents()",
             "DeviceGraphOrchestrator::acquirePersistentMTPOutcomeReadyEvent(")));
 
     EXPECT_NE(initialization_body.find("allocatePersistentDeviceEvent("),
@@ -6630,8 +6664,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ResidentMTPHotPathsUseOnlyPreallocatedE
               std::string::npos)
         << "Persistent MTP PerfStats events must be allocated at setup.";
 
-    const std::array<std::tuple<const char *, const char *, const char *>, 10>
+    const auto ordinary_boundary = initialization_body.find("if(!graph_builder_->config().mtp.enabled)");
+    ASSERT_NE(ordinary_boundary, std::string::npos);
+    EXPECT_LT(initialization_body.find("device_resident_logical_sequence_state_ready_event_"),
+              ordinary_boundary);
+    EXPECT_LT(initialization_body.find("device_resident_logical_state_reader_completion_events_[lane]"),
+              ordinary_boundary)
+        << "Logical-state readers and writers exist without speculative execution.";
+
+    const std::array<std::tuple<const char *, const char *, const char *>, 11>
         hot_paths = {{
+            {
+                "bool DeviceGraphOrchestrator::beginDeviceResidentGeneration(",
+                "bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(",
+                "ordinary and speculative admission",
+            },
             {
                 "bool DeviceGraphOrchestrator::recordDeviceResidentMTPTransactionMutation(",
                 "bool DeviceGraphOrchestrator::recordRestoredDeviceResidentMTPTransaction(",
@@ -7009,7 +7056,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GreedyMTPDeviceDraftSlotPathDoesNotQuie
         std::string::npos);
     EXPECT_NE(
         compact_graph_outcome_stage.find(
-            "enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice("),
+            "enqueueArgmaxF32RowsWithHistoryDevice("),
         std::string::npos);
     EXPECT_NE(
         compact_graph_outcome_stage.find(
@@ -7833,6 +7880,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataSta
 {
     const auto source =
         readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto publication_source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp");
     const auto stage_source =
         readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp");
     const auto runner_interface =
@@ -7851,9 +7900,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationMetadataSta
         removeAsciiWhitespace(stripCommentsAndStringLiterals(stage_source));
     const auto materialize_body = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
-            source,
+            publication_source,
             "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(",
-            "bool DeviceGraphOrchestrator::executeMTPSpeculativeStatePublicationCaptured(")));
+            "bool DeviceGraphOrchestrator::installMTPStatePublicationGraph(")));
     const auto lifecycle_body = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             source,
@@ -8097,7 +8146,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
               std::string::npos)
         << "Captured recurrent-state publication must consume compact GPU row metadata.";
 
-    EXPECT_NE(compact_publish.find("executeMTPSpeculativeStatePublicationCaptured("),
+    EXPECT_NE(compact_publish.find("executeMTPStatePublicationGraph("),
               std::string::npos)
         << "The endpoint must replay the strict captured publication graph.";
     EXPECT_NE(compact_publish.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("),
@@ -8105,7 +8154,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPDeviceResidentPublicationRequiresAto
         << "Terminal hidden must be selected from the accepted device row.";
     EXPECT_NE(compact_publish.find("finalizeMTPSpeculativeStatePublicationLaunch("),
               std::string::npos);
-    EXPECT_LT(compact_publish.find("executeMTPSpeculativeStatePublicationCaptured("),
+    EXPECT_LT(compact_publish.find("executeMTPStatePublicationGraph("),
               compact_publish.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("));
     EXPECT_LT(compact_publish.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("),
               compact_publish.find("finalizeMTPSpeculativeStatePublicationLaunch("))
@@ -8180,7 +8229,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::sealDeviceSpeculativeOutcomeVerifierGeometry(",
-            "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(")));
+            "bool DeviceGraphOrchestrator::finalizeMTPSpeculativeStatePublicationLaunch(")));
     const auto prepare = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
@@ -8910,7 +8959,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGODeviceLogicalStateMailboxOwnsArenaRo
         << "The captured stage must own every device-resident KV mutation.";
     EXPECT_NE(compact_publication_lifecycle.find("recordDeviceResidentLogicalSequenceStateMailbox("),
               std::string::npos);
-    EXPECT_LT(compact_direct_publish.find("executeMTPSpeculativeStatePublicationCaptured("),
+    EXPECT_LT(compact_direct_publish.find("executeMTPStatePublicationGraph("),
               compact_direct_publish.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("));
     EXPECT_LT(compact_direct_publish.find("selectMTPTerminalHiddenRowsFromDeviceAcceptedState("),
               compact_direct_publish.find("finalizeMTPSpeculativeStatePublicationLaunch("))
@@ -9352,7 +9401,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "waitForDeviceResidentLogicalSequenceStateRowReuse(",
         compose_complete);
     const size_t replacement_write = compact_batch_advance.find(
-        "backend->enqueueInitializeMTPDeviceLogicalState(",
+        "backend->enqueueInitializeGenerationLogicalState(",
         writer_wait);
     ASSERT_NE(compose_read, std::string::npos);
     ASSERT_NE(compose_launch, std::string::npos);
@@ -10060,8 +10109,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "waitForRequiredStochasticTargetSampleReady("
         "target_sample_slot,producer_stream,");
     const size_t initialize = compact_publication.find(
-        "backend->enqueueInitializeMTPDeviceLogicalState("
-        "condition_token_device,live_position_device,");
+        "backend->enqueueInitializeGenerationLogicalState({"
+        ".source=GenerationInitialFrontier::SampledCondition,"
+        ".positions=live_position_device,"
+        ".sampled_tokens=condition_token_device,");
     const size_t mailbox_event = compact_publication.find(
         "recordDeviceResidentLogicalSequenceStateMailbox(");
     ASSERT_NE(prior_mailbox_reuse, std::string::npos);
@@ -10422,7 +10473,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "RB>1 condition rows must execute decode semantics with mailbox-owned "
            "positions and recurrent-state lengths, not padded prefill metadata.";
     EXPECT_NE(condition_advance.find(
-                  "backend->enqueueInitializeMTPDeviceLogicalState("),
+                  "backend->enqueueInitializeGenerationLogicalState("),
               std::string::npos)
         << "The sampled first target rows must republish the resident mailbox.";
     EXPECT_EQ(condition_advance.find("deviceToHost"), std::string::npos);
@@ -10463,7 +10514,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "bool DeviceGraphOrchestrator::initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(",
             "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(")));
     EXPECT_NE(initial_publication.find(
-                  "backend->enqueueInitializeMTPDeviceLogicalState("),
+                  "backend->enqueueInitializeGenerationLogicalState("),
               std::string::npos);
     EXPECT_NE(initial_publication.find(
                   "recordDeviceResidentLogicalSequenceStateMailbox("),
@@ -10507,7 +10558,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         removeAsciiWhitespace(stripCommentsAndStringLiterals(backend_interface));
     EXPECT_NE(compact_backend.find("enqueuePrepareMTPBatchedSidecarInputs("),
               std::string::npos);
-    EXPECT_NE(compact_backend.find("enqueueInitializeMTPDeviceLogicalState("),
+    EXPECT_NE(compact_backend.find("enqueueInitializeGenerationLogicalState("),
               std::string::npos);
 }
 
@@ -10747,10 +10798,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "GPU serial decode must capture a stable arena position row.";
     EXPECT_NE(
         main_forward.find(
-            "input.materialize_serial_decode_position_from_device_kv=materialize_serial_decode_position_from_device_kv"),
+            "input.device_decode_position=DeviceDecodePositionBinding{"),
         std::string::npos)
-        << "The execution prelude must receive explicit typed policy for the "
-           "device-owned serial position snapshot.";
+        << "Decode must bind the exact cache and arena rows into its captured position root.";
     EXPECT_NE(main_forward.find(
                   "publishRequestInputReuseReady(output.execution.stream,"),
               std::string::npos)
@@ -10766,12 +10816,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "deviceSequenceCachedTokenCountPtr("),
         std::string::npos)
         << "Serial decode positions must derive from authoritative device KV state.";
-    EXPECT_NE(
+    EXPECT_EQ(
         forward_live_state_prelude.find(
             "enqueuePrepareMTPVerifierPositionIds(live_position_device,"),
         std::string::npos)
-        << "The scalar decode snapshot must use the backend's device-only "
-           "position materializer.";
+        << "The host prelude must not materialize position outside the captured graph.";
     EXPECT_NE(
         forward_live_state_prelude.find(
             "DeviceTimelinePoint::RequestInputReuseReady"),
@@ -10806,7 +10855,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "bool DeviceGraphOrchestrator::initializeDeviceResidentLogicalSequenceStateFromMainBatchSamples(",
             "bool DeviceGraphOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(")));
     EXPECT_NE(initial_publication.find(
-                  "stochastic_target_sample_tokens_dev_,static_cast<constint32_t*>(request_sequence_lengths_dev_),request_count"),
+                  ".source=GenerationInitialFrontier::SampledCondition,"
+                  ".positions=static_cast<constint32_t*>(request_sequence_lengths_dev_),"
+                  ".sampled_tokens=static_cast<constint32_t*>(stochastic_target_sample_tokens_dev_),"
+                  ".request_count=request_count"),
               std::string::npos);
     EXPECT_NE(initial_publication.find("ptrs.target_cached_tokens"),
               std::string::npos)
@@ -10838,7 +10890,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
               std::string::npos);
     EXPECT_NE(compact_backend.find("threshold_position_device"),
               std::string::npos);
-    EXPECT_NE(compact_backend.find("target_positions_device"),
+    EXPECT_NE(compact_backend.find("constGenerationLogicalStateInitialization&initialization"),
               std::string::npos);
     EXPECT_EQ(compact_backend.find("target_positions_host"),
               std::string::npos);
@@ -10857,12 +10909,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             << "Every GPU bonus sampler must consume the resident position in-kernel.";
         EXPECT_NE(compact.find("mtp_spec_threshold_from_seed("),
                   std::string::npos);
-        EXPECT_NE(compact.find("constintposition=target_positions[request];"),
+        EXPECT_NE(compact.find("initialization.initializeRequest(static_cast<int>(request))"),
                   std::string::npos)
-            << "Initial publication must load logical positions from device memory.";
+            << "Both backends must use the shared device-owned frontier initializer.";
         EXPECT_EQ(compact.find("intposition_0"), std::string::npos)
             << "Host-derived position launch scalars are obsolete.";
     }
+    const auto logical_initialization = removeAsciiWhitespace(stripCommentsAndStringLiterals(
+        readFile(root / "src/v2/kernels/common/GenerationLogicalState.h")));
+    EXPECT_NE(logical_initialization.find("constint32_tposition=positions[request];"),
+              std::string::npos)
+        << "Initial publication must load logical positions from device memory.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy,
@@ -11131,7 +11188,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DGOResidentPublicationDoesNotMutateKVBe
     const auto support_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::supportsDeviceResidentLogicalSequenceStatePublication() const",
-        "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(");
+        "bool DeviceGraphOrchestrator::materializeMTPDraftTokenPublicationGraph(");
     const auto prepare_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::prepareDeviceResidentMTPSpecPublicationMetadata(",
@@ -13785,16 +13842,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CachedForwardReplayRefreshesResidentPos
     EXPECT_NE(compact_rope_stage.find("updateDynamicDevicePositionIds(constvoid*position_ids_device,intseq_len)override"),
               std::string::npos);
 
-    EXPECT_NE(compact_forward_types.find("booluses_device_position_ids=false"),
+    EXPECT_NE(compact_forward_types.find("constvoid*device_position_ids=nullptr"),
               std::string::npos)
-        << "Forward graph signatures must distinguish resident-position graphs.";
-    EXPECT_NE(compact_forward_types.find("uses_device_position_ids==other.uses_device_position_ids"),
+        << "Forward graph signatures must name the exact resident-position owner.";
+    EXPECT_NE(compact_forward_types.find("device_position_ids==other.device_position_ids"),
               std::string::npos);
-    EXPECT_NE(compact_forward_types.find("std::hash<bool>{}(sig.uses_device_position_ids)"),
+    EXPECT_NE(compact_forward_types.find("std::hash<constvoid*>{}(sig.device_position_ids)"),
               std::string::npos);
-    EXPECT_NE(compact_forward_engine.find("uses_device_position_ids"),
+    EXPECT_NE(compact_forward_engine.find("usesDevicePositionIds()"),
               std::string::npos)
         << "Perf tags should expose whether a cached graph used resident positions.";
+    EXPECT_NE(compact_forward_engine.find(".device_position_ids=effective_input.position_ids_device"),
+              std::string::npos);
+    EXPECT_NE(compact_forward_engine.find(".device_token_ids=effective_input.token_ids_device"),
+              std::string::npos)
+        << "Both resident input owners must participate in complete capture identity.";
 
     EXPECT_NE(compact_forward_types.find("constint32_t*device_sequence_lengths=nullptr"),
               std::string::npos)
@@ -14921,7 +14983,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "bool DeviceGraphOrchestrator::initializeKVCaches("));
     const auto publication_body = removeAsciiWhitespace(sliceBetween(
         source,
-        "bool DeviceGraphOrchestrator::zeroAndPublishMTPGeneratedTokenHistoryOnStream(",
+        "bool DeviceGraphOrchestrator::zeroAndPublishGenerationSamplingInputsOnStream(",
         "bool DeviceGraphOrchestrator::materializePendingMTPVerifierInputTokensOnDevice("));
     const auto reset_body = removeAsciiWhitespace(sliceBetween(
         header,
@@ -14930,14 +14992,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     EXPECT_NE(
         initialization_body.find(
-            "explicitGPUStreamForOperation(\"initialize_mtp_persistent_state\")"),
+            "explicitGPUStreamForOperation(\"initialize_generation_persistent_state\")"),
         std::string::npos)
         << "Fresh GPU runners need one explicit persistent-state initialization stream.";
     EXPECT_NE(
         initialization_body.find(
-            "zeroAndPublishMTPGeneratedTokenHistoryOnStream("),
+            "zeroAndPublishGenerationSamplingInputsOnStream("),
         std::string::npos)
         << "Construction must publish initialized histogram bytes before the first request.";
+    EXPECT_NE(
+        initialization_body.find("initializeAndPublishDeviceGenerationStorageOnStream("),
+        std::string::npos)
+        << "Ordinary and speculative generation initialize the same resident controller owner.";
     EXPECT_NE(publication_body.find("backend->memset("), std::string::npos)
         << "The histogram must be initialized directly on its owning GPU.";
     EXPECT_NE(
@@ -14950,7 +15016,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "Initialization ordering is an event edge, never a stream or device synchronization.";
     EXPECT_NE(
         reset_body.find(
-            "zeroAndPublishMTPGeneratedTokenHistoryOnStream(reset_transaction.executionStream(),reset_reason)"),
+            "zeroAndPublishGenerationSamplingInputsOnStream(reset_transaction.executionStream(),reset_reason)"),
         std::string::npos)
         << "Request reset and construction must use the same ownership boundary.";
 }
@@ -15750,7 +15816,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured(",
-            "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(")));
+            "bool DeviceGraphOrchestrator::sealDeviceSpeculativeOutcomeVerifierGeometry(")));
 
     EXPECT_NE(
         stage_execute.find(
@@ -16304,9 +16370,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "signature.all_position_logit_rows!=preparation.valid_graph_row_count"),
         std::string::npos)
         << "Logical preparation rows may be shorter than the reusable physical forward bucket.";
-    EXPECT_NE(verifier_exporter.find("!signature.uses_device_token_ids"),
+    EXPECT_NE(verifier_exporter.find("!signature.usesDeviceTokenIds()"),
               std::string::npos);
-    EXPECT_NE(verifier_exporter.find("!signature.uses_device_position_ids"),
+    EXPECT_NE(verifier_exporter.find("!signature.usesDevicePositionIds()"),
               std::string::npos);
     EXPECT_NE(
         verifier_exporter.find("!signature.usesDeviceSequenceLengths()"),
@@ -16348,6 +16414,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         root / "src/v2/backends/cuda/CUDAGraphCapture.cu");
     const auto runner_source = readFile(
         root / "src/v2/execution/runner/OrchestrationRunner.cpp");
+    const auto program = removeAsciiWhitespace(stripCommentsAndStringLiterals(
+        readFile(root / "src/v2/execution/mtp/DeviceGenerationGraphProgram.cpp")));
 
     const auto compact_header = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(header));
@@ -16531,16 +16599,19 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         composer.find("supportsDeviceControlledWhileLoop()"),
         std::string::npos);
-    EXPECT_NE(
-        composer.find("buildDeviceControlledWhileLoop("),
-        std::string::npos);
-    EXPECT_NE(composer.find("capture->instantiate()"), std::string::npos);
+    EXPECT_NE(composer.find("DeviceGenerationGraphProgram::native("), std::string::npos);
+    EXPECT_NE(composer.find("DeviceGenerationGraphProgram::ticketPublisher("), std::string::npos);
+    EXPECT_EQ(composer.find("buildDeviceControlledWhileLoop("), std::string::npos)
+        << "Algorithms declare fragments; only the shared program compiler lowers native loops.";
+    EXPECT_NE(program.find("destination.buildDeviceControlledWhileLoop("), std::string::npos);
+    EXPECT_NE(program.find("destination.buildDeviceControlledSelectorWhileLoop("), std::string::npos);
+    EXPECT_NE(program.find("destination.instantiate()&&destination.hasExecutable()"), std::string::npos);
     EXPECT_NE(composer.find("capture->hasExecutable()"), std::string::npos);
     EXPECT_NE(
-        composer.find("healthy_index=kDeviceGenerationControlOk"),
+        program.find("healthy_index=kDeviceGenerationControlOk"),
         std::string::npos);
     EXPECT_NE(
-        composer.find(
+        program.find(
             "complete_index=kDeviceGenerationControlRequestComplete"),
         std::string::npos);
     EXPECT_NE(composer.find("source_identity_matches"), std::string::npos);
@@ -16585,6 +16656,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     {
         EXPECT_EQ(composer.find(needle), std::string::npos)
             << "Device-generation parent composition contains forbidden work: "
+            << needle;
+        EXPECT_EQ(program.find(needle), std::string::npos)
+            << "The shared generation compiler inherits the same no-transfer/no-sync contract: "
             << needle;
     }
 
@@ -16726,7 +16800,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "cudaGraphConditionalHandleCreate(&condition,graph_,0,cudaGraphCondAssignDefault)"),
         std::string::npos);
     EXPECT_NE(
-        conditional_builder.find("cudaGraphAddKernelNode(&initial_predicate_node"),
+        conditional_builder.find("initial_predicate_node=prelude.tail"),
         std::string::npos);
     EXPECT_NE(
         conditional_builder.find(
@@ -16747,8 +16821,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_NE(
         conditional_fragment_lowerer.find("cudaGraphCondTypeIf"),
         std::string::npos);
-    // Every model/sampler fragment belongs behind one request-health predicate.
-    // First-sample selection is a body conditional, not a pre-admission prologue.
+    // Local sampling belongs behind request health; collective arrival cannot
+    // be guarded by the follower's stale prior command. The shared prelude
+    // performs that exchange before the loop's live continuation check.
     const auto fixed_builder = sliceBetween(
         conditional_builder,
         "boolCUDAGraphCapture::buildDeviceControlledWhileLoop(",
@@ -16765,10 +16840,31 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         EXPECT_EQ(countOccurrences(*region, "appendDeviceControlledFragment("), 1u)
             << "Each named program region must reuse the one typed fragment-lowering authority.";
     }
-    EXPECT_NE(fixed_builder.find(
-        "cudaGraphAddKernelNode(&initial_predicate_node,graph_,nullptr,0,"),
+    const auto initialization_builder = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            cuda_capture,
+            "DeviceControlledFragmentAppendResult appendGuardedLoopInitialization(",
+            "#endif")));
+    EXPECT_NE(initialization_builder.find("cudaGraphCondTypeIf"), std::string::npos);
+    EXPECT_NE(initialization_builder.find(
+        "cudaGraphConditionalHandleCreate(&initialization_condition,graph,0,cudaGraphCondAssignDefault)"),
         std::string::npos)
-        << "Entry health must precede every model or sampler operation.";
+        << "CUDA IF and WHILE nodes require distinct native conditional handles.";
+    EXPECT_NE(initialization_builder.find(
+        "cudaGraphKernelNodeSetParams(entry_predicate,&initialization_predicate)"),
+        std::string::npos);
+    const auto prelude = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        cuda_capture, "DeviceControlledFragmentAppendResult appendLoopPrelude(", "#endif")));
+    const auto admitted = prelude.find("appendGuardedLoopInitialization(");
+    const auto arrived = prelude.find("appendLoopEntry(");
+    const auto checked = prelude.find("cudaGraphAddKernelNode(&result.tail,graph,dependency?");
+    ASSERT_NE(admitted, std::string::npos);
+    ASSERT_NE(arrived, std::string::npos);
+    ASSERT_NE(checked, std::string::npos);
+    EXPECT_LT(admitted, arrived) << "First-token EOS must still be published to followers.";
+    EXPECT_LT(arrived, checked) << "A follower cannot read the prior request's command before arrival.";
+    EXPECT_NE(fixed_builder.find("appendLoopPrelude("), std::string::npos);
+    EXPECT_NE(selector_builder.find("appendLoopPrelude("), std::string::npos);
     EXPECT_EQ(
         cuda_capture.find("lowerCudaConditionalBodyEventHandoffs"),
         std::string::npos)

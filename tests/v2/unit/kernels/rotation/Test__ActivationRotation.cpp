@@ -19,6 +19,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../utils/CPUProjectionTestWorkspace.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1682,8 +1683,10 @@ TEST(Test__ActivationRotation, FusedPacking_GEMM_Invariance_Q4_0)
         {static_cast<size_t>(M), static_cast<size_t>(N)});
 
     // Execute GEMM: kernel rotates activations, uses rotation-fused packed weights
+    llaminar2::test::CPUProjectionTestWorkspace workspace(M, K, kernel->getWorkspaceRequirements(M));
     bool ok = kernel->multiply_tensor(
-        input_tensor.get(), output_tensor.get(), M, N, K);
+        input_tensor.get(), output_tensor.get(), M, N, K,
+        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
     ASSERT_TRUE(ok) << "GEMM should succeed";
 
     const float *Y_fused = output_tensor->data();
@@ -1733,7 +1736,9 @@ TEST(Test__ActivationRotation, FusedPacking_PreservesFormatForNonRotated)
     float *inp_data = input->mutable_data();
     for (int i = 0; i < K; ++i) inp_data[i] = 1.0f;
 
-    bool ok = kernel->multiply_tensor(input.get(), output.get(), 1, N, K);
+    llaminar2::test::CPUProjectionTestWorkspace workspace(1, K);
+    bool ok = kernel->multiply_tensor(input.get(), output.get(), 1, N, K,
+        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
     ASSERT_TRUE(ok);
 
     // Just verify output is not NaN/Inf

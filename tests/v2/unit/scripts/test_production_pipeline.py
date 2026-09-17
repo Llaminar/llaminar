@@ -5,46 +5,135 @@ Mocked processes prove orchestration decisions, not inference performance.
 Prefix-state obligations come from typed model declarations; exact output
 tokens cannot excuse missing recurrent state or a response-selected contract.
 The real local CI run remains the only source of image certificates.
+Inventory regressions include untagged models: a complete E2E projection
+cannot stand in for the full model inventory or omit its shard identity pins.
+Container mount translation must preserve that inventory exactly and reject
+path traversal instead of silently selecting a different model namespace.
+Native acquisition audits check original responses without approving baselines;
+failed retries, stale configurations and duplicate passes remain visible.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
+import multiprocessing
 import re
+import shlex
+import signal
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 import subprocess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import docker_paths
+import cross_host_artifacts as remote_artifacts
 import generation_tokens as generation
 import generation_regression_http as generation_http
+import generation_corpus
+import audit_generation_acquisition as acquisition
+import export_generation_controls as control_export
 import run_model_parity_generation as generation_runner
 import prebuilt_test_image
 import production_artifacts as artifacts
 import run_model_parity_benchmarks as benchmark
 import run_production_pipeline as pipeline
+import run_production_cross_host_e2e as remote_e2e
+import cross_host_containers as remote_containers
+import cross_host_network as remote_network
 import run_production_parity_campaigns as parity
+import run_production_prerequisites as prerequisites_runner
 from test_generation_movement_ledger import empty_ledger, ledger as movement_ledger
+from test_model_parity_inventory import remote_cases
 
 
 def cell(name="cell"):
     """Minimal tagged configuration with a complete split-model manifest."""
+    runtime = GenerationHTTPTests().record()["runtime"]
+    runtime["generation"]["serial_control_id"] = name
     return {"case": name, "campaign": "campaign", "backends": "CUDA+ROCm",
             "model_files": ["/src/models/model-1.gguf", "/src/models/model-2.gguf"],
             "configuration": {"model_parity_schema": 1, "id": name,
+                "cross_host_e2e": [], "runtime": runtime,
                 "model": "/src/models/model-1.gguf", "e2e": {"context_length": 8192,
                     "server_args": ["--define-domain", "arbitrary;devices=rocm:0,cuda:0", "--mtp"]}}}
 
 
 def manifest():
-    return {"schema": 1, "source_revision": "revision", "cells": [cell()]}
+    return {"schema": 1, "scope": "e2e", "source_revision": "revision", "cells": [cell()]}
+
+
+def full_manifest():
+    """Include a non-E2E model with independent shards, without another matrix."""
+    untagged = cell("untagged")
+    untagged["model_files"] = ["/src/models/other-1.gguf", "/src/models/other-2.gguf"]
+    untagged["configuration"].update(model=untagged["model_files"][0], e2e=None)
+    return {**manifest(), "scope": "all", "cells": [cell(), untagged]}
+
+
+def parity_report():
+    """Complete mock numerical evidence uses the same full fixture membership."""
+    return {"correctness_passed": True, "performance_requirements_met": True,
+            "artifact_contract_passed": True, "preflight_return_code": 0,
+            "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2,
+            "exact_matrix_cell_count": len(full_manifest()["cells"]),
+            "campaigns": [{"campaign": "campaign", "return_code": 0, "outcome": "completed",
+                "artifact_contract_passed": True,
+                "gtest_cases": [row["case"] for row in full_manifest()["cells"]]}]}
+
+
+def prerequisite_report():
+    """Canonical model-free receipt, separate from mathematical diagnostics."""
+    return {"preflight_return_code": 0, "preflight_elapsed_seconds": 1,
+            "preflight_build_directory": "/src/build_v2_integration", "preflight_completed_ns": 123,
+            "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "preflight_test_count": 2}
+
+
+def generation_report(inventory=None, isa="AVX512", image="runtime-id"):
+    """Synthetic scheduling evidence; token/protocol validation has separate tests."""
+    inventory = inventory or full_manifest()
+    rows = [row for row in inventory["cells"] if generation_corpus.InventoryScope.GENERATION.accepts(row["configuration"])]
+    return {"schema": 1, "mode": "regression", "complete": True, "passed": True,
+            "certification_eligible": True, "image": image, "cpu_isa": isa, "corpus_digest": "c" * 64,
+            "source_revision": inventory["source_revision"], "inventory_digest": artifacts.digest(inventory),
+            "prerequisite_report_digest": artifacts.digest(prerequisite_report()), "selected": len(rows),
+            "cells": [{"case": row["case"], "configuration": copy.deepcopy(row["configuration"]),
+                       "return_code": 0, "evidence_error": None} for row in rows]}
+
+
+def install_corpus_io_fixture(test, *, mock_stat=False):
+    """Mock only external corpus/model I/O; keep report admission real.
+
+    ApprovedGenerationCorpusTests independently exercise actual files, approval
+    catalogs, full configuration binding, provenance and token validation.
+    These pipeline tests must not depend on a downloaded corpus or real GGUFs.
+    """
+    loader = patch.object(pipeline.ApprovedGenerationCorpus, "load_reviewed",
+                          return_value=argparse.Namespace(pin=argparse.Namespace(document_digest="c" * 64)))
+    loader.start()
+    test.addCleanup(loader.stop)
+    if mock_stat:
+        stat = patch.object(pipeline, "model_identities", return_value={})
+        stat.start()
+        test.addCleanup(stat.stop)
+
+
+def image_pair(source, isa="AVX512"):
+    """Independent mock Docker metadata for the test and Release siblings."""
+    common = {"org.opencontainers.image.revision": source["revision"],
+              "org.llaminar.source_tree": source["tree"], "org.llaminar.cpu_isa": isa,
+              "org.llaminar.build_type": "Release", "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON"}
+    return {"builder": {"id": "builder-id", "layers": ["test-layer"],
+                        "labels": {**common, "org.llaminar.image_role": "builder",
+                                   "org.llaminar.integration_skipped": "0"}},
+            "runtime": {"id": "runtime-id", "layers": ["runtime-layer"],
+                        "labels": {**common, "org.llaminar.image_role": "runtime"}}}
 
 
 def e2e_report(inventory=None):
@@ -55,6 +144,17 @@ def e2e_report(inventory=None):
             "selected": len(inventory["cells"]),
             "cells": [{"case": row["case"], "return_code": 0, "outcome": "passed",
                        "configuration": copy.deepcopy(row["configuration"])} for row in inventory["cells"]]}
+
+
+def non_remote_documents(inventory, image="runtime-id"):
+    """Give untagged fixtures the same explicit empty-phase receipt as CI."""
+    remote = pipeline.cross_host_e2e_projection(inventory, inventory["source_revision"])
+    assert not remote["cells"], "remote fixtures must supply executed-scenario evidence explicitly"
+    return {"cross-host-manifest": remote,
+            "cross-host-e2e": {"schema": 1, "eligible": False, "complete": True,
+                "source_revision": inventory["source_revision"], "image": image,
+                "manifest_digest": artifacts.digest(remote), "scenarios": [],
+                "all_resources_retired": True}}
 
 
 def workload():
@@ -80,26 +180,29 @@ def certified_variants(directory, source, baseline):
     for isa in pipeline.SHIPPING_ISAS:
         path = directory / isa.lower()
         inventory = {**manifest(), "source_revision": source["revision"]}
-        images = {"runtime": {"id": "sha256:" + isa, "labels": {"org.llaminar.cpu_isa": isa}},
-                  "builder": {"id": "builder-" + isa}}
+        images = image_pair(source, isa)
+        images["runtime"]["id"] = "sha256:" + isa
+        images["builder"]["id"] = "builder-" + isa
         evidence = {**e2e_report(inventory), "source_revision": source["revision"],
                     "image": images["runtime"]["id"]}
         row = {"case": "cell", "identity": {"cpu_isa": isa},
                "tokens_per_second": {"prefill": 100, "decode": 10}}
-        documents = {"manifest": inventory, "e2e": evidence,
-            "parity": {"correctness_passed": True, "performance_requirements_met": True,
-                       "artifact_contract_passed": True, "preflight_return_code": 0,
-                       "preflight_tests": ["V2_Unit_A", "V2_Integration_B"],
-                       "preflight_test_count": 2, "exact_matrix_cell_count": 1},
+        documents = {"manifest": inventory,
+            "all-cells": {**full_manifest(), "source_revision": source["revision"]}, "e2e": evidence,
+            "prerequisites/prerequisites": prerequisite_report(),
+            "generation/report": generation_report({**full_manifest(), "source_revision": source["revision"]},
+                                                    isa, images["runtime"]["id"]),
             "benchmarks": {"passed": True, "complete": True, "diagnostic": False,
                            "image": images["runtime"]["id"], "manifest_digest": artifacts.digest(inventory),
                            "e2e_report_digest": artifacts.digest(evidence), "cells": [row],
                            "baseline_digest": artifacts.digest(baseline)}}
+        documents.update(non_remote_documents(documents["all-cells"], images["runtime"]["id"]))
         for name, document in documents.items():
             artifacts.write_json(path / f"{name}.json", document)
         final = {"tag": "registry/image:" + isa.lower(), "id": "sha256:certified-" + isa,
-                 "certificate": pipeline.certificates(source, images, path)}
-        artifacts.write_json(path / "pipeline.json", {"certified": True, "images": images, "final": final})
+                 "certificate": pipeline.certificates(source, images, path, cpu_isa=isa)}
+        artifacts.write_json(path / "pipeline.json", {"certified": True, "images": images, "final": final,
+            "identity": {"corpus_root": str(ROOT / "corpora"), "diagnostic_mathematical_parity": False}})
         finals[isa] = final
     return finals
 
@@ -271,6 +374,59 @@ class GenerationHTTPTests(unittest.TestCase):
         self.mtp_policy = generation_http.MTPPolicy.OFF
         with patch.object(generation_http, "post_completion", side_effect=self.response):
             return generation_http.run_probes(self.record(), "http://unused", directory)
+
+    def test_completed_http_response_survives_a_hard_watchdog_kill(self):
+        """A later stuck request must not erase already returned runtime proof.
+
+        Use a real process death, not an exception that runs Python finally
+        blocks. The mock transport blocks only after the first valid response
+        has been processed. The surviving document must remain incomplete and
+        cannot be admitted as a passing serial control.
+        """
+        context = multiprocessing.get_context("fork")
+        receive, send = context.Pipe(duplex=False)
+        release = context.Event()
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "interrupted"
+
+            def worker():
+                """Exercise the real reporter with a bounded mock HTTP stall."""
+                calls = 0
+                def response(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        send.send("second-request-started")
+                        release.wait(5)
+                        raise RuntimeError("test did not retire its stalled child")
+                    return self.response(*args)
+                with patch.object(generation_http, "post_completion", side_effect=response):
+                    generation_http.run_probes(self.record(), "http://unused", output)
+
+            process = context.Process(target=worker)
+            process.start()
+            try:
+                self.assertTrue(receive.poll(5), "first response did not finish")
+                self.assertEqual(receive.recv(), "second-request-started")
+                process.kill()
+                process.join(5)
+                self.assertEqual(process.exitcode, -signal.SIGKILL)
+                path = output / "observations.json"
+                self.assertTrue(path.is_file(), "hard timeout lost a completed HTTP response")
+                observed = json.loads(path.read_text())
+                self.assertFalse(observed["complete"])
+                self.assertFalse(observed["certification_eligible"])
+                self.assertFalse(observed["repeatability_passed"])
+                self.assertEqual([row["id"] for row in observed["requests"]], ["seed"])
+                self.assertEqual(len(observed["requests"][0]["response"]["token_ids"]["completion"]), 384)
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    generation_http.observation_traces(self.record(), observed)
+            finally:
+                if process.is_alive():
+                    process.kill()
+                    process.join(5)
+                receive.close()
+                send.close()
 
     def test_non_mtp_early_eos_fails_live_and_saved_continuous_horizon(self):
         record = self.record()
@@ -451,7 +607,7 @@ class GenerationHTTPTests(unittest.TestCase):
                 generation_http.admit_control(self.record(True), changed)
 
     def test_canonical_request_geometry_and_sampler_are_mandatory(self):
-        for mutate in (lambda r: r.update(requests=[]), lambda r: r.update(readiness_timeout_seconds=601),
+        for mutate in (lambda r: r.update(requests=[]), lambda r: r.update(readiness_timeout_seconds=901),
                        lambda r: r.update(mtp_verify_mode="greedy"),
                        lambda r: r["requests"][0].update(prefix="full"),
                        lambda r: r["requests"][2].update(prefix="fresh"),
@@ -685,6 +841,7 @@ class GenerationHTTPTests(unittest.TestCase):
     def test_selectors_resolve_an_existing_control_without_synthesizing_argv(self):
         campaign = parity.CampaignCell("campaign", parity.CampaignGroup("CUDA", "ALL"))
         inventory = [(campaign, "Suite.serial", self.record()), (campaign, "Suite.mtp", self.record(True))]
+        inventory[1][2]["runtime"]["generation"]["mtp_policy"] = "dynamic"
         args = argparse.Namespace(mode=generation_runner.RunMode.COLLECT, backend="CUDA", campaign=".*", cell="Suite.mtp")
         with patch.object(generation_runner, "discover", return_value=inventory):
             self.assertEqual(generation_runner.select_cells(args), [generation_runner.GenerationCell(
@@ -738,6 +895,669 @@ class GenerationHTTPTests(unittest.TestCase):
                 preflight.assert_not_called()
                 staging.assert_not_called()
                 self.assertFalse(output.exists())
+
+
+class GenerationAcquisitionAuditTests(unittest.TestCase):
+    """Count original native proof without turning a progress audit into approval."""
+
+    def setUp(self):
+        """Use the real HTTP observer with synthetic device-free server responses."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.http = GenerationHTTPTests(methodName="runTest")
+        self.records = {name: self.http.record(name == "mtp") for name in ("serial", "mtp")}
+        self.inventory = {"schema": 1, "scope": "all", "source_revision": "revision", "cells": [
+            {"case": "Suite." + name, "campaign": "campaign", "backends": "CPU",
+             "configuration": record, "model_files": [record["model"]]}
+            for name, record in self.records.items()]}
+        self.manifest = self.root / "inventory.json"
+        artifacts.write_json(self.manifest, self.inventory)
+        self.serial = self.http.collect(self.root / "serial/row/generation")
+        self.http.mtp_policy = generation_http.MTPPolicy.DEPTH2
+        with patch.object(generation_http, "post_completion", side_effect=self.http.response):
+            generation_http.run_probes(self.records["mtp"], "http://unused",
+                                      self.root / "mtp/row/generation", self.serial)
+        self.reports = []
+        for name in self.records:
+            report = {"schema": 1, "mode": "collect-controls" if name == "serial" else "compare-controls",
+                "source_revision": "revision", "certification_eligible": False, "complete": True,
+                "passed": True, "selected": 1, "preflight_return_code": 0, "preflight_test_count": 2,
+                "preflight_tests": ["V2_Unit_A", "V2_Integration_B"], "cells": [{
+                    "case": "Suite." + name, "configuration": self.records[name], "return_code": 0,
+                    "evidence_error": None, "artifacts": str(self.root / name / "row")}]}
+            path = self.root / name / "report.json"
+            artifacts.write_json(path, report)
+            self.reports.append(path)
+
+    def test_complete_counts_are_original_exact_proof_not_corpus_approval(self):
+        result = acquisition.audit(self.manifest, self.reports)
+        self.assertEqual(result["counts"], {kind: {"expected": 1, "passed": 1, "not_complete": 0}
+                                            for kind in ("serial", "mtp")})
+        self.assertTrue(result["acquisition_complete"])
+        self.assertFalse(result["certification_eligible"])
+        self.assertEqual(result["unresolved_failed_cases"], [])
+        self.assertEqual(result["unseen_cases"], [])
+        self.assertEqual(len(result["reports"]), 2)
+        self.assertEqual(result["inventory_digest"], artifacts.digest(self.inventory))
+        partial = acquisition.audit(self.manifest, self.reports[:1])
+        self.assertFalse(partial["acquisition_complete"])
+        self.assertEqual(partial["unseen_cases"], ["Suite.mtp"])
+
+    def test_export_preserves_inputs_mapping_and_tokens_without_approval(self):
+        sources = {self.records["serial"]["model"]: [1, 2, 4096, 3, 4]}
+        with patch.object(control_export, "model_identities", return_value=sources):
+            exported = control_export.export_controls(self.manifest, self.reports, "AVX512")
+            with self.assertRaisesRegex(ValueError, "complete audited"):
+                control_export.export_controls(self.manifest, self.reports[:1], "AVX512")
+        self.assertEqual(exported["kind"], "unapproved_generation_controls")
+        self.assertEqual([row["id"] for row in exported["controls"]], ["serial"])
+        expected = generation_corpus.portable_inventory(self.inventory, sources)
+        self.assertEqual(exported["inventory"], expected)
+        for actual, original in zip(exported["controls"][0]["requests"], self.serial["requests"]):
+            self.assertEqual(actual["response"]["token_ids"], original["response"]["token_ids"])
+            self.assertNotIn("runtime_summary", actual["response"])
+        pin = generation_corpus.ApprovedCorpusPin("AVX512", artifacts.digest(exported))
+        with self.assertRaisesRegex(ValueError, "approval schema"):
+            generation_corpus.ApprovedGenerationCorpus.admit(exported, pin, self.inventory, sources)
+        output = self.root / "existing.json"
+        output.write_text("preserve")
+        with patch.object(control_export, "export_controls") as acquire:
+            with self.assertRaises(FileExistsError):
+                control_export.main(["--manifest", str(self.manifest), "--reports", str(self.reports[0]),
+                                     "--cpu-isa", "AVX512", "--output", str(output)])
+            acquire.assert_not_called()
+        self.assertEqual(output.read_text(), "preserve")
+
+    def test_partial_aggregate_keeps_completed_cells_but_not_unfinished_responses(self):
+        report = json.loads(self.reports[1].read_text())
+        report.update(complete=False, passed=False, selected=2)
+        artifacts.write_json(self.reports[1], report)
+        self.assertTrue(acquisition.audit(self.manifest, self.reports)["acquisition_complete"])
+        observation = self.root / "mtp/row/generation/observations.json"
+        changed = json.loads(observation.read_text())
+        changed["complete"] = False
+        artifacts.write_json(observation, changed)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            acquisition.audit(self.manifest, self.reports)
+
+    def test_later_failure_is_not_hidden_by_an_earlier_pass_and_retry_can_resolve_it(self):
+        failed = json.loads(self.reports[1].read_text())
+        failed.update(complete=False, passed=False)
+        failed["cells"][0]["return_code"] = 1
+        failure_path = self.root / "failure.json"
+        artifacts.write_json(failure_path, failed)
+        result = acquisition.audit(self.manifest, [*self.reports, failure_path])
+        self.assertFalse(result["acquisition_complete"])
+        self.assertEqual(result["counts"]["mtp"]["passed"], 0)
+        self.assertEqual(result["unresolved_failed_cases"], ["Suite.mtp"])
+        retried = acquisition.audit(self.manifest, [self.reports[0], failure_path, self.reports[1]])
+        self.assertTrue(retried["acquisition_complete"])
+        self.assertEqual(retried["unresolved_failed_cases"], [])
+
+    def test_reports_and_successful_cells_cannot_be_duplicated(self):
+        with self.assertRaisesRegex(ValueError, "distinct explicit"):
+            acquisition.audit(self.manifest, [*self.reports, self.reports[1]])
+        duplicate = self.root / "mtp/duplicate.json"
+        artifacts.write_json(duplicate, json.loads(self.reports[1].read_text()))
+        with self.assertRaisesRegex(ValueError, "duplicate passing"):
+            acquisition.audit(self.manifest, [*self.reports, duplicate])
+
+    def test_acquisition_preserves_old_source_provenance_without_claiming_a_current_build_proof(self):
+        report = json.loads(self.reports[0].read_text())
+        report["source_revision"] = "original-control-source"
+        artifacts.write_json(self.reports[0], report)
+        result = acquisition.audit(self.manifest, self.reports)
+        self.assertTrue(result["acquisition_complete"])
+        self.assertTrue(result["mixed_source_revisions"])
+        self.assertEqual(result["source_revisions"], ["original-control-source", "revision"])
+        self.assertFalse(result["certification_eligible"])
+
+    def test_full_inventory_and_current_configuration_cannot_be_replaced_by_a_name(self):
+        changed = copy.deepcopy(self.inventory)
+        changed["scope"] = "e2e"
+        artifacts.write_json(self.manifest, changed)
+        with self.assertRaisesRegex(ValueError, "all-cell manifest"):
+            acquisition.audit(self.manifest, self.reports)
+        artifacts.write_json(self.manifest, self.inventory)
+        report = json.loads(self.reports[1].read_text())
+        report["cells"][0]["configuration"]["runtime"]["server_args"].append("changed-policy")
+        artifacts.write_json(self.reports[1], report)
+        with self.assertRaisesRegex(ValueError, "canonical configuration"):
+            acquisition.audit(self.manifest, self.reports)
+
+    def test_token_drift_and_missing_serial_control_do_not_count_as_passes(self):
+        with self.assertRaisesRegex(ValueError, "green canonical serial control"):
+            acquisition.audit(self.manifest, self.reports[1:])
+        observation = self.root / "mtp/row/generation/observations.json"
+        changed = json.loads(observation.read_text())
+        # Change both repeats to retain self-repeatability while violating the
+        # independent serial answer at the final token of the required horizon.
+        for row in changed["requests"][:2]:
+            row["response"]["token_ids"]["completion"][-1] += 1
+        artifacts.write_json(observation, changed)
+        with self.assertRaisesRegex(ValueError, "original serial control"):
+            acquisition.audit(self.manifest, self.reports)
+
+    def test_report_flags_do_not_replace_prerequisites_or_original_artifact_ownership(self):
+        original = json.loads(self.reports[1].read_text())
+        for mutation in ({"preflight_return_code": 1}, {"preflight_tests": []},
+                         {"preflight_tests": ["V2_Unit_A", "V2_Unit_A"]}, {"preflight_test_count": 0},
+                         {"source_revision": ""}, {"selected": 2}, {"certification_eligible": True}):
+            artifacts.write_json(self.reports[1], original | mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                acquisition.audit(self.manifest, self.reports)
+        escaped = copy.deepcopy(original)
+        escaped["cells"][0]["artifacts"] = str(self.root / "serial/row")
+        artifacts.write_json(self.reports[1], escaped)
+        with self.assertRaisesRegex(ValueError, "escape their original"):
+            acquisition.audit(self.manifest, self.reports)
+
+
+class ApprovedGenerationCorpusTests(unittest.TestCase):
+    """A reviewed token file cannot choose or weaken its consuming inventory."""
+
+    def setUp(self):
+        """Keep compact synthetic streams, without model files or runtime proof."""
+        helper = GenerationHTTPTests()
+        records = [helper.record(), helper.record(True)]
+        files = [records[0]["model"], "/models/second-shard.gguf"]
+        self.inventory = {"schema": 1, "scope": "all", "source_revision": "candidate",
+            "cells": [{"case": "Suite." + record["id"], "campaign": "campaign", "backends": "CPU",
+                       "model_files": list(files), "configuration": record} for record in records]}
+        self.sources = {path: [1, index + 2, 4096 + index, 100, 200] for index, path in enumerate(files)}
+        requests = []
+        for request in generation_http.generation_profile(records[0])["requests"]:
+            response = helper.response("unused", request["body"], 1)
+            # Expected tokens are not yesterday's prefix, movement or MTP
+            # receipts. Every real candidate still needs fresh runtime proof.
+            response.pop("runtime_summary")
+            requests.append({"id": request["id"], "response": response})
+        self.document = {"schema": 1, "kind": "approved_generation_controls", "cpu_isa": "AVX512",
+            "inventory": generation_corpus.portable_inventory(self.inventory, self.sources),
+            "provenance": {kind: [artifacts.digest({"synthetic_proof": kind})]
+                           for kind in ("numerical", "serial", "mtp")},
+            "controls": [{"id": "serial", "requests": requests}]}
+        self.pin = generation_corpus.ApprovedCorpusPin("AVX512", artifacts.digest(self.document))
+
+    def admit(self, document=None, *, repin=False, inventory=None, sources=None):
+        """Only tests repin malformed fixtures to reach each structural guard."""
+        document = self.document if document is None else document
+        pin = (generation_corpus.ApprovedCorpusPin("AVX512", artifacts.digest(document))
+               if repin else self.pin)
+        return generation_corpus.ApprovedGenerationCorpus.admit(
+            document, pin, self.inventory if inventory is None else inventory,
+            self.sources if sources is None else sources)
+
+    def record(self, name="mtp", *, inventory=None):
+        """Select the exact fixture record, without reconstructing its policy."""
+        rows = (self.inventory if inventory is None else inventory)["cells"]
+        return next(row["configuration"] for row in rows if row["configuration"]["id"] == name)
+
+    def test_serial_and_mtp_share_immutable_expected_streams_without_runtime_receipts(self):
+        corpus = self.admit()
+        serial = corpus.expected(self.record("serial"))
+        self.assertEqual(corpus.expected(self.record()), serial)
+        self.assertEqual(sum(len(trace.completion) for trace in serial.values()), 1536)
+        self.document["controls"][0]["requests"][0]["response"]["token_ids"]["completion"][383] = 999999
+        serial.clear()
+        self.assertEqual(len(corpus.expected(self.record("serial"))), 4)
+        self.assertEqual(corpus.expected(self.record("serial"))["seed"].completion[383], 383)
+        with self.assertRaisesRegex(ValueError, "outside the approved"):
+            corpus.expected({**self.record(), "id": "unseen"})
+
+    def test_expected_document_roundtrip_and_live_mtp_prefix_evidence(self):
+        """Golden tokens never substitute for a candidate's actual runtime proof."""
+        helper = GenerationHTTPTests()
+        record = self.record()
+        corpus = self.admit()
+        expected = corpus.expectations_document(record)
+        self.assertEqual(generation_http.admit_expected_tokens(record, expected), corpus.expected(record))
+        helper.mtp_policy = generation_http.MTPPolicy.DEPTH2
+        with tempfile.TemporaryDirectory() as temp, patch.object(generation_http, "post_completion", side_effect=helper.response):
+            result = generation_http.run_probes(record, "http://unused", Path(temp) / "probe", expected_tokens=expected)
+            self.assertTrue(result["serial_comparison_passed"])
+        for mutation in (
+            lambda doc: doc["requests"].pop(),
+            lambda doc: doc["configuration"]["runtime"]["generation"]["requests"][0]["body"].update(seed=99),
+            lambda doc: doc.update(serial_control_id="different"),
+            lambda doc: doc["requests"][0]["completion"].pop(),
+        ):
+            changed = copy.deepcopy(expected)
+            mutation(changed)
+            with self.assertRaises(ValueError):
+                generation_http.admit_expected_tokens(record, changed)
+        # The final token is just as binding as the first; checking a matching
+        # prefix or concatenating short outputs must not satisfy the horizon.
+        changed = copy.deepcopy(expected)
+        for request in changed["requests"]:
+            request["completion"][383] = 999999
+        with tempfile.TemporaryDirectory() as temp, patch.object(generation_http, "post_completion", side_effect=helper.response):
+            with self.assertRaises(ValueError):
+                generation_http.run_probes(record, "http://unused", Path(temp) / "probe", expected_tokens=changed)
+
+
+
+    def test_same_named_cell_cannot_change_its_admitted_configuration(self):
+        corpus = self.admit()
+        mutations = (lambda x: x.update(model="/models/foreign.gguf"),
+                     lambda x: x["runtime"]["server_args"].append("changed-topology"),
+                     lambda x: x["runtime"]["generation"]["requests"][0]["body"].update(seed=42),
+                     lambda x: x["runtime"]["generation"].update(mtp_policy="off"),
+                     lambda x: x["runtime"].update(movement_evidence="different-policy"))
+        for mutate in mutations:
+            record = copy.deepcopy(self.record())
+            mutate(record)
+            with self.assertRaisesRegex(ValueError, "admitted configuration"):
+                corpus.expected(record)
+        # A bare ID cannot authenticate the contract, nor can changing the
+        # caller's original inventory mutate the corpus's admission snapshot.
+        with self.assertRaises(TypeError):
+            corpus.expected("mtp")
+        self.record()["runtime"]["server_args"].append("changed-after-admission")
+        with self.assertRaisesRegex(ValueError, "admitted configuration"):
+            corpus.expected(self.record())
+
+    def test_changed_payload_or_untyped_pin_fails_before_inventory_admission(self):
+        changed = copy.deepcopy(self.document)
+        changed["controls"][0]["requests"][0]["response"]["token_ids"]["completion"][383] += 1
+        with patch.object(generation_corpus, "portable_inventory") as inventory:
+            with self.assertRaisesRegex(ValueError, "reviewed metadata pin"):
+                self.admit(changed)
+            inventory.assert_not_called()
+        with self.assertRaises(TypeError):
+            generation_corpus.ApprovedGenerationCorpus.admit(self.document, {}, self.inventory, self.sources)
+        for value in ("", "abc", "A" * 64, None):
+            with self.subTest(pin=value), self.assertRaises(ValueError):
+                generation_corpus.ApprovedCorpusPin("AVX512", value)
+
+    def test_both_isas_have_explicit_independent_approval(self):
+        for isa in ("AVX2", "AVX512"):
+            document = {**self.document, "cpu_isa": isa}
+            pin = generation_corpus.ApprovedCorpusPin(isa, artifacts.digest(document))
+            corpus = generation_corpus.ApprovedGenerationCorpus.admit(document, pin, self.inventory, self.sources)
+            self.assertEqual(corpus.pin.cpu_isa, isa)
+            wrong = generation_corpus.ApprovedCorpusPin("AVX512" if isa == "AVX2" else "AVX2", pin.document_digest)
+            with self.assertRaisesRegex(ValueError, "CPU ISA"):
+                generation_corpus.ApprovedGenerationCorpus.admit(document, wrong, self.inventory, self.sources)
+
+    def test_mount_and_source_revision_changes_do_not_change_regression_identity(self):
+        inventory = copy.deepcopy(self.inventory)
+        inventory["source_revision"] = "new-source-improvement"
+        sources = {}
+        for row in inventory["cells"]:
+            row["configuration"]["model"] = row["configuration"]["model"].replace("/models/", "/container/models/")
+            row["model_files"] = [path.replace("/models/", "/container/models/") for path in row["model_files"]]
+        for path, stat in self.sources.items():
+            sources[path.replace("/models/", "/container/models/")] = [9, stat[1] + 50, stat[2], 900, 901]
+        corpus = self.admit(inventory=inventory, sources=sources)
+        self.assertEqual(corpus.inventory_digest, self.admit().inventory_digest)
+        self.assertEqual(corpus.expected(self.record(inventory=inventory)), self.admit().expected(self.record()))
+        with self.assertRaisesRegex(ValueError, "admitted configuration"):
+            corpus.expected(self.record())
+        self.assertEqual(self.inventory["cells"][0]["configuration"]["model"], "/models/model.gguf")
+
+    def test_same_model_filename_with_changed_shard_size_is_rejected(self):
+        for path in self.sources:
+            sources = copy.deepcopy(self.sources)
+            sources[path][2] += 1
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "model/configuration inventory"):
+                self.admit(sources=sources)
+
+    def test_container_mount_adapter_preserves_reviewed_tokens_and_all_shard_identity(self):
+        """Join real mapping and corpus admission without trusting a mount alias."""
+        container = copy.deepcopy(self.inventory)
+        for row in container["cells"]:
+            row["configuration"]["model"] = "/src/models/" + Path(row["configuration"]["model"]).name
+            row["model_files"] = ["/src/models/" + Path(path).name for path in row["model_files"]]
+        mounted = pipeline.remap_manifest(container, Path("/runtime/model pool"))
+        sources = {"/runtime/model pool/" + Path(path).name: [9, stat[1] + 50, stat[2], 900, 901]
+                   for path, stat in self.sources.items()}
+        corpus = self.admit(inventory=mounted, sources=sources)
+        self.assertEqual(corpus.expected(self.record(inventory=mounted)),
+                         self.admit().expected(self.record()))
+        with self.assertRaisesRegex(ValueError, "admitted configuration"):
+            corpus.expected(self.record(inventory=container))
+        # Translation cannot legitimize a substituted secondary shard merely
+        # because its filename is the same inside the new mount.
+        sources["/runtime/model pool/second-shard.gguf"][2] += 1
+        with self.assertRaisesRegex(ValueError, "model/configuration inventory"):
+            self.admit(inventory=mounted, sources=sources)
+
+    def test_missing_extra_invalid_or_ambiguous_shard_pins_fail(self):
+        for mutate in (lambda x: x.pop("/models/second-shard.gguf"),
+                       lambda x: x.update({"/extra.gguf": [1, 2, 3, 4, 5]}),
+                       lambda x: x["/models/model.gguf"].__setitem__(2, 0),
+                       lambda x: x["/models/model.gguf"].__setitem__(1, True)):
+            sources = copy.deepcopy(self.sources)
+            mutate(sources)
+            with self.assertRaises(ValueError):
+                self.admit(sources=sources)
+        inventory = copy.deepcopy(self.inventory)
+        for row in inventory["cells"]:
+            row["model_files"][1] = "/other/model.gguf"
+        sources = {"/models/model.gguf": self.sources["/models/model.gguf"],
+                   "/other/model.gguf": self.sources["/models/second-shard.gguf"]}
+        with self.assertRaisesRegex(ValueError, "filenames are ambiguous"):
+            self.admit(inventory=inventory, sources=sources)
+
+    def test_full_inventory_and_exact_runtime_policy_are_required(self):
+        mutations = (lambda x: x.update(scope="e2e"),
+                     lambda x: x["cells"].pop(),
+                     lambda x: x["cells"][0]["configuration"].pop("e2e"),
+                     lambda x: x["cells"].append(copy.deepcopy(x["cells"][0])),
+                     lambda x: x["cells"][1]["configuration"]["runtime"]["server_args"].append("different-topology"),
+                     lambda x: x["cells"][0]["configuration"]["runtime"]["generation"]["requests"][0]["body"].update(seed=42),
+                     lambda x: x["cells"][1]["configuration"]["runtime"]["generation"].update(serial_control_id="absent"))
+        for mutate in mutations:
+            inventory = copy.deepcopy(self.inventory)
+            mutate(inventory)
+            with self.assertRaises(ValueError):
+                self.admit(inventory=inventory)
+
+    def test_serial_control_requires_the_same_secondary_shards(self):
+        """Matching primary model/workload cannot hide a different split model."""
+        inventory = copy.deepcopy(self.inventory)
+        inventory["cells"][1]["model_files"][1] = "/models/replaced-second.gguf"
+        sources = {**self.sources, "/models/replaced-second.gguf": [1, 99, 4097, 100, 200]}
+        with self.assertRaisesRegex(ValueError, "exact canonical serial control"):
+            generation_corpus.portable_inventory(inventory, sources)
+
+    def test_only_exact_serial_controls_can_supply_answers(self):
+        for mutate in (lambda x: x["controls"].clear(),
+                       lambda x: x["controls"].append(copy.deepcopy(x["controls"][0])),
+                       lambda x: x["controls"][0].update(id="mtp"),
+                       lambda x: x["controls"][0].update(id="unknown")):
+            document = copy.deepcopy(self.document)
+            mutate(document)
+            with self.assertRaisesRegex(ValueError, "exactly the canonical serial controls"):
+                self.admit(document, repin=True)
+
+    def test_provenance_and_approval_kind_cannot_be_omitted(self):
+        for mutate in (lambda x: x.update(kind="unapproved_observations"),
+                       lambda x: x.update(schema=True),
+                       lambda x: x.pop("provenance"),
+                       lambda x: x["provenance"].pop("numerical"),
+                       lambda x: x["provenance"].update(mtp=[]),
+                       lambda x: x["provenance"].update(serial=["not-a-proof"]),
+                       lambda x: x["provenance"].update(serial=x["provenance"]["serial"] * 2)):
+            document = copy.deepcopy(self.document)
+            mutate(document)
+            with self.assertRaises(ValueError):
+                self.admit(document, repin=True)
+
+    def test_requests_must_be_complete_ordered_and_byte_repeatable(self):
+        for mutate in (lambda rows: rows.pop(), lambda rows: rows.reverse(),
+                       lambda rows: rows[1].update(id=rows[0]["id"]),
+                       lambda rows: rows[1]["response"]["token_ids"]["completion"].__setitem__(383, 9876),
+                       lambda rows: rows[2]["response"]["token_ids"]["prompt"].__setitem__(0, 9876)):
+            document = copy.deepcopy(self.document)
+            mutate(document["controls"][0]["requests"])
+            with self.assertRaises(ValueError):
+                self.admit(document, repin=True)
+
+    def test_a_review_pin_cannot_waive_the_continuous_token_horizon(self):
+        document = copy.deepcopy(self.document)
+        response = document["controls"][0]["requests"][0]["response"]
+        response["token_ids"]["completion"] = response["token_ids"]["completion"][:13]
+        response["usage"].update(completion_tokens=13, total_tokens=response["usage"]["prompt_tokens"] + 13)
+        response["choices"][0]["finish_reason"] = "stop"
+        with self.assertRaisesRegex(ValueError, "insufficient continuous"):
+            self.admit(document, repin=True)
+
+    def test_loading_requires_existing_materialized_bytes_and_never_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "corpus.json"
+            with self.assertRaises(FileNotFoundError):
+                generation_corpus.ApprovedGenerationCorpus.load(path, self.pin, self.inventory, self.sources)
+            artifacts.write_json(path, self.document)
+            before = path.read_bytes()
+            loaded = generation_corpus.ApprovedGenerationCorpus.load(path, self.pin, self.inventory, self.sources)
+            self.assertEqual(loaded.expected(self.record()), loaded.expected(self.record("serial")))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(Path(folder).iterdir()), [path])
+            # An unmaterialized LFS pointer is not an empty or downloadable
+            # corpus. The caller must explicitly provision the selected data.
+            path.write_text("version https://git-lfs.github.com/spec/v1\noid sha256:" + "0" * 64 + "\nsize 123\n")
+            with self.assertRaises(json.JSONDecodeError):
+                generation_corpus.ApprovedGenerationCorpus.load(path, self.pin, self.inventory, self.sources)
+
+    def approval_fixture(self, root):
+        """Install synthetic review metadata separately from candidate results."""
+        source, data = root / "source", root / "mounted-corpora"
+        catalog = {"schema": 1, "corpora": {"AVX512": {
+            "path": "generation/reviewed/avx512.json", "document_digest": self.pin.document_digest}}}
+        artifacts.write_json(source / generation_corpus.APPROVAL_CATALOG, catalog)
+        artifacts.write_json(data / catalog["corpora"]["AVX512"]["path"], self.document)
+        return source, data, catalog
+
+    def test_source_catalog_selects_each_isa_without_fetching_the_other_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, data, catalog = self.approval_fixture(Path(folder))
+            avx2 = {**self.document, "cpu_isa": "AVX2"}
+            catalog["corpora"]["AVX2"] = {"path": "generation/reviewed/avx2.json",
+                                           "document_digest": artifacts.digest(avx2)}
+            artifacts.write_json(source / generation_corpus.APPROVAL_CATALOG, catalog)
+            before = {path: path.read_bytes() for path in Path(folder).rglob("*") if path.is_file()}
+            reader = generation_corpus.ApprovedGenerationCorpus.load_reviewed
+            result = reader(source, data, "AVX512", self.inventory, self.sources)
+            self.assertEqual(result.expected(self.record()), self.admit().expected(self.record()))
+            with self.assertRaises(FileNotFoundError):
+                reader(source, data, "AVX2", self.inventory, self.sources)
+            self.assertEqual(before, {path: path.read_bytes() for path in Path(folder).rglob("*") if path.is_file()})
+            artifacts.write_json(data / catalog["corpora"]["AVX2"]["path"], avx2)
+            self.assertEqual(reader(source, data, "AVX2", self.inventory, self.sources).pin.cpu_isa, "AVX2")
+
+    def test_candidate_payload_cannot_choose_its_own_review_pin(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, data, catalog = self.approval_fixture(Path(folder))
+            candidate = copy.deepcopy(self.document)
+            candidate["controls"][0]["requests"][0]["response"]["token_ids"]["completion"][383] += 1
+            artifacts.write_json(data / catalog["corpora"]["AVX512"]["path"], candidate)
+            # Even a valid-looking catalog next to candidate data is not the
+            # source-owned approval catalog consulted by the consumer.
+            catalog["corpora"]["AVX512"]["document_digest"] = artifacts.digest(candidate)
+            artifacts.write_json(data / generation_corpus.APPROVAL_CATALOG, catalog)
+            with self.assertRaisesRegex(ValueError, "reviewed metadata pin"):
+                generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                    source, data, "AVX512", self.inventory, self.sources)
+
+    def test_missing_or_unapproved_source_catalog_never_selects_another_isa(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with self.assertRaises(FileNotFoundError):
+                generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                    root, root, "AVX512", self.inventory, self.sources)
+            source, data, _ = self.approval_fixture(root)
+            with self.assertRaisesRegex(ValueError, "no reviewed generation corpus"):
+                generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                    source, data, "AVX2", self.inventory, self.sources)
+            with self.assertRaisesRegex(ValueError, "shipping CPU ISA"):
+                generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                    source, data, "NATIVE", self.inventory, self.sources)
+
+    def test_invalid_catalog_metadata_and_path_spellings_fail_before_payload_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, data, catalog = self.approval_fixture(Path(folder))
+            malformed = [[], {**catalog, "schema": True}, {**catalog, "unreviewed": True},
+                         {"schema": 1, "corpora": {"NATIVE": {}}}]
+            for path in ("", ".", "../candidate.json", "a/../../candidate.json", "/tmp/candidate.json",
+                         "./relative.json", "a//relative.json", "a\\relative.json"):
+                changed = copy.deepcopy(catalog)
+                changed["corpora"]["AVX512"]["path"] = path
+                malformed.append(changed)
+            for field, value in (("document_digest", "not-a-pin"), ("candidate_pin", "0" * 64)):
+                changed = copy.deepcopy(catalog)
+                changed["corpora"]["AVX512"][field] = value
+                malformed.append(changed)
+            with patch.object(generation_corpus.ApprovedGenerationCorpus, "load") as load:
+                for document in malformed:
+                    with self.subTest(document=document):
+                        artifacts.write_json(source / generation_corpus.APPROVAL_CATALOG, document)
+                        with self.assertRaises(ValueError):
+                            generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                                source, data, "AVX512", self.inventory, self.sources)
+                load.assert_not_called()
+
+    def test_source_and_payload_symlinks_cannot_escape_their_admitted_roots(self):
+        for escape_catalog in (False, True):
+            with self.subTest(catalog=escape_catalog), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                source, data, catalog = self.approval_fixture(root)
+                path = (source / generation_corpus.APPROVAL_CATALOG if escape_catalog
+                        else data / catalog["corpora"]["AVX512"]["path"])
+                outside = root / "candidate.json"
+                path.rename(outside)
+                path.symlink_to(outside)
+                with self.assertRaisesRegex(ValueError, "escapes"):
+                    generation_corpus.ApprovedGenerationCorpus.load_reviewed(
+                        source, data, "AVX512", self.inventory, self.sources)
+
+
+class RoutineGenerationPolicyTests(unittest.TestCase):
+    """Default scheduling and source-bound evidence cannot silently lose cells."""
+
+    def test_default_selects_off_and_dynamic_not_fixed_depths(self):
+        helper = GenerationHTTPTests()
+        campaign = parity.CampaignCell("campaign", parity.CampaignGroup("CUDA", "ALL"))
+        records = [helper.record()]
+        for policy in ("depth_1", "depth_2", "depth_3", "depth_15", "dynamic"):
+            record = helper.record(True)
+            record["id"] = policy
+            record["runtime"]["generation"]["mtp_policy"] = policy
+            records.append(record)
+        inventory = [(campaign, "Suite." + record["id"], record) for record in records]
+        args = argparse.Namespace(mode=generation_runner.RunMode.REGRESSION, backend=".*", campaign=".*", cell=".*")
+        with patch.object(generation_runner, "discover", return_value=inventory):
+            self.assertEqual([cell.configuration["id"] for cell in generation_runner.select_cells(args)],
+                             ["serial", "dynamic"])
+            self.assertEqual(len(generation_runner.select_cells(args, generation_corpus.InventoryScope.ALL)), 6)
+
+    def test_mathematical_matrix_is_explicit_and_receipts_cannot_change_policy(self):
+        self.assertNotIn(pipeline.Phase.PARITY, pipeline.pipeline_phases())
+        self.assertIn(pipeline.Phase.PARITY, pipeline.pipeline_phases(True))
+        names = [phase.value for phase in pipeline.pipeline_phases(True)]
+        pipeline.validate_phase_prefix(dict.fromkeys(names), True)
+        with self.assertRaises(ValueError):
+            pipeline.validate_phase_prefix(dict.fromkeys(names))
+        with patch.object(pipeline, "source_identity") as source:
+            with self.assertRaises(SystemExit):
+                pipeline.main(["--output", "/unused", "--through", "parity"])
+            source.assert_not_called()
+
+    def test_complete_report_requires_reviewed_answers_exact_cells_and_shared_gate(self):
+        good = generation_report()
+        generation_runner.validate_regression_report(good, full_manifest(), prerequisite_report(),
+                                                     "runtime-id", "AVX512", "c" * 64)
+        for mutate in (
+            lambda r: r.update(mode="collect-controls"), lambda r: r.update(mode="compare-controls"),
+            lambda r: r.update(corpus_digest="new-self-approved-answers"),
+            lambda r: r.update(cpu_isa="AVX2"), lambda r: r.update(image="another-image"),
+            lambda r: r.update(certification_eligible=False), lambda r: r.update(passed=False),
+            lambda r: r.update(prerequisite_report_digest="stale"), lambda r: r.update(cells=[]),
+            lambda r: r["cells"].__setitem__(1, copy.deepcopy(r["cells"][0])),
+            lambda r: r["cells"][0]["configuration"]["runtime"]["generation"]["requests"][0]["body"].update(seed=99),
+        ):
+            report = copy.deepcopy(good)
+            mutate(report)
+            with self.assertRaises(ValueError):
+                generation_runner.validate_regression_report(report, full_manifest(), prerequisite_report(),
+                                                             "runtime-id", "AVX512", "c" * 64)
+
+
+class PrerequisiteEntrypointTests(unittest.TestCase):
+    """The model-free command delegates to one complete existing authority."""
+
+    def test_local_and_installed_paths_execute_both_complete_namespaces(self):
+        """Mock external operations, not the canonical gate's phase transitions."""
+        for installed in (False, True):
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                build = root / "build"
+                build.mkdir()
+                output = root / "results"
+                receipt = root / "installed.json"
+                artifacts.write_json(receipt, {"fixture": True})
+                argv = ["--build-dir", str(build), "--output", str(output)]
+                if installed:
+                    argv += ["--installed-build-receipt", str(receipt)]
+                with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+                     patch.object(parity, "discover_production_parity_preflight_tests", return_value=("V2_Integration_B",)), \
+                     patch.object(prebuilt_test_image, "validate") as validate, \
+                     patch.object(parity, "_run_process", return_value=0) as execute:
+                    self.assertEqual(prerequisites_runner.main(argv), 0)
+                commands = [call.args[0] for call in execute.call_args_list]
+                self.assertEqual(len(commands), 2 if installed else 3)
+                if installed:
+                    validate.assert_called_once_with(receipt, build)
+                else:
+                    validate.assert_not_called()
+                    self.assertEqual(commands[0], ["cmake", "--build", str(build), "--parallel", "--target",
+                                                  parity.PRODUCTION_PARITY_UNIT_BUILD_TARGET,
+                                                  parity.PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET])
+                unit, preflight = commands[-2:]
+                self.assertEqual(unit[unit.index("-R") + 1], "^V2_Unit_")
+                self.assertEqual(preflight[preflight.index("-L") + 1], "^ProductionParityPreflight$")
+                for command in (unit, preflight):
+                    self.assertIn("--output-log", command)
+                    self.assertIn("--output-junit", command)
+                    self.assertIn("--no-tests=error", command)
+                result = json.loads((output / "prerequisites.json").read_text())
+                self.assertEqual(result["preflight_tests"], ["V2_Unit_A", "V2_Integration_B"])
+                self.assertEqual(result["preflight_return_code"], 0)
+                self.assertFalse(result["certification_eligible"])
+
+    def test_existing_output_is_never_replaced_or_reused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            output = root / "results"
+            output.mkdir()
+            artifacts.write_json(output / "prerequisites.json", {"prior": "evidence"})
+            with patch.object(prerequisites_runner, "run_production_parity_preflight") as execute:
+                with self.assertRaises(FileExistsError):
+                    prerequisites_runner.main(["--build-dir", str(root), "--output", str(output)])
+                execute.assert_not_called()
+            self.assertEqual(json.loads((output / "prerequisites.json").read_text()), {"prior": "evidence"})
+
+    def test_failed_gate_exit_code_is_preserved_without_synthesized_success(self):
+        for code in (1, 2, 124):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                output = root / "results"
+                with patch.object(prerequisites_runner, "run_production_parity_preflight",
+                                  return_value=(code, 1.0, ())) as execute:
+                    self.assertEqual(prerequisites_runner.main([
+                        "--build-dir", str(root), "--output", str(output)]), code)
+                    execute.assert_called_once_with(root, None, installed_build_receipt=None,
+                                                    artifact_directory=output)
+                self.assertEqual(list(output.iterdir()), [])
+
+    def test_missing_or_invalid_installed_receipt_cannot_rebuild_around_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            receipt = root / "installed.json"
+            with patch.object(prerequisites_runner, "run_production_parity_preflight") as authority:
+                with self.assertRaises(FileNotFoundError):
+                    prerequisites_runner.main(["--build-dir", str(root), "--output", str(root / "missing"),
+                                               "--installed-build-receipt", str(receipt)])
+                authority.assert_not_called()
+            artifacts.write_json(receipt, {"invalid": True})
+            with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
+                 patch.object(parity, "discover_production_parity_preflight_tests", return_value=("V2_Integration_B",)), \
+                 patch.object(prebuilt_test_image, "validate", side_effect=ValueError("stale installation")), \
+                 patch.object(parity, "_run_process") as execute:
+                with self.assertRaisesRegex(ValueError, "stale installation"):
+                    prerequisites_runner.main(["--build-dir", str(root), "--output", str(root / "invalid"),
+                                               "--installed-build-receipt", str(receipt)])
+                execute.assert_not_called()
+
+    def test_cli_has_no_inventory_selector_or_skip_switch(self):
+        for flag in ("--cell", "--skip-preflight", "--backend", "--collect-controls"):
+            with self.subTest(flag=flag), patch.object(prerequisites_runner, "run_production_parity_preflight") as execute:
+                with self.assertRaises(SystemExit) as error:
+                    prerequisites_runner.main(["--build-dir", "unused", "--output", "unused", flag])
+                self.assertEqual(error.exception.code, 2)
+                execute.assert_not_called()
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
@@ -810,7 +1630,7 @@ class BenchmarkPolicyTests(unittest.TestCase):
             retired = execute.call_args_list[1].args[0]
             self.assertEqual(retired[:3], ["docker", "rm", "-f"])
             self.assertEqual(retired[3], launched[launched.index("--name") + 1])
-            self.assertEqual(execute.call_args_list[0].kwargs["timeout"], 600)
+            self.assertEqual(execute.call_args_list[0].kwargs["timeout"], 900)
             environment = [launched[i + 1] for i, value in enumerate(launched) if value == "-e"]
             self.assertEqual(environment, ["LLAMINAR_BENCHMARK_ITERATIONS=3",
                                            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1"])
@@ -894,6 +1714,1061 @@ class BenchmarkPolicyTests(unittest.TestCase):
         self.assertEqual(after["cells"][0]["configuration"]["e2e"], before["cells"][0]["configuration"]["e2e"])
 
 
+class PipelineInventoryTests(unittest.TestCase):
+    def setUp(self):
+        install_corpus_io_fixture(self)
+
+    """One discovered full inventory owns model pins and its exact E2E subset."""
+
+    def test_container_model_translation_rejects_escape_and_ambiguous_paths(self):
+        """Reject malformed primary and secondary paths before model admission."""
+        for filename in ("/src/models/../outside.gguf",
+                         "/src/models/nested/../../outside.gguf",
+                         "/src/models/./model.gguf", "/src/models//model.gguf",
+                         "/src/models/model.gguf/", "/other/model.gguf",
+                         "relative.gguf", "/src/models", "/src/models/",
+                         "/src/models/bad\x00.gguf", "/src/models/bad\n.gguf"):
+            for index in (0, 1):
+                full = full_manifest()
+                row = full["cells"][1]  # Untagged models need the same boundary.
+                row["model_files"][index] = filename
+                if index == 0:
+                    row["configuration"]["model"] = filename
+                before = copy.deepcopy(full)
+                with self.subTest(filename=filename, shard=index), self.assertRaises(ValueError):
+                    pipeline.remap_manifest(full, Path("/admitted/models"))
+                self.assertEqual(full, before)
+
+    def test_container_model_translation_requires_an_absolute_resolved_mount(self):
+        """The caller supplies the admitted mount, never a working-directory alias."""
+        for destination in (Path("relative"), Path("/admitted/../outside")):
+            with self.subTest(destination=destination), self.assertRaises(ValueError):
+                pipeline.remap_manifest(full_manifest(), destination)
+
+    def test_container_model_translation_preserves_nested_inventory_and_policy(self):
+        """Translation changes only model mount spelling, including untagged shards."""
+        full = full_manifest()
+        for row in full["cells"]:
+            row["model_files"] = [path.replace("/src/models/", "/src/models/nested folder/")
+                                  for path in row["model_files"]]
+            row["configuration"]["model"] = row["model_files"][0]
+        before = copy.deepcopy(full)
+        translated = pipeline.remap_manifest(full, Path("/mounted models"))
+        expected = copy.deepcopy(full)
+        for row in expected["cells"]:
+            row["model_files"] = [path.replace("/src/models/", "/mounted models/")
+                                  for path in row["model_files"]]
+            row["configuration"]["model"] = row["model_files"][0]
+        self.assertEqual(translated, expected)
+        self.assertEqual(full, before)
+        self.assertEqual(len(pipeline.e2e_projection(translated, "revision")["cells"]), 1)
+
+    def test_build_rejects_untagged_path_escape_before_model_stat_admission(self):
+        """Exercise the real build transition, not merely the translation helper."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            models = root / "models"
+            models.mkdir()
+            full = full_manifest()
+            full["cells"][1]["model_files"][1] = "/src/models/../unmounted.gguf"
+            args = argparse.Namespace(models=models, model_ramdisk_root=root,
+                reference_cache_root=root / "references", output=root / "results",
+                cpu_isa="AVX512", image=None, resume=False, through="build")
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+
+            def export(images, command, args, output, log):
+                """Supply the malformed installed inventory at its real boundary."""
+                artifacts.write_json(output / "container-all-cells.json", full)
+
+            with patch.object(pipeline, "source_identity", return_value=source), \
+                 patch.object(pipeline, "build", return_value=image_pair(source)), \
+                 patch.object(pipeline, "run_builder", side_effect=export), \
+                 patch.object(pipeline, "model_identities") as pin:
+                with self.assertRaisesRegex(ValueError, "noncanonical path"):
+                    pipeline.run_variant(args, source)
+                pin.assert_not_called()
+            state = json.loads((args.output / "pipeline.json").read_text())
+            self.assertEqual(state["phases"], {})
+            self.assertFalse(state["certified"])
+
+    def test_tagged_projection_preserves_records_without_mutating_full_inventory(self):
+        """Eligibility selects whole rows; it cannot rewrite runtime policy."""
+        full = full_manifest()
+        before = copy.deepcopy(full)
+        projected = pipeline.e2e_projection(full, "revision")
+        self.assertEqual(projected, manifest())
+        self.assertEqual(full, before)
+        projected["cells"][0]["configuration"]["e2e"]["server_args"].append("changed")
+        self.assertEqual(full, before)
+
+    def test_remote_projection_keeps_canonical_policy_and_rejects_stale_or_duplicate_tags(self):
+        """Remote discovery is an immutable projection, never another model table."""
+        full = full_manifest()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        original = copy.deepcopy(full)
+        projected = pipeline.cross_host_e2e_projection(full, "revision")
+        self.assertEqual(projected, {**full, "scope": "cross-host-e2e", "cells": full["cells"][:1]})
+        projected["cells"][0]["configuration"]["cross_host_e2e"][0]["server_policy_args"].append("changed")
+        self.assertEqual(full, original)
+        for mutate in (
+            lambda m: m["cells"][1]["configuration"].pop("cross_host_e2e"),
+            lambda m: m["cells"][0]["configuration"]["cross_host_e2e"].pop(),
+            lambda m: m["cells"][1]["configuration"].update(
+                e2e={}, cross_host_e2e=remote_cases()),
+        ):
+            broken = copy.deepcopy(full)
+            mutate(broken)
+            with self.assertRaises(ValueError):
+                pipeline.cross_host_e2e_projection(broken, "revision")
+
+    def test_full_inventory_rejects_wrong_scope_and_malformed_untagged_members(self):
+        """Validate untagged members too, before filtering would hide a defect."""
+        for index, mutate in enumerate((
+                lambda m: m.update(scope="e2e"), lambda m: m.pop("scope"),
+                lambda m: m.update(source_revision="other"), lambda m: m.update(schema=True),
+                lambda m: m.update(cells=[]), lambda m: m["cells"].append(copy.deepcopy(m["cells"][1])),
+                lambda m: m["cells"][1]["configuration"].update(id="cell"),
+                lambda m: m["cells"][1]["configuration"].pop("e2e"),
+                lambda m: m["cells"][1]["configuration"].update(e2e=False),
+                lambda m: m["cells"][1].update(model_files=[]),
+                lambda m: m["cells"][1]["model_files"].append(m["cells"][1]["model_files"][0]),
+                lambda m: m["cells"][1]["configuration"].update(model="/src/models/absent.gguf"))):
+            full = full_manifest()
+            mutate(full)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pipeline.e2e_projection(full, "revision")
+
+    def test_build_exports_full_inventory_and_pins_untagged_model_shards(self):
+        """Exercise the real build transition with only external Docker mocked."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            models = root / "models"
+            models.mkdir()
+            full = full_manifest()
+            full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+            for row in full["cells"]:
+                for filename in row["model_files"]:
+                    (models / Path(filename).name).write_text("model fixture")
+            args = argparse.Namespace(models=models, model_ramdisk_root=root,
+                reference_cache_root=root / "references", output=root / "results",
+                cpu_isa="AVX512", image=None, resume=False, through="build")
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            images = image_pair(source)
+
+            def export(images, command, args, output, log):
+                """Materialize the metadata-only container command's declared output."""
+                self.assertEqual(command[:2], ["python3", "scripts/ci/model_parity_inventory.py"])
+                self.assertEqual(command[command.index("--scope") + 1], "all")
+                self.assertFalse({"--cell", "--campaign", "--backend"}.intersection(command))
+                filename = Path(command[command.index("--export-manifest") + 1]).name
+                artifacts.write_json(output / filename, full)
+
+            with patch.object(pipeline, "source_identity", return_value=source), \
+                 patch.object(pipeline, "build", return_value=images) as build, \
+                 patch.object(pipeline, "run_builder", side_effect=export) as discover, \
+                 patch.object(pipeline, "image_identity", side_effect=lambda identity: next(
+                     item for item in images.values() if item["id"] == identity)):
+                state = pipeline.run_variant(args, source)
+                self.assertEqual(build.call_count, 1)
+                self.assertEqual(discover.call_count, 1)
+                self.assertEqual(len(state["model_sources"]), 4)
+                self.assertEqual(set(state["phases"]["build"]["files"]),
+                                 {"container-all-cells.json", "all-cells.json", "manifest.json", "cross-host-manifest.json"})
+                observed = json.loads((args.output / "all-cells.json").read_text())
+                self.assertEqual(observed, pipeline.remap_manifest(full, models))
+                projected = json.loads((args.output / "manifest.json").read_text())
+                self.assertEqual(projected, pipeline.e2e_projection(observed, "revision"))
+                remote = json.loads((args.output / "cross-host-manifest.json").read_text())
+                self.assertEqual(remote, pipeline.cross_host_e2e_projection(observed, "revision"))
+                self.assertEqual(len(remote["cells"][0]["configuration"]["cross_host_e2e"]), 4)
+                self.assertFalse(state["certified"])
+                args.resume = True
+                self.assertEqual(pipeline.run_variant(args, source), state)
+                # A receipt cannot invent metadata for an immutable Docker ID.
+                # Re-inspection must compare labels/layers as well as the ID.
+                for field, value in (("labels", {**images["builder"]["labels"],
+                                                "org.llaminar.cpu_isa": "AVX2"}),
+                                     ("layers", ["foreign-layer"])):
+                    forged = copy.deepcopy(state)
+                    forged["images"]["builder"][field] = value
+                    artifacts.write_json(args.output / "pipeline.json", forged)
+                    with self.subTest(field=field), self.assertRaisesRegex(ValueError, "identity/labels/layers"):
+                        pipeline.run_variant(args, source)
+                artifacts.write_json(args.output / "pipeline.json", state)
+                # A model used only by numerical/generation cells must invalidate
+                # resume just as decisively as an E2E-tagged model does.
+                (models / "other-2.gguf").write_text("changed untagged shard")
+                with self.assertRaisesRegex(ValueError, "model files changed"):
+                    pipeline.run_variant(args, source)
+                self.assertEqual(build.call_count, 1)
+
+    def test_host_phases_use_frozen_scripts_and_source_changes_stop_the_next_phase(self):
+        """Exercise real phase admission; mock external execution, not policy.
+
+        Builder tests are installed in their image. Host-driven HTTP and
+        benchmarks must instead run the matching archived scripts, even if a
+        developer edits the workspace while a long device phase is running.
+        These synthetic reports prove scheduling only, never inference.
+        """
+        for isa in pipeline.SHIPPING_ISAS:
+            for changed in (False, True):
+                with self.subTest(isa=isa, changed=changed), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    models = root / "models"
+                    models.mkdir()
+                    full = full_manifest()
+                    for filename in {name for row in full["cells"] for name in row["model_files"]}:
+                        (models / Path(filename).name).write_text("model fixture")
+                    args = argparse.Namespace(models=models, model_ramdisk_root=root,
+                        reference_cache_root=root / "references", output=root / "results",
+                        cpu_isa=isa, image=None, resume=False, through="benchmarks")
+                    source = {"revision": "revision", "tree": "tree", "dirty": False}
+                    current_source = copy.deepcopy(source)
+                    images = image_pair(source, isa)
+
+                    def builder(images, command, args, output, log):
+                        """Stand in for only installed discovery and test execution."""
+                        name = "container-all-cells.json" if log == "discovery.log" else "prerequisites/prerequisites.json"
+                        artifacts.write_json(output / name, full if log == "discovery.log" else prerequisite_report())
+
+                    def host(command, log, **kwargs):
+                        """Assert launch provenance before producing a mock receipt."""
+                        phase = log.stem
+                        expected = args.output / "source/scripts/ci" / f"run_model_parity_{phase}.py"
+                        self.assertEqual(command[:2], [sys.executable, str(expected)])
+                        self.assertFalse({"--cell", "--campaign", "--backend", "--diagnostic"}.intersection(command))
+                        flag = "--container-image" if phase in ("e2e", "generation") else "--image"
+                        self.assertEqual(command[command.index(flag) + 1], images["runtime"]["id"])
+                        manifest_path = Path(command[command.index("--manifest") + 1])
+                        self.assertEqual(manifest_path, args.output / ("all-cells.json" if phase == "generation" else "manifest.json"))
+                        projected = json.loads(manifest_path.read_text())
+                        if phase == "generation":
+                            self.assertEqual(projected, pipeline.remap_manifest(full, models))
+                            self.assertEqual(command[command.index("--prerequisite-report") + 1],
+                                             str(args.output / "prerequisites/prerequisites.json"))
+                            artifacts.write_json(Path(command[command.index("--output") + 1]) / "report.json",
+                                                 generation_report(projected, isa))
+                            return
+                        self.assertEqual(projected, pipeline.e2e_projection(pipeline.remap_manifest(full, models), "revision"))
+                        if phase == "e2e":
+                            result = e2e_report(projected)
+                            if changed:
+                                current_source["tree"] = "workspace-edited-during-e2e"
+                        else:
+                            self.assertEqual(phase, "benchmarks")
+                            self.assertEqual(command[command.index("--e2e-report") + 1], str(args.output / "e2e.json"))
+                            result = {"synthetic_benchmark_receipt": True}
+                        artifacts.write_json(Path(command[command.index("--report") + 1]), result)
+
+                    with patch.object(pipeline, "source_identity", side_effect=lambda: copy.deepcopy(current_source)), \
+                         patch.object(pipeline, "build", return_value=images), \
+                         patch.object(pipeline, "run_builder", side_effect=builder), \
+                         patch.object(pipeline, "run", side_effect=host) as run:
+                        if changed:
+                            with self.assertRaisesRegex(ValueError, "source changed after admission"):
+                                pipeline.run_variant(args, source)
+                        else:
+                            state = pipeline.run_variant(args, source)
+                            self.assertFalse(state["certified"])
+                        self.assertEqual([call.args[1].stem for call in run.call_args_list],
+                                         ["generation", "e2e"] if changed else ["generation", "e2e", "benchmarks"])
+
+    def test_cross_host_phase_follows_http_and_precedes_benchmarks(self):
+        """A declared remote projection is a real ordered certification phase."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            models = root / "models"
+            models.mkdir()
+            full = full_manifest()
+            full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+            for filename in {name for row in full["cells"] for name in row["model_files"]}:
+                (models / Path(filename).name).write_text("model fixture")
+            args = argparse.Namespace(models=models, model_ramdisk_root=root,
+                reference_cache_root=root / "references", output=root / "results",
+                cpu_isa="AVX512", image=None, resume=False, through="benchmarks")
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            images = image_pair(source, "AVX512")
+
+            def builder(images, command, args, output, log):
+                artifacts.write_json(output / ("container-all-cells.json" if log == "discovery.log" else "prerequisites/prerequisites.json"),
+                                     full if log == "discovery.log" else prerequisite_report())
+
+            def host(command, log, **kwargs):
+                phase = log.stem
+                if phase == "generation":
+                    artifacts.write_json(Path(command[command.index("--output") + 1]) / "report.json",
+                                         generation_report(pipeline.remap_manifest(full, models)))
+                elif phase == "e2e":
+                    artifacts.write_json(Path(command[command.index("--report") + 1]),
+                                         e2e_report(pipeline.e2e_projection(pipeline.remap_manifest(full, models), "revision")))
+                elif phase == "cross-host-e2e":
+                    remote = pipeline.cross_host_e2e_projection(pipeline.remap_manifest(full, models), "revision")
+                    runtime = images["runtime"]["id"]
+                    scenarios = [scenario for row in remote["cells"]
+                                 for scenario in row["configuration"]["cross_host_e2e"]]
+                    artifacts.write_json(Path(command[command.index("--report") + 1]), {
+                        "schema": 1, "eligible": True, "complete": True,
+                        "source_revision": "revision", "image": runtime,
+                        "manifest_digest": artifacts.digest(remote), "all_resources_retired": True,
+                        "scenarios": [{"id": item["id"], "frontend": item["frontend"],
+                                       "topology": item["topology"], "return_code": 0,
+                                       "outcome": "passed", "resource_retired": True,
+                                       "transport_proof": True, "http_proof": True}
+                                      for item in scenarios]})
+                else:
+                    artifacts.write_json(Path(command[command.index("--report") + 1]), {"synthetic": True})
+
+            with patch.object(pipeline, "source_identity", return_value=source), \
+                 patch.object(pipeline, "build", return_value=images), \
+                 patch.object(pipeline, "run_builder", side_effect=builder), \
+                 patch.object(pipeline, "run", side_effect=host) as execute:
+                state = pipeline.run_variant(args, source)
+            self.assertEqual([call.args[1].stem for call in execute.call_args_list],
+                             ["generation", "e2e", "cross-host-e2e", "benchmarks"])
+            self.assertIn("cross-host-e2e", state["phases"])
+
+
+class CrossHostRunnerTests(unittest.TestCase):
+    """Device-free checks for remote launcher admission and artifact safety."""
+
+    def test_peer_evidence_downloads_overlap_and_preserve_exact_records(self):
+        import threading
+        for collision in (False, True):
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                peers = [{"directory": f"/owned/{index}", "container": f"peer-{index}",
+                          "public_ip": f"192.0.2.{index}"} for index in (1, 2)]
+                rendezvous = threading.Barrier(2)
+                payload = b'{"records":[{"name":"exact","value":17}]}\n'
+
+                def execute(argv, **kwargs):
+                    if argv[0] != "scp":
+                        return ""
+                    self.assertIn("-C", argv)
+                    self.assertEqual(kwargs["timeout"], 60)
+                    target = Path(argv[-1])
+                    # A serial implementation times out at this rendezvous.
+                    rendezvous.wait(timeout=2)
+                    self.assertEqual(list(root.glob("*.json")), [])
+                    name = "duplicate.json" if collision else target.name + ".json"
+                    (target / name).write_bytes(payload)
+                    return ""
+
+                with patch.object(remote_containers, "execute", side_effect=execute):
+                    if collision:
+                        with self.assertRaisesRegex(ValueError, "duplicated an artifact"):
+                            remote_containers.collect_peer_evidence(
+                                {"artifact": temp, "key": "/key", "peers": peers})
+                        self.assertEqual(list(root.glob("*.json")), [])
+                    else:
+                        remote_containers.collect_peer_evidence(
+                            {"artifact": temp, "key": "/key", "peers": peers})
+                        self.assertEqual(sorted(path.name for path in root.glob("*.json")),
+                                         ["peer-1.json", "peer-2.json"])
+                        self.assertTrue(all(path.read_bytes() == payload for path in root.glob("*.json")))
+
+    def test_case_priority_reorders_without_weakening_complete_projection(self):
+        full = full_manifest()
+        cases = remote_cases()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = cases
+        projected = pipeline.cross_host_e2e_projection(full, "revision")
+        original = copy.deepcopy(projected)
+        canonical = remote_e2e.selected_rows(projected)
+        first = [cases[-1]["id"], cases[0]["id"]]
+        ordered = remote_e2e.selected_rows(projected, first)
+        self.assertEqual([row[1]["id"] for row in ordered],
+                         first + [row[1]["id"] for row in canonical if row[1]["id"] not in first])
+        self.assertCountEqual(ordered, canonical)
+        self.assertEqual(projected, original)
+        for invalid in (["not-a-canonical-case"], [first[0], first[0]]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                remote_e2e.selected_rows(projected, invalid)
+        projected["cells"].append(copy.deepcopy(projected["cells"][0]))
+        with self.assertRaisesRegex(ValueError, "repeats a scenario"):
+            remote_e2e.selected_rows(projected)
+
+    def test_private_key_cli_destination_survives_pipeline_forwarding(self):
+        args = argparse.Namespace(ssh_private_key="/private/task key", azure_subscription="subscription")
+        forwarded = pipeline.cross_host_cli_arguments(args)
+        self.assertEqual(forwarded[forwarded.index("--ssh-private-key") + 1], args.ssh_private_key)
+        self.assertEqual(pipeline.cross_host_identity(args)["ssh_private_key"], args.ssh_private_key)
+
+    def test_partial_long_context_and_wrong_remote_policy_never_pass(self):
+        scenario = remote_cases()[0]
+        profile = {"context_length": 4096, "minimum_prompt_tokens": 900, "generation_tokens": 384}
+        complete = {"schema": 1, "tier": "full", "complete": True, **profile,
+                    "results": [{"passed": True} for _ in range(8)]}
+        proof = {"case": scenario["id"], "scenario": scenario, "execution": {"observed": True}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            artifacts.write_json(path / "long_context_results.json", complete)
+            artifacts.write_json(path / "runtime.cross-host.json", proof)
+            remote_e2e.validate_case_evidence(path, scenario, profile)
+            for mutate in (lambda long, proof: long.update(complete=False),
+                           lambda long, proof: long["results"].pop(),
+                           lambda long, proof: long["results"][0].update(passed=False),
+                           lambda long, proof: long.update(context_length=8192),
+                           lambda long, proof: proof.update(case="other"),
+                           lambda long, proof: proof.update(execution={}),
+                           lambda long, proof: proof["scenario"].update(frontend="auto-serve")):
+                bad_long, bad_proof = copy.deepcopy(complete), copy.deepcopy(proof)
+                mutate(bad_long, bad_proof)
+                artifacts.write_json(path / "long_context_results.json", bad_long)
+                artifacts.write_json(path / "runtime.cross-host.json", bad_proof)
+                with self.assertRaises(ValueError):
+                    remote_e2e.validate_case_evidence(path, scenario, profile)
+
+    def test_report_artifacts_survive_staging_cleanup_on_success_and_failure(self):
+        """Exercise the runner and real Azure lease owner with a fake provider.
+
+        Only network/model execution is replaced. Evidence is written through
+        the actual per-cell lifecycle, and cloud retirement must run on both
+        ordinary completion and a rejected cell without deleting HTTP logs.
+        """
+        from test_azure_cross_host_resources import FakeAzure, PUBLIC_KEY, SUBSCRIPTION
+        for failure in (None, "cell", "import", "plan"):
+            failed = failure is not None
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                model = root / "model.gguf"
+                model.write_bytes(b"fixture")
+                private = root / "key"
+                private.write_text("fixture: not used by mocked transport")
+                private.chmod(0o600)
+                public = root / "key.pub"
+                public.write_text(PUBLIC_KEY)
+                profile = {"context_length": 4096, "minimum_prompt_tokens": 900,
+                    "generation_tokens": 384, "readiness_timeout_seconds": 60,
+                    "request_timeout_seconds": 60, "thinking_modes": "non-thinking",
+                    "movement_evidence": "required"}
+                parent = cell()
+                parent.update(model_files=[str(model)])
+                parent["configuration"].update(model=str(model), e2e=profile,
+                    cross_host_e2e=remote_cases())
+                manifest_path = root / "manifest.json"
+                artifacts.write_json(manifest_path, {"schema": 1, "scope": "cross-host-e2e",
+                    "source_revision": "revision", "cells": [parent]})
+                report_path = root / "evidence" / "report.json"
+                cli = FakeAzure()
+
+                budgets = {}
+
+                def harness(command, env, log, *, budget):
+                    directory = Path(env["LLAMINAR_E2E_LOG_DIR"])
+                    self.assertIsInstance(budget, remote_e2e.E2ECellBudget)
+                    self.assertIs(budgets.setdefault(directory, budget), budget)
+                    if "prepare" in command:
+                        log.write("preserved plan diagnostic\n")
+                        return 1 if failure == "plan" else 0
+                    ident = command[command.index("--cross-host-case") + 1]
+                    scenario = next(row for row in parent["configuration"]["cross_host_e2e"]
+                                    if row["id"] == ident)
+                    log.write("preserved HTTP diagnostic\n")
+                    artifacts.write_json(directory / "runtime.cross-host.json", {
+                        "case": ident, "scenario": scenario, "execution": {"observed": True}})
+                    artifacts.write_json(directory / "long_context_results.json", {
+                        "schema": 1, "tier": "full", "complete": not failed,
+                        **profile, "results": [{"passed": True} for _ in range(8)]})
+                    return 0
+
+                @contextmanager
+                def fleet(**kwargs):
+                    self.assertIn(len(kwargs["hosts"]), (1, 2))
+                    scenario = next(row for row in parent["configuration"]["cross_host_e2e"]
+                                    if row["id"] == kwargs["artifact"].name)
+                    plan = kwargs["plan_args"]
+                    declared = scenario["server_policy_args"]
+                    self.assertEqual(plan[3:3 + len(declared)], declared)
+                    applied = json.loads((kwargs["artifact"] / "server-args.json").read_text())
+                    if kwargs["frontend_mode"] == "plan-apply":
+                        self.assertEqual(applied, ["--config", str(remote_containers.CASE_ROOT / "plan.json")])
+                    else:
+                        self.assertEqual(applied[:len(declared)], declared)
+                    yield root / "unused-launcher"
+
+                @contextmanager
+                def connection(*args):
+                    yield remote_network.PrivateMPIConnection("10.207.14.1")
+
+                def stage_image(image, hosts, key, directory):
+                    (directory / "runtime-import-peer.log").write_text("preserved import diagnostic\n")
+                    if failure == "import":
+                        raise RuntimeError("runtime import failed")
+                    artifacts.write_json(directory / "runtime-import.json", {"source_image": image})
+                    return {host["public_ip"]: "sha256:remote-fixture" for host in hosts}
+
+                with patch.object(remote_e2e, "AzureCLI", return_value=cli), \
+                     patch.object(remote_e2e, "validate_local_network"), \
+                     patch.object(remote_e2e, "private_mpi_connection", side_effect=connection), \
+                     patch.object(remote_e2e, "image_identity", return_value={"id": "runtime-id"}), \
+                     patch.object(remote_e2e, "validate_attached_execution"), \
+                     patch.object(remote_e2e, "wait_remote_runtime"), \
+                     patch.object(remote_e2e, "stage_image", side_effect=stage_image) as image_stage, \
+                     patch.object(remote_e2e, "distribute"), \
+                     patch.object(remote_e2e, "ssh"), patch.object(remote_e2e, "upload_artifact"), \
+                     patch.object(remote_containers, "container_fleet", side_effect=fleet) as fleets, \
+                     patch.object(remote_e2e, "run_e2e_process", side_effect=harness), \
+                     patch.object(remote_e2e.time, "sleep"):
+                    argv = ["--manifest", str(manifest_path), "--source-revision", "revision",
+                        "--container-image", "runtime-id", "--models", str(root),
+                        "--model-ramdisk-root", str(root / "staging"), "--report", str(report_path),
+                        "--azure-subscription", SUBSCRIPTION, "--azure-ssh-source", "8.8.8.8/32",
+                        "--azure-ssh-public-key", str(public), "--ssh-private-key", str(private)]
+                    if failed:
+                        with self.assertRaisesRegex(RuntimeError, "runtime import failed" if failure == "import"
+                                                   else "cross-host scenario failed"):
+                            remote_e2e.main(argv)
+                    else:
+                        self.assertEqual(remote_e2e.main(argv), 0)
+                self.assertIsNone(cli.group)
+                image_stage.assert_called_once()
+                self.assertEqual([len(call.kwargs["hosts"]) for call in fleets.call_args_list],
+                                 [] if failure == "import" else [1] if failed else [1, 1, 2, 2])
+                self.assertEqual(list((root / "staging").iterdir()), [])
+                report = json.loads(report_path.read_text())
+                self.assertEqual(report["complete"], not failed)
+                self.assertTrue(report["all_resources_retired"])
+                self.assertEqual(len(report["scenarios"]), 0 if failure == "import" else 1 if failed else 4)
+                import_logs = list(report_path.parent.rglob("runtime-import-peer.log"))
+                self.assertEqual(len(import_logs), 1)
+                self.assertEqual(import_logs[0].read_text(), "preserved import diagnostic\n")
+                for observed in report["scenarios"]:
+                    evidence = Path(observed["artifacts"])
+                    self.assertTrue(evidence.is_relative_to(report_path.parent))
+                    if failure == "plan":
+                        self.assertEqual((evidence / "plan.log").read_text(), "preserved plan diagnostic\n")
+                        self.assertFalse((evidence / "harness.log").exists())
+                        self.assertFalse((evidence / "long_context_results.json").exists())
+                        continue
+                    self.assertEqual((evidence / "harness.log").read_text(), "preserved HTTP diagnostic\n")
+                    self.assertTrue((evidence / "long_context_results.json").is_file())
+                receipt = next(report_path.parent.rglob("azure-lease.json"))
+                self.assertEqual(json.loads(receipt.read_text())["state"], "retired")
+
+    def test_safe_names_are_bounded_path_components(self):
+        self.assertEqual(remote_e2e.safe_name("a/b:c"), "a_b_c")
+        self.assertNotIn("/", remote_e2e.safe_name("../"))
+
+    def test_remote_command_failure_preserves_captured_diagnostics(self):
+        with patch.object(remote_e2e.subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["ssh"], 1, "bounded stdout", "remote failure")):
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                remote_e2e.run(["ssh"])
+        self.assertEqual(caught.exception.output, "bounded stdout")
+        self.assertEqual(caught.exception.stderr, "remote failure")
+
+    def test_mpi_interface_selection_is_exact_and_rejects_ambiguous_inventory(self):
+        def interface(name, address, flags=("UP",)):
+            return {"ifname": name, "flags": list(flags),
+                    "addr_info": [{"family": "inet", "local": address}]}
+        inventory = [interface("lo", "127.0.0.1"), interface("eth0", "172.17.0.2"),
+                     interface("tun4123", "10.207.14.1")]
+        self.assertEqual(remote_containers.mpi_parameters("10.207.14.1", inventory),
+                         "oob_tcp_if_include=tun4123\nbtl_tcp_if_include=tun4123\n")
+        self.assertEqual(remote_containers.mpi_parameters("10.221.0.4",
+                [interface("enP1s0", "10.221.0.4"), interface("tun9", "10.207.14.2")]),
+                         "oob_tcp_if_include=enP1s0\nbtl_tcp_if_include=enP1s0\n")
+        for invalid in ([], [interface("eth0", "10.207.14.1", ())],
+                        [*inventory, interface("other0", "10.207.14.1")],
+                        [interface("eth0,lo", "10.207.14.1")]):
+            with self.subTest(inventory=invalid), self.assertRaises(ValueError):
+                remote_containers.mpi_parameters("10.207.14.1", invalid)
+        for address in ("127.0.0.1", "0.0.0.0", "224.0.0.1", "::1"):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                remote_containers.mpi_parameters(address, inventory)
+
+    def test_server_frontend_never_runs_plan_inside_readiness(self):
+        """A saved-plan server launch must not secretly launch another MPI job."""
+        configuration = {"controller": "owned-controller", "frontend": "plan-apply",
+                         "host_model": "/models/source.gguf", "container_model": "/models/runtime.gguf",
+                         "plan_args": ["plan", "--output", "/run/plan.json"], "peers": []}
+        process = Mock()
+        process.wait.return_value = 0
+        with patch.object(remote_containers.subprocess, "run") as plan, \
+             patch.object(remote_containers.subprocess, "Popen", return_value=process) as server, \
+             patch.object(remote_containers, "execute"), \
+             patch.object(remote_containers, "collect_peer_evidence"):
+            self.assertEqual(remote_containers.frontend(configuration, ["serve", "--config", "/run/plan.json"]), 0)
+        plan.assert_not_called()
+        self.assertEqual(server.call_args.args[0][-3:], ["serve", "--config", "/run/plan.json"])
+
+    def test_plan_preparation_publishes_only_after_success_and_always_retires_mpi(self):
+        """Failure/cancellation cannot distribute an incomplete apply document."""
+        for error in (None, subprocess.CalledProcessError(1, ["plan"]), InterruptedError("cancelled")):
+            with self.subTest(error=error):
+                configuration = {"controller": "owned-controller", "frontend": "plan-apply",
+                    "host_model": "/models/source.gguf", "container_model": "/models/runtime.gguf",
+                    "plan_args": ["plan", "--output", "/run/plan.json"], "key": "/key",
+                    "workspace": "/owned", "peers": [{"public_ip": "20.0.0.1", "directory": "/peer-1"},
+                                                       {"public_ip": "20.0.0.2", "directory": "/peer-2"}]}
+                with patch.object(remote_containers.subprocess, "run", side_effect=error) as plan, \
+                     patch.object(remote_containers, "execute") as execute:
+                    if error is None:
+                        self.assertEqual(remote_containers.prepare_plan(configuration), 0)
+                    else:
+                        with self.assertRaises(type(error)):
+                            remote_containers.prepare_plan(configuration)
+                self.assertEqual(plan.call_args.args[0][-3:], ["plan", "--output", "/run/plan.json"])
+                copies = [call for call in execute.call_args_list if call.args[0][0] == "scp"]
+                self.assertEqual(len(copies), 2 if error is None else 0)
+                self.assertEqual(execute.call_args.args[0], ["docker", "exec", "owned-controller", "python3",
+                    remote_containers.CONTROL, "stop", remote_containers.CONFIG])
+
+    def test_auto_serve_cannot_request_a_separate_plan_job(self):
+        with patch.object(remote_containers.subprocess, "run") as plan:
+            with self.assertRaises(ValueError):
+                remote_containers.prepare_plan({"frontend": "auto-serve"})
+        plan.assert_not_called()
+
+    def test_container_fleet_encloses_mpi_and_retires_every_acquired_owner(self):
+        for backend in ("cuda", "rocm"):
+            for count in (1, 2):
+                for fail_start in (False, True):
+                    with self.subTest(backend=backend, count=count, fail_start=fail_start), \
+                         tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        hosts = [{"public_ip": f"20.0.0.{i + 1}", "private_ip": f"10.1.0.{i + 2}",
+                                  "runtime_image": "sha256:remote-fixture"}
+                                 for i in range(count)]
+                        acquired, retired, creates = [], [], []
+
+                        def execute(command, **kwargs):
+                            if command[0] == "ssh":
+                                command = shlex.split(command[-1])
+                            if command[:4] == ["ip", "-j", "-4", "address"]:
+                                return json.dumps([{"ifname": f"nic{i}", "flags": ["UP"],
+                                    "addr_info": [{"family": "inet", "local": f"10.1.0.{i}"}]}
+                                    for i in range(1, 4)])
+                            if command[:2] == ["docker", "create"]:
+                                creates.append(command)
+                                acquired.append(command[command.index("--name") + 1])
+                            if command[:2] == ["docker", "start"] and fail_start and len(acquired) == 2:
+                                raise subprocess.CalledProcessError(1, command)
+                            if command[:2] == ["docker", "rm"]:
+                                retired.append(command[-1])
+                            return ""
+
+                        with patch.object(remote_containers, "execute", side_effect=execute), \
+                             patch.object(docker_paths, "device_args", return_value=["--network", "host"]) as devices, \
+                             patch.object(docker_paths, "containing_container", return_value={"Id": "controller-ns"}), \
+                             patch.object(docker_paths, "host_path", side_effect=str):
+                            def launch():
+                                with remote_containers.container_fleet(image="sha256:fixture", hosts=hosts,
+                                        key=root / "key", workspace=root / "launch", artifact=root / "evidence",
+                                        model_dir=root / "models", model_name="fixture.gguf", frontend_mode="auto-serve",
+                                        plan_args=[], backend=backend, controller_address="10.1.0.1",
+                                        continuation_devices=1) as launcher:
+                                    self.assertEqual(subprocess.run(["sh", "-n", str(launcher)]).returncode, 0)
+                                    config = json.loads((launcher.parent / "fleet.json").read_text())
+                                    self.assertEqual(len(config["peers"]), count)
+                                    self.assertEqual(len((launcher.parent / "hosts").read_text().splitlines()), count + 1)
+                                    self.assertEqual((launcher.parent / "mpi.conf").read_text(),
+                                        "oob_tcp_if_include=nic1\nbtl_tcp_if_include=nic1\n")
+                                    for index in range(count):
+                                        self.assertEqual((launcher.parent / f"mpi-peer-{index+1}.conf").read_text(),
+                                            f"oob_tcp_if_include=nic{index+2}\nbtl_tcp_if_include=nic{index+2}\n")
+                            if fail_start:
+                                with self.assertRaises(subprocess.CalledProcessError):
+                                    launch()
+                            else:
+                                launch()
+                            devices.assert_called_once_with("sha256:fixture", {"cuda": "CUDA", "rocm": "ROCm"}[backend])
+                        self.assertEqual(retired, list(reversed(acquired)))
+                        for index, command in enumerate(creates):
+                            self.assertEqual(command[-3:], ["/bin/sleep",
+                                "sha256:fixture" if index == 0 else "sha256:remote-fixture", "infinity"])
+                        self.assertIn("container:controller-ns", creates[0])
+                        visibility = "CUDA_VISIBLE_DEVICES=0" if backend == "cuda" else "ROCR_VISIBLE_DEVICES=0"
+                        self.assertIn(visibility, creates[0])
+                        for command in creates[1:]:
+                            self.assertNotIn(visibility, command)
+
+    def test_mpi_daemon_runs_inside_the_declared_peer_image(self):
+        peer = {"mpi_ip": "10.1.0.2", "public_ip": "20.0.0.1", "container": "owned-peer"}
+        with patch.object(remote_containers.os, "execvp") as launch:
+            remote_containers.daemon({"peers": [peer]}, ["10.1.0.2", "orted -mca ess env"])
+        self.assertEqual(shlex.split(launch.call_args.args[1][-1]),
+            ["docker", "exec", "owned-peer", "/bin/sh", "-c", "orted -mca ess env"])
+        with self.assertRaisesRegex(ValueError, "outside the admitted"):
+            remote_containers.daemon({"peers": [peer]}, ["10.1.0.3", "orted"])
+
+    def test_cloud_controller_environment_never_reaches_inference(self):
+        self.assertEqual(remote_containers.runtime_environment({
+            "LLAMINAR_PERF_STATS_JSON": "rank-{rank}.json", "LLAMINAR_ENABLE_PERF_STATS": "1",
+            "LLAMINAR_AZURE_AUTH_TOKEN": "secret", "LLAMINAR_AZURE_SSH_PRIVATE_KEY": "private-path",
+            "AZURE_CLIENT_SECRET": "secret", "PATH": "/bin"}),
+            {"LLAMINAR_PERF_STATS_JSON": "rank-{rank}.json", "LLAMINAR_ENABLE_PERF_STATS": "1"})
+
+    def test_image_import_authenticates_content_across_docker_stores(self):
+        source = {"Id": "sha256:source", "Config": {"Env": ["POLICY=correct"], "User": "llaminar"},
+                  "RootFS": {"Type": "layers", "Layers": ["sha256:layer1", "sha256:layer2"]},
+                  "Architecture": "amd64", "Os": "linux"}
+        for corruption in (None, "layer", "order", "config", "architecture"):
+            remote = json.loads(json.dumps(source))
+            remote["Id"] = "sha256:containerd-manifest"
+            remote["Config"]["Entrypoint"] = None
+            if corruption == "layer": remote["RootFS"]["Layers"][0] = "sha256:foreign"
+            if corruption == "order": remote["RootFS"]["Layers"].reverse()
+            if corruption == "config": remote["Config"]["Env"] = ["POLICY=wrong"]
+            if corruption == "architecture": remote["Architecture"] = "arm64"
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as temp:
+                commands = []
+                def local(command, **kwargs):
+                    commands.append(command)
+                    return json.dumps([source]) if command[:3] == ["docker", "image", "inspect"] else ""
+                with patch.object(remote_e2e, "run", side_effect=local), \
+                     patch.object(remote_e2e, "cached_runtime_image", return_value=None), \
+                     patch.object(remote_e2e, "import_runtime_archives") as import_archives, \
+                     patch.object(remote_e2e, "ssh", return_value=json.dumps([remote])), \
+                     patch.object(remote_e2e, "upload_artifact"), \
+                     patch.object(remote_e2e, "distribute"), \
+                     patch.object(remote_e2e, "image_identity", return_value={"id": source["Id"]}):
+                    if corruption:
+                        with self.assertRaisesRegex(ValueError, "different runtime"):
+                            remote_e2e.stage_image(source["Id"], [{"public_ip": "peer"}], Path("/key"), Path(temp))
+                    else:
+                        self.assertEqual(remote_e2e.stage_image(source["Id"], [{"public_ip": "peer"}], Path("/key"), Path(temp)),
+                                         {"peer": remote["Id"]})
+                        self.assertTrue((Path(temp) / "runtime-import.json").is_file())
+                tag = next(command[-1] for command in commands if command[:2] == ["docker", "tag"])
+                self.assertIn(["docker", "save", "-o", str(Path(temp) / "runtime-image.tar"), tag], commands)
+                self.assertEqual(commands[-1], ["docker", "image", "rm", tag])
+                import_archives.assert_called_once_with(
+                    [{"public_ip": "peer"}], Path("/key"), Path(temp))
+
+    def test_full_runtime_cache_requires_exact_content_and_avoids_export_and_import(self):
+        source = {"Id": "sha256:source", "Config": {"Env": ["POLICY=correct"]},
+                  "RootFS": {"Type": "layers", "Layers": ["sha256:layer"]},
+                  "Architecture": "amd64", "Os": "linux"}
+        remote = {**source, "Id": "sha256:daemon-local"}
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(remote_e2e, "run", return_value=json.dumps([source])) as local, \
+             patch.object(remote_e2e, "ssh", side_effect=[remote["Id"] + "\n", json.dumps([remote])]) as commands, \
+             patch.object(remote_e2e, "distribute") as transfer:
+            self.assertEqual(remote_e2e.stage_image(source["Id"], [{"public_ip": "peer"}], Path("/key"), Path(temp)),
+                             {"peer": remote["Id"]})
+            transfer.assert_not_called()
+            local.assert_called_once_with(["docker", "image", "inspect", source["Id"]])
+            self.assertEqual(len(commands.call_args_list), 2)
+            receipt = json.loads((Path(temp) / "runtime-import.json").read_text())
+            self.assertEqual(receipt["cached_hosts"], ["peer"])
+        remote["Config"] = {"Env": ["POLICY=wrong"]}
+        with patch.object(remote_e2e, "ssh", side_effect=[remote["Id"] + "\n", json.dumps([remote])]):
+            self.assertIsNone(remote_e2e.cached_runtime_image("peer", Path("/key"), artifacts.runtime_image_content(source)))
+        with patch.object(remote_e2e, "ssh", side_effect=[remote["Id"] + "\n", "[]"]):
+            with self.assertRaisesRegex(ValueError, "requested identities"):
+                remote_e2e.cached_runtime_image("peer", Path("/key"), artifacts.runtime_image_content(source))
+
+    def test_retained_archive_is_outside_boot_cleaned_temporary_and_model_directories(self):
+        archive = Path(remote_e2e.REMOTE_IMAGE_ARCHIVE)
+        self.assertTrue(archive.is_relative_to("/home/llaminar/.cache/llaminar-cross-host"))
+        self.assertFalse(archive.is_relative_to("/tmp"))
+        self.assertFalse(archive.is_relative_to("/opt/llaminar-models"))
+
+    def test_model_staging_checks_complete_shards_and_duplicate_basenames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "one.gguf"
+            source.write_text("fixture")
+            parent = {"model_files": [str(source)]}
+            (root / "stage").mkdir()
+            staged = remote_e2e.stage_models([parent], [], root / "unused-key", root / "stage")
+            self.assertFalse((staged / source.name).is_symlink())
+            self.assertEqual((staged / source.name).read_text(), source.read_text())
+            self.assertIs(remote_e2e.stage_models([parent], [], root / "unused-key", root / "stage",
+                                                  model_dir=staged), staged)
+            peers = [{"public_ip": "peer", "private_ip": "10.1.0.2"}]
+            with patch.object(remote_e2e, "ssh"), patch.object(remote_e2e, "distribute") as distribute:
+                remote_e2e.stage_models([parent], peers, root / "unused-key", root / "stage", model_dir=staged)
+            self.assertEqual(distribute.call_args.args[:3],
+                (staged / source.name, "/opt/llaminar-models/one.gguf", peers))
+            other = root / "other" / source.name
+            other.parent.mkdir()
+            other.write_text("different")
+            (root / "stage2").mkdir()
+            with self.assertRaises(ValueError):
+                remote_e2e.stage_models([{"model_files": [str(source), str(other)]}], [], root / "unused-key", root / "stage2")
+
+    def test_remote_runtime_probe_uses_fresh_authenticated_connection(self):
+        with patch.object(remote_e2e, "ssh", return_value="") as probe:
+            remote_e2e.wait_remote_runtime("203.0.113.10", Path("/tmp/key"), timeout=1)
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[:2], ("203.0.113.10", Path("/tmp/key")))
+
+    def test_loader_consumes_the_canonical_projection_shape(self):
+        full = full_manifest()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        projected = pipeline.cross_host_e2e_projection(full, "revision")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cross-host.json"
+            artifacts.write_json(path, projected)
+            loaded = remote_e2e.load_manifest(path, "revision")
+            self.assertEqual(loaded["cells"][0]["configuration"]["model"],
+                             full["cells"][0]["configuration"]["model"])
+
+class RemoteImageImportTests(unittest.TestCase):
+    """Prove concurrent launch and bounded cleanup without Docker, SSH or devices."""
+
+    def test_all_peers_launch_before_polling_and_every_client_is_joined(self):
+        processes = [Mock(pid=1001), Mock(pid=1002)]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(remote_e2e.subprocess, "Popen", side_effect=processes) as launch, \
+             patch.object(remote_e2e.os, "killpg") as kill:
+            def complete():
+                self.assertEqual(launch.call_count, 2, "imports must not serialize across peers")
+                return 0
+            for process in processes:
+                process.poll.side_effect = complete
+            remote_e2e.import_runtime_archives(
+                [{"public_ip": "peer-a"}, {"public_ip": "peer-b"}], Path("/key"), Path(temp))
+            kill.assert_not_called()
+            for process in processes:
+                process.wait.assert_called_once_with(timeout=5)
+            for call in launch.call_args_list:
+                self.assertTrue(call.kwargs["start_new_session"])
+                self.assertTrue(call.kwargs["stdout"].closed)
+                self.assertEqual(shlex.split(call.args[0][-1]),
+                                 ["docker", "load", "--input", remote_e2e.REMOTE_IMAGE_ARCHIVE])
+
+    def test_failure_deadline_and_cancellation_retire_other_imports(self):
+        for reason, expected in (("failure", RuntimeError), ("deadline", TimeoutError),
+                                 ("cancel", InterruptedError), ("spawn", OSError)):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as temp:
+                processes = [Mock(pid=1001), Mock(pid=1002)]
+                for process in processes:
+                    process.poll.return_value = None
+                if reason == "failure":
+                    processes[0].poll.return_value = 7
+                events = []
+                def kill(pid, signum):
+                    events.append(("signal", pid, signum))
+                    processes[pid - 1001].poll.return_value = -signum
+                for process in processes:
+                    process.wait.side_effect = lambda timeout, pid=process.pid: events.append(("join", pid))
+                spawns = [processes[0], OSError("spawn failed")] if reason == "spawn" else processes
+                with patch.object(remote_e2e.subprocess, "Popen", side_effect=spawns) as launch, \
+                     patch.object(remote_e2e.os, "killpg", side_effect=kill), \
+                     patch.object(remote_e2e.time, "monotonic", side_effect=[0, 2]), \
+                     patch.object(remote_e2e.time, "sleep", side_effect=InterruptedError("cancelled")):
+                    with self.assertRaises(expected):
+                        remote_e2e.import_runtime_archives(
+                            [{"public_ip": "peer-a"}, {"public_ip": "peer-b"}],
+                            Path("/key"), Path(temp), timeout=1 if reason == "deadline" else 600)
+                expected_owned = processes[:1] if reason == "spawn" else processes
+                for process in expected_owned:
+                    process.wait.assert_called_once_with(timeout=5)
+                signals = [index for index, event in enumerate(events) if event[0] == "signal"]
+                joins = [index for index, event in enumerate(events) if event[0] == "join"]
+                self.assertLess(max(signals), min(joins), "signal every live peer before waiting")
+                for call in launch.call_args_list:
+                    self.assertTrue(call.kwargs["stdout"].closed)
+
+    def test_client_ignoring_termination_is_killed_and_joined(self):
+        process = Mock(pid=1001)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("owned ssh", 5), 0]
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(remote_e2e.subprocess, "Popen", return_value=process), \
+             patch.object(remote_e2e.os, "killpg") as kill, \
+             patch.object(remote_e2e.time, "sleep", side_effect=InterruptedError("cancelled")):
+            with self.assertRaises(InterruptedError):
+                remote_e2e.import_runtime_archives([{"public_ip": "peer"}], Path("/key"), Path(temp))
+        self.assertEqual([call.args for call in kill.call_args_list],
+                         [(1001, signal.SIGTERM), (1001, signal.SIGKILL)])
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_duplicate_or_ambiguous_peers_and_invalid_deadlines_fail_before_launch(self):
+        for peers, timeout in (([], 600), (["same", "same"], 600),
+                               (["a/b", "a?b"], 600), (["peer"], 0), (["peer"], 601)):
+            with self.subTest(peers=peers, timeout=timeout), \
+                 patch.object(remote_e2e.subprocess, "Popen") as launch:
+                with self.assertRaises(ValueError):
+                    remote_e2e.import_runtime_archives(
+                        [{"public_ip": peer} for peer in peers], Path("/key"), Path("/unused"), timeout)
+                launch.assert_not_called()
+
+    def test_unreaped_client_does_not_prevent_joining_other_owned_clients(self):
+        processes = [Mock(pid=1001), Mock(pid=1002)]
+        for process in processes:
+            process.poll.return_value = None
+        processes[0].wait.side_effect = subprocess.TimeoutExpired("owned ssh", 5)
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(remote_e2e.subprocess, "Popen", side_effect=processes) as launch, \
+             patch.object(remote_e2e.os, "killpg") as kill, \
+             patch.object(remote_e2e.time, "sleep", side_effect=InterruptedError("cancelled")):
+            with self.assertRaisesRegex(RuntimeError, "client retirement failed"):
+                remote_e2e.import_runtime_archives(
+                    [{"public_ip": "peer-a"}, {"public_ip": "peer-b"}], Path("/key"), Path(temp))
+        self.assertEqual(processes[0].wait.call_count, 2)
+        processes[1].wait.assert_called_once_with(timeout=5)
+        self.assertIn((1002, signal.SIGTERM), [call.args for call in kill.call_args_list])
+        self.assertTrue(all(call.kwargs["stdout"].closed for call in launch.call_args_list))
+
+
+class CrossHostArtifactTests(unittest.TestCase):
+    """Exercise real streaming/retirement locally; mock only the Azure SSH hop."""
+
+    @staticmethod
+    def local_command(peer, key, arguments):
+        """Run the exact peer helper without a device, image, SSH key or VM."""
+        return [sys.executable, "-u", str(Path(remote_artifacts.__file__)), *arguments]
+
+    def test_concurrent_private_reads_and_owner_close(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from urllib.error import HTTPError, URLError
+        from urllib.request import urlopen
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            payload = bytes(range(256)) * 4096 + b"final unequal chunk"
+            source.write_bytes(payload)
+            peer = {"private_ip": "127.0.0.1"}
+            with patch.object(remote_artifacts, "remote_command", side_effect=self.local_command):
+                with remote_artifacts.private_source(peer, root / "unused-key", str(source),
+                                                    [peer], len(payload)) as endpoint:
+                    with self.assertRaises(HTTPError) as error:
+                        urlopen(endpoint.url, timeout=1)
+                    self.assertEqual(error.exception.code, 403)
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        list(pool.map(lambda index: remote_artifacts.fetch(endpoint, root / f"copy-{index}"), range(3)))
+                    for index in range(3):
+                        self.assertEqual((root / f"copy-{index}").read_bytes(), payload)
+                    self.assertFalse(list(root.glob("*.partial-*")))
+                with self.assertRaises(URLError):
+                    urlopen(endpoint.url, timeout=1)
+
+    def test_receiver_failure_retires_source_and_preserves_existing_destination(self):
+        from urllib.error import URLError
+        from urllib.request import urlopen
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"admitted input")
+            destination.write_bytes(b"unrelated existing data")
+            peer = {"private_ip": "127.0.0.1"}
+            with patch.object(remote_artifacts, "remote_command", side_effect=self.local_command):
+                with self.assertRaises(FileExistsError):
+                    with remote_artifacts.private_source(peer, root / "key", str(source),
+                                                        [peer], source.stat().st_size) as endpoint:
+                        remote_artifacts.fetch(endpoint, destination)
+                self.assertEqual(destination.read_bytes(), b"unrelated existing data")
+                with self.assertRaises(URLError):
+                    urlopen(endpoint.url, timeout=1)
+
+    def test_incomplete_transfer_never_publishes_a_model(self):
+        import io
+        from unittest.mock import MagicMock
+        for declared in ("3", "16"):
+            with self.subTest(content_length=declared), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                endpoint = remote_artifacts.ArtifactEndpoint("http://private/artifact", "token", 16)
+                response = io.BytesIO(b"abc")
+                response.status = 200
+                response.geturl = lambda: endpoint.url
+                response.headers = {"Content-Length": declared}
+                opener = MagicMock()
+                opener.open.return_value = response
+                with patch.object(remote_artifacts, "build_opener", return_value=opener), \
+                     self.assertRaisesRegex(ValueError, "byte count|complete input"):
+                    remote_artifacts.fetch(endpoint, root / "model.gguf")
+                self.assertEqual(list(root.iterdir()), [])
+
+    def test_distribution_crosses_wan_once_for_arbitrary_peer_count(self):
+        from unittest.mock import Mock
+        for count in (1, 2, 4):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "model.gguf"
+                source.write_bytes(b"same complete input")
+                peers = [{"name": f"cpu-{i}", "public_ip": f"203.0.113.{i+1}", "private_ip": f"10.1.0.{i+1}"}
+                         for i in range(count)]
+                upload = Mock()
+                retired = []
+                @contextmanager
+                def private_source(*args):
+                    try:
+                        self.assertEqual(args[0], peers[0])
+                        self.assertEqual(args[3], peers[1:])
+                        yield remote_artifacts.ArtifactEndpoint("http://private/artifact", "token", source.stat().st_size)
+                    finally:
+                        retired.append(True)
+                with patch.object(remote_artifacts, "private_source", side_effect=private_source), \
+                     patch.object(remote_artifacts, "remote_command", return_value=["mock-fetch"]), \
+                     patch.object(remote_artifacts, "remote_stamp", side_effect=[None] * count +
+                                  [remote_artifacts.file_stamp(source)]), \
+                     patch.object(remote_artifacts.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 0, "")) as fetch:
+                    remote_artifacts.distribute(source, "/opt/models/model.gguf", peers, root / "key", upload)
+                upload.assert_called_once_with(peers[0]["public_ip"], root / "key", source, "/opt/models/model.gguf")
+                self.assertEqual(fetch.call_count, count - 1)
+                self.assertEqual(retired, [True] if count > 1 else [])
+
+    def test_unchanged_owned_replicas_require_no_transfer(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "model.gguf"
+            source.write_bytes(b"stable input")
+            peers = [{"name": f"cpu-{i}", "public_ip": f"203.0.113.{i+1}", "private_ip": f"10.1.0.{i+1}"}
+                     for i in range(2)]
+            upload = Mock()
+            with patch.object(remote_artifacts, "remote_stamp", return_value=remote_artifacts.file_stamp(source)), \
+                 patch.object(remote_artifacts, "private_source") as transfer:
+                remote_artifacts.distribute(source, "/opt/models/model.gguf", peers, Path("/key"), upload)
+            upload.assert_not_called()
+            transfer.assert_not_called()
+
+    def test_owned_replacement_is_atomic_and_preserves_source_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, destination = root / "source", root / "destination"
+            source.write_bytes(b"new exact input")
+            destination.write_bytes(b"previous owned cache")
+            previous = remote_artifacts.file_stamp(destination)
+            peer = {"private_ip": "127.0.0.1"}
+            with patch.object(remote_artifacts, "remote_command", side_effect=self.local_command):
+                with remote_artifacts.private_source(peer, root / "key", str(source), [peer], source.stat().st_size) as endpoint:
+                    remote_artifacts.fetch(endpoint, destination, replacing=previous,
+                                           mtime_ns=source.stat().st_mtime_ns)
+                    with self.assertRaises(FileExistsError):
+                        remote_artifacts.fetch(endpoint, destination, replacing=previous)
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertEqual(remote_artifacts.file_stamp(destination), remote_artifacts.file_stamp(source))
+            self.assertFalse(list(root.glob("*.partial-*")))
+
+    def test_owned_cache_rejects_symlinks_even_when_target_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.write_bytes(b"input")
+            link = root / "link"
+            link.symlink_to(source)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                remote_artifacts.file_stamp(link)
+
+    def test_incremental_upload_preserves_times_without_inplace_or_hash_gate(self):
+        with patch.object(remote_e2e, "run", return_value="transfer evidence") as upload:
+            remote_e2e.upload_artifact("20.0.0.1", Path("/keys/private"), Path("/source/model"), "/opt/models/model")
+        argv = upload.call_args.args[0]
+        self.assertEqual(argv[0], "rsync")
+        self.assertIn("--times", argv)
+        self.assertIn("--modify-window=-1", argv)
+        self.assertNotIn("--inplace", argv)
+        self.assertNotIn("--checksum", argv)
+
+    def test_distribution_rejects_nonprivate_or_duplicate_peers_before_upload(self):
+        from unittest.mock import Mock
+        for addresses in (("8.8.8.8",), ("127.0.0.1",), ("0.0.0.0",), ("10.1.0.1", "10.1.0.1")):
+            with self.subTest(addresses=addresses), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "model.gguf"
+                source.write_bytes(b"payload")
+                peers = [{"public_ip": f"203.0.113.{i+1}", "private_ip": address}
+                         for i, address in enumerate(addresses)]
+                upload = Mock()
+                with self.assertRaisesRegex(ValueError, "distinct private"):
+                    remote_artifacts.distribute(source, "/opt/models/model.gguf", peers, Path("/key"), upload)
+                upload.assert_not_called()
+
+
 class CertificateTests(unittest.TestCase):
     def test_certificate_layer_cannot_hide_a_runtime_overwrite(self):
         pipeline.validate_certificate_changes("C /usr/local/share\nA /usr/local/share/llaminar/certificates/production.json\n")
@@ -904,22 +2779,22 @@ class CertificateTests(unittest.TestCase):
                 pipeline.validate_certificate_changes(invalid)
 
     def setUp(self):
+        install_corpus_io_fixture(self, mock_stat=True)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name)
         self.source = {"revision": "revision", "tree": "tree", "dirty": False}
-        self.images = {"runtime": {"id": "runtime-id", "labels": {"org.llaminar.cpu_isa": "AVX512"}},
-                       "builder": {"id": "builder-id"}}
+        self.images = image_pair(self.source)
         self.documents = {
             "manifest": manifest(),
-            "parity": {"correctness_passed": True, "performance_requirements_met": True,
-                       "artifact_contract_passed": True, "preflight_return_code": 0,
-                       "preflight_tests": ["V2_Unit_A", "V2_Integration_B"],
-                       "preflight_test_count": 2, "exact_matrix_cell_count": 1},
+            "all-cells": full_manifest(),
+            "prerequisites/prerequisites": prerequisite_report(),
+            "generation/report": generation_report(),
             "e2e": e2e_report(),
             "benchmarks": {"passed": True, "complete": True, "image": "runtime-id",
                            "diagnostic": False, "e2e_report_digest": artifacts.digest(e2e_report()),
                            "manifest_digest": artifacts.digest(manifest()), "cells": [{"case": "cell"}]}}
+        self.documents.update(non_remote_documents(self.documents["all-cells"]))
 
     def write(self):
         for name, document in self.documents.items():
@@ -927,16 +2802,97 @@ class CertificateTests(unittest.TestCase):
 
     def test_exact_complete_evidence_can_certify(self):
         self.write()
-        result = pipeline.certificates(self.source, self.images, self.path)
+        result = pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
         self.assertTrue(result["certified"])
         self.assertEqual(result["tested_image"], "runtime-id")
+        self.assertEqual(result["inventory_digest"], artifacts.digest(full_manifest()))
+        self.assertEqual(result["generation"]["exact_cells"], 2)
+        self.assertIsNone(result["diagnostic_mathematical_parity"])
+
+    def test_cross_host_report_requires_exact_routes_transport_and_retirement(self):
+        """Remote certification is an E2E proof, not an empty cloud receipt."""
+        full = full_manifest()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        remote = pipeline.cross_host_e2e_projection(full, self.source["revision"])
+        image = self.images["runtime"]["id"]
+        expected = [scenario for scenario in remote_cases()]
+        report = {"schema": 1, "eligible": True, "complete": True,
+                  "source_revision": self.source["revision"], "image": image,
+                  "manifest_digest": artifacts.digest(remote), "all_resources_retired": True,
+                  "scenarios": [{"id": scenario["id"], "frontend": scenario["frontend"],
+                                 "topology": scenario["topology"], "return_code": 0,
+                                 "outcome": "passed", "resource_retired": True,
+                                 "transport_proof": True, "http_proof": True}
+                                for scenario in expected]}
+        pipeline.validate_cross_host_report(report, remote, image, self.source["revision"])
+        for field, value in (("all_resources_retired", False), ("transport_proof", False),
+                             ("http_proof", False), ("return_code", 1), ("outcome", "failed")):
+            bad = copy.deepcopy(report)
+            (bad if field == "all_resources_retired" else bad["scenarios"][0])[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                pipeline.validate_cross_host_report(bad, remote, image, self.source["revision"])
+
+    def test_pipeline_owned_cross_host_manifest_requires_a_report(self):
+        """A build receipt cannot silently skip the phase before benchmarks."""
+        full = full_manifest()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        remote = pipeline.cross_host_e2e_projection(full, self.source["revision"])
+        self.documents["all-cells"] = full
+        self.documents["manifest"] = pipeline.e2e_projection(full, self.source["revision"])
+        self.documents.pop("cross-host-e2e")
+        self.write()
+        artifacts.write_json(self.path / "cross-host-manifest.json", remote)
+        with self.assertRaisesRegex(ValueError, "no evidence report"):
+            pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
+
+    def test_missing_remote_manifest_cannot_erase_declared_remote_obligations(self):
+        full = full_manifest()
+        full["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        self.documents["all-cells"] = full
+        self.documents["manifest"] = pipeline.e2e_projection(full, self.source["revision"])
+        self.documents.pop("cross-host-manifest")
+        self.documents.pop("cross-host-e2e")
+        self.write()
+        with self.assertRaisesRegex(ValueError, "no canonical manifest"):
+            pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
+
+    def test_tagged_projection_cannot_replace_or_differ_from_full_inventory(self):
+        """Even internally consistent E2E results need their full-inventory parent."""
+        original = copy.deepcopy(self.documents)
+        for index, mutate in enumerate((
+                lambda d: d.update({"all-cells": manifest()}),
+                lambda d: d["all-cells"]["cells"][0]["configuration"]["e2e"].update(context_length=4096),
+                lambda d: d["manifest"]["cells"].append(cell("extra")),
+                lambda d: d["generation/report"].update(selected=1),
+                lambda d: d["generation/report"].update(selected=True))):
+            self.documents = copy.deepcopy(original)
+            mutate(self.documents)
+            self.write()
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
+
+    def test_numerical_membership_cannot_be_replaced_by_counts_or_another_selection(self):
+        """A green summary/count cannot hide a missing or failed exact member."""
+        original = parity_report()
+        for index, mutate in enumerate((
+                lambda p: p.pop("campaigns"), lambda p: p.update(campaigns=[]),
+                lambda p: p["campaigns"][0].update(gtest_cases=["cell", "cell"]),
+                lambda p: p["campaigns"][0].update(gtest_cases=["cell", "different"]),
+                lambda p: p["campaigns"][0].update(campaign="different"),
+                lambda p: p["campaigns"][0].update(return_code=1),
+                lambda p: p["campaigns"][0].update(outcome="cancelled"),
+                lambda p: p["campaigns"][0].update(artifact_contract_passed=False))):
+            changed = copy.deepcopy(original)
+            mutate(changed)
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pipeline.validate_parity(changed, full_manifest()["cells"])
 
     def test_every_missing_report_blocks_certification(self):
         for name in self.documents:
             self.write()
             (self.path / f"{name}.json").unlink()
-            with self.subTest(name=name), self.assertRaises(OSError):
-                pipeline.certificates(self.source, self.images, self.path)
+            with self.subTest(name=name), self.assertRaises((OSError, ValueError)):
+                pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
 
     def test_regression_subset_wrong_image_or_stale_manifest_cannot_certify(self):
         original = copy.deepcopy(self.documents)
@@ -947,23 +2903,23 @@ class CertificateTests(unittest.TestCase):
             self.documents["benchmarks"].update(bad)
             self.write()
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                pipeline.certificates(self.source, self.images, self.path)
+                pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
 
     def test_exit_zero_e2e_with_changed_configuration_is_rejected(self):
         self.documents["e2e"]["cells"][0]["configuration"]["e2e"]["server_args"] = []
         self.write()
         with self.assertRaises(ValueError):
-            pipeline.certificates(self.source, self.images, self.path)
+            pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
 
-    def test_missing_unit_preflight_or_economy_never_certifies(self):
+    def test_missing_unit_preflight_never_certifies(self):
         original = copy.deepcopy(self.documents)
         for bad in ({"preflight_tests": []}, {"preflight_test_count": 0},
-                    {"preflight_return_code": 1}, {"performance_requirements_met": False}):
+                    {"preflight_return_code": 1}):
             self.documents = copy.deepcopy(original)
-            self.documents["parity"].update(bad)
+            self.documents["prerequisites/prerequisites"].update(bad)
             self.write()
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                pipeline.certificates(self.source, self.images, self.path)
+                pipeline.certificates(self.source, self.images, self.path, cpu_isa="AVX512")
 
     def test_local_and_dirty_runs_cannot_publish_or_commit(self):
         with patch.dict(pipeline.os.environ, {}, clear=True), patch.object(pipeline.subprocess, "check_output") as execute:
@@ -974,14 +2930,104 @@ class CertificateTests(unittest.TestCase):
     def test_image_requires_release_both_backends_correct_tree_and_isa(self):
         labels = {"org.opencontainers.image.revision": "revision", "org.llaminar.source_tree": "tree",
                   "org.llaminar.build_type": "Release", "org.llaminar.cpu_isa": "AVX512",
-                  "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON"}
-        pipeline.require_full_runtime({"labels": labels}, self.source, "AVX512")
+                  "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON", "org.llaminar.image_role": "runtime"}
+        pipeline.require_image({"labels": labels}, self.source, "AVX512", pipeline.ImageRole.RUNTIME)
         for field in labels:
             with self.subTest(field=field), self.assertRaises(ValueError):
-                pipeline.require_full_runtime({"labels": {**labels, field: "wrong"}}, self.source, "AVX512")
+                pipeline.require_image({"labels": {**labels, field: "wrong"}}, self.source,
+                                       "AVX512", pipeline.ImageRole.RUNTIME)
+
+    def test_builder_identity_is_required_before_certifying_complete_reports(self):
+        """A matching runtime cannot excuse a stale or untested builder image."""
+        self.write()
+        for key in self.images["builder"]["labels"]:
+            changed = copy.deepcopy(self.images)
+            changed["builder"]["labels"][key] = "wrong"
+            with self.subTest(label=key), self.assertRaises(ValueError):
+                pipeline.certificates(self.source, changed, self.path, cpu_isa="AVX512")
+        # The caller's shipping slot remains authority even if both images
+        # consistently advertise the other ISA.
+        with self.assertRaises(ValueError):
+            pipeline.certificates(self.source, image_pair(self.source, "AVX2"), self.path, cpu_isa="AVX512")
+
+
+class ImageIdentityTests(unittest.TestCase):
+    """Expected source/ISA/role comes from admission, not the inspected image."""
+
+    def test_docker_roles_export_the_actual_build_arguments(self):
+        """Guard producer metadata; runtime image admission tests its consumers."""
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        builder, runtime = dockerfile.split("FROM toolchain AS builder", 1)[1].split(
+            "FROM ubuntu:24.04 AS runtime", 1)
+        fields = {
+            "org.opencontainers.image.revision": "VCS_REF",
+            "org.llaminar.source_tree": "LLAMINAR_SOURCE_TREE",
+            "org.llaminar.cpu_isa": "LLAMINAR_CPU_ISA",
+            "org.llaminar.build_type": "LLAMINAR_BUILD_TYPE",
+            "org.llaminar.cuda": "LLAMINAR_ENABLE_CUDA",
+            "org.llaminar.rocm": "LLAMINAR_ENABLE_ROCM",
+        }
+        for role, stage in ((pipeline.ImageRole.BUILDER, builder),
+                            (pipeline.ImageRole.RUNTIME, runtime)):
+            with self.subTest(role=role):
+                self.assertIn(f'org.llaminar.image_role="{role.value}"', stage)
+                for label, argument in fields.items():
+                    self.assertIn(f'{label}="${{{argument}}}"', stage)
+        self.assertIn('org.llaminar.integration_skipped="${LLAMINAR_SKIP_INTEGRATION}"', builder)
+
+    def test_both_shipping_pairs_require_every_declared_build_property(self):
+        """Exercise both roles and both ISAs, including absent identity fields."""
+        source = {"revision": "revision", "tree": "tree", "dirty": False}
+        for isa in pipeline.SHIPPING_ISAS:
+            images = image_pair(source, isa)
+            pipeline.require_image_pair(images, source, isa)
+            for role in pipeline.ImageRole:
+                for key in images[role.value]["labels"]:
+                    for remove in (False, True):
+                        changed = copy.deepcopy(images)
+                        if remove:
+                            changed[role.value]["labels"].pop(key)
+                        else:
+                            changed[role.value]["labels"][key] = "wrong"
+                        with self.subTest(isa=isa, role=role, field=key, remove=remove), self.assertRaises(ValueError):
+                            pipeline.require_image_pair(changed, source, isa)
+        with self.assertRaises(TypeError):
+            pipeline.require_image(images["runtime"], source, isa, "runtime")
+        with self.assertRaises(ValueError):
+            pipeline.require_image_pair(images, source, "native")
+
+    def test_missing_swapped_and_shared_image_roles_are_rejected(self):
+        """Two role names cannot authenticate one image or the opposite sibling."""
+        source = {"revision": "revision", "tree": "tree", "dirty": False}
+        images = image_pair(source)
+        for changed in ({}, {"runtime": images["runtime"]},
+                        {"runtime": images["builder"], "builder": images["runtime"]},
+                        {**images, "extra": images["builder"]},
+                        {**images, "builder": {**images["builder"], "id": images["runtime"]["id"]}}):
+            with self.subTest(roles=list(changed)), self.assertRaises(ValueError):
+                pipeline.require_image_pair(changed, source, "AVX512")
+
+    def test_bad_builder_stops_before_building_runtime(self):
+        """Fail at the first wrong image, rather than paying for a second build."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            args = argparse.Namespace(cpu_isa="AVX512")
+            wrong = image_pair(source, "AVX2")["builder"]
+            with patch.object(pipeline, "run") as execute, \
+                 patch.object(pipeline, "image_identity", return_value=wrong):
+                with self.assertRaisesRegex(ValueError, "builder image"):
+                    pipeline.build(args, source, root)
+            self.assertEqual(execute.call_count, 1)
+            command = execute.call_args.args[0]
+            self.assertEqual(command[command.index("--target") + 1], "builder")
 
 
 class InfrastructureTests(unittest.TestCase):
+    def setUp(self):
+        install_corpus_io_fixture(self, mock_stat=True)
+
     def test_all_isa_e2e_suites_precede_any_benchmark_and_certification(self):
         args = argparse.Namespace(output=Path("reports"), cpu_isas=list(pipeline.SHIPPING_ISAS),
                                   through="certify", image="registry/image:version", resume=False)
@@ -989,7 +3035,7 @@ class InfrastructureTests(unittest.TestCase):
             result = pipeline.drive_variants(args, {})
         self.assertEqual(set(result), set(pipeline.SHIPPING_ISAS))
         order = [(call.args[0].cpu_isa, call.args[0].through) for call in execute.call_args_list]
-        self.assertEqual(order, [(isa, phase.value) for phase in pipeline.Phase for isa in pipeline.SHIPPING_ISAS])
+        self.assertEqual(order, [(isa, phase.value) for phase in pipeline.pipeline_phases() for isa in pipeline.SHIPPING_ISAS])
         for call in execute.call_args_list:
             variant = call.args[0]
             self.assertEqual(variant.output, args.output / variant.cpu_isa.lower())
@@ -1011,7 +3057,7 @@ class InfrastructureTests(unittest.TestCase):
     def test_shipping_requires_both_isas_and_combines_ratchets_without_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            source = {"revision": "revision", "dirty": False}
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
             baseline = {"schema": 1, "entries": {}, "regression_threshold_pct": 10}
             finals = certified_variants(path, source, baseline)
             payloads = pipeline.publication_payloads(source, path, finals, baseline)
@@ -1053,6 +3099,20 @@ class InfrastructureTests(unittest.TestCase):
                 (path / "src/new_implementation.cpp").write_text("// new source\n")
                 self.assertNotEqual(pipeline.source_identity()["tree"], before["tree"])
 
+    def test_builder_installs_the_source_identity_policy(self):
+        """The functional Git-identity fixture must also have its data in Docker.
+
+        This packaging check catches the omitted COPY during the fast native
+        gate; the preceding functional regression executes again in the real
+        installed builder and proves that the input actually arrived there.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        builder = dockerfile.split("FROM toolchain AS builder", 1)[1].split("FROM ubuntu:24.04 AS runtime", 1)[0]
+        inputs = [part for line in builder.splitlines() if line.startswith("COPY ")
+                  for part in shlex.split(line)[1:-1]]
+        for policy in ("Dockerfile", ".dockerignore", ".gitignore"):
+            self.assertIn(policy, inputs)
+
     def test_default_cli_certifies_both_and_keeps_local_publication_disabled(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "results"
@@ -1062,28 +3122,27 @@ class InfrastructureTests(unittest.TestCase):
                  patch.object(pipeline, "run_variant", return_value={"certified": True}) as variants, \
                  patch.object(pipeline, "publish") as publish:
                 self.assertEqual(pipeline.main(["--output", str(output)]), 0)
-            self.assertEqual(variants.call_count, 2 * len(pipeline.Phase))
+            self.assertEqual(variants.call_count, 2 * len(pipeline.pipeline_phases()))
             publish.assert_not_called()
             state = json.loads((output / "pipeline.json").read_text())
             self.assertTrue(state["certified"])
             self.assertTrue(state["shipping_set_complete"])
             self.assertEqual(set(state["variants"]), set(pipeline.SHIPPING_ISAS))
 
-    def test_shared_core_exports_the_cuda_driver_link_contract(self):
-        # Source-policy guard for the driver-free Docker build. cuda_backend's
-        # private whole-archive inclusion does not propagate this SDK dependency.
+    def test_shared_core_defers_cuda_driver_binding(self):
+        # CPU-only cluster members use the same full-backend shared core.
         cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
         public_blocks = re.findall(r"target_link_libraries\(llaminar2_core\s+PUBLIC\s+([^)]*)\)", cmake)
         cuda_contract = [block for block in public_blocks if "CUDA::cudart" in block]
         self.assertEqual(len(cuda_contract), 1)
-        self.assertIn("CUDA::cuda_driver", cuda_contract[0])
+        self.assertNotIn("CUDA::cuda_driver", cmake)
+        self.assertIn("backends/cuda/CUDADriverApi.cpp", cmake)
 
-    def test_driver_stub_is_confined_to_build_time_test_name_discovery(self):
+    def test_driver_stub_is_not_needed_for_build_or_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         directory = "/tmp/llaminar-build-discovery-driver"
-        self.assertIn(f'LD_LIBRARY_PATH="{directory}:${{LD_LIBRARY_PATH}}"', dockerfile)
-        self.assertIn(f"rm {directory}/libcuda.so.1", dockerfile)
-        self.assertIn(f"rmdir {directory}", dockerfile)
+        self.assertNotIn(directory, dockerfile)
+        self.assertNotIn("stubs/libcuda", dockerfile)
         runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1]
         self.assertNotIn(directory, runtime)
         self.assertNotIn("stubs", runtime)
@@ -1168,7 +3227,7 @@ class InfrastructureTests(unittest.TestCase):
             git("push", "origin", "develop")
             result = root / "reports"
             result.mkdir()
-            source = {"revision": revision, "dirty": False}
+            source = {"revision": revision, "tree": git("rev-parse", "HEAD^{tree}"), "dirty": False}
             finals = certified_variants(result, source, base)
             executed = []
             def command(argv, _log, **kwargs):
@@ -1200,7 +3259,7 @@ class InfrastructureTests(unittest.TestCase):
             root = Path(directory)
             base = {"schema": 1, "entries": {}, "regression_threshold_pct": 10}
             artifacts.write_json(root / "benchmarks/production/high_water.json", base)
-            source = {"revision": "revision", "dirty": False}
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
             finals = certified_variants(root, source, base)
             env = {"GITHUB_ACTIONS": "true", "GITHUB_EVENT_NAME": "push",
                    "GITHUB_REF": "refs/heads/develop", "GITHUB_SHA": "revision"}
@@ -1218,7 +3277,7 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "benchmarks/production/high_water.json").read_text()), base)
 
     def test_resume_cannot_skip_a_phase(self):
-        names = [phase.value for phase in pipeline.Phase]
+        names = [phase.value for phase in pipeline.pipeline_phases()]
         for length in range(len(names) + 1):
             pipeline.validate_phase_prefix(dict.fromkeys(names[:length]))
         for impossible in ({"certify": {}}, {"build": {}, "e2e": {}}, {"unknown": {}}):
@@ -1324,15 +3383,50 @@ class InfrastructureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 docker_paths.host_path(ROOT)
 
-    def test_driver_injection_follows_image_linkage_not_only_requested_backend(self):
-        for backend in ("CPU", "ROCm", "CPU+ROCm", "CUDA"):
+    def test_attached_execution_requires_delayed_output_and_exact_exit(self):
+        for outcome in ("complete", "premature", "missing-output", "timeout"):
+            with self.subTest(outcome=outcome):
+                calls = []
+
+                def execute(command, **kwargs):
+                    calls.append(command)
+                    if command[:2] == ["docker", "exec"]:
+                        if outcome == "timeout":
+                            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                        return subprocess.CompletedProcess(command,
+                            0 if outcome == "premature" else 23,
+                            command[-1] + "\n" if outcome == "complete" else "")
+                    return subprocess.CompletedProcess(command, 0)
+
+                with patch.object(docker_paths.subprocess, "run", side_effect=execute):
+                    if outcome == "complete":
+                        docker_paths.validate_attached_execution("image")
+                    else:
+                        expected = subprocess.TimeoutExpired if outcome == "timeout" else RuntimeError
+                        with self.assertRaises(expected):
+                            docker_paths.validate_attached_execution("image")
+                self.assertEqual(calls[-1][:4], ["docker", "rm", "--force", "--volumes"])
+                self.assertEqual(calls[-1][-1], calls[0][3])
+                self.assertIn("--network", calls[0])
+                self.assertEqual(calls[0][calls[0].index("--network") + 1], "host")
+                self.assertEqual(sum(command[:2] == ["docker", "exec"] for command in calls), 1)
+
+    def test_devcontainer_uses_the_direct_mounted_docker_socket(self):
+        configuration = json.loads((ROOT / ".devcontainer/devcontainer.json").read_text())
+        self.assertEqual(configuration["containerEnv"]["DOCKER_HOST"],
+                         "unix:///var/run/docker-host.sock")
+
+    def test_driver_injection_follows_selected_backend_not_image_linkage(self):
+        for backend in ("CPU", "ROCm", "CPU+ROCm", "CUDA", "CPU+CUDA+ROCm"):
             with self.subTest(backend=backend), \
-                 patch.object(docker_paths, "image_identity", return_value={"labels": {"org.llaminar.cuda": "ON"}}), \
                  patch.object(docker_paths, "rocm_device_group_ids", return_value=(992,)), \
                  patch.object(docker_paths.subprocess, "check_output", return_value="--gpus\nall\n") as inject:
                 arguments = docker_paths.device_args("full-image", backend)
-                self.assertIn("--gpus", arguments)
-                self.assertIn("--required", inject.call_args.args[0])
+                self.assertEqual("--gpus" in arguments, "CUDA" in backend)
+                if "CUDA" in backend:
+                    self.assertIn("--required", inject.call_args.args[0])
+                else:
+                    inject.assert_not_called()
                 self.assertEqual("--device=/dev/kfd" in arguments, "ROCm" in backend)
                 self.assertEqual("992" in arguments, "ROCm" in backend)
 
@@ -1370,6 +3464,8 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(docker_paths.daemon_device_metadata("image", "probe script"), "992\n44\n")
         self.assertEqual([command[1] for command in calls], ["create", "start", "wait", "cp", "rm"])
         create = calls[0]
+        self.assertIn("--network", create)
+        self.assertEqual(create[create.index("--network") + 1], "host")
         self.assertIn("type=bind,src=/dev,dst=/host-dev,readonly", create)
         self.assertIn("probe script", create)
         name = create[create.index("--name") + 1]
@@ -1434,15 +3530,32 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("NVIDIA device metadata probe failed", result.stderr)
 
-    def test_backend_subset_image_does_not_require_an_unused_cuda_driver(self):
-        with patch.object(docker_paths, "image_identity", return_value={"labels": {"org.llaminar.cuda": "OFF"}}), \
-             patch.object(docker_paths.subprocess, "check_output") as inject:
+    def test_nvidia_runtime_probe_uses_the_inference_network_mode(self):
+        """GPU admission must not depend on unrelated bridge/iptables setup."""
+        # Simulate a host whose native GPU injection works but whose bridge
+        # creation does not. Run the real shell helper; no source spelling
+        # assertion can prove which Docker command it actually submits.
+        shell = ('docker() { case "$1" in '
+                 'info) printf "{}\\n" ;; '
+                 'run) case " $* " in *" --network host "*) return 0 ;; '
+                 '*) return 1 ;; esac ;; *) return 1 ;; esac; }; '
+                 'python3() { return 9; }; export -f docker python3; '
+                 'exec bash "$1" --probe-image image --required')
+        result = subprocess.run(["bash", "-c", shell, "probe-test",
+                                 str(ROOT / "scripts/ci/docker_gpu_run_args.sh")],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "--gpus\nall\n")
+
+    def test_cpu_rank_requires_no_nvidia_injection(self):
+        with patch.object(docker_paths.subprocess, "check_output") as inject:
             self.assertNotIn("--gpus", docker_paths.device_args("cpu-image", "CPU"))
             inject.assert_not_called()
 
-    def test_server_harness_uses_the_same_image_driver_contract_as_benchmarks(self):
+    def test_server_harness_uses_request_intent_for_driver_injection(self):
         harness = (ROOT / "tests/v2/e2e/server/test_server_e2e.sh").read_text()
-        self.assertIn('--cuda-driver-required "$CONTAINER_IMAGE"', harness)
+        self.assertNotIn('--cuda-driver-required', harness)
+        self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
     def test_workflow_has_one_driver_no_parallel_model_matrix_or_old_ratchet(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

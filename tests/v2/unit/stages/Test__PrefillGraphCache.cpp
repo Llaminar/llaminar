@@ -1,6 +1,10 @@
 /**
  * @file Test__PrefillGraphCache.cpp
  * @brief Unit tests for PrefillGraphCache state machine, preflight, and invalidation
+ *
+ * Device-free fixtures verify cache ownership and the physical prefill ladder.
+ * The compact serving default must chunk long prompts without reducing context;
+ * explicit larger inventories retain their selection and cache-budget coverage.
  */
 
 #include <gtest/gtest.h>
@@ -356,7 +360,7 @@ TEST(Test__PrefillGraphCache, BucketSelection_ExactBucket)
 
 TEST(Test__PrefillGraphCache, BucketSelection_JustOverBucket)
 {
-    auto selection = selectPrefillGraphBucket(513, defaultPrefillGraphBuckets());
+    auto selection = selectPrefillGraphBucket(513, prefillGraphBucketSizes(1024));
 
     ASSERT_TRUE(selection);
     EXPECT_EQ(selection.real_seq_len, 513);
@@ -364,9 +368,9 @@ TEST(Test__PrefillGraphCache, BucketSelection_JustOverBucket)
     EXPECT_FALSE(selection.exact);
 }
 
-TEST(Test__PrefillGraphCache, BucketSelection_DefaultsIncludeDenseBenchmarkLane)
+TEST(Test__PrefillGraphCache, BucketSelection_ExplicitDenseBenchmarkLane)
 {
-    auto buckets = defaultPrefillGraphBuckets();
+    auto buckets = prefillGraphBucketSizes(600);
     EXPECT_NE(std::find(buckets.begin(), buckets.end(), 600), buckets.end());
 
     auto selection = selectPrefillGraphBucket(595, buckets);
@@ -423,9 +427,8 @@ TEST(Test__PrefillGraphCache,
         defaultPrefillGraphBuckets(),
         kDefaultExpertOverlayPrefillSegmentRows);
 
-    EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 600)
-        << "The production bucket inventory currently resolves the measured "
-           "single-segment 595-token regime to its 600-row capture";
+    EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 512)
+        << "Overlay segments must respect the compact serving default";
     ASSERT_FALSE(retained_buckets.empty());
     EXPECT_EQ(retained_buckets.back(),
               kDefaultExpertOverlayPrefillSegmentRows);
@@ -441,7 +444,7 @@ TEST(Test__PrefillGraphCache,
      ExpertOverlayLadderMinimizesPaddingWithinRetainedCacheBudget)
 {
     const auto retained = retainedPrefillGraphBucketLadder(
-        defaultPrefillGraphBuckets(),
+        prefillGraphBucketSizes(768),
         /*resident_graph_rows=*/768,
         /*maximum_bucket_count=*/8);
     EXPECT_EQ(
@@ -610,6 +613,26 @@ TEST(Test__PrefillGraphCache, ChunkPlanning_UsesLargestBucketsThenRemainder)
     EXPECT_EQ(chunks[2].token_offset, 512);
     EXPECT_EQ(chunks[2].real_count, 88);
     EXPECT_EQ(chunks[2].bucket_seq_len, 128);
+}
+
+/** @test Compact default captures cover every real token of a long context. */
+TEST(Test__PrefillGraphCache, ChunkPlanning_DefaultCapPreservesLongContext)
+{
+    for (const int context : {513, 595, 8192, 131073})
+    {
+        const auto chunks = planPrefillChunks(context, defaultPrefillGraphBuckets());
+        ASSERT_FALSE(chunks.empty());
+        int covered = 0;
+        for (const auto &chunk : chunks)
+        {
+            EXPECT_EQ(chunk.token_offset, covered);
+            EXPECT_GT(chunk.real_count, 0);
+            EXPECT_LE(chunk.real_count, chunk.bucket_seq_len);
+            EXPECT_LE(chunk.bucket_seq_len, 512);
+            covered += chunk.real_count;
+        }
+        EXPECT_EQ(covered, context);
+    }
 }
 
 TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)

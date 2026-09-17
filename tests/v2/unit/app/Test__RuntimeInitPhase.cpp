@@ -35,9 +35,9 @@ TEST(Test__RuntimeInitPhase, DryRunPreflightInitializesRunnerAndPrintsResolvedPl
 
     EXPECT_CALL(runner, initializeForDryRun()).WillOnce(Return(true));
     EXPECT_CALL(runner, config()).WillOnce(ReturnRef(config));
-    EXPECT_CALL(runner, shutdown()).Times(1);
+    EXPECT_CALL(runner, shutdown()).Times(0); // Caller owns runner retirement.
 
-    EXPECT_TRUE(RuntimeInitPhase::runDryRunPreflight(config, runner, 0, out));
+    EXPECT_TRUE(RuntimeInitPhase::runDryRunPreflight(runner, 0, out));
     EXPECT_TRUE(config.dry_run);
 
     const std::string output = out.str();
@@ -56,14 +56,14 @@ TEST(Test__RuntimeInitPhase, DryRunPreflightDoesNotPrintResolvedPlanOnWorkerRank
 
     EXPECT_CALL(runner, initializeForDryRun()).WillOnce(Return(true));
     EXPECT_CALL(runner, config()).Times(0);
-    EXPECT_CALL(runner, shutdown()).Times(1);
+    EXPECT_CALL(runner, shutdown()).Times(0);
 
-    EXPECT_TRUE(RuntimeInitPhase::runDryRunPreflight(config, runner, 1, out));
+    EXPECT_TRUE(RuntimeInitPhase::runDryRunPreflight(runner, 1, out));
     EXPECT_TRUE(config.dry_run);
     EXPECT_TRUE(out.str().empty());
 }
 
-TEST(Test__RuntimeInitPhase, DryRunPreflightFailureClearsDryRunFlagForNonzeroExit)
+TEST(Test__RuntimeInitPhase, DryRunPreflightFailurePreservesRequestedIntent)
 {
     OrchestrationConfig config = OrchestrationConfig::defaults();
     config.dry_run = true;
@@ -75,10 +75,10 @@ TEST(Test__RuntimeInitPhase, DryRunPreflightFailureClearsDryRunFlagForNonzeroExi
 
     EXPECT_CALL(runner, initializeForDryRun()).WillOnce(Return(false));
     EXPECT_CALL(runner, lastError()).WillOnce(ReturnRef(error));
-    EXPECT_CALL(runner, shutdown()).Times(1);
+    EXPECT_CALL(runner, shutdown()).Times(0);
 
-    EXPECT_FALSE(RuntimeInitPhase::runDryRunPreflight(config, runner, 0, out));
-    EXPECT_FALSE(config.dry_run);
+    EXPECT_FALSE(RuntimeInitPhase::runDryRunPreflight(runner, 0, out));
+    EXPECT_TRUE(config.dry_run);
     EXPECT_TRUE(out.str().empty());
 }
 
@@ -175,6 +175,26 @@ TEST(Test__RuntimeInitPhase, CpuOnlyOverlayRetainsRankLocalVisibility)
 
     EXPECT_FALSE(
         RuntimeInitPhase::requiresHostWideAcceleratorVisibility(config, 0));
+}
+
+TEST(Test__RuntimeInitPhase, AutomaticDiscoveryHonorsHardFiltersWithoutLosingOtherSocketGpus)
+{
+    OrchestrationConfig config;
+    config.hostfile = "cluster-hosts";
+    EXPECT_TRUE(RuntimeInitPhase::requiresHostWideAcceleratorVisibility(config, 0));
+    for (const auto backends : {std::vector{DeviceType::CPU}, std::vector{DeviceType::CUDA},
+            std::vector{DeviceType::ROCm}, std::vector{DeviceType::CPU, DeviceType::ROCm}})
+    {
+        config.automatic_planning.only_backends = backends;
+        const bool cpu_only = backends == std::vector{DeviceType::CPU};
+        EXPECT_EQ(RuntimeInitPhase::requiresHostWideAcceleratorVisibility(config, 0), !cpu_only);
+        EXPECT_EQ(MPIBootstrapPhase::classifyDeviceIntent(config), cpu_only ?
+            BootstrapDeviceIntent::CpuOnly : BootstrapDeviceIntent::Automatic);
+        // A hardware preference is not a hard exclusion or a rank/socket pin.
+        config.automatic_planning.prefer_backend = backends.front();
+        EXPECT_EQ(RuntimeInitPhase::requiresHostWideAcceleratorVisibility(config, 7), !cpu_only);
+        config.automatic_planning.prefer_backend.reset();
+    }
 }
 
 TEST(Test__RuntimeInitPhase, BootstrapDoesNotConfuseMpiWithGpuOrCpuIntent)

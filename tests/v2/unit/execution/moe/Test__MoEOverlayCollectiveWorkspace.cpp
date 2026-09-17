@@ -4,6 +4,8 @@
  *
  * These tests lock down immutable ticket identity, sparse collective keys and
  * participant-local transport adaptation without requiring an accelerator.
+ * MPI ordering is exercised through a device-free observing context; source
+ * policy checks forbid blocking operations rather than requiring variable names.
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
@@ -32,6 +34,46 @@
 #include <vector>
 
 using namespace llaminar2;
+
+namespace
+{
+    /** @brief Device-free peer payload and observation of receive-before-send ordering. */
+    class ReturnOrderingMPI final : public llaminar2::test::MockMPIContext
+    {
+    public:
+        /** @brief Borrow a fixed encoded peer result for this one transport test. */
+        explicit ReturnOrderingMPI(std::span<const std::byte> payload)
+            : MockMPIContext({.rank = 0, .world_size = 2}), payload_(payload) {}
+
+        /** @brief Fill the admitted receive buffer and retain the base call counter. */
+        MPI_Request irecv(void *data, size_t count, MPI_Datatype type,
+                          int source, int tag) const override
+        {
+            EXPECT_LE(payload_.size(), count);
+            if (payload_.size() <= count)
+                std::memcpy(data, payload_.data(), payload_.size());
+            return MockMPIContext::irecv(data, count, type, source, tag);
+        }
+
+        /** @brief Observe how many receives were actually posted before dispatch. */
+        MPI_Request isend(const void *data, size_t count, MPI_Datatype type,
+                          int target, int tag) const override
+        {
+            receives_at_dispatch = irecv_call_count();
+            return MockMPIContext::isend(data, count, type, target, tag);
+        }
+
+        /** @brief Return the exact peer envelope length without invoking MPI. */
+        int getCount(const MPI_Status &, MPI_Datatype) const override
+        {
+            return static_cast<int>(payload_.size());
+        }
+
+        mutable size_t receives_at_dispatch = 0;
+    private:
+        std::span<const std::byte> payload_;
+    };
+}
 
 TEST(
     Test__MoEOverlayCollectiveWorkspace,
@@ -300,14 +342,68 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
         source.find("telemetry.recordAsyncSendSubmission("),
         std::string::npos);
 
-    const size_t preposted_return = source.find(
-        "pending_return_receive_ = config_.mpi_ctx->irecv(");
-    ASSERT_NE(preposted_return, std::string::npos);
-    const size_t dispatch_submission = source.find(
-        "slot->request = config_.mpi_ctx->isend(", preposted_return);
-    ASSERT_NE(dispatch_submission, std::string::npos);
-    EXPECT_LT(preposted_return, dispatch_submission)
-        << "The return receive must be visible before dispatch publication";
+}
+
+/** @brief Payload returns are preposted; empty outcomes never post or wait for a receive. */
+TEST(Test__MoEOverlayCollectiveWorkspace, RankBatchReturnRequirementOwnsActualMPIOrdering)
+{
+    for (const bool empty : {false, true})
+    {
+        SCOPED_TRACE(empty);
+        auto wire = std::make_shared<MoEOverlayRankBatchWireWorkspace>(
+            MoEOverlayRankBatchWireWorkspace::Config{
+                .participant_ids = {3}, .max_total_rows = 1,
+                .max_total_entries = 1, .d_model = 4, .top_k = 1});
+        MoEOverlayCollectiveWorkspace storage;
+        storage.ensureCapacity(1, 1, 4, 1, DeviceId::cpu());
+        auto dispatch = storage.localExpertInput(0, 0);
+        dispatch.source_participant = 7;
+        dispatch.target_participant = 3;
+        dispatch.residency_epoch = 11;
+        dispatch.live_row_count = dispatch.live_entry_count = empty ? 0 : 1;
+        dispatch.entry_offsets_host[0] = 0;
+        dispatch.entry_offsets_host[1] = empty ? 0 : 1;
+        dispatch.row_ids_host[0] = 0;
+        dispatch.expert_ids_host[0] = 0;
+        dispatch.route_weights_host[0] = 1.0f;
+        dispatch.original_route_slots_host[0] = dispatch.compact_route_slots_host[0] = 0;
+        std::fill_n(dispatch.hidden_rows_fp32, 4, 1.0f);
+        auto peer = storage.localExpertOutput(0, 0);
+        peer.source_participant = 3;
+        peer.target_participant = 7;
+        peer.residency_epoch = 11;
+        peer.live_row_count = empty ? 0 : 1;
+        peer.row_ids_host[0] = 0;
+        std::fill_n(peer.output_rows_fp32, 4, 9.0f);
+        auto result = storage.returnReceive(0, 0);
+        const auto key = [](MoEOverlayCollectiveDirection direction) {
+            return makeMoEOverlayRankBatchKey(13, 1, ExpertHistogramSource::DecodeToken,
+                                            0, 0, 0, 0, 1, direction);
+        };
+        const std::array<const MoEOverlayReturnRows *, 1> peer_views{&peer};
+        size_t bytes = 0;
+        std::string error;
+        ASSERT_TRUE(wire->encodeReturn(key(MoEOverlayCollectiveDirection::ReturnReduce),
+                                      peer_views, &bytes, &error)) << error;
+        auto mpi = std::make_shared<ReturnOrderingMPI>(wire->encodedPayload(bytes));
+        MoEOverlayMPIRankBatchTransport transport({
+            .mpi_ctx = mpi, .source_world_rank = 0, .target_world_rank = 1,
+            .workspace = wire, .transaction_slot_count = 8});
+        const std::array<const MoEOverlaySparseRows *, 1> dispatch_views{&dispatch};
+        const std::array<MoEOverlayReturnRows *, 1> result_views{&result};
+        const auto sent = transport.exchangeDispatch(
+            key(MoEOverlayCollectiveDirection::Dispatch), dispatch_views, {});
+        ASSERT_TRUE(sent.ok) << sent.error;
+        EXPECT_EQ(mpi->receives_at_dispatch, empty ? 0u : 1u);
+        const auto received = transport.exchangeReturn(
+            key(MoEOverlayCollectiveDirection::ReturnReduce), {}, result_views);
+        ASSERT_TRUE(received.ok) << received.error;
+        EXPECT_EQ(mpi->irecv_call_count(), empty ? 0u : 1u);
+        EXPECT_EQ(mpi->wait_call_count(), 0u);
+        EXPECT_EQ(result.live_row_count, empty ? 0u : 1u);
+        EXPECT_EQ(result.residency_epoch, 11u);
+        if (!empty) EXPECT_FLOAT_EQ(result.output_rows_fp32[3], 9.0f);
+    }
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace,

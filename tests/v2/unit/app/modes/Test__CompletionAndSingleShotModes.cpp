@@ -1,16 +1,24 @@
+/**
+ * @file Test__CompletionAndSingleShotModes.cpp
+ * @brief Device-free request-mode ownership and termination regressions.
+ *
+ * Modes may stop their runner and command followers, but process finalization
+ * belongs to the enclosing application session. Mock modes must neither start
+ * MPI nor require a fake process-wide shutdown to reach their terminal result.
+ */
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
 #include "app/AppContext.h"
 #include "app/modes/BenchmarkMode.h"
 #include "app/modes/CompletionMode.h"
+#include "app/modes/InteractiveChatMode.h"
 #include "app/modes/SingleShotChatMode.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockTokenizer.h"
 #include "utils/Logger.h"
 
-#include <mpi.h>
 #include <memory>
 #include <stdexcept>
 
@@ -582,23 +590,36 @@ TEST(Test__SingleShotChatMode, UserTextStaysOnStdoutAndInfoLogsUseStderr)
     EXPECT_THAT(stderr_text, HasSubstr("Generating response (max 2 tokens)"));
 }
 
+TEST(Test__InteractiveChatMode, MissingTemplateTerminatesWaitingFollowers)
+{
+    for (int authority : {0, 1})
+    {
+        ModeHarness h(authority, 2, authority);
+        Sequence terminal;
+        EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).InSequence(terminal);
+        EXPECT_CALL(*h.tokenizer, hasChatTemplate()).InSequence(terminal).WillOnce(Return(false));
+        EXPECT_CALL(*h.runner, shutdownMPIWorkers()).InSequence(terminal);
+        EXPECT_CALL(*h.runner, shutdown()).InSequence(terminal);
+        InteractiveChatMode mode;
+        EXPECT_EQ(mode.execute(h.ctx), 1);
+    }
+}
+
+TEST(Test__InteractiveChatMode, ThrowingPreconditionAbortsWaitingFollowers)
+{
+    ModeHarness h(1, 2, 1);
+    Sequence terminal;
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).InSequence(terminal);
+    EXPECT_CALL(*h.tokenizer, hasChatTemplate()).InSequence(terminal)
+        .WillOnce(Throw(std::runtime_error("injected template failure")));
+    EXPECT_CALL(*h.runner, abortMPIWorkers("injected template failure")).InSequence(terminal);
+    EXPECT_CALL(*h.runner, shutdown()).InSequence(terminal);
+    InteractiveChatMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
+}
+
 int main(int argc, char **argv)
 {
-    int initialized = 0;
-    MPI_Initialized(&initialized);
-    if (!initialized)
-    {
-        MPI_Init(&argc, &argv);
-    }
-
     ::testing::InitGoogleMock(&argc, argv);
-    const int result = RUN_ALL_TESTS();
-
-    int finalized = 0;
-    MPI_Finalized(&finalized);
-    if (!finalized)
-    {
-        MPI_Finalize();
-    }
-    return result;
+    return RUN_ALL_TESTS();
 }

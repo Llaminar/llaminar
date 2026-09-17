@@ -4,6 +4,9 @@
  *
  * All validation rules are defined in createStandard(). To add a new rule,
  * add a single addRule() call in that function. No other files need to change.
+ * Plan/apply intent is resolved by the typed planning-policy boundary; this
+ * validator reports its errors without maintaining a second interpretation of
+ * hard restrictions, preferences or automatic-versus-explicit placement.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -222,6 +225,33 @@ namespace llaminar2
     ConfigValidator ConfigValidator::createStandard()
     {
         ConfigValidator v;
+
+        // YAML parsing already enforces this geometry. Typed callers and the
+        // lossless plan codec must reach the same admission rule; zero is not
+        // an automatic sentinel for the runtime's allocated context capacity.
+        v.addRule({
+            .id = "context-length-positive",
+            .description = "Context capacity must be a positive token count",
+            .fix_hint = "Supply --context-length greater than zero",
+            .applies = [](const OrchestrationConfig &c) { return c.max_seq_len <= 0; },
+            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
+            { return "Context length must be positive."; },
+        });
+
+        v.addRule({
+            .id = "orchestration-planning-intent",
+            .description = "Automatic constraints and applied placement must name one coherent action",
+            .fix_hint = "Use auto with hard filters, or apply an explicit topology without search hints",
+            .applies = [](const OrchestrationConfig &c) {
+                return c.planning_mode != OrchestrationPlanningMode::InferFromPlacement ||
+                    c.automatic_planning.specified() || c.execution_rank_selection.has_value();
+            },
+            .check = [](const OrchestrationConfig &c) -> std::optional<std::string> {
+                try { (void)resolveOrchestrationIntent(c); }
+                catch (const std::invalid_argument &error) { return error.what(); }
+                return std::nullopt;
+            },
+        });
 
         // =====================================================================
         // CROSS-MODE MUTUAL EXCLUSION RULES

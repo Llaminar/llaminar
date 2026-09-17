@@ -1,6 +1,10 @@
 /**
  * @file WeightIdentity.cpp
  * @brief Implements semantic model-weight identity and canonical-name inference.
+ *
+ * Metadata-only planning and live prepared bindings must agree on arithmetic
+ * roles. Projection matrices stay distinct from SSM vectors and normalization
+ * parameters even when their GGUF names share a recurrent-model prefix.
  */
 
 #include "WeightIdentity.h"
@@ -101,6 +105,11 @@ namespace llaminar2
         return "Unknown";
     }
 
+    /**
+     * @brief Resolve canonical source semantics without loading or preparing a tensor.
+     * @param name Original GGUF name, including its optional block prefix.
+     * @return Shared loading/planning role; unknown names remain explicitly Other.
+     */
     WeightRole inferWeightRole(const std::string &name)
     {
         if (name == "token_embd.weight") return WeightRole::Embedding;
@@ -117,6 +126,8 @@ namespace llaminar2
             name.find("ssm_beta.weight") != std::string::npos)
             return WeightRole::GDNAlphaBetaProjection;
         if (name.find("gdn_qkv.weight") != std::string::npos ||
+            name.find("attn_gate.weight") != std::string::npos ||
+            name.find("ssm_out.weight") != std::string::npos ||
             name.find("ssm.qkv_proj.weight") != std::string::npos)
             return WeightRole::GDNProjection;
         if (name.find("ssm_conv1d.weight") != std::string::npos ||

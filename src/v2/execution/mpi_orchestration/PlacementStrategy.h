@@ -111,7 +111,7 @@ namespace llaminar2
         int node_count = 1;                      ///< Number of physical nodes
         std::vector<float> rank_compute_weights; ///< Relative compute power per rank
 
-        // Complete cluster device inventory (populated by MPITopology::exchangeCapabilities)
+        // Complete immutable observation from the exact MPI context's discovery.
         ClusterInventory cluster_inventory;
 
         // =====================================================================

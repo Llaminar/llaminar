@@ -311,7 +311,15 @@ namespace llaminar2::test
             config.rank = rank;
             config.world_size = world_size;
             config.mpi_ctx = mpi_ctx;
-            config.rank_runner = std::move(runner);
+            if (runner)
+            {
+                const auto rank_plan = GlobalPPRankPlanBuilder::build(config.topology, rank);
+                const auto stages = rank_plan.executeStages();
+                if (stages.size() != 1u)
+                    throw std::invalid_argument("Single-runner fixture requires exactly one local stage");
+                config.stage_runners.push_back(makeStageRunnerEntry(
+                    config.topology, rank, stages.front()->stage_id, std::move(runner)));
+            }
             config.vocab_size = VOCAB_SIZE;
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
@@ -688,6 +696,51 @@ namespace llaminar2::test
     // Validation Tests
     // =========================================================================
 
+    /** @brief A remote endpoint must never resolve to a different local layer scope. */
+    TEST_F(Test__GlobalOrchestrator, RegistryHasNoStandInForRemoteEndpoints)
+    {
+        const auto topology = buildTwoStagePPTopo();
+        for (int rank : {0, 1})
+        {
+            StageRunnerRegistry registry;
+            auto runner = std::make_unique<MockDeviceRunner>();
+            const auto *local = runner.get();
+            registry.add(makeStageRunnerEntry(topology, rank, rank, std::move(runner)));
+            const auto &read_only = registry;
+            EXPECT_EQ(registry.pipelineHeadRunner(), rank == 0 ? local : nullptr);
+            EXPECT_EQ(registry.pipelineTailRunner(), rank == 1 ? local : nullptr);
+            EXPECT_EQ(read_only.pipelineHeadRunner(), rank == 0 ? local : nullptr);
+            EXPECT_EQ(read_only.pipelineTailRunner(), rank == 1 ? local : nullptr);
+            EXPECT_EQ(registry.runnerForStage(1 - rank), nullptr);
+            EXPECT_EQ(read_only.runnerForStage(1 - rank), nullptr);
+            EXPECT_FALSE(registry.hasRunnerForStage(1 - rank));
+            EXPECT_EQ(registry.size(), 1u);
+        }
+    }
+
+    /** @brief Endpoint authority and layer scopes are authenticated before any execution. */
+    TEST_F(Test__GlobalOrchestrator, RejectsForeignStageAndChangedEndpointOrScope)
+    {
+        MockMPIContext mpi(0, 2);
+        for (int corruption = 0; corruption < 5; ++corruption)
+        {
+            auto config = makeConfig(buildTwoStagePPTopo(), 0, 2, &mpi,
+                                     std::make_unique<MockDeviceRunner>());
+            auto &entry = config.stage_runners.front();
+            if (corruption == 0)
+                entry.action.has_lm_head = true;
+            else if (corruption == 1)
+                ++entry.action.last_layer;
+            else if (corruption == 2)
+                ++entry.pp_stage_config->first_layer;
+            else if (corruption == 3)
+                entry.stage_id = entry.action.stage_id = 1;
+            else
+                entry.domain_name = "foreign-domain";
+            EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+        }
+    }
+
     TEST_F(Test__GlobalOrchestrator, ThrowsOnNullMPIContext)
     {
         auto topo = buildSingleStageTopo(1);
@@ -698,7 +751,8 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = nullptr;
-        config.rank_runner = std::move(runner);
+        config.stage_runners.push_back(makeStageRunnerEntry(
+            config.topology, 0, 0, std::move(runner)));
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -715,7 +769,6 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = &mpi;
-        config.rank_runner = nullptr;
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -732,7 +785,7 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = &mpi;
-        config.rank_runner = std::move(runner);
+        // The malformed topology must fail before considering runner ownership.
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -745,7 +798,8 @@ namespace llaminar2::test
         auto topo = buildSingleStageTopo(1);
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        auto config = makeConfig(std::move(topo), 5, 1, &mpi, std::move(runner));
+        auto config = makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner));
+        config.rank = 5;
         EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
@@ -777,7 +831,8 @@ namespace llaminar2::test
         auto topo = buildSingleStageTopo(1);
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        auto config = makeConfig(std::move(topo), -1, 1, &mpi, std::move(runner));
+        auto config = makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner));
+        config.rank = -1;
         EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
@@ -2267,9 +2322,11 @@ namespace llaminar2::test
         {
             MockMPIContext mpi(rank, 2);
             auto topo = buildTwoStageSameTPTopo();
-            auto runner = std::make_unique<MockDeviceRunner>();
-
-            GlobalOrchestrator orch(makeConfig(std::move(topo), rank, 2, &mpi, std::move(runner)));
+            auto config = makeConfig(std::move(topo), rank, 2, &mpi, nullptr);
+            for (int stage : {0, 1})
+                config.stage_runners.push_back(makeStageRunnerEntry(
+                    config.topology, rank, stage, std::make_unique<MockDeviceRunner>()));
+            GlobalOrchestrator orch(std::move(config));
 
             const auto &plan = orch.rankPlan();
             auto transfers = plan.transferActions();
@@ -2281,7 +2338,7 @@ namespace llaminar2::test
         }
     }
 
-    TEST_F(Test__GlobalOrchestrator, SameTPTopo_Rank0_ForwardExecutesLocalHandoffCompatibilityRunner)
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_RejectsOneRunnerMasqueradingAsTwoStages)
     {
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStageSameTPTopo();
@@ -2290,17 +2347,10 @@ namespace llaminar2::test
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.has_hidden_state = true;
         runner_config.hidden_state_dim = D_MODEL;
-        auto runner_raw = new MockDeviceRunner(runner_config);
-        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
-
-        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
-
-        std::vector<int> tokens = {1, 2, 3};
-        EXPECT_TRUE(orch.forward(tokens.data(), 3));
-        EXPECT_EQ(mpi.send_call_count(), 0u);
-        EXPECT_EQ(mpi.recv_call_count(), 0u);
-        EXPECT_EQ(runner_raw->forward_call_count(), 2u);
-        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+        auto config = makeConfig(std::move(topo), 0, 2, &mpi, nullptr);
+        config.stage_runners.push_back(makeStageRunnerEntry(
+            config.topology, 0, 0, std::make_unique<MockDeviceRunner>(runner_config)));
+        EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
     TEST_F(Test__GlobalOrchestrator, SameTPTopo_AnyRankExecutesTwoStageRunnersInOrder)
@@ -2424,10 +2474,11 @@ namespace llaminar2::test
         MockMPIContext mpi(1, 3);
         auto topo = buildPartialOverlapTPTopo();
 
-        auto runner_raw = new MockDeviceRunner();
-        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
-
-        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+        auto config = makeConfig(std::move(topo), 1, 3, &mpi, nullptr);
+        for (int stage : {0, 1})
+            config.stage_runners.push_back(makeStageRunnerEntry(
+                config.topology, 1, stage, std::make_unique<MockDeviceRunner>()));
+        GlobalOrchestrator orch(std::move(config));
 
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();

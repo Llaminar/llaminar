@@ -108,7 +108,7 @@ namespace
 
     // Decode and grouped verifier depths have dedicated common-trainer
     // transactions. This legacy harness is restricted to ordinary prefill.
-    static const std::vector<int> M_VALUES = defaultPrefillGraphBucketSizes();
+    static const std::vector<int> M_VALUES = supportedPrefillGraphBucketSizes();
 
     struct FormatSpec
     {
@@ -275,7 +275,7 @@ namespace
                 << "duplicate ROCm NativeVNNI exact geometry " << shape.name;
         EXPECT_EQ(observed_shapes, expected_shapes);
 
-        EXPECT_EQ(M_VALUES, llaminar2::defaultPrefillGraphBucketSizes());
+        EXPECT_EQ(M_VALUES, llaminar2::supportedPrefillGraphBucketSizes());
         EXPECT_EQ(std::count(M_VALUES.begin(), M_VALUES.end(), 1), 0);
         for (int m = 2; m <= llaminar2::kDefaultNativeVNNIVerifierRowCapacity;
              ++m)
@@ -1160,7 +1160,7 @@ namespace
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
         const std::vector<int> m_values = getEnvCsvInts(
             "LLAMINAR_ROCM_NVNNI_SWEEP_M",
-            defaultPrefillGraphBucketSizes());
+            supportedPrefillGraphBucketSizes());
         const int warmup_runs = std::max(
             1,
             getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_WARMUP")

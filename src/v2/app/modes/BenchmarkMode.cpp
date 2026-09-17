@@ -2,6 +2,10 @@
  * @file BenchmarkMode.cpp
  * @brief Release benchmark entry point sharing production readiness and policy.
  *
+ * Request termination belongs to this mode; process finalization belongs to
+ * the caller's MPIProcessSession. Returning first retires mode-local adapters
+ * and handlers before the runner, contexts and outer session are destroyed.
+ *
  * The orchestration runner owns model preparation and topology-resolved runtime
  * defaults. This mode drives the requested workload and exports that resolved
  * configuration without adding benchmark-only calibration or device policy.
@@ -18,7 +22,6 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
-#include "app/MPIShutdown.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -144,7 +147,13 @@ namespace llaminar2
                      << (user_selected_gpu_graphs ? " (env override)" : ""));
         }
 
-        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        /**
+         * @brief Terminate the request channel while retaining outer MPI ownership.
+         * @param ctx Active caller-owned application resources.
+         * @param detail Failure shared with followers before runner retirement.
+         * @return Nonzero command exit; the caller's scope finalizes MPI later.
+         */
+        int shutdownAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
             const bool is_authority =
@@ -165,7 +174,6 @@ namespace llaminar2
             }
 
             MoEExpertOverlayProfiler::flush();
-            mpiShutdown();
             return 1;
         }
 
@@ -205,20 +213,18 @@ namespace llaminar2
             runner->runMPIWorkerLoop();
             runner->shutdown();
             MoEExpertOverlayProfiler::flush();
-            mpiShutdown();
             return 0;
         }
 
         if (mpi_coordinated)
             runner->setMPICoordinatedMode(true);
 
-        auto shutdownAndFinalize = [&](bool success, const std::string &failure_reason = {}) -> int
+        auto shutdownAndReturn = [&](bool success, const std::string &failure_reason = {}) -> int
         {
             MoEExpertOverlayProfiler::flush();
             if (mpi_coordinated)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
-            mpiShutdown();
             return success ? 0 : 1;
         };
 
@@ -238,7 +244,7 @@ namespace llaminar2
             LOG_ERROR(
                 "Inference runtime did not become ready for benchmarking: "
                 << runner->lastError());
-            return shutdownAndFinalize(
+            return shutdownAndReturn(
                 false, "inference runtime preparation failed");
         }
 
@@ -256,7 +262,7 @@ namespace llaminar2
                 LOG_ERROR("Failed to open benchmark JSON output path: "
                           << ctx.config.benchmark_json_output_path);
                 MoEExpertOverlayProfiler::flush();
-                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+                return shutdownAndReturn(false, "failed to write benchmark JSON");
             }
             // The runner exposes the topology-resolved startup configuration;
             // raw CLI intent cannot attest which hardware defaults ran.
@@ -266,23 +272,23 @@ namespace llaminar2
                 LOG_ERROR("Failed to write benchmark JSON output path: "
                           << ctx.config.benchmark_json_output_path);
                 MoEExpertOverlayProfiler::flush();
-                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+                return shutdownAndReturn(false, "failed to write benchmark JSON");
             }
             LOG_INFO("Benchmark JSON written to " << ctx.config.benchmark_json_output_path);
         }
         MoEExpertOverlayProfiler::flush();
 
-        return shutdownAndFinalize(
+        return shutdownAndReturn(
             result.success,
             result.success ? std::string{} : "benchmark runner reported failure");
     }
     catch (const std::exception &e)
     {
-        return finalizeAfterUnhandledException(ctx, e.what());
+        return shutdownAfterUnhandledException(ctx, e.what());
     }
     catch (...)
     {
-        return finalizeAfterUnhandledException(ctx, "unknown exception");
+        return shutdownAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

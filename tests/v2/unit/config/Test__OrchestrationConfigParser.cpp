@@ -22,6 +22,7 @@
 #include "config/OrchestrationConfigParser.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "utils/DebugEnv.h"
+#include "planning/ActivationBufferSizing.h"
 
 using namespace llaminar2;
 
@@ -55,6 +56,116 @@ private:
 // ============================================================================
 // Factory Function Tests
 // ============================================================================
+
+/**
+ * @brief Preserve caller-owned prefill policy across startup parser tests.
+ *
+ * The CLI deliberately publishes into the process environment for MPI startup.
+ * Each test restores both that export and the already-read DebugEnv snapshot.
+ */
+class ScopedPrefillBucketEnvironment
+{
+public:
+    /** @brief Save the explicit inventory, if one was inherited. */
+    ScopedPrefillBucketEnvironment()
+    {
+        if (const char *value = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"))
+            previous_ = value;
+    }
+
+    /** @brief Restore the caller's inventory and its canonical parsed view. */
+    ~ScopedPrefillBucketEnvironment()
+    {
+        if (previous_)
+            setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", previous_->c_str(), 1);
+        else
+            unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
+        mutableDebugEnv().reload();
+    }
+
+private:
+    std::optional<std::string> previous_;
+};
+
+TEST(Test__OrchestrationConfigParser, PrefillDefaultsCapWorkspaceNotContext)
+{
+    ScopedPrefillBucketEnvironment restore;
+    ASSERT_EQ(unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), 0);
+    mutableDebugEnv().reload();
+    ArgvHelper args{"llaminar2", "--context-length", "131072"};
+    OrchestrationConfigParser parser;
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.max_seq_len, 131072);
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes,
+              (std::vector<int>{64, 128, 256, 384, 512}));
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        EXPECT_EQ(resolveActivationBufferSeqLen(config.max_seq_len, device), 512);
+}
+
+TEST(Test__OrchestrationConfigParser, PrefillMaximumPublishesAndRefreshesStartupPolicy)
+{
+    ScopedPrefillBucketEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,4096", 1), 0);
+    mutableDebugEnv().reload();
+    ASSERT_EQ(debugEnv().execution.prefill_graph_bucket_sizes.back(), 4096);
+    ArgvHelper args{"llaminar2", "--context-length", "131072",
+                    "--prefill-max-bucket-size", "1024"};
+    OrchestrationConfigParser parser;
+    for (int parse = 0; parse < 2; ++parse)
+    {
+        const auto config = parser.parseArgs(args.argc(), args.argv());
+        EXPECT_EQ(config.max_seq_len, 131072);
+        EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes,
+                  prefillGraphBucketSizes(1024));
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            EXPECT_EQ(resolveActivationBufferSeqLen(config.max_seq_len, device), 1024);
+        // A freshly constructed snapshot models an MPI child's inherited
+        // environment; direct launches and repeated parsing must agree.
+        ExecutionConfig inherited;
+        EXPECT_EQ(inherited.prefill_graph_bucket_sizes,
+                  debugEnv().execution.prefill_graph_bucket_sizes);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, PrefillMaximumEqualsSyntaxAllowsSmallExactCap)
+{
+    ScopedPrefillBucketEnvironment restore;
+    ArgvHelper args{"llaminar2", "--prefill-max-bucket-size=32"};
+    OrchestrationConfigParser parser;
+    parser.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes, (std::vector<int>{32}));
+    EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "32");
+}
+
+TEST(Test__OrchestrationConfigParser, PrefillMaximumRejectsMalformedValuesBeforePublication)
+{
+    ScopedPrefillBucketEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256", 1), 0);
+    mutableDebugEnv().reload();
+    OrchestrationConfigParser parser;
+    for (const char *value : {"0", "-1", "512junk", "1.5", "2147483648", ""})
+    {
+        ArgvHelper args{"llaminar2", "--prefill-max-bucket-size", value};
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+        EXPECT_STREQ(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"), "64,256");
+        EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes,
+                  (std::vector<int>{64, 256}));
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, PrefillExplicitEnvironmentSurvivesWithoutCLIOverride)
+{
+    ScopedPrefillBucketEnvironment restore;
+    ASSERT_EQ(setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256,4096", 1), 0);
+    mutableDebugEnv().reload();
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2"};
+    parser.parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(debugEnv().execution.prefill_graph_bucket_sizes,
+              (std::vector<int>{64, 256, 4096}));
+    EXPECT_NE(OrchestrationConfigParser::getHelpText().find("--prefill-max-bucket-size"),
+              std::string::npos);
+}
 
 TEST(Test__OrchestrationConfigParser, CreateParser_ReturnsNonNull)
 {

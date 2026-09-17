@@ -83,7 +83,8 @@ namespace llaminar2
     void LoadOrchestrator::planWeight(int device_id, const std::string &name,
                                       int N, int K, int payload_bytes_per_block,
                                       bool is_asymmetric, bool has_emins,
-                                      size_t raw_gguf_bytes)
+                                      size_t raw_gguf_bytes,
+                                      WeightVRAMPool::ContiguousAlias alias)
     {
         planWeightForOwner(
             device_id,
@@ -94,7 +95,7 @@ namespace llaminar2
             is_asymmetric,
             has_emins,
             raw_gguf_bytes,
-            persistent_owner_);
+            persistent_owner_, alias);
     }
 
     void LoadOrchestrator::planWeightForOwner(
@@ -106,7 +107,8 @@ namespace llaminar2
         bool is_asymmetric,
         bool has_emins,
         size_t raw_gguf_bytes,
-        PhysicalMemoryOwner owner)
+        PhysicalMemoryOwner owner,
+        WeightVRAMPool::ContiguousAlias alias)
     {
         auto *ctx = findDevice(device_id);
         if (!ctx)
@@ -118,7 +120,7 @@ namespace llaminar2
 
         const size_t bytes_before = ctx->pool->totalPlannedBytes();
         ctx->pool->planWeight(name, N, K, payload_bytes_per_block, is_asymmetric,
-                              has_emins, raw_gguf_bytes);
+                              has_emins, raw_gguf_bytes, alias);
         recordPersistentOwnerGrowth(
             *ctx,
             owner,
@@ -436,6 +438,13 @@ namespace llaminar2
     }
 
     size_t LoadOrchestrator::numDevices() const { return devices_.size(); }
+
+    DeviceId LoadOrchestrator::managedDevice(int device_id) const
+    {
+        if (!backend_ || device_id < 0 || !findDevice(device_id))
+            throw std::invalid_argument("LoadOrchestrator has no bound backend/device for this ordinal");
+        return {backend_->backendDeviceType(), device_id};
+    }
 
     void LoadOrchestrator::addWeightJob(int device_id, const WeightJob &job)
     {

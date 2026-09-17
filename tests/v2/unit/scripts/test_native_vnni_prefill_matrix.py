@@ -36,10 +36,21 @@ from native_vnni_dispatch.shape_manifest import (  # noqa: E402
     ShapeRole,
     load_shape_manifest,
 )
+from native_vnni_prefill_policy import load_native_vnni_m_policy  # noqa: E402
 
 
 class NativeVNNIPrefillMatrixTest(unittest.TestCase):
     """Lock projection applicability and comprehensive exact-overlay M rows."""
+
+    def test_cpp_policy_keeps_full_training_inventory_with_compact_serving(self) -> None:
+        """The serving cap cannot silently remove large shapes from trainers."""
+
+        rows = load_native_vnni_m_policy(
+            REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
+        )
+        self.assertEqual(rows, sorted({*range(2, 17), *GPU_PREFILL_M_BUCKETS}))
+        self.assertEqual(rows[-1], 4096)
+        self.assertIn(600, rows)
 
     def test_cpu_exact_projection_depths_follow_model_size_tier(self) -> None:
         matrix = {row.shape.name: row.m_values for row in cpu_prefill_measurements()}

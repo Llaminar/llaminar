@@ -157,6 +157,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Compose command-local options without shadowing shared flags.
+         * @param extension Additional options, including their category order.
+         * @throws std::invalid_argument if any added name already has an owner.
+         *
+         * A subcommand can add presentation controls, but cannot redefine a
+         * model/runtime option or change its parsing semantics by precedence.
+         */
+        CliSpec &extend(const CliSpec &extension)
+        {
+            for (const auto &option : extension.options_)
+            {
+                for (const auto &name : option.allNames())
+                    if (find(name))
+                        throw std::invalid_argument("Command option shadows a shared flag: " + name);
+                add(option);
+            }
+            for (const auto &category : extension.categories_)
+                addCategory(category);
+            return *this;
+        }
+
+        /**
          * @brief Walk `args` and mutate `config` accordingly.
          *
          * `args` should NOT include argv[0]. Unknown arguments throw

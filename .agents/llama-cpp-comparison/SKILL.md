@@ -59,7 +59,7 @@ repeat the fixed Release benchmark, preferably A/B/A or interleaved repetitions,
 and compare token identities and memory BOM as well as throughput. Retain a
 change only when its model-level benefit exceeds the measured noise and the
 applicable correctness gates pass. Use
-[model parity](../model-parity-testing/SKILL.md) for the full Unit gate,
+[Llaminar testing](../llaminar-testing/SKILL.md) for the full Unit gate,
 ProductionParityPreflight and affected canonical real-weight cells. Report
 missing or still-running evidence explicitly; do not call a timing candidate
 certified.

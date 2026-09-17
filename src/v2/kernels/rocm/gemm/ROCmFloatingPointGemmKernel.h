@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include "kernels/common/FloatingOutputPartitionScope.h"
+
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
@@ -162,6 +164,24 @@ namespace llaminar2
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
+
+            /**
+             * @brief Keep mirrored outputs on the same fixed column reduction as serial TP.
+             * @param actual_columns Prepared physical N.
+             * @param serial_columns Regular serial shard N, including nondivisible tails.
+             * @return Recording scope; invalid prepared geometry throws.
+             */
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOutputPartitionEquivalenceScope(int actual_columns, int serial_columns) override
+            {
+                return FloatingOutputPartitionScope::begin(*this, actual_columns, serial_columns);
+            }
+
+            /** @return Prepared physical output width used by admission and equivalence checks. */
+            int get_n() const override { return static_cast<int>(N_); }
+
+            /** @return Prepared reduction width, independent of mirrored output ownership. */
+            int get_k() const override { return static_cast<int>(K_); }
 
             bool supports_fused_projection() const override { return true; }
 

@@ -55,11 +55,22 @@ namespace llaminar2
         WeightVRAMPool(WeightVRAMPool &&other) noexcept;
         WeightVRAMPool &operator=(WeightVRAMPool &&other) noexcept;
 
-        /// Phase 1: Plan — calculate sizes, no allocation.
-        /// Call once per weight that will be stored on this device.
+        /** @brief Mutually exclusive contiguous view sharing a packed allocation. */
+        struct ContiguousAlias
+        {
+            size_t bytes; ///< Zero disables the alias; otherwise reserve max, not sum.
+        };
+
+        /**
+         * @brief Plan a packed weight and optional mutually exclusive raw view.
+         * @param alias Contiguous capacity beginning at the payload address.
+         * Native planes retain their offsets. The allocator alone extends the
+         * region when the raw view is larger; callers never reproduce alignment
+         * arithmetic or allocate two copies for non-concurrent representations.
+         */
         void planWeight(const std::string &name, int N, int K,
                         int payload_bytes_per_block, bool is_asymmetric, bool has_emins,
-                        size_t raw_gguf_bytes);
+                        size_t raw_gguf_bytes, ContiguousAlias alias = {0});
 
         /// Phase 1 (raw): Plan a floating-point weight that needs no repack.
         /// Allocates a contiguous region for raw bytes (H2D copy only, no repack).

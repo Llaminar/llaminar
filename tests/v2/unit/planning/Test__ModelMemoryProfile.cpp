@@ -12,6 +12,8 @@
  * These tests validate tensor inventory extraction, layer ownership parsing,
  * serialization, and preservation of GGUF quantization names used by downstream
  * memory estimators.
+ * Malformed length/count/trailer cases must fail before allocating an invented
+ * tensor directory; metadata publication consumes one exact versioned payload.
  */
 
 using namespace llaminar2;
@@ -576,4 +578,22 @@ TEST(Test__ModelMemoryProfile, Deserialize_RejectsUnknownWireVersion)
     EXPECT_THROW(
         ModelMemoryProfile::deserialize(buffer.data(), buffer.size()),
         std::runtime_error);
+}
+
+TEST(Test__ModelMemoryProfile, Deserialize_RejectsNullOrTrailingPayload)
+{
+    EXPECT_THROW(ModelMemoryProfile::deserialize(nullptr, 0), std::runtime_error);
+    auto bytes = ModelMemoryProfile{}.serialize();
+    bytes.push_back(0);
+    EXPECT_THROW(ModelMemoryProfile::deserialize(bytes.data(), bytes.size()), std::runtime_error);
+}
+
+TEST(Test__ModelMemoryProfile, Deserialize_RejectsImpossibleCountBeforeAllocation)
+{
+    auto bytes = ModelMemoryProfile{}.serialize();
+    const uint32_t impossible_count = UINT32_MAX;
+    // The empty profile ends with its zero tensor count, so no guessed scalar
+    // offset or duplicated schema inventory is needed to corrupt this field.
+    std::memcpy(bytes.data() + bytes.size() - sizeof(uint32_t), &impossible_count, sizeof(uint32_t));
+    EXPECT_THROW(ModelMemoryProfile::deserialize(bytes.data(), bytes.size()), std::runtime_error);
 }

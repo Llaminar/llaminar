@@ -67,7 +67,10 @@ emit() {
 
 docker_supports_nvidia_runtime() {
     docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"' && return 0
-    docker run --rm --gpus all --entrypoint /bin/true "$probe_image" >/dev/null 2>&1
+    # Production test containers use host networking. GPU admission must use
+    # that same mode: creating an unrelated bridge can block on firewall
+    # maintenance before Docker even checks the requested GPU capability.
+    docker run --rm --network host --gpus all --entrypoint /bin/true "$probe_image" >/dev/null 2>&1
 }
 
 lib_dir_has_driver_libs() {

@@ -25,6 +25,7 @@
 #include "collective/GlobalTPContext.h"
 #include "tensors/TensorClasses.h"
 #include "utils/Logger.h"
+#include "utils/MPIContext.h"
 
 #include <algorithm>
 #include <array>
@@ -122,11 +123,14 @@ protected:
      */
     std::unique_ptr<GlobalTPContext> createTwoRankContext(int domain_id = 42)
     {
+        const auto inventory = MPIContextFactory::global()->clusterInventory();
+        const auto &observed = inventory->ranks.at(world_rank_);
         return GlobalTPContext::createWithSplit(
             MPI_COMM_WORLD,
             domain_id,
             /*color=*/0,        // Same color = same domain
-            /*key=*/world_rank_ // Key determines ordering within domain
+            /*key=*/world_rank_, // Key determines ordering within domain
+            GlobalDeviceAddress::cpu(observed.cpu.numa_node, observed.hostname)
         );
     }
 };
@@ -842,11 +846,14 @@ TEST_F(Test__GlobalTPContext_MPI, ScopeReflectsNodePlacement_AllRanks)
 
 TEST_F(Test__GlobalTPContext_MPI, SameNodeUPIUsesShmemSpinBackend)
 {
+    const auto inventory = MPIContextFactory::global()->clusterInventory();
+    const auto &observed = inventory->ranks.at(world_rank_);
     auto ctx = GlobalTPContext::createWithSplit(
         MPI_COMM_WORLD,
         /*domain_id=*/6060,
         /*color=*/0,
         /*key=*/world_rank_,
+        GlobalDeviceAddress::cpu(observed.cpu.numa_node, observed.hostname),
         /*hostfile_path=*/"",
         CollectiveBackendType::UPI);
     ASSERT_NE(ctx, nullptr);

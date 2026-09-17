@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -143,6 +144,22 @@ namespace llaminar2
             std::size_t planned_bytes,
             std::size_t already_resident_bytes = 0u);
 
+        /**
+         * @brief Add the per-owner envelope of mutually exclusive setup plans.
+         * @param alternatives Complete plans whose temporary owners retire before
+         *        the next alternative executes. Shared source storage may persist.
+         * @return This builder; existing concurrent contributions remain additive.
+         * @throws std::invalid_argument for conflicting resources or residency credits.
+         *
+         * This is admission arithmetic, not permission to overlap executions.
+         * The enclosing setup transaction must serialize these alternatives.
+         * Retained credits require allocation identity and cannot be combined by
+         * a maximum; this interface deliberately admits new storage only. Failure
+         * leaves the builder unchanged, including when the final addition overflows.
+         */
+        PhysicalMemoryPlanBuilder &addMutuallyExclusive(
+            std::span<const PhysicalMemoryPlan> alternatives);
+
         /** @return Immutable plan sorted by rank and typed device identity. */
         [[nodiscard]] PhysicalMemoryPlan build() const;
 
@@ -162,7 +179,8 @@ namespace llaminar2
     public:
         /**
          * @brief Certify a non-empty fitting aggregate plan.
-         * @throws std::invalid_argument when any resource is over budget.
+         * @throws PhysicalMemoryCapacityExhausted when any valid resource is over budget.
+         * @throws std::invalid_argument when the aggregate is empty or malformed.
          */
         explicit PhysicalMemoryPlanAdmissionCertificate(
             PhysicalMemoryPlan plan);
@@ -536,6 +554,16 @@ namespace llaminar2
     class PhysicalMemoryAuthority final
     {
     public:
+        /**
+         * @brief Apply a user ceiling to an observed allocator's admission capacity.
+         * @param observed_available_bytes Immutable observation, not a subsystem balance.
+         * @param explicit_limit_bytes Optional user constraint; zero deliberately admits no bytes.
+         * @return Capacity supplied to the canonical BOM, never a safety reserve or live debit.
+         */
+        [[nodiscard]] static std::size_t admissionCapacity(
+            std::size_t observed_available_bytes,
+            std::optional<std::size_t> explicit_limit_bytes) noexcept;
+
         /**
          * @brief Bind a fitting topology admission to one materializing rank.
          * @param admission Shared immutable topology-wide proof.

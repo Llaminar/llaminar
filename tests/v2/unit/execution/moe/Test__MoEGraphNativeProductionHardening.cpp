@@ -1,6 +1,10 @@
 /**
  * @file Test__MoEGraphNativeProductionHardening.cpp
- * @brief Phase 21 graph-native MoE overlay production hardening tests.
+ * @brief Graph-native MoE topology, routing and configuration invariants.
+ *
+ * These device-free cases validate production placement semantics independently
+ * of model loading. Omitted policies resolve to typed defaults; malformed
+ * explicit policies still fail instead of entering an alternative execution path.
  */
 
 #include "config/OrchestrationConfigParser.h"
@@ -143,7 +147,8 @@ namespace llaminar2::test
                                { return error.find(needle) != std::string::npos; });
         }
 
-        std::string parseArgsError(std::initializer_list<const char *> args)
+        /** @brief Parse real CLI inputs; return typed intent or propagate its input error. */
+        OrchestrationConfig parseArgs(std::initializer_list<const char *> args)
         {
             std::vector<std::string> strings;
             std::vector<char *> argv;
@@ -153,15 +158,7 @@ namespace llaminar2::test
                 argv.push_back(arg.data());
 
             OrchestrationConfigParser parser;
-            try
-            {
-                (void)parser.parseArgs(static_cast<int>(argv.size()), argv.data());
-            }
-            catch (const std::invalid_argument &error)
-            {
-                return error.what();
-            }
-            return {};
+            return parser.parseArgs(static_cast<int>(argv.size()), argv.data());
         }
 
     } // namespace
@@ -261,25 +258,43 @@ namespace llaminar2::test
         EXPECT_TRUE(hasErrorContaining(result, "at most one fallback tier"));
     }
 
-    TEST(Test__MoEGraphNativeProductionHardening, ParserRequiresRoutedDomainScopeAndComputePolicy)
+    TEST(Test__MoEGraphNativeProductionHardening, ParserDefaultsOmittedDomainPoliciesButRejectsInvalidExplicitValues)
     {
-        const std::string missing_scope = parseArgsError({"llaminar2",
+        const auto missing_scope = parseArgs({"llaminar2",
                                                           "--moe-routed-expert-placement", "tiered-overlay",
                                                           "--moe-routed-expert-continuation-domain", "cuda_hot",
                                                           "--moe-routed-expert-shared-domain", "cuda_hot",
                                                           "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;backend=nccl;routed_compute=apportioned",
                                                           "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
-        EXPECT_NE(missing_scope.find("missing scope"), std::string::npos);
+        ASSERT_NE(missing_scope.moe_routed_expert_plan, nullptr);
+        ASSERT_EQ(missing_scope.moe_routed_expert_plan->domains.size(), 1u);
+        EXPECT_EQ(missing_scope.moe_routed_expert_plan->domains.front().scope,
+                  ExecutionDomainScope::AUTO);
+        EXPECT_EQ(missing_scope.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                  RoutedExpertComputePolicy::Apportioned);
 
-        const std::string missing_compute = parseArgsError({"llaminar2",
+        const auto missing_compute = parseArgs({"llaminar2",
                                                             "--moe-routed-expert-placement", "tiered-overlay",
                                                             "--moe-routed-expert-continuation-domain", "cuda_hot",
                                                             "--moe-routed-expert-shared-domain", "cuda_hot",
                                                             "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;scope=single;backend=nccl",
                                                             "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
-        EXPECT_NE(missing_compute.find("missing routed_compute"), std::string::npos);
+        ASSERT_NE(missing_compute.moe_routed_expert_plan, nullptr);
+        ASSERT_EQ(missing_compute.moe_routed_expert_plan->domains.size(), 1u);
+        EXPECT_EQ(missing_compute.moe_routed_expert_plan->domains.front().scope,
+                  ExecutionDomainScope::SINGLE);
+        EXPECT_EQ(missing_compute.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                  RoutedExpertComputePolicy::Apportioned);
+
+        for (const char *domain : {
+                 "x=cuda:0;scope=misspelled;routed_compute=apportioned",
+                 "x=cuda:0;scope=single;routed_compute=misspelled"})
+        {
+            EXPECT_THROW((void)parseArgs({"llaminar2", "--moe-routed-expert-domain", domain}),
+                         std::invalid_argument);
+        }
     }
 
     TEST(Test__MoEGraphNativeProductionHardening, ExecutionPlanResolverReportsAmbiguousLocalTPRankHints)

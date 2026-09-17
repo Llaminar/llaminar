@@ -271,14 +271,14 @@ if(HAVE_CUDA)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
     
-    # NOTE: CUDA_SEPARABLE_COMPILATION is set per-target (on cuda_backend and
-    # device_benchmarks) rather than globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
+    # NOTE: CUDA_SEPARABLE_COMPILATION is set on cuda_backend rather than
+    # globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
     # this resolves device symbols at library build time. Without this, every downstream
     # executable (580+ test binaries) gets its own nvcc device-link step, adding ~19MB
-    # per executable and massive link time. With per-library resolution, only the 3 GPU
+    # per executable and massive link time. With per-library resolution, only the GPU
     # libraries need device linking — executables link normally.
     #
-    # The nvlink_pool job limit is no longer needed (3 library device links vs 580+
+    # The nvlink_pool job limit is no longer needed (library device links vs 580+
     # executable device links), but we keep a small pool as a safety net.
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
@@ -427,6 +427,7 @@ if(HAVE_CUDA)
     # Note: NvidiaContextFactory.cu registers the CUDA factory with GPUDeviceContextPool
     # Note: CUDAWorkerImpl.cu provides cuda_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(cuda_backend STATIC 
+        backends/cuda/CUDADriverApi.cpp
         backends/cuda/CUDABackend.cu
         backends/cuda/CUDATensorValidation.cu
         backends/cuda/NvidiaDeviceContext.cu
@@ -472,14 +473,15 @@ if(HAVE_CUDA)
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
-    # - cuda_driver: uniform graph metadata inspection for runtime and NCCL nodes
+    # Driver API symbols are deferred by CUDADriverApi; CPU-only cluster members
+    # load this same full binary without an NVIDIA driver or toolkit stub.
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
-        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt
+        ${CMAKE_DL_LIBS}
     )
     
     # Link MPI for NCCLBackend.cpp (which uses MPI_Comm_rank for distributed communication)
@@ -1016,77 +1018,14 @@ if(HAVE_ROCM)
     endif()
 endif()
 
-# =============================================================================
-# Device Benchmarks (CPU + CUDA + ROCm)
-# =============================================================================
-# Lightweight benchmarks for measuring actual device capabilities:
-# - Memory bandwidth (GB/s)
-# - Compute throughput (GFLOPS/GOPS)
-# - Host-device transfer rates
-# - Peer-to-peer transfer rates (multi-GPU)
-#
-# Results are used by PlacementStrategy to make informed placement decisions
-# based on measured values rather than heuristic estimates.
-
-set(BENCHMARK_SOURCES
-    backends/benchmarks/DeviceBenchmark.cpp
-    backends/benchmarks/CPUBenchmark.cpp
-)
-
-# Add CUDA benchmark if CUDA backend enabled
-if(HAVE_CUDA)
-    list(APPEND BENCHMARK_SOURCES backends/benchmarks/CUDABenchmark.cu)
-endif()
-
-# Add ROCm benchmark if ROCm backend enabled
-if(HAVE_ROCM)
-    list(APPEND BENCHMARK_SOURCES backends/benchmarks/ROCmBenchmark.cpp)
-endif()
-
-
-
-add_library(device_benchmarks STATIC ${BENCHMARK_SOURCES})
-# Resolve device symbols at library build time (same rationale as cuda_backend/rocm_backend).
-if(HAVE_CUDA)
-    set_target_properties(device_benchmarks PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-    )
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
-    endif()
-endif()
-if(HAVE_ROCM)
-    set_target_properties(device_benchmarks PROPERTIES
-        HIP_RESOLVE_DEVICE_SYMBOLS ON
-    )
-endif()
-target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
-
-if(HAVE_CUDA)
-    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart)
-    target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
-endif()
-
-if(HAVE_ROCM)
-    target_link_libraries(device_benchmarks PRIVATE hip::host)
-    target_compile_definitions(device_benchmarks PRIVATE HAVE_ROCM=1)
-    # ROCm files need HIP compilation
+# HostBackendROCm belongs to the live collective backend, not an optional
+# benchmark library. Preserve its HIP compilation when both vendors are built.
+if(HAVE_ROCM AND HAVE_CUDA)
     set_source_files_properties(
-        backends/benchmarks/ROCmBenchmark.cpp
+        collective/backends/HostBackendROCm.cpp
         PROPERTIES LANGUAGE HIP
     )
-    if(HAVE_CUDA)
-        set_source_files_properties(
-            collective/backends/HostBackendROCm.cpp
-            PROPERTIES LANGUAGE HIP
-        )
-    endif()
 endif()
-
-message(STATUS "V2: Device benchmarks library configured")
 
 # =============================================================================
 # OneDNN Configuration for INT8/BF16 GEMM Acceleration
@@ -1379,6 +1318,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/ComputeBackend.cpp
     backends/HostMemoryCapacity.cpp
     backends/HardwareInventory.cpp
+    backends/CPUCacheInventory.cpp
+    backends/CPUExecutionGeometry.cpp
+    kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
@@ -1440,6 +1382,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
     execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp
     execution/compute_stages/stages/MTPStochasticTargetDistributionStage.cpp
+    execution/compute_stages/stages/OrdinaryGenerationSamplingStage.cpp
+    execution/compute_stages/stages/DecodePositionSnapshotStage.cpp
+    execution/mtp/DeviceGenerationGraphProgram.cpp
     execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
@@ -1582,6 +1527,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
+    execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp
+    execution/local_execution/orchestrators/PipelineForwardGraphEdges.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
@@ -1616,6 +1565,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
+    config/OrchestrationConfigDocument.cpp
+    config/OrchestrationStartupPolicy.cpp
+    config/OrchestrationPlanningPolicy.cpp
     # Declarative config validation rule framework (device selection conflict detection)
     config/ConfigValidator.cpp
     # ParallelismTree parser (Phase 7 - CLI/YAML parser for ParallelismTree)
@@ -1637,12 +1589,46 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/ClusterInventoryGatherer.cpp
     planning/ModelMemoryProfile.cpp
     planning/WeightMemoryEstimator.cpp
+    planning/WeightShardGeometry.cpp
+    planning/PlanningForwardWeightWork.cpp
+    planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
     planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
+    planning/RankMemoryPlanInputs.cpp
+    planning/MoEOverlayPlanningInputs.cpp
+    planning/MoEOverlayMemoryPlanInputs.cpp
+    planning/PlanningModelMetadata.cpp
+    planning/PlanningPublication.cpp
+    planning/ResolvedRankOrchestration.cpp
+    planning/AutomaticOrchestrationCandidates.cpp
+    planning/OrchestrationCandidateAdmission.cpp
+    planning/AutomaticOrchestrationPlanner.cpp
+    planning/AutomaticPlanningStartup.cpp
+    planning/OrchestrationPerformanceEvidence.cpp
+    planning/PlanningExecutionMeasurement.cpp
+    planning/PlanningMemoryBandwidthMeasurement.cpp
+    planning/PlanningProjectionMeasurement.cpp
+    planning/PlanningLocalTPMeasurement.cpp
+    planning/PlanningCPUExpertMeasurement.cpp
+    planning/PlanningGPUExpertMeasurement.cpp
+    planning/PlanningModelSample.cpp
+    planning/PlanningExpertSample.cpp
+    planning/PlanningMatrixSample.cpp
+    planning/PlanningKernelServiceCatalog.cpp
+    planning/PlanningCommunicationService.cpp
+    planning/PlanningCommunicationCost.cpp
+    planning/PlanningHostDeviceMeasurement.cpp
+    planning/PlanningWeightServiceModel.cpp
+    planning/PlanningRequestCostModel.cpp
+    kernels/cpu/gemm/CPUWeightPreparationMemory.cpp
+    planning/PlanningMPITransferMeasurement.cpp
+    planning/ExecutionRankMembership.cpp
+    utils/MPIContext.cpp
+    execution/mpi_orchestration/DeviceInventory.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
     execution/mpi_orchestration/ExecutionPlanBuilder.cpp
     # Pipeline parallel graph builder (Phase 3 - PP stage insertion)
@@ -1658,6 +1644,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
     app/MPIShutdown.cpp
+    app/MPIProcessSession.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
     app/commands/CommandMPI.cpp
@@ -1777,6 +1764,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    kernels/KernelFactoryGPUWeights.cpp
     kernels/HybridKVCacheConfig.cpp
     kernels/common/PreparedEmbeddingWeights.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
@@ -1850,6 +1838,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/runner/RankInitializationLifecycle.cpp
     execution/runner/ModelContextRetirement.cpp
     execution/runner/OrchestrationRunner.cpp
+    execution/runner/MTPStochasticVerificationOwner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
     execution/global/NamedDomainGraphBuilder.cpp
     # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
@@ -2077,16 +2066,6 @@ if(HAVE_ROCM)
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
 endif()
 
-# Link device benchmarks library
-if(LLAMINAR_SHARED_CORE)
-    target_link_libraries(llaminar2_core PRIVATE
-        -Wl,--whole-archive device_benchmarks -Wl,--no-whole-archive
-    )
-else()
-    target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
-endif()
-message(STATUS "V2: Linked device benchmarks library")
-
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
     if(LLAMINAR_HAVE_CUTLASS)
@@ -2096,10 +2075,6 @@ if(HAVE_CUDA)
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 
-        # Shared-core consumers must explicitly resolve Driver API symbols when
-        # building against toolkit stubs without an installed NVIDIA driver.
-        # This is a link dependency, never a stub copied into the runtime image.
-        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt  # For fused GEMM+bias operations
     )

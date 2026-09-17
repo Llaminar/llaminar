@@ -525,6 +525,19 @@ namespace llaminar2::test::parity
 
         // LM_HEAD thresholds
         float kl_threshold = 0.15f;      ///< Maximum KL divergence for logits
+        /** Optional prefill-only budget; ordinary decode and MTP retain their own limits. */
+        std::optional<float> prefill_kl_threshold;
+
+        /**
+         * @return The prefill logit budget without changing incremental decode.
+         *
+         * A model/KV-specific prefill allowance must not silently relax every
+         * later token or recursively conditioned predictor checkpoint.
+         */
+        float prefillKLThreshold() const noexcept
+        {
+            return prefill_kl_threshold.value_or(kl_threshold);
+        }
         /**
          * @brief Optional KL budget for recursively conditioned MTP logits.
          *
@@ -2080,6 +2093,8 @@ namespace llaminar2::test::parity
         int early_layers_count = 4;                     ///< Number of early layers to check
         int min_early_layers_passed = 4;                ///< Min early layers that must pass
         float kl_threshold = 0.05f;                     ///< Max KL divergence for logits
+        /** Optional prefill-only KL budget; unset retains the ordinary logit limit. */
+        std::optional<float> prefill_kl_threshold;
         /**
          * @brief Optional MTP-only KL budget; unset preserves @ref kl_threshold.
          */
@@ -3110,7 +3125,7 @@ namespace llaminar2::test::parity
         {
             std::cout << "LM_HEAD KL divergence: " << std::fixed
                       << std::setprecision(4) << summary.lm_head_kl
-                      << " (threshold: " << config.kl_threshold << ")\n";
+                      << " (threshold: " << config.prefillKLThreshold() << ")\n";
         }
     }
 
@@ -11204,7 +11219,7 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
+            summary.lm_head_passed = (summary.lm_head_kl < config_.prefillKLThreshold()) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
                                      ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
                                      (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
@@ -11585,7 +11600,7 @@ namespace llaminar2::test::parity
                     }
                 }
             }
-            summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
+            summary.lm_head_passed = (summary.lm_head_kl < config_.prefillKLThreshold()) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
                                      ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
                                      (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
@@ -11885,7 +11900,7 @@ namespace llaminar2::test::parity
                 << "At least " << config_.min_early_layers_passed << " of the first "
                 << config_.early_layers_count << " layers should pass TP parity";
 
-            EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
+            EXPECT_LT(summary.lm_head_kl, config_.prefillKLThreshold())
                 << "LM_HEAD KL divergence too high: " << summary.lm_head_kl;
 
             EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
@@ -12081,9 +12096,9 @@ namespace llaminar2::test::parity
             // LM_HEAD assertions (skip if this rank has no LM_HEAD data, e.g. PP head)
             if (has_lm_head_data)
             {
-                EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
+                EXPECT_LT(summary.lm_head_kl, config_.prefillKLThreshold())
                     << "LM_HEAD KL divergence too high: " << summary.lm_head_kl
-                    << " (threshold: " << config_.kl_threshold << ")";
+                    << " (threshold: " << config_.prefillKLThreshold() << ")";
 
                 EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
                     << "LM_HEAD Top-1 accuracy too low: " << (summary.lm_head_top1 * 100.0f)

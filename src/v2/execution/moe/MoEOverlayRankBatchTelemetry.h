@@ -68,6 +68,31 @@ namespace llaminar2
         }
 
         /**
+         * @brief Observe an authenticated empty numerical outcome, not MPI traffic.
+         * @param participant_count Complete graph-bound participant count.
+         *
+         * Both endpoints retain the exact ordered outcome. No payload-byte or
+         * physical return-transaction counter is incremented for an elided RPC.
+         */
+        void recordEmptyReturn(std::size_t participant_count) const
+        {
+            if (kind_ != MoEOverlayRankBatchTransportKind::MPI ||
+                key_.direction != MoEOverlayCollectiveDirection::ReturnReduce)
+                throw std::logic_error("Empty MPI return evidence requires its exact return boundary");
+            if (!PerfStatsCollector::isDomainEnabled("forward_graph"))
+                return;
+            auto tags = topologyTags();
+            tags.emplace("participant_count", std::to_string(participant_count));
+            PerfStatsCollector::addCounter(
+                "forward_graph", "moe_overlay_rank_batch_empty_return_transactions",
+                1.0, "moe_overlay", transportName(), tags);
+            PerfStatsCollector::recordOrderedSequenceStep(
+                "forward_graph", "moe_overlay_rank_batch_empty_return_sequence",
+                {key_.generation_id, key_.step_id, key_.sequence, 0u},
+                phase(), transportName(), tags);
+        }
+
+        /**
          * @brief Aggregate completed wire/codec/total intervals by the same geometry.
          * @param codec_ns MPI encode/decode time; zero for in-place shared rows.
          * @param wait_ns Peer publication/wire wait, including peer computation.

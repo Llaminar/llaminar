@@ -11,6 +11,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "execution/mtp/MTPCheckpointPolicy.h"
 #include "planning/KVCacheMemoryEstimator.h"
 
 #include <cstddef>
@@ -43,6 +44,7 @@ namespace llaminar2
         int mtp_full_attention_layers = 0;
         int mtp_gdn_layers = 0;
 
+        /** @return All non-KV persistent contributions; the physical authority admits them. */
         size_t stateBytes() const noexcept
         {
             return live_recurrent_state_bytes +
@@ -51,6 +53,7 @@ namespace llaminar2
         }
     };
 
+    /** @brief Contributes cache/state BOM bytes from the live runtime's ownership geometry. */
     class PersistentStateMemoryEstimator
     {
     public:
@@ -81,7 +84,8 @@ namespace llaminar2
          * @param first_layer First main-model layer owned by this participant.
          * @param last_layer Last main-model layer owned by this participant.
          * @param kv_precision Runtime KV storage format.
-         * @param mtp_enabled Whether shifted MTP caches/checkpoints are resident.
+         * @param mtp_role Main rollback and shifted predictor ownership. Pipeline
+         *        followers retain the former without allocating the latter.
          */
         static PersistentStateEstimate estimate(
             const ModelMemoryProfile &profile,
@@ -95,6 +99,6 @@ namespace llaminar2
             int first_layer,
             int last_layer,
             const std::string &kv_precision,
-            bool mtp_enabled);
+            MTPStateRole mtp_role);
     };
 }

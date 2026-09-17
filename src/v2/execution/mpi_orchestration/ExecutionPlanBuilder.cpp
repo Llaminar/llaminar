@@ -7,12 +7,15 @@
  * Two modes of operation:
  * 1. Named domains: Uses --define-domain and --pp-stage for complex configs
  * 2. Simple TP/PP: Uses --tp, --pp, --device for straightforward cases
+ * Physical CPU locality comes only from the gathered observation, never from
+ * communicator rank order or a presumed contiguous NUMA numbering scheme.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "ExecutionPlanBuilder.h"
+#include "planning/RankHardwareOwnership.h"
 #include "../moe/MoERoutedExpertPlacementPlan.h"
 #include "../../utils/Logger.h"
 #include "../../backends/ComputeBackend.h"
@@ -325,7 +328,7 @@ namespace llaminar2
                 throw std::invalid_argument("Execution domain '" + domain.name + "' needs one owner rank per participant");
             for (std::size_t index = 0; index < domain.devices.size(); ++index)
             {
-                const auto &device = domain.devices[index];
+                auto &device = domain.devices[index];
                 // Local ordinals may repeat on different MPI ranks. An explicit
                 // owner is authoritative, not a hint to the discovery heuristic.
                 const int required_rank = canonical.ranks.empty()
@@ -335,6 +338,24 @@ namespace llaminar2
                 if (rank >= 0)
                 {
                     rank_set.insert(rank);
+                    const auto &owner = cluster_inventory.ranks.at(rank);
+                    if (device.isLocal()) device.hostname = owner.hostname;
+                    if (device.numa_node < 0)
+                    {
+                        if (device.isCPU())
+                        {
+                            if (owner.cpu.numa_node < 0)
+                                throw std::invalid_argument("CPU domain endpoint on a whole-host rank requires an explicit NUMA node");
+                            device.numa_node = owner.cpu.numa_node;
+                        }
+                        else
+                        {
+                            const auto gpu = std::find_if(owner.gpus.begin(), owner.gpus.end(), [&](const auto &observed) {
+                                return observed.type == device.device_type && observed.local_device_id == device.device_ordinal;
+                            });
+                            if (gpu != owner.gpus.end()) device.numa_node = gpu->numa_node;
+                        }
+                    }
                 }
                 else
                 {
@@ -362,6 +383,25 @@ namespace llaminar2
                 throw std::invalid_argument(oss.str());
             }
             domain.ranks.assign(rank_set.begin(), rank_set.end());
+
+            // Domain indices and shard indices use parent-rank order. Move
+            // device/owner/work-share tuples together, retaining declaration
+            // order within a rank-local group. Sorting ranks alone misbinds a
+            // reversed cross-rank declaration to another participant's CPU.
+            std::vector<size_t> order(domain.devices.size());
+            std::iota(order.begin(), order.end(), size_t{0});
+            std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+                return domain.device_ranks[left] < domain.device_ranks[right];
+            });
+            const auto devices = domain.devices;
+            const auto owners = domain.device_ranks;
+            const auto weights = domain.weights;
+            for (size_t index = 0; index < order.size(); ++index)
+            {
+                domain.devices[index] = devices[order[index]];
+                domain.device_ranks[index] = owners[order[index]];
+                if (!weights.empty()) domain.weights[index] = weights.at(order[index]);
+            }
 
             // Build rank-to-index mapping
             int idx = 0;
@@ -430,7 +470,7 @@ namespace llaminar2
                 for (const auto &rank_inv : cluster_inventory.ranks)
                 {
                     domain.devices.push_back(GlobalDeviceAddress::cpu(
-                        rank_inv.numa_nodes > 0 ? 0 : rank_inv.local_rank,
+                        rank_inv.cpu.numa_node,
                         rank_inv.hostname));
                 }
             }
@@ -477,30 +517,10 @@ namespace llaminar2
             // For CPU devices, match by NUMA node
             if (device.isCPU())
             {
-                /*
-                 * A one-rank local execution plan owns the whole host, not
-                 * just the socket whose index equals local_rank.  This matters
-                 * for explicit local CPU tensor-parallel domains such as
-                 * cpu:0,cpu:1: both NUMA participants are valid and both are
-                 * serviced by rank 0.  Multi-rank jobs keep the stricter
-                 * socket-to-local-rank ownership heuristic below so a
-                 * rank-qualified CPU domain still catches missing ranks.
-                 */
-                if (cluster_inventory.world_size == 1)
-                {
-                    const int numa_nodes = std::max(1, rank_inv.numa_nodes);
-                    if (device.numa_node < 0 || device.numa_node < numa_nodes)
-                    {
-                        return rank_inv.rank;
-                    }
-                }
-
-                // CPU device is typically on the rank's NUMA node
-                // Simple heuristic: rank N owns CPU on NUMA node rank % numa_nodes
-                if (device.numa_node == rank_inv.local_rank % std::max(1, rank_inv.numa_nodes))
-                {
+                // A one-process invocation can be bound too. Only a genuine
+                // whole-host observation permits all explicitly observed nodes.
+                if (rankOwnsCPUNode(rank_inv, device.numa_node))
                     return rank_inv.rank;
-                }
             }
             else
             {
@@ -712,7 +732,7 @@ namespace llaminar2
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
             plan.hostname = rank_inv.hostname;
-            plan.numa_node = rank_inv.local_rank; // Approximate
+            plan.numa_node = rank_inv.cpu.numa_node;
         }
 
         // Collect ALL PP stages this rank participates in (sorted by stage_id)
@@ -893,7 +913,7 @@ namespace llaminar2
             }
             else
             {
-                plan.primary_device = GlobalDeviceAddress::cpu(0, rank_inv.hostname);
+                plan.primary_device = GlobalDeviceAddress::cpu(rank_inv.cpu.numa_node, rank_inv.hostname);
             }
         }
 
@@ -969,7 +989,7 @@ namespace llaminar2
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
             plan.hostname = rank_inv.hostname;
-            plan.numa_node = rank_inv.local_rank;
+            plan.numa_node = rank_inv.cpu.numa_node;
         }
 
         // PP configuration
@@ -1156,7 +1176,7 @@ namespace llaminar2
             }
             else
             {
-                plan.primary_device = GlobalDeviceAddress::cpu(0, rank_inv.hostname);
+                plan.primary_device = GlobalDeviceAddress::cpu(rank_inv.cpu.numa_node, rank_inv.hostname);
             }
         }
 
@@ -1479,49 +1499,15 @@ namespace llaminar2
             {
                 spec.is_global_tp = true;
 
-                // Participating ranks
-                if (dom_def && !dom_def->explicit_ranks.empty())
-                {
-                    spec.participating_ranks = dom_def->explicit_ranks;
-                }
-                else if (resolved && !resolved->ranks.empty())
-                {
-                    spec.participating_ranks = resolved->ranks;
-                }
-                else
-                {
-                    // Fallback: all ranks
-                    for (int r = 0; r < cluster_inventory.world_size; ++r)
-                    {
-                        spec.participating_ranks.push_back(r);
-                    }
-                }
-                std::sort(spec.participating_ranks.begin(), spec.participating_ranks.end());
-                spec.participating_ranks.erase(
-                    std::unique(spec.participating_ranks.begin(), spec.participating_ranks.end()),
-                    spec.participating_ranks.end());
-
-                // Per-rank device: use first device from the domain if available
-                if (dom_def && !dom_def->devices.empty())
-                {
-                    spec.per_rank_device = dom_def->devices.front();
-                    if (dom_def->devices.size() == spec.participating_ranks.size())
-                    {
-                        spec.per_rank_devices = dom_def->devices;
-                    }
-                }
-                else if (resolved && !resolved->devices.empty())
-                {
-                    spec.per_rank_device = resolved->devices.front();
-                    if (resolved->devices.size() == spec.participating_ranks.size())
-                    {
-                        spec.per_rank_devices = resolved->devices;
-                    }
-                }
-                else
-                {
-                    spec.per_rank_device = GlobalDeviceAddress::cpu();
-                }
+                // The domain compiler owns aligned rank/device membership.
+                // Re-reading requested declarations here loses normalized
+                // physical endpoints and can independently reorder TP shards.
+                if (!resolved || resolved->ranks.empty() ||
+                    resolved->devices.size() != resolved->ranks.size())
+                    throw std::invalid_argument("Global TP stage requires one resolved endpoint per rank");
+                spec.participating_ranks = resolved->ranks;
+                spec.per_rank_devices = resolved->devices;
+                spec.per_rank_device = resolved->devices.front();
             }
 
             specs.push_back(std::move(spec));
@@ -1542,7 +1528,7 @@ namespace llaminar2
             specs.push_back(std::move(single));
         }
 
-        return GlobalPPTopology::build(std::move(specs), model_config.n_layers, cluster_inventory.world_size);
+        return GlobalPPTopology::build(std::move(specs), model_config.n_layers, cluster_inventory);
     }
 
     // =========================================================================

@@ -10,6 +10,7 @@
  *   ctest --test-dir build_v2_release -R V2_Perf_AVX2vsAVX512 -V
  */
 
+#include "../../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <chrono>
@@ -248,13 +249,14 @@ TEST_F(Perf__AVX2vsAVX512, GEMV_AllFormats)
                 continue;
 
             auto A_q8 = createRandomQ8_1(shape.K, 1, 99);
+            llaminar2::test::NativeVNNITestPartialStorage partial_storage(packed, 1);
             std::vector<float> out(shape.N);
 
             double t512 = benchmarkMedianUs(
                 [&]()
                 {
                     std::memset(out.data(), 0, out.size() * sizeof(float));
-                    gemv_native_vnni_preq(packed, A_q8.data(), out.data(), ISAPath::AVX512);
+                    gemv_native_vnni_preq(packed, A_q8.data(), out.data(), partial_storage.span(), ISAPath::AVX512);
                 },
                 WARMUP_ITERS, BENCH_ITERS);
 
@@ -262,7 +264,7 @@ TEST_F(Perf__AVX2vsAVX512, GEMV_AllFormats)
                 [&]()
                 {
                     std::memset(out.data(), 0, out.size() * sizeof(float));
-                    gemv_native_vnni_preq(packed, A_q8.data(), out.data(), ISAPath::AVX2);
+                    gemv_native_vnni_preq(packed, A_q8.data(), out.data(), partial_storage.span(), ISAPath::AVX2);
                 },
                 WARMUP_ITERS, BENCH_ITERS);
 
@@ -366,13 +368,14 @@ TEST_F(Perf__AVX2vsAVX512, GEMM_RepresentativeFormats)
         for (int M : GEMM_M_VALUES)
         {
             auto A_q8 = createRandomQ8_1(shape.K, M, 99);
+            llaminar2::test::NativeVNNITestPartialStorage partial_storage(packed, M);
             std::vector<float> out(static_cast<size_t>(M) * shape.N);
 
             double t512 = benchmarkMedianUs(
                 [&]()
                 {
                     std::memset(out.data(), 0, out.size() * sizeof(float));
-                    gemm_native_vnni_preq(packed, A_q8.data(), out.data(), M, shape.N, ISAPath::AVX512);
+                    gemm_native_vnni_preq(packed, A_q8.data(), out.data(), partial_storage.span(), M, shape.N, ISAPath::AVX512);
                 },
                 WARMUP_ITERS / 2, BENCH_ITERS / 2);
 
@@ -380,7 +383,7 @@ TEST_F(Perf__AVX2vsAVX512, GEMM_RepresentativeFormats)
                 [&]()
                 {
                     std::memset(out.data(), 0, out.size() * sizeof(float));
-                    gemm_native_vnni_preq(packed, A_q8.data(), out.data(), M, shape.N, ISAPath::AVX2);
+                    gemm_native_vnni_preq(packed, A_q8.data(), out.data(), partial_storage.span(), M, shape.N, ISAPath::AVX2);
                 },
                 WARMUP_ITERS / 2, BENCH_ITERS / 2);
 

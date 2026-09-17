@@ -17,6 +17,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
@@ -75,6 +76,18 @@ namespace
         WorkspaceRequirements getWorkspaceRequirements(int, int = 0, int = 0) const override
         {
             return WorkspaceRequirements{};
+        }
+
+        /** @brief Match the production transform declaration without invoking kernels. */
+        void appendSwiGLUWorkspaceRequirements(WorkspaceRequirements &requirements, int m, int k) const override
+        {
+            requirements.merge(cpuSwiGLUWorkspaceRequirements(m, k));
+        }
+
+        /** @brief Record the same independently selected product lifetime as NativeVNNI. */
+        void appendOutputAccumulationWorkspaceRequirements(WorkspaceRequirements &requirements, int m, int n) const override
+        {
+            requirements.merge(cpuProjectionFP32WorkspaceRequirements(kCPUProjectionProduct, m, n));
         }
 
         void bindWorkspace(DeviceWorkspaceManager *workspace) override { bound_workspace = workspace; }
@@ -619,6 +632,24 @@ TEST_F(Test__GEMMStage, ExecutePassesBoundWorkspaceToFusedSwigluKernel)
 
     GEMMStage stage(params);
     DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+    // gate_input is execution authority even when the diagnostic bool is false.
+    ASSERT_FALSE(params.do_swiglu);
+    const auto requirements = stage.getWorkspaceRequirements(9);
+    ASSERT_EQ(requirements.buffers.size(), 1u);
+    EXPECT_EQ(requirements.buffers.front().name, kCPUSwiGLUInput);
+    EXPECT_EQ(requirements.buffers.front().size_bytes, 9u * params.k * sizeof(float));
+    auto plain_params = params;
+    plain_params.gate_input = nullptr;
+    plain_params.do_swiglu = true;
+    GEMMStage plain(plain_params);
+    EXPECT_TRUE(plain.getWorkspaceRequirements(9).buffers.empty());
+    auto accumulated_params = plain_params;
+    accumulated_params.beta = .25f;
+    GEMMStage accumulated(accumulated_params);
+    const auto accumulated_requirements = accumulated.getWorkspaceRequirements(9);
+    ASSERT_EQ(accumulated_requirements.buffers.size(), 1u);
+    EXPECT_EQ(accumulated_requirements.buffers.front().name, kCPUProjectionProduct);
+    EXPECT_EQ(accumulated_requirements.buffers.front().size_bytes, 9u * params.n * sizeof(float));
     stage.bindWorkspace(&workspace);
 
     CPUDeviceContext ctx(DeviceId::cpu(), 1);

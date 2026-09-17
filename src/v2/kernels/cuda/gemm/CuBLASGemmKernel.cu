@@ -12,6 +12,7 @@
  */
 
 #include "CuBLASGemmKernel.h"
+#include "CUDAFloatingPointGemmWorkspaceContract.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
@@ -39,10 +40,11 @@ namespace llaminar2
 
         namespace
         {
-            constexpr int kMaxBatchedSameAProjections = 8;
-            constexpr const char *kBatchedSameAAArray = "cublas_batched_same_a_a_ptrs";
-            constexpr const char *kBatchedSameABArray = "cublas_batched_same_a_b_ptrs";
-            constexpr const char *kBatchedSameACArray = "cublas_batched_same_a_c_ptrs";
+            constexpr int kMaxBatchedSameAProjections =
+                static_cast<int>(floating_gemm_abi::kMaxBatchedProjections);
+            using floating_gemm_workspace::kBatchedSameAAArray;
+            using floating_gemm_workspace::kBatchedSameABArray;
+            using floating_gemm_workspace::kBatchedSameACArray;
             constexpr auto kBiasMatmulWorkspace = floating_gemm_abi::kCudaBlasMatmulWorkspace;
             constexpr auto kBiasMatmulWorkspaceBytes = floating_gemm_abi::kBlasMatmulWorkspaceBytes;
 
@@ -684,14 +686,7 @@ namespace llaminar2
 
         WorkspaceRequirements CuBLASGemmKernel::getWorkspaceRequirements(int, int, int) const
         {
-            WorkspaceRequirements reqs;
-            const size_t bytes = static_cast<size_t>(kMaxBatchedSameAProjections) * sizeof(void *);
-            reqs.buffers.push_back({kBatchedSameAAArray, bytes, 256, true});
-            reqs.buffers.push_back({kBatchedSameABArray, bytes, 256, true});
-            reqs.buffers.push_back({kBatchedSameACArray, bytes, 256, true});
-            reqs.buffers.push_back(
-                {kBiasMatmulWorkspace, kBiasMatmulWorkspaceBytes, 256, true});
-            return reqs;
+            return floating_gemm_workspace::blasRequirements();
         }
 
         // =====================================================================

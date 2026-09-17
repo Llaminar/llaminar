@@ -149,7 +149,9 @@ namespace llaminar2
      * and a peer's post-adoption acknowledgement, making premature physical
      * staging unrepresentable. Only the terminal acknowledgement transitions it
      * to `ReadyToStage`. Deferred capacity keeps that exact state and
-     * transaction, while `Active` transfers ownership to the authority wave.
+     * transaction, while `Active` transfers physical ownership to the authority
+     * wave. Shutdown may discard only an unstarted local `ReadyToStage`
+     * proposal; `Active` remains retained through normal publication or abort.
      */
     enum class MoEOverlayRetainedTransactionState : std::uint8_t
     {
@@ -396,7 +398,13 @@ namespace llaminar2
         /** @brief Stop and join this process-local worker with the mutex held. */
         void stopLocalAndDrainLocked();
 
-        /** @brief Worker entry that catches all failures and owns state progress. */
+        /**
+         * @brief Poll retained work and resource retirement through shutdown.
+         * @param stop_token Closes new proposal admission without revoking waves.
+         *
+         * The same typed transaction transitions run before and after stop;
+         * only proposal admission and subordinate evidence producers close.
+         */
         void run(std::stop_token stop_token) noexcept;
 
         /** @brief Perform one non-blocking maintenance iteration. */
@@ -427,7 +435,14 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayHistogramWindowResult
         progressAuthoritativeHistogramWindow();
 
-        /** @brief Start or retry the exact retained transaction. */
+        /**
+         * @brief Admit, retry or discard one ReadyToStage transaction.
+         *
+         * This is the sole cancellation edge for unstarted local proposals once
+         * shutdown closes admission. An already-published distributed proposal
+         * remains executable so its physical peers can finish the generation.
+         * Active waves cannot enter this method and retain their normal poller.
+         */
         void tryBeginRetainedTransaction();
 
         /** @brief Progress coordinator publication or peer reception once. */

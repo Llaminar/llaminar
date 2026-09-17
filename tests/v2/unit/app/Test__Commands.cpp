@@ -164,17 +164,19 @@ TEST(Test__Commands, PlanRequiresModel)
     EXPECT_EQ(plan.execute(args.argc(), args.argv()), 1);
 }
 
-TEST(Test__Commands, PlanRejectsInvalidStrategy)
+TEST(Test__Commands, PlanRejectsRetiredPrivateStrategySpelling)
 {
     PlanCommand plan;
-    ArgvBuilder args("llaminar2", "-m", "model.gguf", "-s", "bogus");
+    ArgvBuilder args("llaminar2", "-m", "model.gguf", "--strategy", "cpu-only");
     EXPECT_EQ(plan.execute(args.argc(), args.argv()), 1);
 }
 
-TEST(Test__Commands, PlanAcceptsValidStrategy)
+TEST(Test__Commands, PlanValidatesSharedAutomaticPolicyWithoutHardwareOrModelLoading)
 {
     PlanCommand plan;
-    ArgvBuilder args("llaminar2", "--no-mpi-bootstrap", "-m", "/opt/llaminar-models/qwen2.5-0.5b-instruct-q4_0.gguf", "-s", "cpu-only");
+    ArgvBuilder args("llaminar2", "--validate-only", "-m", "model.gguf",
+                    "--only-backends", "cpu", "--only-strategies", "tp",
+                    "--mtp", "--mtp-depth-policy", "dynamic", "--kv-cache-precision", "fp32");
     EXPECT_EQ(plan.execute(args.argc(), args.argv()), 0);
 }
 

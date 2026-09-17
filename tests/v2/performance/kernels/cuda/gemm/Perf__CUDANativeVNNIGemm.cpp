@@ -173,7 +173,7 @@ namespace
 
     TEST(CUDANativeVNNIGemmPerfOffline, PrefillRowsExcludeDecodeAndVerifierDepths)
     {
-        EXPECT_EQ(kPrefillMValues, llaminar2::defaultPrefillGraphBucketSizes());
+        EXPECT_EQ(kPrefillMValues, llaminar2::supportedPrefillGraphBucketSizes());
         EXPECT_EQ(std::count(kPrefillMValues.begin(), kPrefillMValues.end(), 1), 0);
         for (int m = 2; m <= llaminar2::kDefaultNativeVNNIVerifierRowCapacity;
              ++m)
@@ -841,7 +841,7 @@ namespace
     {
         int warmup_runs = 3;
         int bench_runs = 10;
-        std::vector<int> prefill_m = llaminar2::defaultPrefillGraphBucketSizes();
+        std::vector<int> prefill_m = llaminar2::supportedPrefillGraphBucketSizes();
         std::set<std::string> shape_filters;
         std::vector<int> tile_ids = {0, 1, 2, 3, 4, 5};
         /*

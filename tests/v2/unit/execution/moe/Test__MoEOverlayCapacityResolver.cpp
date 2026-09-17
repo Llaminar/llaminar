@@ -14,6 +14,10 @@
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "../../../utils/CPUExecutionTestGeometry.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <gtest/gtest.h>
@@ -395,6 +399,20 @@ namespace llaminar2
             return profile;
         }
 
+        /** @brief Add exact expert matrices for CPU metadata-only workspace admission. */
+        void addRoutedExpertMetadata(ModelMemoryProfile &profile)
+        {
+            for (int layer = 0; layer < profile.n_layers; ++layer)
+            for (const auto suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"})
+            {
+                const int k = std::string_view(suffix) == "ffn_down_exps.weight"
+                    ? profile.expert_feed_forward_length : profile.d_model;
+                profile.tensors.push_back({.name = "blk." + std::to_string(layer) + "." + suffix,
+                    .quant_type = "Q8_0", .elements = size_t(profile.expert_count) * profile.d_model *
+                        profile.expert_feed_forward_length, .K = size_t(k), .layer_index = layer});
+            }
+        }
+
         /** @return Explicit model/load contract required by GPU capacity tests. */
         [[nodiscard]] MoEOverlayGPUWeightLoadCapacityInput
         testGPUWeightLoadCapacityInput(
@@ -449,6 +467,36 @@ namespace llaminar2
             };
         }
     } // namespace
+
+    /** @brief Setup admission accepts every floating family without a quantized stand-in. */
+    TEST(MoEOverlayCapacityResolver, FloatingManifestDefinesExactDeviceTransferCapacity)
+    {
+        using Directory = DeviceMoETransferSlotDirectory;
+        const auto capacity = Directory::planBufferedCapacity(1, 1, 2);
+        for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+        {
+            auto model_manifest = manifest(2, native_vnni_formats::Q8_0);
+            size_t wire_bytes = 0;
+            WeightVRAMPool planner;
+            for (auto &layer : model_manifest)
+                for (auto &projection : layer.projections)
+                    projection.format = ExpertWeightFormat::floating(type);
+            for (const auto &projection : model_manifest.front().projections)
+                wire_bytes += static_cast<size_t>(projection.N) * projection.K *
+                              projection.format.floatingElementBytes();
+            const auto profile = Directory::profileForLayerWeightManifest(model_manifest);
+            EXPECT_EQ(profile.max_wire_payload_bytes, wire_bytes);
+            for (uint32_t slot = 0; slot < capacity.total_slots; ++slot)
+                for (const auto &spec : profile.allocation_specs)
+                    planner.planRawWeight(std::to_string(slot) + spec.label, spec.N, spec.K,
+                        static_cast<size_t>(spec.N) * spec.K * spec.format.floatingElementBytes());
+            EXPECT_EQ(Directory::allocationBOM(capacity, profile).payload_bytes,
+                      planner.totalPlannedBytes());
+            model_manifest[1].projections[1].format = ExpertWeightFormat::floating(
+                type == TensorType::FP32 ? TensorType::FP16 : TensorType::FP32);
+            EXPECT_THROW(Directory::profileForLayerWeightManifest(model_manifest), std::invalid_argument);
+        }
+    }
 
     TEST(MoEOverlayCapacityResolver, EveryCataloguedCodebookHasExactCpuAndGpuFootprint)
     {
@@ -2127,7 +2175,8 @@ namespace llaminar2
     TEST(MoEOverlayLocalCapacityPlanner,
          GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource)
     {
-        const auto profile = smallModelProfile();
+        auto profile = smallModelProfile();
+        addRoutedExpertMetadata(profile);
 
         RankExecutionPlan rank_plan;
         rank_plan.rank = 5;
@@ -2143,6 +2192,11 @@ namespace llaminar2
 
         RankInventory inventory;
         inventory.rank = 5;
+        inventory.cpu_cores = 8;
+        inventory.cpu_worker_threads = 8;
+        // Generic hardware units must not replace the rank's actual workshare.
+        inventory.cpu.compute_units = 64;
+        inventory.cpu_execution = test::kSyntheticCPUExecutionGeometry;
         inventory.cpu_memory_bytes = 1024u * 1024u * 1024u;
         inventory.cpu.memory_bytes = 1024u * 1024u * 1024u;
         inventory.cpu.free_memory_bytes = 640u * 1024u * 1024u;
@@ -2218,11 +2272,21 @@ namespace llaminar2
         const auto *dynamic_bom = dynamic.physical_memory_admission->plan().find(cpu_identity);
         ASSERT_NE(static_bom, nullptr);
         ASSERT_NE(dynamic_bom, nullptr);
+        auto probe_profile = profile;
+        probe_profile.expert_used_count = 1;
+        WorkspaceMemoryGeometry probe_geometry;
+        probe_geometry.device = DeviceId::cpu();
+        probe_geometry.device_compute_units = inventory.cpu_cores;
+        probe_geometry.cpu_execution = inventory.cpu_execution;
+        probe_geometry.resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
+        probe_geometry.first_layer = 0;
+        probe_geometry.last_layer = profile.n_layers - 1;
         EXPECT_EQ(dynamic_bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace) -
                       static_bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
                   MoEOverlayCPUServiceMeasurement::allocationBytes({
                       .d_model = profile.d_model,
-                      .intermediate = profile.expert_feed_forward_length}) +
+                      .intermediate = profile.expert_feed_forward_length},
+                      WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(probe_profile, probe_geometry)) +
                       capacity_input.host_demand_memory->allocationBytes());
         // Missing evidence is an admission defect; an all-GPU authority or
         // Static policy must not silently acquire a host routing mirror either.
@@ -2271,7 +2335,20 @@ namespace llaminar2
         constexpr std::size_t kExpectedCpuSparsePacketBytes =
             (1u + 2u + 4u + 8u + 16u) *
             (2u * 64u + 2u) * sizeof(float);
-        EXPECT_EQ(cpu->fixedBytes(), kExpectedCpuSparsePacketBytes);
+        auto invocation_workspace = cpuSwiGLUWorkspaceRequirements(
+            capacity_input.resident_graph_rows * profile.expert_used_count,
+            profile.expert_feed_forward_length);
+        invocation_workspace.merge(cpuProjectionQ8WorkspaceRequirements(
+            capacity_input.resident_graph_rows * profile.expert_used_count,
+            std::max(profile.d_model, profile.expert_feed_forward_length)));
+        for (const auto [n, k] : {std::pair{profile.d_model, profile.expert_feed_forward_length},
+                                 std::pair{profile.expert_feed_forward_length, profile.d_model}})
+            invocation_workspace.merge(CPUProjectionWorkspaceContract::sourceNative("Q8_0", {
+                .rows = capacity_input.resident_graph_rows * profile.expert_used_count,
+                .n = n, .k = k, .workers = inventory.cpu_cores, .execution = inventory.cpu_execution,
+                .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+        EXPECT_EQ(cpu->fixedBytes(), kExpectedCpuSparsePacketBytes +
+            invocation_workspace.total_bytes_with_alignment());
         EXPECT_GT(cuda->fixedBytes(), 0u);
         EXPECT_EQ(
             cuda->resourceId(),
@@ -2279,6 +2356,29 @@ namespace llaminar2
                 5, DeviceId::cuda(0)));
         for (const auto &device_plan : result.fixed_memory_plan.devices)
             EXPECT_EQ(device_plan.activation_seq_len(), 8);
+
+        // Exhausted hardware is a rejected capacity candidate, not missing
+        // hardware. Explicit caps cannot conceal impossible raw observations.
+        rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        for (const bool cpu_resource : {true, false})
+        {
+            auto &observed = cpu_resource ? inventory.cpu : inventory.gpus.front();
+            const auto original = observed.free_memory_bytes;
+            observed.free_memory_bytes = 0;
+            EXPECT_THROW((void)MoEOverlayLocalCapacityPlanner::plan(capacity_input), PhysicalMemoryCapacityExhausted);
+            observed.free_memory_bytes = observed.memory_bytes + 1;
+            try
+            {
+                (void)MoEOverlayLocalCapacityPlanner::plan(capacity_input);
+                FAIL() << "An impossible observation was admitted";
+            }
+            catch (const PhysicalMemoryCapacityExhausted &)
+            {
+                FAIL() << "Malformed inventory cannot advance candidate search";
+            }
+            catch (const std::invalid_argument &) {}
+            observed.free_memory_bytes = original;
+        }
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -2427,6 +2527,7 @@ namespace llaminar2
         profile.n_kv_heads = 8;
         profile.head_dim = 128;
         profile.max_seq_len = 4096;
+        addRoutedExpertMetadata(profile);
 
         RankExecutionPlan rank_plan;
         rank_plan.rank = 0;
@@ -2445,6 +2546,9 @@ namespace llaminar2
         RankInventory inventory;
         inventory.rank = 0;
         inventory.cpu_memory_bytes = kLargeBudget;
+        inventory.cpu_cores = 8;
+        inventory.cpu_worker_threads = 8;
+        inventory.cpu_execution = test::kSyntheticCPUExecutionGeometry;
         inventory.cpu.memory_bytes = kLargeBudget;
         inventory.cpu.free_memory_bytes = kLargeBudget;
         inventory.gpus = {

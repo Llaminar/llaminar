@@ -455,6 +455,10 @@ MemoryPlan MemoryPlanner::plan(
                         .model_graph_identity_count = executable_count,
                         .model_graph_topology_variant_count = 1u,
                         .auxiliary_executable_count =
+                            (cfg.captured_serving_graphs.ordinary_generation
+                                ? OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                                    cfg.device, cfg.captured_serving_graphs.mtp_graph_owners.retainsGraphCapacity())
+                                : 0u) +
                             cfg.captured_serving_graphs
                                 .mtp_graph_owners
                                 .generalAuxiliaryExecutableSlotCount(),
@@ -493,6 +497,12 @@ MemoryPlan MemoryPlanner::plan(
          */
         const int main_layer_count =
             std::max(0, profile.n_layers - profile.mtp_layer_count);
+        const bool owns_terminal_main_layer =
+            main_layer_count > 0 &&
+            cfg.first_layer <= main_layer_count - 1 &&
+            last_layer >= main_layer_count - 1;
+        const auto mtp_state_role = resolveMTPStateRole(
+            cfg.mtp_enabled, owns_terminal_main_layer);
         if (cfg.device.is_gpu() && cfg.graph_snapshot_memory.effective_kv &&
             cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
@@ -506,7 +516,7 @@ MemoryPlan MemoryPlanner::plan(
             for (int layer = 0; layer < profile.n_layers; ++layer)
             {
                 const bool sidecar = layer >= main_layer_count;
-                const bool resident = sidecar ? cfg.mtp_enabled :
+                const bool resident = sidecar ? mtp_state_role == MTPStateRole::PredictorOwner :
                     (layer >= cfg.first_layer && layer <= last_layer);
                 if (!resident || (diagnostic.layer && layer != *diagnostic.layer) ||
                     !PersistentStateMemoryEstimator::isFullAttentionLayer(profile, layer))
@@ -537,10 +547,6 @@ MemoryPlan MemoryPlanner::plan(
                                 "retained effective-KV snapshot arenas"),
                 "reference and effective-KV snapshots");
         }
-        const bool owns_terminal_main_layer =
-            main_layer_count > 0 &&
-            cfg.first_layer <= main_layer_count - 1 &&
-            last_layer >= main_layer_count - 1;
         const int weight_last_layer =
             cfg.mtp_enabled &&
                     owns_terminal_main_layer &&
@@ -548,13 +554,28 @@ MemoryPlan MemoryPlanner::plan(
                 ? profile.n_layers - 1
                 : last_layer;
 
+        // Pipeline intervals restrict transformer weights, not vocabulary
+        // ownership. Resolve the exact global uses once and pass that same
+        // scope to primary and mirrored contributions. A terminal predictor
+        // embeds its draft rows locally even though it is not the main entry.
+        const bool retains_embedding_weights =
+            (cfg.owns_embedding && cfg.first_layer == 0) ||
+            (cfg.mtp_enabled && owns_terminal_main_layer);
+        const WeightComponentScope weight_components =
+            retains_embedding_weights
+                ? (owns_terminal_main_layer ? WeightComponentScope::EmbeddingAndTerminal
+                                            : WeightComponentScope::Embedding)
+                : (owns_terminal_main_layer ? WeightComponentScope::Terminal
+                                            : WeightComponentScope::Intermediate);
+
         // Weight estimation
         auto weight_est = WeightMemoryEstimator::estimate(
             profile, cfg.device,
             cfg.shard_index, cfg.total_shards,
             cfg.first_layer, weight_last_layer,
             cfg.weight_residency,
-            cfg.tensor_parallel_assignment);
+            cfg.tensor_parallel_assignment,
+            weight_components);
         primary_weight_bytes = weight_est.device_bytes;
 
         for (std::size_t set_index = 0;
@@ -622,7 +643,9 @@ MemoryPlan MemoryPlanner::plan(
                         /*total_shards=*/1,
                         cfg.first_layer,
                         weight_last_layer,
-                        sidecar_residency);
+                        sidecar_residency,
+                        std::nullopt,
+                        weight_components);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     sidecar_estimate.device_bytes,
@@ -652,7 +675,9 @@ MemoryPlan MemoryPlanner::plan(
                         /*total_shards=*/1,
                         cfg.first_layer,
                         weight_last_layer,
-                        mirrored_residency);
+                        mirrored_residency,
+                        std::nullopt,
+                        weight_components);
                 const std::size_t component_bytes =
                     additional_set ==
                             AdditionalPersistentWeightSet::
@@ -671,6 +696,11 @@ MemoryPlan MemoryPlanner::plan(
             }
             case AdditionalPersistentWeightSet::ReplicatedMTPSidecarDense:
             {
+                // Earlier pipeline stages participate in grouped verification
+                // of their main layers; they do not execute the tail's learned
+                // predictor or materialize its replicated weight set.
+                if (!owns_terminal_main_layer)
+                    break;
                 if (profile.mtp_layer_count <= 0 ||
                     main_layer_count >= profile.n_layers)
                 {
@@ -691,16 +721,9 @@ MemoryPlan MemoryPlanner::plan(
                                     0));
                 }
 
-                /*
-                 * WeightMemoryEstimator includes non-layer tensors for any
-                 * layer interval because PP endpoints may own them. Price the
-                 * trailing predictor interval and subtract the exact same
-                 * estimator's globals-only view. The remainder is therefore
-                 * precisely the dense/shared predictor block materialized by
-                 * participantReplicaNames(ExpertOverlay), with routed parents
-                 * excluded by the zero-expert residency contract.
-                 */
-                const auto sidecar_and_globals =
+                // Describe precisely the extra layer uses. No globals-only
+                // synthetic interval or subtractive correction is needed.
+                const auto sidecar =
                     WeightMemoryEstimator::estimate(
                         profile,
                         cfg.device,
@@ -708,26 +731,12 @@ MemoryPlan MemoryPlanner::plan(
                         /*total_shards=*/1,
                         main_layer_count,
                         profile.n_layers - 1,
-                        sidecar_residency);
-                const auto globals_only =
-                    WeightMemoryEstimator::estimate(
-                        profile,
-                        cfg.device,
-                        /*shard_index=*/0,
-                        /*total_shards=*/1,
-                        profile.n_layers,
-                        profile.n_layers - 1,
-                        sidecar_residency);
-                if (sidecar_and_globals.device_bytes <
-                    globals_only.device_bytes)
-                {
-                    throw std::logic_error(
-                        "Replicated MTP sidecar estimate underflowed its globals-only view");
-                }
+                        sidecar_residency,
+                        std::nullopt,
+                        WeightComponentScope::LayersOnly);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
-                    sidecar_and_globals.device_bytes -
-                        globals_only.device_bytes,
+                    sidecar.device_bytes,
                     "additional replicated MTP sidecar weights");
                 break;
             }
@@ -767,7 +776,7 @@ MemoryPlan MemoryPlanner::plan(
                     cfg.first_layer,
                     last_layer,
                     cfg.kv_precision,
-                    cfg.mtp_enabled);
+                    mtp_state_role);
             kv_cache_bytes =
                 persistent_state.kv_cache_bytes;
             live_recurrent_state_bytes =
@@ -987,6 +996,8 @@ MemoryPlan MemoryPlanner::plan(
                         *cfg.local_tp_backend)
                         .perDeviceBytes();
             }
+            if (cfg.local_pipeline_backend.has_value())
+                collective_bytes += CollectiveMemoryEstimator::nativePipelineBoundaryBytes(*cfg.local_pipeline_backend);
         }
 
         // Activation estimation
@@ -1026,6 +1037,7 @@ MemoryPlan MemoryPlanner::plan(
                     .mtp_target_query_rows = cfg.mtp_target_query_rows,
                     .mtp_terminal_logits_layout =
                         cfg.mtp_terminal_logits_layout,
+                    .generation_request_capacity = cfg.generation_request_capacity,
                 },
                 cfg.device);
 
@@ -1057,6 +1069,7 @@ MemoryPlan MemoryPlanner::plan(
                 WorkspaceMemoryGeometry{
                     .device = cfg.device,
                     .device_compute_units = cfg.device_compute_units,
+                    .cpu_execution = cfg.cpu_execution,
                     .batch_size = cfg.batch_size,
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
@@ -1119,9 +1132,10 @@ MemoryPlan MemoryPlanner::plan(
                 WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
                     profile,
                     WorkspaceMemoryGeometry{
-                        .device = cfg.device,
-                        .device_compute_units = cfg.device_compute_units,
-                        .batch_size = cfg.batch_size,
+                    .device = cfg.device,
+                    .device_compute_units = cfg.device_compute_units,
+                    .cpu_execution = cfg.cpu_execution,
+                    .batch_size = cfg.batch_size,
                         .resident_graph_rows = participant_graph_rows,
                         .max_context_rows = max_seq,
                         .owns_embedding = false,
@@ -1310,6 +1324,7 @@ ResidentGraphMemoryPlan MemoryPlanner::planLargestFittingResidentGraphRows(
     if (!has_bucketed_participant)
     {
         selection.memory_plan = plan(profile, device_configs);
+        selection.device_inputs = device_configs;
         selection.resident_graph_rows =
             device_configs.empty()
                 ? 0
@@ -1338,6 +1353,7 @@ ResidentGraphMemoryPlan MemoryPlanner::planLargestFittingResidentGraphRows(
     if (candidates.empty())
     {
         selection.memory_plan = plan(profile, device_configs);
+        selection.device_inputs = device_configs;
         return selection;
     }
 
@@ -1379,6 +1395,7 @@ ResidentGraphMemoryPlan MemoryPlanner::planLargestFittingResidentGraphRows(
         MemoryPlan candidate_plan = plan(profile, evaluated);
         selection.resident_graph_rows = retained_graph_rows;
         selection.memory_plan = std::move(candidate_plan);
+        selection.device_inputs = std::move(evaluated);
         if (selection.memory_plan.fits())
             return selection;
     }

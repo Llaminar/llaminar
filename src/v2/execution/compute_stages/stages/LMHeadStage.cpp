@@ -122,20 +122,7 @@ namespace llaminar2
         }
         bindStageStream(lm_gemm);
 
-        std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
-            output_partition_scope;
-        if (params_.serial_equivalent_partition_width > 0)
-        {
-            if (params_.serial_equivalent_partition_width > params_.vocab_size)
-            {
-                throw std::logic_error(
-                    "[LMHeadStage] Replicated LM-head serial partition width exceeds its physical vocabulary width");
-            }
-            output_partition_scope =
-                lm_gemm->beginOutputPartitionEquivalenceScope(
-                    params_.vocab_size,
-                    params_.serial_equivalent_partition_width);
-        }
+        const auto output_partition_scope = beginOutputPartitionScope(lm_gemm);
 
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
@@ -368,8 +355,23 @@ namespace llaminar2
     // IWorkspaceConsumerStage Implementation
     // =============================================================================
 
+    std::unique_ptr<ITensorGemm::OutputPartitionEquivalenceScope>
+    LMHeadStage::beginOutputPartitionScope(ITensorGemm *kernel) const
+    {
+        if (params_.serial_equivalent_partition_width <= 0) return {};
+        if (!kernel || params_.serial_equivalent_partition_width > params_.vocab_size)
+            throw std::logic_error("[LMHeadStage] Invalid prepared mirrored-output partition contract");
+        return kernel->beginOutputPartitionEquivalenceScope(
+            params_.vocab_size, params_.serial_equivalent_partition_width);
+    }
+
     WorkspaceRequirements LMHeadStage::getWorkspaceRequirements(int m, int n, int k) const
     {
+        // A mirrored head writes every vocabulary column but retains its
+        // serial TP shard's reduction tree. Pricing with full-N policy could
+        // declare zero partials and then require them during execution.
+        const auto partition_scope = beginOutputPartitionScope(
+            const_cast<LMHeadStage *>(this)->resolvePreparedKernel("LMHeadStage::getWorkspaceRequirements"));
         WorkspaceRequirements reqs = IWorkspaceConsumerStage::getWorkspaceRequirements(m, n, k);
 
         const auto *logits = dynamic_cast<const TensorBase *>(params_.logits);

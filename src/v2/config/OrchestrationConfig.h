@@ -8,6 +8,7 @@
  * - Pipeline parallelism configuration
  * - Named domains for complex multi-GPU scenarios
  * - Collective backend selection
+ * - Saved discovery-to-execution rank selection, applied before runner creation
  *
  * Usage patterns:
  *
@@ -30,6 +31,7 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "CollectiveBackendType.h"
 #include "ExecutionDomainDefinition.h"
+#include "OrchestrationPlanningPolicy.h"
 #include "execution/config/RuntimeConfig.h" // For FusedAttentionBackend
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/parallelism_tree/ParallelismTree.h"
@@ -248,6 +250,13 @@ namespace llaminar2
      */
     struct OrchestrationConfig
     {
+        /** Admission intent; applying explicit placement never reruns automatic selection. */
+        OrchestrationPlanningMode planning_mode = OrchestrationPlanningMode::InferFromPlacement;
+        /** Hard compute/strategy filters and soft ranking hints, not runtime device state. */
+        AutomaticOrchestrationOptions automatic_planning;
+        /** Exact saved execution membership; omission retains all discovery ranks. */
+        std::optional<ExecutionRankSelection> execution_rank_selection;
+
         // =========================================================================
         // Introspection Flags
         // =========================================================================
@@ -353,6 +362,12 @@ namespace llaminar2
 
         std::string model_path; ///< Path to GGUF model file
         int max_seq_len = 4096; ///< Maximum sequence length
+        /**
+         * Explicit captured-prefill cap, distinct from KV context capacity.
+         * Omission retains inherited startup policy; a value survives plan/apply
+         * and is published through the canonical startup-policy adapter.
+         */
+        std::optional<int> prefill_max_bucket_size;
         bool use_mmap = true;   ///< Use memory-mapped file loading
 
         // =========================================================================
@@ -434,6 +449,15 @@ namespace llaminar2
 
         std::optional<size_t> max_gpu_memory_mb; ///< Maximum GPU memory in MB
         std::optional<size_t> max_cpu_memory_mb; ///< Maximum CPU memory in MB
+
+        /**
+         * @brief Resolve an explicit CPU/GPU MiB constraint into bytes.
+         * @param backend Physical compute/storage backend being priced.
+         * @return Requested byte ceiling, or absence; this never observes or subtracts free memory.
+         * @throws std::overflow_error when the configured limit cannot fit size_t.
+         * @throws std::invalid_argument for an unsupported backend.
+         */
+        [[nodiscard]] std::optional<size_t> memoryLimitBytes(DeviceType backend) const;
 
         // =========================================================================
         // MoE Configuration

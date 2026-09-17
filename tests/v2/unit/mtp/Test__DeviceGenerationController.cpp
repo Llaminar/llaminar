@@ -34,6 +34,24 @@ namespace
     /**
      * @brief Prove the controller handoff admits only the complete transaction cycle.
      */
+    TEST(Test__DeviceGenerationController, FatalTransitionsPreserveFirstFailure)
+    {
+        for (int first = 1; first <= static_cast<int>(DeviceGenerationError::InvalidOrdinaryTransition); ++first)
+        for (int later = 1; later <= static_cast<int>(DeviceGenerationError::InvalidOrdinaryTransition); ++later)
+        {
+            ControlRow control{};
+            control[kDeviceGenerationControlOk] = 1;
+            ASSERT_FALSE(fail_device_generation_control(control.data(), static_cast<DeviceGenerationError>(first)));
+            ASSERT_FALSE(fail_device_generation_control(control.data(), static_cast<DeviceGenerationError>(later)));
+            EXPECT_EQ(control[kDeviceGenerationControlErrorCode], first);
+            EXPECT_EQ(prepare_device_generation_transaction_budget(2, 0, control.data()), 0);
+            EXPECT_EQ(control[kDeviceGenerationControlErrorCode], first);
+            EXPECT_EQ(control[kDeviceGenerationControlOk], 0);
+            EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
+            EXPECT_EQ(control[kDeviceGenerationControlTransactionCommitBudget], 0);
+        }
+    }
+
     TEST(
         Test__DeviceGenerationController,
         StateHandoffRequiresPublishBorrowRepublishOrder)
@@ -197,7 +215,7 @@ namespace
 
     TEST(
         Test__DeviceGenerationController,
-        HostedTicketSelectionPreservesDepthPrefixThenMaintenanceOrder)
+        HostedContinuationRetiresCompletedTailBeforeNextDepthPrefix)
     {
         const std::array<DeviceControlledLoopFragment, 5> branch = {{
             {.name = "transaction",
@@ -220,8 +238,8 @@ namespace
             branch);
 
         const DeviceControlledLoopTicketSelection due{
-            .iteration_admitted = true,
-            .conditional_word_nonzero = true,
+            .next_iteration_admitted = true,
+            .completed_iteration_word_nonzero = true,
             .selector = 3,
         };
         ASSERT_EQ(due.countSelected(ordered_branch), 5u);
@@ -231,19 +249,19 @@ namespace
         ASSERT_NE(due.selectOrdinal(ordered_branch, 3u), nullptr);
         ASSERT_NE(due.selectOrdinal(ordered_branch, 4u), nullptr);
         EXPECT_STREQ(due.selectOrdinal(ordered_branch, 0u)->name,
-                     "transaction");
-        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 1u)->name,
-                     "depth two");
-        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 2u)->name,
-                     "depth three");
-        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 3u)->name,
-                     "epoch release");
-        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 4u)->name,
                      "maintenance");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 1u)->name,
+                     "transaction");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 2u)->name,
+                     "depth two");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 3u)->name,
+                     "depth three");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 4u)->name,
+                     "epoch release");
 
         const DeviceControlledLoopTicketSelection not_due{
-            .iteration_admitted = true,
-            .conditional_word_nonzero = false,
+            .next_iteration_admitted = true,
+            .completed_iteration_word_nonzero = false,
             .selector = 2,
         };
         EXPECT_EQ(not_due.countSelected(ordered_branch), 3u);
@@ -254,12 +272,13 @@ namespace
         EXPECT_EQ(not_due.selectOrdinal(ordered_branch, 3u), nullptr);
 
         const DeviceControlledLoopTicketSelection terminal{
-            .iteration_admitted = false,
-            .conditional_word_nonzero = true,
+            .next_iteration_admitted = false,
+            .completed_iteration_word_nonzero = true,
             .selector = 3,
         };
-        EXPECT_EQ(terminal.countSelected(ordered_branch), 0u);
-        EXPECT_EQ(terminal.selectOrdinal(ordered_branch, 0u), nullptr);
+        ASSERT_EQ(terminal.countSelected(ordered_branch), 1u);
+        EXPECT_STREQ(terminal.selectOrdinal(ordered_branch, 0u)->name, "maintenance");
+        EXPECT_EQ(terminal.selectOrdinal(ordered_branch, 1u), nullptr);
     }
 
     TEST(
@@ -291,10 +310,10 @@ namespace
         for (bool nonzero : {false, true})
         {
             const DeviceControlledLoopTicketSelection ticket{
-                .iteration_admitted = admitted,
-                .conditional_word_nonzero = nonzero};
-            EXPECT_EQ(ticket.selects(pending), admitted && !nonzero);
-            EXPECT_EQ(ticket.selects(consumed), admitted && nonzero);
+                .next_iteration_admitted = admitted,
+                .completed_iteration_word_nonzero = nonzero};
+            EXPECT_EQ(ticket.selects(pending), !nonzero);
+            EXPECT_EQ(ticket.selects(consumed), nonzero);
         }
     }
 

@@ -1,6 +1,9 @@
 /**
  * @file CUDANativeVNNIGemmPerfCommon.h
  * @brief Shared utilities for CUDA native-vnni GEMM perf and sweep harnesses.
+ *
+ * Training retains the full supported prefill inventory even when serving
+ * selects a smaller default cap, so explicit larger captures remain covered.
  */
 
 #pragma once
@@ -143,7 +146,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
 
     // M=1 belongs to decode and M=2..16/31 belongs to the grouped verifier
     // transaction. This harness measures only ordinary prefill/GEMM buckets.
-    inline const std::vector<int> kPrefillMValues = defaultPrefillGraphBucketSizes();
+    inline const std::vector<int> kPrefillMValues = supportedPrefillGraphBucketSizes();
 
     struct RunConfig
     {

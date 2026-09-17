@@ -11,9 +11,33 @@
 #include "v2/execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "v2/execution/local_execution/device/WorkspaceDescriptor.h"
 #include "v2/interfaces/IWorkspaceConsumer.h"
+#include "v2/kernels/cpu/CPUInvocationWorkspace.h"
+#include "v2/planning/PhysicalMemoryAuthority.h"
+#include "v2/backends/BackendManager.h"
+#include <algorithm>
+#include <future>
 
 namespace llaminar2::test
 {
+
+    /** @brief An immutable operation exposing the same invocation binding contract as CPU projections. */
+    class InvocationWorkspaceKernel final : public CPUInvocationWorkspaceConsumer
+    {
+    public:
+        /** @return One explicitly sized persistent output scratch region. */
+        WorkspaceRequirements getWorkspaceRequirements(int m, int, int) const override
+        {
+            WorkspaceRequirements requirements;
+            requirements.buffers.push_back({"invocation", size_t(m) * sizeof(float), 64});
+            return requirements;
+        }
+        /** @brief Write only this invocation's arena; no kernel state or allocation changes. */
+        void execute(DeviceWorkspaceManager *workspace, size_t count, float value) const
+        {
+            auto scratch = CPUInvocationWorkspace::require<float>(workspace, "invocation", count);
+            std::fill(scratch.begin(), scratch.end(), value);
+        }
+    };
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Mock Kernel for Testing Delegation
@@ -110,6 +134,60 @@ namespace llaminar2::test
     private:
         IWorkspaceConsumer *kernel_ = nullptr;
     };
+
+    /** @test Shared immutable kernels never borrow another participant's binding, including concurrent calls. */
+    TEST(Test__IWorkspaceConsumerStage, InvocationOwnedWorkspacesAreIndependentAndRetireThroughTheirAuthority)
+    {
+        // Only register the CPU allocator; this unit must not discover GPUs.
+        if (!hasCPUBackend())
+            initCPUBackend(-1);
+        InvocationWorkspaceKernel kernel;
+        constexpr size_t count = 64;
+        const auto requirements = kernel.getWorkspaceRequirements(count, 0, 0);
+        const size_t bytes = requirements.total_bytes_with_alignment();
+        PhysicalMemoryPlanBuilder builder;
+        builder.add({.world_rank = 0, .device = DeviceId::cpu(),
+                .total_bytes = 2 * bytes, .admission_available_bytes = 2 * bytes},
+            PhysicalMemoryOwner::ExecutionWorkspace, 2 * bytes);
+        const auto memory = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+        {
+            DeviceWorkspaceManager first(DeviceId::cpu(), bytes, memory), second(DeviceId::cpu(), bytes, memory);
+            ASSERT_TRUE(first.allocate(requirements));
+            ASSERT_TRUE(second.allocate(requirements));
+            TestableWorkspaceConsumerStage first_stage, second_stage;
+            first_stage.setKernel(&kernel);
+            second_stage.setKernel(&kernel);
+            first_stage.bindWorkspace(&first);
+            second_stage.bindWorkspace(&second);
+            ASSERT_TRUE(first_stage.hasWorkspace());
+            ASSERT_TRUE(second_stage.hasWorkspace());
+            EXPECT_FALSE(kernel.hasWorkspace());
+            EXPECT_EQ(kernel.getWorkspace(), nullptr);
+
+            auto left = std::async(std::launch::async, [&] {
+                for (int i = 0; i < 20; ++i) kernel.execute(first_stage.getWorkspace(), count, 3.0f);
+            });
+            auto right = std::async(std::launch::async, [&] {
+                for (int i = 0; i < 20; ++i) kernel.execute(second_stage.getWorkspace(), count, 7.0f);
+            });
+            left.get();
+            right.get();
+            for (auto value : CPUInvocationWorkspace::require<float>(&first, "invocation", count)) EXPECT_EQ(value, 3.0f);
+            for (auto value : CPUInvocationWorkspace::require<float>(&second, "invocation", count)) EXPECT_EQ(value, 7.0f);
+            first_stage.unbindWorkspace();
+            EXPECT_FALSE(first_stage.hasWorkspace());
+            EXPECT_TRUE(second_stage.hasWorkspace());
+            kernel.execute(second_stage.getWorkspace(), count, 9.0f);
+            EXPECT_THROW(kernel.execute(nullptr, count, 1.0f), std::runtime_error);
+            EXPECT_THROW(kernel.execute(&second, count + 1, 1.0f), std::runtime_error);
+            EXPECT_THROW(CPUInvocationWorkspace::require<float>(&second, "missing", 1), std::runtime_error);
+            EXPECT_THROW(CPUInvocationWorkspace::multiply(SIZE_MAX, 2), std::overflow_error);
+            second_stage.unbindWorkspace();
+        }
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Tests: Null Kernel Behavior

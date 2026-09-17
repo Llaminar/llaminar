@@ -23,6 +23,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
+#include "execution/mtp/OrdinaryGenerationGraphPlan.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
 #include "transfer/TransferEngine.h"
@@ -332,7 +333,14 @@ namespace
 // GPUDeviceContextPool Tests
 // ===========================================================================
 
-/** @test Retained MTP capacity owns every general/helper slot before execution. */
+/**
+ * @test Retained MTP and ordinary generation own every graph slot before execution.
+ *
+ * Retaining speculative capacity must not erase the ordinary request's sampler
+ * and transaction owners. Both algorithms may serve this admitted model, even
+ * when the current request has MTP disabled. Price their shared parent once and
+ * the additional ordinary owners through the same typed runtime inventory.
+ */
 TEST(Test__GPUDeviceContextPool,
      RetainedMTPGraphCapacityIsPricedBeforeExecution)
 {
@@ -395,7 +403,9 @@ TEST(Test__GPUDeviceContextPool,
                 // Match the physical classes declared by runtime graph owners;
                 // the total slot count alone overprices bounded CUDA helpers.
                 .auxiliary_executable_count =
-                    owner_plan.generalAuxiliaryExecutableSlotCount(),
+                    owner_plan.generalAuxiliaryExecutableSlotCount() +
+                    OrdinaryGenerationGraphPlan::additionalExecutableCount(
+                        cfg.device, /*has_mtp_graph_owners=*/true),
                 .bounded_helper_executable_count =
                     owner_plan.boundedHelperExecutableSlotCount(),
             }));

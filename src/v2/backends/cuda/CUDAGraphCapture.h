@@ -355,10 +355,10 @@ namespace llaminar2
         using IGPUGraphCapture::buildDeviceControlledWhileLoop;
         /** @copydoc IGPUGraphCapture::buildDeviceControlledWhileLoop */
         bool buildDeviceControlledWhileLoop(
-            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+            const DeviceControlledLoopProgram &program,
             const DeviceControlledLoopPredicate &predicate) override;
         bool buildDeviceControlledSelectorWhileLoop(
-            std::span<const DeviceControlledLoopFragment> ordered_body_fragments,
+            const DeviceControlledLoopProgram &program,
             const DeviceControlledLoopPredicate &predicate,
             const DeviceControlledLoopSelector &selector_policy) override;
         [[nodiscard]] void *executionStream() const noexcept override

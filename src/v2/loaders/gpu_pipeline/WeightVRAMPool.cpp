@@ -16,6 +16,7 @@
  */
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
@@ -122,7 +123,8 @@ namespace llaminar2
 
     void WeightVRAMPool::planWeight(const std::string &name, int N, int K,
                                     int payload_bytes_per_block, bool is_asymmetric,
-                                    bool has_emins, size_t raw_gguf_bytes)
+                                    bool has_emins, size_t raw_gguf_bytes,
+                                    ContiguousAlias alias)
     {
         if (allocated_)
         {
@@ -172,6 +174,13 @@ namespace llaminar2
             plan.emins_bytes = regions.emins_bytes;
             plan.emins_offset = allocateRegion(plan.emins_bytes);
         }
+
+        // A transfer slot can carry packed or raw floating weights at different
+        // epochs. Both views share the payload origin, never execute together,
+        // and are charged once to the physical owner of this pool.
+        if (alias.bytes > std::numeric_limits<size_t>::max() - plan.payload_offset)
+            throw std::overflow_error("WeightVRAMPool contiguous alias overflows size_t");
+        current_offset_ = std::max(current_offset_, plan.payload_offset + alias.bytes);
 
         plans_[name] = plan;
         weight_order_.push_back(name);

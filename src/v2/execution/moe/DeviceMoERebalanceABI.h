@@ -22,7 +22,7 @@ namespace llaminar2::moe_rebalance_abi
      * Any field-layout change to a cross-backend record must increment this
      * value and update the corresponding byte-size assertion below.
      */
-    inline constexpr uint32_t kVersion = 14u;
+    inline constexpr uint32_t kVersion = 15u;
 
     /**
      * @brief Exact byte size of one device-owned rebalance command.

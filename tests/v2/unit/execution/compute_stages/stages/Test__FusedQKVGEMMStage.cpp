@@ -34,6 +34,7 @@
 #include "tensors/FP16Utils.h"
 #include "utils/Logger.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
+#include "../../../../utils/CPUProjectionTestWorkspace.h"
 
 namespace llaminar2
 {
@@ -340,6 +341,7 @@ namespace llaminar2
         FusedQKVGEMMStage stage(params);
 
         // Execute
+        test::CPUStageTestWorkspace workspace(stage, m_);
         ASSERT_TRUE(stage.execute(ctx_.get()));
 
         // Verify outputs are non-zero (GEMM was actually computed)
@@ -414,6 +416,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             // Save results
@@ -453,6 +456,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             // Save results
@@ -526,6 +530,7 @@ namespace llaminar2
             .n_v = n_v_};
         attachPreparedRefs(qkv_params);
         FusedQKVGEMMStage qkv_stage(qkv_params);
+        test::CPUStageTestWorkspace qkv_workspace(qkv_stage, m_);
         ASSERT_TRUE(qkv_stage.execute(ctx_.get()));
 
         auto kv_output_k = std::make_unique<FP32Tensor>(
@@ -554,6 +559,9 @@ namespace llaminar2
         auto kv_stage = ComputeStageFactory::createFusedKVGEMM(kv_params);
         ASSERT_NE(kv_stage, nullptr);
         EXPECT_EQ(kv_stage->type(), ComputeStageType::GEMM_FUSED_KV);
+        auto *kv_consumer = dynamic_cast<IWorkspaceConsumer *>(kv_stage.get());
+        ASSERT_NE(kv_consumer, nullptr);
+        test::CPUStageTestWorkspace kv_workspace(*kv_consumer, m_);
         ASSERT_TRUE(kv_stage->execute(ctx_.get()));
 
         EXPECT_EQ(
@@ -640,6 +648,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             std::copy(output_q_->data(), output_q_->data() + m_ * n_q_, output_q_no_bias.begin());
@@ -677,6 +686,7 @@ namespace llaminar2
             attachPreparedRefs(params);
 
             FusedQKVGEMMStage stage(params);
+            test::CPUStageTestWorkspace workspace(stage, m_);
             ASSERT_TRUE(stage.execute(ctx_.get()));
 
             std::copy(output_q_->data(), output_q_->data() + m_ * n_q_, output_q_with_bias.begin());

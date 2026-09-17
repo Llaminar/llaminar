@@ -51,6 +51,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 
 namespace llaminar2
 {
@@ -1211,6 +1212,7 @@ namespace llaminar2
             std::vector<std::string> stage_names;          ///< Ordered stage names in this segment
             bool capturable = true;                        ///< Whether this segment can be graph-captured
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
+            uint64_t evidence_family = 0;                 ///< Setup-issued diagnostic identity of the owning capture plan; never controls replay.
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
             size_t capture_wave_ordinal = 0;                ///< Ordered active capture wave; meaningful only when capturable.
             std::string capture_wave_identity;              ///< Optional explicit cross-participant identity.
@@ -1354,6 +1356,17 @@ namespace llaminar2
          */
         struct GraphSegmentCache
         {
+            /**
+             * @brief Process-unique observation identity for this materialization.
+             *
+             * All units inherit this identity when buildCapturePlan seals their
+             * inventory. Reset/rebuild obtains a new identity, while request
+             * reset and replay retain it. It is not a cache key or execution
+             * authority; observers use it to distinguish unused setup variants
+             * from the exact family submitted during inference.
+             */
+            uint64_t evidence_family = 0;
+
             /**
              * @brief Submission state of the cache-owned executable.
              *
@@ -1758,9 +1771,13 @@ namespace llaminar2
                 reset(StreamResetPolicy::Destroy);
             }
 
-            // Move-only (non-copyable due to stream/event ownership)
+            /**
+             * @brief Transfer physical graph ownership and its observation ID.
+             * @param other Cache left without streams, events or family identity.
+             */
             GraphSegmentCache(GraphSegmentCache &&other) noexcept
-                : segments(std::move(other.segments)),
+                : evidence_family(std::exchange(other.evidence_family, 0)),
+                  segments(std::move(other.segments)),
                   snapshot_manifest(std::move(other.snapshot_manifest)),
                   initialized(other.initialized),
                   needs_capture(other.needs_capture),
@@ -1832,11 +1849,17 @@ namespace llaminar2
                 other.retained_composed_parent_replay.clear();
                 other.auxiliary_branch_authority = nullptr;
             }
+            /**
+             * @brief Retire this cache before assuming another family's lifetime.
+             * @param other Sole previous owner; self-assignment is a no-op.
+             * @return This cache with unchanged identity of the transferred graphs.
+             */
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
                 if (this != &other)
                 {
                     reset(StreamResetPolicy::Destroy);
+                    evidence_family = std::exchange(other.evidence_family, 0);
                     segments = std::move(other.segments);
                     snapshot_manifest = std::move(other.snapshot_manifest);
                     initialized = other.initialized;
@@ -1997,6 +2020,9 @@ namespace llaminar2
              * Segmentation, incomplete capture, ambiguous stream ownership, or
              * incomplete stage coverage are hard failures. This method never
              * launches eagerly and never recaptures as a substitute.
+             * A fully native composed parent exports that sole executable,
+             * never one of its graph-only source children. Parents requiring
+             * concurrent host ticket service cannot be embedded in a device loop.
              *
              * @param graph Complete source graph whose stage lifecycle
              *        contracts must be self-contained at replay time.
@@ -2070,6 +2096,13 @@ namespace llaminar2
                 }
             };
 
+            /**
+             * @brief Retire native graph resources and invalidate their evidence ID.
+             * @param stream_policy Whether to destroy or retain the owned stream.
+             *
+             * This is a cache-lifetime boundary, not a request data reset. Exact
+             * terminal events protect resource retirement before ownership clears.
+             */
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
                 if (terminal_fence_published_generation >
@@ -2087,6 +2120,7 @@ namespace llaminar2
                 // so no backend child-node lifetime can outlive its source cache.
                 retained_parent_capture.reset();
                 segments.clear();
+                evidence_family = 0;
                 auxiliary_branch.reset();
                 auxiliary_branch_authority = nullptr;
                 initialized = false;

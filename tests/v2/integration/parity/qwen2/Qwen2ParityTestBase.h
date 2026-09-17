@@ -39,6 +39,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 // GlobalOrchestrator (cross-rank PP + global TP)
 #include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "collective/ILocalTPContext.h"
 #include "collective/LocalTPContext.h"
@@ -793,6 +794,7 @@ namespace llaminar2::test::parity::qwen2
          */
         virtual void applyModelOverrides() {}
 
+        /** @brief Project the complete numerical contract before model/graph admission. */
         void SetUp() override
         {
             // Apply backend-specific thresholds
@@ -803,6 +805,7 @@ namespace llaminar2::test::parity::qwen2
             config_.early_layers_count = thresholds.early_layers_count;
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
+            config_.prefill_kl_threshold = thresholds.prefill_kl_threshold;
             config_.mtp_kl_threshold = thresholds.mtp_kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
             config_.allreduce_stages = thresholds.allreduce_stages;
@@ -2473,7 +2476,16 @@ namespace llaminar2::test::parity::qwen2
             go_config.rank = rank;
             go_config.world_size = world_size;
             go_config.mpi_ctx = mpi_ctx_.get();
-            go_config.rank_runner = std::move(runner_); // Transfer ownership
+            const auto local_plan = GlobalPPRankPlanBuilder::build(go_config.topology, rank);
+            const auto local_stages = local_plan.executeStages();
+            if (local_stages.size() != 1u)
+                throw std::logic_error("Qwen2 single-stage fixture requires one exact local stage");
+            StageRunnerEntry entry;
+            entry.action = *local_stages.front();
+            entry.stage_id = entry.action.stage_id;
+            entry.domain_name = entry.action.domain_name;
+            entry.runner = std::move(runner_);
+            go_config.stage_runners.push_back(std::move(entry));
             go_config.vocab_size = vocab_size;
             go_config.d_model = d_model;
             go_config.architecture_name = arch_name;

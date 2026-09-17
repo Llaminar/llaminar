@@ -3266,12 +3266,14 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRe
             "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
     ASSERT_FALSE(source.empty());
 
-    const auto build_input_pos = source.find("// Build forward input");
+    const auto forward_pos = source.find("const float *DeviceGraphOrchestrator::forwardImpl(");
+    ASSERT_NE(forward_pos, std::string::npos);
+    const auto build_input_pos = source.find("ForwardInput input;", forward_pos);
     ASSERT_NE(build_input_pos, std::string::npos);
-    const auto pp_mode_pos = source.find("// For PP mode:", build_input_pos);
-    ASSERT_NE(pp_mode_pos, std::string::npos);
+    const auto cache_binding_pos = source.find("input.kv_cache = state_.kv_cache.get();", build_input_pos);
+    ASSERT_NE(cache_binding_pos, std::string::npos);
     const std::string build_input_body =
-        source.substr(build_input_pos, pp_mode_pos - build_input_pos);
+        source.substr(build_input_pos, cache_binding_pos - build_input_pos);
 
     const auto position_offset_pos =
         build_input_body.find(
@@ -3305,7 +3307,7 @@ TEST_F(
 {
     const std::string source =
         readSourceFileForDeviceGraphOrchestratorTest(
-            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp");
     const std::string header =
         readSourceFileForDeviceGraphOrchestratorTest(
             "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
@@ -3313,9 +3315,9 @@ TEST_F(
     ASSERT_FALSE(header.empty());
 
     const auto materialize_pos = source.find(
-        "bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(");
+        "bool DeviceGraphOrchestrator::installMTPStatePublicationGraph(");
     const auto execute_pos = source.find(
-        "bool DeviceGraphOrchestrator::executeMTPSpeculativeStatePublicationCaptured(",
+        "bool DeviceGraphOrchestrator::materializePipelineFollowerMTPPublicationGraph(",
         materialize_pos);
     ASSERT_NE(materialize_pos, std::string::npos);
     ASSERT_NE(execute_pos, std::string::npos);

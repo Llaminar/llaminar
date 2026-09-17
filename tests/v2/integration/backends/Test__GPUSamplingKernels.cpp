@@ -2605,7 +2605,7 @@ namespace
                     {.name = "transaction commit", .capture = commit.get()},
                 }};
             ASSERT_TRUE(generation->buildDeviceControlledWhileLoop(
-                transaction_fragments,
+                DeviceControlledLoopProgram{.iteration = transaction_fragments},
                 DeviceControlledLoopPredicate{
                     .control_rows_device =
                         static_cast<const int *>(d_control),
@@ -2848,7 +2848,7 @@ namespace
             run_case(condition_set, trace_publication);
 
             ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(
-                fragments,
+                DeviceControlledLoopProgram{.iteration = fragments},
                 DeviceControlledLoopPredicate{
                     .control_rows_device =
                         static_cast<const int *>(d_control),
@@ -3451,7 +3451,7 @@ namespace
                 {.name = "two-stream event transaction", .capture = fragment.get()},
             }};
             ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(
-                fragments,
+                DeviceControlledLoopProgram{.iteration = fragments},
                 DeviceControlledLoopPredicate{
                     .control_rows_device = static_cast<const int *>(d_control),
                     .control_stride = control_stride,
@@ -3499,8 +3499,10 @@ namespace
      * The parent owns one unconditional depth-one fragment, fourteen monotonic
      * selector-gated fragments, and one shared completion tail. Replaying the
      * same executable for selectors one through fifteen must write exactly that
-     * prefix and the common tail. Out-of-range selectors must poison the
-     * controller before either region executes.
+     * prefix and the common tail. A once-only initializer has its own marker
+     * and can complete the request before any draft work. Out-of-range
+     * selectors must poison the controller before either repeated region
+     * executes; terminal and unhealthy entry must skip initialization too.
      */
     TEST_P(
         GPUSamplingTest,
@@ -3519,7 +3521,8 @@ namespace
         constexpr int control_stride = 4;
         constexpr int minimum_selector = 1;
         constexpr int maximum_selector = 15;
-        constexpr int trace_word_count = maximum_selector + 1;
+        constexpr int initialization_trace_index = maximum_selector + 1;
+        constexpr int trace_word_count = maximum_selector + 2;
         constexpr int invalid_selector_error = 7719;
         constexpr int trace_sentinel = -1;
         constexpr int common_tail_value = 9001;
@@ -3533,12 +3536,14 @@ namespace
         void *d_common_tail_value =
             backend_->allocate(sizeof(int), device_id_);
         void *d_complete = backend_->allocate(sizeof(int), device_id_);
-        const std::array<void *, 5> allocations = {
+        void *d_initial_complete = backend_->allocate(sizeof(int), device_id_);
+        const std::array<void *, 6> allocations = {
             d_control,
             d_trace,
             d_slot_values,
             d_common_tail_value,
-            d_complete};
+            d_complete,
+            d_initial_complete};
         for (void *allocation : allocations)
             ASSERT_NE(allocation, nullptr);
 
@@ -3638,12 +3643,27 @@ namespace
                 .capture = common_tail.get(),
             });
 
+            // Use device copies as exact markers for once-only work. A request
+            // may finish here, just as prefill sampling can exhaust its budget
+            // or reach EOS without admitting any model decode transaction.
+            auto initialization = cuda_context.createGraphCapture(fragment_stream);
+            ASSERT_TRUE(initialization->beginCapture());
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                static_cast<int *>(d_trace) + initialization_trace_index,
+                d_slot_values, sizeof(int), device_id_, fragment_stream));
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                static_cast<int *>(d_control) + complete_index,
+                d_initial_complete, sizeof(int), device_id_, fragment_stream));
+            ASSERT_TRUE(initialization->endCapture());
+            const DeviceControlledLoopFragment initializers[] = {
+                {.name = "once-only request initialization", .capture = initialization.get()}};
             auto parent = cuda_context.createGraphCapture(parent_stream);
             ASSERT_NE(parent, nullptr);
             ASSERT_TRUE(
                 parent->supportsDeviceControlledSelectorWhileLoop());
             ASSERT_TRUE(parent->buildDeviceControlledSelectorWhileLoop(
-                fragments,
+                DeviceControlledLoopProgram{
+                    .initialization = initializers, .iteration = fragments},
                 DeviceControlledLoopPredicate{
                     .control_rows_device =
                         static_cast<const int *>(d_control),
@@ -3664,8 +3684,9 @@ namespace
                     .invalid_selector_error = invalid_selector_error}));
             ASSERT_TRUE(parent->instantiate());
 
-            auto run_legal_depth = [&](int depth)
+            auto run_legal_depth = [&](int depth, bool completes_during_initialization)
             {
+                const int initial_complete = completes_during_initialization ? 1 : 0;
                 const std::array<int, control_stride> initial_control = {
                     1,
                     0,
@@ -3673,6 +3694,9 @@ namespace
                     0};
                 std::array<int, trace_word_count> actual_trace{};
                 std::array<int, control_stride> actual_control{};
+                ASSERT_TRUE(copyHostToDevice(
+                    d_initial_complete, &initial_complete, sizeof(initial_complete),
+                    device_id_, parent_stream));
                 ASSERT_TRUE(copyHostToDevice(
                     d_control,
                     initial_control.data(),
@@ -3705,19 +3729,25 @@ namespace
                 {
                     EXPECT_EQ(
                         actual_trace[static_cast<size_t>(slot)],
-                        slot < depth
+                        !completes_during_initialization && slot < depth
                             ? slot_values[static_cast<size_t>(slot)]
                             : trace_sentinel)
                         << "selector=" << depth << " slot=" << slot;
                 }
                 EXPECT_EQ(
                     actual_trace[maximum_selector],
-                    common_tail_value);
+                    completes_during_initialization ? trace_sentinel : common_tail_value);
+                EXPECT_EQ(actual_trace[initialization_trace_index], slot_values[0]);
                 EXPECT_EQ(actual_control[healthy_index], 1);
                 EXPECT_EQ(actual_control[complete_index], 1);
                 EXPECT_EQ(actual_control[selector_index], depth);
                 EXPECT_EQ(actual_control[error_index], 0);
 
+                // Poison every marker before terminal replay: identical stale
+                // writes must not masquerade as proof of zero execution.
+                ASSERT_TRUE(copyHostToDevice(
+                    d_trace, empty_trace.data(), sizeof(empty_trace),
+                    device_id_, parent_stream));
                 ASSERT_TRUE(parent->launch())
                     << "A terminal controller must replay zero iterations";
                 std::array<int, trace_word_count> terminal_replay_trace{};
@@ -3729,14 +3759,17 @@ namespace
                     parent_stream));
                 ASSERT_TRUE(
                     backend_->synchronizeStream(parent_stream, device_id_));
-                EXPECT_EQ(terminal_replay_trace, actual_trace);
+                EXPECT_EQ(terminal_replay_trace, empty_trace);
             };
 
-            for (int depth = minimum_selector;
-                 depth <= maximum_selector;
-                 ++depth)
+            for (int replay = 0; replay < 20; ++replay)
             {
-                run_legal_depth(depth);
+                SCOPED_TRACE(replay);
+                for (int depth = minimum_selector; depth <= maximum_selector; ++depth)
+                {
+                    run_legal_depth(depth, false);
+                    run_legal_depth(depth, true);
+                }
             }
 
             auto run_invalid_depth = [&](int depth)
@@ -3748,6 +3781,10 @@ namespace
                     0};
                 std::array<int, trace_word_count> actual_trace{};
                 std::array<int, control_stride> actual_control{};
+                const int initial_complete = 0;
+                ASSERT_TRUE(copyHostToDevice(
+                    d_initial_complete, &initial_complete, sizeof(initial_complete),
+                    device_id_, parent_stream));
                 ASSERT_TRUE(copyHostToDevice(
                     d_control,
                     initial_control.data(),
@@ -3776,7 +3813,9 @@ namespace
                 ASSERT_TRUE(
                     backend_->synchronizeStream(parent_stream, device_id_));
 
-                EXPECT_EQ(actual_trace, empty_trace);
+                auto expected_trace = empty_trace;
+                expected_trace[initialization_trace_index] = slot_values[0];
+                EXPECT_EQ(actual_trace, expected_trace);
                 EXPECT_EQ(actual_control[healthy_index], 0);
                 EXPECT_EQ(actual_control[complete_index], 1);
                 EXPECT_EQ(
@@ -3786,7 +3825,21 @@ namespace
             run_invalid_depth(minimum_selector - 1);
             run_invalid_depth(maximum_selector + 1);
 
+            // Unhealthy admission is absorbing even when Complete is not set.
+            const std::array<int, control_stride> unhealthy_control = {0, 0, 1, 123};
+            ASSERT_TRUE(copyHostToDevice(d_control, unhealthy_control.data(),
+                sizeof(unhealthy_control), device_id_, parent_stream));
+            ASSERT_TRUE(copyHostToDevice(d_trace, empty_trace.data(),
+                sizeof(empty_trace), device_id_, parent_stream));
+            ASSERT_TRUE(parent->launch());
+            std::array<int, trace_word_count> unhealthy_trace{};
+            ASSERT_TRUE(copyDeviceToHost(unhealthy_trace.data(), d_trace,
+                sizeof(unhealthy_trace), device_id_, parent_stream));
+            ASSERT_TRUE(backend_->synchronizeStream(parent_stream, device_id_));
+            EXPECT_EQ(unhealthy_trace, empty_trace);
+
             parent.reset();
+            initialization.reset();
             common_tail.reset();
             slot_captures.clear();
             cuda_context.destroyStream(fragment_stream);
@@ -4528,6 +4581,7 @@ namespace
                 MTPVerifierPreparationStage::Params stage_params;
                 stage_params.device_id = execution_device;
                 stage_params.backend = backend_;
+                stage_params.authority = MTPVerifierPreparationStage::Authority::VerifierInputOwner;
                 stage_params.token_rows = token_rows;
                 stage_params.request_count = 1;
                 stage_params.padded_seq_len = max_verifier_width;
@@ -5216,19 +5270,19 @@ namespace
                     prompt_lengths.size() * sizeof(int32_t),
                     device_id_,
                     stream));
-                ASSERT_TRUE(backend_->enqueueInitializeMTPDeviceLogicalState(
-                    d_samples,
-                    d_target,
-                    request_count,
-                    device_id_,
-                    stream,
-                    d_base,
-                    d_target,
-                    d_accepted,
-                    d_next,
-                    d_all_accepted,
-                    d_stopped,
-                    d_ok));
+                ASSERT_TRUE(backend_->enqueueInitializeGenerationLogicalState({
+                    .source = GenerationInitialFrontier::SampledCondition,
+                    .positions = static_cast<const int32_t *>(d_target),
+                    .sampled_tokens = static_cast<const int32_t *>(d_samples),
+                    .request_count = request_count,
+                    .output = {.base_cached_tokens = static_cast<int32_t *>(d_base),
+                        .target_positions = static_cast<int32_t *>(d_target),
+                        .accepted_state_counts = static_cast<int32_t *>(d_accepted),
+                        .next_condition_tokens = static_cast<int32_t *>(d_next),
+                        .all_drafts_accepted_flags = static_cast<int32_t *>(d_all_accepted),
+                        .stopped_flags = static_cast<int32_t *>(d_stopped),
+                        .publication_ok_flags = static_cast<int32_t *>(d_ok)}},
+                    device_id_, stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
             });
         };
@@ -5356,19 +5410,19 @@ namespace
                         static_cast<int32_t *>(d_target) + request,
                         /*threshold_position_offset=*/0));
                 }
-                ASSERT_TRUE(backend_->enqueueInitializeMTPDeviceLogicalState(
-                    d_samples,
-                    d_target,
-                    request_count,
-                    device_id_,
-                    stream,
-                    d_base,
-                    d_target,
-                    d_accepted,
-                    d_next,
-                    d_all_accepted,
-                    d_stopped,
-                    d_ok));
+                ASSERT_TRUE(backend_->enqueueInitializeGenerationLogicalState({
+                    .source = GenerationInitialFrontier::SampledCondition,
+                    .positions = static_cast<const int32_t *>(d_target),
+                    .sampled_tokens = static_cast<const int32_t *>(d_samples),
+                    .request_count = request_count,
+                    .output = {.base_cached_tokens = static_cast<int32_t *>(d_base),
+                        .target_positions = static_cast<int32_t *>(d_target),
+                        .accepted_state_counts = static_cast<int32_t *>(d_accepted),
+                        .next_condition_tokens = static_cast<int32_t *>(d_next),
+                        .all_drafts_accepted_flags = static_cast<int32_t *>(d_all_accepted),
+                        .stopped_flags = static_cast<int32_t *>(d_stopped),
+                        .publication_ok_flags = static_cast<int32_t *>(d_ok)}},
+                    device_id_, stream));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
 
@@ -6810,14 +6864,11 @@ namespace
                 ASSERT_TRUE(capture->beginCapture());
                 ASSERT_TRUE(
                     backend_
-                        ->enqueueArgmaxF32BatchedRowsWithMTPPenaltiesDevice(
+                        ->enqueueArgmaxF32RowsWithHistoryDevice(
                             d_logits,
                             rows,
                             vocab_size,
-                            d_draft_tokens,
-                            d_counts,
-                            d_policy,
-                            d_active_rows,
+                            GenerationPenaltyHistory::speculative(d_counts, d_policy, d_draft_tokens, d_active_rows),
                             device_id_,
                             stream,
                             d_argmax_values,

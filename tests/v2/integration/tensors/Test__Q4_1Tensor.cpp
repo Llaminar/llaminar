@@ -1,4 +1,13 @@
+/**
+ * @file Test__Q4_1Tensor.cpp
+ * @brief Native Q4_1 tensor arithmetic using explicitly owned CPU workspace.
+ *
+ * Direct GEMM calls borrow the same admitted workspace contract as production
+ * stages. The fixture owns scratch until computation completes; prepared weights
+ * never retain or allocate an implicit activation bank.
+ */
 #include <gtest/gtest.h>
+#include "../../utils/CPUProjectionTestWorkspace.h"
 #include <vector>
 #include <memory>
 #include <cmath>
@@ -94,7 +103,8 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_SingleBlock)
 
     // Run GEMM
     // multiply(A, C, m, n, k)
-    bool success = gemm->multiply_tensor(input.get(), output.get(), m, n, k);
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {gemm.get()}));
+    bool success = gemm->multiply_tensor(input.get(), output.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
     ASSERT_TRUE(success);
 
     // Calculate expected result
@@ -154,7 +164,8 @@ TEST_F(Test__Q4_1Tensor, GemmCorrectness_MultipleBlocks)
     output_data[0] = 0.0f;
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {gemm.get()}));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     float expected_sum = 0.0f;
     // Block 0
@@ -240,10 +251,11 @@ TEST_F(Test__Q4_1Tensor, QuantizedVsFP32Parity)
 
     // Run quantized GEMM (INT8 path)
     auto quantized_gemm = q4_1_tensor->createGemm();
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {quantized_gemm.get()}));
     ASSERT_TRUE(quantized_gemm->multiply_tensor(
         input.get(),
         output_quantized.get(),
-        m, n, k));
+        m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     // Run FP32 GEMM (OneDNN reference)
     gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());

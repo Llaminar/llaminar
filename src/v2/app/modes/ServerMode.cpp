@@ -2,6 +2,10 @@
  * @file ServerMode.cpp
  * @brief HTTP server mode with OpenAI-compatible REST API
  *
+ * Request termination belongs to this mode; process finalization belongs to
+ * the caller's MPIProcessSession. Returning first retires mode-local adapters
+ * and handlers before the runner, contexts and outer session are destroyed.
+ *
  * Endpoints:
  *   GET  /health                  — Liveness check
  *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
@@ -13,9 +17,11 @@
  */
 
 #include "app/modes/ServerMode.h"
+#include "app/modes/ServerRankMembership.h"
+#include "app/modes/ServerExecutionEvidence.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
-#include "app/MPIShutdown.h"
+#include "utils/Assertions.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -317,7 +323,13 @@ namespace llaminar2
                 DebugEnv::envValue("LLAMINAR_ENABLE_SERVER_SHUTDOWN_ENDPOINT"));
         }
 
-        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        /**
+         * @brief Terminate the request channel while retaining outer MPI ownership.
+         * @param ctx Active caller-owned application resources.
+         * @param detail Failure shared with followers before runner retirement.
+         * @return Nonzero command exit; the caller's scope finalizes MPI later.
+         */
+        int shutdownAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
             const bool is_authority =
@@ -337,7 +349,6 @@ namespace llaminar2
                 ctx.runner->shutdown();
             }
             flushPerfStatsFromEnv();
-            mpiShutdown();
             return 1;
         }
     } // namespace
@@ -377,11 +388,28 @@ namespace llaminar2
             CoordinatedRequestRole::Authority;
         // Copy immutable topology only for observation. This runs once before
         // serving/participating; graph and request decisions never consult it.
-        PerfStatsCollector::addCounter(
-            "server", "rank_membership", 1.0, "startup", {},
-            {{"rank", std::to_string(mpi_ctx->rank())},
-             {"world_size", std::to_string(mpi_ctx->world_size())},
-             {"authority_rank", std::to_string(runner->coordinatedRootRank())}});
+        if (PerfStatsCollector::isDomainEnabled("server"))
+        {
+            // Read the already-published context snapshot. A second hostname
+            // probe or MPI exchange here would introduce another topology
+            // authority and a new startup failure/ordering boundary.
+            const auto inventory = mpi_ctx->clusterInventory();
+            LLAMINAR_ASSERT_NOT_NULL(inventory, "server cluster inventory");
+            PerfStatsCollector::addCounter(
+                "server", "rank_membership", 1.0, "startup", {},
+                serverRankMembershipTags(*inventory, mpi_ctx->rank(),
+                                         runner->coordinatedRootRank()));
+            PerfStatsCollector::addCounter(
+                "server", "execution_topology", 1.0, "startup", {},
+                serverExecutionTopologyTags(serverExecutionParticipants(
+                    runner->executionPlan(), runner->config(), mpi_ctx->world_size())));
+            // Only the service authority publishes request policy. Expert-only
+            // followers do not own an independent MTP/prefix configuration.
+            if (is_authority)
+                PerfStatsCollector::addCounter(
+                    "server", "execution_policy", 1.0, "startup", {},
+                    serverExecutionPolicyTags(runner->executionPlan(), runner->config()));
+        }
         if (mpi_coordinated && !is_authority)
         {
             // Followers enter the MPI command loop and participate in the
@@ -392,7 +420,6 @@ namespace llaminar2
             runner->runMPIWorkerLoop();
             runner->shutdown();
             flushPerfStatsFromEnv();
-            mpiShutdown();
             return 0;
         }
 
@@ -409,7 +436,6 @@ namespace llaminar2
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
-            mpiShutdown();
             return 1;
         }
 
@@ -424,7 +450,6 @@ namespace llaminar2
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
-            mpiShutdown();
             return 1;
         }
 
@@ -581,7 +606,6 @@ namespace llaminar2
                 runner->shutdownMPIWorkers();
             runner->shutdown();
             flushPerfStatsFromEnv();
-            mpiShutdown();
             return 1;
         }
 
@@ -613,7 +637,6 @@ namespace llaminar2
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
                 flushPerfStatsFromEnv();
-                mpiShutdown();
                 return 1;
             }
         }
@@ -627,16 +650,15 @@ namespace llaminar2
 
         runner->shutdown();
         flushPerfStatsFromEnv();
-        mpiShutdown();
         return 0;
     }
     catch (const std::exception &e)
     {
-        return finalizeAfterUnhandledException(ctx, e.what());
+        return shutdownAfterUnhandledException(ctx, e.what());
     }
     catch (...)
     {
-        return finalizeAfterUnhandledException(ctx, "unknown exception");
+        return shutdownAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

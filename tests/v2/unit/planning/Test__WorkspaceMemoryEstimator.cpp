@@ -16,10 +16,15 @@
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/common/EmbeddingWorkspaceContract.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
 #include "kernels/kvcache/KVCacheWorkspaceContract.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmWorkspaceContract.h"
 #include "kernels/rope/RoPEWorkspaceContract.h"
 #include "tensors/TensorType.h"
 #include <algorithm>
@@ -28,8 +33,193 @@
 
 using namespace llaminar2;
 
+/** @test Missing participant facts cannot be replaced by planner-local CPU detection. */
+TEST(Test__WorkspaceMemoryEstimator, CPUProjectionRequiresPublishedQuantizedGeometryOnly)
+{
+    CPUProjectionWorkspaceGeometry geometry{.rows = 15, .n = 512, .k = 256, .workers = 8,
+        .execution = test::kSyntheticCPUExecutionGeometry};
+    EXPECT_FALSE(CPUProjectionWorkspaceContract::sourceNative("Q8_0", geometry).buffers.empty());
+    for (const auto format : {"F32", "F16", "BF16"})
+        EXPECT_TRUE(CPUProjectionWorkspaceContract::sourceNative(format, geometry).buffers.empty());
+    auto incomplete = geometry;
+    incomplete.execution = {};
+    EXPECT_THROW(CPUProjectionWorkspaceContract::sourceNative("Q8_0", incomplete), std::invalid_argument);
+    incomplete = geometry;
+    incomplete.workers = 0;
+    EXPECT_THROW(CPUProjectionWorkspaceContract::sourceNative("Q6_K", incomplete), std::invalid_argument);
+    incomplete = geometry;
+    incomplete.execution.maximum_native_row_tile = 8;
+    EXPECT_THROW(CPUProjectionWorkspaceContract::sourceNative("IQ2_S", incomplete), std::invalid_argument);
+    EXPECT_THROW(CPUProjectionWorkspaceContract::sourceNative("unknown", geometry), std::invalid_argument);
+    geometry.k = INT_MAX;
+    EXPECT_THROW(CPUProjectionWorkspaceContract::sourceNative("Q8_0", geometry), std::invalid_argument);
+}
+
+/** @test Ordered partials account for all physical rows, partitions and masked tail columns. */
+TEST(Test__WorkspaceMemoryEstimator, CPUOrderedPartialBankUsesCheckedPhysicalExtent)
+{
+    EXPECT_EQ(cpuProjectionPartialFloats(3, 65, 2), 3u * 2 * 2 * 64);
+    EXPECT_EQ(cpuProjectionPartialFloats(3, 65, 0), 0u);
+    EXPECT_EQ(cpuProjectionPartialFloats(3, 65, 1), 0u);
+    EXPECT_TRUE(cpuProjectionPartialWorkspaceRequirements(0).buffers.empty());
+    const auto requirements = cpuProjectionPartialWorkspaceRequirements(cpuProjectionPartialFloats(3, 65, 2));
+    ASSERT_EQ(requirements.buffers.size(), 1u);
+    EXPECT_EQ(requirements.buffers[0].name, kCPUProjectionPartials);
+    EXPECT_EQ(requirements.buffers[0].size_bytes, 3u * 2 * 2 * 64 * sizeof(float));
+    EXPECT_THROW(cpuProjectionPartialFloats(0, 64, 2), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialFloats(1, 0, 2), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialFloats(1, 64, -1), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialFloats(std::numeric_limits<int>::max(),
+        std::numeric_limits<int>::max(), std::numeric_limits<int>::max()), std::overflow_error);
+}
+
+/** @test Fused capacity is a checked worker envelope, not a sum over all model experts. */
+TEST(Test__WorkspaceMemoryEstimator, CPUFusedPartialEnvelopeBoundsEveryOwnershipRoute)
+{
+    for (int rows : {1, 2, 3, 4, 15, 31, 128})
+    for (int columns : {1, 64, 65, 513})
+    for (int partitions : {0, 1, 2, 8, 16, 17, 32, 127})
+    for (int workers = 1; workers <= 64; ++workers)
+    for (int row_tile : {1, 2, 4})
+    {
+        const auto serial = cpuProjectionPartialFloats(rows, columns, partitions);
+        const auto tile = cpuProjectionPartialFloats(std::min(rows, row_tile), 64, partitions);
+        const auto slots = partitions > MoEProjectionNumericalContract::ordered_k_partitions
+            ? workers : workers - 1;
+        EXPECT_EQ(cpuProjectionPartialEnvelopeFloats(rows, columns, partitions, workers, row_tile),
+            std::max(serial, size_t(slots) * tile));
+    }
+    EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, 2, 0, 2), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, 2, 1, 0), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, 2, 1, 5), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionPartialEnvelopeFloats(1, 64, INT_MAX, INT_MAX, 4), std::overflow_error);
+}
+
+/** @test CPU admission and execution price one shared transform, independent of codebook and layer count. */
+TEST(Test__WorkspaceMemoryEstimator, CPUDownTransformUsesCanonicalShapeAndSerialNameMerge)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.n_layers = 2;
+    profile.d_model = 128;
+    profile.d_ff = 4096;
+    profile.vocab_size = 4096;
+    WorkspaceMemoryGeometry geometry{.device = DeviceId::cpu(), .resident_graph_rows = 31,
+        .local_d_ff = 4096, .first_layer = 0, .last_layer = 1};
+    geometry.device_compute_units = 1;
+    geometry.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    const auto empty = WorkspaceMemoryEstimator::estimate(profile, geometry);
+    for (const auto format : {"F32", "F16", "BF16", "Q4_K", "IQ2_S"})
+    {
+        profile.tensors = {{.name = "blk.0.ffn_down.weight", .quant_type = format,
+            .elements = 128u * 4096u, .K = 4096, .layer_index = 0}};
+        for (int shards = 1; shards <= 8; ++shards)
+        {
+            geometry.total_shards = shards;
+            geometry.local_d_ff = 4096 / shards;
+            for (int shard = 0; shard < shards; ++shard)
+            {
+                geometry.shard_index = shard;
+                const size_t width = size_t(4096 / shards) + (shard < 4096 % shards ? 1u : 0u);
+                auto requirements = cpuSwiGLUWorkspaceRequirements(31, width);
+                if (std::string_view(format) == "Q4_K" || std::string_view(format) == "IQ2_S")
+                    requirements.merge(cpuProjectionQ8WorkspaceRequirements(31, width));
+                EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
+                    requirements.total_bytes_with_alignment());
+            }
+        }
+        geometry.total_shards = 1;
+        geometry.shard_index = 0;
+        const auto one = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        auto second = profile.tensors.front();
+        second.name = "blk.1.ffn_down.weight";
+        second.layer_index = 1;
+        profile.tensors.push_back(second);
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry), one);
+    }
+    EXPECT_THROW(cpuSwiGLUWorkspaceRequirements(0, 256), std::invalid_argument);
+    EXPECT_THROW(cpuSwiGLUWorkspaceRequirements(1, -1), std::invalid_argument);
+}
+
+/** @test A sparse CPU follower admits the same compact-route transform shape as its graph. */
+TEST(Test__WorkspaceMemoryEstimator, CPUSparseFollowerAdmitsInvocationScratch)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 1;
+    profile.expert_count = 8;
+    profile.expert_used_count = 3;
+    profile.expert_feed_forward_length = 512;
+    profile.d_model = 128;
+    WorkspaceMemoryGeometry geometry{.device = DeviceId::cpu(), .batch_size = 2,
+        .resident_graph_rows = 15};
+    geometry.device_compute_units = 8;
+    geometry.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    geometry.first_layer = geometry.last_layer = 0;
+    for (const auto format : {"F32", "F16", "BF16", "Q8_0", "Q6_K", "IQ2_S"})
+    {
+        profile.tensors = {
+            {.name = "blk.0.ffn_gate_exps.weight", .quant_type = format,
+             .elements = 8u * 512 * 128, .K = 128, .layer_index = 0},
+            {.name = "blk.0.ffn_up_exps.weight", .quant_type = format,
+             .elements = 8u * 512 * 128, .K = 128, .layer_index = 0},
+            {.name = "blk.0.ffn_down_exps.weight", .quant_type = format,
+             .elements = 8u * 128 * 512, .K = 512, .layer_index = 0}};
+        auto requirements = cpuSwiGLUWorkspaceRequirements(2 * 15 * 3, 512);
+        for (const auto [n, k] : {std::pair{512, 128}, std::pair{128, 512}})
+            requirements.merge(CPUProjectionWorkspaceContract::sourceNative(format, {
+                .rows = 2 * 15 * 3, .n = n, .k = k, .workers = 8,
+                .execution = geometry.cpu_execution,
+                .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry),
+            requirements.total_bytes_with_alignment()) << format;
+    }
+    profile.expert_feed_forward_length = 0;
+    EXPECT_THROW(WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry), std::runtime_error);
+}
+
 namespace
 {
+
+/** @test Q8 capacity follows block tails and terminal MTP rows, not vocabulary or context size. */
+TEST(Test__WorkspaceMemoryEstimator, CPUQ8InputBankCoversTailsAndTiedOutput)
+{
+    for (const int rows : {1, 2, 15, 31})
+    for (const int columns : {1, 31, 32, 33, 255, 256, 257})
+    {
+        const auto requirement = cpuProjectionQ8WorkspaceRequirements(rows, columns);
+        ASSERT_EQ(requirement.buffers.size(), 1u);
+        EXPECT_EQ(requirement.buffers.front().size_bytes,
+            size_t(rows) * ((size_t(columns) + 31) / 32) * sizeof(Q8_1Block));
+    }
+    EXPECT_THROW(cpuProjectionQ8WorkspaceRequirements(0, 256), std::invalid_argument);
+    EXPECT_THROW(cpuProjectionQ8WorkspaceRequirements(1, -1), std::invalid_argument);
+
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35";
+    profile.d_model = 256;
+    profile.vocab_size = 4096;
+    WorkspaceMemoryGeometry geometry{.device = DeviceId::cpu(), .resident_graph_rows = 8192,
+        .mtp_target_query_rows = 31};
+    geometry.device_compute_units = 1;
+    geometry.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    const auto empty = WorkspaceMemoryEstimator::estimate(profile, geometry);
+    profile.tensors = {{.name = "token_embd.weight", .quant_type = "Q8_0",
+        .elements = 4096u * 256u, .K = 256, .layer_index = -1}};
+    // This metadata-only profile has no recurrent rollback owner. The existing
+    // graph-family contract therefore admits both main and compact namespaces:
+    // verifier-width terminal input plus the compact serial sampling input.
+    const auto terminal_banks =
+        cpuProjectionQ8WorkspaceRequirements(31, 256).total_bytes_with_alignment() +
+        cpuProjectionQ8WorkspaceRequirements(1, 256).total_bytes_with_alignment();
+    EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
+        terminal_banks);
+    auto terminal = profile.tensors.front();
+    terminal.name = "output.weight";
+    profile.tensors.push_back(terminal);
+    EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry) - empty,
+        terminal_banks);
+}
 
 /**
  * @brief Price only the attention ABI when updating historical family goldens.
@@ -830,6 +1020,61 @@ TEST(Test__WorkspaceMemoryEstimator,
             floating_gemm_abi::kBlasMatmulWorkspaceBytes);
 }
 
+/** @test All floating sources admit both wrapper and BLAS pointer triplets, without a GPU. */
+TEST(Test__WorkspaceMemoryEstimator, CUDAFloatingExpertsIncludeNestedBLASPointerArrays)
+{
+    auto profile = qwen35MoEProfile(false);
+    auto geometry = graphGeometry(DeviceId::cuda(0));
+    geometry.apportioned_routed_experts = true;
+    profile.tensors.clear();
+    for (const std::string_view format : {"F16", "BF16", "F32"})
+    {
+        profile.tensors = {{"blk.0.ffn_gate_exps.weight", 0, std::string(format),
+            size_t(512 * 2048) * profile.expert_count, 2048, 0}};
+        for (int rows : {1, 8, 15, 129})
+        {
+            geometry.resident_graph_rows = rows;
+            auto base = MoEWorkspaceBuffers::cudaMoE(rows, profile.d_model,
+                profile.expert_feed_forward_length, profile.expert_count, profile.expert_used_count);
+            base.merge(MoEWorkspaceBuffers::cudaMoE(rows * profile.expert_used_count, profile.d_model,
+                profile.expert_feed_forward_length, profile.expert_count, 1));
+            const size_t redirect = floating_gemm_abi::kMaxBatchedProjections *
+                size_t(rows * profile.expert_used_count) * 512 * sizeof(float);
+            const size_t expected = base.total_bytes_with_alignment() + redirect +
+                floating_gemm_abi::kBlasMatmulWorkspaceBytes + 6 * 256;
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile, geometry), expected)
+                << format << " rows=" << rows;
+            const auto contract = cuda::floating_gemm_workspace::projectionRequirements(rows, 512);
+            EXPECT_EQ(contract.buffers.size(), 8u); // Six pointer arrays, library scratch, redirect.
+            EXPECT_NE(contract.find(cuda::floating_gemm_workspace::kBatchedSameAAArray), nullptr);
+            EXPECT_NE(contract.find(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS), nullptr);
+        }
+    }
+    EXPECT_THROW(cuda::floating_gemm_workspace::projectionRequirements(SIZE_MAX, 512), std::overflow_error);
+}
+
+/** @test Ordinary ROCm metadata and library/wrapper kernels compose one named scratch ABI. */
+TEST(Test__WorkspaceMemoryEstimator, ROCmFloatingProjectionHasCanonicalLibraryAndPointerScratch)
+{
+    const auto library = rocm::floating_gemm_workspace::blasRequirements();
+    const auto projection = rocm::floating_gemm_workspace::projectionRequirements();
+    ASSERT_EQ(library.buffers.size(), 1u);
+    EXPECT_EQ(library.buffers.front().name, floating_gemm_abi::kROCmBlasMatmulWorkspace);
+    EXPECT_EQ(library.buffers.front().size_bytes, floating_gemm_abi::kBlasMatmulWorkspaceBytes);
+    ASSERT_EQ(projection.buffers.size(), 4u);
+    for (auto name : {GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS,
+                     GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS,
+                     GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS})
+    {
+        const auto *buffer = projection.find(name);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ(buffer->size_bytes, floating_gemm_abi::kMaxBatchedProjections * sizeof(void *));
+        EXPECT_EQ(buffer->alignment, 256u);
+    }
+    EXPECT_EQ(projection.total_bytes_with_alignment(),
+        library.total_bytes_with_alignment() + 3u * 256u);
+}
+
 TEST(Test__WorkspaceMemoryEstimator, Qwen35MoE4K_CoversObservedCUDAFamilyPlan)
 {
     const auto profile = qwen35MoEProfile(true);
@@ -1202,10 +1447,11 @@ TEST(Test__WorkspaceMemoryEstimator,
     constexpr size_t kLocalProjectionColumns = 8192;
     constexpr size_t kRedirectBytes =
         8ULL * 4096ULL * kLocalProjectionColumns * sizeof(float);
-    constexpr size_t kThreeAlignedPointerArrays = 3ULL * 256ULL;
+    // Wrapper and nested cuBLAS adapter retain separate captured triplets.
+    constexpr size_t kSixAlignedPointerArrays = 6ULL * 256ULL;
     EXPECT_EQ(
         floating_bytes - quantized_bytes,
-        kRedirectBytes + kThreeAlignedPointerArrays +
+        kRedirectBytes + kSixAlignedPointerArrays +
             floating_gemm_abi::kBlasMatmulWorkspaceBytes);
 }
 

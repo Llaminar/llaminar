@@ -25,7 +25,20 @@ def row(name, tagged):
     return {"case": name, "campaign": "campaign", "backends": "CPU+ROCm",
             "model_files": ["/models/model.gguf"],
             "configuration": {"model_parity_schema": 1, "id": name,
+                "cross_host_e2e": [],
                 "model": "/models/model.gguf", "e2e": {"server_args": ["opaque"]} if tagged else None}}
+
+
+def remote_cases():
+    """Synthetic wire examples exercise schema validation, not model selection."""
+    return [{"schema": 1, "id": f"opaque-{count}-{route}", "frontend": route,
+             "topology": {"kind": "cross-host-expert-overlay", "continuation_backend": "rocm",
+                          "continuation_devices": 1, "remote_cpu_hosts": count,
+                          "cpu_ranks_per_host": 1, "execution_ranks": count + 1,
+                          "continuation_priority": -4, "remote_priority": 37},
+             "movement_evidence": "required", "owner_order": "ordinal",
+             "server_policy_args": ["--only-strategies", "expert-overlay"]}
+            for count in (1, 2) for route in ("plan-apply", "auto-serve")]
 
 
 class InventoryTests(unittest.TestCase):
@@ -61,6 +74,105 @@ class InventoryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "all-cell manifest"):
                     self.discover(inventory.InventoryScope.ALL)
                 self.assertEqual(len(self.discover(inventory.InventoryScope.E2E)), 1)
+
+    def test_remote_scope_projects_existing_tags_without_running_cloud_commands(self):
+        self.document["cells"][1]["configuration"]["cross_host_e2e"] = remote_cases()
+        with patch.object(inventory.subprocess, "run", side_effect=AssertionError("no execution during discovery")):
+            selected = self.discover(inventory.InventoryScope.CROSS_HOST_E2E)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0][2]["cross_host_e2e"], remote_cases())
+        exported = inventory.export_manifest(selected, "revision", inventory.InventoryScope.CROSS_HOST_E2E)
+        self.assertEqual(exported["scope"], "cross-host-e2e")
+        self.document = exported
+        self.assertEqual(self.discover(inventory.InventoryScope.CROSS_HOST_E2E), selected)
+        with self.assertRaisesRegex(ValueError, "all-cell manifest"):
+            self.discover(inventory.InventoryScope.ALL)
+
+    def test_remote_scope_rejects_stale_empty_or_untagged_metadata(self):
+        with self.assertRaisesRegex(ValueError, "no cross-host-e2e canonical cells"):
+            self.discover(inventory.InventoryScope.CROSS_HOST_E2E)
+        self.document["cells"][0]["configuration"].pop("cross_host_e2e")
+        with self.assertRaisesRegex(ValueError, "stale metadata"):
+            self.discover(inventory.InventoryScope.CROSS_HOST_E2E)
+        self.document["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        with self.assertRaisesRegex(ValueError, "HTTP-tagged"):
+            self.discover(inventory.InventoryScope.CROSS_HOST_E2E)
+
+    def test_remote_wire_rejects_missing_duplicate_and_inconsistent_frontend_routes(self):
+        for mutate in (
+            lambda rows: rows.pop(),
+            lambda rows: rows.append(copy.deepcopy(rows[0])),
+            lambda rows: rows[0].update(frontend="private-runner"),
+            lambda rows: rows[0].update(schema=True),
+            lambda rows: rows[0].update(id=""),
+            lambda rows: rows[0].update(model="/stale/path.gguf"),
+            lambda rows: rows[0].update(movement_evidence="not_applicable"),
+            lambda rows: rows[0].update(server_policy_args="--mtp"),
+            lambda rows: rows[0].update(server_policy_args=["--different-policy"]),
+            lambda rows: rows[0]["topology"].update(remote_cpu_hosts=0),
+            lambda rows: rows[0]["topology"].update(remote_cpu_hosts=True),
+            lambda rows: rows[0]["topology"].update(remote_cpu_hosts=2**31 - 1),
+            lambda rows: rows[0]["topology"].update(execution_ranks=7),
+            lambda rows: rows[0]["topology"].update(continuation_backend="cpu"),
+            lambda rows: rows[0]["topology"].update(remote_priority=-4),
+        ):
+            record = row("source", True)["configuration"]
+            record["cross_host_e2e"] = remote_cases()
+            mutate(record["cross_host_e2e"])
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                inventory.cross_host_scenarios(record)
+
+    def test_remote_cli_lists_expanded_frontend_identities_from_the_exporter(self):
+        self.document["cells"][1]["configuration"]["cross_host_e2e"] = remote_cases()
+        self.path.write_text(json.dumps(self.document))
+        with patch("builtins.print") as output:
+            self.assertEqual(inventory.main([
+                "--manifest", str(self.path), "--source-revision", "revision",
+                "--scope", "cross-host-e2e"]), 0)
+        self.assertEqual([call.args[0] for call in output.call_args_list[:-1]],
+                         [scenario["id"] for scenario in remote_cases()])
+        self.assertEqual(output.call_args_list[-1].args[0],
+                         "[model-parity-inventory] scope=cross-host-e2e cells=4 source_cells=1")
+
+    def test_remote_harness_selects_only_an_exact_existing_scenario(self):
+        record = row("source", True)["configuration"]
+        record["cross_host_e2e"] = remote_cases()
+        original = copy.deepcopy(record)
+        for scenario in record["cross_host_e2e"]:
+            self.assertIs(inventory.select_cross_host_scenario(record, scenario["id"]), scenario)
+        self.assertEqual(record, original)
+        for name in ("", "opaque-.*", "absent", None):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                inventory.select_cross_host_scenario(record, name)
+        # Narrowing may not hide a missing partner or invalid source identity.
+        for mutate in (lambda r: r["cross_host_e2e"].pop(),
+                       lambda r: r.pop("model"), lambda r: r.update(model_parity_schema=True),
+                       lambda r: r.pop("id")):
+            broken = copy.deepcopy(record)
+            mutate(broken)
+            with self.assertRaises(ValueError):
+                inventory.select_cross_host_scenario(broken, remote_cases()[0]["id"])
+
+    def test_remote_harness_selects_exact_scenario_from_manifest_projection(self):
+        self.document["cells"][1]["configuration"]["cross_host_e2e"] = remote_cases()
+        projected = {"schema": 1, "scope": "cross-host-e2e",
+                     "source_revision": "revision",
+                     "cells": [self.document["cells"][1]]}
+        selected = inventory.select_cross_host_scenario_from_manifest(
+            projected, remote_cases()[0]["id"])
+        self.assertEqual(selected, remote_cases()[0])
+
+    def test_remote_manifest_rejects_duplicate_scenario_ownership(self):
+        self.document["cells"][0] = copy.deepcopy(self.document["cells"][1])
+        self.document["cells"][0]["case"] = "duplicate-source"
+        self.document["cells"][0]["configuration"]["id"] = "duplicate-source-id"
+        self.document["cells"][0]["configuration"]["cross_host_e2e"] = remote_cases()
+        self.document["cells"][1]["configuration"]["cross_host_e2e"] = remote_cases()
+        with self.assertRaisesRegex(ValueError, "absent or duplicated"):
+            inventory.select_cross_host_scenario_from_manifest(
+                {"schema": 1, "scope": "cross-host-e2e", "source_revision": "revision",
+                 "cells": self.document["cells"]},
+                remote_cases()[0]["id"])
 
     def test_filters_do_not_hide_duplicate_or_invalid_manifest_entries(self):
         self.args.cell = "tagged"

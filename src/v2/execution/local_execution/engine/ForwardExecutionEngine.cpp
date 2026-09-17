@@ -4,6 +4,9 @@
  *
  * Contains the forward graph execution logic extracted from
  * DeviceGraphOrchestrator::executeForward().
+ * Every invocation owns one participant's graph and output stream. Pipeline
+ * composition belongs to the rank/global orchestrator; there is no uncached
+ * multi-device execution branch in this engine.
  *
  * Split into:
  * - execute():          Entry point — signature computation, cache dispatch
@@ -13,9 +16,11 @@
  */
 
 #include "ForwardExecutionEngine.h"
+#include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "PrefillBucketUtils.h"
 #include "../graph/DeviceGraphCaptureController.h"
 #include "../../compute_stages/ComputeStageFactory.h"
+#include "../../compute_stages/stages/DecodePositionSnapshotStage.h"
 #include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
@@ -1003,8 +1008,8 @@ namespace llaminar2
                 {"live_mtp_request_batch_condition",
                  boolTag(signature.live_mtp_request_batch_condition)},
                 {"all_position_logit_rows", std::to_string(signature.all_position_logit_rows)},
-                {"uses_device_token_ids", boolTag(signature.uses_device_token_ids)},
-                {"uses_device_position_ids", boolTag(signature.uses_device_position_ids)},
+                {"uses_device_token_ids", boolTag(signature.usesDeviceTokenIds())},
+                {"uses_device_position_ids", boolTag(signature.usesDevicePositionIds())},
                 {"uses_device_sequence_lengths", boolTag(signature.usesDeviceSequenceLengths())},
                 {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
@@ -1732,13 +1737,29 @@ namespace llaminar2
     bool ForwardExecutionEngine::execute(
         const ForwardInput &input,
         ForwardOutput &output,
-        IForwardExecutionHost &host)
+        IForwardExecutionHost &host,
+        std::optional<ForwardGraphSignature> *materialized_signature)
     {
+        if (materialized_signature)
+            materialized_signature->reset();
+        last_executed_forward_graph_ = {};
+        // Validate before a cache lookup: a matching shape must never hide a
+        // malformed or foreign position producer behind an older executable.
+        if (input.device_decode_position &&
+            (!input.device_decode_position->valid() || !input.device.is_gpu() ||
+             input.execution_phase != ForwardExecutionPhase::Decode ||
+             input.execution_role != ForwardExecutionRole::MainInference ||
+             input.batch_size != 1 || input.seq_len != 1 || input.position_ids ||
+             input.position_ids_device != input.device_decode_position->position ||
+             input.position_policy != ForwardPositionPolicy::ExplicitRows))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Invalid graph-owned decode position binding");
+            return false;
+        }
         ScopedWorkerGPUContextResolver worker_resolver_scope(
             executor_,
             host,
             input.device);
-        last_executed_forward_graph_ = {};
         const bool setup_materialization =
             input.graph_submission_intent ==
             ForwardGraphSubmissionIntent::
@@ -1849,9 +1870,8 @@ namespace llaminar2
             return false;
         }
         const bool decode_has_history = is_decode && first_position > 0;
-        const bool has_unified_pp = config_.has_unified_pp;
-        const bool is_standard_path = !has_unified_pp && !config_.pp_stage_config.has_value();
-        const bool is_partial_pp_path = !has_unified_pp && config_.pp_stage_config.has_value();
+        const bool is_standard_path = !config_.pp_stage_config.has_value();
+        const bool is_partial_pp_path = config_.pp_stage_config.has_value();
 
         // =====================================================================
         // Decode Graph Cache: Reuse cached graph for decode mode (seq_len=1)
@@ -1910,7 +1930,6 @@ namespace llaminar2
         const bool prefill_topology_cache_eligible =
             config_.cache_config.enabled &&
             !is_decode &&
-            !has_unified_pp &&
             has_stable_forward_inputs &&
             (is_standard_path || is_partial_pp_path);
         const bool cpu_exact_prefill_cache_eligible =
@@ -2006,7 +2025,6 @@ namespace llaminar2
         const bool forward_cache_eligible =
             (config_.cache_config.enabled &&
              is_decode &&
-             !has_unified_pp &&
              has_stable_forward_inputs &&
              (is_standard_path || is_partial_pp_path)) ||
             cpu_exact_prefill_cache_eligible ||
@@ -2049,14 +2067,17 @@ namespace llaminar2
                         : 0,
                 .mtp_verifier_outcome_graph_mode =
                     host.mtpVerifierOutcomeGraphMode(),
-                .uses_device_token_ids = input.token_ids_device != nullptr,
-                .uses_device_position_ids = input.position_ids_device != nullptr,
+                .device_token_ids = effective_input.token_ids_device,
+                .device_position_ids = effective_input.position_ids_device,
                 .position_policy = effective_input.position_policy,
                 .device_sequence_lengths = effective_input.sequence_lengths_device,
+                .device_decode_position = effective_input.device_decode_position,
                 .device_prefill_chunk_capture_identity =
                     effective_input.device_prefill_chunk
                         ? effective_input.device_prefill_chunk->capture_identity
                         : uint64_t{0},
+                .pipeline_forward_edges = PipelineForwardGraphEdges::encloses(effective_input)
+                    ? config_.pipeline_forward_edges : nullptr,
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
@@ -2115,9 +2136,9 @@ namespace llaminar2
                 << " all_logits="
                 << boolTag(forward_signature.all_position_logits)
                 << " device_tokens="
-                << boolTag(forward_signature.uses_device_token_ids)
+                << boolTag(forward_signature.usesDeviceTokenIds())
                 << " device_positions="
-                << boolTag(forward_signature.uses_device_position_ids)
+                << boolTag(forward_signature.usesDevicePositionIds())
                 << " position_policy="
                 << static_cast<int>(forward_signature.position_policy)
                 << " device_lengths="
@@ -2174,9 +2195,9 @@ namespace llaminar2
                            forward_signature
                                .live_mtp_request_batch_condition)
                     << " device_tokens="
-                    << boolTag(forward_signature.uses_device_token_ids)
+                    << boolTag(forward_signature.usesDeviceTokenIds())
                     << " device_positions="
-                    << boolTag(forward_signature.uses_device_position_ids)
+                    << boolTag(forward_signature.usesDevicePositionIds())
                     << " position_policy="
                     << static_cast<int>(forward_signature.position_policy)
                     << " device_lengths="
@@ -2213,9 +2234,9 @@ namespace llaminar2
                 << " seq_len=" << forward_signature.seq_len
                 << " batch_size=" << forward_signature.batch_size
                 << " device_tokens="
-                << boolTag(forward_signature.uses_device_token_ids)
+                << boolTag(forward_signature.usesDeviceTokenIds())
                 << " device_positions="
-                << boolTag(forward_signature.uses_device_position_ids)
+                << boolTag(forward_signature.usesDevicePositionIds())
                 << " device_lengths="
                 << boolTag(
                        forward_signature.usesDeviceSequenceLengths())
@@ -2240,6 +2261,8 @@ namespace llaminar2
             touchPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  forward_signature, start);
+            if (success && materialized_signature)
+                *materialized_signature = forward_signature;
             if (setup_materialization)
             {
                 if (success && !forward_signature.decode)
@@ -2308,7 +2331,7 @@ namespace llaminar2
 
         const bool success = executeCacheMiss(build_input, output, forward_signature, build_cache,
                                               should_cache_after_build, host, is_decode,
-                                              has_unified_pp, start);
+                                              start);
         if (!success && forward_cache_eligible)
         {
             /*
@@ -2330,6 +2353,11 @@ namespace llaminar2
                 << " success=" << boolTag(success));
         }
         if (success && build_cache && build_cache->valid)
+        {
+            if (materialized_signature)
+                *materialized_signature = forward_signature;
+        }
+        if (success && build_cache && build_cache->valid && !setup_materialization)
             recordLastExecutedForwardGraph(
                 forward_signature,
                 /*cache_hit=*/false,
@@ -2431,14 +2459,19 @@ namespace llaminar2
         const ForwardGraphCache &cache = cache_it->second;
         if (!signature.device.is_gpu() || !signature.decode)
             return reject("device-loop composition requires a GPU decode graph");
-        if (!signature.uses_device_token_ids ||
-            !signature.uses_device_position_ids)
+        if (!signature.usesDeviceTokenIds() ||
+            !signature.usesDevicePositionIds())
         {
             return reject(
                 "device-loop composition requires device-owned token and position rows");
         }
-        if (!cache.phase3_active)
-            return reject("forward graph is not replay-ready");
+        // Composition consumes a sealed executable, not evidence that it has
+        // already executed. `phase3_active` only skips semantic-node resets
+        // after ordinary replay; using it as readiness forced synthetic first
+        // inference before an ordinary/PP generation parent could be built.
+        if (cache.segment_cache.executable_submission_state ==
+            DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::Empty)
+            return reject("forward graph has no materialized executable");
 
         std::string template_error;
         const auto template_view = cache.segment_cache.deviceLoopGraphTemplate(
@@ -2455,6 +2488,42 @@ namespace llaminar2
         view.stage_count = template_view->stage_count;
         view.captured_node_count = template_view->captured_node_count;
         return view;
+    }
+
+    bool ForwardExecutionEngine::observeComposedForwardCompletion(
+        const ForwardGraphSignature &signature,
+        const IGPUGraphCapture *source_capture,
+        int64_t completed_invocations,
+        std::string *error) const
+    {
+        const auto reject = [&](const char *reason) {
+            if (error) *error = reason;
+            return false;
+        };
+        if (error) error->clear();
+        if (!source_capture || completed_invocations < 0 ||
+            !signature.device.is_gpu() || !signature.decode)
+            return reject("Composed forward completion requires a GPU decode source and nonnegative count");
+        const auto found = cache_.find(signature);
+        if (found == cache_.end() || !found->second.valid || !found->second.graph)
+            return reject("Composed forward completion has no exact cached source");
+        const auto &segment = found->second.segment_cache;
+        // The compiler already proved complete stage coverage at export. Check
+        // the retained owner in constant time here, not by walking the model or
+        // querying native graph nodes again for every completed request.
+        if (!segment.initialized || segment.needs_capture ||
+            segment.executable_submission_state ==
+                DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::Empty ||
+            segment.segments.size() != 1 ||
+            segment.segments.front().capture.get() != source_capture ||
+            !source_capture->hasExecutable())
+            return reject("Composed forward completion lost its original materialized child");
+        if (completed_invocations != 0)
+            PerfStatsCollector::addCounter("forward_graph", "decode_graph_phase",
+                static_cast<double>(completed_invocations), "decode", signature.device.toString(),
+                {{"context", forwardGraphPerfContext(signature)}, {"phase", "replay"},
+                 {"source", "captured_generation_parent"}, {"observation", "authenticated_terminal"}});
+        return true;
     }
 
     std::optional<ForwardExecutionEngine::RetainedDecodeGraphView>
@@ -2481,17 +2550,19 @@ namespace llaminar2
             return reject("the exact forward graph cache entry is not valid");
         if (!signature.device.is_gpu() || !signature.decode)
             return reject("retained replay requires a GPU decode graph");
-        if (!signature.uses_device_token_ids ||
-            !signature.uses_device_position_ids)
+        if (!signature.usesDeviceTokenIds() ||
+            !signature.usesDevicePositionIds())
         {
             return reject(
                 "retained replay requires device-owned token and position rows");
         }
-        if (!cache.phase3_active || !cache.segment_cache.initialized ||
+        if (cache.segment_cache.executable_submission_state ==
+                DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::Empty ||
+            !cache.segment_cache.initialized ||
             cache.segment_cache.needs_capture)
         {
             return reject(
-                "forward graph has not reached steady retained replay state");
+                "forward graph has not materialized its complete retained executable");
         }
         if (!cache.segment_cache.capture_stream || !cache.gpu_ctx ||
             cache.segment_cache.segments.empty())
@@ -5422,6 +5493,23 @@ namespace llaminar2
     // executeCacheMiss() — Build and Execute New Forward Graph
     // =========================================================================
 
+    /**
+     * @brief Materialize and submit one participant-local forward transaction.
+     * @param input_in Logical request and declared device/stream ownership.
+     * @param output Receives outputs with exact producer provenance on success.
+     * @param signature Complete identity used for any retained graph entry.
+     * @param build_cache Optional persistent storage for captured graph inputs.
+     * @param should_cache Whether this transaction installs a retained entry.
+     * @param host Participant's graph, resource and publication authority.
+     * @param is_decode Selects decode-specific capture and completion policy.
+     * @param start Start timestamp used only for passive timing evidence.
+     * @return False on rejected setup or execution; no alternate path is tried.
+     * @throws std::runtime_error if output ownership escapes this participant.
+     *
+     * Cache storage and stream provenance survive together. Pipeline stages
+     * use their own participant's cache; cross-device composition is never an
+     * uncached exception to this engine's lifecycle.
+     */
     bool ForwardExecutionEngine::executeCacheMiss(
         const ForwardInput &input_in,
         ForwardOutput &output,
@@ -5430,19 +5518,9 @@ namespace llaminar2
         bool should_cache,
         IForwardExecutionHost &host,
         bool is_decode,
-        bool has_unified_pp,
         std::chrono::high_resolution_clock::time_point start)
     {
         // ===== CACHE MISS: Build new graph =====
-
-        // Unified PP path currently executes multi-device graphs and does not use
-        // this forward cache; clear entries to avoid stale memory growth.
-        if (has_unified_pp && !cache_.empty())
-        {
-            invalidateAll();
-            cache_.clear();
-            LOG_DEBUG("[ForwardExecutionEngine] Cleared forward graph cache for unified PP execution path");
-        }
 
         // For cache misses on standard path: redirect token_ids and
         // position_ids to stable buffers so that cached stages' pointers survive.
@@ -5501,6 +5579,32 @@ namespace llaminar2
 
         output = build_result.output();
         ComputeGraph graph = build_result.takeGraph();
+
+        // Native pipeline transport is an explicit graph operation. The
+        // surrounding chunk/verifier prelude still owns local positions/real lengths;
+        // graph capture never copies a previous stage's TensorBase or changes
+        // its current-device authority.
+        if (config_.pipeline_forward_edges && PipelineForwardGraphEdges::encloses(effective_input))
+            config_.pipeline_forward_edges->append(graph, effective_input);
+
+        if (effective_input.device_decode_position)
+        {
+            const auto model_roots = graph.getRootNodes();
+            if (model_roots.empty())
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Cannot bind a decode position producer to an empty model graph");
+                return false;
+            }
+            constexpr const char *node = "decode_position_snapshot";
+            graph.addNode(node, std::make_unique<DecodePositionSnapshotStage>(
+                DecodePositionSnapshotStage::Params{
+                    .device_id = effective_input.device,
+                    .binding = *effective_input.device_decode_position}), effective_input.device);
+            // The cache count may be changed by attention inside any model
+            // branch. Freeze it before every root, not merely before RoPE.
+            for (const auto &root : model_roots)
+                graph.addDependency(root, node);
+        }
 
         if (effective_input.device_prefill_chunk)
         {
@@ -5881,24 +5985,7 @@ namespace llaminar2
          */
         void *execution_stream_used = nullptr;
 
-        // Execution path depends on configuration:
-        // - Unified PP: multi-device execution with all PP stage devices
-        // - Single-device: standard single-context execution
-        if (has_unified_pp)
-        {
-            auto contexts = host.getPipelineDeviceContexts();
-            if (contexts.empty())
-            {
-                LOG_ERROR("[ForwardExecutionEngine] No pipeline device contexts available");
-                return false;
-            }
-
-            LOG_DEBUG("[ForwardExecutionEngine] Executing unified PP graph with "
-                      << contexts.size() << " device contexts...");
-
-            success = executor_.executeMultiDevice(graph, contexts);
-        }
-        else
+        // The graph and every producer stream belong to this participant.
         {
             LOG_DEBUG("[ForwardExecutionEngine] Getting device context for " << effective_input.device << "...");
             IDeviceContext *ctx = host.getDeviceContext(effective_input.device);
@@ -6076,28 +6163,9 @@ namespace llaminar2
         DeviceId producer_device = effective_input.device;
         if (success)
         {
-            /*
-             * A unified pipeline graph may finish on a device other than the
-             * input token owner. Resolve that output device's worker stream
-             * explicitly so provenance still names the stream which executes
-             * its final hidden-state stages.
-             */
-            producer_device =
-                resolveForwardOutputProducerDevice(
-                    output,
-                    effective_input.device);
-            if (has_unified_pp && producer_device.is_gpu())
-            {
-                IWorkerGPUContext *producer_gpu_ctx =
-                    host.getWorkerGPUContext(producer_device);
-                if (!producer_gpu_ctx || !producer_gpu_ctx->defaultStream())
-                {
-                    LOG_ERROR("[ForwardExecutionEngine] Unified GPU forward completed without an explicit output producer stream on "
-                              << producer_device.toString());
-                    return false;
-                }
-                execution_stream_used = producer_gpu_ctx->defaultStream();
-            }
+            producer_device = resolveForwardOutputProducerDevice(output, effective_input.device);
+            if (producer_device != effective_input.device)
+                throw std::runtime_error("Participant-local forward published an output on another device");
 
             publishForwardOutputProvenance(
                 output,

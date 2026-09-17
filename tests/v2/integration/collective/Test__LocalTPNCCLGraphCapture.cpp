@@ -4,6 +4,9 @@
  *
  * Keep this in a separate translation unit from ROCm tests: cuda_runtime.h and
  * hip_runtime.h expose overlapping vector types and are intentionally not mixed.
+ * Retained-parent tests distinguish recording re-entry from request-time replay:
+ * the latter must preserve collective ordering through many device-owned WHILE
+ * iterations without recapturing or involving a host controller.
  */
 
 #include <gtest/gtest.h>
@@ -2581,6 +2584,212 @@ TEST(Test__LocalTPNCCLGraphCapture, NCCLRetainedParentFragmentReentry)
         parents[rank].reset();
         freeDevicePtr(rank, inputs[rank]);
         freeDevicePtr(rank, outputs[rank]);
+        EXPECT_EQ(cudaStreamDestroy(streams[rank]), cudaSuccess);
+    }
+}
+
+/**
+ * @test Retained NCCL WHILE bodies survive changed request budgets and replays.
+ *
+ * Capturing an empty conditional beside a collective does not prove that the
+ * collective itself may run repeatedly inside that conditional. Four captured
+ * all-reduce/rooted-reduce/broadcast fragments share one communicator inside the
+ * production device-controlled parent. The existing device commit clock owns
+ * termination; the host changes only request inputs between completed launches.
+ * Alternate participant submission order and vary the iteration budget to expose
+ * cross-launch work/FIFO reuse. Every replay checks both devices, not only rank 0.
+ * Alternate parent-only requests with a captured first transaction followed by
+ * the retained parent, sharing the same source captures and communicator state.
+ */
+TEST(Test__LocalTPNCCLGraphCapture, NCCLNativeWhileCollectivesReuseAcrossRequestResets)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA participants";
+    auto context = createLocalTPContext(
+        {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+        {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(context, nullptr);
+
+    enum ClockWord : int { Healthy, Committed, Remaining, Due, Advanced, WordCount };
+    constexpr size_t count = 32768u;
+    constexpr std::array<size_t, 4> widths = {1u, 257u, 2048u, count};
+    constexpr std::array<uint32_t, 6> budgets = {1u, 2u, 3u, 15u, 31u, 128u};
+    std::array<float *, 2> inputs{}, outputs{};
+    std::array<std::unique_ptr<FP32Tensor>, 2> allreduce_rows;
+    std::array<uint32_t *, 2> clocks{};
+    std::array<cudaStream_t, 2> streams{};
+    std::array<std::unique_ptr<CUDAGraphCapture>, 2> parents;
+    std::array<std::array<std::unique_ptr<CUDAGraphCapture>, widths.size()>, 2> fragments;
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        allocateAndUpload(rank, std::vector<float>(count, float(rank + 1)), &inputs[rank]);
+        allocateAndUpload(rank, std::vector<float>(count, 0.0f), &outputs[rank]);
+        allocateAndUpload(rank, std::vector<uint32_t>{1u, 0u, 1u, 0u, 0u}, &clocks[rank]);
+        ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+        ASSERT_EQ(cudaStreamCreateWithFlags(&streams[rank], cudaStreamNonBlocking), cudaSuccess);
+        parents[rank] = std::make_unique<CUDAGraphCapture>(streams[rank], rank);
+        allreduce_rows[rank] = TestTensorFactory::createFP32({count});
+        TestTensorFactory::fillValue(allreduce_rows[rank].get(), 0.0f);
+        ASSERT_TRUE(allreduce_rows[rank]->ensureOnDevice(DeviceId::cuda(rank)));
+    }
+
+    Barrier boundary(2);
+    std::atomic<bool> failed{false};
+    const auto record = [&](int rank)
+    {
+        EXPECT_EQ(cudaSetDevice(rank), cudaSuccess);
+        // Provision the ordinary all-reduce's transport before recording.
+        if (!context->allreduceOnStream(allreduce_rows[rank].get(),
+                "native_while_allreduce", count, streams[rank], "fp32"))
+            failed.store(true);
+        boundary.arriveAndWait();
+        if (cudaStreamSynchronize(streams[rank]) != cudaSuccess) failed.store(true);
+        boundary.arriveAndWait();
+        if (failed.load()) return;
+        std::array<DeviceControlledLoopFragment, widths.size()> body;
+        for (size_t part = 0; part < widths.size(); ++part)
+        {
+            auto &fragment = fragments[rank][part];
+            fragment = std::make_unique<CUDAGraphCapture>(streams[rank], rank);
+            const bool began = fragment->beginCapture();
+            if (!began) failed.store(true);
+            // A failure is shared before either participant enters a collective.
+            // Both still close their capture and rendezvous at the same boundary.
+            boundary.arriveAndWait();
+            const bool admitted = !failed.load();
+            boundary.arriveAndWait();
+            if (admitted)
+            {
+                const int root = static_cast<int>(part % 2u);
+                GraphCaptureGuard capture_scope;
+                const bool seeded = cudaMemcpyAsync(
+                    allreduce_rows[rank]->gpu_data_ptr(), inputs[rank],
+                    widths[part] * sizeof(float), cudaMemcpyDeviceToDevice,
+                    streams[rank]) == cudaSuccess;
+                const bool summed = seeded && context->allreduceOnStream(
+                    allreduce_rows[rank].get(), "native_while_allreduce",
+                    widths[part], streams[rank], "fp32");
+                // Also exercise broadcast's asymmetric completion boundary:
+                // the root can advance before its peer. Reduction-only bodies
+                // would omit this shared-communicator progression pattern.
+                const bool entered = summed && context->broadcastRawOnStream(
+                    outputs[rank], outputs[rank], widths[part],
+                    CollectiveDataType::FLOAT32, root, rank, streams[rank],
+                    "native_while_entry_broadcast");
+                const bool reduced = entered && context->reduceRawOnStream(
+                    inputs[rank], outputs[rank], widths[part],
+                    CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM,
+                    root, rank, streams[rank], "native_while_reduce");
+                // A rooted reduction only publishes the root's output. Explicit
+                // broadcast makes that result valid on every participant before
+                // either advances its loop clock; non-root receive storage is
+                // otherwise deliberately unspecified by the collective contract.
+                const bool broadcast = reduced && context->broadcastRawOnStream(
+                    outputs[rank], outputs[rank], widths[part],
+                    CollectiveDataType::FLOAT32, root, rank, streams[rank],
+                    "native_while_broadcast");
+                EXPECT_TRUE(broadcast) << "fragment=" << part << " rank=" << rank;
+                if (!broadcast) failed.store(true);
+                if (part + 1u == widths.size() && broadcast)
+                {
+                    // A real device-owned publisher advances once per complete
+                    // collective sequence. Its due word is the WHILE predicate;
+                    // acknowledgement permits the next nonterminal iteration.
+                    const bool published = backend->enqueuePublishSerialDecodeCommitBoundary(
+                        clocks[rank] + Committed, clocks[rank] + Remaining,
+                        clocks[rank] + Due, clocks[rank] + Advanced, rank, streams[rank]);
+                    const bool acknowledged = backend->enqueueAcknowledgeDecodeCommitBoundary(
+                        clocks[rank] + Remaining, clocks[rank] + Due,
+                        clocks[rank] + Advanced, rank, streams[rank]);
+                    EXPECT_TRUE(published && acknowledged);
+                    if (!published || !acknowledged) failed.store(true);
+                }
+            }
+            boundary.arriveAndWait();
+            if (began && !fragment->endCapture()) failed.store(true);
+            boundary.arriveAndWait();
+            if (failed.load()) break;
+            // Production may execute the first transaction through its source
+            // captures before continuing inside their retained WHILE parent.
+            // Both executable owners must therefore share NCCL state safely.
+            if (!fragment->instantiate()) failed.store(true);
+            boundary.arriveAndWait();
+            if (failed.load()) break;
+            body[part] = {.name = "captured NCCL loop body", .capture = fragment.get()};
+        }
+        if (!failed.load())
+        {
+            const bool composed = parents[rank]->buildDeviceControlledWhileLoop(
+                DeviceControlledLoopProgram{.iteration = body}, DeviceControlledLoopPredicate{
+                    .control_rows_device = reinterpret_cast<const int *>(clocks[rank]),
+                    .control_stride = WordCount, .request_count = 1,
+                    .healthy_index = Healthy, .complete_index = Due});
+            EXPECT_TRUE(composed);
+            const bool instantiated = composed && parents[rank]->instantiate();
+            EXPECT_TRUE(instantiated);
+            if (!instantiated) failed.store(true);
+        }
+    };
+    std::thread first(record, 0), second(record, 1);
+    first.join();
+    second.join();
+    if (!failed.load())
+    {
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            const uint32_t budget = budgets[static_cast<size_t>(replay) % budgets.size()];
+            SCOPED_TRACE(::testing::Message() << "replay=" << replay << " budget=" << budget);
+            const bool captured_first_transaction = replay % 2 != 0;
+            const uint32_t total = budget + (captured_first_transaction ? 1u : 0u);
+            const std::array<uint32_t, WordCount> initial = {1u, 0u, total, 0u, 0u};
+            const std::array<std::vector<float>, 2> values = {
+                std::vector<float>(count, float(replay + 1)),
+                std::vector<float>(count, float(replay + 2))};
+            // Inputs remain alive until both terminal waits. No host observation
+            // or resubmission occurs inside the device-controlled loop.
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                const int rank = (slot + replay) % 2;
+                ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(inputs[rank], values[rank].data(), count * sizeof(float),
+                    cudaMemcpyHostToDevice, streams[rank]), cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(clocks[rank], initial.data(), sizeof(initial),
+                    cudaMemcpyHostToDevice, streams[rank]), cudaSuccess);
+                if (captured_first_transaction)
+                    for (auto &fragment : fragments[rank]) ASSERT_TRUE(fragment->launch());
+                ASSERT_TRUE(parents[rank]->launch());
+            }
+            for (int rank = 0; rank < 2; ++rank)
+            {
+                ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+                ASSERT_EQ(cudaStreamSynchronize(streams[rank]), cudaSuccess);
+                std::vector<float> actual(count);
+                std::vector<uint32_t> clock(WordCount);
+                downloadDeviceVector(rank, outputs[rank], &actual);
+                downloadDeviceVector(rank, clocks[rank], &clock);
+                EXPECT_EQ(actual, std::vector<float>(count, float(2 * replay + 3)))
+                    << "rank=" << rank;
+                downloadDeviceVector(rank,
+                    static_cast<const float *>(allreduce_rows[rank]->gpu_data_ptr()), &actual);
+                EXPECT_EQ(actual, std::vector<float>(count, float(2 * replay + 3)))
+                    << "allreduce rank=" << rank;
+                EXPECT_EQ(clock, (std::vector<uint32_t>{1u, total, 0u, 1u, 1u}));
+            }
+        }
+    }
+    EXPECT_FALSE(failed.load());
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        // Retire executable owners before their definitions and persistent data.
+        ASSERT_EQ(cudaSetDevice(rank), cudaSuccess);
+        parents[rank].reset();
+        for (auto &fragment : fragments[rank]) fragment.reset();
+        freeDevicePtr(rank, clocks[rank]);
+        freeDevicePtr(rank, inputs[rank]);
+        freeDevicePtr(rank, outputs[rank]);
+        allreduce_rows[rank].reset();
         EXPECT_EQ(cudaStreamDestroy(streams[rank]), cudaSuccess);
     }
 }

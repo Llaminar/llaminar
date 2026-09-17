@@ -24,6 +24,7 @@
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 #include "mocks/MockModelLoader.h"
+#include "utils/EmbeddingVerifierFormats.h"
 
 using namespace llaminar2::test;
 
@@ -1368,6 +1369,43 @@ TEST_F(WeightManagerComputeSliceBoundariesTest,
 }
 
 /**
+ * @brief Only prepared quantized embeddings may share a host-only source.
+ *
+ * Native floating embeddings are raw device reads, including mirrored decode
+ * tables. Their participant tensors must remain independently uploadable.
+ * This is a device-free ownership proof: no upload or backend enumeration runs.
+ */
+TEST_F(WeightManagerComputeSliceBoundariesTest,
+       ReplicatedEmbeddingOwnershipFollowsItsNativeRepresentation)
+{
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto loader = std::make_shared<MockModelLoader>();
+        loader->addTensor("token_embd.weight", format.create({64u, 256u}, 192017));
+        WeightManager manager(*loader);
+        auto sharding = Qwen2SchemaFactory{}.getWeightShardingConfig();
+        sharding.exact_matches["token_embd.weight"] = WeightShardingMode::Replicate;
+        manager.setWeightShardingConfig(sharding);
+        manager.setTensorParallelConfig(tp_config_);
+
+        auto first = manager.getWeightForDevice("token_embd.weight", DeviceId::cuda(0));
+        auto second = manager.getWeightForDevice("token_embd.weight", DeviceId::cuda(1));
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(second, nullptr);
+        EXPECT_EQ(first->isHostResident(), format.prepared_embed_q8);
+        EXPECT_EQ(second->isHostResident(), format.prepared_embed_q8);
+        EXPECT_EQ(first.get() == second.get(), format.prepared_embed_q8);
+        EXPECT_STREQ(tensorTypeName(first->native_type()), format.label);
+        EXPECT_EQ(first->native_type(), second->native_type());
+        ASSERT_EQ(first->size_bytes(), second->size_bytes());
+        EXPECT_EQ(std::memcmp(first->raw_data(), second->raw_data(), first->size_bytes()), 0);
+        EXPECT_EQ(first->gpu_data_ptr(), nullptr);
+        EXPECT_EQ(second->gpu_data_ptr(), nullptr);
+    }
+}
+
+/**
  * @brief A packed expert cache entry must identify its exact global experts.
  *
  * Ordinal and random ownership both pack four experts into this fixture's
@@ -1854,7 +1892,7 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_SingleDevice)
     EXPECT_TRUE(result);
 }
 
-TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleDevices)
+TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleCpuDevices)
 {
     WeightManager wm(*mock_loader_, nullptr, nullptr,
                      WeightDistributionStrategy::REPLICATED,
@@ -1866,10 +1904,11 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleDevices)
     // Load a weight first
     wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
-    // Preload for multiple devices
+    // Unit preload stays device-free. Native GPU embedding upload and capture
+    // are certified by the symmetrical EmbeddingWeightResidency integrations.
     std::vector<DeviceId> devices = {
-        DeviceId::cpu(),
-        DeviceId(DeviceType::CUDA, 0)};
+        DeviceId(DeviceType::CPU, 0),
+        DeviceId(DeviceType::CPU, 1)};
     bool result = wm.preloadForDevices(devices);
 
     EXPECT_TRUE(result);

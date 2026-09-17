@@ -169,7 +169,9 @@ namespace llaminar2
         int32_t local_slot = -1;
         uint32_t flags = 0;
         DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
-        uint32_t reserved = 0;
+        // Immutable capacity tag for reusable raw storage. NativeVNNI means
+        // no raw view was allocated, not a conversion or alternate arithmetic.
+        DeviceMoEWeightFormat floating_allocation_format = DeviceMoEWeightFormat::NativeVNNI;
 
         /** @return Whether the selected arithmetic family has a complete triple. */
         [[nodiscard]] constexpr bool weightsReady() const noexcept

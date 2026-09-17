@@ -1,0 +1,32 @@
+/**
+ * @file CUDADriverFunctions.def
+ * @brief Exact CUDA SDK declarations used by the deferred Driver API boundary.
+ *
+ * The including file defines LLAMINAR_CUDA_DRIVER_ENTRY(member, sdk_symbol).
+ * Expand the SDK symbol before stringification: cuda.h may select a versioned
+ * or per-thread-stream ABI. Its declared pointer type and loader name must
+ * always refer to that same entry point. There are no alternate symbol names.
+ */
+LLAMINAR_CUDA_DRIVER_ENTRY(init, cuInit)
+LLAMINAR_CUDA_DRIVER_ENTRY(deviceGet, cuDeviceGet)
+LLAMINAR_CUDA_DRIVER_ENTRY(deviceGetCount, cuDeviceGetCount)
+LLAMINAR_CUDA_DRIVER_ENTRY(devicePrimaryCtxGetState, cuDevicePrimaryCtxGetState)
+LLAMINAR_CUDA_DRIVER_ENTRY(getErrorName, cuGetErrorName)
+LLAMINAR_CUDA_DRIVER_ENTRY(getErrorString, cuGetErrorString)
+LLAMINAR_CUDA_DRIVER_ENTRY(ctxGetCurrent, cuCtxGetCurrent)
+LLAMINAR_CUDA_DRIVER_ENTRY(streamGetCtx, cuStreamGetCtx)
+LLAMINAR_CUDA_DRIVER_ENTRY(streamWaitValue32, cuStreamWaitValue32)
+LLAMINAR_CUDA_DRIVER_ENTRY(streamWriteValue32, cuStreamWriteValue32)
+LLAMINAR_CUDA_DRIVER_ENTRY(streamWaitValue64, cuStreamWaitValue64)
+LLAMINAR_CUDA_DRIVER_ENTRY(streamWriteValue64, cuStreamWriteValue64)
+LLAMINAR_CUDA_DRIVER_ENTRY(graphGetNodes, cuGraphGetNodes)
+LLAMINAR_CUDA_DRIVER_ENTRY(graphNodeGetType, cuGraphNodeGetType)
+LLAMINAR_CUDA_DRIVER_ENTRY(graphKernelNodeGetParams, cuGraphKernelNodeGetParams)
+LLAMINAR_CUDA_DRIVER_ENTRY(graphChildGraphNodeGetGraph, cuGraphChildGraphNodeGetGraph)
+LLAMINAR_CUDA_DRIVER_ENTRY(funcGetName, cuFuncGetName)
+LLAMINAR_CUDA_DRIVER_ENTRY(funcGetAttribute, cuFuncGetAttribute)
+LLAMINAR_CUDA_DRIVER_ENTRY(occupancyMaxActiveBlocksPerMultiprocessor, cuOccupancyMaxActiveBlocksPerMultiprocessor)
+#if CUDA_VERSION >= 12000
+LLAMINAR_CUDA_DRIVER_ENTRY(kernelGetName, cuKernelGetName)
+LLAMINAR_CUDA_DRIVER_ENTRY(kernelGetFunction, cuKernelGetFunction)
+#endif

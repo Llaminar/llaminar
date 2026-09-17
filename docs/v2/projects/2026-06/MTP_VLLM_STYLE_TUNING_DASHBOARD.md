@@ -8,6 +8,239 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-15, 05:27 UTC: **A — cross-host speedup measured; long E2E pending.**
+Real full-image Azure requests improve 5.35x/6.43x for 32/64 output tokens,
+with identical request/response messages. Both rank files pass remote expert
+and graph-completion checks; 1,678 empty replies are avoided. The native
+655-Unit/186-preflight gate and ten focused installed groups per ISA pass.
+The full remote E2E runner is active; the diagnostic is not an image certificate.
+
+Earlier 2026-09-15: **A — cross-host empty-return elision locally verified.**
+Typed numerical obligations remove empty return RPCs while exact graph receipts
+retain follower lifetime ownership. The complete MPI regression suite passes
+20 fresh processes; 22 observer tests distinguish real bytes, empty outcomes
+and graph completion. Full rebuilt prerequisites and both immutable-image/Azure
+measurement remain pending. No changed MTP depth, precision or numerical gate.
+
+Earlier 2026-09-15: **A — cross-host completion prerequisite under verification.**
+Root MPI return waits consumed 60.843 of 66.833 seconds in a bounded full-image
+HTTP probe; at least 53.455 seconds belonged to provably empty exchanges.
+The working tree now has explicit, exact follower graph-completion receipts
+before transaction retirement. The focused regression demonstrated the old
+premature-retirement behavior. Empty numerical returns have not yet been
+removed, and no speedup or new image certification is claimed. See
+[the measured lifecycle audit](../2026-09/cross-host-empty-route-lifecycle.md).
+
+2026-09-14: **510/510 native generation cells individually green**: 175/175
+serial controls plus 335/335 MTP comparisons. The final unseen batch passes all
+49 cells without another runtime change or per-cell prerequisite run. The
+auditor confirms zero unseen and zero unresolved failed cells. Acquisition is
+complete but remains unapproved, mixed-revision native evidence, not Docker
+certification. Coordinated orchestration rebuild and Unit/preflight are next;
+automatic planning and both ISA image certificates remain in progress.
+
+Previous 2026-09-13 checkpoint: all 175 native serial controls pass; **304/335 MTP cells pass**,
+and 31 remain. Qwen36 dual-ROCm Dynamic/Ordinal depth 1 now passes its
+original four 384-token HTTP requests in 68.998s with clean shutdown.
+The continuation selector now retires the completed tail before the next
+verifier; terminal tickets retain outstanding maintenance. Both backend
+captured probes (20 replays per depth/terminal shape) and all 28 controller
+units pass. The rebuilt canonical gate passes 651 Units and 170 preflight
+tests. All twenty fresh-process repetitions pass; unseen-only acquisition has
+resumed for the remaining 49 cells. Depths 2/3/15/adaptive pass in
+70.048/69.147/107.390/90.373s, completing Dynamic/Ordinal. Static/Random
+and Dynamic/Random also complete every depth. Ornith dual-ROCm Static/Ordinal
+depths 1/2/3/15 pass; dynamic depth is running. No further runtime fix or
+per-cell prerequisite run was needed. See
+[the lifecycle audit](../2026-09/hosted-mtp-maintenance-continuation.md).
+
+Earlier acquisition history:
+Both Qwen122B CUDA1/CPU2 and CUDA2/CPU2 complete their 20-cell MTP matrices:
+Static/Dynamic × Ordinal/Random × depths 1/2/3/15/adaptive. The newly completed
+CUDA2/CPU2 Dynamic/Random group takes 210.810/204.967/214.114/382.661/233.881s.
+Every original response is serial-token-exact; prefix, captured-graph, the
+declared movement/no-movement contract and teardown checks pass. Adaptive
+bounds remain 1–15 with 163/152 policy updates while both movement objectives
+execute. CUDA1/CPU1 rank-local Static/Ordinal also passes all five policies in
+180.666/195.358/207.304/436.957/229.373s, with all original exact streams,
+prefix/capture proof, empty movement journals and clean teardown. Adaptive
+bounds remain 1–15 with 162/153 updates. No additional runtime fix or prerequisite
+rerun was needed. CUDA1/CPU1 Dynamic/Ordinal depths 1 and 2 also pass. Depth 2
+previously completed all exact streams but failed strict shutdown-log validation.
+Local stop discarded Active wave ownership; the consolidated admission-only
+cancellation fix passes its focused regression, existing maintenance Unit suite,
+and 20 focused preflight repetitions. Its exact HTTP retry passes all eight
+checks in 207.942s. The next unseen depth-3 cell passes all original exact
+streams and complete harness checks in 219.823s. Depth 15 then passes in
+439.805s and adaptive depth in 238.194s, completing the Dynamic/Ordinal MTP
+family. All original responses remain serial-exact; captured execution,
+prefix, physical movement and clean teardown pass. Adaptive bounds remain
+1–15 with real policy updates. Static/Random depths 1/2/3/15/adaptive then pass
+in 186.485/198.318/208.200/442.751/233.111s. All original streams are exact and authoritative
+movement journals remain empty; the full harness passes each cell.
+Adaptive bounds remain 1–15 with 162/153 updates on the two workloads.
+Dynamic/Random depths 1/2/3/15/adaptive then pass in
+196.827/213.845/227.335/451.655/245.368s, with all original exact streams and
+completed tier movement. The complete harness passes each cell. All 20
+CUDA1/CPU1 MTP cells are individually green, matching CUDA1/CPU2 and CUDA2/CPU2.
+ROCm1/CPU2 Static/Ordinal depths 1/2/3/15/adaptive then pass in
+148.082/155.219/164.075/336.245/170.512s, with all original exact streams,
+empty movement journals, prefix/capture proof and clean two-rank teardown.
+Adaptive bounds remain 1–15 with 164/157 policy updates. The five-cell family
+is individually green. Dynamic/Ordinal depths 1/2/3/15/adaptive then pass in
+164.900/171.482/181.239/352.470/186.031s, with exact original streams, both
+completed movement objectives and full harness checks. Adaptive bounds remain
+1–15 with 164/157 updates. All ten Ordinal MTP cells are individually green;
+Static/Random depths 1/2/3/15/adaptive then pass in
+154.864/158.659/168.618/337.743/170.689s, with exact original streams,
+empty movement journals and full harness checks. Adaptive bounds remain 1–15
+with 164/157 updates. Dynamic/Random depths 1/2/3/15/adaptive then pass in
+172.719/174.058/183.639/355.958/188.444s. All original streams are exact;
+both movement objectives and full harness checks pass. Adaptive bounds remain
+1–15 with 164/157 updates. All 20 ROCm1/CPU2 MTP cells are individually green,
+and ROCm2/CPU2 Static/Ordinal depths 1/2/3/15/adaptive then pass in
+176.736/180.290/186.327/312.773/194.906s. All original streams are exact,
+movement journals remain empty, and every complete harness passes. Adaptive
+bounds remain 1–15 with 177/157 updates. ROCm2/CPU2 Dynamic/Ordinal depth 1
+then passes in 205.818s with all original exact streams, the full harness and
+1,026/66/568 tier/participant/combined movement edges. Depths 2/3/15/adaptive
+then pass in 211.033/216.909/341.155/222.380s, with all original exact streams,
+both movement objectives and full harness checks. Adaptive retains bounds
+1–15 with 177/157 updates. Static/Random depths 1/2 pass in 179.491/182.147s,
+with all original exact responses, empty movement journals and full harness
+checks. Depths 3/15/adaptive then pass in 187.117/311.856/194.399s with the
+same complete proof. Adaptive bounds remain 1–15 with 177/157 updates;
+Dynamic/Random depths 1/2 then pass in 209.427/212.771s, with all original
+exact responses, complete harness checks and 1,136/28/620 and 1,124/34/596
+tier/participant/combined edges. Depths 3/15/adaptive then pass in
+218.342/344.114/228.956s, with all original exact responses, complete harness
+checks and both movement objectives. Adaptive retains bounds 1–15 with
+177/157 policy updates. All 20 ROCm2/CPU2 MTP cells are individually green;
+ROCm3/CPU2 Static/Ordinal depth 1 passes in 187.570s with all original exact
+streams, empty movement and complete harness/teardown checks. Depths 2/3 then
+pass in 191.153/194.513s with the same complete proof. Depth 15 then passes
+in 303.296s, retaining every exact stream and full harness checks. Adaptive
+then passes in 204.985s, with bounds 1–15 and 164/166 policy updates.
+The complete Static/Ordinal group is green; Dynamic/Ordinal depth 1 then
+passes in 229.968s with all original exact responses, complete harness checks,
+and 992/120/401 tier/participant/combined movement edges. Depths 2/3 then
+pass in 229.984/233.690s with all exact streams, both movement objectives and
+complete harness checks. Depths 15/adaptive then pass in 350.839/245.420s,
+with all exact streams, both movement axes and complete harness checks.
+Adaptive bounds remain 1–15 with 164/166 policy updates. All ten Ordinal
+MTP cells are green. Static/Random depths 1/2 then pass in 198.714/196.421s
+with all original exact responses, empty movement and complete harness checks.
+Depths 3/15 then pass in 200.319/305.105s with all original exact responses,
+empty movement and complete harness checks. Adaptive then passes in 213.251s
+with bounds 1–15 and 164/166 updates, completing Static/Random.
+Dynamic/Random depth 1 passes in 234.066s with every original exact stream,
+full harness checks and 1,244/36/435 tier/participant/combined movement edges.
+Depths 2/3 then pass in 236.122/239.801s with all original exact responses,
+both movement axes and complete harness checks. Depths 15/adaptive then pass
+in 350.789/251.770s with the same full proof. Adaptive bounds remain 1–15
+with 164/166 updates. All 20 ROCm3/CPU2 MTP cells are individually green;
+ROCm4/CPU2 Static/Ordinal depths 1/2/3/15/adaptive then pass in
+200.682/198.210/199.563/282.448/212.993s with all original exact streams,
+empty movement and complete harness checks. Adaptive retains bounds 1–15
+and 153/148 updates. Dynamic/Ordinal depth 1 then passes in 262.293s with
+all original exact streams, complete harness checks and 1,046/74/107
+tier/participant/combined movement edges. Depths 2/3 then pass in
+261.630/251.378s with all original exact streams, both movement objectives
+and full harness checks. Depths 15/adaptive then pass in 342.316/267.864s
+with all original exact streams, both movement objectives and full harness
+checks. Adaptive retains bounds 1–15 with 153/148 updates. All ten Ordinal
+MTP cells are green. Static/Random depths 1/2 then pass in 212.640/215.307s
+with all original exact streams, empty movement and full harness checks.
+Depths 3/15 then pass in 224.841/284.762s with all original exact streams,
+empty movement and full harness checks. Adaptive then passes in 227.177s,
+with every original response exact, no movement, bounds 1–15 and 153/148
+updates. Static/Random is complete; Dynamic/Random depths 1/2 then pass in
+277.379/265.607s with all original exact streams, both movement objectives
+and complete harness checks. Depths 3/15 then pass in 269.783/344.945s
+with all original exact streams, both movement objectives and full harness
+checks. Adaptive then passes in 282.797s with all original exact streams,
+both movement objectives and complete harness checks. Bounds remain 1–15
+with 153/148 updates. All 20 ROCm4/CPU2 MTP cells are individually green;
+ROCm1/CPU1 rank-local Static/Ordinal depths 1/2 then pass in 191.276/203.472s
+with all original exact streams, empty movement and complete harness checks.
+Depths 3/15 then pass in 220.130/472.126s with the same full proof;
+adaptive then passes in 217.918s with all exact streams, no movement,
+bounds 1–15 and 164/157 updates. Static/Ordinal is complete;
+Dynamic/Ordinal depths 1/2 then pass in 206.421/224.080s with all original
+exact streams, complete harness checks and 768/864 tier-residency edges.
+Only tier migration is available on this topology. Depth 3 then passes in
+237.466s with all original exact streams, 864 final tier edges and full
+harness checks. Depths 15/adaptive then pass in 490.823/244.203s with all
+original exact streams, complete harness checks and 1,638/768 tier edges.
+Adaptive retains bounds 1–15 with 164/157 updates. All ten Ordinal MTP
+cells are green. Static/Random depths 1/2/3 then pass in
+189.673/205.602/222.891s with all original exact streams, empty movement
+and complete harness checks. Depths 15/adaptive then pass in 473.716/220.650s
+with all original exact streams, no movement and full harness checks.
+Adaptive retains bounds 1–15 with 164/157 updates. Static/Random is complete.
+Dynamic/Random depths 1/2/3 then pass in 209.247/222.772/239.261s with all
+original exact streams, full harness checks and 576/768/768 tier edges.
+Depths 15/adaptive then pass in 499.928/245.152s with all original exact
+streams, full harness checks and 1,416/768 tier edges. Adaptive retains
+bounds 1–15 with 164/157 updates. All twenty ROCm1/CPU1 MTP cells are green.
+Qwen 3.6 35B IQ3S dual-CUDA Static/Ordinal depth 1 passes in 41.165s with
+all original exact streams, no movement and full harness checks; depth 2
+stalled after two exact responses. An unchanged retry passes three then stalls
+on the fourth; read-only host stacks locate the terminal generation event wait.
+The first process later crashed after a failed CUDA-GDB attach, so that crash
+is not attributed to the original hang. This was the sole current red.
+The NCCL native-WHILE/request-reset regression is added to preflight. Its expanded
+all-reduce/reduce/broadcast version passes twenty process runs (400 request
+resets) in 65.26s. Disposable markers locate different full-sidecar collective
+positions on the GPUs despite matched generation/epoch state and captured
+collective geometry; source graph submission/reuse remains under investigation.
+Rebuilt prefill-default/parser
+Unit suites pass too. The clean retry reaches its unchanged 600s watchdog.
+Event tracing finds metadata consuming shifted-KV readiness on a setup stream,
+leaving the actual mailbox writer unordered. All seven metadata paths now use
+the existing const observation API. Symmetric held-reader regressions pass
+twenty runs each. Rebuilt Release completes all four exact streams and clean
+teardown; the direct diagnostic omitted the movement-policy environment and
+cannot count as a ledger pass. The shared refresh now passes all 650 Unit and
+168 preflight tests after updating the long-prefill mock to use production
+chunk plans. Twenty canonical depth-2 HTTP runs then pass all eight checks and
+eighty exact original responses (median cell time 38.648s). The saved-evidence
+audit confirms no current red and 123 unseen. The unseen-only batch resumes
+at depth 3, reusing the same receipt, and passes eighteen new cells to finish
+all twenty Qwen 3.6 dual-CUDA MTP cases. All original responses and independent
+harness checks pass; every Dynamic final journal has 108 device-owned
+participant-placement edges, Static journals are empty, and adaptive bounds
+remain 1–15. Ornith's entire twenty-cell dual-CUDA matrix then passes with all
+original responses and lifecycle checks. Each Dynamic final journal has 108
+participant-placement edges; Static remains empty and adaptive bounds remain
+1–15. Qwen 3.6 single-CUDA then passes all five MTP policies in
+22.348/22.246/22.948/38.648/25.300s with every original response and harness
+check. No current failure remains; 80 cells are unseen and Qwen 3.8 dense
+single-CUDA depth 1 is running. All previously completed coverage stands.
+
+The read-only acquisition auditor rechecks full saved responses against original
+controls, preserving mixed-source provenance without issuing approval. The
+three newly approved Qwen2 Q4_0 HF allowances are declared and rebuilt;
+phase-isolation Unit tests pass and all 18 runtime/generation declarations are
+unchanged. The full refreshed gate passes 650 Unit and 167 preflight tests;
+all three fresh HF retries pass with eight CSVs each in 2.900/3.817/3.448s
+for CPU-Q8/CUDA-Q8/ROCm-TQ KV. Existing decode cosine-or-KL limits remain
+unchanged. The remaining 185-cell HTTP batch resumes at ROCm3/CPU2 depth 1
+after an interruption, reusing the fresh receipt without replaying completed
+cells. Corpus approval and both image certificates remain pending.
+
+An independent outer CI fix rejects escaping/noncanonical model paths before
+admission. The 126-test pipeline suite and both registered pipeline/E2E Unit
+tests pass; the ongoing runtime, inventory and control corpus are unchanged.
+
+The CPU dense depth-15 timeout, stochastic expert-follower admission guard and
+first-use MTP capture-evidence defect are closed. Both native first-submission
+policies pass 20 repetitions per GPU backend. The shutdown fix passes the full
+650-Unit/167-preflight gate, including the newly registered local-drain regression.
+Unseen-only comparisons resume at depth 3 with that refreshed receipt.
+Neither an approved corpus nor either Docker
+image is certified. See the [current evidence and lifecycle audit](../2026-09/production-ci-generation-regression.md#latest-continuation--september-13-unseen-mtp-proof).
+
 2026-09-12 lossless-grid follow-on: IQ3_S, IQ3_XXS, IQ2_XXS and IQ1_S now
 preserve native grids/scales through CPU preparation and CUDA/ROCm movement.
 Both backend/ISA sweeps reduce the failing format set from nine to five;

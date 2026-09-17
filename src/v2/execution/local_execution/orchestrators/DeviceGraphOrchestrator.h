@@ -28,6 +28,7 @@
  */
 
 #pragma once
+#include "execution/mtp/MTPMainForwardPolicy.h"
 
 #include "../graph/IGraphBuilder.h"
 #include "../../../backends/DeviceId.h"
@@ -41,6 +42,7 @@
 #include "../device/ReusableExecutionWorkspace.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
+#include "../../compute_stages/stages/OrdinaryGenerationSamplingStage.h"
 #include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
 #include "../../moe/MoERebalanceController.h"          // For ExpertReplicaSet
 #include "../../moe/CPUCurrentBatchLLEP.h"             // CPU transient LLEP authority
@@ -60,12 +62,12 @@
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
 #include "../../mtp/MTPGraphOwnerPlan.h"
+#include "../../mtp/OrdinaryGenerationGraphPlan.h"
 #include "../../mtp/MTPVerifierPolicy.h"
 #include "../../mtp/HostedDeviceGenerationLifecycle.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
-#include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
 #include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
 #include "../../../collective/ITPContext.h"            // For polymorphic TP context ownership
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
@@ -93,6 +95,8 @@
 
 namespace llaminar2
 {
+    class PipelineForwardGraphEdges;
+    struct PipelinePublicationTransport;
     class MoEOverlayInferenceParticipantGraphScope;
 
     /**
@@ -426,12 +430,6 @@ namespace llaminar2
         /// Typed ownership of the row stored in `prefix_terminal_hidden`.
         MTPTerminalHiddenPublication mtp_terminal_hidden_publication;
 
-        /// Per-device KV caches for Pipeline Parallelism
-        /// When PP is enabled, each PP stage device has its own KV cache containing
-        /// only the layers processed by that stage. Key is DeviceId, value is the cache.
-        /// Only populated when pipeline_config->hasPP() is true.
-        std::unordered_map<DeviceId, std::unique_ptr<IKVCache>> pp_kv_caches;
-
         // === Position Tracking ===
         std::vector<int> positions;        ///< Per-sequence position offset
         std::vector<int> sequence_lengths; ///< Per-sequence length (for padding)
@@ -515,12 +513,6 @@ namespace llaminar2
         {
             if (kv_cache && !kv_cache->resetRequestState(context))
                 return false;
-            for (auto &[device, cache] : pp_kv_caches)
-            {
-                (void)device;
-                if (cache && !cache->resetRequestState(context))
-                    return false;
-            }
             return true;
         }
 
@@ -664,6 +656,9 @@ namespace llaminar2
                                     public IMoEOverlayDeviceInferenceBoundary,
                                     public IMoEOverlayDeviceInitialRuntimePublisher
     {
+        // Pipeline composition borrows participant-local recordings and the
+        // existing event handoff; it never owns a second sampler/controller.
+        friend class PipelineDeviceGeneration;
     public:
         // =========================================================================
         // Dependencies Struct for Interface-Based Construction (Testing Support)
@@ -716,9 +711,6 @@ namespace llaminar2
 
             /// PP stage bounds (empty = full model)
             std::optional<FactoryPPStageConfig> pp_stage_config;
-
-            /// Unified pipeline config for multi-stage PP+TP
-            std::shared_ptr<PipelineConfig> pipeline_config = nullptr;
 
             // ---- Optional: additional config ----
 
@@ -781,7 +773,7 @@ namespace llaminar2
          * Accepts all configuration-time dependencies in a single struct.
          * Required fields: model_ctx, graph_builder.
          * Optional: mpi_ctx or topology, collective_ctx, pp_stage_config,
-         *           pipeline_config, turboquant_ctx, weight_streamer,
+         *           pp_stage_config, turboquant_ctx, weight_streamer,
          *           weight_manager, etc.
          *
          * @param deps Dependency injection container
@@ -1339,9 +1331,6 @@ namespace llaminar2
             global_tp_ctx_ = std::move(ctx);
         }
 
-        /// Retain domain-scoped TP contexts and wire them to the graph builder.
-        void setDomainTPContexts(std::map<std::string, std::shared_ptr<ITPContext>> contexts);
-
         // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
         // =========================================================================
@@ -1459,59 +1448,6 @@ namespace llaminar2
          * @return true if PP stage configuration is set
          */
         bool isPPStage() const { return pp_stage_config_.has_value(); }
-
-        // =====================================================================
-        // Unified Pipeline Configuration (Phase 6: Full PP+TP Integration)
-        // =====================================================================
-
-        /**
-         * @brief Set unified pipeline configuration for PP+TP composition
-         *
-         * When set, the orchestrator can build and execute unified graphs that
-         * span multiple PP stages with internal TP. This replaces the need for
-         * external coordinators that manually sequence PP stages.
-         *
-         * The orchestrator will:
-         * - Create ILocalPPContext for each inter-stage transfer
-         * - Create ILocalTPContext for each TP domain
-         * - Build unified graphs via buildUnifiedPipelineGraph()
-         * - Execute the full pipeline in a single forward() call
-         *
-         * @param config PipelineConfig with TP domains and PP stages
-         */
-        void setPipelineConfig(std::shared_ptr<PipelineConfig> config);
-
-        /**
-         * @brief Get the unified pipeline configuration
-         * @return Shared pointer to PipelineConfig (may be nullptr)
-         */
-        std::shared_ptr<PipelineConfig> pipelineConfig() const { return pipeline_config_; }
-
-        /**
-         * @brief Check if unified PP mode is enabled
-         * @return true if PipelineConfig is set with multiple PP stages
-         */
-        bool hasUnifiedPP() const { return pipeline_config_ && pipeline_config_->hasPP(); }
-
-        /**
-         * @brief Initialize PP contexts for inter-stage activation transfers
-         *
-         * Creates ILocalPPContext instances for each pair of adjacent PP stages.
-         * Must be called after setPipelineConfig() and before forward().
-         *
-         * @return true if initialization succeeded
-         */
-        bool initializePPContexts();
-
-        /**
-         * @brief Initialize TP contexts for each domain
-         *
-         * Creates ILocalTPContext instances for each TP domain in the config.
-         * Must be called after setPipelineConfig() and before forward().
-         *
-         * @return true if initialization succeeded
-         */
-        bool initializeTPContexts();
 
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism)
@@ -2475,11 +2411,8 @@ namespace llaminar2
             GraphBuildSession &withExternalHiddenState(TensorBase *hidden_state);
 
             // Pipeline configuration
-            GraphBuildSession &withPipelineConfig(std::shared_ptr<PipelineConfig> config);
             GraphBuildSession &forPPStage(int first_layer, int last_layer,
                                           bool has_embedding = false, bool has_lm_head = false);
-            GraphBuildSession &withPPContext(int from_stage, int to_stage, ILocalPPContext *context);
-            GraphBuildSession &withTPContext(const std::string &domain_name, ITPContext *context);
 
             // Resource configuration
             GraphBuildSession &withWeights(const ModelWeights &weights);
@@ -2489,7 +2422,6 @@ namespace llaminar2
             // Build methods (terminal operations)
             [[nodiscard]] GraphBuildResult buildForward();
             [[nodiscard]] GraphBuildResult buildPartial();
-            [[nodiscard]] GraphBuildResult buildUnified();
             [[nodiscard]] GraphBuildResult build();
 
             // Validation
@@ -2502,7 +2434,6 @@ namespace llaminar2
             const int *explicit_position_ids_ = nullptr;
             const void *explicit_position_ids_device_ = nullptr;
             TensorBase *external_hidden_state_ = nullptr;
-            std::shared_ptr<PipelineConfig> pipeline_config_;
             struct PPStageSpec
             {
                 int first_layer;
@@ -2511,8 +2442,6 @@ namespace llaminar2
                 bool has_lm_head;
             };
             std::optional<PPStageSpec> pp_stage_;
-            std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts_;
-            std::map<std::string, ITPContext *> tp_contexts_;
             std::optional<ModelWeights> weights_;
             std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
@@ -3013,6 +2942,16 @@ namespace llaminar2
             const DeviceStochasticBatchOutcomeRequest *requests,
             int request_count,
             DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /**
+         * @brief Admit one algorithm into the shared resident response/controller banks.
+         * @param request Immutable budget, algorithm/depth and leading-row ownership.
+         * @return Whether the complete admission and exact-stream event publication succeeded.
+         *
+         * Ordinary and forward-only requests need no speculative graph capacity.
+         * Speculative requests must fit retained MTP capacity. An active request
+         * cannot be replaced; reset retires its publication before bank reuse.
+         * Admission does not claim that the algorithm's parent is materialized.
+         */
         bool beginDeviceResidentGeneration(
             const DeviceGenerationAdmissionRequest &request) override;
 
@@ -3912,7 +3851,7 @@ namespace llaminar2
                  * verifier graph then consumes one explicit transitive event
                  * instead of trusting a host-side sampler mirror.
                  */
-                if (!zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+                if (!zeroAndPublishGenerationSamplingInputsOnStream(
                         reset_transaction.executionStream(),
                         reset_reason))
                 {
@@ -4619,6 +4558,8 @@ namespace llaminar2
          * owner.  This method performs both selection and arena publication so
          * setup-only materialization and live execution cannot construct
          * different output topologies.
+         * Pipeline participants without an LM head return two null outputs:
+         * their declared physical publication is hidden state, not vocabulary.
          *
          * @param execution_role Typed producer role for the graph.
          * @param rows Number of logical logits rows written by the graph.
@@ -4833,8 +4774,6 @@ namespace llaminar2
             ComputeGraph &graph,
             void *publication_stream);
 
-        /** Get device contexts for all PP pipeline devices. */
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
 
         /** Resolve PP copy info for cache-miss builds. */
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
@@ -4903,6 +4842,19 @@ namespace llaminar2
             void *execution_stream,
             DeviceId execution_device) override;
 
+        /** @brief Validate graph-owned MTP input arrival for a pipeline follower.
+         * @param input Exact local row and main-cache bindings of the retained forward.
+         * @param execution_stream Non-null stream receiving the native collective.
+         * @param execution_device Exact participant owning that stream and arena.
+         * @return False for absent transport, foreign banks, conflicting producer
+         * authority or geometry outside admitted capacity. No device state is read
+         * or written here: the captured row receive and local checkpoint are the
+         * actual producers, ordered before every model root by the graph. */
+        bool validatePipelineFollowerMTPInput(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) const;
+
         /** Wait at an optional rank-level rendezvous immediately before graph execution. */
         bool waitBeforeForwardGraphExecution(
             const ForwardInput &input,
@@ -4960,12 +4912,13 @@ namespace llaminar2
             const char *producer);
 
         /**
-         * @brief Establish an empty device-owned generated-token histogram.
+         * @brief Establish empty device-owned token history and unresolved seeds.
          *
          * Construction and request reset share this single ownership boundary:
          * enqueue the zero-fill on the exact producer stream, then publish that
-         * stream's event through BufferArena before any verifier graph may read
-         * the histogram.  Allocation alone is deliberately insufficient because
+         * stream's event through BufferArena before any generation graph may read
+         * the banks. Zero seeds cannot produce a draw until admission replaces
+         * them with resolved randomness. Allocation alone is insufficient because
          * newly allocated GPU storage has no initialized device-authoritative
          * bytes.
          *
@@ -4977,7 +4930,7 @@ namespace llaminar2
          * @return true only after the initialized bytes and producer event have
          *         both been published to the arena.
          */
-        bool zeroAndPublishMTPGeneratedTokenHistoryOnStream(
+        bool zeroAndPublishGenerationSamplingInputsOnStream(
             void *producer_stream,
             const char *reason);
 
@@ -5199,19 +5152,20 @@ namespace llaminar2
             const char *consumer_name);
 
         /**
-         * @brief Preallocate every event used by the resident GPU MTP timeline.
+         * @brief Preallocate common generation events and configured speculative events.
          *
          * The resident verifier transaction records readiness many times per
          * generated token. Creating CUDA/HIP events at those publication sites
          * is both an allocation in the decode hot path and an ambiguous lifetime
-         * boundary. This initializer runs after the fixed MTP row capacities are
-         * known and creates all sample, verifier, publication, transaction,
-         * logical-state, response, and profiling events up front.
+         * boundary. This initializer runs after fixed row capacities are known.
+         * Logical-state publication and reader events exist for every GPU
+         * algorithm; sample, verifier, transaction, response and profiling
+         * events are added only when speculative execution is configured.
          *
          * @return true when CPU execution needs no events or every GPU event
-         *         required by the configured MTP capacity was created.
+         *         required by the configured generation policy was created.
          */
-        bool initializePersistentMTPDeviceEvents();
+        bool initializePersistentDeviceGenerationEvents();
 
         /**
          * @brief Borrow one preallocated response-ready event for an outcome handle.
@@ -5551,7 +5505,20 @@ namespace llaminar2
             DeviceTimelineRole consumer_role,
             const char *consumer_name) const;
 
-        /** Clear any pending prefix restore/truncate handoff. */
+        /**
+         * @brief Transfers a consumed live-prefix mutation fence to deferred retirement.
+         *
+         * A prefix restore or truncate publishes its producer event before a
+         * captured consumer observes the changed live state.  Once that
+         * consumer has installed its event wait, the publication record is no
+         * longer the active handoff, but the event still protects a later
+         * prefix archive from reading the producer's bytes too early.  Keep a
+         * valid event even when the mutation has no auxiliary payload aliases:
+         * event validity is the ordering authority, while alias vectors only
+         * extend object lifetime.  Retirement is non-blocking here; the exact
+         * completion event is queried and released later by the normal payload
+         * retirement path.
+         */
         void clearPendingLivePrefixMutationReady() const;
 
         /**
@@ -7828,6 +7795,8 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             MTPSpeculativeStatePublicationStage *stage = nullptr;
             uint64_t workspace_generation = 0;
+            /** Frozen collective owner is part of every embedded transport identity. */
+            const PipelineForwardGraphEdges *pipeline_edges = nullptr;
             bool valid = false;
 
             void resetSessionState()
@@ -7870,6 +7839,7 @@ namespace llaminar2
                 graph.reset();
                 stage = nullptr;
                 workspace_generation = 0;
+                pipeline_edges = nullptr;
                 valid = false;
             }
 
@@ -7890,6 +7860,7 @@ namespace llaminar2
                 graph.reset();
                 stage = nullptr;
                 workspace_generation = 0;
+                pipeline_edges = nullptr;
                 valid = false;
             }
         };
@@ -8109,12 +8080,27 @@ namespace llaminar2
                 Unmaterialized = 0,
                 NativeConditionalParent,
                 HostedDispatchTicketPublisher,
+                /** Complete follower transaction; only the pipeline tail owns tickets. */
+                HostedPipelineTransaction,
             };
 
             std::shared_ptr<void> stream;
             std::unique_ptr<IGPUGraphCapture> capture;
             /** Exact child capture, policy, and predicate identities in the executable. */
             std::vector<DeviceControlledLoopFragment> source_fragments;
+            /** Ordinary sampler recordings and the complete hosted transaction.
+             * Destroyed after their enclosing parent, before its arena/stream. */
+            std::array<std::unique_ptr<IGPUGraphCapture>, OrdinaryGenerationGraphPlan::child_recordings> ordinary_children;
+            /** Command arrival, inbound activation and outbound activation
+             * recordings. They borrow this participant's stable arena only. */
+            std::array<std::unique_ptr<IGPUGraphCapture>, 3> pipeline_children;
+            /** Exact bindings; seed contents remain request data, not topology. */
+            std::optional<OrdinaryGenerationSamplingStage::Params> ordinary_sampling_identity;
+            /** Complete forward identity, not a last-executed diagnostic handle. */
+            std::optional<ForwardGraphSignature> ordinary_forward_identity;
+            /** Immutable initial frontier selects sampling versus consumption. */
+            sampling_math::DeviceGenerationLeadingRowDisposition ordinary_leading =
+                sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
             /** Exact semantic branch inventory for hosted heterogeneous replay. */
             std::vector<HostedDeviceGenerationFragment> hosted_fragments;
             /** Flat source-fragment span owned by each legal draft depth. */
@@ -8179,6 +8165,12 @@ namespace llaminar2
             {
                 if (capture)
                     capture->reset();
+                for (auto &child : ordinary_children)
+                    child.reset();
+                for (auto &child : pipeline_children)
+                    child.reset();
+                ordinary_sampling_identity.reset();
+                ordinary_forward_identity.reset();
                 workspace_generation = 0;
                 request_count = 0;
                 draft_depth = 0;
@@ -8208,6 +8200,12 @@ namespace llaminar2
                 stream.reset();
             }
         };
+
+        /** Frozen rank-owned prefill transport. Installed before the forward
+         * engine exists and kept alive beyond every borrowed graph. */
+        const PipelineForwardGraphEdges *pipeline_forward_edges_ = nullptr;
+        /** Participant-native transport retires after parents and before its arena, not with the rank. */
+        std::shared_ptr<PipelinePublicationTransport> pipeline_publication_transport_;
 
         /**
          * @brief Capture owner for seeded stochastic row sampling and reduction.
@@ -9236,6 +9234,9 @@ namespace llaminar2
          * does not prove that the producer copies have completed on the host.
          * Moving the event and source owners here allows subsequent restores to
          * publish a fresh event while prior owners retire by nonblocking query.
+         * After an event-ordered handoff back to a permanent pool, the source
+         * list may be empty. Keep the event until completion nonetheless: an
+         * aborted next capture must not let teardown free that pool early.
          */
         struct PendingPrefixPayloadUse
         {
@@ -9243,11 +9244,10 @@ namespace llaminar2
             std::vector<PrefixBlockHandle> retained_payload_sources;
             std::vector<std::shared_ptr<void>> retained_device_sources;
 
+            /** @return Whether teardown still owns this exact completion edge. */
             bool valid() const
             {
-                return completion_event &&
-                       (!retained_payload_sources.empty() ||
-                        !retained_device_sources.empty());
+                return completion_event != nullptr;
             }
         };
 
@@ -9486,6 +9486,18 @@ namespace llaminar2
          * allocation that supplied its source bytes.
          */
         void retirePendingPrefixPayloadUses(bool wait_for_all) const;
+
+        /**
+         * @brief Hand runner-owned metadata slots from restore reads to checkpoint writes.
+         * @param checkpoint_stream Exact stream that will overwrite acquired slots.
+         * @return True after every required restore-completion wait is queued.
+         *
+         * Only matching shared ownership in this runner's permanent metadata
+         * pool may release a restore-use reference before host completion.
+         * External snapshots still exclude overwrite; external allocations and
+         * prefix payload leases retain their ordinary completion lifetime.
+         */
+        bool orderCheckpointMetadataPoolReuse(void *checkpoint_stream) const;
 
         /**
          * @brief Retire every published GPU producer before arena-backed storage dies.
@@ -9813,6 +9825,8 @@ namespace llaminar2
             RestoredPrefixDecodeBridgeInitialization,
             AcceptedSpecState,
             MainBatchSampleInitialization,
+            UnsampledLogitsInitialization,
+            OrdinaryGenerationTerminal,
         };
 
         /// Return the stable diagnostic name for one typed publication operation.
@@ -10361,15 +10375,19 @@ namespace llaminar2
                 exact_serial_participants);
 
         /**
-         * @brief Materialize every backend MTP workspace topology without executing it.
+         * @brief Materialize the terminal predictor's MTP workspace topology without executing it.
          *
          * The returned graphs are short-lived declarations used by the first
          * workspace plan on CPU, CUDA, and ROCm. They are built through the same
          * model graph builder as production sidecars, so new stages and
          * workspace names automatically join the family instead of requiring
-         * byte-count updates here. CPU stage objects retain raw workspace
-         * addresses just as captured GPU graph nodes do, so CPU sidecars must
-         * participate before the family allocation is published.
+         * byte-count updates here. Pipeline followers return without adding a
+         * participant: their main-model MTP condition/verifier topology is
+         * declared by the primary forward family, while only the terminal owns
+         * the predictor's shifted KV and frozen sidecar weights. CPU stage
+         * objects retain raw workspace addresses just as captured GPU graph
+         * nodes do, so a terminal CPU sidecar must participate before the
+         * family allocation is published.
          *
          * @pre @p owned_mtp_graphs is empty. Primary-lane declarations have a
          *      separate owner, so this MTP contributor cannot erase, reorder,
@@ -10480,28 +10498,9 @@ namespace llaminar2
         /// External hidden state input for PP middle/final stages
         TensorBase *external_hidden_state_input_ = nullptr;
 
-        // =========================================================================
-        // Unified Pipeline Configuration (Phase 6 - Full PP+TP)
-        // =========================================================================
-
-        /// Unified pipeline configuration for PP+TP composition
-        /// When set, orchestrator builds/executes unified graphs spanning all stages
-        std::shared_ptr<PipelineConfig> pipeline_config_;
-
-        /// PP contexts for inter-stage activation transfers
-        /// Key: {from_stage_id, to_stage_id}
-        std::map<std::pair<int, int>, std::unique_ptr<ILocalPPContext>> pp_contexts_;
-
-        /// TP contexts for each domain (one per domain name)
-        /// Each domain may have internal tensor parallelism
-        /// NOTE: Uses shared_ptr because PPStage can hold a reference to the TP context
+        /// Constructor-injected domain contexts retain their collective owners.
+        /// The rank/global orchestrator creates them; DGO never discovers domains.
         std::map<std::string, std::shared_ptr<ITPContext>> domain_tp_contexts_;
-
-        /// Whether PP contexts have been initialized
-        bool pp_contexts_initialized_ = false;
-
-        /// Whether TP contexts have been initialized
-        bool tp_contexts_initialized_ = false;
 
         /**
          * @brief Nonzero identity of the request-state session currently owned
@@ -10810,14 +10809,17 @@ namespace llaminar2
             const char *perf_context);
 
         /**
-         * @brief Materialize all GPU terminal-hidden publication graph objects.
+         * @brief Materialize all terminal-predictor GPU hidden-publication graph objects.
          *
          * This runs after the largest-participant workspace family has fixed
          * arena and workspace addresses. It builds immutable contiguous and
          * accepted-state families plus one device-geometry graph for every
-         * legal request count. Prompt width is resident data, not graph
-         * identity. Decode execution treats a missing or stale cache as fatal
-         * instead of allocating or rebuilding in the hot path.
+         * legal request count. Pipeline followers do not contribute an object:
+         * their captured main-condition/verifier graph belongs to the primary
+         * family and they do not own shifted KV progress. Prompt width is
+         * resident data, not graph identity. Decode execution treats a missing
+         * or stale terminal cache as fatal instead of allocating or rebuilding
+         * in the hot path.
          */
         bool materializeMTPTerminalHiddenPublicationGraphs();
 
@@ -10839,6 +10841,20 @@ namespace llaminar2
         bool materializeMTPServingForwardExecutablesWithoutLaunch(
             TensorBase *pipeline_hidden_input,
             void *publication_stream);
+
+        /** @brief Bind one canonical resident MTP main-forward family member.
+         * @param policy Condition commit purpose or verifier outcome topology.
+         * @param pipeline_hidden_input This participant's received hidden bank, or null at entry.
+         * @param publication_stream Exact local stream ordering setup/admission producers.
+         * @param submission Capture without launch at setup, or execute a pipeline follower.
+         * @param error Receives the first invalid binding or execution failure.
+         * @return Whether the canonical forward engine completed the requested operation.
+         * Serving setup and follower replay use identical row addresses, geometry
+         * and graph policies. A live terminal still enters its outcome-owning
+         * transaction API; this method never creates a sampler/token plan. */
+        bool executeMTPMainForward(const MTPMainForwardPolicy &policy,
+            TensorBase *pipeline_hidden_input, void *publication_stream,
+            ForwardGraphSubmissionIntent submission, std::string *error = nullptr);
 
         /**
          * @brief Build one typed GPU rows-select graph against current bindings.
@@ -11195,6 +11211,47 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Compose ordinary generation from the resident forward and sampler.
+         * @param sampling_mode Must agree with the immutable admitted sampling law.
+         * @param error Receives the first unsupported binding or capture failure.
+         * @return True only for one complete retained policy, without inference launch.
+         * The existing controller, event handoff and terminal bridge retain ownership.
+         */
+        enum class OrdinaryGenerationComposition { CompleteLocal, PipelineTail };
+
+        /** @brief Exact borrowed forward recording and its complete cache identity. */
+        struct OrdinaryGenerationForward
+        {
+            ForwardExecutionEngine::DeviceLoopGraphTemplateView graph;
+            ForwardGraphSignature signature;
+        };
+
+        /** @brief Record one participant's resident-token forward without launching.
+         * Non-head pipeline stages receive into their own stable hidden bank.
+         * @param condition Device token source, owned locally or received from the tail.
+         * @param error Receives the first invalid binding or capture diagnostic.
+         * @return Complete local recording, never a cross-device subgraph. */
+        std::optional<OrdinaryGenerationForward> materializeOrdinaryGenerationForward(
+            const int32_t *condition, std::string *error);
+
+        /** @brief Prepare local ordinary generation, or only the tail's borrowed fragments.
+         * Pipeline composition installs the complete collective-bearing parent.
+         * @param sampling_mode Admitted sampler policy.
+         * @param error Receives the first preparation failure.
+         * @param composition Explicit owner of the complete parent.
+         * @return True only when the requested recordings are ready. */
+        bool materializeOrdinaryDeviceGenerationLoopGraph(
+            DeviceGenerationSamplingMode sampling_mode, std::string *error,
+            OrdinaryGenerationComposition composition = OrdinaryGenerationComposition::CompleteLocal);
+
+        /** @brief Publish passive forward-replay evidence from an authenticated terminal.
+         * @param completed_invocations Consumed model rows; prefill sampling contributes zero.
+         * @return Whether the compiled ordinary parent still borrows its exact forward.
+         * No execution state is updated, and no extra device observation occurs.
+         * Pipeline followers call this only after their own terminal KV validation. */
+        bool observeOrdinaryGenerationForwardCompletion(int64_t completed_invocations);
+
+        /**
          * @brief Build or validate the fixed-geometry seeded stochastic fragment.
          *
          * Descriptor inspection is setup-only. The resulting stage captures no
@@ -11258,16 +11315,41 @@ namespace llaminar2
             int verifier_rows_per_request,
             std::string *error = nullptr);
 
+        /** @brief Bind only received committed metadata and this follower's main state.
+         * @param verifier_graph Exact participant-local verifier whose state is published.
+         * @param verifier_rows_per_request Physical captured verifier capacity.
+         * @param error Optional first violated ownership or capture invariant.
+         * @return Whether the local publication graph is ready for collective capture.
+         * No outcome, response, penalty or predictor authority is accepted here. */
+        bool materializePipelineFollowerMTPPublicationGraph(
+            ComputeGraph &verifier_graph, int verifier_rows_per_request, std::string *error = nullptr);
+
+        /** @brief Install one canonical publication graph for either local authority.
+         * @param params Authority-specific persistent bindings, without caller-supplied checkpoints.
+         * @param verifier_graph Local source of recurrent and routing-history stage identities.
+         * @param error Optional first violated binding invariant.
+         * @return Whether the graph matches or replaces the retained identity.
+         * This participant contributes its own checkpoints; shared native transport
+         * is explicit graph topology and participates in cache identity. */
+        bool installMTPStatePublicationGraph(MTPSpeculativeStatePublicationStage::Params params,
+            ComputeGraph &verifier_graph, std::string *error = nullptr);
+
         /**
          * @brief Replay the publication graph between two explicit event edges.
          *
          * The caller stream owns compact verifier output on entry and consumes
          * all accepted state on return. Warmup/capture/replay occur on the
          * cache-owned stream; both crossings are device event waits.
+         * @param producer_stream Exact producer/consumer of the local transaction.
+         * @param error Optional first violated lifecycle invariant.
+         * @param submission Setup-only composition or complete captured submission.
+         * @return Whether the requested native lifecycle completed.
          */
-        bool executeMTPSpeculativeStatePublicationCaptured(
-            const DeviceSpeculativePublicationRequest &request,
-            std::string *error = nullptr);
+        bool executeMTPStatePublicationGraph(
+            void *producer_stream,
+            std::string *error = nullptr,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy submission =
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch);
 
         /**
          * @brief Publish host lifecycle metadata after one captured transaction.

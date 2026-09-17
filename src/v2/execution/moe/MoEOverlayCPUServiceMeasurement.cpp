@@ -14,6 +14,7 @@
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -27,9 +28,8 @@ namespace llaminar2
     {
         using llaminar::v2::kernels::KernelFactory;
         // Small real-kernel observations, not full-model synthetic inference.
-        constexpr int kPrefillRows = 8;
+        constexpr int kPrefillRows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
         constexpr int kVerifierRows = 4;
-        constexpr int kMeasuredSamples = 3;
 
         /** @return Production phase and bounded representative batch geometry. */
         std::pair<MoEOverlayServicePhaseHint, int> phaseGeometry(ExpertHistogramSource source)
@@ -144,12 +144,21 @@ namespace llaminar2
             p.cpu_grouped_serial_workspace = std::move(workspace);
             p.service_phase = phase;
             p.force_decode_equivalent_verifier_prefill = phase == MoEOverlayServicePhaseHint::GroupedVerifier;
+            std::unique_ptr<DeviceWorkspaceManager> invocation_workspace;
             MoEExpertComputeStage stage(std::move(p));
+            const auto requirements = stage.getWorkspaceRequirements(rows);
+            // This is a separate physical allocation from the grouped tensor
+            // bank above. Its own authority lease retires with the manager.
+            invocation_workspace = std::make_unique<DeviceWorkspaceManager>(device,
+                requirements.total_bytes_with_alignment(), memory);
+            if (!invocation_workspace->allocate(requirements))
+                throw std::runtime_error("CPU prepared-service invocation workspace admission failed");
+            stage.bindWorkspace(invocation_workspace.get());
             auto context = IDeviceContext::create(device);
             if (!stage.execute(context.get()))
                 throw std::runtime_error("CPU prepared-service warmup failed");
             uint64_t total = 0;
-            for (int sample = 0; sample < kMeasuredSamples; ++sample)
+            for (int sample = 0; sample < MoEOverlayCPUServiceMeasurement::kMeasuredSamples; ++sample)
             {
                 const auto start = std::chrono::steady_clock::now();
                 if (!stage.execute(context.get()))
@@ -164,9 +173,30 @@ namespace llaminar2
         }
     }
 
-    size_t MoEOverlayCPUServiceMeasurement::allocationBytes(Geometry geometry)
+    size_t MoEOverlayCPUServiceMeasurement::allocationBytes(Geometry geometry, size_t invocation_workspace_bytes)
     {
-        return payloadBytes(geometry, std::max(kPrefillRows, kVerifierRows));
+        const int rows = std::max(kPrefillRows, kVerifierRows);
+        const size_t tensors = payloadBytes(geometry, rows);
+        const size_t invocation = invocation_workspace_bytes;
+        if (invocation > std::numeric_limits<size_t>::max() - tensors)
+            throw std::overflow_error("CPU prepared-service total workspace overflow");
+        return tensors + invocation;
+    }
+
+    int MoEOverlayCPUServiceMeasurement::rowsForPhase(ExpertHistogramSource source)
+    {
+        return phaseGeometry(source).second;
+    }
+
+    uint64_t MoEOverlayCPUServiceMeasurement::measurePrepared(
+        const MoEOverlayPreparedExpertTriplet &source, DeviceId device, int layer,
+        ExpertHistogramSource phase, Geometry geometry,
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+        if (!device.is_cpu() || layer < 0 || !memory || !source.complete())
+            throw std::invalid_argument("CPU prepared-service observation requires a complete admitted CPU expert");
+        (void)payloadBytes(geometry, kMaximumRows);
+        return measureExpert(source, device, layer, phase, geometry, memory);
     }
 
     std::vector<MoEOverlayParticipantLayerServiceTotals> MoEOverlayCPUServiceMeasurement::measure(
@@ -178,7 +208,7 @@ namespace llaminar2
         if (!memory) throw std::invalid_argument("CPU prepared-service measurement requires physical admission");
         if (epoch != registry.initialEpoch())
             throw std::logic_error("CPU prepared-service measurement may only lease the published initial epoch");
-        (void)allocationBytes(geometry); // Validate before indexing the immutable banks.
+        (void)payloadBytes(geometry, kMaximumRows); // Validate before indexing the immutable banks.
         const auto started = std::chrono::steady_clock::now();
         const auto ids = registry.localParticipantIds();
         std::vector<MoEOverlayParticipantLayerServiceTotals> live;
@@ -216,7 +246,7 @@ namespace llaminar2
             }
             if (selected_expert < 0)
                 throw std::logic_error("CPU prepared-service class has no exact resident source");
-            const auto duration = measureExpert(bank->layers[selected_layer].experts[selected_expert],
+            const auto duration = measurePrepared(bank->layers[selected_layer].experts[selected_expert],
                 bank->device, selected_layer, gap.source, geometry, memory);
             const auto participant_index = static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), gap.participant_id) - ids.begin());
             auto &row = result.at(participant_index * catalog.layerCount() + selected_layer);

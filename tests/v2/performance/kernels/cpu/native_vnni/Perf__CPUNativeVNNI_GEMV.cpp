@@ -22,6 +22,7 @@
  *   Individual tests: --gtest_filter="*Q8_0_AllModels*"
  */
 
+#include "../../../../utils/NativeVNNITestPartialStorage.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -63,6 +64,7 @@
 #include "utils/NativeVNNITrainerEvidence.h"
 #include "utils/NativeVNNIPrefillProbePlan.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 #include "utils/VerifierRowTestInventory.h"
 #include "../../native_vnni_dispatch/NativeVNNIPairedRequestManifest.h"
 #include "../../native_vnni_dispatch/NativeVNNIShapeManifest.h"
@@ -2150,16 +2152,19 @@ namespace
         // Identify the weight data buffer and size for cache flushing
         const void *weight_data = packed.native_interleaved.data();
         size_t weight_bytes = packed.native_interleaved.size();
+        // The raw kernel borrows this bank; setup is outside every timed call.
+        std::vector<Q8_1Block> activation_storage(packed.blocks_per_row);
+        NativeVNNITestPartialStorage partial_storage(packed, 1);
 
         for (int i = 0; i < WARMUP; ++i)
-            gemv_native_vnni(packed, A, C);
+            gemv_native_vnni(packed, A, C, partial_storage.span(), activation_storage);
 
         std::vector<double> times(ITERS);
         for (int i = 0; i < ITERS; ++i)
         {
             flush_cache_range(weight_data, weight_bytes);
             auto t0 = std::chrono::high_resolution_clock::now();
-            gemv_native_vnni(packed, A, C);
+            gemv_native_vnni(packed, A, C, partial_storage.span(), activation_storage);
             auto t1 = std::chrono::high_resolution_clock::now();
             times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
         }
@@ -2934,15 +2939,16 @@ namespace
                     {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
                     {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
 
+                CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel0, &kernel1}));
                 for (int i = 0; i < LOCAL_WARMUP; ++i)
-                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace.get()));
 
                 std::vector<double> times;
                 times.reserve(LOCAL_ITERS);
                 for (int i = 0; i < LOCAL_ITERS; ++i)
                 {
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace.get()));
                     auto t1 = std::chrono::high_resolution_clock::now();
                     times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
                 }
@@ -3058,10 +3064,13 @@ namespace
                 1.0f,
                 static_cast<uint32_t>(23000 + K + expert_N + active_experts + fmt.name.size()));
 
+            WorkspaceRequirements requirements;
+            for (const auto &kernel : kernels) requirements.merge(kernel->getWorkspaceRequirements(1));
+            CPUProjectionTestWorkspace workspace(1, K, requirements);
             auto run_fused = [&]()
             {
                 const bool ok =
-                    kernels.front()->multiply_fused_tensor(input.get(), projections, 1, K);
+                    kernels.front()->multiply_fused_tensor(input.get(), projections, 1, K, nullptr, workspace.get());
                 if (!ok)
                     ADD_FAILURE() << "Fused MoE gate/up projection failed for " << fmt.name;
             };
@@ -3075,7 +3084,7 @@ namespace
                             serial_outputs[static_cast<size_t>(p)].get(),
                             1,
                             expert_N,
-                            K);
+                            K, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
                     if (!ok)
                         ADD_FAILURE() << "Serial MoE gate/up projection failed for "
                                       << fmt.name << " projection=" << p;
@@ -3226,15 +3235,16 @@ namespace
                     {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
                     {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
 
+                CPUProjectionTestWorkspace workspace(M, K, cpuProjectionTestRequirements(M, {&kernel0, &kernel1}));
                 for (int i = 0; i < warmup; ++i)
-                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace.get()));
 
                 std::vector<double> times;
                 times.reserve(static_cast<size_t>(iters));
                 for (int i = 0; i < iters; ++i)
                 {
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K, nullptr, workspace.get()));
                     auto t1 = std::chrono::high_resolution_clock::now();
                     times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
                 }
@@ -3461,12 +3471,13 @@ namespace
                         static_cast<size_t>(M) * static_cast<size_t>(shape.N),
                         0.0f);
 
+                    NativeVNNITestPartialStorage partial_storage(packed, M);
                     auto run_grouped = [&]()
                     {
                         gemm_native_vnni_preq_decode_equivalent_rows(
                             packed,
                             q8_rows.data(),
-                            grouped.data(),
+                            grouped.data(), partial_storage.span(),
                             M,
                             shape.N,
                             isa_path);
@@ -3478,7 +3489,7 @@ namespace
                             gemv_native_vnni_preq(
                                 packed,
                                 q8_rows.data() + static_cast<size_t>(row) * K_blocks,
-                                serial.data() + static_cast<size_t>(row) * shape.N,
+                                serial.data() + static_cast<size_t>(row) * shape.N, partial_storage.span(),
                                 isa_path);
                         }
                     };
@@ -3611,7 +3622,7 @@ namespace
                             gemm_native_vnni_preq_decode_equivalent_rows(
                                 packed,
                                 q8_rows.data(),
-                                wide_rows.data(),
+                                wide_rows.data(), partial_storage.span(),
                                 M,
                                 shape.N,
                                 isa_path,
@@ -3622,7 +3633,7 @@ namespace
                             gemm_native_vnni_preq_decode_equivalent_rows(
                                 packed,
                                 q8_rows.data(),
-                                pairwise_rows.data(),
+                                pairwise_rows.data(), partial_storage.span(),
                                 M,
                                 shape.N,
                                 isa_path,
@@ -4159,8 +4170,9 @@ namespace
                 std::vector<double>(static_cast<size_t>(pair_count), 0.0),
             };
             constexpr ISAPath isa_path = ISAPath::AUTO;
+            NativeVNNITestPartialStorage partial_storage(packed, 1);
             gemv_native_vnni_preq(
-                packed, quantized.data(), oracle.data(), isa_path,
+                packed, quantized.data(), oracle.data(), partial_storage.span(), isa_path,
                 DecodeSchedulePolicy::FrozenSerialOracle);
 
             const std::array<const CPUDecodeScheduleCandidate *, 2> candidates = {
@@ -4176,7 +4188,7 @@ namespace
                     gemv_native_vnni_preq(
                         packed,
                         quantized.data(),
-                        candidate_outputs[candidate_index].data(),
+                        candidate_outputs[candidate_index].data(), partial_storage.span(),
                         isa_path,
                         candidate.policy);
                 };
@@ -4228,8 +4240,8 @@ namespace
 
             /*
              * Prime both schedules in alternating order. This starts the
-             * OpenMP worker team, raises the K-partial buffer to its required
-             * high-water mark, and removes first-use faults before timing.
+             * OpenMP worker team and removes first-use faults from the already
+             * declared K-partial bank before timing. No workspace grows here.
              */
             for (int warmup = 0; warmup < warmups; ++warmup)
             {
@@ -4240,7 +4252,7 @@ namespace
                     gemv_native_vnni_preq(
                         packed,
                         quantized.data(),
-                        candidate_outputs[candidate_index].data(),
+                        candidate_outputs[candidate_index].data(), partial_storage.span(),
                         isa_path,
                         candidates[candidate_index]->policy);
                 }
@@ -4260,7 +4272,7 @@ namespace
                     gemv_native_vnni_preq(
                         packed,
                         quantized.data(),
-                        candidate_outputs[candidate_index].data(),
+                        candidate_outputs[candidate_index].data(), partial_storage.span(),
                         isa_path,
                         candidates[candidate_index]->policy);
                     const auto end = std::chrono::steady_clock::now();
@@ -4500,6 +4512,7 @@ namespace
             const size_t output_elements =
                 static_cast<size_t>(request.m) * request.n;
             std::vector<float> serial(output_elements, 0.0f);
+            NativeVNNITestPartialStorage partial_storage(packed, request.m);
             constexpr ISAPath isa_path = ISAPath::AUTO;
             for (int row = 0; row < request.m; ++row)
             {
@@ -4507,7 +4520,7 @@ namespace
                     packed,
                     quantized.data() +
                         static_cast<size_t>(row) * packed.blocks_per_row,
-                    serial.data() + static_cast<size_t>(row) * request.n,
+                    serial.data() + static_cast<size_t>(row) * request.n, partial_storage.span(),
                     isa_path);
             }
 
@@ -4532,7 +4545,7 @@ namespace
                 gemm_native_vnni_preq_decode_equivalent_rows(
                     packed,
                     quantized.data(),
-                    candidate_outputs[candidate_index].data(),
+                    candidate_outputs[candidate_index].data(), partial_storage.span(),
                     request.m,
                     request.n,
                     isa_path,
@@ -4862,6 +4875,7 @@ namespace
             ASSERT_NE(fixture.kernel, nullptr) << format.name;
             CPUNativeVNNIGemmKernel *const kernel = fixture.kernel.get();
             const auto &packed = kernel->packedWeights();
+            NativeVNNITestPartialStorage partial_storage(packed, 1);
             const size_t weight_bytes =
                 packed.native_interleaved.size() + packed.payload.size();
             const NativeVNNITileConfig serial_geometry = computeTileConfig(
@@ -4957,7 +4971,7 @@ namespace
                         gemv_native_vnni_preq(
                             packed,
                             quantized.data(),
-                            output.data(),
+                            output.data(), partial_storage.span(),
                             isa_path,
                             candidate.policy);
                     };
@@ -5004,7 +5018,7 @@ namespace
             gemv_native_vnni_preq(
                 packed,
                 quantized.data(),
-                oracle.data(),
+                oracle.data(), partial_storage.span(),
                 isa_path,
                 DecodeSchedulePolicy::FrozenSerialOracle);
             const std::string oracle_digest =
@@ -5029,7 +5043,7 @@ namespace
                     gemv_native_vnni_preq(
                         packed,
                         quantized.data(),
-                        output.data(),
+                        output.data(), partial_storage.span(),
                         isa_path,
                         candidate.policy);
                 };
@@ -5065,6 +5079,7 @@ namespace
                 gemv_native_vnni_fused_preq(
                     quantized.data(),
                     shared_descriptors.data(),
+                    partial_storage.span(),
                     static_cast<int>(shared_descriptors.size()),
                     isa_path,
                     candidate.policy);
@@ -5090,6 +5105,7 @@ namespace
                     }};
                 gemv_fused_multi_input_preq(
                     multi_input_descriptors.data(),
+                    partial_storage.span(),
                     static_cast<int>(multi_input_descriptors.size()),
                     isa_path,
                     candidate.policy);
@@ -5384,13 +5400,14 @@ namespace
             std::vector<float> serial(
                 static_cast<size_t>(maximum_m) * N,
                 0.0f);
+            NativeVNNITestPartialStorage partial_storage(packed, maximum_m);
             for (int row = 0; row < maximum_m; ++row)
             {
                 gemv_native_vnni_preq(
                     packed,
                     quantized_rows.data() +
                         static_cast<size_t>(row) * packed.blocks_per_row,
-                    serial.data() + static_cast<size_t>(row) * N,
+                    serial.data() + static_cast<size_t>(row) * N, partial_storage.span(),
                     ISAPath::AUTO);
             }
 
@@ -5415,7 +5432,7 @@ namespace
                 gemm_native_vnni_preq_decode_equivalent_rows(
                     packed,
                     quantized_rows.data(),
-                    grouped.data(),
+                    grouped.data(), partial_storage.span(),
                     M,
                     N,
                     ISAPath::AUTO,
@@ -5450,7 +5467,7 @@ namespace
                 gemm_native_vnni_preq_decode_equivalent_rows(
                     packed,
                     quantized_rows.data(),
-                    grouped.data(),
+                    grouped.data(), partial_storage.span(),
                     M,
                     N,
                     ISAPath::AUTO,
@@ -5545,13 +5562,14 @@ namespace
             std::vector<float> serial(
                 static_cast<size_t>(maximum_m) * N,
                 0.0f);
+            NativeVNNITestPartialStorage partial_storage(packed, maximum_m);
             for (int row = 0; row < maximum_m; ++row)
             {
                 gemv_native_vnni_preq(
                     packed,
                     quantized_rows.data() +
                         static_cast<size_t>(row) * packed.blocks_per_row,
-                    serial.data() + static_cast<size_t>(row) * N,
+                    serial.data() + static_cast<size_t>(row) * N, partial_storage.span(),
                     ISAPath::AUTO);
             }
 
@@ -5570,7 +5588,7 @@ namespace
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), partial_storage.span(),
                         M,
                         N,
                         ISAPath::AUTO,
@@ -5636,11 +5654,14 @@ namespace
                             .verifier_schedule = candidate,
                         },
                     }};
+                    llaminar2::test::NativeVNNITestPartialStorage fused_partial_storage(
+                        descriptors.data(), static_cast<int>(descriptors.size()), M);
                     const auto run_fused = [&]()
                     {
                         return gemm_native_vnni_fused_verifier_rows_preq(
                             quantized_rows.data(),
                             descriptors.data(),
+                            fused_partial_storage.span(),
                             static_cast<int>(descriptors.size()),
                             M,
                             packed.blocks_per_row,
@@ -5703,7 +5724,7 @@ namespace
                     gemm_native_vnni_preq_decode_equivalent_rows(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), partial_storage.span(),
                         M,
                         N,
                         ISAPath::AUTO,
@@ -6173,6 +6194,7 @@ namespace
 
             for (int M : verifier_rows)
             {
+                NativeVNNITestPartialStorage partial_storage(packed, M);
                 if (executed_cases >= max_cases)
                     break;
                 if (profiler_batch.enabled() && !profiler_batch.containsCell(
@@ -6260,7 +6282,7 @@ namespace
                             gemm_native_vnni_preq_decode_equivalent_rows(
                                 packed,
                                 quantized_rows.data(),
-                                grouped.data(),
+                                grouped.data(), partial_storage.span(),
                                 M,
                                 N,
                                 isa_path,
@@ -6340,7 +6362,7 @@ namespace
                             packed,
                             quantized_rows.data() +
                                 static_cast<size_t>(row) * K_blocks,
-                            serial.data() + static_cast<size_t>(row) * N,
+                            serial.data() + static_cast<size_t>(row) * N, partial_storage.span(),
                             isa_path);
                     }
                 };
@@ -6378,11 +6400,14 @@ namespace
                         .ldc = N,
                     },
                 }};
+                llaminar2::test::NativeVNNITestPartialStorage fused_partial_storage(
+                    fused_descriptors.data(), static_cast<int>(fused_descriptors.size()), M);
                 const auto run_fused_projection_bundle = [&]()
                 {
                     return gemm_native_vnni_fused_verifier_rows_preq(
                         quantized_rows.data(),
                         fused_descriptors.data(),
+                        fused_partial_storage.span(),
                         static_cast<int>(fused_descriptors.size()),
                         M,
                         K_blocks,
@@ -6410,7 +6435,7 @@ namespace
                         gemm_native_vnni_preq_decode_equivalent_rows(
                             packed,
                             quantized_rows.data(),
-                            grouped.data(),
+                            grouped.data(), partial_storage.span(),
                             M,
                             N,
                             isa_path,
@@ -7415,6 +7440,7 @@ namespace
                         M, format.name, k_blocks);
 
                 std::vector<float> grouped(static_cast<size_t>(M) * N, 0.0f);
+                NativeVNNITestPartialStorage partial_storage(packed, M);
                 const NativeVNNITileConfig serial_route = computeTileConfig(
                     N,
                     K,
@@ -7438,7 +7464,7 @@ namespace
                     gemm_native_vnni_preq(
                         packed,
                         quantized_rows.data(),
-                        grouped.data(),
+                        grouped.data(), partial_storage.span(),
                         M,
                         N,
                         isa_path,
@@ -7588,7 +7614,7 @@ namespace
                             packed,
                             quantized_rows.data() +
                                 static_cast<size_t>(row) * k_blocks,
-                            serial.data() + oracle_index * static_cast<size_t>(N),
+                            serial.data() + oracle_index * static_cast<size_t>(N), partial_storage.span(),
                             isa_path);
                     }
                 };
