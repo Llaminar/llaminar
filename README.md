@@ -103,184 +103,211 @@ cmake --build build_v2_integration --parallel
 
 ### Running Llaminar
 
-Set these once before running the one-liners below:
+The runtime image contains CPU, CUDA, and ROCm support. Select it for the
+**host CPU ISA**, not for the accelerator: use the unsuffixed tag on an
+AVX-512 host and `-avx2` on an AVX2 host. Pin a release tag or digest in a
+deployment; the `develop` tags below are for trying the current build.
 
 ```bash
 export MODEL_DIR=/opt/llaminar-models
-export MODEL_DENSE="$MODEL_DIR/Qwen3.8-27B-IQ4_XS.gguf"
-export MODEL_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
+export QWEN38=/models/Qwen3.8-27B-IQ4_XS.gguf
+export QWEN36_MOE=/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+export LLAMINAR_AVX512=ghcr.io/llaminar/llaminar:develop
+export LLAMINAR_AVX2=ghcr.io/llaminar/llaminar:develop-avx2
 
-# Choose the runtime image ISA for this host.
-# AVX512 uses the current unsuffixed tags; AVX2 uses tags ending in -avx2.
-export LLAMINAR_CPU_ISA=AVX512  # or AVX2
-case "$LLAMINAR_CPU_ISA" in
-  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
-  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
-  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
-esac
+# Choose exactly one for this host, then pull it.
+export LLAMINAR_IMAGE="$LLAMINAR_AVX512" # AVX-512 host
+# export LLAMINAR_IMAGE="$LLAMINAR_AVX2" # AVX2 host
+docker pull "$LLAMINAR_IMAGE"
 
-# Use the immutable tag emitted by a successful production CI/release run.
-export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
-# docker run pulls these public GHCR images automatically when needed.
-export AMD_KFD_GID="$(stat -c '%g' /dev/kfd 2>/dev/null || true)"
-export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' 2>/dev/null | head -n1)" 2>/dev/null || true)"
-
-COMMON_RUN=(--rm -it --network bridge --ulimit core=-1 --user 0:0 --security-opt seccomp=unconfined --cap-add SYS_NICE --cap-add SYS_PTRACE --shm-size=16g -v "$MODEL_DIR:$MODEL_DIR:ro")
-CUDA_RUN=(--gpus all)
-ROCM_RUN=(--device /dev/kfd --device /dev/dri --group-add "$AMD_KFD_GID" --group-add "$AMD_RENDER_GID")
-PREFIX_FLAGS=(--prefix-cache --prefix-cache-storage ram --prefix-cache-ram-budget-mb 1024 --prefix-cache-terminal-state auto)
-MOE_PREFIX_FLAGS=("${PREFIX_FLAGS[@]}" --prefix-cache-moe-policy placement-fingerprint)
-MTP_FLAGS=(--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed --mtp-verify-mode greedy)
+COMMON_RUN=(
+  --rm --network host --ipc=host
+  --security-opt seccomp=unconfined
+  --cap-add SYS_NICE --cap-add SYS_PTRACE
+  -v "$MODEL_DIR:/models:ro"
+)
 ```
 
-For adaptive MTP, use `--mtp-depth-policy dynamic` with the desired
-`--mtp-max-draft-tokens` capacity. Automatic controller defaults are selected
-from the single device or the complete homogeneous continuation domain's card
-identity, independently of other expert tiers. Explicit thresholds override
-these defaults; `--mtp-depth-demote-zero-accept auto` restores automatic
-selection. The resolved execution plan and benchmark JSON report the selected
-profile and effective threshold. Selecting a profile does not enable MTP or
-change the requested mode, depth bounds, or memory capacity.
+The image runs as a non-root user. ROCm needs KFD/DRI device access and the
+actual host GIDs; this discovers every local render node without assuming a
+particular card or render-device number:
+
+```bash
+ROCM_DEVICE_ARGS=(--device=/dev/kfd --device=/dev/dri)
+for node in /dev/kfd /dev/dri/card* /dev/dri/renderD*; do
+  [[ -e "$node" ]] && ROCM_DEVICE_ARGS+=(--group-add "$(stat -c '%g' "$node")")
+done
+```
+
+#### Serve Qwen 3.8 locally
+
+Production model activations are currently FP32. The examples use FP16 KV,
+tiered prefix caching, and dynamic-depth MTP. With host networking, the server
+listens directly on the selected port; do not add `-p`.
+
+**One ROCm card (32K context):**
+
+```bash
+docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
+  --name qwen38-rocm "$LLAMINAR_IMAGE" serve \
+  -m "$QWEN38" -d rocm:0 \
+  --context-length 32768 \
+  --activation-precision fp32 --kv-cache-precision fp16 \
+  --prefix-cache --prefix-cache-storage tiered \
+  --mtp --mtp-depth-policy dynamic \
+  --host 0.0.0.0 --port 8080
+```
+
+**One CUDA card (8K context on a 24 GiB RTX 3090):**
+
+```bash
+docker run "${COMMON_RUN[@]}" --gpus all \
+  --name qwen38-cuda "$LLAMINAR_IMAGE" serve \
+  -m "$QWEN38" -d cuda:0 \
+  --context-length 8192 \
+  --activation-precision fp32 --kv-cache-precision fp16 \
+  --prefix-cache --prefix-cache-storage tiered \
+  --mtp --mtp-depth-policy dynamic \
+  --host 0.0.0.0 --port 8080
+```
+
+**Two cards with homogeneous TP:** use one vendor per tensor-parallel
+communicator. Do not combine CUDA and ROCm in a dense TP group.
+
+```bash
+# 2 x ROCm
+docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
+  --name qwen38-rocm-tp2 "$LLAMINAR_IMAGE" serve \
+  -m "$QWEN38" --tp 2 --tp-scope rank_local \
+  --tp-devices rocm:0,rocm:1 --backend rccl \
+  --context-length 32768 \
+  --activation-precision fp32 --kv-cache-precision fp16 \
+  --prefix-cache --prefix-cache-storage tiered \
+  --mtp --mtp-depth-policy dynamic --host 0.0.0.0 --port 8080
+
+# 2 x CUDA
+docker run "${COMMON_RUN[@]}" --gpus all \
+  --name qwen38-cuda-tp2 "$LLAMINAR_IMAGE" serve \
+  -m "$QWEN38" --tp 2 --tp-scope rank_local \
+  --tp-devices cuda:0,cuda:1 --backend nccl \
+  --context-length 32768 \
+  --activation-precision fp32 --kv-cache-precision fp16 \
+  --prefix-cache --prefix-cache-storage tiered \
+  --mtp --mtp-depth-policy dynamic --host 0.0.0.0 --port 8080
+```
+
+#### Plan once, then apply exactly
+
+`plan` and `serve` accept the same inference configuration. Automatic planning
+is the default when no explicit placement is supplied, so `--auto` is optional.
+Use `--only-backends` and `--only-strategies` for hard constraints;
+`--plan-workload` is a ranking horizon, not a request-output limit. A saved
+plan is a lossless, apply-only document: `serve --config` does not rerun the
+search or reinterpret its constraints.
+
+```bash
+mkdir -p plans
+
+docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
+  -v "$PWD/plans:/plans" "$LLAMINAR_IMAGE" plan \
+  -m "$QWEN38" --only-backends rocm --only-strategies single,tp \
+  --context-length 32768 --plan-workload 512,384 \
+  --mtp --mtp-depth-policy dynamic --kv-cache-precision fp16 \
+  --output /plans/qwen38-rocm.json
+
+docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
+  -v "$PWD/plans:/plans:ro" "$LLAMINAR_IMAGE" serve \
+  --config /plans/qwen38-rocm.json --host 0.0.0.0 --port 8080
+```
+
+#### Remote CPU ExpertOverlay with an MPI hostfile
+
+The cross-host topology uses one local GPU continuation rank and one CPU rank
+per remote machine. All ranks run the **same immutable image digest**, have the
+same GGUF path, and communicate over private, routable addresses. The hostfile
+names physical MPI endpoints; it does not copy an image or GGUF, and it does
+not turn a node-local transport into a cross-host transport. A Docker deployment
+must therefore launch every MPI daemon *inside* its matching runtime image;
+launching host-MPI processes beside containers is not a supported topology.
+
+```text
+# cluster/hosts: GPU controller first, then one CPU-only host per line.
+10.10.0.10 slots=1
+10.10.0.21 slots=1
+10.10.0.22 slots=1
+```
+
+After the cluster launcher has started the identical runtime image on each of
+those machines, run the public frontend on the GPU controller. This is the
+exact default-auto policy exercised by the Azure E2E: it requires every host,
+permits only ROCm/CPU compute, and selects ExpertOverlay rather than manually
+hard-coding expert owners. It gives the planner the topology intent, while the
+physical-memory authority decides how many experts each admitted tier can hold.
+
+```bash
+llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --mpi-hostfile /cluster/hosts \
+  --only-backends rocm,cpu --only-strategies expert-overlay \
+  --auto-hosts all --context-length 32768 --plan-workload 512,384 \
+  --activation-precision fp32 --kv-cache-precision fp16 \
+  --prefix-cache --prefix-cache-storage tiered \
+  --mtp --mtp-depth-policy dynamic \
+  --output /cluster/qwen36-rocm-remote-cpu.json
+
+llaminar2 serve --config /cluster/qwen36-rocm-remote-cpu.json
+```
+
+For the managed Azure route, do not hand-roll remote Docker/MPI processes. The
+certification runner provisions owned CPU peers, stages the immutable image and
+the declared GGUF shards, builds the exact hostfile, runs both `plan`/apply and
+direct auto-serve, proves remote CPU expert work in prefill and decode, then
+retires the lease:
+
+```bash
+python3 scripts/ci/run_production_cross_host_e2e.py \
+  --manifest build_v2_integration/production-ci/avx2/cross-host-manifest.json \
+  --source-revision "$(git rev-parse HEAD)" \
+  --container-image ghcr.io/llaminar/llaminar:develop-avx2 \
+  --models /opt/llaminar-models \
+  --model-ramdisk-root /mnt/llaminar-production-parity \
+  --report parity-results/cross-host-e2e.json \
+  --azure-subscription "$AZURE_SUBSCRIPTION" \
+  --azure-ssh-source "$AZURE_SSH_SOURCE" \
+  --azure-ssh-public-key "$AZURE_SSH_PUBLIC_KEY" \
+  --ssh-private-key "$HOME/.ssh/id_ed25519"
+```
+
+See [production CI](docs/production-ci.md#azure-resources-for-cross-host-e2e)
+for credential, networking, lease-retirement, and retained-debugging policy.
 
 #### Compact expert-tier topology
 
-The CLI can declare a domain and its expert tier together. Integer priorities
-define preference (smaller is preferred); names carry no device-speed meaning.
-Omitted scope, collective, rank ownership and expert capacity are resolved by
-inventory binding and the canonical physical-memory admission. The preferred
-tier is the default continuation/base/shared domain; explicit role and compute
-policy overrides remain available in `serve --help`.
+Use compact `--expert-tier` declarations when you want an authored topology.
+Tier names are labels; integer priority is the policy, and smaller is preferred.
+Scope, collective, rank ownership, capacity, and safety margin resolve from the
+inventory and `PhysicalMemoryAuthority`. Do not hard-code an expert count just
+to fill a device. The lowest numeric priority is the continuation tier by
+default, so there is no separate `fallback=true` switch.
 
 ```bash
-./build_v2_release/llaminar2 serve -m model.gguf \
-  --expert-tier 'compute=cuda:0,cuda:1;priority=0' \
-  --expert-tier 'capacity=rocm:0,rocm:1;priority=10'
+llaminar2 serve -m model.gguf \
+  --expert-tier 'accelerator=cuda:0,cuda:1;priority=0' \
+  --expert-tier 'capacity=cpu;priority=10' \
+  --moe-residency-maintenance dynamic \
+  --mtp --mtp-depth-policy dynamic
 ```
 
-Use `--hostfile cluster.hosts` (also accepted as `--mpi-hostfile`) to define MPI
-cluster membership. MPI admits the hostfile's slots unless `--mpi-procs` is
-explicit. Each host supplies its own hardware inventory and rank-local worker
-geometry; the initiating machine's CPU indices are not applied across hosts.
-A hostfile does not make a node-local-only execution transport cross-node.
-
-`plan` defaults to automatic placement and accepts the same inference options
-as `serve`, including MTP, KV precision and movement policy. It adds only
-`--output` and `--format` presentation options. Hard constraints use
-`--only-backends` / `--only-strategies`; there is no separate plan strategy
-vocabulary or KV-precision flag.
-
-For automatic ROCm-only compute with a 32K-token context:
+#### Send a request
 
 ```bash
-./build_v2_release/llaminar2 serve -m model.gguf \
-  --only-backends rocm --context-length 32768
-```
-
-This permits CPU control/storage, but not CPU expert offload or CUDA compute.
-`--auto` is implicit without explicit placement. To plan for a cluster, save the
-selected configuration, then apply it without repeating the search constraints:
-
-```bash
-./build_v2_release/llaminar2 plan -m model.gguf --hostfile cluster.hosts \
-  --only-backends rocm,cpu --only-strategies expert-overlay \
-  --auto-hosts all \
-  --mtp --mtp-depth-policy dynamic --kv-cache-precision fp16 --output plan.json
-./build_v2_release/llaminar2 serve --config plan.json
-```
-
-Both auto frontends accept `--plan-workload 512,384` (YAML
-`planning.workload: 512,384`) to price an expected prefill/generation horizon.
-The positive token counts must fit `--context-length`. This is a ranking hint,
-not a generation limit; omission uses a balanced, context-bounded horizon.
-The plan summary reports that objective and the cost evidence. Applying a
-saved plan does not repeat the search or accept automatic workload hints.
-Automatic startup takes one bounded batch of source-format kernel, independent
-streaming-memory, and topology-specific link measurements. All candidates reuse
-it; planning does not warm up a synthetic model for each configuration. Costs
-include compiled weight ownership, live context work and communication, with
-zero interconnect cost for a single device. The reported estimates explicitly
-label routing/roofline/protocol approximations; they are not model benchmarks
-and assume neither future rebalancing gains nor an MTP acceptance rate.
-At equal estimated request cost, explicit preferences break ties first, then
-fewer compute devices win. A faster multi-device plan may still win; the
-single-device preference does not override performance or hard constraints.
-
-`--config` accepts authored YAML or the versioned JSON document owned by
-`OrchestrationConfigDocument`. JSON carries the complete typed configuration,
-including optional MTP settings and exact domain/rank declarations; malformed,
-missing, duplicate, or unknown fields fail instead of selecting defaults.
-Saved execution selections also retain discovery-rank order and the discovery
-process count. Direct auto-serve and `plan` share one startup transaction:
-publish intent and model metadata, prepare evidence on the discovery ranks,
-then select on root and publish the configuration. Discovery inventory remains
-the same immutable shared observation throughout. The frontend admits that exact subset before constructing
-runners; excluded processes do not load the model. Rank references inside the
-configuration name the selected execution namespace, not MPI discovery order.
-The cluster inventory records which ranks share a physical machine. Link
-measurements price those known connections; they do not infer local versus
-remote placement from speed, hostnames, or rank numbering.
-CLI arguments override the loaded configuration. Explicit
-`prefill_max_bucket_size` and deterministic settings are published through the
-same startup policy as their CLI equivalents. A configuration is still subject
-to current hardware and physical-memory admission; it is not a reservation or
-an inference certificate. The shared automatic planner's implementation status
-is tracked in [the orchestration plan](docs/v2/projects/2026-09/automatic-orchestration-plan.md).
-
-#### CPU Cross-socket TP/EP
-
-```bash
-docker run "${COMMON_RUN[@]}" -p 8080:8080 "$LLAMINAR_CPU_IMAGE" serve --host 0.0.0.0 --port 8080 -d cpu "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
-```
-
-#### CUDA SingleDevice
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 "$LLAMINAR_CUDA_IMAGE" serve --host 0.0.0.0 --port 8080 -d cuda:0 "${PREFIX_FLAGS[@]}" "${MTP_FLAGS[@]}" -m "$MODEL_DENSE"
-```
-
-#### CUDA TensorParallel tp=2
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 "$LLAMINAR_CUDA_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices cuda:0,cuda:1 "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
-```
-
-#### ROCm SingleDevice
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO -p 8080:8080 "$LLAMINAR_ROCM_IMAGE" serve --host 0.0.0.0 --port 8080 -d rocm:0 "${PREFIX_FLAGS[@]}" "${MTP_FLAGS[@]}" -m "$MODEL_DENSE"
-```
-
-#### ROCm TensorParallel tp=2
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO -p 8080:8080 "$LLAMINAR_ROCM_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices rocm:0,rocm:1 "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
-```
-
-#### ROCm TensorParallel tp=4
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO -p 8080:8080 "$LLAMINAR_ROCM_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices rocm:0,rocm:1,rocm:2,rocm:3 "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
-```
-
-#### CUDA+ROCm Pipeline Parallel
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 "$LLAMINAR_FULL_IMAGE" serve --host 0.0.0.0 --port 8080 --define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63 -m "$MODEL_PP_DENSE"
-```
-
-#### CUDA+ROCm Host-staged Tensor Parallel tp=2
-
-This uses the E2E model files and the validated host-staged cross-vendor TP
-shape. The release-container server E2E matrix does not currently include this
-exact Quickstart header as a full server case.
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 "$LLAMINAR_FULL_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices cuda:0,rocm:0 --backend host "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role":"user","content":"Explain ROCm graph capture in two sentences."}],
+    "max_tokens": 128,
+    "temperature": 0.0,
+    "enable_thinking": false
+  }'
 ```
 
 #### Exact completion token IDs
