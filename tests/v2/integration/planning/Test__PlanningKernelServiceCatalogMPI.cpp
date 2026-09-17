@@ -290,6 +290,47 @@ namespace
         });
     }
 
+    /**
+     * @brief Prove source-free GPU measurement does not invent PMA work on idle ranks.
+     *
+     * A physical GPU is intentionally measured by one affinity-selected MPI
+     * reporter.  Other discovery ranks still join publication and receipt
+     * collectives, but they own neither a source payload nor a workspace for
+     * this probe.  This reproduces heterogeneous GPU-only automatic planning:
+     * constructing an empty PMA certificate on the non-reporting rank is an
+     * accounting error, not a capacity rejection.
+     */
+    void proveGPUOnlySourceFreeCollectionWithIdleReporterRank(
+        std::vector<DeviceType> backends)
+    {
+        const auto mpi = MPIContextFactory::global();
+        const auto inventory = mpi->clusterInventory();
+        ASSERT_GE(mpi->world_size(), 2);
+        const AutomaticOrchestrationRequest selection({.only_backends = std::move(backends)});
+        const auto expected = PlanningKernelServiceCatalog::observers(*inventory, selection);
+        if (expected.empty()) GTEST_SKIP() << "No selected GPU is available";
+        const bool has_idle_rank = std::any_of(inventory->ranks.begin(), inventory->ranks.end(),
+            [&](const RankInventory &rank) {
+                return std::none_of(expected.begin(), expected.end(), [&](const auto &observer) {
+                    return observer.discoveryRank() == rank.rank;
+                });
+            });
+        if (!has_idle_rank)
+            GTEST_SKIP() << "Every discovery rank is an actual selected GPU reporter";
+
+        const auto streaming = PlanningKernelServiceCatalog::collect(
+            mpi, *inventory, selection, PlanningStreamingServicePlan{});
+        const auto arithmetic = PlanningKernelServiceCatalog::collect(
+            mpi, *inventory, selection, PlanningFP32ArithmeticPlan{});
+        EXPECT_EQ(streaming.has_value(), mpi->is_root());
+        EXPECT_EQ(arithmetic.has_value(), mpi->is_root());
+        if (!mpi->is_root()) return;
+        ASSERT_TRUE(streaming);
+        ASSERT_TRUE(arithmetic);
+        EXPECT_EQ(streaming->records().size(), expected.size());
+        EXPECT_EQ(arithmetic->records().size(), expected.size());
+    }
+
     /** @return Exact full source triplet; the last expert detects incorrect source slicing. */
     PlanningExpertSampleRequest request()
     {
@@ -477,6 +518,15 @@ TEST(PlanningKernelServiceCatalogMPI, CUDA_StreamingCollection) { proveStreaming
 #endif
 #ifdef HAVE_ROCM
 TEST(PlanningKernelServiceCatalogMPI, ROCm_StreamingCollection) { proveStreamingCollection(DeviceType::ROCm); }
+#endif
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
+TEST(PlanningKernelServiceCatalogMPI, Heterogeneous_GPUOnlySourceFreeCollectionWithIdleReporterRank)
+{
+    ensureNvidiaFactoryRegistered();
+    ensureAMDFactoryRegistered();
+    proveGPUOnlySourceFreeCollectionWithIdleReporterRank({DeviceType::CUDA, DeviceType::ROCm});
+}
 #endif
 
 TEST(PlanningKernelServiceCatalogMPI, CPU_CompleteSourceAndExecutionEvidence)

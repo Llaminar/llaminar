@@ -28,7 +28,7 @@ import sys
 import tempfile
 import unittest
 import subprocess
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
@@ -134,6 +134,20 @@ def image_pair(source, isa="AVX512"):
                                    "org.llaminar.integration_skipped": "0"}},
             "runtime": {"id": "runtime-id", "layers": ["runtime-layer"],
                         "labels": {**common, "org.llaminar.image_role": "runtime"}}}
+
+
+def remote_runtime_identity(*, identifier="runtime-id", isa="AVX2", revision="revision",
+                            source_tree="source-tree"):
+    """Build the full label contract admitted before a remote CPU image transfer."""
+    return {"id": identifier, "labels": {
+        "org.opencontainers.image.revision": revision,
+        "org.llaminar.source_tree": source_tree,
+        "org.llaminar.cpu_isa": isa,
+        "org.llaminar.image_role": "runtime",
+        "org.llaminar.build_type": "Release",
+        "org.llaminar.cuda": "ON",
+        "org.llaminar.rocm": "ON",
+    }}
 
 
 def e2e_report(inventory=None):
@@ -1985,7 +1999,8 @@ class PipelineInventoryTests(unittest.TestCase):
                 (models / Path(filename).name).write_text("model fixture")
             args = argparse.Namespace(models=models, model_ramdisk_root=root,
                 reference_cache_root=root / "references", output=root / "results",
-                cpu_isa="AVX512", image=None, resume=False, through="benchmarks")
+                cpu_isa="AVX512", image=None, resume=False, through="benchmarks",
+                resolved_remote_cpu_image="remote-avx2-id")
             source = {"revision": "revision", "tree": "tree", "dirty": False}
             images = image_pair(source, "AVX512")
 
@@ -2009,6 +2024,7 @@ class PipelineInventoryTests(unittest.TestCase):
                     artifacts.write_json(Path(command[command.index("--report") + 1]), {
                         "schema": 1, "eligible": True, "complete": True,
                         "source_revision": "revision", "image": runtime,
+                        "remote_cpu_image": "remote-avx2-id",
                         "manifest_digest": artifacts.digest(remote), "all_resources_retired": True,
                         "scenarios": [{"id": item["id"], "frontend": item["frontend"],
                                        "topology": item["topology"], "return_code": 0,
@@ -2025,11 +2041,60 @@ class PipelineInventoryTests(unittest.TestCase):
                 state = pipeline.run_variant(args, source)
             self.assertEqual([call.args[1].stem for call in execute.call_args_list],
                              ["generation", "e2e", "cross-host-e2e", "benchmarks"])
+            cross_host = execute.call_args_list[2].args[0]
+            self.assertEqual(cross_host[cross_host.index("--remote-cpu-image") + 1], "remote-avx2-id")
             self.assertIn("cross-host-e2e", state["phases"])
 
 
 class CrossHostRunnerTests(unittest.TestCase):
     """Device-free checks for remote launcher admission and artifact safety."""
+
+    def test_remote_cpu_runtime_requires_matching_release_source_and_real_isa_support(self):
+        """Reject a doomed AVX-512 peer before image/model transfer or MPI startup."""
+        controller_identity = remote_runtime_identity(identifier="sha256:controller", isa="AVX512")
+        avx2_identity = remote_runtime_identity(identifier="sha256:peer", isa="AVX2")
+        controller = remote_e2e.RuntimeImage(controller_identity, remote_e2e.CPUISA.AVX512)
+        peer = remote_e2e.RuntimeImage(avx2_identity, remote_e2e.CPUISA.AVX2)
+        host = [{"public_ip": "192.0.2.10"}]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(remote_e2e, "remote_cpu_features",
+                              return_value=remote_e2e.CPU_ISA_FEATURES[remote_e2e.CPUISA.AVX2]):
+                remote_e2e.admit_remote_cpu_runtime(controller, peer, host, Path("/key"), directory)
+            evidence = json.loads((directory / "remote-cpu-runtime.json").read_text())
+            self.assertEqual(evidence["controller_cpu_isa"], "AVX512")
+            self.assertEqual(evidence["remote_cpu_isa"], "AVX2")
+            self.assertEqual(evidence["hosts"][0]["supported_cpu_isas"], ["AVX2"])
+            with patch.object(remote_e2e, "remote_cpu_features",
+                              return_value=remote_e2e.CPU_ISA_FEATURES[remote_e2e.CPUISA.AVX2]):
+                with self.assertRaisesRegex(ValueError, "supplied CPU runtime requires AVX512"):
+                    remote_e2e.admit_remote_cpu_runtime(
+                        controller, remote_e2e.RuntimeImage(controller_identity, remote_e2e.CPUISA.AVX512),
+                        host, Path("/key"), directory)
+        foreign = remote_runtime_identity(identifier="sha256:foreign", source_tree="other-source-tree")
+        with self.assertRaisesRegex(ValueError, "different immutable source tree"):
+            remote_e2e.admit_remote_cpu_runtime(
+                controller, remote_e2e.RuntimeImage(foreign, remote_e2e.CPUISA.AVX2), host, Path("/key"), Path("/tmp"))
+
+    def test_runtime_image_admission_rejects_stale_or_non_runtime_metadata(self):
+        """Image labels are an admission contract, never an advisory transfer tag."""
+        admitted = remote_runtime_identity(identifier="sha256:admitted")
+        corruptions = (
+            ("org.opencontainers.image.revision", "old-revision", "requested full-backend Release source"),
+            ("org.llaminar.image_role", "builder", "requested full-backend Release source"),
+            ("org.llaminar.cpu_isa", "SSE2", "supported explicit CPU ISA"),
+            ("org.llaminar.source_tree", "", "source tree identity"),
+        )
+        with patch.object(remote_e2e, "image_identity", return_value=admitted):
+            runtime = remote_e2e.admit_runtime_image("runtime", "revision")
+        self.assertEqual(runtime.cpu_isa, remote_e2e.CPUISA.AVX2)
+        for key, value, expected in corruptions:
+            with self.subTest(key=key):
+                invalid = copy.deepcopy(admitted)
+                invalid["labels"][key] = value
+                with patch.object(remote_e2e, "image_identity", return_value=invalid), \
+                     self.assertRaisesRegex(ValueError, expected):
+                    remote_e2e.admit_runtime_image("runtime", "revision")
 
     def test_peer_evidence_downloads_overlap_and_preserve_exact_records(self):
         import threading
@@ -2088,10 +2153,16 @@ class CrossHostRunnerTests(unittest.TestCase):
             remote_e2e.selected_rows(projected)
 
     def test_private_key_cli_destination_survives_pipeline_forwarding(self):
-        args = argparse.Namespace(ssh_private_key="/private/task key", azure_subscription="subscription")
+        args = argparse.Namespace(ssh_private_key="/private/task key", azure_subscription="subscription",
+                                  azure_pricing="spot", remote_cpu_image="operator-peer-image",
+                                  resolved_remote_cpu_image="sha256:built-avx2")
         forwarded = pipeline.cross_host_cli_arguments(args)
         self.assertEqual(forwarded[forwarded.index("--ssh-private-key") + 1], args.ssh_private_key)
         self.assertEqual(pipeline.cross_host_identity(args)["ssh_private_key"], args.ssh_private_key)
+        self.assertEqual(forwarded[forwarded.index("--azure-pricing") + 1], "spot")
+        self.assertEqual(pipeline.cross_host_identity(args)["azure_pricing"], "spot")
+        self.assertEqual(forwarded[forwarded.index("--remote-cpu-image") + 1], "sha256:built-avx2")
+        self.assertEqual(pipeline.cross_host_identity(args)["remote_cpu_image"], "operator-peer-image")
 
     def test_partial_long_context_and_wrong_remote_policy_never_pass(self):
         scenario = remote_cases()[0]
@@ -2126,8 +2197,9 @@ class CrossHostRunnerTests(unittest.TestCase):
         ordinary completion and a rejected cell without deleting HTTP logs.
         """
         from test_azure_cross_host_resources import FakeAzure, PUBLIC_KEY, SUBSCRIPTION
-        for failure in (None, "cell", "import", "plan"):
-            failed = failure is not None
+        for failure in (None, "cell", "import", "fleet", "plan", "planning-only"):
+            planning_only = failure == "planning-only"
+            failed = failure is not None and not planning_only
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 model = root / "model.gguf"
@@ -2174,6 +2246,12 @@ class CrossHostRunnerTests(unittest.TestCase):
                 @contextmanager
                 def fleet(**kwargs):
                     self.assertIn(len(kwargs["hosts"]), (1, 2))
+                    self.assertTrue(kwargs["workspace"].is_relative_to(
+                        remote_e2e.CROSS_HOST_CONTAINER_SCRATCH))
+                    self.assertTrue(kwargs["artifact"].is_relative_to(
+                        remote_e2e.CROSS_HOST_CONTAINER_SCRATCH))
+                    if failure == "fleet":
+                        raise RuntimeError("container fleet rejected the owned remote mount")
                     scenario = next(row for row in parent["configuration"]["cross_host_e2e"]
                                     if row["id"] == kwargs["artifact"].name)
                     plan = kwargs["plan_args"]
@@ -2184,6 +2262,10 @@ class CrossHostRunnerTests(unittest.TestCase):
                         self.assertEqual(applied, ["--config", str(remote_containers.CASE_ROOT / "plan.json")])
                     else:
                         self.assertEqual(applied[:len(declared)], declared)
+                    workspace = kwargs["workspace"]
+                    workspace.mkdir(parents=True, exist_ok=True)
+                    artifacts.write_json(workspace / "plan.json", {
+                        "kind": "llaminar.orchestration-config", "configuration": {}})
                     yield root / "unused-launcher"
 
                 @contextmanager
@@ -2200,11 +2282,13 @@ class CrossHostRunnerTests(unittest.TestCase):
                 with patch.object(remote_e2e, "AzureCLI", return_value=cli), \
                      patch.object(remote_e2e, "validate_local_network"), \
                      patch.object(remote_e2e, "private_mpi_connection", side_effect=connection), \
-                     patch.object(remote_e2e, "image_identity", return_value={"id": "runtime-id"}), \
+                     patch.object(remote_e2e, "image_identity", return_value=remote_runtime_identity()), \
                      patch.object(remote_e2e, "validate_attached_execution"), \
                      patch.object(remote_e2e, "wait_remote_runtime"), \
+                     patch.object(remote_e2e, "remote_cpu_features",
+                                  return_value=remote_e2e.CPU_ISA_FEATURES[remote_e2e.CPUISA.AVX2]), \
                      patch.object(remote_e2e, "stage_image", side_effect=stage_image) as image_stage, \
-                     patch.object(remote_e2e, "distribute"), \
+                     patch.object(remote_e2e, "distribute") as model_transfer, \
                      patch.object(remote_e2e, "ssh"), patch.object(remote_e2e, "upload_artifact"), \
                      patch.object(remote_containers, "container_fleet", side_effect=fleet) as fleets, \
                      patch.object(remote_e2e, "run_e2e_process", side_effect=harness), \
@@ -2214,31 +2298,56 @@ class CrossHostRunnerTests(unittest.TestCase):
                         "--model-ramdisk-root", str(root / "staging"), "--report", str(report_path),
                         "--azure-subscription", SUBSCRIPTION, "--azure-ssh-source", "8.8.8.8/32",
                         "--azure-ssh-public-key", str(public), "--ssh-private-key", str(private)]
+                    if planning_only:
+                        argv.append("--planning-only")
                     if failed:
-                        with self.assertRaisesRegex(RuntimeError, "runtime import failed" if failure == "import"
-                                                   else "cross-host scenario failed"):
+                        expected = ("runtime import failed" if failure == "import" else
+                                    "container fleet rejected" if failure == "fleet" else
+                                    "cross-host scenario failed")
+                        with self.assertRaisesRegex(RuntimeError, expected):
                             remote_e2e.main(argv)
                     else:
                         self.assertEqual(remote_e2e.main(argv), 0)
                 self.assertIsNone(cli.group)
                 image_stage.assert_called_once()
+                if planning_only:
+                    # Planning metadata is root-published through MPI. A
+                    # remote model transfer would conceal a follower-side
+                    # GGUF dependency and turn a control-plane check into a
+                    # multi-gigabyte data-plane operation.
+                    model_transfer.assert_not_called()
+                else:
+                    model_transfer.assert_called_once()
                 self.assertEqual([len(call.kwargs["hosts"]) for call in fleets.call_args_list],
-                                 [] if failure == "import" else [1] if failed else [1, 1, 2, 2])
+                                 [] if failure == "import" else [1] if failed else
+                                 [1, 2] if planning_only else [1, 1, 2, 2])
                 self.assertEqual(list((root / "staging").iterdir()), [])
                 report = json.loads(report_path.read_text())
                 self.assertEqual(report["complete"], not failed)
                 self.assertTrue(report["all_resources_retired"])
-                self.assertEqual(len(report["scenarios"]), 0 if failure == "import" else 1 if failed else 4)
+                self.assertEqual(len(report["scenarios"]),
+                                 0 if failure in ("import", "fleet") else
+                                 1 if failed else 2 if planning_only else 4)
+                self.assertEqual(report["diagnostic_planning_only"], planning_only)
+                if failure in ("import", "fleet"):
+                    message = ("runtime import failed" if failure == "import" else
+                               "container fleet rejected the owned remote mount")
+                    self.assertEqual(report["infrastructure_failure"], {
+                        "type": "RuntimeError",
+                        "message": message})
+                else:
+                    self.assertIsNone(report["infrastructure_failure"])
                 import_logs = list(report_path.parent.rglob("runtime-import-peer.log"))
                 self.assertEqual(len(import_logs), 1)
                 self.assertEqual(import_logs[0].read_text(), "preserved import diagnostic\n")
                 for observed in report["scenarios"]:
                     evidence = Path(observed["artifacts"])
                     self.assertTrue(evidence.is_relative_to(report_path.parent))
-                    if failure == "plan":
+                    if failure in ("plan", "planning-only"):
                         self.assertEqual((evidence / "plan.log").read_text(), "preserved plan diagnostic\n")
                         self.assertFalse((evidence / "harness.log").exists())
                         self.assertFalse((evidence / "long_context_results.json").exists())
+                        self.assertEqual(observed["planning_proof"], planning_only)
                         continue
                     self.assertEqual((evidence / "harness.log").read_text(), "preserved HTTP diagnostic\n")
                     self.assertTrue((evidence / "long_context_results.json").is_file())
@@ -2250,12 +2359,26 @@ class CrossHostRunnerTests(unittest.TestCase):
         self.assertNotIn("/", remote_e2e.safe_name("../"))
 
     def test_remote_command_failure_preserves_captured_diagnostics(self):
-        with patch.object(remote_e2e.subprocess, "run", return_value=subprocess.CompletedProcess(
-                ["ssh"], 1, "bounded stdout", "remote failure")):
+        process = MagicMock()
+        process.communicate.return_value = ("bounded stdout", "remote failure")
+        process.returncode = 1
+        with patch.object(remote_e2e.subprocess, "Popen", return_value=process):
             with self.assertRaises(subprocess.CalledProcessError) as caught:
                 remote_e2e.run(["ssh"])
         self.assertEqual(caught.exception.output, "bounded stdout")
         self.assertEqual(caught.exception.stderr, "remote failure")
+
+    def test_remote_command_interrupt_retires_its_exact_process_group(self):
+        process = MagicMock()
+        process.pid = 713
+        process.poll.return_value = None
+        process.communicate.side_effect = InterruptedError("controller cancellation")
+        with patch.object(remote_e2e.subprocess, "Popen", return_value=process), \
+             patch.object(remote_e2e.os, "killpg") as terminate:
+            with self.assertRaisesRegex(InterruptedError, "controller cancellation"):
+                remote_e2e.run(["rsync", "model.gguf"])
+        process.wait.assert_called_once_with(timeout=5)
+        terminate.assert_called_once_with(713, remote_e2e.signal.SIGTERM)
 
     def test_mpi_interface_selection_is_exact_and_rejects_ambiguous_inventory(self):
         def interface(name, address, flags=("UP",)):
@@ -3031,7 +3154,10 @@ class InfrastructureTests(unittest.TestCase):
     def test_all_isa_e2e_suites_precede_any_benchmark_and_certification(self):
         args = argparse.Namespace(output=Path("reports"), cpu_isas=list(pipeline.SHIPPING_ISAS),
                                   through="certify", image="registry/image:version", resume=False)
-        with patch.object(pipeline, "run_variant", return_value={"certified": True}) as execute:
+        def advance(variant, _source):
+            return {"certified": True,
+                    "images": {"runtime": {"id": "runtime-" + variant.cpu_isa.lower()}}}
+        with patch.object(pipeline, "run_variant", side_effect=advance) as execute:
             result = pipeline.drive_variants(args, {})
         self.assertEqual(set(result), set(pipeline.SHIPPING_ISAS))
         order = [(call.args[0].cpu_isa, call.args[0].through) for call in execute.call_args_list]
@@ -3041,6 +3167,8 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(variant.output, args.output / variant.cpu_isa.lower())
             self.assertEqual(variant.resume, variant.through != "build")
             self.assertEqual(variant.image, "registry/image:version" + ("-avx2" if variant.cpu_isa == "AVX2" else ""))
+            if variant.through == "cross-host-e2e":
+                self.assertEqual(variant.resolved_remote_cpu_image, "runtime-avx2")
 
     def test_failing_second_e2e_suite_blocks_both_benchmarks(self):
         args = argparse.Namespace(output=Path("reports"), cpu_isas=list(pipeline.SHIPPING_ISAS),
@@ -3116,10 +3244,13 @@ class InfrastructureTests(unittest.TestCase):
     def test_default_cli_certifies_both_and_keeps_local_publication_disabled(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "results"
+            def advance(variant, _source):
+                return {"certified": True,
+                        "images": {"runtime": {"id": "runtime-" + variant.cpu_isa.lower()}}}
             with patch.object(pipeline, "source_identity", return_value={"revision": "revision", "tree": "tree"}), \
                  patch.object(pipeline, "device_lease"), \
                  patch.object(pipeline.docker_paths, "publish_model_cache"), \
-                 patch.object(pipeline, "run_variant", return_value={"certified": True}) as variants, \
+                 patch.object(pipeline, "run_variant", side_effect=advance) as variants, \
                  patch.object(pipeline, "publish") as publish:
                 self.assertEqual(pipeline.main(["--output", str(output)]), 0)
             self.assertEqual(variants.call_count, 2 * len(pipeline.pipeline_phases()))
@@ -3557,11 +3688,16 @@ class InfrastructureTests(unittest.TestCase):
         self.assertNotIn('--cuda-driver-required', harness)
         self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
-    def test_workflow_has_one_driver_no_parallel_model_matrix_or_old_ratchet(self):
+    def test_develop_workflow_has_one_model_free_driver_and_no_certification_axes(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-        self.assertIn("scripts/ci/run_production_pipeline.py", workflow)
+        self.assertIn("scripts/ci/run_develop_image_gate.py", workflow)
+        self.assertNotIn("scripts/ci/run_production_pipeline.py", workflow)
         self.assertNotIn("run_benchmark_check.sh", workflow)
+        self.assertNotIn("run_model_parity", workflow)
+        self.assertNotIn("azure", workflow.lower())
         self.assertNotIn("matrix:", workflow)
+        self.assertIn("branches: [develop]", workflow)
+        self.assertIn("--publish", workflow)
         self.assertIn("submodules: false", workflow)
         self.assertIn("lfs: false", workflow)
 

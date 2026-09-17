@@ -1,51 +1,29 @@
 name: CI
 
-# Repository Actions remains administratively disabled until explicitly enabled.
-# Once enabled, hosted and local certification have exactly one entry point.
+# The develop branch publishes only freshly built, model-free-gated runtime
+# images. Full generation, HTTP E2E, remote MPI, benchmarks and certification
+# remain explicit production-pipeline work; this workflow must not grow a
+# second copy of that heavier policy.
 on:
-  pull_request:
-    branches: [develop, master]
   push:
     branches: [develop]
-    paths-ignore:
-      - 'benchmarks/production/results/**'
-      - 'benchmarks/production/high_water.json'
   workflow_dispatch:
-  workflow_call:
-    inputs:
-      image-tag:
-        description: Optional immutable release tag for the certified image.
-        required: false
-        type: string
-        default: ''
-    outputs:
-      image-ref-avx512:
-        description: Independently certified full-backend AVX512 image.
-        value: ${{ jobs.production.outputs.image-ref-avx512 }}
-      image-ref-avx2:
-        description: Independently certified full-backend AVX2 image.
-        value: ${{ jobs.production.outputs.image-ref-avx2 }}
 
 permissions:
   contents: read
+  packages: write
 
-# One node owns the full heterogeneous topology. Never cancel a run halfway
-# through model teardown or overlap two workflows on the same accelerators.
 concurrency:
-  group: llaminar-production-certification
+  group: llaminar-develop-image-gate
   cancel-in-progress: false
 
 jobs:
-  production:
-    name: Build → Unit → Preflight → Parity → E2E → Benchmarks → Certify
+  develop-images:
+    # Manual dispatches from another branch must not mutate the develop tag.
+    if: github.ref == 'refs/heads/develop'
+    name: Build → Unit → Preflight → Publish develop images
     runs-on: [llaminar-bench]
-    timeout-minutes: 360
-    permissions:
-      contents: write
-      packages: write
-    outputs:
-      image-ref-avx512: ${{ steps.certify.outputs.image-ref-avx512 }}
-      image-ref-avx2: ${{ steps.certify.outputs.image-ref-avx2 }}
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
         with:
@@ -54,46 +32,16 @@ jobs:
       - uses: docker/setup-buildx-action@v4
         with:
           driver: docker
-      - name: Log in to GHCR for official publication
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Prepare persistent model staging (never clears an existing cache)
-        run: |
-          bash scripts/ci/setup_production_parity_tmpfs.sh
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/llaminar-parity-references
-      - name: Run canonical production pipeline
-        id: certify
-        env:
-          RELEASE_TAG: ${{ inputs.image-tag }}
+      - name: Build, gate and publish both develop runtime images
         shell: bash
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:${RELEASE_TAG:-${GITHUB_SHA}-full}"
-          args=(--models /opt/llaminar-models
-                --reference-cache-root /opt/llaminar-parity-references
-                --output parity-results/production-ci --image "$image")
-          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
-            args+=(--publish)
-          fi
-          python3 scripts/ci/run_production_pipeline.py "${args[@]}"
-          echo "image-ref-avx512=$image" >> "$GITHUB_OUTPUT"
-          echo "image-ref-avx2=${image}-avx2" >> "$GITHUB_OUTPUT"
-      - name: Preserve reports, certificates and failure logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: production-certification-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            parity-results/production-ci/*.json
-            parity-results/production-ci/*/*.json
-            parity-results/production-ci/*/*.log
-            parity-results/production-ci/*/prerequisites/**
-            parity-results/production-ci/*/e2e-*/**
-            parity-results/production-ci/*/benchmarks-*/**
-            parity-results/production-ci/*/production-campaign-artifacts/**
-          if-no-files-found: warn
-          retention-days: 30
+          python3 scripts/ci/run_develop_image_gate.py \
+            --output parity-results/develop-image-gate \
+            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
+            --publish

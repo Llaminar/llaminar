@@ -5,14 +5,18 @@ The C++ parity inventory is the only source of model/topology membership.  An
 eligible cell is executed through the existing HTTP harness with one local GPU
 rank and one CPU rank per distinct remote VM.  This command owns a durable
 Azure lease and stages the exact Release image and complete model shard set;
-it never falls back to a local or node-local run.  Authentication is supplied
-by an existing ``az login`` (or CI's federated login), and secrets are never
-written to reports.
+it never falls back to a local or node-local run.  Its explicit planning-only
+diagnostic instead leaves GGUF data on discovery root and proves typed metadata
+publication to followers, so an accidental remote model read cannot be masked
+by a WAN copy. Authentication is supplied by an existing ``az login`` (or
+CI's federated login), and secrets are never written to reports.
 """
 from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, suppress
+from dataclasses import dataclass
+from enum import Enum
 import json
 import os
 from pathlib import Path
@@ -27,7 +31,8 @@ import time
 import uuid
 
 from azure_cross_host_resources import (
-    AzureCLI, AzureCPUCapacity, DEFAULT_TUNNEL_SUBNET, Disposal, campaign_resources,
+    AzureCLI, AzureCPUCapacity, AzureComputePricing, DEFAULT_TUNNEL_SUBNET, Disposal,
+    campaign_resources,
 )
 from cross_host_network import private_mpi_connection, validate_local_network
 from cross_host_artifacts import distribute
@@ -40,9 +45,51 @@ from run_model_parity_e2e import (
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = ROOT / "tests/v2/e2e/server/test_server_e2e.sh"
+# The controller container must see its launch files and peer-collected output
+# through the Docker daemon's mount namespace.  A caller may put durable
+# reports in /tmp, which is intentionally private to this devcontainer, so
+# never make the report directory double as a bind-mounted fleet workspace.
+CROSS_HOST_CONTAINER_SCRATCH = ROOT / "parity-results" / ".cross-host-container-scratch"
 # Ubuntu clears /tmp across VM restarts. Keep the incremental transfer basis
 # on the explicitly retained user disk, separate from mounted model inputs.
 REMOTE_IMAGE_ARCHIVE = "/home/llaminar/.cache/llaminar-cross-host/runtime-image.tar"
+
+
+class CPUISA(str, Enum):
+    """One installed x86 runtime ISA contract.
+
+    The Docker images deliberately compile the whole CPU execution surface to
+    either AVX2 or AVX-512.  A remote rank cannot safely discover that fact by
+    attempting to start an MPI daemon: an illegal instruction then looks like
+    an unrelated MPI failure.  Keep the two shippable contracts typed at the
+    transport boundary and admit the peer image before staging its bytes.
+    """
+
+    AVX2 = "AVX2"
+    AVX512 = "AVX512"
+
+
+@dataclass(frozen=True)
+class RuntimeImage:
+    """One authenticated Release runtime and its immutable CPU ISA contract.
+
+    ``identity`` is Docker's local immutable image identity.  Images may use
+    different local Docker IDs after import, so only the controller-side ID is
+    retained here; :func:`stage_image` authenticates the portable content on
+    every remote daemon separately.
+    """
+
+    identity: dict
+    cpu_isa: CPUISA
+
+
+CPU_ISA_FEATURES: dict[CPUISA, frozenset[str]] = {
+    # Keep this list identical to the global flags in src/v2/CMakeLists.txt.
+    # Linux exposes BMI1 as ``bmi1`` even though GCC's option is ``-mbmi``.
+    CPUISA.AVX2: frozenset({"sse4_1", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2", "popcnt"}),
+    CPUISA.AVX512: frozenset({"sse4_1", "avx", "avx2", "fma", "f16c", "bmi1", "bmi2", "popcnt",
+                              "avx512f", "avx512bw", "avx512dq", "avx512vl", "avx512_vnni"}),
+}
 
 
 def safe_name(value: str) -> str:
@@ -107,21 +154,157 @@ def validate_private_key(path: Path) -> None:
         raise ValueError("SSH private key must not be group/world readable")
 
 
+def admit_runtime_image(reference: str, source_revision: str) -> RuntimeImage:
+    """Bind one requested runtime to the canonical source and ISA contracts.
+
+    A mixed-ISA MPI cohort is valid only when every participant runs the same
+    source tree and Release ABI.  It is *not* valid to silently substitute a
+    generic CPU image after a peer rejects the controller image.  Callers name
+    the optional CPU-peer runtime explicitly; this admission merely rejects a
+    stale, non-runtime, incomplete-backend, or cross-source image before a
+    large transfer or daemon launch can obscure the defect.
+    """
+    identity = image_identity(reference)
+    labels = identity.get("labels")
+    if not isinstance(labels, dict):
+        raise ValueError("runtime image omitted OCI labels")
+    try:
+        cpu_isa = CPUISA(labels["org.llaminar.cpu_isa"])
+    except (KeyError, ValueError) as error:
+        raise ValueError("runtime image has no supported explicit CPU ISA") from error
+    required = {
+        "org.opencontainers.image.revision": source_revision,
+        "org.llaminar.image_role": "runtime",
+        "org.llaminar.build_type": "Release",
+        "org.llaminar.cuda": "ON",
+        "org.llaminar.rocm": "ON",
+    }
+    if any(labels.get(key) != value for key, value in required.items()):
+        raise ValueError("runtime image does not match the requested full-backend Release source")
+    source_tree = labels.get("org.llaminar.source_tree")
+    if not isinstance(source_tree, str) or not source_tree:
+        raise ValueError("runtime image omitted its immutable source tree identity")
+    return RuntimeImage(identity=identity, cpu_isa=cpu_isa)
+
+
+def remote_cpu_features(host: str, key: Path) -> frozenset[str]:
+    """Read one remote CPU's kernel-authoritative x86 feature set.
+
+    This is physical inventory evidence, not a performance estimate and not a
+    replacement for Llaminar's MPI inventory.  Container selection happens
+    before the remote rank can join MPI, so the transport owner must first
+    prove that its own executable will decode on that host.  ``/proc/cpuinfo``
+    is deliberately read through the host SSH boundary rather than from a
+    possibly incompatible container image.
+    """
+    output = ssh(host, key, ["bash", "-lc", "LC_ALL=C grep -m1 '^flags[[:space:]]*:' /proc/cpuinfo"], timeout=30)
+    prefix, separator, flags = output.strip().partition(":")
+    if prefix.strip() != "flags" or not separator:
+        raise ValueError(f"remote host {host} did not publish an x86 CPU flags row")
+    parsed = frozenset(flag.lower() for flag in flags.split())
+    if not parsed:
+        raise ValueError(f"remote host {host} published an empty x86 CPU flags row")
+    return parsed
+
+
+def compatible_remote_cpu_isas(features: frozenset[str]) -> tuple[CPUISA, ...]:
+    """Return every shipped ISA executable that this peer can execute.
+
+    Preserve the explicit maximum-ISA ordering so diagnostics explain why a
+    peer accepts AVX2 but rejects AVX-512.  No scalar or generic fallback is
+    advertised because the release matrix deliberately ships only these two
+    concrete compiled contracts.
+    """
+    compatible = tuple(isa for isa in (CPUISA.AVX512, CPUISA.AVX2)
+                       if CPU_ISA_FEATURES[isa].issubset(features))
+    if not compatible:
+        raise ValueError("remote CPU does not support Llaminar's AVX2 release baseline")
+    return compatible
+
+
+def admit_remote_cpu_runtime(controller: RuntimeImage, peer: RuntimeImage,
+                             hosts: list[dict], key: Path, directory: Path) -> None:
+    """Prove a peer image is source-coherent and executable on every CPU host.
+
+    The controller may legitimately use AVX-512 while Azure CPU ranks use the
+    AVX2 image.  Their common source-tree label is the ABI/protocol contract;
+    their distinct local ISA labels are the physical-execution contract.  The
+    resulting immutable observation is durable campaign evidence, so no later
+    planner result has to reconstruct topology facts from a SIGILL symptom.
+    """
+    controller_labels = controller.identity["labels"]
+    peer_labels = peer.identity["labels"]
+    if peer_labels["org.llaminar.source_tree"] != controller_labels["org.llaminar.source_tree"]:
+        raise ValueError("remote CPU runtime has a different immutable source tree than the controller")
+    observations = []
+    for host in hosts:
+        address = host["public_ip"]
+        compatible = compatible_remote_cpu_isas(remote_cpu_features(address, key))
+        if peer.cpu_isa not in compatible:
+            offered = ",".join(item.value for item in compatible)
+            raise ValueError(f"remote host {address} supports {offered}, but the supplied "
+                             f"CPU runtime requires {peer.cpu_isa.value}")
+        observations.append({"host": address, "supported_cpu_isas": [item.value for item in compatible],
+                             "selected_cpu_isa": peer.cpu_isa.value})
+    write_json(directory / "remote-cpu-runtime.json", {
+        "controller_image": controller.identity["id"],
+        "controller_cpu_isa": controller.cpu_isa.value,
+        "remote_cpu_image": peer.identity["id"],
+        "remote_cpu_isa": peer.cpu_isa.value,
+        "source_revision": controller_labels["org.opencontainers.image.revision"],
+        "source_tree": controller_labels["org.llaminar.source_tree"],
+        "hosts": observations,
+    })
+
+
+def infrastructure_failure(error: Exception, private_key: Path) -> dict[str, str]:
+    """Publish a bounded, key-redacted setup failure in durable campaign evidence.
+
+    A cloud lease can retire successfully even though a local container fleet
+    failed before it created a scenario result.  Keeping that cause beside the
+    retirement receipt makes the failure actionable without recording the
+    private-key path that happened to be present in a subprocess command.
+    """
+    message = str(error).replace(str(private_key), "<ssh-private-key>")
+    return {"type": type(error).__name__, "message": message[:2048] or "no diagnostic text"}
+
+
 def run(command: list[str], *, cwd: Path = ROOT, env: dict | None = None,
         timeout: int = 1200, log: Path | None = None) -> str:
-    """Execute an argv-bounded command and optionally retain its full output."""
+    """Execute an argv-bounded command with cancellation-owned process retirement.
+
+    Artifact staging can run long enough for CI or an operator to cancel the
+    campaign.  A child in the controller's process group would survive the
+    signal handler while :class:`subprocess.Popen` waits for it, preventing the
+    Azure lease from reaching its cleanup scope.  Each command is therefore a
+    separate process group and is retired before the original interruption or
+    timeout leaves this function.
+    """
     stream = log.open("w") if log else subprocess.PIPE
+    process = None
     try:
-        result = subprocess.run(command, cwd=cwd, env=env, stdout=stream,
-                                stderr=subprocess.STDOUT if log else subprocess.PIPE,
-                                text=True, timeout=timeout, check=False)
+        process = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream,
+                                   stderr=subprocess.STDOUT if log else subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            if process.poll() is None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+            raise
     finally:
         if log:
             stream.close()
-    if result.returncode:
-        raise subprocess.CalledProcessError(result.returncode, command,
-                                            output=result.stdout, stderr=result.stderr)
-    return result.stdout or ""
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
+    return stdout or ""
 
 
 def ssh_argv(host: str, key: Path, command: list[str]) -> list[str]:
@@ -369,8 +552,14 @@ def stage_models(parents: list[dict], hosts: list[dict], key: Path, directory: P
 
 
 def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: list[dict],
-             args: argparse.Namespace, directory: Path) -> dict:
-    """Run one public frontend with MPI daemons enclosed by the tested images."""
+             args: argparse.Namespace, directory: Path, *, planning_only: bool = False) -> dict:
+    """Run one public frontend, or its explicit non-certifying plan probe.
+
+    A plan probe retains the normal hostfile, container fleet, MPI daemons,
+    model metadata and automatic planner.  It stops after the public ``plan``
+    command writes an apply document, so it is useful for control-plane
+    diagnostics without implying that HTTP inference was certified.
+    """
     import cross_host_containers
     from cross_host_containers import CASE_ROOT, container_fleet
 
@@ -382,9 +571,10 @@ def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: l
         raise ValueError("parent model is absent from the complete staged shard set")
     if len(hosts) + 1 != scenario["topology"]["execution_ranks"]:
         raise ValueError("owned VM count differs from the canonical MPI topology")
+    if planning_only and scenario["frontend"] != "plan-apply":
+        raise ValueError("planning-only probes require the canonical plan-apply frontend")
     artifact = directory / safe_name(ident)
     artifact.mkdir()
-    workspace = artifact / "launch"
     # Plan and direct serve receive the same complete policy. Applying the
     # saved document must not reapply automatic filters or silently override
     # memory-affecting MTP/KV settings after the plan has been admitted.
@@ -401,29 +591,65 @@ def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: l
     args_file = artifact / "server-args.json"
     write_json(args_file, policy)
     started = time.monotonic()
-    with container_fleet(image=image, hosts=hosts, key=args.ssh_private_key,
-            workspace=workspace, artifact=artifact, model_dir=model_dir, model_name=model.name,
-            frontend_mode=scenario["frontend"], plan_args=plan_args,
-            backend=scenario["topology"]["continuation_backend"],
-            continuation_devices=scenario["topology"]["continuation_devices"],
-            controller_address=args.controller_address) as launcher:
-        # The two public commands are separate lifecycle phases, not a plan
-        # job hidden inside server startup. Both still spend one cell deadline.
-        budget = E2ECellBudget()
-        return_code = 0
-        if scenario["frontend"] == "plan-apply":
-            with (artifact / "plan.log").open("w") as log:
-                return_code = run_e2e_process(
-                    [sys.executable, str(Path(cross_host_containers.__file__).resolve()),
-                     "prepare", str(workspace / "fleet.json")], env, log, budget=budget)
-        command = ["bash", str(HARNESS), "--binary", str(launcher),
-                   "--suite", f"{staged}|tp|200||{ident}|e2e-certification",
-                   "--server-args-file", str(args_file), "--cross-host-configuration",
-                   str(args.manifest), "--cross-host-case", ident, "--port", str(args.port)]
-        if return_code == 0:
-            with (artifact / "harness.log").open("w") as log:
-                return_code = run_e2e_process(command, env, log, budget=budget)
+    planning_proof = False
     evidence_error = None
+    CROSS_HOST_CONTAINER_SCRATCH.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="cross-host-case-", dir=CROSS_HOST_CONTAINER_SCRATCH) as scratch:
+        mounted_root = Path(scratch)
+        workspace = mounted_root / "launch"
+        # Preserve the opaque canonical name inside the daemon-visible tree so
+        # remote evidence remains naturally associated with the durable report.
+        mounted_artifact = mounted_root / artifact.name
+        mounted_artifact.mkdir()
+        # The HTTP harness consumes the durable copy, while the controller
+        # container sees this explicitly mirrored immutable launch contract.
+        # Do not let a private bind mount inherit incidental parent files.
+        write_json(mounted_artifact / "server-args.json", policy)
+        with container_fleet(image=image, hosts=hosts, key=args.ssh_private_key,
+                workspace=workspace, artifact=mounted_artifact, model_dir=model_dir, model_name=model.name,
+                frontend_mode=scenario["frontend"], plan_args=plan_args,
+                backend=scenario["topology"]["continuation_backend"],
+                continuation_devices=scenario["topology"]["continuation_devices"],
+                controller_address=args.controller_address) as launcher:
+            # The two public commands are separate lifecycle phases, not a plan
+            # job hidden inside server startup. Both still spend one cell deadline.
+            budget = E2ECellBudget()
+            return_code = 0
+            if scenario["frontend"] == "plan-apply":
+                with (artifact / "plan.log").open("w") as log:
+                    return_code = run_e2e_process(
+                        [sys.executable, str(Path(cross_host_containers.__file__).resolve()),
+                         "prepare", str(workspace / "fleet.json")], env, log, budget=budget)
+                if return_code == 0:
+                    try:
+                        plan = json.loads((workspace / "plan.json").read_text())
+                        planning_proof = (plan.get("kind") == "llaminar.orchestration-config"
+                                          and isinstance(plan.get("configuration"), dict))
+                        if not planning_proof:
+                            raise ValueError("public plan omitted its orchestration configuration")
+                    except (OSError, ValueError, json.JSONDecodeError) as error:
+                        return_code = 1
+                        evidence_error = str(error)
+            if not planning_only:
+                command = ["bash", str(HARNESS), "--binary", str(launcher),
+                           "--suite", f"{staged}|tp|200||{ident}|e2e-certification",
+                           "--server-args-file", str(args_file), "--cross-host-configuration",
+                           str(args.manifest), "--cross-host-case", ident, "--port", str(args.port)]
+                if return_code == 0:
+                    with (artifact / "harness.log").open("w") as log:
+                        return_code = run_e2e_process(command, env, log, budget=budget)
+        # Container and remote-peer output was written under the daemon's
+        # namespace. Copy it only after every container is retired, then make
+        # the caller-selected report directory the sole durable evidence owner.
+        if mounted_artifact.exists():
+            shutil.copytree(mounted_artifact, artifact, dirs_exist_ok=True)
+    if planning_only:
+        return {"id": ident, "frontend": scenario["frontend"], "topology": scenario["topology"],
+                "return_code": return_code,
+                "outcome": "passed" if planning_proof else "failed",
+                "planning_proof": planning_proof, "transport_proof": False, "http_proof": False,
+                "resource_retired": False, "elapsed_seconds": time.monotonic() - started,
+                "artifacts": str(artifact), "evidence_error": evidence_error}
     proof_ok = False
     if return_code == 0:
         try:
@@ -435,7 +661,7 @@ def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: l
     return {"id": ident, "frontend": scenario["frontend"], "topology": scenario["topology"],
             "return_code": return_code,
             "outcome": "passed" if proof_ok else "cell_timeout" if return_code == 124 else "failed",
-            "transport_proof": proof_ok, "http_proof": proof_ok,
+            "planning_proof": planning_proof, "transport_proof": proof_ok, "http_proof": proof_ok,
             "resource_retired": False, "elapsed_seconds": time.monotonic() - started,
             "artifacts": str(artifact), "evidence_error": evidence_error}
 def validate_case_evidence(directory: Path, scenario: dict, profile: dict) -> None:
@@ -471,14 +697,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--container-image", required=True)
+    parser.add_argument("--remote-cpu-image",
+                        help="explicit Release image for remote CPU MPI ranks; defaults to --container-image only when compatible")
     parser.add_argument("--models", type=Path, required=True)
     parser.add_argument("--model-ramdisk-root", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--first-case", action="append", default=[],
                         help="Run this exact canonical scenario first (repeatable); all scenarios remain required")
+    parser.add_argument("--planning-only", action="store_true",
+                        help="Explicit diagnostic: run only canonical plan-apply routes; never E2E-certifies")
     parser.add_argument("--azure-subscription", default=os.environ.get("AZURE_SUBSCRIPTION_ID", ""))
     parser.add_argument("--azure-location", default=os.environ.get("LLAMINAR_AZURE_LOCATION", "uksouth"))
     parser.add_argument("--azure-vm-size", default=os.environ.get("LLAMINAR_AZURE_VM_SIZE", "Standard_E16ads_v6"))
+    parser.add_argument("--azure-pricing", choices=[item.value for item in AzureComputePricing],
+                        default=os.environ.get("LLAMINAR_AZURE_PRICING", AzureComputePricing.SPOT.value),
+                        help="Explicit Azure billing contract; Spot is the default and never falls back")
     parser.add_argument("--azure-image", default=os.environ.get("LLAMINAR_AZURE_IMAGE", "Canonical:ubuntu-24_04-lts:server:24.04.202608270"))
     parser.add_argument("--azure-os-disk-gib", type=int, default=int(os.environ.get("LLAMINAR_AZURE_OS_DISK_GIB", "256")))
     parser.add_argument("--azure-ssh-source", default=os.environ.get("LLAMINAR_AZURE_SSH_SOURCE", ""))
@@ -503,14 +736,21 @@ def main(argv: list[str] | None = None) -> int:
     public_key = args.azure_ssh_public_key.read_text().strip()
     manifest = load_manifest(args.manifest, args.source_revision)
     selected = selected_rows(manifest, args.first_case)
+    if args.planning_only:
+        selected = [(parent, scenario) for parent, scenario in selected
+                    if scenario["frontend"] == "plan-apply"]
+        if not selected:
+            raise ValueError("canonical cross-host projection has no plan-apply scenario to probe")
     capacity = AzureCPUCapacity(args.azure_location, args.azure_vm_size, args.azure_image,
         args.azure_os_disk_gib, args.azure_ssh_source, args.azure_private_subnet,
-        tunnel_subnet=args.azure_tunnel_subnet)
+        pricing=AzureComputePricing(args.azure_pricing), tunnel_subnet=args.azure_tunnel_subnet)
     # The lease creates its own private connectivity. Check local prerequisites
     # before cloud mutation; a pre-existing route to an uncreated VNet cannot
     # be a meaningful readiness requirement.
     validate_local_network(capacity.private_subnet, capacity.tunnel_subnet)
-    image = image_identity(args.container_image)["id"]
+    controller_runtime = admit_runtime_image(args.container_image, args.source_revision)
+    peer_runtime = admit_runtime_image(args.remote_cpu_image or args.container_image, args.source_revision)
+    image = controller_runtime.identity["id"]
     validate_attached_execution(image)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     if args.report.exists():
@@ -519,10 +759,12 @@ def main(argv: list[str] | None = None) -> int:
     receipt = (args.reuse_azure_lease.resolve(strict=True) if args.reuse_azure_lease
                else artifact_root / "azure-lease.json")
     report = {"schema": 1, "eligible": True, "complete": False,
+              "diagnostic_planning_only": args.planning_only,
               "source_revision": args.source_revision, "image": image,
+              "remote_cpu_image": peer_runtime.identity["id"],
               "manifest_digest": digest(manifest), "scenarios": [], "all_resources_retired": False,
               "scenario_order": [scenario["id"] for _, scenario in selected],
-              "azure_lease_receipt": str(receipt)}
+              "azure_lease_receipt": str(receipt), "infrastructure_failure": None}
     try:
         args.model_ramdisk_root.mkdir(parents=True, exist_ok=True)
         # Capacity is shared across the image's cases; execution membership is
@@ -543,12 +785,28 @@ def main(argv: list[str] | None = None) -> int:
                 public = [str(item["public_ip"]) for item in hosts]
                 for host in public:
                     wait_remote_runtime(host, args.ssh_private_key)
+                # A remote CPU rank can use an ISA-specific sibling of the
+                # controller image, but only after both source identity and
+                # physical host features have been admitted. This happens
+                # before image/model transfer and before an MPI daemon can
+                # turn a predictable SIGILL into a generic rank failure.
+                admit_remote_cpu_runtime(controller_runtime, peer_runtime, hosts,
+                                         args.ssh_private_key, directory)
                 with private_mpi_connection(hosts, args.ssh_private_key,
                         capacity.private_subnet, capacity.tunnel_subnet, directory) as connection:
                     args.controller_address = connection.controller_address
-                    stage_models(parents, hosts, args.ssh_private_key, staging_directory, model_dir=model_dir)
+                    if not args.planning_only:
+                        stage_models(parents, hosts, args.ssh_private_key, staging_directory,
+                                     model_dir=model_dir)
+                    # AutomaticPlanningStartup opens a GGUF only on discovery
+                    # root, then publishes the typed PlanningModelMetadata to
+                    # every follower.  A planning-only probe must preserve
+                    # that production ownership boundary: transferring a
+                    # complete model to remote ranks would both waste a WAN
+                    # transfer and mask an accidental follower GGUF read.
                     try:
-                        imported = stage_image(image, hosts, args.ssh_private_key, staging_directory)
+                        imported = stage_image(peer_runtime.identity["id"], hosts,
+                                               args.ssh_private_key, staging_directory)
                     finally:
                         # Import diagnostics must survive a failed admission or
                         # cancellation just as the cloud lease receipt does.
@@ -559,7 +817,8 @@ def main(argv: list[str] | None = None) -> int:
                     for case_index, (parent, scenario) in enumerate(selected, start=1):
                         print(f"[production-cross-host] START {case_index}/{len(selected)} {scenario['id']}", flush=True)
                         peers = hosts[:scenario["topology"]["remote_cpu_hosts"]]
-                        result = run_case(parent, scenario, image, model_dir, peers, args, directory)
+                        result = run_case(parent, scenario, image, model_dir, peers, args, directory,
+                                          planning_only=args.planning_only)
                         report["scenarios"].append(result)
                         write_json(args.report, report)
                         print(f"[production-cross-host] {result['outcome'].upper()} {case_index}/{len(selected)} "
@@ -570,6 +829,13 @@ def main(argv: list[str] | None = None) -> int:
             for result in report["scenarios"]:
                 result["resource_retired"] = True
         report["all_resources_retired"] = True
+    except Exception as error:
+        # A pre-cell infrastructure failure is not a passing empty campaign.
+        # Once a case has emitted its own result, that result is its authority;
+        # the enclosing rejection only says that the campaign stopped as asked.
+        if not report["scenarios"]:
+            report["infrastructure_failure"] = infrastructure_failure(error, args.ssh_private_key)
+        raise
     finally:
         # A failed cell and successful cloud retirement are independent facts.
         # Preserve both. This is a snapshot of the canonical owner, not another

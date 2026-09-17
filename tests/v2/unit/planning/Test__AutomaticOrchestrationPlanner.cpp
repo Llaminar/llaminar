@@ -7,6 +7,7 @@
  * are real production components. No tensor payload or accelerator is used.
  */
 #include "planning/AutomaticOrchestrationPlanner.h"
+#include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/AutomaticPlanningStartup.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "config/OrchestrationConfigDocument.h"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 
 using namespace llaminar2;
 
@@ -299,6 +301,39 @@ TEST(AutomaticOrchestrationPlanner, EqualCostsPreferNarrowerTPWithoutDisablingWi
             });
         EXPECT_TRUE(saw_three);
         EXPECT_EQ(result.candidate().devicePlans().size(), 2u);
+    }
+}
+
+TEST(AutomaticOrchestrationPlanner, AutomaticCandidatesExcludeGDNIncompatibleTensorParallelWidths)
+{
+    test::PlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    auto profile = source.metadata().memoryProfile();
+    // Eight Q heads split over three ranks are [4, 2, 2] under the production
+    // GQA-aware splitter.  GDN's two key heads therefore cross the second
+    // boundary; degree two remains dependency-closed and must remain searchable.
+    profile.gdn_group_count = 2;
+    profile.gdn_time_step_rank = 8;
+    PlanningModelMetadata hybrid(std::move(profile), source.metadata().mainLayerCount());
+
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto config = request(source, backend);
+        config.automatic_planning.only_strategies = std::vector{OrchestrationStrategy::TensorParallel};
+        auto observed = inventory(backend);
+        auto third = observed.ranks.front().gpus.back();
+        third.local_device_id = 1;
+        third.uuid = "third";
+        observed.ranks.front().gpus.push_back(third);
+        observed.buildNodeAggregations();
+
+        std::set<size_t> widths;
+        visitAutomaticOrchestrationCandidates(config, hybrid, observed,
+            [&](AutomaticOrchestrationCandidate candidate) {
+                EXPECT_EQ(candidate.strategy, OrchestrationStrategy::TensorParallel);
+                widths.insert(candidate.config.tp_devices.size());
+            });
+        EXPECT_EQ(widths, (std::set<size_t>{2u}));
     }
 }
 

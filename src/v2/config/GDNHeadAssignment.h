@@ -54,6 +54,60 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Return whether a proportional partition has exact GDN key-head boundaries.
+         *
+         * This is the non-throwing representability query used while a planner
+         * enumerates optional tensor-parallel widths.  It returns @c false only
+         * when an otherwise valid partition would cut through a key-head group
+         * or leave a participant without a key head.  Invalid global geometry
+         * remains an error: a search must not hide a malformed model behind an
+         * empty candidate set.
+         *
+         * @param global_key_heads Global query/key head count.
+         * @param global_value_heads Global value head count.
+         * @param partition_start Start of this participant's range in the
+         *        shared partition space.
+         * @param partition_count Width of this participant's partition range.
+         * @param partition_total Total width of the partition space.
+         * @return @c true only when the interval can be represented exactly by
+         *         one dependency-closed GDN key-head assignment.
+         * @throws std::invalid_argument when the global geometry or requested
+         *         partition range is itself invalid.
+         */
+        static bool hasIntegralKeyHeadBoundaries(
+            int global_key_heads,
+            int global_value_heads,
+            int partition_start,
+            int partition_count,
+            int partition_total)
+        {
+            if (global_key_heads <= 0 || global_value_heads <= 0)
+                throw std::invalid_argument("GDN head counts must be positive");
+            if (partition_total <= 0 || partition_start < 0 || partition_count <= 0 ||
+                partition_start > partition_total - partition_count)
+            {
+                throw std::invalid_argument("GDN partition range is invalid");
+            }
+            if (global_value_heads % global_key_heads != 0)
+            {
+                throw std::invalid_argument(
+                    "GDN value-head count must be an integer multiple of key-head count");
+            }
+
+            const long long scaled_start =
+                static_cast<long long>(global_key_heads) * partition_start;
+            const long long scaled_end =
+                static_cast<long long>(global_key_heads) *
+                (partition_start + partition_count);
+            if (scaled_start % partition_total != 0 ||
+                scaled_end % partition_total != 0)
+            {
+                return false;
+            }
+            return scaled_end > scaled_start;
+        }
+
+        /**
          * @brief Construct an assignment from a participant's proportional range.
          *
          * @param global_key_heads Global query/key head count.

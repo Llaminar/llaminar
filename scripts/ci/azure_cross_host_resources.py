@@ -50,6 +50,38 @@ class Disposal(str, Enum):
     DEALLOCATE = "deallocate-retain-disks"
 
 
+class AzureComputePricing(str, Enum):
+    """Explicit VM billing contract; Spot never silently falls back to regular capacity."""
+    SPOT = "spot"
+    ON_DEMAND = "on-demand"
+
+    def arm_properties(self) -> dict:
+        """Return the exact ARM VM properties for this selected billing contract.
+
+        Spot instances retain their provider-visible eviction policy and
+        uncapped current-price bid in the deployment.  If Azure cannot admit
+        Spot capacity or later evicts it, the E2E run fails and the durable
+        lease cleans up; a regular-priced replacement is never substituted.
+        """
+        if self is AzureComputePricing.SPOT:
+            return {"priority": "Spot", "evictionPolicy": "Deallocate",
+                    "billingProfile": {"maxPrice": -1}}
+        if self is AzureComputePricing.ON_DEMAND:
+            return {}
+        raise ValueError("unsupported Azure compute pricing contract")
+
+    def matches_vm_observation(self, vm: dict) -> bool:
+        """Check the canonical Azure CLI VM view retains this billing contract."""
+        if self is AzureComputePricing.SPOT:
+            return (vm.get("priority") == "Spot"
+                    and vm.get("evictionPolicy") == "Deallocate"
+                    and vm.get("billingProfile") == {"maxPrice": -1})
+        if self is AzureComputePricing.ON_DEMAND:
+            return (vm.get("priority") is None and vm.get("evictionPolicy") is None
+                    and vm.get("billingProfile") is None)
+        raise ValueError("unsupported Azure compute pricing contract")
+
+
 class LeaseState(str, Enum):
     """A receipt distinguishes interrupted acquisition from completed retirement."""
     ALLOCATING = "allocating"
@@ -75,6 +107,7 @@ class AzureCPUCapacity:
     os_disk_gib: int
     ssh_source: str
     private_subnet: str
+    pricing: AzureComputePricing = AzureComputePricing.SPOT
     shutdown_after_minutes: int = 120
     tunnel_subnet: str = DEFAULT_TUNNEL_SUBNET
 
@@ -88,6 +121,8 @@ class AzureCPUCapacity:
             raise ValueError("Azure image must be a pinned publisher:offer:sku:version URN")
         if type(self.os_disk_gib) is not int or self.os_disk_gib <= 0:
             raise ValueError("Azure OS disk capacity must be a positive integer")
+        if not isinstance(self.pricing, AzureComputePricing):
+            raise ValueError("Azure compute pricing must be an explicit supported contract")
         source = ipaddress.ip_network(self.ssh_source, strict=True)
         if (source.version != 4 or source.prefixlen != 32 or not source.network_address.is_global
                 or str(source) != self.ssh_source):
@@ -117,6 +152,30 @@ class AzureCLI:
             raise ValueError("Azure subscription must be a canonical UUID")
         self.subscription = subscription
 
+    @staticmethod
+    def _safe_quota_summary(error_output: str, codes: list[str]) -> str:
+        """Extract bounded numeric quota evidence without exposing provider payloads.
+
+        Azure's quota diagnostic often contains an actionable location and the
+        three cardinalities needed to explain an admission rejection.  Keeping
+        those values makes a failed campaign self-contained while deliberately
+        excluding the provider's free-form message, request URL, and any
+        future deployment parameter echo.
+        """
+        if "QuotaExceeded" not in codes:
+            return ""
+        patterns = {
+            "location": r"Location:\s*([a-z0-9]{2,32})",
+            "limit": r"Current Limit:\s*([0-9]{1,12})",
+            "usage": r"Current Usage:\s*([0-9]{1,12})",
+            "required": r"Additional Required:\s*([0-9]{1,12})",
+        }
+        values = {name: match.group(1) for name, pattern in patterns.items()
+                  if (match := re.search(pattern, error_output, flags=re.IGNORECASE))}
+        if not values:
+            return ""
+        return " quota[" + ",".join(f"{name}={value}" for name, value in values.items()) + "]"
+
     def call(self, *arguments: str):
         """Execute one bounded CLI request without shell expansion or token output.
 
@@ -134,8 +193,9 @@ class AzureCLI:
             # provider messages or command payloads that could contain secrets.
             codes = sorted(set(re.findall(r'"code"\s*:\s*"([A-Za-z][A-Za-z0-9]{0,79})"',
                                           result.stderr or "")))
+            quota = self._safe_quota_summary(result.stderr or "", codes)
             raise RuntimeError(f"Azure CLI {arguments[0]} {arguments[1]} failed "
-                               f"(exit {result.returncode}, codes={','.join(codes) or 'unavailable'}); "
+                               f"(exit {result.returncode}, codes={','.join(codes) or 'unavailable'}{quota}); "
                                "inspect the local Azure CLI command log or Azure activity logs")
         return json.loads(result.stdout) if result.stdout.strip() else None
 
@@ -261,7 +321,8 @@ def deployment_template(capacity: AzureCPUCapacity, count: int, public_key: str,
                     "customData": bootstrap,
                     "linuxConfiguration": {"disablePasswordAuthentication": True,
                         "ssh": {"publicKeys": [{"path": "/home/llaminar/.ssh/authorized_keys", "keyData": public_key}]}}},
-                "networkProfile": {"networkInterfaces": [{"id": nic_id}]}}}, {
+                "networkProfile": {"networkInterfaces": [{"id": nic_id}]},
+                **capacity.pricing.arm_properties()}}, {
             "type": "Microsoft.DevTestLab/schedules", "apiVersion": "2018-09-15",
             "name": f"shutdown-computevm-{name}", "location": capacity.location,
             "tags": tags, "dependsOn": [vm_id], "properties": {
@@ -299,6 +360,8 @@ class AzureCampaignLease:
                 or type(document.get("host_count")) is not int or document["host_count"] <= 0):
             raise ValueError("Azure cleanup receipt has an invalid resource scope")
         Disposal(document["disposal"])
+        if "pricing" in document:
+            AzureComputePricing(document["pricing"])
         LeaseState(document["state"])
         self.document = dict(document)
 
@@ -351,6 +414,8 @@ class AzureCampaignLease:
         observed = self.cli.call("group", "show", "--name", group)
         expected_tags = {"purpose": PURPOSE, "llaminar-lease": self.document["lease_id"],
                          "llaminar-disposal": self.document["disposal"]}
+        if "pricing" in self.document:
+            expected_tags["llaminar-pricing"] = self.document["pricing"]
         if (observed.get("id", "").lower() != self.document["group_id"].lower()
                 or any(observed.get("tags", {}).get(key) != value for key, value in expected_tags.items())):
             raise ValueError("Azure group ownership changed; refusing cleanup mutation")
@@ -377,7 +442,8 @@ class AzureCampaignLease:
             raise ValueError("Azure lease can only provision once, from allocating state")
         expires = datetime.now(timezone.utc) + timedelta(minutes=capacity.shutdown_after_minutes)
         tags = {"purpose": PURPOSE, "llaminar-lease": self.document["lease_id"],
-                "llaminar-disposal": self.document["disposal"], "expires-at": expires.isoformat()}
+                "llaminar-disposal": self.document["disposal"],
+                "llaminar-pricing": capacity.pricing.value, "expires-at": expires.isoformat()}
         template = deployment_template(capacity, self.document["host_count"], public_key, tags, expires)
         # Validate the complete template before creating the resource group.
         # No private key, cloud token, model or executable enters this document.
@@ -388,7 +454,8 @@ class AzureCampaignLease:
         # an old receipt must not overwrite somebody else's newly adopted group.
         if self.cli.call("group", "exists", "--name", group) is not False:
             raise ValueError("Azure target appeared before acquisition; refusing group upsert")
-        self._publish(LeaseState.DEPLOYING, expires_at=expires.isoformat())
+        self._publish(LeaseState.DEPLOYING, expires_at=expires.isoformat(),
+                      pricing=capacity.pricing.value)
         self.cli.call("group", "create", "--name", group, "--location", capacity.location,
                       "--tags", *(f"{key}={value}" for key, value in tags.items()))
         if not self._owned_group():
@@ -491,7 +558,8 @@ class AzureCampaignLease:
                     or any(image.get(key) != value for key, value in {
                         "publisher": publisher, "offer": offer, "sku": sku, "version": version}.items())
                     or vm.get("publicIps") != original["public_ip"]
-                    or vm.get("privateIps") != original["private_ip"]):
+                    or vm.get("privateIps") != original["private_ip"]
+                    or not capacity.pricing.matches_vm_observation(vm)):
                 raise ValueError("retained Azure VM changed ownership, capacity, addresses or stopped state")
         # No mutations precede this publication. Rejected reuse must not stop
         # another active controller's pool, whereas a partial restart is ours.

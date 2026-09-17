@@ -31,6 +31,15 @@ Routine tests only read those baselines; acquisition/review/publication is a
 separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
+
+The enabled `develop` GitHub workflow is intentionally narrower than that
+routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
+build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
+Unit and ProductionParityPreflight transaction inside each builder, and publish
+the two tested `develop` runtime tags. It does not run model discovery,
+generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
+certificate. Use it for fast shippable developer images; use the full pipeline
+when requesting a certified artifact.
 Do not run fixed-depth MTP cells or mathematical HF parity by default.
 
 Token drift or a suspected accuracy bug calls for the **specific matching
@@ -110,9 +119,12 @@ production pipeline runs the HTTP long-needle suite first, then
 `scripts/ci/run_production_cross_host_e2e.py`, and only then benchmarks. The
 runner uses the existing Azure CLI login (CI performs federated login), creates
 fresh owner-tagged CPU VMs through `azure_cross_host_resources.py`, stages the
-immutable image and every declared model shard, and invokes the public HTTP
+immutable controller image and every declared model shard, and invokes the public HTTP
 server with its MPI hostfile. The frontend owns bootstrap; MPI daemons and
-inference children run inside the same immutable image on each host. Each
+inference children run inside source-tree-identical Release images on each
+host. A controller may use AVX512 while a remote CPU peer uses the explicitly
+admitted AVX2 sibling: the runner reads host CPU flags before transfer and
+rejects an incompatible image rather than masking a SIGILL as an MPI failure. Each
 scenario must execute both
 the `plan-apply` and `auto-serve` routes, prove nonlocal CPU expert work and
 matched transport evidence in prefill and decode, and retire its exact Azure

@@ -2748,6 +2748,15 @@ set_tests_properties(V2_Unit_ProductionPipeline PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_DevelopImageGate
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
+)
+set_tests_properties(V2_Unit_DevelopImageGate PROPERTIES
+    LABELS "V2;Unit;BuildSystem;Container;Preflight;Publication;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_AzureCrossHostResources
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_azure_cross_host_resources.py
@@ -16039,6 +16048,18 @@ foreach(planning_sample_backend IN ITEMS CUDA ROCm)
     endif()
 endforeach()
 
+# A heterogeneous GPU-only planning request can nominate different rank-local
+# reporters for CUDA and ROCm. Idle discovery ranks participate in the
+# publication collectives but own no source-free probe allocation; keep that
+# PMA lifecycle proof in the production preflight group.
+if(HAVE_CUDA AND HAVE_ROCM)
+    add_v2_test(V2_Integration_PlanningMPIKernelService_Heterogeneous
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=PlanningKernelServiceCatalogMPI.Heterogeneous_GPUOnlySourceFreeCollectionWithIdleReporterRank
+        LABELS "V2;Integration;Orchestration;Planning;Lifecycle;MPI;CUDA;ROCm;Regression"
+        MPI_PROCS 2 TIMEOUT 30 NO_MODELS)
+endif()
+
 # Own MPI finalization inside the executable so an excluded discovery rank can
 # retire while two selected ranks still construct topology and run collectives.
 add_executable(v2_integration_execution_session_retirement
@@ -18783,6 +18804,9 @@ if(HAVE_ROCM)
 endif()
 if(HAVE_CUDA AND HAVE_ROCM)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+        # A source-free GPU probe can have an idle discovery rank.  Preserve
+        # the no-allocation PMA lifecycle in the canonical preflight gate.
+        V2_Integration_PlanningMPIKernelService_Heterogeneous
         V2_Integration_LocalTP_HeterogeneousGraphCaptureTicket
         V2_Integration_MappedActivationEpoch_CUDA_ROCm
         V2_Integration_HeterogeneousGPUExpertBlobTransfer

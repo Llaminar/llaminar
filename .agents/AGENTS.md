@@ -501,11 +501,19 @@ Never update expected tokens automatically. Both full
 E2E server suites must pass before either ISA's benchmarks run. Only complete
 per-image evidence may attach a certificate; official publication requires
 both images. Explicit one-off diagnostic benchmarks cannot certify images.
-Official CI commits both compact ISA result JSONs and one combined upward-only
-high-water proposal; local
-runs never commit or publish implicitly. See `docs/production-ci.md`. Do not
+An explicit protected full-certification invocation commits both compact ISA
+result JSONs and one combined upward-only high-water proposal; local runs never
+commit or publish implicitly. See `docs/production-ci.md`. Do not
 add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
+
+The enabled `develop` GitHub workflow is deliberately smaller: it invokes
+`scripts/ci/run_develop_image_gate.py` to build AVX512 and AVX2 full-backend
+images, run only the complete Unit and `ProductionParityPreflight` gates inside
+each builder, and publish the two tested `develop` runtime tags. It does not
+run model/generation/parity/E2E/benchmark certification and must not be
+expanded into a second production-pipeline implementation. See
+`docs/production-ci.md` for the exact boundary and local invocation.
 
 For an isolated model-free gate, `scripts/ci/run_production_prerequisites.py`
 delegates to the same complete Unit/preflight authority and preserves its

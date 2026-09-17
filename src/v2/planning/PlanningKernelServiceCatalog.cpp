@@ -383,7 +383,18 @@ namespace llaminar2
             return decode_projection(PlanningFP32ArithmeticObservations{device, integer(wire.at("prepared_bytes")), {}, {}});
         }
 
-        /** @return Source and all mutually exclusive preparation demands through the sole PMA builder. */
+        /**
+         * @brief Admit this rank's source and mutually exclusive measurement demands through PMA.
+         *
+         * Source-free probes may assign no observer to a discovery rank.  Such
+         * a rank owns no planning byte and must not manufacture an empty PMA
+         * certificate merely to participate in the control collective.  A null
+         * result is therefore an explicit no-allocation state; every caller
+         * that will load or measure still requires a non-null authority.
+         *
+         * @return Canonical rank-local admission authority, or null when this
+         *         source-free probe has no rank-local allocation or observer.
+         */
         std::shared_ptr<PhysicalMemoryAuthority> admit(const ClusterInventory &inventory, int rank,
             const PlanningKernelSamplePlan &plan, std::span<const PlanningServiceObserver> observers)
         {
@@ -465,8 +476,10 @@ namespace llaminar2
             }
             PhysicalMemoryPlanBuilder complete;
             complete.addMutuallyExclusive(alternatives);
+            const auto admitted = complete.build();
+            if (admitted.resources().empty()) return {};
             return std::make_shared<PhysicalMemoryAuthority>(
-                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(complete.build()), rank);
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admitted), rank);
         }
     }
 
@@ -621,6 +634,15 @@ namespace llaminar2
                 "source reader must match the requested service kind");
             assigned = observers(inventory, request);
             memory = admit(inventory, rank, plan, assigned);
+            const bool local_observer = std::any_of(assigned.begin(), assigned.end(),
+                [&](const PlanningServiceObserver &observer) {
+                    return observer.discoveryRank() == rank;
+                });
+            // No-observer source-free ranks join the same publication schedule
+            // but have no allocator work.  Every other rank will either publish
+            // source bytes or invoke a measurement and must carry PMA proof.
+            require(source_free && !local_observer ? !memory : bool(memory),
+                "planning allocation authority disagrees with local source/observer ownership");
             std::map<int, int> slots;
             for (const auto &member : inventory.ranks)
             {

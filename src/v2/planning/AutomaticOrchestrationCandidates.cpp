@@ -9,6 +9,8 @@
  * performance admission remain separate and cannot short-circuit on first fit.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
+#include "config/GDNHeadAssignment.h"
+#include "config/TensorParallelConfig.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/RankHardwareOwnership.h"
 #include <algorithm>
@@ -114,6 +116,45 @@ namespace llaminar2
                     });
             };
             if (std::none_of(pools.begin(), pools.end(), same)) pools.push_back(std::move(pool));
+        }
+
+        /**
+         * @brief Return whether a TP pool preserves the model's GDN ownership relation.
+         *
+         * Automatic search may discard an optional topology which cannot ever
+         * compile without changing model arithmetic.  The test deliberately
+         * uses TensorParallelConfig rather than division by pool size because
+         * its proportional split is the exact geometry later used by loading
+         * and graph construction, including GQA alignment and remainders.
+         *
+         * @param profile Immutable model geometry.
+         * @param pool Proposed homogeneous or CPU tensor-parallel participants.
+         * @return @c true when every participant owns an integral GDN key-head
+         *         interval, or when the model has no GDN layers.
+         * @throws std::invalid_argument for incomplete or invalid GDN geometry.
+         */
+        bool preservesGDNHeadOwnership(const ModelMemoryProfile &profile, const Pool &pool)
+        {
+            if (pool.size() <= 1 ||
+                (profile.gdn_group_count == 0 && profile.gdn_time_step_rank == 0))
+            {
+                return true;
+            }
+            if (profile.gdn_group_count <= 0 || profile.gdn_time_step_rank <= 0)
+            {
+                throw std::invalid_argument(
+                    "Automatic planning requires both GDN key and value head counts");
+            }
+
+            const auto sharding = TensorParallelConfig::equalSplit(
+                static_cast<int>(pool.size()), profile.n_heads, profile.n_kv_heads,
+                profile.d_ff, profile.vocab_size);
+            return std::all_of(sharding.assignments().begin(), sharding.assignments().end(),
+                [&](const DeviceShardingAssignment &assignment) {
+                    return GDNHeadAssignment::hasIntegralKeyHeadBoundaries(
+                        profile.gdn_group_count, profile.gdn_time_step_rank,
+                        assignment.head_start, assignment.head_count, profile.n_heads);
+                });
         }
 
         /**
@@ -288,6 +329,8 @@ namespace llaminar2
         {
             const auto strategy = pool.size() == 1 ? OrchestrationStrategy::SingleDevice : OrchestrationStrategy::TensorParallel;
             if (!policy->allows(strategy)) continue;
+            if (strategy == OrchestrationStrategy::TensorParallel &&
+                !preservesGDNHeadOwnership(model.memoryProfile(), pool)) continue;
             auto membership = membershipFor({pool}, inventory);
             auto config = explicitRequest(request);
             if (pool.size() == 1)
@@ -354,6 +397,7 @@ namespace llaminar2
                 }
                 if (!overlays ||
                     first.front().address.device_type == DeviceType::CPU) continue;
+                if (!preservesGDNHeadOwnership(model.memoryProfile(), first)) continue;
                 auto overlay_domains = domains;
                 if (second.front().address.device_type == DeviceType::CPU)
                 {

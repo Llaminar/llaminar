@@ -85,6 +85,9 @@ class FakeAzure:
                     "private_ip": f"10.221.0.{index + 4}",
                     "publicIps": f"20.0.0.{index + 1}", "privateIps": f"10.221.0.{index + 4}",
                     "powerState": "VM running", "location": resource["location"],
+                    "priority": resource["properties"].get("priority"),
+                    "evictionPolicy": resource["properties"].get("evictionPolicy"),
+                    "billingProfile": resource["properties"].get("billingProfile"),
                     "hardwareProfile": resource["properties"]["hardwareProfile"],
                     "storageProfile": resource["properties"]["storageProfile"]})
                 disk = self.hosts[-1]["storageProfile"]["osDisk"]
@@ -138,6 +141,7 @@ class AzureCapacityTests(unittest.TestCase):
                        {"private_subnet": "10.0.0.1/24"}, {"os_disk_gib": True},
                        {"tunnel_subnet": "8.8.8.0/30"}, {"tunnel_subnet": "10.221.0.0/30"},
                        {"tunnel_subnet": "10.207.14.0/24"},
+                       {"pricing": "spot"},
                        {"os_disk_gib": 0}, {"location": ""}, {"vm_size": ""},
                        {"shutdown_after_minutes": True}, {"shutdown_after_minutes": 1440}):
             with self.subTest(change=change), self.assertRaises(ValueError):
@@ -158,6 +162,9 @@ class AzureCapacityTests(unittest.TestCase):
                 self.assertEqual(schedule["properties"]["targetResourceId"], schedule["dependsOn"][0])
                 self.assertEqual(schedule["properties"]["status"], "Enabled")
             for vm in vms:
+                self.assertEqual(vm["properties"]["priority"], "Spot")
+                self.assertEqual(vm["properties"]["evictionPolicy"], "Deallocate")
+                self.assertEqual(vm["properties"]["billingProfile"], {"maxPrice": -1})
                 linux = vm["properties"]["osProfile"]["linuxConfiguration"]
                 self.assertTrue(linux["disablePasswordAuthentication"])
                 self.assertEqual(linux["ssh"]["publicKeys"][0]["keyData"], PUBLIC_KEY)
@@ -181,6 +188,16 @@ class AzureCapacityTests(unittest.TestCase):
                              [True] + [False] * (count - 1))
             self.assertEqual([nic["properties"]["ipConfigurations"][0]["properties"]["privateIPAddress"]
                               for nic in nics], [f"10.221.0.{4 + index}" for index in range(count)])
+
+    def test_on_demand_is_explicit_and_does_not_retain_spot_properties(self):
+        capacity = replace(CAPACITY, pricing=azure.AzureComputePricing.ON_DEMAND)
+        template = azure.deployment_template(capacity, 1, PUBLIC_KEY, {"owner": "test"},
+            datetime(2026, 9, 14, 23, 57, tzinfo=timezone.utc))
+        vm = next(row for row in template["resources"]
+                  if row["type"] == "Microsoft.Compute/virtualMachines")
+        self.assertNotIn("priority", vm["properties"])
+        self.assertNotIn("evictionPolicy", vm["properties"])
+        self.assertNotIn("billingProfile", vm["properties"])
 
     def test_invalid_template_arguments_fail_before_deployment(self):
         for count, key, when in ((0, PUBLIC_KEY, datetime.now(timezone.utc)),
@@ -221,6 +238,19 @@ class AzureCapacityTests(unittest.TestCase):
                 azure.AzureCLI(SUBSCRIPTION).call("deployment", "group")
         self.assertNotIn("private", str(caught.exception))
         self.assertNotIn("credential", str(caught.exception))
+
+    def test_quota_error_exposes_only_bounded_admission_cardinalities(self):
+        error = json.dumps({"code": "QuotaExceeded", "message": (
+            "Operation denied. Location: uksouth, Current Limit: 10, Current Usage: 8, "
+            "Additional Required: 4, private credential=https://example.invalid/token")})
+        with patch.object(azure.subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 1, "", error)):
+            with self.assertRaisesRegex(RuntimeError,
+                    r"QuotaExceeded quota\[location=uksouth,limit=10,usage=8,required=4\]") as caught:
+                azure.AzureCLI(SUBSCRIPTION).call("deployment", "group")
+        self.assertNotIn("private", str(caught.exception))
+        self.assertNotIn("credential", str(caught.exception))
+        self.assertNotIn("example", str(caught.exception))
 
 
 class PrivateMPINetworkTests(unittest.TestCase):
@@ -331,7 +361,10 @@ class AzureLeaseTests(unittest.TestCase):
         lease = self.prepare()
         hosts = lease.provision(CAPACITY, PUBLIC_KEY)
         self.assertEqual([row["name"] for row in hosts], ["cpu-0", "cpu-1"])
-        self.assertEqual(json.loads(self.receipt.read_text())["state"], "ready")
+        document = json.loads(self.receipt.read_text())
+        self.assertEqual(document["state"], "ready")
+        self.assertEqual(document["pricing"], azure.AzureComputePricing.SPOT.value)
+        self.assertEqual(self.cli.group["tags"]["llaminar-pricing"], "spot")
         with self.assertRaises(ValueError):
             lease.provision(CAPACITY, PUBLIC_KEY)
         lease.retire()
@@ -520,7 +553,9 @@ class AzureLeaseTests(unittest.TestCase):
         lease.provision(CAPACITY, PUBLIC_KEY)
         lease.retire()
         for key, value in (("powerState", "VM running"), ("publicIps", "20.0.0.200"),
-                           ("tags", {}), ("hardwareProfile", {"vmSize": "Standard_B1s"})):
+                           ("tags", {}), ("hardwareProfile", {"vmSize": "Standard_B1s"}),
+                           ("priority", None), ("evictionPolicy", None),
+                           ("billingProfile", None)):
             original = self.cli.hosts[0][key]
             self.cli.hosts[0][key] = value
             before = len(self.cli.calls)

@@ -223,12 +223,17 @@ docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
 #### Remote CPU ExpertOverlay with an MPI hostfile
 
 The cross-host topology uses one local GPU continuation rank and one CPU rank
-per remote machine. All ranks run the **same immutable image digest**, have the
-same GGUF path, and communicate over private, routable addresses. The hostfile
-names physical MPI endpoints; it does not copy an image or GGUF, and it does
-not turn a node-local transport into a cross-host transport. A Docker deployment
-must therefore launch every MPI daemon *inside* its matching runtime image;
-launching host-MPI processes beside containers is not a supported topology.
+per remote machine. Every runtime image must carry the same immutable source
+tree and release revision, but its CPU ISA is selected for the physical host:
+an AVX512 GPU-controller image may deliberately pair with AVX2 CPU-peer
+images. Each peer is feature-admitted before MPI starts, so an unsupported ISA
+fails with a precise diagnostic instead of becoming a remote `SIGILL`. All
+ranks use the same GGUF path and communicate over private, routable addresses.
+The hostfile names physical MPI endpoints; it does not copy an image or GGUF,
+and it does not turn a node-local transport into a cross-host transport. A
+Docker deployment must therefore launch every MPI daemon *inside* its matching
+runtime image; launching host-MPI processes beside containers is not a
+supported topology.
 
 ```text
 # cluster/hosts: GPU controller first, then one CPU-only host per line.
@@ -237,12 +242,13 @@ launching host-MPI processes beside containers is not a supported topology.
 10.10.0.22 slots=1
 ```
 
-After the cluster launcher has started the identical runtime image on each of
-those machines, run the public frontend on the GPU controller. This is the
-exact default-auto policy exercised by the Azure E2E: it requires every host,
-permits only ROCm/CPU compute, and selects ExpertOverlay rather than manually
-hard-coding expert owners. It gives the planner the topology intent, while the
-physical-memory authority decides how many experts each admitted tier can hold.
+After the cluster launcher has started the source-coherent, host-compatible
+runtime image on each machine, run the public frontend on the GPU controller.
+This is the exact default-auto policy exercised by the Azure E2E: it requires
+every host, permits only ROCm/CPU compute, and selects ExpertOverlay rather
+than manually hard-coding expert owners. It gives the planner the topology
+intent, while the physical-memory authority decides how many experts each
+admitted tier can hold.
 
 ```bash
 llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
@@ -261,13 +267,16 @@ For the managed Azure route, do not hand-roll remote Docker/MPI processes. The
 certification runner provisions owned CPU peers, stages the immutable image and
 the declared GGUF shards, builds the exact hostfile, runs both `plan`/apply and
 direct auto-serve, proves remote CPU expert work in prefill and decode, then
-retires the lease:
+retires the lease. A local AVX-512 controller may use the AVX2 sibling on
+Azure CPU peers; the runner verifies matching source-tree labels and the
+peer's real CPU ISA before staging either image or model bytes:
 
 ```bash
 python3 scripts/ci/run_production_cross_host_e2e.py \
   --manifest build_v2_integration/production-ci/avx2/cross-host-manifest.json \
   --source-revision "$(git rev-parse HEAD)" \
-  --container-image ghcr.io/llaminar/llaminar:develop-avx2 \
+  --container-image ghcr.io/llaminar/llaminar:develop \
+  --remote-cpu-image ghcr.io/llaminar/llaminar:develop-avx2 \
   --models /opt/llaminar-models \
   --model-ramdisk-root /mnt/llaminar-production-parity \
   --report parity-results/cross-host-e2e.json \

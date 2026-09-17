@@ -1,13 +1,38 @@
 # Production image certification
 
-`scripts/ci/run_production_pipeline.py` is the local and GitHub Actions entry
-point. By default it independently certifies full CPU/CUDA/ROCm **Release**
-images for both AVX512 and AVX2, not a devcontainer or independently rebuilt
-executables. Administrative enablement of GitHub
-Actions is separate from installing/changing this workflow.
+`scripts/ci/run_production_pipeline.py` is the explicit local/full-certification
+entry point. By default it independently certifies full CPU/CUDA/ROCm
+**Release** images for both AVX512 and AVX2, not a devcontainer or
+independently rebuilt executables. It remains deliberately broader than the
+develop-branch GitHub Actions job described below.
 
 The shared [Llaminar testing workflow](../.agents/llaminar-testing/SKILL.md)
 routes local development checks, model diagnostics, and this full image gate.
+
+## Develop branch image gate
+
+`.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
+`scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
+full-backend builder/runtime pairs, runs the complete Unit and
+`ProductionParityPreflight` transaction inside each builder, then publishes
+only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
+`ghcr.io/llaminar/llaminar:develop-avx2`. It does not run model discovery,
+generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
+or image certification, and its tags must never be described as certified
+release artifacts.
+
+Run that exact narrow gate locally when validating its plumbing:
+
+```bash
+python3 scripts/ci/run_develop_image_gate.py \
+  --output parity-results/develop-image-gate \
+  --image ghcr.io/llaminar/llaminar:develop \
+  --publish
+```
+
+`--publish` requires both ISA lanes and is performed only after both installed
+Unit/preflight transactions pass. Omitting it is a local build/test diagnostic;
+`--cpu-isa` may narrow such a diagnostic but can never publish a partial pair.
 
 ```mermaid
 flowchart TD
@@ -22,7 +47,7 @@ flowchart TD
     R -- no --> F[Keep diagnostic evidence; no certificate or publication]
     R -- yes --> C[Separate image-bound certificate layers]
     C --> L[Two local pushable certified images]
-    C --> O[Official CI: publish both images and one combined result commit]
+    C --> O[Explicit full-certification publication: both images and one combined result commit]
 ```
 
 ## Run locally
@@ -51,7 +76,8 @@ symbols fail before capture; toolkit stubs are never used for test discovery
 or shipped as a substitute.
 
 `--reference-cache-root` names the parent of authenticated Hugging Face packs.
-Locally it defaults to the existing workspace packs; official CI uses a
+Locally it defaults to the existing workspace packs; a separately provisioned
+full-certification runner uses a
 persistent `/opt/llaminar-parity-references` directory. The test image mounts
 it at `/reference-cache` and sets `LLAMINAR_PARITY_REFERENCE_CACHE_ROOT`.
 Model-owned pack names, generation leases and authentication are unchanged.
@@ -273,10 +299,14 @@ consumes only `cross-host-manifest.json`, stages the immutable runtime image and
 complete model shards, provisions one fresh CPU pool per image, and
 invokes the existing HTTP/long-context harness through the public frontend.
 The frontend consumes the hostfile and owns MPI bootstrap. Controller, remote
-MPI daemons and inference children all run inside the same immutable image;
-native host MPI processes never launch isolated container ranks. Each pinned
-Ubuntu peer receives a secret-free Docker/SSH/TUN bootstrap. The runner waits
-for it over a fresh SSH connection before transferring image/model bytes.
+MPI daemons and inference children all run inside source-tree-identical
+immutable Release images; a controller may use AVX512 while a CPU-only Azure
+peer uses its authenticated AVX2 sibling. Before image/model transfer, the
+runner reads the peer's host CPU flags and rejects an ISA-incompatible runtime
+instead of discovering that mismatch as an MPI `SIGILL`. Native host MPI
+processes never launch isolated container ranks. Each pinned Ubuntu peer
+receives a secret-free Docker/SSH/TUN bootstrap. The runner waits for it over a
+fresh SSH connection before transferring image/model bytes.
 No pre-baked mutable VM image or host-side MPI installation is assumed.
 The helper does not select models, execute inference or issue certificates;
 only a complete public-frontend E2E run can provide that evidence.
@@ -287,13 +317,30 @@ and cloud startup/retirement are amortized across both frontend routes and
 host counts.
 
 The normal pipeline forwards `--azure-subscription`, `--azure-location`,
-`--azure-vm-size`, `--azure-image`, `--azure-ssh-source`,
+`--azure-vm-size`, `--azure-pricing`, `--azure-image`, `--azure-ssh-source`,
 `--azure-ssh-public-key`, `--ssh-private-key`, `--azure-private-subnet`,
 `--azure-tunnel-subnet`, and
 `--azure-disposal` to this runner. The subscription is checked through the
 already-authenticated `az` process before a lease is prepared. The standalone
 runner is useful for an explicitly selected projection, but it still requires
 the complete manifest and never accepts a hand-written host count.
+`--remote-cpu-image` names the exact Release AVX2 sibling for remote CPU
+ranks; omitting it requests the controller image and succeeds only when that
+image's ISA is physically supported by every peer. The full dual-ISA pipeline
+selects its built AVX2 sibling automatically. This is a typed image-selection
+contract, not an execution fallback.
+`--azure-pricing spot` is the default: each VM is deployed with Azure Spot
+priority, deallocate-on-eviction, and the current-price cap. A Spot capacity
+shortage or eviction fails the selected E2E run and retires its owned lease;
+the runner never silently substitutes an on-demand VM. `on-demand` remains an
+explicit operator choice for a separately requested diagnostic run.
+`--planning-only` is also an explicit non-certifying diagnostic: it selects
+only canonical plan/apply routes. The discovery root reads the real GGUF and
+publishes its typed planning metadata through MPI; follower ranks must not
+open or receive model payloads. Therefore this mode transfers the immutable
+runtime image but no GGUF bytes to remote peers. A complete E2E run always
+stages every declared model shard before serving and remains the only remote
+inference certificate.
 Its repeatable `--first-case <canonical-scenario-id>` option prioritizes failing
 or unseen scenarios without removing any required cases. Remaining scenarios
 keep their canonical order; unknown and repeated IDs fail before provisioning.
@@ -338,8 +385,8 @@ Use the existing Azure CLI login locally. CI should establish an
 before invoking the same driver. Do not put tokens, private SSH keys or the
 Azure CLI credential directory in Docker images or result artifacts. Keep
 cloud credentials unavailable to untrusted pull-request code; provision only
-from an explicitly trusted certification environment. GitHub Actions remains
-disabled until explicitly enabled.
+from an explicitly trusted certification environment. The enabled develop
+image gate has no Azure credentials and never invokes this remote phase.
 
 Every campaign owns a fresh, uniquely named resource group and a durable
 `lease.json`. Infrastructure inputs select the subscription, region, pinned OS
@@ -519,10 +566,10 @@ certificate. The certificate names the **tested candidate image ID**; the
 pipeline receipt additionally names the final certificate-bearing image ID.
 This avoids a circular claim that an image embeds its own digest.
 
-Official `--publish` is permitted only in an authenticated GitHub Actions
-protected-branch context, after both ISA variants certify. It uses a private
-Git index to commit both compact ISA result JSONs and one merged high-water
-file, without rerunning hooks or changing the runner checkout. ISA is part of
+An explicit full-certification `--publish` invocation is permitted only in an
+authenticated protected-branch context, after both ISA variants certify. It
+uses a private Git index to commit both compact ISA result JSONs and one merged
+high-water file, without rerunning hooks or changing the runner checkout. ISA is part of
 the measurement identity, so neither ISA overwrites or ratchets against the
 other's scores. Both certified images are pushed first; a registry failure
 cannot advance Git or its high-water marks. A normal fast-forward Git

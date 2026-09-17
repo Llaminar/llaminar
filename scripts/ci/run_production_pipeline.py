@@ -356,12 +356,12 @@ def validate_parity(report: dict, cells: list[dict]) -> None:
 
 
 def validate_cross_host_report(report: dict, manifest: dict, image: str,
-                               revision: str) -> None:
+                               revision: str, remote_cpu_image: str | None = None) -> None:
     """Authenticate the remote MPI E2E result before benchmarks are admitted.
 
     The remote runner owns cloud allocation, transport and HTTP execution.  It
     publishes only compact per-scenario evidence here; this validator joins it
-    to the already validated manifest and immutable runtime image.  In
+    to the already validated manifest and immutable controller/CPU-peer images. In
     particular, a green HTTP report, a VM that merely booted, or an unretired
     Azure lease cannot satisfy a declared remote scenario.
     """
@@ -383,9 +383,14 @@ def validate_cross_host_report(report: dict, manifest: dict, image: str,
                 or report.get("all_resources_retired") is not True):
             raise ValueError("cross-host E2E is not applicable but its report is malformed")
         return
+    remote_image_mismatch = (remote_cpu_image is not None
+                             and (not isinstance(remote_cpu_image, str) or not remote_cpu_image
+                                  or not isinstance(report, dict)
+                                  or report.get("remote_cpu_image") != remote_cpu_image))
     if (not isinstance(report, dict) or report.get("schema") != 1
             or report.get("eligible") is not True or report.get("complete") is not True
             or report.get("source_revision") != revision or report.get("image") != image
+            or remote_image_mismatch
             or report.get("manifest_digest") != digest(manifest)
             or report.get("all_resources_retired") is not True
             or not isinstance(report.get("scenarios"), list)):
@@ -634,8 +639,8 @@ def cross_host_identity(args) -> dict:
     changed location/SKU/network/SSH-public-key or disposal policy must start a
     new receipt, while the Azure helper records the exact owned lease separately.
     """
-    names = ("azure_subscription", "azure_location", "azure_vm_size", "azure_image",
-             "azure_os_disk_gib", "azure_ssh_source", "azure_ssh_public_key",
+    names = ("azure_subscription", "azure_location", "azure_vm_size", "azure_pricing", "azure_image",
+             "azure_os_disk_gib", "azure_ssh_source", "azure_ssh_public_key", "remote_cpu_image",
              "azure_private_subnet", "azure_tunnel_subnet", "azure_disposal", "ssh_private_key")
     return {name: str(getattr(args, name, "") or "") for name in names}
 
@@ -648,9 +653,11 @@ def cross_host_cli_arguments(args) -> list[str]:
     `az` process (local login or CI federated login); no token is read or
     serialized by this driver.
     """
-    mapping = (("--azure-subscription", "azure_subscription"),
+    mapping = (("--remote-cpu-image", "resolved_remote_cpu_image"),
+               ("--azure-subscription", "azure_subscription"),
                ("--azure-location", "azure_location"),
                ("--azure-vm-size", "azure_vm_size"),
+               ("--azure-pricing", "azure_pricing"),
                ("--azure-image", "azure_image"),
                ("--azure-os-disk-gib", "azure_os_disk_gib"),
                ("--azure-ssh-source", "azure_ssh_source"),
@@ -662,6 +669,8 @@ def cross_host_cli_arguments(args) -> list[str]:
     result = []
     for flag, name in mapping:
         value = getattr(args, name, None)
+        if flag == "--remote-cpu-image" and value in (None, ""):
+            value = getattr(args, "remote_cpu_image", None)
         if value not in (None, ""):
             result.extend((flag, str(value)))
     return result
@@ -782,11 +791,15 @@ def run_variant(args, source: dict) -> dict:
             elif phase == Phase.CROSS_HOST_E2E:
                 remote_manifest = json.loads((directory / "cross-host-manifest.json").read_text())
                 if remote_manifest["cells"]:
+                    remote_cpu_image = getattr(args, "resolved_remote_cpu_image", None)
+                    if not isinstance(remote_cpu_image, str) or not remote_cpu_image:
+                        raise ValueError("cross-host E2E requires an admitted AVX2 remote CPU runtime image")
                     command = [sys.executable,
                                str(directory / "source/scripts/ci/run_production_cross_host_e2e.py"),
                                "--manifest", str(directory / "cross-host-manifest.json"),
                                "--source-revision", source["revision"],
                                "--container-image", state["images"]["runtime"]["id"],
+                               "--remote-cpu-image", remote_cpu_image,
                                "--models", str(args.models),
                                "--model-ramdisk-root", str(args.model_ramdisk_root),
                                "--report", str(directory / "cross-host-e2e.json")]
@@ -804,7 +817,8 @@ def run_variant(args, source: dict) -> dict:
                         "scenarios": [], "all_resources_retired": True})
                 validate_cross_host_report(
                     json.loads((directory / "cross-host-e2e.json").read_text()),
-                    remote_manifest, state["images"]["runtime"]["id"], source["revision"])
+                    remote_manifest, state["images"]["runtime"]["id"], source["revision"],
+                    getattr(args, "resolved_remote_cpu_image", None))
                 files = ["cross-host-e2e.json"]
             elif phase == Phase.BENCHMARKS:
                 run([sys.executable, str(directory / "source/scripts/ci/run_model_parity_benchmarks.py"),
@@ -843,6 +857,24 @@ def variant_arguments(args, isa: str, through: Phase) -> argparse.Namespace:
         "image": (args.image + ("-avx2" if isa == "AVX2" else "")) if args.image else None})
 
 
+def remote_cpu_runtime_image(args, states: dict) -> str | None:
+    """Choose the explicit peer runtime for a mixed-ISA remote CPU cohort.
+
+    The official shipping set builds AVX2 before any cross-host phase, so an
+    AVX512 controller can retain its local performance while remote Azure CPU
+    ranks receive the compatible AVX2 sibling.  A caller may supply an
+    immutable image override. A partial AVX512-only run leaves this unset; the
+    actual cross-host phase then fails only when its manifest declares a
+    remote CPU peer, rather than making a non-applicable phase depend on it.
+    """
+    explicit = getattr(args, "remote_cpu_image", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    avx2 = states.get("AVX2", {}).get("images", {}).get("runtime", {})
+    identity = avx2.get("id") if isinstance(avx2, dict) else None
+    return identity if isinstance(identity, str) and identity else None
+
+
 def drive_variants(args, source: dict) -> dict:
     """Finish a gate for every ISA before entering the next gate for any ISA.
 
@@ -856,7 +888,10 @@ def drive_variants(args, source: dict) -> dict:
     for phase in pipeline_phases(getattr(args, "diagnostic_mathematical_parity", False)):
         for isa in args.cpu_isas:
             print(f"[production-ci] ISA={isa} gate={phase.value}", flush=True)
-            states[isa] = run_variant(variant_arguments(args, isa, phase), source)
+            variant = variant_arguments(args, isa, phase)
+            if phase is Phase.CROSS_HOST_E2E:
+                variant.resolved_remote_cpu_image = remote_cpu_runtime_image(args, states)
+            states[isa] = run_variant(variant, source)
         if phase.value == args.through:
             break
     return states
@@ -883,6 +918,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="Azure subscription UUID for declared cross-host E2E (or AZURE_SUBSCRIPTION_ID)")
     parser.add_argument("--azure-location", default=os.environ.get("LLAMINAR_AZURE_LOCATION", "uksouth"))
     parser.add_argument("--azure-vm-size", default=os.environ.get("LLAMINAR_AZURE_VM_SIZE", "Standard_E16ads_v6"))
+    parser.add_argument("--azure-pricing", choices=("spot", "on-demand"),
+                        default=os.environ.get("LLAMINAR_AZURE_PRICING", "spot"),
+                        help="Azure VM billing contract for cross-host E2E; Spot never falls back")
     parser.add_argument("--azure-image", default=os.environ.get(
         "LLAMINAR_AZURE_IMAGE", "Canonical:ubuntu-24_04-lts:server:24.04.202608270"))
     parser.add_argument("--azure-os-disk-gib", type=int,
@@ -893,6 +931,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Path to the Ed25519 public key used by the Azure lease")
     parser.add_argument("--ssh-private-key", default=os.environ.get("LLAMINAR_AZURE_SSH_PRIVATE_KEY", ""),
                         help="Private key path used only by the remote SSH transport")
+    parser.add_argument("--remote-cpu-image",
+                        help="explicit AVX2 Release runtime for remote CPU MPI peers; official dual-ISA runs select the built sibling")
     parser.add_argument("--azure-private-subnet", default=os.environ.get("LLAMINAR_AZURE_PRIVATE_SUBNET", "10.221.0.0/24"))
     parser.add_argument("--azure-tunnel-subnet", default=os.environ.get("LLAMINAR_AZURE_TUNNEL_SUBNET", DEFAULT_TUNNEL_SUBNET))
     parser.add_argument("--azure-disposal", choices=("delete-owned-group", "deallocate-retain-disks"),
