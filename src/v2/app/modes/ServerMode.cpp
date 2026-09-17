@@ -8,6 +8,7 @@
  *
  * Endpoints:
  *   GET  /health                  — Liveness check
+ *   GET  /v1/models               — OpenAI-compatible loaded-model discovery
  *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
  *
  * The resolved request authority, not MPI rank zero, owns HTTP serving.
@@ -55,6 +56,37 @@ using json = nlohmann::json;
 
 namespace llaminar2
 {
+    std::string openAIModelListResponse(const std::string &model_name)
+    {
+        /*
+         * This endpoint names the already-admitted model only.  It must not
+         * scan directories, load a second GGUF, or touch runner state: HTTP
+         * model discovery is intentionally independent of the live graph.
+         */
+        return json{{"object", "list"},
+                    {"data", json::array({{
+                         {"id", model_name},
+                         {"object", "model"},
+                         {"created", 0},
+                         {"owned_by", "llaminar"},
+                     }})}}
+            .dump();
+    }
+
+    void registerOpenAIModelDiscoveryEndpoint(httplib::Server &server,
+                                              std::string model_name)
+    {
+        // The route owns its copy: config/runner setup may leave scope before
+        // the HTTP event loop stops, while discovery must remain immutable.
+        server.Get("/v1/models", [model_name = std::move(model_name)](
+                                     const httplib::Request &,
+                                     httplib::Response &res)
+                   {
+                       res.set_content(openAIModelListResponse(model_name),
+                                       "application/json");
+                   });
+    }
+
     namespace
     {
         using SteadyClock = std::chrono::steady_clock;
@@ -507,6 +539,12 @@ namespace llaminar2
                 {
             json response = {{"status", "ok"}};
             res.set_content(response.dump(), "application/json"); });
+
+        // ─── GET /v1/models ──────────────────────────────────────────
+        // OpenAI clients commonly discover a server's usable model before
+        // presenting it in their UI.  The response is immutable for this
+        // server lifetime because its model was admitted before bind(2).
+        registerOpenAIModelDiscoveryEndpoint(svr, model_name);
 
         if (shutdownEndpointEnabled())
         {

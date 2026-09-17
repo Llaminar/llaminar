@@ -10556,6 +10556,18 @@ add_v2_test(V2_Integration_TPSnapshotReplicatedMTPSidecarSharding
     NO_MODELS
 )
 
+# Ordinary GPU generation is a distinct zero-draft captured-parent policy.
+# Keep the rank fan-out contract in model-free preflight so an accidental
+# speculative-only geometry check cannot strand a live HTTP decode request.
+add_v2_test(V2_Integration_RankOrdinaryDeviceGeneration
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestratorDeviceGeneration.MaterializesOrdinaryParentWithZeroDraftDepthAcrossParticipants
+    LABELS "V2;Integration;Parity;LocalTP;GraphCapture;DeviceGeneration;Regression"
+    MPI_PROCS 1
+    TIMEOUT 60
+    NO_MODELS
+)
+
 # Test: persistent LocalTP worker fan-out generation ownership.
 # This is deliberately a host-only unit target; GPU child work and collective
 # execution remain in the LocalTP integration suites.
@@ -18616,6 +18628,7 @@ add_v2_test(V2_Integration_FPWeightPipeline
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_PlanningExecutionMeasurement_CPU
+    V2_Integration_RankOrdinaryDeviceGeneration
     V2_Integration_GroupedVerifierRows_CPU_RoPE
     V2_Integration_GroupedVerifierRows_CPU_AllFormats
     V2_Integration_CPUAttentionCacheSource

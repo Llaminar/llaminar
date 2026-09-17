@@ -450,6 +450,63 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
 }
 
 /**
+ * @brief Qwen 3.8 charges KV slots only for its sixteen full-attention layers.
+ *
+ * A Qwen 3.8 27B GGUF has 64 main layers plus one trailing MTP block, with
+ * one main full-attention layer every four layers. Its Gated DeltaNet layers
+ * own bounded recurrent state rather than a context-sized K/V history. This
+ * deliberately uses the reported FP16 64k ROCm configuration: charging all
+ * 64 main layers would turn the expected four-gibibyte cache into a
+ * sixteen-gibibyte allocation and incorrectly reject a 32 GiB MI50.
+ */
+TEST(Test__MemoryPlanner,
+     Qwen38Hybrid64K_ROCmChargesOnlyFullAttentionLayersForKV)
+{
+    auto profile = createQwen36HybridMTPStateProfile();
+    profile.n_heads = 24;
+    profile.n_kv_heads = 4;
+    profile.head_dim = 256;
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::rocm(0);
+    cfg.device_compute_units = 60;
+    cfg.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+    cfg.device_free_bytes = cfg.device_total_bytes;
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 65536;
+    cfg.kv_precision = "fp16";
+    cfg.mtp_enabled = false;
+
+    const auto plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_EQ(plan.devices.size(), 1u);
+    const auto &device = plan.devices.front();
+    const size_t expected_hybrid_kv = KVCacheMemoryEstimator::estimate(
+        KVCacheFamily::Hybrid,
+        /*n_layers=*/16,
+        cfg.batch_size,
+        cfg.max_seq_len,
+        profile.n_kv_heads,
+        profile.head_dim,
+        cfg.kv_precision,
+        cfg.device);
+    const size_t incorrect_all_attention_kv = KVCacheMemoryEstimator::estimate(
+        KVCacheFamily::Hybrid,
+        /*n_layers=*/64,
+        cfg.batch_size,
+        cfg.max_seq_len,
+        profile.n_kv_heads,
+        profile.head_dim,
+        cfg.kv_precision,
+        cfg.device);
+
+    EXPECT_EQ(device.kv_cache_bytes(), expected_hybrid_kv);
+    EXPECT_EQ(expected_hybrid_kv, 4ULL * 1024ULL * 1024ULL * 1024ULL + 384ULL);
+    EXPECT_EQ(incorrect_all_attention_kv, 4ULL * expected_hybrid_kv)
+        << "K/V payload and its per-layer sequence metadata scale together.";
+    EXPECT_GT(incorrect_all_attention_kv, 15ULL * 1024ULL * 1024ULL * 1024ULL);
+}
+
+/**
  * @brief A replicated TP predictor owns a full-width shifted cache.
  *
  * The committed Qwen hybrid cache remains TP-sharded, but the learned MTP

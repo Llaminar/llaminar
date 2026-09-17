@@ -105,15 +105,19 @@ cmake --build build_v2_integration --parallel
 
 The runtime image contains CPU, CUDA, and ROCm support. Select it for the
 **host CPU ISA**, not for the accelerator: use the unsuffixed tag on an
-AVX-512 host and `-avx2` on an AVX2 host. Pin a release tag or digest in a
-deployment; the `develop` tags below are for trying the current build.
+AVX-512 host and `-avx2` on an AVX2 host. The recipes below use the current
+`develop` pair published by CI.
 
 ```bash
 export MODEL_DIR=/opt/llaminar-models
 export QWEN38=/models/Qwen3.8-27B-IQ4_XS.gguf
 export QWEN36_MOE=/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
-export LLAMINAR_AVX512=ghcr.io/llaminar/llaminar:develop
-export LLAMINAR_AVX2=ghcr.io/llaminar/llaminar:develop-avx2
+# These are the two mutable develop tags published by the develop CI gate.
+# They have passed Unit + ProductionParityPreflight, but are not release
+# certificates. Every remaining Docker recipe uses this same tag pair.
+export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
+export LLAMINAR_AVX512="${LLAMINAR_IMAGE_REPOSITORY}:develop"
+export LLAMINAR_AVX2="${LLAMINAR_IMAGE_REPOSITORY}:develop-avx2"
 
 # Choose exactly one for this host, then pull it.
 export LLAMINAR_IMAGE="$LLAMINAR_AVX512" # AVX-512 host
@@ -275,8 +279,8 @@ peer's real CPU ISA before staging either image or model bytes:
 python3 scripts/ci/run_production_cross_host_e2e.py \
   --manifest build_v2_integration/production-ci/avx2/cross-host-manifest.json \
   --source-revision "$(git rev-parse HEAD)" \
-  --container-image ghcr.io/llaminar/llaminar:develop \
-  --remote-cpu-image ghcr.io/llaminar/llaminar:develop-avx2 \
+  --container-image "${LLAMINAR_IMAGE_REPOSITORY}:develop" \
+  --remote-cpu-image "${LLAMINAR_IMAGE_REPOSITORY}:develop-avx2" \
   --models /opt/llaminar-models \
   --model-ramdisk-root /mnt/llaminar-production-parity \
   --report parity-results/cross-host-e2e.json \
@@ -583,7 +587,7 @@ After reboot, confirm the AMD device nodes exist:
 ls -l /dev/kfd /dev/dri/render*
 ```
 
-5. Pull the independently certified runtime image for this host's ISA:
+5. Pull the CI-published develop runtime image for this host's ISA:
 
 ```bash
 export LLAMINAR_CPU_ISA=AVX512  # or AVX2
@@ -593,9 +597,11 @@ case "$LLAMINAR_CPU_ISA" in
   *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
 esac
 
-# Use the immutable tag emitted by a successful production CI/release run.
-export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
+# Develop CI publishes this exact AVX512/AVX2 tag pair.  Keep every recipe on
+# the pair rather than substituting a local build tag.
+export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
+export LLAMINAR_IMAGE_TAG=develop
+export LLAMINAR_FULL_IMAGE="${LLAMINAR_IMAGE_REPOSITORY}:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
 export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
 export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
 export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
@@ -603,11 +609,11 @@ export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
 docker pull "$LLAMINAR_FULL_IMAGE"
 ```
 
-Docker also pulls the image automatically on first `docker run`. Official
-certification ships full CPU/CUDA/ROCm images for both ISAs; the example backend
-variables name that same artifact. Backend selection remains a runtime CLI
-choice. Unsuffixed tags are AVX512; append `-avx2` for independently certified
-AVX2 images. Local backend-subset builds below do not carry these certificates.
+Docker also pulls the image automatically on first `docker run`. Develop CI
+publishes full CPU/CUDA/ROCm images for both ISAs; the example backend variables
+name that same artifact. Backend selection remains a runtime CLI choice.
+Unsuffixed `develop` is AVX512 and `develop-avx2` is its AVX2 sibling. Local
+backend-subset builds below are separate local artifacts.
 
 To build images locally instead of pulling GHCR, use the release image build
 script:
@@ -698,7 +704,7 @@ export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
 export MODEL_TP_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 ```
 
-Use the immutable tag from a successful production CI/release run:
+Use the CI-published develop tag for this host's ISA:
 
 ```bash
 export LLAMINAR_CPU_ISA=AVX512  # or AVX2
@@ -708,9 +714,11 @@ case "$LLAMINAR_CPU_ISA" in
   *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
 esac
 
-# Use the immutable tag emitted by a successful production CI/release run.
-export LLAMINAR_IMAGE_TAG="replace-with-certified-tag"
-export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
+# Develop CI publishes this exact AVX512/AVX2 tag pair.  Keep every recipe on
+# the pair rather than substituting a local build tag.
+export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
+export LLAMINAR_IMAGE_TAG=develop
+export LLAMINAR_FULL_IMAGE="${LLAMINAR_IMAGE_REPOSITORY}:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
 export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
 export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
 export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"

@@ -3634,6 +3634,109 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
 }
 
 /**
+ * @brief Device-generation participant that records the rank materialization
+ *        contract without requiring a real accelerator.
+ *
+ * The production rank coordinator must allow the explicitly typed Ordinary
+ * policy to use draft depth zero.  This mock makes that boundary observable
+ * while retaining the same multi-participant worker-pool route as a TP rank.
+ */
+class OrdinaryDeviceGenerationParticipant final : public MockDeviceGraphOrchestrator
+{
+public:
+    /**
+     * @brief Advertise one complete captured-parent policy for the test GPU.
+     * @param topology Requested captured-loop topology.
+     * @return Native conditional policy for fixed-depth generation only.
+     */
+    DeviceGenerationExecutionPolicy deviceGenerationExecutionPolicy(
+        DeviceGenerationLoopTopology topology) const noexcept override
+    {
+        return topology == DeviceGenerationLoopTopology::FixedDepth
+                   ? DeviceGenerationExecutionPolicy::NativeConditionalGraph
+                   : DeviceGenerationExecutionPolicy::Unsupported;
+    }
+
+    /**
+     * @brief Record the ordinary materialization geometry accepted by the rank.
+     * @param request_count Number of device-owned request rows.
+     * @param draft_depth Zero for the typed ordinary algorithm.
+     * @param topology Fixed parent topology.
+     * @param sampling_mode Immutable sampler graph mode.
+     * @return True only for the valid ordinary captured-parent contract.
+     */
+    bool materializeDeviceResidentGeneration(
+        int request_count,
+        int draft_depth,
+        DeviceGenerationLoopTopology topology,
+        DeviceGenerationSamplingMode sampling_mode) override
+    {
+        ++materialization_count_;
+        last_draft_depth_ = draft_depth;
+        return request_count == 1 && draft_depth == 0 &&
+               topology == DeviceGenerationLoopTopology::FixedDepth &&
+               isValidDeviceGenerationSamplingMode(sampling_mode);
+    }
+
+    /** @brief Return how many rank-worker materialization calls arrived. */
+    int materializationCount() const noexcept { return materialization_count_; }
+
+    /** @brief Return the immutable ordinary depth passed by the rank. */
+    int lastDraftDepth() const noexcept { return last_draft_depth_; }
+
+private:
+    int materialization_count_{0};
+    int last_draft_depth_{-1};
+};
+
+/**
+ * @brief Ordinary GPU generation composes a captured parent with zero drafts.
+ *
+ * A rank-level ``draft_depth <= 0`` check previously rejected this valid
+ * contract before participant graph composition.  Exercise two participants
+ * so the regression includes the persistent TP worker-pool dispatch path.
+ */
+TEST(Test__RankOrchestratorDeviceGeneration,
+     MaterializesOrdinaryParentWithZeroDraftDepthAcrossParticipants)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    std::array<OrdinaryDeviceGenerationParticipant *, 2> participants{};
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        auto runner = std::make_unique<OrdinaryDeviceGenerationParticipant>();
+        participants[static_cast<size_t>(participant)] = runner.get();
+        runner->set_primary_device_id(DeviceId::cuda(participant));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+    ASSERT_NE(orchestrator, nullptr);
+
+    DeviceGenerationAdmissionRequest admission;
+    admission.request_count = 1;
+    admission.max_new_tokens = 1;
+    admission.depth_policy = sampling_math::DeviceGenerationPolicy::ordinary();
+    ASSERT_TRUE(admission.valid());
+    ASSERT_TRUE(orchestrator->beginDeviceResidentGeneration(admission));
+    EXPECT_TRUE(orchestrator->materializeDeviceResidentGeneration(
+        1,
+        0,
+        DeviceGenerationLoopTopology::FixedDepth,
+        DeviceGenerationSamplingMode::Greedy));
+
+    for (const auto *participant : participants)
+    {
+        ASSERT_NE(participant, nullptr);
+        EXPECT_EQ(participant->materializationCount(), 1);
+        EXPECT_EQ(participant->lastDraftDepth(), 0);
+    }
+}
+
+/**
  * @brief Certified reuse is unrepresentable without its exact model store.
  *
  * Memory admission and rank materialization deliberately share the same typed

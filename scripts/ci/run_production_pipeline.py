@@ -421,6 +421,87 @@ def validate_phase_prefix(phases: dict, mathematical_parity: bool = False) -> No
         raise ValueError("pipeline receipt has an impossible phase transition")
 
 
+def phase_failure(phase: Phase, error: Exception) -> dict:
+    """Describe one failed, otherwise resumable phase without claiming progress.
+
+    The completed ``phases`` prefix remains the only reusable evidence.  This
+    separate typed record names the first uncompleted phase and its ordinary
+    Python exception, allowing a later ``--resume`` to retry exactly that
+    phase.  It intentionally records no command line or environment, because
+    those may contain credential paths owned by the cross-host runner.
+    """
+    message = str(error).strip() or type(error).__name__
+    return {"schema": 1, "phase": phase.value,
+            "exception": type(error).__name__, "message": message}
+
+
+def validate_phase_failure(state: dict, mathematical_parity: bool = False) -> None:
+    """Reject a failure record that could conceal a skipped certification gate."""
+    failure = state.get("failure")
+    if failure is None:
+        return
+    names = [phase.value for phase in pipeline_phases(mathematical_parity)]
+    phases = state.get("phases")
+    if (not isinstance(failure, dict) or set(failure) != {"schema", "phase", "exception", "message"}
+            or failure.get("schema") != 1 or not isinstance(failure.get("phase"), str)
+            or failure["phase"] not in names or not isinstance(failure.get("exception"), str)
+            or not failure["exception"] or not isinstance(failure.get("message"), str)
+            or not failure["message"] or not isinstance(phases, dict)
+            or len(phases) >= len(names) or failure["phase"] != names[len(phases)]):
+        raise ValueError("pipeline receipt has an impossible failed phase transition")
+
+
+def recover_interrupted_phase(state: dict, mathematical_parity: bool = False) -> bool:
+    """Convert a legacy in-progress marker into an explicit retryable failure.
+
+    A power loss or SIGKILL cannot run the driver's exception handler.  Older
+    receipts therefore contain only ``running`` and are ambiguous on resume.
+    Treat that marker as an interrupted first-uncompleted phase, never as a
+    pass or a reason to replay an earlier gate.  The caller persists the
+    returned state before doing more work.
+    """
+    running = state.pop("running", None)
+    if running is None:
+        return False
+    if "failure" in state or not isinstance(running, str):
+        raise ValueError("pipeline receipt has contradictory interrupted phase state")
+    names = [phase.value for phase in pipeline_phases(mathematical_parity)]
+    phases = state.get("phases")
+    if (running not in names or not isinstance(phases, dict) or len(phases) >= len(names)
+            or running != names[len(phases)]):
+        raise ValueError("pipeline receipt has an impossible interrupted phase transition")
+    state["failure"] = {"schema": 1, "phase": running,
+                        "exception": "InterruptedRun",
+                        "message": "previous process ended before this phase published a terminal result"}
+    return True
+
+
+def persist_phase_failure(output: Path, phase: Phase, error: Exception,
+                          mathematical_parity: bool = False) -> None:
+    """Atomically retire one started phase when the outer driver catches it.
+
+    The per-ISA receipt is written before executing a phase.  Keeping failure
+    retirement in the shared ISA driver covers every phase implementation and
+    avoids duplicated exception paths around Docker, HTTP, Azure and local
+    process launches.  A malformed/unrelated receipt is left alone so the
+    original operational exception remains the primary diagnostic.
+    """
+    receipt_path = output / "pipeline.json"
+    try:
+        state = json.loads(receipt_path.read_text())
+        if not isinstance(state, dict) or state.get("running") != phase.value:
+            return
+        state.pop("running")
+        state["failure"] = phase_failure(phase, error)
+        validate_phase_prefix(state.get("phases"), mathematical_parity)
+        validate_phase_failure(state, mathematical_parity)
+        write_json(receipt_path, state)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        # Preserve the original gate failure.  A later resume will still reject
+        # a malformed receipt instead of treating work as successfully reused.
+        return
+
+
 def generation_evidence(directory: Path, inventory: dict, image: str, cpu_isa: str,
                         corpus_root: Path) -> tuple[dict, dict]:
     """Reauthenticate source-pinned answers and complete live regression evidence."""
@@ -701,6 +782,10 @@ def run_variant(args, source: dict) -> dict:
         if state.get("identity") != identity:
             raise ValueError("source/build inputs changed; start a new output directory")
         validate_phase_prefix(state["phases"], mathematical_parity)
+        recovered = recover_interrupted_phase(state, mathematical_parity)
+        validate_phase_failure(state, mathematical_parity)
+        if recovered:
+            write_json(receipt_path, state)
     elif receipt_path.exists():
         raise ValueError("output already has a run; use --resume or a new directory")
     for phase in pipeline_phases(mathematical_parity):
@@ -728,6 +813,10 @@ def run_variant(args, source: dict) -> dict:
         else:
             started = time.monotonic()
             print(f"[production-ci] RUN {phase.value}", flush=True)
+            if "failure" in state:
+                # Validation above proves this is exactly the phase now being
+                # retried; discard the old terminal record only at retry.
+                del state["failure"]
             write_json(receipt_path, state | {"running": phase.value})
             files = []
             if phase == Phase.BUILD:
@@ -891,7 +980,12 @@ def drive_variants(args, source: dict) -> dict:
             variant = variant_arguments(args, isa, phase)
             if phase is Phase.CROSS_HOST_E2E:
                 variant.resolved_remote_cpu_image = remote_cpu_runtime_image(args, states)
-            states[isa] = run_variant(variant, source)
+            try:
+                states[isa] = run_variant(variant, source)
+            except Exception as error:
+                persist_phase_failure(variant.output, phase, error,
+                                      getattr(args, "diagnostic_mathematical_parity", False))
+                raise
         if phase.value == args.through:
             break
     return states

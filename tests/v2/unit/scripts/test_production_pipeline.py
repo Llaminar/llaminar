@@ -3415,6 +3415,52 @@ class InfrastructureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pipeline.validate_phase_prefix(impossible)
 
+    def test_failed_phase_is_terminally_recorded_and_can_only_retry_its_first_gap(self):
+        """An ordinary gate error must not strand a receipt at ``running``."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "results"
+            variant = output / "avx2"
+            artifacts.write_json(variant / "pipeline.json", {
+                "schema": 1, "identity": {}, "certified": False,
+                "phases": {"build": {}, "prerequisites": {}}, "running": "generation"})
+            args = argparse.Namespace(output=output, cpu_isas=["AVX2"], through="generation",
+                                      image=None, resume=False, diagnostic_mathematical_parity=False)
+            def advance_or_fail(candidate, _source):
+                if candidate.through == "generation":
+                    raise ValueError("reviewed corpus is absent")
+                return {"certified": False}
+
+            with patch.object(pipeline, "run_variant", side_effect=advance_or_fail):
+                with self.assertRaisesRegex(ValueError, "reviewed corpus is absent"):
+                    pipeline.drive_variants(args, {"revision": "revision"})
+            state = json.loads((variant / "pipeline.json").read_text())
+            self.assertNotIn("running", state)
+            self.assertEqual(state["failure"], {
+                "schema": 1, "phase": "generation", "exception": "ValueError",
+                "message": "reviewed corpus is absent"})
+            pipeline.validate_phase_failure(state)
+
+            # A stale pre-change running marker is converted to the same typed
+            # lifecycle state and cannot skip or replay an earlier success.
+            stale = {"phases": {"build": {}, "prerequisites": {}}, "running": "generation"}
+            self.assertTrue(pipeline.recover_interrupted_phase(stale))
+            self.assertNotIn("running", stale)
+            self.assertEqual(stale["failure"]["phase"], "generation")
+            pipeline.validate_phase_failure(stale)
+            for corrupt in (
+                {"phases": {"build": {}}, "running": "e2e"},
+                {"phases": {"build": {}, "prerequisites": {}}, "running": "generation",
+                 "failure": state["failure"]},
+                {"phases": {"build": {}, "prerequisites": {}}, "failure":
+                 {"schema": 1, "phase": "e2e", "exception": "ValueError", "message": "wrong gap"}},
+            ):
+                with self.subTest(corrupt=corrupt), self.assertRaises(ValueError):
+                    if "running" in corrupt:
+                        pipeline.recover_interrupted_phase(corrupt)
+                    else:
+                        pipeline.validate_phase_failure(corrupt)
+
     def test_prebuilt_receipt_rejects_changed_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "installed.json"

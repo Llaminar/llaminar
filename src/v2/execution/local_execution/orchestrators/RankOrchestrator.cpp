@@ -12450,7 +12450,10 @@ namespace llaminar2
     {
         if (pp_device_generation_ && pp_device_generation_->active())
             return pp_device_generation_->materialize(request_count, draft_depth, topology, sampling_mode);
-        if (request_count <= 0 || draft_depth <= 0 ||
+        // Zero is the only valid draft depth for the separately typed ordinary
+        // generation policy.  Negative values remain invalid: they can never
+        // name a captured transaction geometry.
+        if (request_count <= 0 || draft_depth < 0 ||
             !isValidDeviceGenerationSamplingMode(sampling_mode))
         {
             LOG_ERROR("[RankOrchestrator] Invalid device-generation parent preparation geometry"
