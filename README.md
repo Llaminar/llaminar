@@ -27,7 +27,7 @@ Llaminar supports the following model architectures initially:
 
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
-* Qwen 3.5/3.6 (dense and MoE)
+* Qwen 3.5/3.6/3.8 (dense and MoE)
 
 ## Benchmarks
 
