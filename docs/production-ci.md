@@ -34,6 +34,54 @@ python3 scripts/ci/run_develop_image_gate.py \
 Unit/preflight transactions pass. Omitting it is a local build/test diagnostic;
 `--cpu-isa` may narrow such a diagnostic but can never publish a partial pair.
 
+### ARC runner on the production host
+
+The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
+but it deliberately uses the host's Docker Unix socket rather than a DIND
+sidecar. Docker's graph store is single-writer state: two daemons must never
+share a writable `data-root`. Socket ownership gives the runner the host
+daemon's one existing image, BuildKit and layer cache, which is both safe and
+the fastest possible reuse of locally built images.
+
+The checked-in deployment values are
+`scripts/ci/arc/llaminar-xeon-host-docker-values.yaml`. They mount the host
+workspace at the same `/home/runner/_work` spelling in the pod and on the
+host, mount `/var/run/docker.sock`, and declare those paths through
+`LLAMINAR_DOCKER_SHARED_ROOTS`. `docker_paths.py` accepts only those exact
+same-path roots; an undeclared Kubernetes path is a fatal configuration error.
+The scale set also mounts the existing canonical model tmpfs read-only. Before
+applying the scale set, prepare the host once:
+
+```bash
+# Run on the host that owns the Kubernetes node and Docker daemon.
+sudo install -d -o 1001 -g 1001 -m 0750 /home/runner/_work
+bash scripts/ci/setup_production_parity_tmpfs.sh --share-uid 1001
+```
+
+`setup_production_parity_tmpfs.sh` adopts the single pre-existing named tmpfs
+with a bind mount when one is already exported; it never copies GGUFs or
+allocates a second RAM disk. `--share-uid` grants the ARC identity read access
+to sealed cached models while retaining the cache lifecycle's one owner. A
+future full model-staging job must run under that cache owner or use an
+explicitly delegated cache-owner transition; it must not bypass the lock and
+directory-sealing protocol.
+
+Apply the values to the existing release from a checkout visible to the host:
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+helm upgrade --reuse-values --namespace arc-runners llaminar-xeon \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  --version 0.14.2 \
+  --values scripts/ci/arc/llaminar-xeon-host-docker-values.yaml
+```
+
+The host Docker socket group is intentionally a deployment-specific numeric
+supplemental group in that values file. Validate it before an upgrade with
+`stat -c '%g' /var/run/docker.sock`; do not guess, chmod the socket, or make
+two daemons share a cache directory. The legacy DIND cache directory is left
+untouched for manual retirement, but no live runner consumes it.
+
 ```mermaid
 flowchart TD
     S[One immutable source snapshot] --> B[AVX512 and AVX2 Docker builders and Release images]

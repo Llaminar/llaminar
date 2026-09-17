@@ -650,9 +650,101 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--share-uid", result.stdout)
         self.assertIn("--status", result.stdout)
         self.assertIn("--unmount", result.stdout)
         self.assertIn("/mnt/llaminar-production-parity", result.stdout)
+
+    def test_persistent_tmpfs_setup_rejects_an_untyped_shared_uid(self) -> None:
+        """A cache reader identity is explicit before mount state is consulted."""
+
+        result = subprocess.run(
+            ["bash", str(TMPFS_SETUP_SCRIPT), "--share-uid", "runner"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid shared UID", result.stderr)
+
+    def test_persistent_tmpfs_setup_adopts_one_named_mount_without_new_pages(self) -> None:
+        """Host adoption is one bind of the named tmpfs, never a second tmpfs."""
+        with tempfile.TemporaryDirectory(prefix="llaminar-tmpfs-adoption-") as raw:
+            root = Path(raw)
+            destination = root / "canonical"
+            existing = root / "exported"
+            destination.mkdir()
+            existing.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            calls = root / "calls"
+
+            def fake(name: str, body: str) -> None:
+                path = fake_bin / name
+                path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body,
+                                encoding="utf-8")
+                path.chmod(0o755)
+
+            fake(
+                "mountpoint",
+                "exit 1\n",
+            )
+            fake(
+                "findmnt",
+                "if [[ \"$*\" == *\"-rn -t tmpfs -o TARGET,SOURCE\"* ]]; then\n"
+                "  printf '%s llaminar-production-parity\\n' \"${LLAMINAR_TEST_EXISTING}\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "case \"$*\" in\n"
+                "  *\"-o FSTYPE\"*) printf 'tmpfs\\n' ;;\n"
+                "  *\"-o SOURCE\"*) printf 'llaminar-production-parity\\n' ;;\n"
+                "  *\"-o OPTIONS\"*) printf 'rw,nosuid,nodev\\n' ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+            )
+            fake(
+                "mount",
+                "printf 'mount' >> \"${LLAMINAR_TEST_CALLS}\"\n"
+                "for argument in \"$@\"; do printf ' <%s>' \"${argument}\" >> \"${LLAMINAR_TEST_CALLS}\"; done\n"
+                "printf '\\n' >> \"${LLAMINAR_TEST_CALLS}\"\n",
+            )
+            fake(
+                "setfacl",
+                "printf 'setfacl' >> \"${LLAMINAR_TEST_CALLS}\"\n"
+                "for argument in \"$@\"; do printf ' <%s>' \"${argument}\" >> \"${LLAMINAR_TEST_CALLS}\"; done\n"
+                "printf '\\n' >> \"${LLAMINAR_TEST_CALLS}\"\n",
+            )
+            fake("df", "exit 0\n")
+            fake("sudo", "exec \"$@\"\n")
+
+            environment = os.environ | {
+                "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                "LLAMINAR_TEST_EXISTING": str(existing),
+                "LLAMINAR_TEST_CALLS": str(calls),
+            }
+            result = subprocess.run(
+                [
+                    "bash", str(TMPFS_SETUP_SCRIPT), "--mount-point",
+                    str(destination), "--share-uid", "1001",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            recorded = calls.read_text(encoding="utf-8")
+            mount_line = recorded.splitlines()[0]
+            self.assertEqual(
+                mount_line,
+                f"mount <--bind> <--> <{existing}> <{destination}>",
+            )
+            self.assertNotIn("<-t>", mount_line)
+            self.assertIn("<u:1001:rX>", recorded)
+            self.assertNotIn("rwX", recorded)
+            self.assertTrue((destination / "cache").is_dir())
 
     def test_classifies_single_backend_and_kv_precision(self) -> None:
         group = campaigns.classify_campaign(

@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ARC values for the xeon production runner.  This runner deliberately uses
+# the node's one Docker daemon through its Unix socket.  A Docker graph store
+# is single-writer state: a DIND sidecar must not share /var/lib/docker (or a
+# writable cache directory) with the host daemon.  Mounting the socket means
+# image layers, BuildKit records and runtime device configuration have exactly
+# one authority and are reused by local host Docker work and CI alike.
+
+controllerServiceAccount:
+  name: arc-gha-rs-controller
+  namespace: arc-systems
+
+githubConfigUrl: https://github.com/Llaminar
+githubConfigSecret: arc-github-app
+runnerGroup: default
+runnerScaleSetName: llaminar-xeon
+scaleSetLabels:
+  - llaminar-bench
+minRunners: 1
+maxRunners: 1
+
+template:
+  spec:
+    # Explicitly clear the old restartable DIND init container. --reuse-values
+    # otherwise retains omitted list keys from the previous Helm revision.
+    initContainers: []
+    # The node Docker socket is root:docker on this host.  The stock runner
+    # image is uid 1001 and already supplies its own primary group, so only
+    # the host socket's explicitly checked supplemental group is required.
+    securityContext:
+      supplementalGroups:
+        - 125
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - /home/runner/run.sh
+        env:
+          - name: DOCKER_HOST
+            value: unix:///var/run/docker.sock
+          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+            value: "120"
+          # These paths are mounted at their exact host spelling in both the
+          # runner and the daemon namespace.  docker_paths.py rejects every
+          # undeclared source rather than guessing a Kubernetes translation.
+          - name: LLAMINAR_DOCKER_SHARED_ROOTS
+            value: /home/runner/_work:/opt/llaminar-models:/mnt/llaminar-production-parity
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          - name: host-docker-socket
+            mountPath: /var/run/docker.sock
+          - name: llaminar-models
+            mountPath: /opt/llaminar-models
+            readOnly: true
+          - name: llaminar-production-parity
+            mountPath: /mnt/llaminar-production-parity
+            readOnly: true
+          - name: llaminar-nvidia-libs
+            mountPath: /opt/llaminar-nvidia-libs
+            readOnly: true
+    volumes:
+      # This exact host path is also the runner's in-pod path.  Host Docker
+      # can therefore bind the checkout and evidence paths without a DIND
+      # translation or a duplicate source tree.
+      - name: work
+        hostPath:
+          path: /home/runner/_work
+          type: Directory
+      - name: host-docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+      - name: llaminar-models
+        hostPath:
+          path: /opt/llaminar-models
+          type: Directory
+      # setup_production_parity_tmpfs.sh adopts a preexisting named tmpfs with
+      # a bind mount, so this is always the existing pages—not a second tmpfs.
+      - name: llaminar-production-parity
+        hostPath:
+          path: /mnt/llaminar-production-parity
+          type: Directory
+      - name: llaminar-nvidia-libs
+        hostPath:
+          path: /opt/llaminar-nvidia-libs
+          type: Directory

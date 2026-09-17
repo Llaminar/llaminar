@@ -3514,6 +3514,64 @@ class InfrastructureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 docker_paths.host_path(ROOT)
 
+    def test_arc_declared_shared_daemon_root_preserves_the_exact_path(self):
+        """ARC uses only an explicit same-path runner/daemon volume contract."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "evidence"
+            source.mkdir()
+            with patch.dict(docker_paths.os.environ, {
+                "DOCKER_HOST": "unix:///var/run/docker.sock",
+                docker_paths.SHARED_DAEMON_ROOTS_ENV: str(root),
+            }, clear=False), \
+                 patch.object(docker_paths, "containing_container") as containing:
+                self.assertEqual(docker_paths.host_path(source), str(source))
+            containing.assert_not_called()
+
+    def test_arc_shared_roots_reject_ambiguous_or_remote_declarations(self):
+        """A shared-root declaration cannot widen Docker authority by accident."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            cases = (
+                "",
+                ":" + str(root),
+                str(root) + ":" + str(root),
+                "/",
+                "relative",
+                str(root / "missing"),
+            )
+            for value in cases:
+                with self.subTest(value=value), \
+                     patch.dict(docker_paths.os.environ, {
+                         "DOCKER_HOST": "unix:///var/run/docker.sock",
+                         docker_paths.SHARED_DAEMON_ROOTS_ENV: value,
+                     }, clear=False):
+                    with self.assertRaises(ValueError):
+                        docker_paths.host_path(root)
+            with patch.dict(docker_paths.os.environ, {
+                "DOCKER_HOST": "tcp://remote:2376",
+                docker_paths.SHARED_DAEMON_ROOTS_ENV: str(root),
+            }, clear=False):
+                with self.assertRaises(ValueError):
+                    docker_paths.host_path(root)
+
+    def test_arc_host_runner_uses_one_host_daemon_not_a_shared_dind_graphstore(self):
+        """The ARC deployment reuses host Docker through a socket, never its data root."""
+        values = (
+            ROOT / "scripts/ci/arc/llaminar-xeon-host-docker-values.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("path: /var/run/docker.sock", values)
+        self.assertIn("type: Socket", values)
+        self.assertIn("mountPath: /home/runner/_work", values)
+        self.assertIn("path: /home/runner/_work", values)
+        self.assertIn(docker_paths.SHARED_DAEMON_ROOTS_ENV, values)
+        self.assertIn("/mnt/llaminar-production-parity", values)
+        self.assertIn("initContainers: []", values)
+        self.assertNotIn("name: dind", values)
+        self.assertNotIn("mountPath: /var/lib/docker", values)
+        self.assertNotIn("name: llaminar-docker-cache", values)
+
     def test_attached_execution_requires_delayed_output_and_exact_exit(self):
         for outcome in ("complete", "premature", "missing-output", "timeout"):
             with self.subTest(outcome=outcome):

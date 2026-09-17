@@ -20,11 +20,73 @@ import tempfile
 import uuid
 
 
-def containing_container() -> dict | None:
-    """Identify our containing Docker namespace, or ordinary daemon-local host."""
+# ARC runner pods use a node-local Docker daemon through a Unix socket.
+# Kubernetes mounts selected host paths into both the runner and that daemon
+# namespace at the same absolute location, so Docker can bind them without
+# translating through a container ID. The deployment must declare those roots
+# explicitly: accepting an arbitrary caller path here would conceal an
+# incomplete mount contract.
+SHARED_DAEMON_ROOTS_ENV = "LLAMINAR_DOCKER_SHARED_ROOTS"
+
+
+def local_docker_endpoint() -> None:
+    """Reject remote daemons before resolving any local bind source.
+
+    Device certification and its model/cache mounts are node-local protocols.
+    ARC's host-socket daemon is admitted through separately declared shared
+    roots; a TCP endpoint is never such a daemon.
+    """
     endpoint = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
     if not endpoint.startswith("unix://"):
         raise ValueError("device certification requires a node-local Docker daemon")
+
+
+def shared_daemon_roots() -> tuple[Path, ...]:
+    """Return exact runner roots mounted identically into its ARC Docker daemon.
+
+    ``LLAMINAR_DOCKER_SHARED_ROOTS`` is an infrastructure-owned, path-separator
+    delimited list.  Each entry must already exist, be an absolute normalized
+    directory, and be narrower than filesystem root.  This makes a missing
+    Kubernetes hostPath/volumeMount a fatal configuration error instead of
+    letting a future bind silently target the wrong namespace.
+    """
+    raw = os.environ.get(SHARED_DAEMON_ROOTS_ENV)
+    if raw is None:
+        return ()
+    if not raw:
+        raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} must not be empty when declared")
+    roots: list[Path] = []
+    for entry in raw.split(os.pathsep):
+        if not entry:
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} must not contain an empty root")
+        candidate = Path(entry)
+        if not candidate.is_absolute():
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} root must be absolute: {entry!r}")
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} root does not exist: {entry!r}") from error
+        if resolved != candidate:
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} root must be normalized: {entry!r}")
+        if not resolved.is_dir() or resolved == Path("/"):
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} root is not a scoped directory: {entry!r}")
+        if resolved in roots:
+            raise ValueError(f"{SHARED_DAEMON_ROOTS_ENV} contains duplicate root: {entry!r}")
+        roots.append(resolved)
+    return tuple(roots)
+
+
+def shared_daemon_path(path: Path) -> str | None:
+    """Return an explicitly shared ARC source path, or ``None`` if not declared."""
+    for root in shared_daemon_roots():
+        if path.is_relative_to(root):
+            return str(path)
+    return None
+
+
+def containing_container() -> dict | None:
+    """Identify our containing Docker namespace, or ordinary daemon-local host."""
+    local_docker_endpoint()
     if not Path("/.dockerenv").exists():
         return None
     container = Path("/etc/hostname").read_text().strip()
@@ -71,6 +133,12 @@ def publish_model_cache(path: Path) -> None:
 def host_path(path: Path) -> str:
     """Return the daemon-visible path for an existing local file or directory."""
     resolved = path.resolve(strict=True)
+    # ARC's declared DIND roots are first-class infrastructure topology, not a
+    # best-effort alternative to Docker mount inspection.  Validate locality
+    # even when the path itself needs no translation.
+    local_docker_endpoint()
+    if shared := shared_daemon_path(resolved):
+        return shared
     container = containing_container()
     if container is None:
         return str(resolved)

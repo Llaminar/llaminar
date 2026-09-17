@@ -40,6 +40,12 @@ the two tested `develop` runtime tags. It does not run model discovery,
 generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
 certificate. Use it for fast shippable developer images; use the full pipeline
 when requesting a certified artifact.
+On the production ARC scale set, the runner uses the host Docker Unix socket
+rather than DIND so CI and local host work use one daemon and one safe Docker
+cache. Never point two Docker daemons at the same writable data root. Its
+workspace and model tmpfs mounts are explicit same-path roots declared through
+`LLAMINAR_DOCKER_SHARED_ROOTS`; consult `docs/production-ci.md` before changing
+the runner deployment.
 Do not run fixed-depth MTP cells or mathematical HF parity by default.
 
 Token drift or a suspected accuracy bug calls for the **specific matching
