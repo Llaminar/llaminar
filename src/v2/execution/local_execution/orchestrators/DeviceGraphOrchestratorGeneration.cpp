@@ -11,6 +11,7 @@
 #include "DeviceGraphOrchestrator.h"
 #include "backends/BackendManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
 #include "utils/Logger.h"
 
@@ -20,6 +21,24 @@ bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t
 {
     const auto &loop = mtp_device_generation_loop_graph_;
     std::string error;
+    if (loop.ordinary_composition == OrdinaryGenerationComposition::ExpertOverlay &&
+        loop.execution_kind == MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher)
+    {
+        /*
+         * Hosted ExpertOverlay forwards pass through
+         * replayRetainedDecodeGraph(), which records every real replay as it is
+         * submitted. The terminal only authenticates that the same retained
+         * cache entry survived; publishing composed-parent evidence here would
+         * double-count work that did not execute inside a parent.
+         */
+        if (!forward_engine_ || !loop.ordinary_forward_identity ||
+            !forward_engine_->retainedDecodeGraph(*loop.ordinary_forward_identity, &error))
+        {
+            LOG_ERROR("Ordinary ExpertOverlay terminal lost its retained forward identity: " << error);
+            return false;
+        }
+        return completed_invocations >= 0;
+    }
     if (!forward_engine_ || !loop.ordinary_forward_identity || loop.source_fragments.size() != 1 ||
         !forward_engine_->observeComposedForwardCompletion(*loop.ordinary_forward_identity,
             loop.source_fragments.front().capture, completed_invocations, &error))
@@ -108,8 +127,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         activeMainLogitsAreColumnParallel() ||
         (pp_stage_config_ && (!pp_stage_config_->has_lm_head ||
             (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail))) ||
-        moe_overlay_epoch_execution_binding_ || usesParticipantLocalDeviceMoERebalanceController())
-        return fail("Ordinary generation requires an admitted scalar sampler and complete local graph; pipeline/overlay composition is not yet installed");
+        usesParticipantLocalDeviceMoERebalanceController() ||
+        (composition == OrdinaryGenerationComposition::ExpertOverlay) !=
+            static_cast<bool>(moe_overlay_epoch_execution_binding_))
+        return fail("Ordinary generation requires an admitted scalar sampler and an exact local, pipeline-tail, or ExpertOverlay composition");
 
     const auto &admission = *active_device_generation_admission_;
     const auto &law = *admission.ordinary_sampling;
@@ -171,6 +192,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
 
     if (loop.valid && loop.workspace_generation == generation &&
         loop.ordinary_sampling_identity == params && loop.ordinary_forward_identity == signature &&
+        loop.ordinary_composition == composition &&
         loop.source_fragments.size() == 1 && loop.source_fragments.front().capture == forward.capture)
     {
         // Leading-row ownership is request data, not graph topology. CUDA
@@ -212,6 +234,15 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordZero,
         .condition_word_device = reinterpret_cast<const uint32_t *>(
             control.rows + kDeviceGenerationControlNextLeadingCommittedOutputCount)}};
+    /*
+     * A MainInference forward is the owner of the ExpertOverlay reader lease:
+     * appendCapturedMainForwardMoEOverlayEpochTransaction decorates this exact
+     * retained forward during materializeOrdinaryGenerationForward.  Keeping
+     * the boundary in that graph is essential because it spans the real sparse
+     * collective body.  Adding a second acquire/release around the sampler
+     * would both duplicate the lease and borrow an independently invalidated
+     * boundary cache after a normal decode recapture.
+     */
     const DeviceControlledLoopFragment iteration[] = {
         {.name = "ordinary_resident_forward", .capture = forward.capture},
         {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()}};
@@ -225,6 +256,26 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         if (!DeviceGenerationGraphProgram::native(*loop.capture, control,
                 {.initialization = initialization, .iteration = iteration}, detail))
             return fail(detail);
+    }
+    else if (composition == OrdinaryGenerationComposition::ExpertOverlay)
+    {
+        std::string retained_error;
+        if (!forward_engine_->retainedDecodeGraph(signature, &retained_error) ||
+            !loop.ordinary_children[Plan::prefill_sampler]->instantiate() ||
+            !loop.ordinary_children[Plan::decode_sampler]->instantiate() ||
+            !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context, *backend, state_.device_id,
+                control, nullptr, device_generation_storage_.dispatch_tickets_device, detail))
+        {
+            return fail("Ordinary ExpertOverlay hosted graph compilation failed: " +
+                        (retained_error.empty() ? detail : retained_error));
+        }
+        loop.hosted_fragments.push_back({
+            .name = "ordinary_expert_overlay_transaction",
+            .kind = HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay,
+            .capture = loop.ordinary_children[Plan::decode_sampler].get(),
+            .forward_signature = signature,
+        });
+        loop.branch_fragment_counts[0] = 1;
     }
     else
     {
@@ -244,9 +295,13 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     }
     // The forward identity and bindings are immutable; all mutable counters,
     // seeds and frontier contents stay in their existing arena-owned banks.
-    loop.source_fragments.push_back(iteration[0]);
+    // Completion attribution belongs to the retained model forward, never to
+    // the overlay lease child that happens to precede it in this composition.
+    loop.source_fragments.push_back(
+        {.name = "ordinary_resident_forward", .capture = forward.capture});
     loop.ordinary_sampling_identity = params;
     loop.ordinary_forward_identity = signature;
+    loop.ordinary_composition = composition;
     loop.ordinary_leading = admission.initial_leading_row_disposition;
     loop.workspace_generation = generation;
     loop.request_count = 1;
@@ -258,6 +313,146 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     loop.valid = true;
     PerfStatsCollector::addCounter("generation", "ordinary_graph_materializations", 1.0,
         "graph_setup", state_.device_id.toString());
+    return true;
+}
+
+bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
+    const ForwardGraphSignature &signature,
+    const IGPUGraphCapture *sampler,
+    void **out_producer_stream,
+    std::string *error)
+{
+    const auto fail = [&](const std::string &reason)
+    {
+        if (error)
+            *error = reason;
+        return false;
+    };
+    if (error)
+        error->clear();
+    if (out_producer_stream)
+        *out_producer_stream = nullptr;
+
+    auto &loop = mtp_device_generation_loop_graph_;
+    if (!forward_engine_ || !sampler || !sampler->hasExecutable() ||
+        !loop.stream ||
+        loop.ordinary_composition !=
+            OrdinaryGenerationComposition::ExpertOverlay ||
+        !loop.ordinary_forward_identity ||
+        *loop.ordinary_forward_identity != signature ||
+        !moe_overlay_inference_transaction_coordinator_)
+    {
+        return fail(
+            "hosted ordinary ExpertOverlay replay has incomplete or divergent retained ownership");
+    }
+
+    std::string retained_error;
+    const auto retained =
+        forward_engine_->retainedDecodeGraph(signature, &retained_error);
+    if (!retained)
+        return fail(retained_error);
+
+    MoEOverlayInferenceExecutionDescriptor descriptor{
+        .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+        .logical_step_id = 0,
+        .placement_epoch =
+            moe_overlay_inference_transaction_coordinator_
+                ->currentPlacementEpoch(),
+        .request_count = 1,
+        .logical_rows_per_request = 1,
+        .physical_rows_per_request = 1,
+        .draft_depth = -1,
+        .sidecar_depth = -1,
+    };
+    MoEOverlayInferenceParticipantGraphScope graph_scope(
+        moe_overlay_inference_transaction_coordinator_,
+        descriptor,
+        moe_overlay_inference_transaction_participant_index_);
+    if (!graph_scope.ready() || !graph_scope.active())
+    {
+        return fail(
+            graph_scope.error().empty()
+                ? "hosted ordinary ExpertOverlay replay has no active transaction binding"
+                : graph_scope.error());
+    }
+
+    const auto request_identity = currentMoESparseRequestIdentity();
+    const auto &binding = graph_scope.binding();
+    if (!request_identity ||
+        request_identity->generation() != binding.request_generation ||
+        binding.descriptor.graph_role !=
+            MoEOverlayInferenceGraphRole::MainDecode ||
+        binding.descriptor.draft_depth != -1 ||
+        binding.descriptor.sidecar_depth != -1)
+    {
+        return fail(
+            "hosted ordinary ExpertOverlay binding disagrees with its request generation or serial decode role");
+    }
+    const IComputeStage::MoEOverlayCollectiveRuntimeParams sparse_params{
+        .generation_id = binding.request_generation,
+        .step_id = binding.descriptor.logical_step_id,
+        .execution_semantics =
+            IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                ExecutionSemantics::Decode,
+        .mtp_depth = -1,
+        .placement_epoch = binding.descriptor.placement_epoch,
+    };
+    if (!sparse_params.valid() || !sparse_params.hasExecutionSemantics())
+    {
+        return fail(
+            "hosted ordinary ExpertOverlay replay produced an invalid sparse wire identity");
+    }
+
+    DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency =
+        [&graph_scope, device = state_.device_id](
+            DeviceGraphExecutor::GraphExecutableLaunchPhase,
+            void *execution_stream) -> bool
+    {
+        if (!graph_scope.ownsTicketAuthority())
+            return true;
+        std::string arm_error;
+        if (!graph_scope.armForExecutableLaunch(
+                execution_stream, &arm_error))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Hosted ordinary decode could not arm its ExpertOverlay follower at the retained executable launch edge on "
+                << device.toString() << ": " << arm_error);
+            return false;
+        }
+        return true;
+    };
+
+    IDeviceContext *const ctx = getDeviceContext(state_.device_id);
+    void *forward_stream = nullptr;
+    bool submitted = forward_engine_->replayRetainedDecodeGraph(
+        signature,
+        ctx,
+        sparse_params,
+        launch_dependency,
+        *this,
+        loop.stream.get(),
+        &forward_stream,
+        &retained_error);
+    if (submitted)
+        submitted = sampler->launchOnStream(loop.stream.get());
+
+    std::string finish_error;
+    if (!graph_scope.finish(submitted, &finish_error))
+        return fail(finish_error);
+    if (!submitted)
+    {
+        return fail(
+            retained_error.empty()
+                ? "hosted ordinary ExpertOverlay sampler submission failed"
+                : retained_error);
+    }
+    if (forward_stream != retained->stream)
+    {
+        return fail(
+            "hosted ordinary ExpertOverlay forward published an invalid completion stream");
+    }
+    if (out_producer_stream)
+        *out_producer_stream = loop.stream.get();
     return true;
 }
 }

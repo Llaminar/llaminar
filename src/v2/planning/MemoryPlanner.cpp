@@ -1105,6 +1105,8 @@ MemoryPlan MemoryPlanner::plan(
                     .total_shards = cfg.total_shards,
                     .apportioned_routed_experts =
                         cfg.weight_residency.selectsRoutedExperts(),
+                    .runtime_device_policy_available =
+                        cfg.runtime_device_policy_available,
                     .mtp_target_query_rows =
                         cfg.mtp_enabled
                             ? cfg.mtp_target_query_rows

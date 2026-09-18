@@ -41,6 +41,10 @@ namespace llaminar2::moe_overlay_controller_device
         std::uint64_t phase_expert_counts[
             kMoEOverlayDeviceControllerDemandPhaseCount]
             [kMoEOverlayDeviceControllerFabricMaxExperts];
+        /** Current full-layer routed load by phase and physical participant. */
+        std::uint64_t phase_participant_load[
+            kMoEOverlayDeviceControllerDemandPhaseCount]
+            [kMoEOverlayDeviceControllerFabricMaxParticipants];
         std::uint64_t participant_load[
             kMoEOverlayDeviceControllerFabricMaxParticipants];
         /** Transaction-local device cache of immutable per-tier service cost. */
@@ -121,6 +125,8 @@ namespace llaminar2::moe_overlay_controller_device
         std::uint64_t inference_interference_ns = 0u;
         std::uint64_t projected_net_benefit_ns = 0u;
         bool residency_eligible = true;
+        bool phase_non_regressing = false;
+        bool improvement_floor_met = false;
         bool payoff_eligible = false;
 
         /** @return Whether both measured policy gates accept the cycle. */
@@ -1274,11 +1280,12 @@ namespace llaminar2::moe_overlay_controller_device
     /**
      * @brief Price one complete capacity-preserving cycle from measured evidence.
      *
-     * Cross-tier work uses exact phase-weighted service deltas. A pure same-tier
-     * cycle cannot change aggregate tier work, so it instead prices the change
-     * in the tier's parallel participant makespan. Reciprocal pair calibration
-     * already measured both directions together and is charged once at the
-     * slower edge; longer cycles remain conservatively additive.
+     * All routed participants execute concurrently, so both cross-tier and
+     * same-tier candidates use the complete layer's measured participant
+     * critical path. Pricing only the experts named by a cross-tier cycle
+     * ignores the straggler whose removal is the reason to rebalance. Reciprocal
+     * pair calibration already measured both directions together and is charged
+     * once at the slower edge; longer cycles remain conservatively additive.
      */
     __device__ __forceinline__ DynamicCycleEconomyScore
     scoreDynamicCycleEconomy(
@@ -1295,127 +1302,74 @@ namespace llaminar2::moe_overlay_controller_device
         if (cycle_length == 0u)
             return score;
 
-        const auto first_source = static_cast<std::uint32_t>(
-            scratch.current_owner[scratch.cycle[0]]);
-        const std::int32_t selected_tier =
-            scratch.participant_tier[first_source];
-        bool pure_same_tier = selected_tier >= 0;
-        for (std::uint32_t edge = 0u; edge < cycle_length; ++edge)
-        {
-            const std::uint32_t expert = scratch.cycle[edge];
-            const auto source = static_cast<std::uint32_t>(
-                scratch.current_owner[expert]);
-            const auto destination = static_cast<std::uint32_t>(
-                scratch.desired_owner[expert]);
-            pure_same_tier = pure_same_tier &&
-                scratch.participant_tier[source] == selected_tier &&
-                scratch.participant_tier[destination] == selected_tier;
-        }
-
         constexpr std::uint32_t kMeasuredDemandPhases =
             kMoEOverlayDeviceControllerDemandPhaseCount;
-        if (pure_same_tier)
+        for (std::uint32_t phase = 0u;
+             phase < kMeasuredDemandPhases;
+             ++phase)
         {
-            for (std::uint32_t phase = 0u;
-                 phase < kMeasuredDemandPhases;
-                 ++phase)
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
             {
-                for (std::uint32_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
-                {
-                    scratch.participant_load[participant] = 0u;
-                }
-                for (std::uint32_t expert = 0u;
-                     expert < expert_count;
-                     ++expert)
-                {
-                    const auto owner = static_cast<std::uint32_t>(
-                        scratch.current_owner[expert]);
-                    if (scratch.participant_tier[owner] == selected_tier)
-                    {
-                        scratch.participant_load[owner] = saturatingAdd(
-                            scratch.participant_load[owner],
-                            scratch.phase_expert_counts[phase][expert]);
-                    }
-                }
-                std::uint64_t before_maximum = 0u;
-                for (std::uint32_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
-                {
-                    if (scratch.participant_tier[participant] == selected_tier &&
-                        scratch.participant_load[participant] > before_maximum)
-                    {
-                        before_maximum = scratch.participant_load[participant];
-                    }
-                    scratch.participant_load[participant] = 0u;
-                }
-                for (std::uint32_t expert = 0u;
-                     expert < expert_count;
-                     ++expert)
-                {
-                    const auto owner = static_cast<std::uint32_t>(
-                        scratch.candidate_owner[expert]);
-                    if (scratch.participant_tier[owner] == selected_tier)
-                    {
-                        scratch.participant_load[owner] = saturatingAdd(
-                            scratch.participant_load[owner],
-                            scratch.phase_expert_counts[phase][expert]);
-                    }
-                }
-                std::uint64_t after_maximum = 0u;
-                for (std::uint32_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
-                {
-                    if (scratch.participant_tier[participant] == selected_tier &&
-                        scratch.participant_load[participant] > after_maximum)
-                    {
-                        after_maximum = scratch.participant_load[participant];
-                    }
-                }
-                const std::uint64_t service = scratch.service_cost
-                    [static_cast<std::uint32_t>(selected_tier)][phase];
-                score.service_before_by_phase_ns[phase] = saturatingAdd(
-                    score.service_before_by_phase_ns[phase],
-                    saturatingMultiply(before_maximum, service));
-                score.service_after_by_phase_ns[phase] = saturatingAdd(
-                    score.service_after_by_phase_ns[phase],
-                    saturatingMultiply(after_maximum, service));
+                scratch.participant_load[participant] =
+                    scratch.phase_participant_load[phase][participant];
             }
-        }
-        else
-        {
-            for (std::uint32_t edge = 0u; edge < cycle_length; ++edge)
+            std::uint64_t before_critical_path = 0u;
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
+            {
+                const auto tier = static_cast<std::uint32_t>(
+                    scratch.participant_tier[participant]);
+                const std::uint64_t participant_service =
+                    saturatingMultiply(
+                        scratch.participant_load[participant],
+                        scratch.service_cost[tier][phase]);
+                before_critical_path =
+                    participant_service > before_critical_path
+                        ? participant_service
+                        : before_critical_path;
+            }
+            /* Candidate ownership differs from the current map only along the
+             * closed cycle. Apply that bounded delta instead of rescanning all
+             * experts for every candidate; controller work stays proportional
+             * to participants and transfer slots, not model expert count. */
+            for (std::uint32_t edge = 0u;
+                 edge < cycle_length;
+                 ++edge)
             {
                 const std::uint32_t expert = scratch.cycle[edge];
                 const auto source = static_cast<std::uint32_t>(
                     scratch.current_owner[expert]);
                 const auto destination = static_cast<std::uint32_t>(
                     scratch.desired_owner[expert]);
-                const auto source_tier = static_cast<std::uint32_t>(
-                    scratch.participant_tier[source]);
-                const auto destination_tier = static_cast<std::uint32_t>(
-                    scratch.participant_tier[destination]);
-                for (std::uint32_t phase = 0u;
-                     phase < kMeasuredDemandPhases;
-                     ++phase)
-                {
-                    const std::uint64_t demand =
-                        scratch.phase_expert_counts[phase][expert];
-                    score.service_before_by_phase_ns[phase] = saturatingAdd(
-                        score.service_before_by_phase_ns[phase],
-                        saturatingMultiply(
-                            demand,
-                            scratch.service_cost[source_tier][phase]));
-                    score.service_after_by_phase_ns[phase] = saturatingAdd(
-                        score.service_after_by_phase_ns[phase],
-                        saturatingMultiply(
-                            demand,
-                            scratch.service_cost[destination_tier][phase]));
-                }
+                const std::uint64_t demand =
+                    scratch.phase_expert_counts[phase][expert];
+                scratch.participant_load[source] -= demand;
+                scratch.participant_load[destination] = saturatingAdd(
+                    scratch.participant_load[destination], demand);
             }
+            std::uint64_t after_critical_path = 0u;
+            for (std::uint32_t participant = 0u;
+                 participant < participant_count;
+                 ++participant)
+            {
+                const auto tier = static_cast<std::uint32_t>(
+                    scratch.participant_tier[participant]);
+                const std::uint64_t participant_service =
+                    saturatingMultiply(
+                        scratch.participant_load[participant],
+                        scratch.service_cost[tier][phase]);
+                after_critical_path =
+                    participant_service > after_critical_path
+                        ? participant_service
+                        : after_critical_path;
+            }
+            score.service_before_by_phase_ns[phase] =
+                before_critical_path;
+            score.service_after_by_phase_ns[phase] =
+                after_critical_path;
         }
 
         const bool reciprocal_pair = cycle_length == 2u &&
@@ -1471,13 +1425,11 @@ namespace llaminar2::moe_overlay_controller_device
             }
         }
 
-        if (!moe_rebalance_policy::phaseObjectivesDoNotRegress(
+        score.phase_non_regressing =
+            moe_rebalance_policy::phaseObjectivesDoNotRegress(
                 score.service_before_by_phase_ns,
                 score.service_after_by_phase_ns,
-                kMeasuredDemandPhases))
-        {
-            return score;
-        }
+                kMeasuredDemandPhases);
         for (std::uint32_t phase = 0u;
              phase < kMeasuredDemandPhases;
              ++phase)
@@ -1496,6 +1448,7 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return score;
         }
+        score.improvement_floor_met = true;
         const std::uint64_t gain =
             score.service_before_ns - score.service_after_ns;
         std::uint64_t observed_activations = 0u;
@@ -1949,6 +1902,10 @@ namespace llaminar2::moe_overlay_controller_device
             invalid_parts[0] == 0u &&
             digest_parts[0] == policy.command_digest &&
             byte_parts[0] == policy.packed_weight_bytes &&
+            policy.phase_tradeoff_candidates <= 0xffffu &&
+            policy.improvement_floor_rejected_cycles <= 0xffffu &&
+            policy.payoff_rejected_cycles <= 0xffffu &&
+            policy.residency_rejected_cycles <= 0xffffu &&
             ((kind ==
                   MoEOverlayDeviceControllerTransactionKind::StaticCheck &&
               policy.command_count == 0u &&
@@ -2008,6 +1965,10 @@ namespace llaminar2::moe_overlay_controller_device
             policy.projected_inference_interference_ns;
         binding.command->projected_net_benefit_ns =
             policy.projected_net_benefit_ns;
+        binding.command->phase_tradeoff_candidates =
+            policy.phase_tradeoff_candidates;
+        binding.command->improvement_floor_rejected_cycles =
+            policy.improvement_floor_rejected_cycles;
         binding.command->payoff_rejected_cycles =
             policy.payoff_rejected_cycles;
         binding.command->residency_rejected_cycles =
@@ -2366,6 +2327,12 @@ namespace llaminar2::moe_overlay_controller_device
                  ++participant)
             {
                 scratch.quotas[participant] = 0u;
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                     ++phase)
+                {
+                    scratch.phase_participant_load[phase][participant] = 0u;
+                }
             }
             for (std::uint32_t expert = 0u;
                  expert < expert_count;
@@ -2445,7 +2412,18 @@ namespace llaminar2::moe_overlay_controller_device
                 scratch.current_owner[expert] = owner;
                 scratch.desired_owner[expert] = -1;
                 scratch.excluded[expert] = 0u;
-                ++scratch.quotas[static_cast<std::uint32_t>(owner)];
+                const auto owner_index = static_cast<std::uint32_t>(owner);
+                ++scratch.quotas[owner_index];
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                     ++phase)
+                {
+                    scratch.phase_participant_load[phase][owner_index] =
+                        saturatingAdd(
+                            scratch.phase_participant_load
+                                [phase][owner_index],
+                            scratch.phase_expert_counts[phase][expert]);
+                }
             }
             result.snapshot_observations = saturatingAdd(
                 result.snapshot_observations, observations);
@@ -2734,8 +2712,15 @@ namespace llaminar2::moe_overlay_controller_device
                             minimum_improvement_per_mille);
                     result.residency_rejected_cycles +=
                         economy.residency_eligible ? 0u : 1u;
+                    result.phase_tradeoff_candidates +=
+                        economy.phase_non_regressing ? 0u : 1u;
+                    result.improvement_floor_rejected_cycles +=
+                        economy.improvement_floor_met ? 0u : 1u;
                     result.payoff_rejected_cycles +=
-                        economy.payoff_eligible ? 0u : 1u;
+                        economy.improvement_floor_met &&
+                                !economy.payoff_eligible
+                            ? 1u
+                            : 0u;
                     if (!economy.eligible())
                     {
                         ++result.rejected_cycles;
@@ -2907,6 +2892,37 @@ namespace llaminar2::moe_overlay_controller_device
                 {
                     scratch.current_owner[expert] =
                         scratch.candidate_owner[expert];
+                    /* Economy rejection belongs to the placement that was
+                     * just replaced. Removing one straggler can make a
+                     * previously neutral cycle the next critical-path win. */
+                    scratch.excluded[expert] = 0u;
+                }
+                /* Keep the layer-local critical-path cache coherent with the
+                 * newly accepted owner map. Later cycle candidates in this
+                 * same wave then price against exactly the placement they
+                 * would follow, without rebuilding all expert loads. */
+                for (std::uint32_t phase = 0u;
+                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                     ++phase)
+                {
+                    for (std::uint32_t participant = 0u;
+                         participant < participant_count;
+                         ++participant)
+                    {
+                        scratch.phase_participant_load[phase][participant] =
+                            0u;
+                    }
+                    for (std::uint32_t expert = 0u;
+                         expert < expert_count;
+                         ++expert)
+                    {
+                        const auto owner = static_cast<std::uint32_t>(
+                            scratch.current_owner[expert]);
+                        scratch.phase_participant_load[phase][owner] =
+                            saturatingAdd(
+                                scratch.phase_participant_load[phase][owner],
+                                scratch.phase_expert_counts[phase][expert]);
+                    }
                 }
                 working_score = candidate_score;
                 result.projected_service_gain_ns = saturatingAdd(

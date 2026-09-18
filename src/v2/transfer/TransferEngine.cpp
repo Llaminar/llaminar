@@ -2669,23 +2669,26 @@ namespace llaminar2
         return cursors;
     }
 
-    void TransferEngine::enqueueMappedTransferInterval(
-        DeviceTransferBuffer &interval, MappedTransferInterval value,
-        void *stream) const
+    void TransferEngine::enqueueMappedTransferWakeState(
+        MappedHostTransferRegion &wake, MappedTransferWakeState value,
+        DeviceId device, void *stream) const
     {
-        if (!interval.isBound() || !interval.contains(0u, sizeof(std::uint32_t)) || !stream ||
-            (value != MappedTransferInterval::Open && value != MappedTransferInterval::Closed))
-            throw std::invalid_argument("Mapped transfer interval requires a bound private word, typed state and exact stream");
-        auto *backend = resolveBackend(interval.device());
-        if (!backend || !backend->enqueueMappedTransferInterval(
-                static_cast<std::uint32_t *>(interval.mutableDeviceData()), value,
-                interval.device().gpu_ordinal(), stream))
-            throw std::runtime_error("Mapped transfer interval publication failed");
+        if (!wake.isBound() || !device.is_gpu() || !wake.hasDevice(device) ||
+            !wake.contains(0u, sizeof(std::uint64_t)) || !stream ||
+            (value != MappedTransferWakeState::InferenceActive &&
+             value != MappedTransferWakeState::InferenceComplete))
+            throw std::invalid_argument("Mapped transfer wake transition requires one bound mapped word, a typed graph state and an exact stream");
+        auto *backend = resolveBackend(device);
+        if (!backend || backend != wake.backendFor(device) ||
+            !backend->enqueueMappedTransferWakeState(
+                static_cast<std::uint64_t *>(wake.deviceAlias(device)), value,
+                device.gpu_ordinal(), stream))
+            throw std::runtime_error("Mapped transfer wake-state publication failed");
     }
 
     void TransferEngine::enqueueMappedTransferService(
         const MappedHostTransferRegion &inbox, DeviceTransferBuffer &cursors,
-        size_t maximum_bytes, const DeviceTransferBuffer *interval,
+        size_t maximum_bytes, const MappedHostTransferRegion *wake,
         MappedTransferServiceRun run, void *stream) const
     {
         const auto device = cursors.device();
@@ -2696,20 +2699,23 @@ namespace llaminar2
             !stream || !maximum_bytes || !capacity ||
             cursors.sizeBytes() % sizeof(MappedTransferServiceCursor) != 0u ||
             capacity > inbox.sizeBytes() / record_bytes ||
-            (run != MappedTransferServiceRun::PublishedPass && run != MappedTransferServiceRun::CapturedInterval) ||
-            ((run == MappedTransferServiceRun::CapturedInterval) != (interval != nullptr)) ||
-            (interval && (!interval->isBound() || interval->device() != device ||
-                          !interval->contains(0u, sizeof(std::uint32_t)))))
-            throw std::invalid_argument("Mapped transfer service has invalid physical inbox, cursor, interval or stream ownership");
+            (run != MappedTransferServiceRun::CapturedInterval &&
+             run != MappedTransferServiceRun::FinitePass) ||
+            ((run == MappedTransferServiceRun::CapturedInterval) !=
+             (wake != nullptr)) ||
+            (wake && (!wake->isBound() || !wake->hasDevice(device) ||
+                      !wake->contains(0u, sizeof(std::uint64_t)))))
+            throw std::invalid_argument("Mapped transfer service has invalid physical inbox, cursor, wake-state or stream ownership");
         auto *backend = resolveBackend(device);
         if (!backend || backend != inbox.backendFor(device) ||
+            (wake && backend != wake->backendFor(device)) ||
             !backend->enqueueMappedTransferService(
                 static_cast<const MappedTransferProgressCommand *>(inbox.deviceAlias(device)),
                 static_cast<MappedTransferProgressCompletion *>(inbox.deviceAlias(
                     device, capacity * sizeof(MappedTransferProgressCommand))),
                 static_cast<MappedTransferServiceCursor *>(cursors.mutableDeviceData()),
                 capacity, maximum_bytes,
-                interval ? static_cast<const std::uint32_t *>(interval->deviceData()) : nullptr,
+                wake ? static_cast<const std::uint64_t *>(wake->deviceAlias(device)) : nullptr,
                 run, device.gpu_ordinal(), stream))
             throw std::runtime_error("Mapped transfer service launch rejected by the exact backend");
     }

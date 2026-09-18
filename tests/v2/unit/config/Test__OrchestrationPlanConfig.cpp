@@ -133,6 +133,8 @@ TEST(OrchestrationPlanConfig, CompactTiersResolveRolesByPriorityNotDeclarationOr
     EXPECT_EQ(plan.continuation_domain, "compute");
     EXPECT_EQ(plan.shared_expert_domain, "compute");
     EXPECT_EQ(plan.effectiveBaseModelDomain(), "compute");
+    EXPECT_EQ(plan.residency_policy,
+              RoutedExpertResidencyPolicy::RoutedTierRebalanced);
     EXPECT_EQ(plan.continuation_domain_spec.effectiveDensePolicy(), DenseParallelPolicy::TensorParallel);
     ASSERT_EQ(plan.routed_tiers.size(), 2u);
     EXPECT_TRUE(plan.routed_tiers[0].fallback);
@@ -210,6 +212,33 @@ TEST(OrchestrationPlanConfig, ExpandedDomainsAcceptTheSameOmittedDefaults)
                               "--moe-routed-expert-domain", "accelerator=cuda:0",
                               "--moe-routed-expert-tier", "a@accelerator;priority=3"});
     EXPECT_EQ(config.moe_routed_expert_plan->continuation_domain, "accelerator");
+    EXPECT_EQ(config.moe_routed_expert_plan->residency_policy,
+              RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+}
+
+TEST(OrchestrationPlanConfig, ExpertOverlayResidencyDefaultTracksMaintenanceIntent)
+{
+    const auto dynamic = parse({
+        "--expert-tier", "compute=cuda:0,cuda:1;priority=0"});
+    ASSERT_TRUE(dynamic.moe_routed_expert_plan);
+    EXPECT_EQ(dynamic.moe_rebalance.mode,
+              MoERebalanceRuntimeMode::Dynamic);
+    EXPECT_EQ(dynamic.moe_routed_expert_plan->residency_policy,
+              RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+
+    const auto disabled = parse({
+        "--expert-tier", "compute=cuda:0,cuda:1;priority=0",
+        "--moe-residency-maintenance", "off"});
+    ASSERT_TRUE(disabled.moe_routed_expert_plan);
+    EXPECT_EQ(disabled.moe_routed_expert_plan->residency_policy,
+              RoutedExpertResidencyPolicy::StaticById);
+
+    const auto explicit_static = parse({
+        "--expert-tier", "compute=cuda:0,cuda:1;priority=0",
+        "--moe-routed-expert-residency", "static-by-id"});
+    ASSERT_TRUE(explicit_static.moe_routed_expert_plan);
+    EXPECT_EQ(explicit_static.moe_routed_expert_plan->residency_policy,
+              RoutedExpertResidencyPolicy::StaticById);
 }
 
 TEST(OrchestrationPlanConfig, CompactDeclarationsRejectAmbiguityAndOverflow)

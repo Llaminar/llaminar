@@ -222,7 +222,10 @@ namespace llaminar2
         }
         else if (config.max_depth <= 0)
         {
-            config.max_depth = configured_draft_tokens;
+            // An absent adaptive ceiling means every production-supported
+            // depth is eligible.  It must not inherit the unrelated fixed
+            // depth, whose default of one would silently disable adaptation.
+            config.max_depth = defaultMTPAdaptiveMaximumDraftDepth();
         }
         if (config.initial_depth <= 0)
         {

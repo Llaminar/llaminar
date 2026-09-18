@@ -43,7 +43,11 @@ namespace llaminar2
         std::uint64_t projected_inference_interference_ns = 0u;
         /** Positive measured benefit retained after every admitted cost. */
         std::uint64_t projected_net_benefit_ns = 0u;
-        /** Cycles rejected because their measured payoff was insufficient. */
+        /** Candidates trading one measured phase for aggregate service gain. */
+        std::uint32_t phase_tradeoff_candidates = 0u;
+        /** Cycles rejected by the configured relative-improvement floor. */
+        std::uint32_t improvement_floor_rejected_cycles = 0u;
+        /** Cycles reaching the net-payoff equation but failing it. */
         std::uint32_t payoff_rejected_cycles = 0u;
         /** Cycles rejected by committed-movement hysteresis. */
         std::uint32_t residency_rejected_cycles = 0u;

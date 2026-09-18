@@ -5,9 +5,10 @@
  * @date 2025
  *
  * Provides chat template support for formatting multi-turn conversations
- * according to model-specific formats. Primary rendering uses the vendored
- * Jinja2 template engine (from llama.cpp) for proper template execution.
- * Falls back to hardcoded format implementations if Jinja rendering fails.
+ * according to model-specific formats. Primary rendering uses one immutable,
+ * model-lifetime program compiled by the vendored Jinja2 template engine and
+ * request-local execution contexts. Falls back to hardcoded format
+ * implementations if Jinja compilation or rendering fails.
  */
 
 #pragma once
@@ -266,7 +267,8 @@ namespace llaminar2
         std::string thinking_start_tag_;
         std::string thinking_end_tag_;
 
-        // Opaque pointer to compiled Jinja program (avoids jinja headers in public API)
+        // Opaque owner of the immutable compiled program. Request execution
+        // never mutates it, so parsing and its allocator footprint are paid once.
         struct JinjaState;
         std::unique_ptr<JinjaState> jinja_state_;
     };

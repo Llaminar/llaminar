@@ -580,6 +580,11 @@ namespace llaminar2
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             MTPConditionForwardPurpose purpose,
             int request_index = 0) override;
+        /** @copydoc IInferenceRunner::advanceOrdinaryMainConditionFromDeviceResidentLogicalState */
+        bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
         /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
@@ -1031,6 +1036,10 @@ namespace llaminar2
             int first_draft_slot = 0) override;
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
+            int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishForcedDeviceResidentConditionToken */
+        bool publishForcedDeviceResidentConditionToken(
+            int32_t token,
             int target_sample_slot = 0) override;
         bool publishDeviceResidentConditionTokenToTargetSampleSlot(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -1983,6 +1992,25 @@ namespace llaminar2
         /** Per-participant authenticated tickets retained between observe/submit. */
         std::vector<sampling_math::DeviceGenerationDispatchTicket>
             rank_hosted_device_generation_tickets_;
+        /**
+         * @brief Rank-owned admission state for the first hosted transaction.
+         *
+         * An ordinary continuation whose leading token was already emitted
+         * begins with a real sparse decode graph, unlike a fresh prefill whose
+         * first hosted operation is only a scalar sample.  The rank must open
+         * that one shared ExpertOverlay sequence before its symmetric children
+         * enter the retained graph.  Encoding the transition explicitly keeps
+         * participant scheduling order from becoming lifecycle authority.
+         */
+        enum class HostedInitialGraphSequence : std::uint8_t
+        {
+            Inactive = 0, ///< No resident-generation request is admitted.
+            NotRequired, ///< Initial operation has no rank-wide sparse graph.
+            Required, ///< Hosted ordinary continuation awaits sequence admission.
+            Admitted, ///< The rank opened the initial depth-zero sequence.
+        };
+        HostedInitialGraphSequence hosted_initial_graph_sequence_ =
+            HostedInitialGraphSequence::Inactive;
         /**
          * Allocation-free participant tickets for ordinary HIP MoE cadence.
          *

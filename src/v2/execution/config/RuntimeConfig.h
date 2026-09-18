@@ -584,7 +584,7 @@ namespace llaminar2
         MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
         MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
         int min_depth = 1;
-        int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
+        int max_depth = 0;     ///< 0 selects the complete supported adaptive range.
         int initial_depth = 0; ///< 0 derives from a policy-specific default.
         int window_size = 16;
         int min_samples = 4;
@@ -658,7 +658,9 @@ namespace llaminar2
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
     {
         const int effective_max_depth =
-            config.max_depth > 0 ? config.max_depth : configured_draft_tokens;
+            config.max_depth > 0
+                ? config.max_depth
+                : defaultMTPAdaptiveMaximumDraftDepth();
         if (config.initial_depth > 0)
             return config.initial_depth;
         if (config.mode == MTPDepthPolicyMode::Fixed)
@@ -992,13 +994,15 @@ namespace llaminar2
     /**
      * @brief Resolve request defaults for the existing host/controller interface.
      * @param config Topology-bound runtime view of the admitted request.
-     * @return Policy with a concrete demotion threshold and unchanged other fields.
+     * @return Policy with concrete automatic thresholds and adaptive ceiling.
      */
     [[nodiscard]] inline MTPDepthPolicyConfig resolveMTPDepthPolicyConfig(
         const MTPRuntimeConfig &config)
     {
         auto policy = config.depth_policy;
         policy.demote_zero_accept_rate = resolveMTPZeroAcceptDemotionRate(config);
+        if (policy.mode != MTPDepthPolicyMode::Fixed && policy.max_depth <= 0)
+            policy.max_depth = defaultMTPAdaptiveMaximumDraftDepth();
         return policy;
     }
 
@@ -1019,7 +1023,7 @@ namespace llaminar2
             1,
             config.depth_policy.max_depth > 0
                 ? config.depth_policy.max_depth
-                : config.draft_tokens);
+                : defaultMTPAdaptiveMaximumDraftDepth());
     }
 
     /**
@@ -1138,7 +1142,7 @@ namespace llaminar2
     struct MTPRequestPolicy
     {
         bool enabled = false; ///< Whether the next request executes MTP.
-        int draft_tokens = 1; ///< Fixed depth or adaptive fallback ceiling.
+        int draft_tokens = 1; ///< Fixed execution depth; adaptive bounds are separate.
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
@@ -1209,7 +1213,9 @@ namespace llaminar2
             if (depth.min_depth < 0)
                 return "MTP request minimum adaptive depth must be non-negative";
             requested_maximum =
-                depth.max_depth > 0 ? depth.max_depth : policy.draft_tokens;
+                depth.max_depth > 0
+                    ? depth.max_depth
+                    : defaultMTPAdaptiveMaximumDraftDepth();
             if (requested_maximum < depth.min_depth)
                 return "MTP request maximum adaptive depth is below its minimum";
             if (depth.initial_depth < 0 ||

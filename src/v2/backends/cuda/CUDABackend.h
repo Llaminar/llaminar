@@ -219,6 +219,12 @@ namespace llaminar2
             void *generated_token_counts_device,
             int device_id,
             void *stream) override;
+        bool enqueueCommitGenerationTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
@@ -915,9 +921,9 @@ namespace llaminar2
             MappedTransferServiceCursor *cursors, size_t capacity,
             int device_id, void *stream) override;
 
-        /** @copydoc IBackend::enqueueMappedTransferInterval */
-        bool enqueueMappedTransferInterval(
-            std::uint32_t *interval, MappedTransferInterval value,
+        /** @copydoc IBackend::enqueueMappedTransferWakeState */
+        bool enqueueMappedTransferWakeState(
+            std::uint64_t *wake, MappedTransferWakeState value,
             int device_id, void *stream) override;
 
         /** @copydoc IBackend::enqueueMappedTransferService */
@@ -925,7 +931,7 @@ namespace llaminar2
             const MappedTransferProgressCommand *commands,
             MappedTransferProgressCompletion *completions,
             MappedTransferServiceCursor *cursors, size_t capacity,
-            size_t maximum_bytes, const std::uint32_t *interval,
+            size_t maximum_bytes, const std::uint64_t *wake,
             MappedTransferServiceRun run, int device_id, void *stream) override;
 
         /** @copydoc IBackend::enqueueMappedTransferProgressClaims */

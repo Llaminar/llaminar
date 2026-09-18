@@ -228,6 +228,12 @@ struct DevicePlanConfig
      */
     int device_compute_units = 0;
     CPUExecutionGeometry cpu_execution; ///< Rank-published CPU kernel geometry; absent for GPU resources.
+    /**
+     * Local backend context is live, so workspace admission may query its
+     * exact device-selected kernel policy. Remote and metadata-only plans keep
+     * this false and use device-free bounds.
+     */
+    bool runtime_device_policy_available = false;
 
     // TP configuration for this device
     int shard_index = 0;

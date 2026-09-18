@@ -2110,6 +2110,11 @@ namespace llaminar2
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             MTPConditionForwardPurpose purpose,
             int request_index = 0) override;
+        /** @copydoc IInferenceRunner::advanceOrdinaryMainConditionFromDeviceResidentLogicalState */
+        bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
         /** @copydoc IInferenceRunner::advanceMTPMainConditionFromDeviceTargetSample */
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
@@ -2853,6 +2858,10 @@ namespace llaminar2
             int first_draft_slot = 0) override;
         bool stageStochasticTargetTokenForDeviceSampling(
             int32_t target_token,
+            int target_sample_slot = 0) override;
+        /** @copydoc IInferenceRunner::publishForcedDeviceResidentConditionToken */
+        bool publishForcedDeviceResidentConditionToken(
+            int32_t token,
             int target_sample_slot = 0) override;
         bool publishDeviceResidentConditionTokenToTargetSampleSlot(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
@@ -8025,6 +8034,8 @@ namespace llaminar2
             enum class Kind : uint8_t
             {
                 CapturedLocal = 0,
+                /** Retained MainDecode plus sampler under one overlay scope. */
+                OrdinaryExpertOverlayReplay,
                 MTPFullSidecarReplay,
                 MTPChainedSidecarReplay,
                 MTPGroupedVerifierReplay,
@@ -8055,6 +8066,26 @@ namespace llaminar2
                        condition_word_device == other.condition_word_device &&
                        minimum_selector == other.minimum_selector;
             }
+        };
+
+        /**
+         * @brief Declares the sole owner of an ordinary generation parent.
+         *
+         * CompleteLocal retains one participant-local forward/sampler loop.
+         * PipelineTail exposes only the tail recordings because the rank-owned
+         * pipeline parent supplies the explicit activation transport.  ExpertOverlay
+         * retains the same complete local loop whose @c MainInference forward
+         * is already decorated with the per-transaction acquire/release edge.
+         * Keeping this as a typed composition prevents a plain local graph from
+         * accidentally replaying while the forward carries an overlay reader
+         * lease.  The boundary stays inside that complete model capture rather
+         * than being duplicated around the parent sampler loop.
+         */
+        enum class OrdinaryGenerationComposition : uint8_t
+        {
+            CompleteLocal = 0,
+            PipelineTail,
+            ExpertOverlay,
         };
 
         /**
@@ -8098,6 +8129,8 @@ namespace llaminar2
             std::optional<OrdinaryGenerationSamplingStage::Params> ordinary_sampling_identity;
             /** Complete forward identity, not a last-executed diagnostic handle. */
             std::optional<ForwardGraphSignature> ordinary_forward_identity;
+            /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
+            std::optional<OrdinaryGenerationComposition> ordinary_composition;
             /** Immutable initial frontier selects sampling versus consumption. */
             sampling_math::DeviceGenerationLeadingRowDisposition ordinary_leading =
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
@@ -8171,6 +8204,7 @@ namespace llaminar2
                     child.reset();
                 ordinary_sampling_identity.reset();
                 ordinary_forward_identity.reset();
+                ordinary_composition.reset();
                 workspace_generation = 0;
                 request_count = 0;
                 draft_depth = 0;
@@ -11132,6 +11166,28 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Enqueue one complete ordinary heterogeneous decode transaction.
+         *
+         * The retained forward owns the real production sparse plan. This
+         * method admits every LocalTP participant into one MainDecode group,
+         * stamps the root-issued wire identity, arms the remote follower at the
+         * forward's exact launch edge, and orders the captured sampler after
+         * the forward terminal using device events. No model state crosses the
+         * host and no eager graph or stage replay is permitted.
+         *
+         * @param signature Exact retained MainDecode cache identity.
+         * @param sampler Captured scalar sampler consuming the forward logits.
+         * @param out_producer_stream Receives the sampler/controller stream.
+         * @param error Optional first violated lifecycle invariant.
+         * @return True after both retained executables are enqueued.
+         */
+        bool replayHostedOrdinaryExpertOverlayTransaction(
+            const ForwardGraphSignature &signature,
+            const IGPUGraphCapture *sampler,
+            void **out_producer_stream,
+            std::string *error = nullptr);
+
+        /**
          * @brief Resolve one typed preparation key to its deterministic slot.
          *
          * Scalar keys must already be canonical power-of-two/final physical
@@ -11217,8 +11273,6 @@ namespace llaminar2
          * @return True only for one complete retained policy, without inference launch.
          * The existing controller, event handoff and terminal bridge retain ownership.
          */
-        enum class OrdinaryGenerationComposition { CompleteLocal, PipelineTail };
-
         /** @brief Exact borrowed forward recording and its complete cache identity. */
         struct OrdinaryGenerationForward
         {

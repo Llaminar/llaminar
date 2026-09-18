@@ -3,10 +3,11 @@
  * @brief Fixed-width node-local command ABI for retained GPU transfer epochs.
  *
  * ExpertOverlay maintenance publishes bounded copy commands into host pages
- * that are mapped into one local GPU.  A retained graph snapshots those
- * commands, copies every active slot in parallel, and release-publishes one
- * completion record per slot.  The ABI contains process-local device virtual
- * addresses and is therefore intentionally invalid for inter-node transport.
+ * that are mapped into one local GPU. A retained graph checks those commands
+ * at entry and after a host-authored work notification, copies every active
+ * physical lane in parallel, and release-publishes one completion record per
+ * lane. The ABI contains process-local device virtual addresses and is
+ * therefore intentionally invalid for inter-node transport.
  */
 
 #pragma once
@@ -56,34 +57,41 @@ namespace llaminar2
         InvalidByteCount = 3u,
     };
 
-    /** Captured service lifetime; only GPU nodes open and close an interval. */
-    enum class MappedTransferInterval : std::uint32_t
+    /** Device-owned lifetime of one graph-bounded CUDA transfer service. */
+    enum class MappedTransferWakeState : std::uint64_t
     {
-        Closed = 0u, ///< No inference interval owns this private graph state.
-        Open = 1u,   ///< Copy quanta may run alongside this captured interval.
+        InferenceActive = 0u, ///< Root opened the service interval.
+        InferenceComplete = 1u, ///< Primary graph terminal closed the interval.
     };
 
-    /** Explicit finite-idle versus captured-interval execution contract. */
+    /** @return Whether a wake generation carries the primary terminal bit. */
+    constexpr bool mappedTransferWakeIsComplete(std::uint64_t value) noexcept
+    {
+        return (value & static_cast<std::uint64_t>(
+            MappedTransferWakeState::InferenceComplete)) != 0u;
+    }
+
+    /** Explicit graph-bounded versus independently queued service lifetime. */
     enum class MappedTransferServiceRun : std::uint8_t
     {
-        PublishedPass, ///< Visit the currently published inbox once and return.
-        CapturedInterval, ///< Retire at a quantum boundary when the graph closes.
+        CapturedInterval, ///< Progress until the primary graph closes the interval.
+        FinitePass, ///< Visit the currently published inbox once and return.
     };
 
     /**
-     * @brief Device-only claimant and resumable cursor for one bounded inbox.
+     * @brief Device-only claimant and generation ledger for one bounded inbox.
      *
      * The GPU lock is acquired by executing work, never reserved by host enqueue.
      * A queued idle submission therefore cannot exclude a resident graph worker.
      * The owner retains the lock through copying and system publication, then
-     * releases it. Graph retirement checkpoints the cursor without completing
-     * the command, so a later interval or finite idle pass resumes exactly once.
-     * This array is sized by physical concurrency, not permanent topology slots.
+     * releases it. Both graph-owned and independently queued finite passes share
+     * this claim, so exactly one of them completes a generation. This array is
+     * sized by physical concurrency, not permanent topology slots.
      */
     struct alignas(64) MappedTransferServiceCursor
     {
         std::uint64_t generation = 0u; ///< Inbox generation owning the cursor.
-        std::uint64_t copied_bytes = 0u; ///< Published only by the GPU claimant.
+        std::uint64_t copied_bytes = 0u; ///< Completion extent of the generation.
         std::uint64_t command_bytes = 0u; ///< Immutable extent of this generation.
         std::uint32_t claimed = 0u; ///< Device-scope exclusive claimant word.
         std::uint32_t reserved0 = 0u;

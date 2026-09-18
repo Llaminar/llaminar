@@ -220,11 +220,11 @@ namespace
             ++service_initializations; return true;
         }
 
-        /** Record one typed private graph transition, not a host-side state mirror. */
-        bool enqueueMappedTransferInterval(std::uint32_t *interval, MappedTransferInterval value,
+        /** Record one typed private graph wake transition. */
+        bool enqueueMappedTransferWakeState(std::uint64_t *wake, MappedTransferWakeState value,
             int ordinal, void *stream) override
         {
-            service_interval = interval; service_interval_value = value;
+            service_wake = wake; service_wake_value = value;
             service_ordinal = ordinal; service_stream = stream;
             ++service_transitions; return true;
         }
@@ -232,11 +232,11 @@ namespace
         /** Record only immutable service bindings and the explicit lifetime policy. */
         bool enqueueMappedTransferService(const MappedTransferProgressCommand *commands,
             MappedTransferProgressCompletion *completions, MappedTransferServiceCursor *,
-            size_t capacity, size_t, const std::uint32_t *interval,
+            size_t capacity, size_t, const std::uint64_t *wake,
             MappedTransferServiceRun run, int ordinal, void *stream) override
         {
             service_commands = commands; service_completions = completions;
-            service_capacity = capacity; service_interval = interval; service_run = run;
+            service_capacity = capacity; service_wake = wake; service_run = run;
             service_ordinal = ordinal; service_stream = stream; ++service_calls;
             return progress_calls_succeed;
         }
@@ -247,11 +247,12 @@ namespace
         size_t service_calls = 0u;
         int service_ordinal = -1;
         void *service_stream = nullptr;
-        const std::uint32_t *service_interval = nullptr;
+        const std::uint64_t *service_wake = nullptr;
         const MappedTransferProgressCommand *service_commands = nullptr;
         MappedTransferProgressCompletion *service_completions = nullptr;
-        MappedTransferInterval service_interval_value = MappedTransferInterval::Closed;
-        MappedTransferServiceRun service_run = MappedTransferServiceRun::PublishedPass;
+        MappedTransferWakeState service_wake_value =
+            MappedTransferWakeState::InferenceComplete;
+        MappedTransferServiceRun service_run = MappedTransferServiceRun::FinitePass;
         bool registration_succeeds = true;
         bool timeline_calls_succeed = true;
         bool progress_calls_succeed = true;
@@ -379,24 +380,26 @@ TEST_F(Test__MappedHostTransferRegion, ResumableServiceUsesExactBindingsWithoutB
         constexpr size_t capacity = 7u;
         const DeviceId devices[] = {device};
         auto inbox = engine_.allocateMappedHostRegion(capacity * 128u, devices);
-        auto interval = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device);
+        auto wake = engine_.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
         auto *stream = reinterpret_cast<void *>(0x12340u);
         auto cursors = engine_.allocateMappedTransferServiceCursors(capacity, device, stream);
-        engine_.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Open, stream);
-        engine_.enqueueMappedTransferService(*inbox, *cursors, 4099u, interval.get(),
+        engine_.enqueueMappedTransferWakeState(
+            *wake, MappedTransferWakeState::InferenceActive, device, stream);
+        engine_.enqueueMappedTransferService(*inbox, *cursors, 4099u, wake.get(),
             MappedTransferServiceRun::CapturedInterval, stream);
         EXPECT_EQ(spy.service_capacity, capacity);
         EXPECT_EQ(spy.service_ordinal, device.gpu_ordinal());
         EXPECT_EQ(spy.service_stream, stream);
-        EXPECT_EQ(spy.service_interval, interval->deviceData());
+        EXPECT_EQ(spy.service_wake, wake->deviceAlias(device));
         EXPECT_EQ(spy.service_commands, inbox->deviceAlias(device));
         EXPECT_EQ(spy.service_completions,
             inbox->deviceAlias(device, capacity * sizeof(MappedTransferProgressCommand)));
-        engine_.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Closed, stream);
+        engine_.enqueueMappedTransferWakeState(
+            *wake, MappedTransferWakeState::InferenceComplete, device, stream);
         engine_.enqueueMappedTransferService(*inbox, *cursors, 4099u, nullptr,
-            MappedTransferServiceRun::PublishedPass, stream);
-        EXPECT_EQ(spy.service_interval, nullptr);
-        EXPECT_EQ(spy.service_run, MappedTransferServiceRun::PublishedPass);
+            MappedTransferServiceRun::FinitePass, stream);
+        EXPECT_EQ(spy.service_wake, nullptr);
+        EXPECT_EQ(spy.service_run, MappedTransferServiceRun::FinitePass);
         EXPECT_EQ(spy.service_initializations, 1u);
         EXPECT_EQ(spy.service_transitions, 2u);
         EXPECT_EQ(spy.service_calls, 2u);
@@ -415,29 +418,31 @@ TEST_F(Test__MappedHostTransferRegion, ResumableServiceRejectsIncompleteOrContra
     auto odd = engine_.allocateDeviceTransferBuffer(sizeof(MappedTransferServiceCursor) + 1u, device);
     auto oversized = engine_.allocateDeviceTransferBuffer(
         (inbox->sizeBytes() / 128u + 1u) * sizeof(MappedTransferServiceCursor), device);
-    auto interval = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device);
-    auto foreign = engine_.allocateDeviceTransferBuffer(sizeof(std::uint32_t), DeviceId::rocm(0));
+    auto wake = engine_.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
+    const DeviceId foreign_devices[] = {DeviceId::rocm(0)};
+    auto foreign = engine_.allocateMappedHostRegion(
+        sizeof(std::uint64_t), foreign_devices);
     auto *stream = reinterpret_cast<void *>(0x12340u);
     EXPECT_THROW((void)engine_.allocateMappedTransferServiceCursors(0u, device, stream), std::invalid_argument);
     EXPECT_THROW((void)engine_.allocateMappedTransferServiceCursors(1u, device, nullptr), std::invalid_argument);
-    EXPECT_THROW(engine_.enqueueMappedTransferInterval(*interval,
-        static_cast<MappedTransferInterval>(7u), stream), std::invalid_argument);
-    for (const auto *bad : {static_cast<const DeviceTransferBuffer *>(nullptr),
-                           static_cast<const DeviceTransferBuffer *>(foreign.get())})
+    EXPECT_THROW(engine_.enqueueMappedTransferWakeState(*wake,
+        static_cast<MappedTransferWakeState>(7u), device, stream), std::invalid_argument);
+    for (const auto *bad : {static_cast<const MappedHostTransferRegion *>(nullptr),
+                           static_cast<const MappedHostTransferRegion *>(foreign.get())})
         EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, bad,
             MappedTransferServiceRun::CapturedInterval, stream), std::invalid_argument);
-    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, interval.get(),
-        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
-    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, interval.get(),
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, wake.get(),
+        MappedTransferServiceRun::FinitePass, stream), std::invalid_argument);
+    EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, wake.get(),
         MappedTransferServiceRun::CapturedInterval, nullptr), std::invalid_argument);
     EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *oversized, 4096u, nullptr,
-        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
+        MappedTransferServiceRun::FinitePass, stream), std::invalid_argument);
     EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *odd, 4096u, nullptr,
-        MappedTransferServiceRun::PublishedPass, stream), std::invalid_argument);
+        MappedTransferServiceRun::FinitePass, stream), std::invalid_argument);
     EXPECT_EQ(cuda_->service_calls, 0u);
     cuda_->progress_calls_succeed = false;
     EXPECT_THROW(engine_.enqueueMappedTransferService(*inbox, *cursors, 4096u, nullptr,
-        MappedTransferServiceRun::PublishedPass, stream), std::runtime_error);
+        MappedTransferServiceRun::FinitePass, stream), std::runtime_error);
     EXPECT_EQ(cuda_->service_calls, 1u); // One failure, no retry through another mechanism.
 }
 

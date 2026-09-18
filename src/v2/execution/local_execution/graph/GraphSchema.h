@@ -828,8 +828,9 @@ namespace llaminar2
          * output. Used by ChatCompletionHandler to parse structured tool_calls
          * from model output.
          *
-         * Default: HERMES_2_PRO (covers Qwen 2.5, Qwen 3, Hermes, most models).
-         * Override in model-specific factories to use a different format.
+         * Default: HERMES_2_PRO for legacy JSON-in-tag templates. Override in
+         * model-specific factories whenever the installed template uses a
+         * different payload grammar; sharing outer tags is not sufficient.
          *
          * @return ToolCallFormat enum value
          */

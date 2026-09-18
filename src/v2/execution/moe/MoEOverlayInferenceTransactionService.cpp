@@ -1484,7 +1484,7 @@ namespace llaminar2
         total_transaction_count_ = 0;
         graph_sequence_count_ = 0;
         last_hosted_sequence_transition_id_ = 0;
-        last_hosted_sequence_next_draft_depth_.reset();
+        last_hosted_sequence_transition_.reset();
         last_hosted_sequence_committed_output_tokens_ = 0u;
         current_placement_epoch_ = command.initial_placement_epoch;
         failure_.clear();
@@ -2579,7 +2579,7 @@ namespace llaminar2
     bool MoEOverlayInferenceTransactionCoordinator::
         advanceHostedGraphSequence(
             std::uint64_t transaction_id,
-            std::optional<int> next_draft_depth,
+            HostedGraphSequenceTransition transition,
             std::uint64_t committed_output_tokens,
             std::string *error)
     {
@@ -2593,13 +2593,33 @@ namespace llaminar2
                 "ExpertOverlay hosted graph transition requires a positive authenticated transaction id",
                 error);
         }
-        if (next_draft_depth &&
-            (*next_draft_depth <= 0 ||
-             *next_draft_depth > config_.max_mtp_draft_depth))
+        switch (transition.kind())
         {
-            return failLocked(
-                "ExpertOverlay hosted graph transition selected a depth outside the retained MTP family",
-                error);
+        case HostedGraphSequenceTransition::Kind::OrdinaryDecode:
+            if (transition.draftDepth() != 0)
+            {
+                return failLocked(
+                    "ExpertOverlay ordinary hosted graph transition must select serial depth zero",
+                    error);
+            }
+            break;
+        case HostedGraphSequenceTransition::Kind::SpeculativeMTP:
+            if (transition.draftDepth() <= 0 ||
+                transition.draftDepth() > config_.max_mtp_draft_depth)
+            {
+                return failLocked(
+                    "ExpertOverlay hosted graph transition selected a depth outside the retained MTP family",
+                    error);
+            }
+            break;
+        case HostedGraphSequenceTransition::Kind::Terminal:
+            if (transition.draftDepth() != -1)
+            {
+                return failLocked(
+                    "ExpertOverlay terminal hosted graph transition carries a successor depth",
+                    error);
+            }
+            break;
         }
 
         /*
@@ -2610,8 +2630,8 @@ namespace llaminar2
          */
         if (transaction_id == last_hosted_sequence_transition_id_)
         {
-            if (next_draft_depth !=
-                    last_hosted_sequence_next_draft_depth_ ||
+            if (!last_hosted_sequence_transition_ ||
+                transition != *last_hosted_sequence_transition_ ||
                 committed_output_tokens !=
                     last_hosted_sequence_committed_output_tokens_)
             {
@@ -2635,10 +2655,17 @@ namespace llaminar2
                 error);
         }
 
-        if (!retireCompletedGraphSequenceLocked(error))
+        const bool initial_sample_without_sparse_graph =
+            last_hosted_sequence_transition_id_ == 0u &&
+            !execution_sequence_.active() && transaction_count_ == 0u;
+        if (!initial_sample_without_sparse_graph &&
+            !retireCompletedGraphSequenceLocked(error))
+        {
             return false;
-        if (next_draft_depth &&
-            !beginGraphSequenceLocked(*next_draft_depth, error))
+        }
+        if (transition.kind() !=
+                HostedGraphSequenceTransition::Kind::Terminal &&
+            !beginGraphSequenceLocked(transition.draftDepth(), error))
         {
             return false;
         }
@@ -2661,9 +2688,22 @@ namespace llaminar2
         }
 
         last_hosted_sequence_transition_id_ = transaction_id;
-        last_hosted_sequence_next_draft_depth_ = next_draft_depth;
+        last_hosted_sequence_transition_ = transition;
         last_hosted_sequence_committed_output_tokens_ =
             committed_output_tokens;
+        const char *const successor = [&transition]() noexcept
+        {
+            switch (transition.kind())
+            {
+            case HostedGraphSequenceTransition::Kind::OrdinaryDecode:
+                return "ordinary_decode";
+            case HostedGraphSequenceTransition::Kind::SpeculativeMTP:
+                return "speculative_mtp";
+            case HostedGraphSequenceTransition::Kind::Terminal:
+                return "terminal";
+            }
+            std::terminate();
+        }();
         PerfStatsCollector::addCounter(
             "moe_overlay_transaction",
             "hosted_sequence_transitions",
@@ -2671,15 +2711,19 @@ namespace llaminar2
             "decode",
             "continuation_rank",
             {{"transaction", std::to_string(transaction_id)},
-             {"terminal", next_draft_depth ? "false" : "true"},
-             {"next_depth",
-              next_draft_depth
-                  ? std::to_string(*next_draft_depth)
-                  : "terminal"},
+             {"terminal", transition.kind() ==
+                     HostedGraphSequenceTransition::Kind::Terminal
+                 ? "true" : "false"},
+             {"successor", successor},
+             {"next_depth", transition.kind() ==
+                     HostedGraphSequenceTransition::Kind::Terminal
+                 ? "terminal" : std::to_string(transition.draftDepth())},
              {"completed_logical_tokens",
               std::to_string(completed_delta)},
              {"committed_output_tokens",
               std::to_string(committed_output_tokens)},
+             {"retired_sparse_sequence",
+              initial_sample_without_sparse_graph ? "false" : "true"},
              {"authority", "idempotent_ticket"}});
         return true;
     }

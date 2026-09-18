@@ -75,6 +75,18 @@ namespace llaminar2
             return qwenStopThinkingPrompt();
         }
 
+        /**
+         * @brief Select the nested function/parameter grammar in the installed template.
+         *
+         * Qwen 3.5 and its later dense derivatives do not emit Hermes JSON
+         * inside @c <tool_call>.  Keeping this selection beside the schema
+         * prevents the HTTP frontend from guessing based on delimiters.
+         */
+        ToolCallFormat getToolCallFormat() const override
+        {
+            return ToolCallFormat::QWEN_3_XML;
+        }
+
         WeightShardingConfig getWeightShardingConfig() const override
         {
             WeightShardingConfig config;

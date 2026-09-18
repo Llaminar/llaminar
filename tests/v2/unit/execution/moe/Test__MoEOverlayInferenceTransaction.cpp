@@ -10,6 +10,7 @@
 
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -1742,14 +1743,20 @@ namespace llaminar2::test
             [&]
             {
                 return coordinator->advanceHostedGraphSequence(
-                    1, 2, /*committed_output_tokens=*/3);
+                    1,
+                    MoEOverlayInferenceTransactionCoordinator::
+                        HostedGraphSequenceTransition::speculativeMTP(2),
+                    /*committed_output_tokens=*/3);
             });
         auto sibling_advance = std::async(
             std::launch::async,
             [&]
             {
                 return coordinator->advanceHostedGraphSequence(
-                    1, 2, /*committed_output_tokens=*/3);
+                    1,
+                    MoEOverlayInferenceTransactionCoordinator::
+                        HostedGraphSequenceTransition::speculativeMTP(2),
+                    /*committed_output_tokens=*/3);
             });
         EXPECT_TRUE(first_advance.get());
         EXPECT_TRUE(sibling_advance.get());
@@ -1760,9 +1767,15 @@ namespace llaminar2::test
 
         execute_active_sequence(2);
         EXPECT_TRUE(coordinator->advanceHostedGraphSequence(
-            2, std::nullopt, /*committed_output_tokens=*/5));
+            2,
+            MoEOverlayInferenceTransactionCoordinator::
+                HostedGraphSequenceTransition::terminal(),
+            /*committed_output_tokens=*/5));
         EXPECT_TRUE(coordinator->advanceHostedGraphSequence(
-            2, std::nullopt, /*committed_output_tokens=*/5));
+            2,
+            MoEOverlayInferenceTransactionCoordinator::
+                HostedGraphSequenceTransition::terminal(),
+            /*committed_output_tokens=*/5));
         EXPECT_EQ(coordinator->activeMTPDraftDepth(), -1);
         EXPECT_EQ(retired_decode_tokens, 5u);
         EXPECT_EQ(retired_decode_notifications, 2u);
@@ -1784,6 +1797,232 @@ namespace llaminar2::test
         EXPECT_EQ(publisher->completeCount(), 1u);
         EXPECT_EQ(
             publisher->completedRetiredDecodeProgressTokens(), 5u);
+    }
+
+    /**
+     * @brief Long hosted generation admits recurring maintenance before return.
+     *
+     * One public generation call can retain 1,024 serial decode transactions.
+     * The immutable transaction frontier must therefore feed four 256-token
+     * controller windows while that call is still active; publishing only the
+     * terminal aggregate would postpone every useful movement until the next
+     * request and make Dynamic indistinguishable from Static over one horizon.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         HostedDecodeFrontierAdmitsMultipleWindowsBeforeOuterTerminal)
+    {
+        using HostedTransition =
+            MoEOverlayInferenceTransactionCoordinator::
+                HostedGraphSequenceTransition;
+        constexpr std::uint64_t kWindowTokens = 256u;
+        constexpr std::uint64_t kResponseTokens = 1024u;
+
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        MoEOverlayMaintenanceBoundaryGate gate(kWindowTokens);
+        std::uint64_t admitted_windows = 0u;
+        std::uint64_t admitted_tokens = 0u;
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
+                    .continuation_participant_count = 1,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                    },
+                    .max_transactions_per_command = 1,
+                    .max_mtp_draft_depth = 3,
+                    .retired_decode_progress_sink =
+                        [&gate, &admitted_windows, &admitted_tokens](
+                            std::uint64_t completed_tokens,
+                            std::string *)
+                    {
+                        gate.notify(
+                            MoEOverlayInferencePhase::Decode,
+                            completed_tokens);
+                        if (auto window = gate.consumeReady())
+                        {
+                            ++admitted_windows;
+                            admitted_tokens += window.completed_tokens;
+                        }
+                        return true;
+                    },
+                });
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+        ASSERT_TRUE(coordinator->beginGraphSequence(/*draft_depth=*/0));
+
+        const MoEOverlayInferenceExecutionDescriptor decode{
+            .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+        };
+        for (std::uint64_t token = 1u; token <= kResponseTokens; ++token)
+        {
+            const auto binding =
+                coordinator->beginParticipantGraph(decode, 0);
+            ASSERT_TRUE(binding.ok) << "token=" << token << " "
+                                    << binding.error;
+            ASSERT_TRUE(coordinator->armParticipantGraph(binding));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(binding, true));
+            ASSERT_TRUE(coordinator->advanceHostedGraphSequence(
+                token,
+                token == kResponseTokens
+                    ? HostedTransition::terminal()
+                    : HostedTransition::ordinaryDecode(),
+                /*committed_output_tokens=*/token));
+
+            if (token == kResponseTokens - 1u)
+            {
+                EXPECT_EQ(admitted_windows, 3u);
+                EXPECT_EQ(admitted_tokens, 3u * kWindowTokens);
+            }
+        }
+
+        EXPECT_EQ(admitted_windows, 4u);
+        EXPECT_EQ(admitted_tokens, kResponseTokens);
+        EXPECT_FALSE(gate.ready());
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), -1);
+        EXPECT_EQ(publisher->publishCount(), kResponseTokens);
+        EXPECT_EQ(publisher->retireCount(), kResponseTokens);
+        ASSERT_TRUE(coordinator->completeCommand(41));
+    }
+
+    /**
+     * @brief Ordinary hosted decode retains depth zero across ticket advances.
+     *
+     * The hosted scheduler is shared with speculative generation, but an
+     * ordinary successor is not an MTP depth.  This regression exercises two
+     * complete serial MainDecode sequences and proves their authenticated
+     * transition cannot be rejected by the positive-depth MTP validator.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         HostedOrdinaryTransitionRetainsSerialDecodePolicy)
+    {
+        using HostedTransition =
+            MoEOverlayInferenceTransactionCoordinator::
+                HostedGraphSequenceTransition;
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
+                    .continuation_participant_count = 2,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                    },
+                    .max_transactions_per_command = 1,
+                    .max_mtp_draft_depth = 3,
+                });
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+
+        const auto execute_serial_decode = [&]
+        {
+            const MoEOverlayInferenceExecutionDescriptor decode{
+                .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                .placement_epoch = 41,
+                .request_count = 1,
+                .logical_rows_per_request = 1,
+                .physical_rows_per_request = 1,
+            };
+            auto first = coordinator->beginParticipantGraph(decode, 0);
+            auto second = coordinator->beginParticipantGraph(decode, 1);
+            ASSERT_TRUE(first.ok) << first.error;
+            ASSERT_TRUE(second.ok) << second.error;
+            ASSERT_TRUE(coordinator->armParticipantGraph(first));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(first, true));
+            ASSERT_TRUE(coordinator->finishParticipantGraph(second, true));
+        };
+
+        ASSERT_TRUE(coordinator->beginGraphSequence(/*draft_depth=*/0));
+        execute_serial_decode();
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(
+            1, HostedTransition::ordinaryDecode(),
+            /*committed_output_tokens=*/1));
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), 0);
+
+        execute_serial_decode();
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(
+            2, HostedTransition::terminal(),
+            /*committed_output_tokens=*/2));
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), -1);
+        EXPECT_EQ(publisher->publishCount(), 2u);
+        EXPECT_EQ(publisher->retireCount(), 2u);
+        ASSERT_TRUE(coordinator->completeCommand(41));
+    }
+
+    /**
+     * @brief Prefix-restored first sampling opens decode without a fake graph.
+     *
+     * A full prefix hit restores terminal logits and therefore has no local or
+     * remote sparse prefill transaction to retire. Its first authenticated
+     * ticket must open the ordinary MainDecode sequence directly; the next
+     * ticket then retires the real sparse decode transaction in the usual way.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         HostedPrefixSampleOpensFirstOrdinaryDecodeSequence)
+    {
+        using HostedTransition =
+            MoEOverlayInferenceTransactionCoordinator::
+                HostedGraphSequenceTransition;
+        auto publisher = std::make_shared<RecordingPublisher>(1);
+        auto coordinator =
+            std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(2),
+                    .continuation_participant_count = 2,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                        MoEOverlayInferenceCompletionBoundaryKind::
+                            HostSynchronous,
+                    },
+                    .max_transactions_per_command = 1,
+                    .max_mtp_draft_depth = 3,
+                });
+        ASSERT_TRUE(coordinator->beginCommand(command()));
+
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(
+            1,
+            HostedTransition::ordinaryDecode(),
+            /*committed_output_tokens=*/1));
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), 0);
+        EXPECT_EQ(publisher->publishCount(), 0u);
+        EXPECT_EQ(publisher->retireCount(), 0u);
+
+        const MoEOverlayInferenceExecutionDescriptor decode{
+            .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+            .placement_epoch = 41,
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+        };
+        auto first = coordinator->beginParticipantGraph(decode, 0);
+        auto second = coordinator->beginParticipantGraph(decode, 1);
+        ASSERT_TRUE(first.ok) << first.error;
+        ASSERT_TRUE(second.ok) << second.error;
+        ASSERT_TRUE(coordinator->armParticipantGraph(first));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(first, true));
+        ASSERT_TRUE(coordinator->finishParticipantGraph(second, true));
+
+        ASSERT_TRUE(coordinator->advanceHostedGraphSequence(
+            2,
+            HostedTransition::terminal(),
+            /*committed_output_tokens=*/2));
+        EXPECT_EQ(coordinator->activeMTPDraftDepth(), -1);
+        EXPECT_EQ(publisher->publishCount(), 1u);
+        EXPECT_EQ(publisher->retireCount(), 1u);
+        ASSERT_TRUE(coordinator->completeCommand(41));
     }
 
     /**

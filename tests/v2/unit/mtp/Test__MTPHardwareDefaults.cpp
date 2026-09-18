@@ -268,3 +268,28 @@ TEST(MTPHardwareDefaults, ParserPreservesAutoAndExplicitOldDefault)
     for (const auto invalid : {"nan", "inf", "-0.01", "1.01", "0.3garbage"})
         EXPECT_THROW((void)parseMTPZeroAcceptDemotionRate(invalid), std::invalid_argument);
 }
+
+/** @test Hardware profiles never narrow the default adaptive depth range. */
+TEST(MTPHardwareDefaults, EveryProfileDefaultsToFullOneThroughFifteenRange)
+{
+    EXPECT_EQ(defaultMTPAdaptiveMaximumDraftDepth(), 15);
+    EXPECT_EQ(
+        sampling_math::DeviceGenerationPolicy::kMaximumSupportedDraftDepth,
+        defaultMTPAdaptiveMaximumDraftDepth());
+
+    for (const auto profile : {
+             MTPDepthDefaultsProfile::Portable,
+             MTPDepthDefaultsProfile::CUDARTX3090,
+             MTPDepthDefaultsProfile::ROCmMI50})
+    {
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.depth_defaults_profile = profile;
+        config.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+
+        const auto policy = resolveMTPDeviceGenerationDepthPolicy(config);
+        EXPECT_TRUE(policy.valid());
+        EXPECT_EQ(policy.minimum_depth, 1);
+        EXPECT_EQ(policy.maximum_depth, 15);
+    }
+}

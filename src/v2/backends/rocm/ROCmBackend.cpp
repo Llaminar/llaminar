@@ -757,6 +757,12 @@ namespace llaminar2
         int *generated_token_counts,
         int device_idx,
         void *stream);
+    extern "C" bool rocmOps_commit_generation_token_history(
+        const int *token,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -1218,6 +1224,28 @@ namespace llaminar2
             static_cast<const int *>(accepted_state_counts_device),
             static_cast<const int *>(stopped_flags_device),
             output_token_capacity,
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueCommitGenerationTokenHistoryDevice(
+        const void *token_device,
+        int vocab_size,
+        void *generated_token_counts_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_device || vocab_size <= 0 ||
+            !generated_token_counts_device || !stream)
+        {
+            return false;
+        }
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_commit_generation_token_history(
+            static_cast<const int *>(token_device),
             vocab_size,
             static_cast<int *>(generated_token_counts_device),
             device_id,

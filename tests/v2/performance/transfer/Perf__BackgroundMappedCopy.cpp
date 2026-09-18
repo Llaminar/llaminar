@@ -25,9 +25,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -44,8 +46,9 @@ namespace
      * @param direction Fixed upload/download role selected by the test name.
      *
      * Four simultaneously published 4 MiB commands exercise all service CTAs.
-     * CUDA's finite idle pass and captured intervals share this exact kernel,
-     * cursor and receipt protocol. Kernel active time comes from GPU receipts;
+     * This measures the finite-pass launch geometry only; a captured worker
+     * has a different concurrency budget and is measured separately below.
+     * Kernel active time comes from GPU receipts;
      * wall time includes public publication/progression costs. These are separate
      * measurements, never substituted for each other. Run either test alone
      * under Nsight for an uncontaminated kernel resource/throughput record.
@@ -163,6 +166,194 @@ namespace
             active_us[samples / 2u], wall_us[samples / 2u],
             bytes * capacity / (wall_us[samples / 2u] * 1000.0));
         context.submitAndWait([&] { context.destroyEvent(ready); });
+    }
+
+    /**
+     * @brief Measure the actual captured copy worker, not its finite-pass sibling.
+     * @param direction Exact upload or download direction for every sample.
+     * @param capacity Physical inbox width, fixed for this profiler/test launch.
+     *
+     * A captured primary branch publishes entry and waits for this fixture to
+     * release it. Commands arrive only after entry, so independently submitted
+     * finite passes cannot accidentally supply the measured progress. All
+     * copies and graph retirement use the production TransferEngine entrypoints.
+     * The hold is a diagnostic liveness fixture, not simulated inference: the
+     * reported bandwidth does not claim to measure interference with GEMMs.
+     * Wall time ends at the last acquired receipt; retirement is timed separately.
+     */
+    void measureCapturedService(MappedTransferDirection direction, std::size_t capacity)
+    {
+        const auto device = DeviceId::cuda(0);
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        if (!backend->deviceCount()) GTEST_SKIP();
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        context.submitAndWait([&]
+        {
+            TransferEngine engine;
+            const DeviceId devices[] = {device};
+            constexpr std::size_t bytes = 4u * 1024u * 1024u;
+            constexpr std::size_t warmups = 3u;
+            constexpr std::size_t samples = 9u;
+            {
+                auto payload = engine.allocateMappedHostRegion(bytes * capacity, devices);
+                auto storage = engine.allocateDeviceTransferBuffer(bytes * capacity, device);
+                auto inbox = engine.allocateMappedHostRegion(capacity *
+                    (sizeof(MappedTransferProgressCommand) + sizeof(MappedTransferProgressCompletion)), devices);
+                auto controls = engine.allocateMappedHostRegion(2u * sizeof(std::uint64_t), devices);
+                auto wake = engine.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
+                auto *commands = static_cast<MappedTransferProgressCommand *>(inbox->mutableHostData());
+                auto *receipts = reinterpret_cast<MappedTransferProgressCompletion *>(commands + capacity);
+                auto *control = static_cast<std::uint64_t *>(controls->mutableHostData());
+                std::fill_n(commands, capacity, MappedTransferProgressCommand{});
+                std::fill_n(receipts, capacity, MappedTransferProgressCompletion{});
+                void *primary = context.getOrCreateAuxiliaryStream("captured_copy_economy_primary");
+                void *worker = context.getOrCreateAuxiliaryStream("captured_copy_economy_worker",
+                    GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance);
+                void *fork = context.createEvent();
+                void *worker_done = context.createEvent();
+                void *terminal = context.createEvent();
+                if (!primary || !worker || !fork || !worker_done || !terminal)
+                    throw std::runtime_error("Captured copy economy setup failed");
+                auto destroy_events = [&](void *)
+                {
+                    context.destroyEvent(terminal);
+                    context.destroyEvent(worker_done);
+                    context.destroyEvent(fork);
+                };
+                std::unique_ptr<void, decltype(destroy_events)> event_owner(&context, destroy_events);
+                auto cursors = engine.allocateMappedTransferServiceCursors(capacity, device, primary);
+                if (!context.recordEventChecked(terminal, primary) || !context.synchronizeEventChecked(terminal))
+                    throw std::runtime_error("Captured copy cursor preparation failed");
+                auto graph = context.createGraphCapture(primary);
+                if (!graph || !graph->beginCapture())
+                    throw std::runtime_error("Captured copy economy recording failed");
+                engine.enqueueMappedTransferWakeState(*wake, MappedTransferWakeState::InferenceActive,
+                    device, primary);
+                if (!context.recordEventChecked(fork, primary) || !context.waitEventChecked(fork, worker))
+                    throw std::runtime_error("Captured copy economy fork failed");
+                engine.enqueueMappedTransferService(*inbox, *cursors, bytes, wake.get(),
+                    MappedTransferServiceRun::CapturedInterval, worker);
+                if (!context.recordEventChecked(worker_done, worker))
+                    throw std::runtime_error("Captured copy worker terminal failed");
+                engine.enqueueMappedTimelinePublish64(*controls, sizeof(std::uint64_t), 1u, device, primary);
+                if (!backend->streamWaitTimelineSignal64(primary, controls->deviceAlias(device),
+                        1u, device.gpu_ordinal()))
+                    throw std::runtime_error("Captured copy economy hold failed");
+                engine.enqueueMappedTransferWakeState(*wake, MappedTransferWakeState::InferenceComplete,
+                    device, primary);
+                if (!context.waitEventChecked(worker_done, primary) || !graph->endCapture() || !graph->instantiate())
+                    throw std::runtime_error("Captured copy economy close/join failed");
+                // Even a deadline/byte failure must first release the held graph.
+                // Otherwise unwinding would free memory still referenced on GPU.
+                auto release_graph = [&]() -> bool
+                {
+                    std::atomic_ref<std::uint64_t>(control[0]).store(1u, std::memory_order_release);
+                    return context.recordEventChecked(terminal, primary) &&
+                        context.synchronizeEventChecked(terminal);
+                };
+                auto unwind_graph = [&](void *) { (void)release_graph(); };
+                std::unique_ptr<void, decltype(unwind_graph)> graph_owner(graph.get(), unwind_graph);
+                std::array<double, samples> wall_us{}, active_sum_us{}, retire_us{};
+                for (std::size_t sample = 0u; sample < samples + warmups; ++sample)
+                {
+                    // Distinguish both slots and generations: a wrong offset,
+                    // duplicate slot, or stale receipt must not pass the check.
+                    const auto expected = [sample](std::size_t slot)
+                    { return static_cast<unsigned char>(sample + 1u + slot * 17u); };
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                        std::memset(payload->mutableHostData(slot * bytes),
+                            direction == MappedTransferDirection::HostToDevice ? 0u : expected(slot), bytes);
+                    engine.enqueueMappedHostToPersistentDeviceRegion(*payload, 0u,
+                        storage->mutableDeviceData(), bytes * capacity, 0u, bytes * capacity, device, primary);
+                    if (!context.recordEventChecked(terminal, primary) || !context.synchronizeEventChecked(terminal))
+                        throw std::runtime_error("Captured copy sample setup failed");
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                        std::memset(payload->mutableHostData(slot * bytes),
+                            direction == MappedTransferDirection::DeviceToHost ? 0u : expected(slot), bytes);
+                    const std::uint64_t generation = sample + 1u;
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                    {
+                        auto &command = commands[slot];
+                        command.generation_magic = mappedTransferProgressGenerationMagic(generation);
+                        command.generation_version = mappedTransferProgressGenerationVersion(generation);
+                        command.source_address = reinterpret_cast<std::uintptr_t>(
+                            direction == MappedTransferDirection::HostToDevice
+                                ? payload->deviceAlias(device, slot * bytes) : storage->deviceData(slot * bytes));
+                        command.destination_address = reinterpret_cast<std::uintptr_t>(
+                            direction == MappedTransferDirection::DeviceToHost
+                                ? payload->deviceAlias(device, slot * bytes) : storage->mutableDeviceData(slot * bytes));
+                        command.bytes = bytes;
+                        command.source_complement = ~command.source_address;
+                        command.destination_complement = ~command.destination_address;
+                        command.bytes_complement = ~command.bytes;
+                    }
+                    std::atomic_ref<std::uint64_t>(control[0]).store(0u, std::memory_order_release);
+                    std::atomic_ref<std::uint64_t>(control[1]).store(0u, std::memory_order_release);
+                    if (!graph->launchOnStream(primary))
+                        throw std::runtime_error("Captured copy economy replay failed");
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (std::atomic_ref<std::uint64_t>(control[1]).load(std::memory_order_acquire) != 1u)
+                    {
+                        if (std::chrono::steady_clock::now() >= deadline)
+                            throw std::runtime_error("Captured copy did not reach its admission point");
+                        std::this_thread::yield();
+                    }
+                    const auto started = std::chrono::steady_clock::now();
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                        std::atomic_ref<std::uint64_t>(commands[slot].generation)
+                            .store(generation, std::memory_order_release);
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                    {
+                        while (std::atomic_ref<std::uint64_t>(receipts[slot].completed_generation)
+                                   .load(std::memory_order_acquire) != generation)
+                        {
+                            if (std::chrono::steady_clock::now() >= deadline)
+                                throw std::runtime_error("Captured copy did not finish before primary release");
+                            std::this_thread::yield();
+                        }
+                    }
+                    const auto completed = std::chrono::steady_clock::now();
+                    if (!release_graph())
+                        throw std::runtime_error("Captured copy graph retirement failed");
+                    const auto retired = std::chrono::steady_clock::now();
+                    std::uint64_t active_ns = 0u;
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                    {
+                        EXPECT_EQ(receipts[slot].error, 0u);
+                        EXPECT_EQ(receipts[slot].completed_bytes, bytes);
+                        active_ns += receipts[slot].device_active_nanoseconds;
+                    }
+                    if (sample >= warmups)
+                    {
+                        wall_us[sample - warmups] = std::chrono::duration<double, std::micro>(completed - started).count();
+                        active_sum_us[sample - warmups] = static_cast<double>(active_ns) / 1000.0;
+                        retire_us[sample - warmups] = std::chrono::duration<double, std::micro>(retired - completed).count();
+                    }
+                    if (direction == MappedTransferDirection::HostToDevice)
+                    {
+                        engine.enqueuePersistentDeviceRegionToMappedHost(storage->deviceData(), bytes * capacity,
+                            0u, *payload, 0u, bytes * capacity, device, primary);
+                        if (!context.recordEventChecked(terminal, primary) || !context.synchronizeEventChecked(terminal))
+                            throw std::runtime_error("Captured copy diagnostic readback failed");
+                    }
+                    for (std::size_t slot = 0u; slot < capacity; ++slot)
+                    {
+                        const auto *actual = static_cast<const unsigned char *>(
+                            payload->mutableHostData(slot * bytes));
+                        EXPECT_TRUE(std::all_of(actual, actual + bytes,
+                            [value = expected(slot)](unsigned char byte) { return byte == value; }));
+                    }
+                }
+                std::sort(wall_us.begin(), wall_us.end());
+                std::sort(active_sum_us.begin(), active_sum_us.end());
+                std::sort(retire_us.begin(), retire_us.end());
+                std::printf("CAPTURED_SERVICE_ECONOMY,%s,slots=%zu,bytes_per_slot=%zu,active_sum_us=%.3f,wall_us=%.3f,wall_GBps=%.3f,retire_host_us=%.3f\n",
+                    direction == MappedTransferDirection::DeviceToHost ? "d2h" : "h2d", capacity, bytes,
+                    active_sum_us[samples / 2u], wall_us[samples / 2u],
+                    bytes * capacity / (wall_us[samples / 2u] * 1000.0), retire_us[samples / 2u]);
+            }
+        });
     }
 
     /**
@@ -372,6 +563,16 @@ namespace
     }
 
 #if defined(HAVE_CUDA)
+    // Separate exact geometries keep profiler attribution unambiguous. Thirty
+    // inboxes cover five migration slots, three projections and two banks.
+    TEST(CapturedTransferServiceEconomy, CUDADownload4Slots4MiB)
+    { measureCapturedService(MappedTransferDirection::DeviceToHost, 4u); }
+    TEST(CapturedTransferServiceEconomy, CUDAUpload4Slots4MiB)
+    { measureCapturedService(MappedTransferDirection::HostToDevice, 4u); }
+    TEST(CapturedTransferServiceEconomy, CUDADownload30Slots4MiB)
+    { measureCapturedService(MappedTransferDirection::DeviceToHost, 30u); }
+    TEST(CapturedTransferServiceEconomy, CUDAUpload30Slots4MiB)
+    { measureCapturedService(MappedTransferDirection::HostToDevice, 30u); }
     TEST(BoundedTransferServiceEconomy, CUDADownload4MiB)
     { measureBoundedService(MappedTransferDirection::DeviceToHost); }
     TEST(BoundedTransferServiceEconomy, CUDAUpload4MiB)

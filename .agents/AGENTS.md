@@ -119,7 +119,9 @@ broken, or uneconomical implementation.
 22. **Every discovered defect gets a focused regression.** Reproduce flaky
     failures in a loop (up to 20 iterations when appropriate), reduce them to a
     focused test, then fold the invariant into the all-format/backend sweep and
-    canonical integration gate.
+    canonical integration gate. Every production defect must also have its
+    focused regression registered explicitly in the `ProductionParityPreflight`
+    suite; broad Unit or backend coverage does not replace that preflight entry.
 
 ### Performance and Observability
 

@@ -7,7 +7,7 @@
  * central lifecycle invariant: a production-shaped inference graph can finish
  * while maintenance completion remains unpublished, because no inference
  * stream waits for a complete transfer command. CUDA joins only its bounded
- * graph worker's retirement, preserving partial-copy cursors across intervals.
+ * graph worker's retirement, including wake-driven finite CUDA service passes.
  * The converse is equally important: a peer-held inference graph must not
  * strand unrelated maintenance behind its not-yet-runnable DMA node.
  * Future observers of that graph are separate native streams, as in prefix
@@ -1303,14 +1303,14 @@ namespace
     }
 
     /**
-     * @brief Exercise the production service ABI across partial graph retirement.
+     * @brief Prove one CUDA service CTA progresses work and retires at terminal.
      *
-     * The diagnostic cursor download occurs only after the graph has joined.
-     * Production never downloads or mirrors this execution state. Two retained
-     * replays finish each command generation; a new generation changes every
-     * source byte and poisons all destinations to expose skipped or stale work.
+     * Commands are published after the primary graph is deliberately held. The
+     * single captured service block must complete every byte before that hold is
+     * released, then retire exactly when the primary terminal closes its private
+     * interval. This proves incremental progress without the former four-SM tax.
      */
-    TEST(MappedTransferProgressEpochIntegration, CUDAGraphBoundedServiceResumesPartialCommands)
+    TEST(MappedTransferProgressEpochIntegration, CUDASingleCTAServiceProgressesDuringHeldInference)
     {
         const auto device = DeviceId::cuda(0);
         auto *backend = getBackendFor(device);
@@ -1320,11 +1320,11 @@ namespace
         TransferEngine transfers;
         const DeviceId devices[] = {device};
         constexpr size_t capacity = 4u;
-        constexpr size_t bytes = 16u * 1024u * 1024u + 13u;
+        constexpr size_t bytes = 4u * 1024u * 1024u;
         auto inbox = transfers.allocateMappedHostRegion(capacity * 128u, devices);
         std::shared_ptr<DeviceTransferBuffer> cursors;
-        auto interval = transfers.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device);
         auto controls = transfers.allocateMappedHostRegion(4096u, devices);
+        auto wake = transfers.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
         auto source = transfers.allocateDeviceTransferBuffer(bytes + 16u, device);
         auto *control = static_cast<std::uint64_t *>(controls->mutableHostData());
         auto *commands = static_cast<MappedTransferProgressCommand *>(inbox->mutableHostData());
@@ -1343,31 +1343,36 @@ namespace
         std::unique_ptr<IGPUGraphCapture> graph;
         context.submitAndWait([&]
         {
-            primary = context.getOrCreateAuxiliaryStream("partial_service_primary");
-            auxiliary = context.getOrCreateAuxiliaryStream("partial_service_auxiliary",
+            primary = context.getOrCreateAuxiliaryStream("wake_service_primary");
+            auxiliary = context.getOrCreateAuxiliaryStream("wake_service_auxiliary",
                 GPUAuxiliaryStreamSchedulingClass::BackgroundMaintenance);
             fork = context.createEvent(); done = context.createEvent();
             if (!primary || !auxiliary || !fork || !done)
-                throw std::runtime_error("partial service setup failed");
+                throw std::runtime_error("wake service setup failed");
             cursors = transfers.allocateMappedTransferServiceCursors(capacity, device, primary);
             context.synchronizeStream(primary); // Cold diagnostic fixture initialization.
             graph = context.createGraphCapture(primary);
             if (!graph || !graph->beginCapture())
-                throw std::runtime_error("partial service capture failed");
-            transfers.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Open, primary);
+                throw std::runtime_error("wake service capture failed");
+            transfers.enqueueMappedTransferWakeState(
+                *wake, MappedTransferWakeState::InferenceActive, device, primary);
             if (!context.recordEventChecked(fork, primary) || !context.waitEventChecked(fork, auxiliary))
-                throw std::runtime_error("partial service fork failed");
-            transfers.enqueueMappedTransferService(*inbox, *cursors, bytes, interval.get(),
+                throw std::runtime_error("wake service fork failed");
+            transfers.enqueueMappedTransferService(*inbox, *cursors, bytes, wake.get(),
                 MappedTransferServiceRun::CapturedInterval, auxiliary);
+            transfers.enqueueMappedTimelinePublish64(
+                *controls, 2u * sizeof(std::uint64_t), 1u,
+                device, auxiliary);
             if (!context.recordEventChecked(done, auxiliary) ||
                 !backend->streamPublishTimelineSignal64(primary, controls->deviceAlias(device, 8u),
                     1u, device.gpu_ordinal()) ||
                 !backend->streamWaitTimelineSignal64(primary, controls->deviceAlias(device),
                     1u, device.gpu_ordinal()))
-                throw std::runtime_error("partial service primary lifecycle failed");
-            transfers.enqueueMappedTransferInterval(*interval, MappedTransferInterval::Closed, primary);
+                throw std::runtime_error("wake service primary lifecycle failed");
+            transfers.enqueueMappedTransferWakeState(
+                *wake, MappedTransferWakeState::InferenceComplete, device, primary);
             if (!context.waitEventChecked(done, primary) || !graph->endCapture() || !graph->instantiate())
-                throw std::runtime_error("partial service terminal capture failed");
+                throw std::runtime_error("wake service terminal capture failed");
         });
         auto release = [&](void *)
         {
@@ -1387,14 +1392,14 @@ namespace
             {
                 if (!backend->hostToDevice(source->mutableDeviceData(), expected.data(), expected.size(),
                         device.gpu_ordinal(), primary))
-                    throw std::runtime_error("partial service source initialization failed");
+                    throw std::runtime_error("wake service source initialization failed");
                 for (size_t slot = 0u; slot < capacity; ++slot)
                 {
                     const auto &initial = direction == MappedTransferDirection::HostToDevice ? expected : poison;
                     std::memcpy(mapped[slot]->mutableHostData(), initial.data(), initial.size());
                     if (!backend->hostToDevice(destinations[slot]->mutableDeviceData(), poison.data(), poison.size(),
                             device.gpu_ordinal(), primary))
-                        throw std::runtime_error("partial service destination initialization failed");
+                            throw std::runtime_error("wake service destination initialization failed");
                 }
                 context.synchronizeStream(primary);
             });
@@ -1413,72 +1418,64 @@ namespace
                 command.source_complement = ~command.source_address;
                 command.destination_complement = ~command.destination_address;
                 command.bytes_complement = ~command.bytes;
-                std::atomic_ref<std::uint64_t>(command.generation).store(generation, std::memory_order_release);
             }
-            for (unsigned replay = 0u; replay < 2u; ++replay)
+            std::atomic_ref<std::uint64_t>(control[0]).store(0u, std::memory_order_release);
+            std::atomic_ref<std::uint64_t>(control[1]).store(0u, std::memory_order_release);
+            std::atomic_ref<std::uint64_t>(control[2]).store(0u, std::memory_order_release);
+            context.submitAndWait([&]
             {
-                std::atomic_ref<std::uint64_t>(control[0]).store(0u, std::memory_order_release);
-                std::atomic_ref<std::uint64_t>(control[1]).store(0u, std::memory_order_release);
-                context.submitAndWait([&] { if (!graph->launch()) throw std::runtime_error("partial service replay failed"); });
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                if (replay == 0u)
-                {
-                    while (std::atomic_ref<std::uint64_t>(control[1]).load(std::memory_order_acquire) != 1u &&
-                           std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-                    // Timing selects an adversarial close, not a performance
-                    // assertion. The joined cursor below proves actual progress.
-                    std::this_thread::sleep_for(std::chrono::microseconds(200));
-                }
-                else
-                {
-                    while (std::chrono::steady_clock::now() < deadline)
-                    {
-                        bool complete = true;
-                        for (size_t slot = 0u; slot < capacity; ++slot)
-                            complete &= std::atomic_ref<std::uint64_t>(receipts[slot].completed_generation)
-                                .load(std::memory_order_acquire) == generation;
-                        if (complete) break;
-                        std::this_thread::yield();
-                    }
-                }
-                release(control);
-                std::array<MappedTransferServiceCursor, capacity> observed{};
-                context.submitAndWait([&]
-                {
-                    if (!backend->deviceToHostOnStream(observed.data(), cursors->deviceData(), sizeof(observed),
-                            device.gpu_ordinal(), primary))
-                        throw std::runtime_error("partial service diagnostic observation failed");
-                    context.synchronizeStream(primary);
-                });
-                size_t partial = 0u;
-                for (const auto &cursor : observed)
-                {
-                    EXPECT_EQ(cursor.claimed, 0u) << "Graph returned with an unretired GPU claim";
-                    partial += cursor.generation == generation && cursor.copied_bytes > 0u && cursor.copied_bytes < bytes;
-                }
-                if (replay == 0u) EXPECT_GT(partial, 0u) << "No actual partial-copy boundary was exercised";
-                else for (size_t slot = 0u; slot < capacity; ++slot)
-                {
-                    EXPECT_EQ(receipts[slot].completed_generation, generation);
-                    EXPECT_EQ(receipts[slot].completed_bytes, bytes);
-                    EXPECT_EQ(receipts[slot].error, 0u);
-                    EXPECT_GT(receipts[slot].device_active_nanoseconds, 0u);
-                }
+                if (!graph->launch())
+                    throw std::runtime_error("wake service replay failed");
+            });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::atomic_ref<std::uint64_t>(control[1]).load(std::memory_order_acquire) != 1u &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            ASSERT_EQ(std::atomic_ref<std::uint64_t>(control[1]).load(std::memory_order_acquire), 1u);
+            for (size_t slot = 0u; slot < capacity; ++slot)
+                std::atomic_ref<std::uint64_t>(commands[slot].generation)
+                    .store(generation, std::memory_order_release);
+            while (std::chrono::steady_clock::now() < deadline)
+            {
+                bool complete = true;
+                for (size_t slot = 0u; slot < capacity; ++slot)
+                    complete &= std::atomic_ref<std::uint64_t>(receipts[slot].completed_generation)
+                        .load(std::memory_order_acquire) == generation;
+                if (complete) break;
+                std::this_thread::yield();
             }
+            EXPECT_EQ(
+                std::atomic_ref<std::uint64_t>(control[2]).load(
+                    std::memory_order_acquire),
+                0u)
+                << "Captured service escaped its primary inference lifetime";
+            for (size_t slot = 0u; slot < capacity; ++slot)
+            {
+                EXPECT_EQ(receipts[slot].completed_generation, generation);
+                EXPECT_EQ(receipts[slot].completed_bytes, bytes);
+                EXPECT_EQ(receipts[slot].error, 0u);
+                EXPECT_GT(receipts[slot].device_active_nanoseconds, 0u);
+            }
+            release(control);
+            EXPECT_EQ(
+                std::atomic_ref<std::uint64_t>(control[2]).load(
+                    std::memory_order_acquire),
+                1u)
+                << "Captured service did not retire at the primary terminal";
             context.submitAndWait([&]
             {
                 if (direction == MappedTransferDirection::HostToDevice)
                     for (size_t slot = 0u; slot < capacity; ++slot)
                         if (!backend->deviceToHostOnStream(mapped[slot]->mutableHostData(),
                                 destinations[slot]->deviceData(), bytes + 16u, device.gpu_ordinal(), primary))
-                            throw std::runtime_error("partial service final diagnostic copy failed");
+                            throw std::runtime_error("wake service final diagnostic copy failed");
                 context.synchronizeStream(primary);
             });
             for (const auto &region : mapped)
             {
                 const auto *actual = static_cast<const std::uint8_t *>(region->mutableHostData());
                 EXPECT_EQ(std::memcmp(actual + offset, expected.data() + offset, bytes), 0)
-                    << "Resumed copy lost or reused bytes";
+                    << "Wake-driven copy lost or reused bytes";
                 EXPECT_TRUE(std::all_of(actual, actual + offset,
                     [](std::uint8_t value) { return value == 0xccu; }));
                 EXPECT_TRUE(std::all_of(actual + offset + bytes, actual + bytes + 16u,

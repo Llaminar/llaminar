@@ -61,6 +61,28 @@ namespace llaminar2
     };
 
     /**
+     * @brief Resolve the default placement policy from durable maintenance intent.
+     *
+     * Dynamic and observe configurations need a histogram-capable placement
+     * plan even though only Dynamic may publish physical movement.  An
+     * explicitly disabled maintenance controller instead receives the stable
+     * expert-id layout.  Keeping this mapping beside the typed policy prevents
+     * CLI, automatic-planning, and implicit-LocalTP entry points from choosing
+     * different defaults.
+     *
+     * @param mode Requested durable residency-maintenance mode.
+     * @return Canonical default routed-expert placement policy.
+     */
+    [[nodiscard]] inline RoutedExpertResidencyPolicy
+    defaultRoutedExpertResidencyPolicy(
+        MoERebalanceRuntimeMode mode) noexcept
+    {
+        return mode == MoERebalanceRuntimeMode::Off
+                   ? RoutedExpertResidencyPolicy::StaticById
+                   : RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+    }
+
+    /**
      * @brief One hardware domain that owns routed-expert compute.
      *
      * `routed_compute_policy` describes whether full experts are replicated,

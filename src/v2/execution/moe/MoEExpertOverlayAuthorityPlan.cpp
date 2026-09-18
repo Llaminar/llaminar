@@ -21,16 +21,6 @@ namespace llaminar2
         constexpr const char *kImplicitTierName =
             "priority_0";
 
-        /** @return Residency policy matching the durable maintenance intent. */
-        RoutedExpertResidencyPolicy residencyPolicyFor(
-            MoERebalanceRuntimeMode mode) noexcept
-        {
-            return mode == MoERebalanceRuntimeMode::Off
-                       ? RoutedExpertResidencyPolicy::StaticById
-                       : RoutedExpertResidencyPolicy::
-                             RoutedTierRebalanced;
-        }
-
         /** @brief Build the canonical one-domain, one-tier LocalTP plan. */
         std::shared_ptr<MoERoutedExpertPlacementPlan>
         buildImplicitLocalTPPlan(
@@ -45,7 +35,8 @@ namespace llaminar2
             plan->base_model_domain = kImplicitDomainName;
             plan->shared_expert_domain = kImplicitDomainName;
             plan->residency_policy =
-                residencyPolicyFor(request.residency_maintenance);
+                defaultRoutedExpertResidencyPolicy(
+                    request.residency_maintenance);
             plan->owner_order = request.owner_order;
 
             RoutedExpertDomain domain;

@@ -498,6 +498,16 @@ namespace llaminar2
         std::vector<MoEOptimizationMovementEdge> movement_ledger;
         /** Sole leader's immutable admitting economics for completed waves. */
         std::vector<MoEOptimizationMovementEconomy> movement_economy;
+        /**
+         * Completed decision evidence, including economically correct no-ops.
+         *
+         * The device command remains authoritative. This mutex protects only
+         * its immutable terminal receipt while an HTTP/status observer copies
+         * it; it is never read by policy and is outside inference hot paths.
+         */
+        mutable std::mutex decision_receipt_mutex;
+        std::uint64_t completed_decision_windows = 0u;
+        std::optional<MoEOptimizationDecisionReceipt> last_decision;
         bool economy_ready = false;
         /** True after the retained local rebase graph has been submitted. */
         bool histogram_rebase_started = false;
@@ -558,6 +568,53 @@ namespace llaminar2
                 .discarded_edges = 0u,
                 .economy = movement_economy,
                 .discarded_economy_records = 0u,
+            };
+        }
+
+        /** @return Race-safe count and last receipt for completed decisions. */
+        [[nodiscard]] std::pair<
+            std::uint64_t,
+            std::optional<MoEOptimizationDecisionReceipt>>
+        completedDecisionEvidence() const
+        {
+            std::lock_guard<std::mutex> lock(decision_receipt_mutex);
+            return {completed_decision_windows, last_decision};
+        }
+
+        /** Publish one authenticated Dynamic decision for passive observers. */
+        void recordDecisionReceipt(
+            const MoEOverlayDeviceControllerCommandHeader &header)
+        {
+            std::lock_guard<std::mutex> lock(decision_receipt_mutex);
+            ++completed_decision_windows;
+            last_decision = MoEOptimizationDecisionReceipt{
+                .transaction = header.transaction_id,
+                .candidate_epoch = header.candidate_epoch,
+                .snapshot_observations = header.snapshot_observations,
+                .command_count = header.command_count,
+                .accepted_cycles = header.accepted_cycles,
+                .rejected_cycles = header.rejected_cycles,
+                .phase_tradeoff_candidates =
+                    header.phase_tradeoff_candidates,
+                .improvement_floor_rejected_cycles =
+                    header.improvement_floor_rejected_cycles,
+                .payoff_rejected_cycles = header.payoff_rejected_cycles,
+                .residency_rejected_cycles = header.residency_rejected_cycles,
+                .priority_cost_before = header.priority_cost_before,
+                .priority_cost_after = header.priority_cost_after,
+                .same_priority_makespan_before =
+                    header.same_priority_makespan_before,
+                .same_priority_makespan_after =
+                    header.same_priority_makespan_after,
+                .projected_service_gain_ns =
+                    header.projected_service_gain_ns,
+                .projected_transfer_and_repack_ns =
+                    header.projected_transfer_and_repack_ns,
+                .projected_inference_interference_ns =
+                    header.projected_inference_interference_ns,
+                .projected_net_benefit_ns = header.projected_net_benefit_ns,
+                .layer_scan_start = header.layer_scan_start,
+                .layer_scan_next = header.layer_scan_next,
             };
         }
 
@@ -2352,7 +2409,13 @@ namespace llaminar2
                     : 0u,
         };
         if (dynamic_worker_)
+        {
             status.completed_movement = dynamic_worker_->completedMovement();
+            const auto [completed_windows, last_decision] =
+                dynamic_worker_->completedDecisionEvidence();
+            status.completed_decision_windows = completed_windows;
+            status.last_decision = last_decision;
+        }
         if (activation_state ==
                 MoEOverlayDeviceControllerActivationState::Prepared ||
             activation_state ==
@@ -4074,6 +4137,8 @@ namespace llaminar2
                 return false;
             }
             last_transaction = command.header.transaction_id;
+            if (!prepared_context_restore)
+                recordDecisionReceipt(command.header);
             *result = {
                 .kind = expected_kind,
                 .transaction = last_transaction,
@@ -4124,6 +4189,12 @@ namespace llaminar2
                       std::to_string(command.header.accepted_cycles)},
                      {"rejected_cycles",
                       std::to_string(command.header.rejected_cycles)},
+                     {"phase_tradeoff_candidates",
+                      std::to_string(
+                          command.header.phase_tradeoff_candidates)},
+                     {"improvement_floor_rejected_cycles",
+                      std::to_string(
+                          command.header.improvement_floor_rejected_cycles)},
                      {"payoff_rejected_cycles",
                       std::to_string(
                           command.header.payoff_rejected_cycles)},
@@ -4909,6 +4980,38 @@ namespace llaminar2
         movement_publication_sequence.fetch_add(
             1u, std::memory_order_release);
 
+        if (!prepared_context_restore)
+            recordDecisionReceipt(command.header);
+
+        /*
+         * Movement completion is a rare service-lifecycle event and must be
+         * visible without enabling PerfStats. Emit it once from the graph
+         * authority after the operational ledger is coherent; follower ranks
+         * still publish their local counters but do not duplicate this line.
+         */
+        if (completed_economy)
+        {
+            LOG_INFO(
+                "[ExpertOverlay][Movement] Completed dynamic transaction"
+                << " transaction=" << last_transaction
+                << " candidate_epoch=" << batch.candidate_epoch
+                << " commands=" << batch.command_count
+                << " cycles=" << batch.migration_cycles.size()
+                << " physical_bytes=" << batch.packed_weight_bytes
+                << " promotions=" << promotions
+                << " demotions=" << demotions
+                << " same_priority_moves=" << same_priority_moves
+                << " projected_service_gain_ns="
+                << command.header.projected_service_gain_ns
+                << " projected_transfer_and_repack_ns="
+                << command.header.projected_transfer_and_repack_ns
+                << " projected_inference_interference_ns="
+                << command.header.projected_inference_interference_ns
+                << " projected_net_benefit_ns="
+                << command.header.projected_net_benefit_ns
+                << " blocking_inference=false");
+        }
+
         PerfStatsCollector::addCounter(
             "moe_overlay_controller",
             "dynamic_movement_transactions",
@@ -4946,6 +5049,12 @@ namespace llaminar2
               std::to_string(command.header.accepted_cycles)},
              {"rejected_cycles",
               std::to_string(command.header.rejected_cycles)},
+             {"phase_tradeoff_candidates",
+              std::to_string(
+                  command.header.phase_tradeoff_candidates)},
+             {"improvement_floor_rejected_cycles",
+              std::to_string(
+                  command.header.improvement_floor_rejected_cycles)},
              {"payoff_rejected_cycles",
               std::to_string(command.header.payoff_rejected_cycles)},
              {"residency_rejected_cycles",

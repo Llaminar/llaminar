@@ -602,7 +602,7 @@ namespace llaminar2::test
         /**
          * @brief Build the exact two-slot policy shape that once starved skew.
          *
-         * Layer zero has two high-value tier exchanges and no participant
+         * Layer zero has one high-value tier exchange and no participant
          * correction. Layer one is tier-optimal and has one lower-value closed
          * cycle that independently reduces the priority-23 makespan. A
          * two-cycle wave therefore proves the device selector searches the
@@ -616,17 +616,17 @@ namespace llaminar2::test
             input.collected_state.assign(
                 6u * input.num_layers * input.num_experts, 0u);
             const std::array<std::uint32_t, 12> layer_zero_owners = {
-                2u, 3u, 1u, 0u, 0u, 1u,
-                4u, 5u, 5u, 4u, 3u, 2u,
+                0u, 1u, 5u, 0u, 2u, 3u,
+                4u, 1u, 5u, 4u, 3u, 2u,
             };
             const std::array<std::uint32_t, 12> layer_one_owners = {
-                0u, 1u, 1u, 0u, 2u, 3u,
-                5u, 4u, 5u, 4u, 3u, 2u,
+                0u, 1u, 1u, 0u, 4u, 5u,
+                5u, 3u, 4u, 3u, 2u, 2u,
             };
             const std::array<std::uint64_t, 12> counts = {
-                1200u, 1100u, 1000u, 900u,
-                850u, 825u, 800u, 700u,
-                600u, 500u, 100u, 50u,
+                1449u, 1391u, 1371u, 1216u,
+                1133u, 993u, 858u, 837u,
+                761u, 507u, 364u, 80u,
             };
             for (std::uint32_t layer = 0u;
                  layer < input.num_layers;
@@ -3999,20 +3999,141 @@ namespace llaminar2::test
     /**
      * Build a full 122B-shaped policy workload without loading model weights.
      *
-     * Repeat the adversarial sixteen-expert distribution across all 256 experts
-     * and 49 layers. Expensive links reject every cycle for the observation
-     * proof; cheap links exercise full-size runtime-bank cloning and publication.
-     * All geometry-dependent oracle arrays are rebuilt from the same seed.
+     * Two deliberately misplaced dominant experts make two successive cycles
+     * shorten the complete participant critical path by more than the normal
+     * economy floor. Expensive links reject both cycles for the observation
+     * proof; cheap links exercise full-size runtime-bank cloning and
+     * publication. All geometry-dependent oracle arrays are rebuilt at the
+     * production 256-expert by 49-layer shape.
      */
     MoEOverlayDevicePlacementPolicyInput fullModelPolicyInput(
-        std::uint64_t transfer_cost_ns)
+        std::uint64_t transfer_cost_ns,
+        const MoEOverlayDeviceControllerTopology &resolved_topology)
     {
-        const auto seed = adversarialPolicyInput();
-        auto input = seed;
+        auto input = adversarialPolicyInput();
+        if (resolved_topology.participants.size() != input.participants.size())
+        {
+            throw std::logic_error(
+                "full-model policy fixture topology has the wrong participant count");
+        }
+        for (const auto &participant : resolved_topology.participants)
+        {
+            auto &metadata = input.participants.at(participant.participant_id);
+            metadata.tier_index = participant.tier_idx;
+            metadata.tier_priority = resolved_topology.groupForParticipant(
+                participant.participant_id)->tier_priority;
+        }
         input.num_layers = 49u;
         input.num_experts = 256u;
         input.maximum_cycles_per_wave = 2u;
         input.dynamic_maximum_cycles_per_layer = 2u;
+        constexpr std::array<std::uint32_t, 6> quotas{
+            43u, 43u, 43u, 43u, 42u, 42u};
+        std::vector<std::uint64_t> counts(input.num_experts, 0u);
+        counts[0] = 10'000'000'000u;
+        counts[1] = 2'000'000'000u;
+        for (std::uint32_t expert = 2u;
+             expert < input.num_experts;
+             ++expert)
+        {
+            counts[expert] = 1'000'000u - expert * 1'000u;
+        }
+
+        /* Reproduce the deterministic quota-constrained target solely to
+         * author an adversarial input snapshot. The production CPU oracle and
+         * device controller independently recompute and must agree on it. */
+        std::vector<std::uint32_t> target_owner(input.num_experts, 0u);
+        std::uint32_t expert_cursor = 0u;
+        std::vector<std::int32_t> priorities;
+        priorities.reserve(input.participants.size());
+        for (const auto &participant : input.participants)
+            priorities.push_back(participant.tier_priority);
+        std::sort(priorities.begin(), priorities.end());
+        priorities.erase(
+            std::unique(priorities.begin(), priorities.end()),
+            priorities.end());
+        for (const std::int32_t priority : priorities)
+        {
+            std::vector<std::uint32_t> participants;
+            for (std::uint32_t participant = 0u;
+                 participant < input.participants.size();
+                 ++participant)
+            {
+                if (input.participants[participant].tier_priority == priority)
+                    participants.push_back(participant);
+            }
+            std::vector<std::uint32_t> remaining;
+            std::vector<std::uint64_t> load(participants.size(), 0u);
+            std::uint32_t tier_quota = 0u;
+            for (const std::uint32_t participant : participants)
+            {
+                remaining.push_back(quotas[participant]);
+                tier_quota += quotas[participant];
+            }
+            for (std::uint32_t slot = 0u; slot < tier_quota; ++slot)
+            {
+                std::size_t selected = participants.size();
+                for (std::size_t member = 0u;
+                     member < participants.size();
+                     ++member)
+                {
+                    if (remaining[member] == 0u)
+                        continue;
+                    if (selected == participants.size() ||
+                        load[member] < load[selected] ||
+                        (load[member] == load[selected] &&
+                         participants[member] < participants[selected]))
+                    {
+                        selected = member;
+                    }
+                }
+                if (selected >= participants.size())
+                    throw std::logic_error(
+                        "full-model policy fixture exhausted a tier quota");
+                target_owner[expert_cursor] = participants[selected];
+                --remaining[selected];
+                load[selected] += counts[expert_cursor];
+                ++expert_cursor;
+            }
+        }
+        if (expert_cursor != input.num_experts || priorities.size() != 2u ||
+            target_owner[0] == target_owner[1] ||
+            input.participants[target_owner[0]].tier_priority != priorities[0] ||
+            input.participants[target_owner[1]].tier_priority != priorities[0])
+        {
+            throw std::logic_error(
+                "full-model policy fixture built a non-canonical target");
+        }
+
+        auto current_owner = target_owner;
+        std::uint32_t cold_two = input.num_experts;
+        std::uint32_t cold_three = input.num_experts;
+        std::uint32_t first_cold_owner = input.participants.size();
+        for (std::uint32_t expert = input.num_experts; expert-- > 0u;)
+        {
+            const std::uint32_t owner = target_owner[expert];
+            if (input.participants[owner].tier_priority == priorities[0])
+                continue;
+            if (cold_two == input.num_experts)
+            {
+                cold_two = expert;
+                first_cold_owner = owner;
+            }
+            else if (owner != first_cold_owner)
+            {
+                cold_three = expert;
+                break;
+            }
+        }
+        if (cold_two == input.num_experts ||
+            cold_three == input.num_experts)
+        {
+            throw std::logic_error(
+                "full-model policy fixture requires two secondary participants");
+        }
+        std::swap(current_owner[0], current_owner[cold_two]);
+        std::swap(current_owner[1], current_owner[cold_three]);
+
         const std::size_t plane = input.num_layers * input.num_experts;
         input.collected_state.assign(input.participants.size() * plane, 0u);
         input.payload_bytes_per_layer.assign(input.num_layers, 4096u);
@@ -4031,18 +4152,20 @@ namespace llaminar2::test
         {
             for (std::uint32_t expert = 0u; expert < input.num_experts; ++expert)
             {
-                std::uint64_t count = 0u;
-                for (std::size_t participant = 0u;
-                     participant < input.participants.size(); ++participant)
-                {
-                    const auto word = seed.collected_state[
-                        (participant * seed.num_layers + layer % seed.num_layers) *
-                        seed.num_experts + expert % seed.num_experts];
-                    input.collected_state[(participant * input.num_layers + layer) *
-                                          input.num_experts + expert] = word;
-                    count += moe_rebalance_policy::collectedStateActivationCount(word);
-                }
-                economy.phase_expert_demand[plane + layer * input.num_experts + expert] = count;
+                input.collected_state[
+                    (static_cast<std::size_t>(current_owner[expert]) *
+                         input.num_layers +
+                     layer) *
+                        input.num_experts +
+                    expert] = moe_rebalance_policy::packCollectedState(
+                    counts[expert],
+                    /*active_transfer_slots=*/0u,
+                    /*physically_resident=*/true,
+                    /*transfer_backed=*/false,
+                    /*authoritative_owner=*/true);
+                economy.phase_expert_demand[
+                    plane + layer * input.num_experts + expert] =
+                    counts[expert];
             }
             for (std::uint32_t tier = 0u; tier < economy.tier_count; ++tier)
                 for (std::uint32_t phase = 0u;
@@ -4072,7 +4195,7 @@ namespace llaminar2::test
         const bool observation_only = geometry == PricedPolicyGeometry::FullModelObservation;
         const std::uint64_t transfer_cost_ns = observation_only ? 1'000'000'000'000u : 1u;
         auto policy_input = geometry != PricedPolicyGeometry::TwoAxisMovement
-            ? fullModelPolicyInput(transfer_cost_ns)
+            ? fullModelPolicyInput(transfer_cost_ns, *resolved_topology)
             : boundedTwoAxisPolicyInput();
         for (const auto &participant : resolved_topology->participants)
         {
@@ -4507,6 +4630,12 @@ namespace llaminar2::test
         EXPECT_EQ(
             observed.policy.projected_net_benefit_ns,
             expected.evidence.projected_net_benefit_ns);
+        EXPECT_EQ(
+            observed.policy.phase_tradeoff_candidates,
+            expected.evidence.phase_tradeoff_candidates);
+        EXPECT_EQ(
+            observed.policy.improvement_floor_rejected_cycles,
+            expected.evidence.improvement_floor_rejected_cycles);
         EXPECT_EQ(
             observed.policy.payoff_rejected_cycles,
             expected.evidence.payoff_rejected_cycles);

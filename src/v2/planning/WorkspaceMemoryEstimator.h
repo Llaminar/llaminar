@@ -54,6 +54,18 @@ struct WorkspaceMemoryGeometry
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.
     bool apportioned_routed_experts = false; ///< Experts are whole-owner slices, not TP slices.
     /**
+     * @brief Whether backend dispatch may be queried on this local device.
+     *
+     * CUDA NativeVNNI prefill scratch depends on the launch policy selected
+     * for the concrete GPU. Metadata-only and remote-device estimates leave
+     * this false and retain the conservative device-free envelope. Runtime
+     * admission sets it only after the local backend context exists, allowing
+     * the estimator to consume the exact same codebook-aware workspace
+     * contract as the production kernel without making Unit tests require a
+     * GPU.
+     */
+    bool runtime_device_policy_available = false;
+    /**
      * Largest flattened grouped-verifier shape retained beside the main graph.
      * Zero means no MTP graph family is materialized on this participant.
      */

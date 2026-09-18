@@ -390,6 +390,26 @@ namespace
             return forward(&token_shadow, 1);
         }
 
+        bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override
+        {
+            ++resident_ordinary_condition_advance_count_;
+            if (!supports_mtp_device_draft_token_input_ ||
+                !logical_state.coversRequest(request_index) ||
+                logical_state.next_condition_tokens_device !=
+                    resident_next_condition_tokens_.data() ||
+                logical_state.target_positions_device !=
+                    resident_target_positions_.data() ||
+                logical_state.target_sequence_lengths_device !=
+                    resident_target_sequence_lengths_.data())
+            {
+                return false;
+            }
+            return forward(&token_shadow, 1);
+        }
+
         bool advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
             int target_sample_slot,
@@ -3350,6 +3370,28 @@ namespace
             return true;
         }
 
+        bool publishForcedDeviceResidentConditionToken(
+            int32_t token,
+            int target_sample_slot = 0) override
+        {
+            ++forced_resident_condition_publication_count_;
+            if (!stageStochasticTargetTokenForDeviceSampling(
+                    token, target_sample_slot))
+            {
+                return false;
+            }
+            resident_target_positions_[0] = position_;
+            resident_target_sequence_lengths_[0] = position_;
+            resident_accepted_state_counts_[0] = 0;
+            resident_next_condition_tokens_[0] = token;
+            resident_all_drafts_accepted_flags_[0] = 0;
+            resident_stopped_flags_[0] = 0;
+            resident_publication_ok_flags_[0] = 1;
+            resident_logical_state_request_count_ = 1;
+            resident_logical_state_valid_ = true;
+            return true;
+        }
+
         bool publishDeviceResidentConditionTokenToTargetSampleSlot(
             const DeviceResidentLogicalSequenceStateHandle &logical_state,
             int request_index,
@@ -5105,6 +5147,10 @@ namespace
         {
             return resident_main_condition_advance_count_;
         }
+        int residentOrdinaryConditionAdvanceCount() const
+        {
+            return resident_ordinary_condition_advance_count_;
+        }
         int targetSampleMainConditionAdvanceCount() const
         {
             return target_sample_main_condition_advance_count_;
@@ -5184,6 +5230,10 @@ namespace
         int stageStochasticTargetTokenCount() const
         {
             return stage_stochastic_target_token_count_;
+        }
+        int forcedResidentConditionPublicationCount() const
+        {
+            return forced_resident_condition_publication_count_;
         }
         int residentConditionTokenTargetPublicationCount() const
         {
@@ -6891,7 +6941,9 @@ namespace
         int prepare_mtp_verifier_input_tokens_host_row_count_{0};
         int device_target_shifted_commit_count_{0};
         int resident_main_condition_advance_count_{0};
+        int resident_ordinary_condition_advance_count_{0};
         int target_sample_main_condition_advance_count_{0};
+        int forced_resident_condition_publication_count_{0};
         std::vector<MTPConditionForwardPurpose> condition_forward_purposes_;
         int resident_logical_state_shifted_commit_count_{0};
         int device_outcome_initial_shifted_commit_count_{0};
@@ -9176,7 +9228,78 @@ namespace
                     ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted));
                 EXPECT_EQ(mock->forwardCallCount(), 1);
                 EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
-            }
+        }
+    }
+
+    /**
+     * @brief Forced ordinary GPU output preserves the resident window boundary.
+     *
+     * A bounded-thinking close sequence can begin immediately after a captured
+     * ordinary window. Each forced token must commit the prior already-emitted
+     * mailbox row through the retained device graph, publish itself as the next
+     * mailbox condition, and let the following ordinary controller resume with
+     * `AlreadyEmitted` ownership. No host-token forward may bridge the windows.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           OrdinaryGPUForcedSequencePreservesDeviceResidentContinuation)
+    {
+        using Leading =
+            sampling_math::DeviceGenerationLeadingRowDisposition;
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/false,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                device);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableDeviceResidentGenerationSequence({
+                {.tokens = {6},
+                 .next_leading_row_disposition = Leading::AlreadyEmitted,
+                 .transaction_count = 1,
+                 .published_state_commit_count = 0},
+                {.tokens = {8},
+                 .next_leading_row_disposition = Leading::AlreadyEmitted,
+                 .transaction_count = 1,
+                 .published_state_commit_count = 1},
+            });
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            const GenerationResult before_force = decodeWithBudget(runner, 1);
+            ASSERT_TRUE(before_force.success()) << before_force.error;
+            EXPECT_THAT(before_force.tokens, ElementsAre(6));
+
+            const GenerationResult forced_first = runner->forceDecodeToken(2);
+            ASSERT_TRUE(forced_first.success()) << forced_first.error;
+            EXPECT_THAT(forced_first.tokens, ElementsAre(2));
+            EXPECT_EQ(
+                forced_first.returned_token_commit,
+                ReturnedTokenCommitState::Pending);
+
+            const GenerationResult forced_second = runner->forceDecodeToken(4);
+            ASSERT_TRUE(forced_second.success()) << forced_second.error;
+            EXPECT_THAT(forced_second.tokens, ElementsAre(4));
+            EXPECT_EQ(
+                forced_second.returned_token_commit,
+                ReturnedTokenCommitState::Pending);
+
+            const GenerationResult after_force = decodeWithBudget(runner, 1);
+            ASSERT_TRUE(after_force.success()) << after_force.error;
+            EXPECT_THAT(after_force.tokens, ElementsAre(8));
+            EXPECT_THAT(
+                mock->deviceGenerationAdmissionDispositions(),
+                ElementsAre(Leading::PendingResponse, Leading::AlreadyEmitted));
+            EXPECT_EQ(mock->residentOrdinaryConditionAdvanceCount(), 2);
+            EXPECT_EQ(mock->forcedResidentConditionPublicationCount(), 2);
+            EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 2);
+            EXPECT_EQ(mock->forwardCallCount(), 3)
+                << "Only prefill and the two retained resident-condition rows may run.";
+            EXPECT_THAT(mock->lastStagedStochasticTargetTokens(),
+                        ElementsAre(2, 4));
+        }
     }
 
     /** Bad terminal row accounting must not publish a response or admit continuation. */

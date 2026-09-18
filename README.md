@@ -475,7 +475,7 @@ keeping placement, collectives, and graph replay explicit.
 
 The release container is built for machines that may use NVIDIA CUDA and AMD
 ROCm in the same process. It ships the Llaminar binary plus CUDA 13.0
-user-space libraries, NCCL for CUDA 13.0, and ROCm 7.1.1 user-space libraries.
+user-space libraries, NCCL for CUDA 13.0, and ROCm 7.2.4 user-space libraries.
 It does not ship kernel drivers.
 
 On the host you need:
@@ -486,7 +486,7 @@ On the host you need:
 - Docker Engine with the Buildx plugin.
 - NVIDIA Linux driver `580.95.05` or newer for CUDA 13.0 Update 2.
 - NVIDIA Container Toolkit configured for Docker.
-- AMDGPU DKMS kernel driver from the ROCm 7.1.1 stack.
+- AMDGPU DKMS kernel driver from the ROCm 7.2.4 stack.
 
 OpenMPI and libnuma are hard Llaminar dependencies. The Docker images include
 them; source builds should install `openmpi-bin`, `libopenmpi-dev`, and
@@ -574,7 +574,7 @@ docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi
 sudo apt-get update
 sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)"
 curl -fsSL -o /tmp/amdgpu-install.deb \
-  https://repo.radeon.com/amdgpu-install/7.1.1/ubuntu/noble/amdgpu-install_7.1.1.70101-1_all.deb
+  https://repo.radeon.com/amdgpu-install/7.2.4/ubuntu/noble/amdgpu-install_7.2.4.70204-1_all.deb
 sudo apt-get install -y /tmp/amdgpu-install.deb
 sudo amdgpu-install --usecase=dkms -y
 sudo usermod -aG render,video "$USER"

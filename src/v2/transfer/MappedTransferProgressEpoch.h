@@ -135,7 +135,7 @@ namespace llaminar2
          * @return Device-active nanoseconds when the executor measures them.
          * @throws std::logic_error before a completed command or during a new command.
          *
-         * CUDA sums claimant intervals across partial graph retirement. Native
+         * CUDA measures the finite pass that claimed the generation. Native
          * event executors without timing return an explicit empty observation;
          * economy callers must reject missing evidence, not substitute host time.
          */
@@ -222,7 +222,8 @@ namespace llaminar2
          * occupy independent native queues. ROCm uses its proven native SDMA
          * service and has no auxiliary compute branch. This is a backend-owned
          * mechanism distinction, not a runtime retry or alternate inference mode.
-         * The factory retains this authority; every cache owns a private interval.
+         * The factory retains this authority; every cache owns one private
+         * mapped lifetime word and one bounded co-resident service CTA.
          */
         [[nodiscard]] GraphCaptureAuxiliaryBranchFactory graphBranchFactory();
 

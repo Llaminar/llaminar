@@ -17584,6 +17584,81 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::
+        advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Resident ordinary-condition advance failed: "
+                << reason);
+            PerfStatsCollector::addCounter(
+                "generation",
+                "resident_ordinary_condition_advance_failures",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"reason", reason}});
+            return false;
+        };
+
+        if (!state_.device_id.is_gpu() || request_index != 0)
+            return fail("operation requires one scalar GPU request");
+        if (!logical_state.coversRequest(request_index) ||
+            logical_state.device != state_.device_id ||
+            !device_resident_logical_sequence_state_mailbox_.ownsHandle(
+                logical_state, live_replay_state_epoch_))
+        {
+            return fail("logical-state mailbox is stale, foreign, or incomplete");
+        }
+
+        const int32_t *condition_token_device =
+            logical_state.nextConditionTokenDeviceForRequest(request_index);
+        const int32_t *condition_position_device =
+            logical_state.targetPositionDeviceForRequest(request_index);
+        const int32_t *condition_sequence_length_device =
+            logical_state.targetSequenceLengthDeviceForRequest(request_index);
+        if (!condition_token_device || !condition_position_device ||
+            !condition_sequence_length_device)
+        {
+            return fail("mailbox does not expose one complete token/position/length row");
+        }
+
+        /*
+         * MainInference plus ExplicitDecode selects ordinary decode arithmetic,
+         * while the three device pointers make token and logical position one
+         * event-published transaction.  This is a retained graph replay through
+         * the same ForwardExecutionEngine used by serving, including sparse
+         * ExpertOverlay collectives; it is not an eager row implementation.
+         */
+        const bool ok =
+            forwardImpl(
+                &token_shadow,
+                condition_token_device,
+                /*seq_len=*/1,
+                /*batch_size=*/1,
+                ForwardExecutionRole::MainInference,
+                ForwardInvocationKind::ExplicitDecode,
+                condition_position_device,
+                condition_sequence_length_device) != nullptr;
+        if (!ok)
+            return fail("captured ordinary condition graph execution failed");
+
+        PerfStatsCollector::addCounter(
+            "generation",
+            "resident_ordinary_condition_advances",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"request_index", std::to_string(request_index)},
+             {"token_owner", "device_logical_state_mailbox"},
+             {"position_owner", "device_logical_state_mailbox"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::
         advanceMTPMainConditionFromDeviceTargetSample(
             int32_t token_shadow,
             int target_sample_slot,
@@ -41580,10 +41655,11 @@ namespace llaminar2
         }
 
         // CUDA must enter progress from the graph root, not from a native queue
-        // that future inference observers can occupy. The GPU closes this
-        // private interval at the inference terminal; partial commands survive
-        // without making inference wait for their payload to finish. ROCm's
-        // native SDMA authority intentionally returns an empty compute branch.
+        // that future inference observers can occupy. Its graph-private native
+        // timeline wait consumes no SM between the eager check and a real work
+        // notification; the terminal releases an otherwise idle wait without
+        // running copy work. ROCm's native SDMA authority intentionally returns
+        // an empty compute branch.
         const auto factory = moe_overlay_transfer_progress_epoch_->graphBranchFactory();
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
@@ -46033,6 +46109,23 @@ namespace llaminar2
         }
         if (prefix_cache_)
         {
+            /*
+             * The compatibility material is model-lifetime state except for
+             * the authoritative MoE movement epoch. Rebuilding it for every
+             * request allocates and sorts tens of thousands of placement
+             * strings for large MoE models. The published identity already
+             * binds its key to the exact epoch observation, so an unchanged
+             * epoch proves that the existing value is current. Movement (or a
+             * live hybrid-layout refresh, which publishes explicitly below)
+             * still takes the full rebuild-and-transition path.
+             */
+            const uint64_t live_movement_epoch = moeRuntimeMovementEpoch();
+            if (prefix_identity_.key != 0 &&
+                !prefix_identity_.bypass &&
+                prefix_identity_.placement_epoch == live_movement_epoch)
+            {
+                return true;
+            }
             auto fingerprint = buildCurrentPrefixFingerprint(prefix_config);
             if (fingerprint.bypass || fingerprint.key == 0)
             {
@@ -47642,13 +47735,47 @@ namespace llaminar2
             parent_hash = key.stableHash();
             const bool terminal_block =
                 (key.token_start + key.token_count) == prompt_token_count;
-            if (prefix_cache_->contains(key) && !terminal_block)
+            const bool key_already_installed = prefix_cache_->contains(key);
+            const bool reuse_admitted_terminal =
+                terminal_block && key_already_installed &&
+                admission.terminalHarvestDisposition(
+                    key,
+                    prompt_token_count) ==
+                    PrefixTerminalHarvestDisposition::ReuseAdmittedArchive;
+            if (key_already_installed &&
+                (!terminal_block || reuse_admitted_terminal))
             {
+                if (reuse_admitted_terminal)
+                {
+                    /*
+                     * The full-hit restore consumed this exact immutable
+                     * terminal archive. Replacing it would duplicate every
+                     * pinned section while the restore event still retains
+                     * the admitted owner. Under a full RAM tier that duplicate
+                     * violates the canonical physical-memory reservation even
+                     * though logical LRU accounting has retired the old key.
+                     * Preserve the archive and avoid all redundant D2H work.
+                     */
+                    PerfStatsCollector::addCounter(
+                        "prefix_cache",
+                        "exact_terminal_archive_reuses",
+                        1.0,
+                        "harvest",
+                        state_.device_id.toString(),
+                        {
+                            {"block", std::to_string(block)},
+                            {"tokens", std::to_string(key.token_count)},
+                        });
+                }
                 if (prefixCacheTraceEnabled())
                 {
                     LOG_INFO("[PREFIX_TRACE] harvest skip-existing device=" << state_.device_id.toString()
                                                                             << " block=" << block
-                                                                            << " key=" << key.toHex());
+                                                                            << " key=" << key.toHex()
+                                                                            << " disposition="
+                                                                            << (reuse_admitted_terminal
+                                                                                    ? "reuse_exact_terminal"
+                                                                                    : "reuse_nonterminal"));
                 }
                 continue;
             }
@@ -51480,9 +51607,39 @@ namespace llaminar2
 
         if (configured_depth_policy.isOrdinary())
         {
+            /*
+             * The external prefill transaction owns the first overlay reader.
+             * Close it before composing the retained ordinary parent so every
+             * later decode iteration can acquire and release exactly once. This
+             * is identical to the speculative parent preparation; ordinary
+             * generation differs only in the forward/sampler body.
+             */
+            if (moe_overlay_epoch_execution_binding_)
+            {
+                auto &loop = mtp_device_generation_loop_graph_;
+                void *const parent_stream = loop.stream.get();
+                if (!parent_stream ||
+                    !waitForLiveInferenceStateReadyForObservation(
+                        parent_stream,
+                        "ordinary_device_generation_parent_materialization",
+                        DeviceTimelineRole::DeviceGenerationController) ||
+                    !prepareMoEOverlayEpochForInternalParent(
+                        parent_stream,
+                        "ordinary_device_generation_parent_materialization"))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Ordinary device-generation parent could not close the externally scheduled ExpertOverlay boundary"
+                              << " device=" << state_.device_id.toString());
+                    return false;
+                }
+            }
             std::string error;
             if (draft_depth != 0 ||
-                !materializeOrdinaryDeviceGenerationLoopGraph(sampling_mode, &error))
+                !materializeOrdinaryDeviceGenerationLoopGraph(
+                    sampling_mode,
+                    &error,
+                    moe_overlay_epoch_execution_binding_
+                        ? OrdinaryGenerationComposition::ExpertOverlay
+                        : OrdinaryGenerationComposition::CompleteLocal))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
                 return false;
@@ -51709,12 +51866,58 @@ namespace llaminar2
                 if (!waitForDeviceResidentLogicalSequenceStateRowReuse(loop.stream.get(),
                         "ordinary_hosted_generation_writer"))
                     return false;
-                const auto first = loop.ordinary_leading ==
-                        sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse
-                    ? OrdinaryGenerationGraphPlan::prefill_sampler
-                    : OrdinaryGenerationGraphPlan::hosted_transaction;
-                if (!loop.ordinary_children[first] ||
-                    !loop.ordinary_children[first]->launchOnStream(loop.stream.get()))
+                const bool pending_response = loop.ordinary_leading ==
+                    sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
+                if (pending_response)
+                {
+                    /*
+                     * Prefill already held and released the overlay epoch. Its
+                     * scalar sample reads the retained logits only, so it must
+                     * not manufacture a second lease boundary.
+                     */
+                    if (!loop.ordinary_children[
+                            OrdinaryGenerationGraphPlan::prefill_sampler] ||
+                        !loop.ordinary_children[
+                            OrdinaryGenerationGraphPlan::prefill_sampler]
+                             ->launchOnStream(loop.stream.get()))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Ordinary initial prefill sample failed");
+                        std::terminate();
+                    }
+                }
+                else if (loop.ordinary_composition &&
+                         *loop.ordinary_composition ==
+                             OrdinaryGenerationComposition::ExpertOverlay)
+                {
+                    /*
+                     * ExpertOverlay deliberately has no monolithic local
+                     * hosted_transaction child: its retained forward enters a
+                     * rank-wide sparse graph group and must be replayed by all
+                     * participants together. RankOrchestrator has already
+                     * admitted that shared sequence and fans these calls out
+                     * on the persistent TP workers.
+                     */
+                    std::string replay_error;
+                    void *producer_stream = nullptr;
+                    const auto &sampler = loop.ordinary_children[
+                        OrdinaryGenerationGraphPlan::decode_sampler];
+                    if (!loop.ordinary_forward_identity || !sampler ||
+                        !replayHostedOrdinaryExpertOverlayTransaction(
+                            *loop.ordinary_forward_identity,
+                            sampler.get(),
+                            &producer_stream,
+                            &replay_error))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Ordinary initial ExpertOverlay transaction failed: "
+                                  << replay_error);
+                        std::terminate();
+                    }
+                }
+                else if (!loop.ordinary_children[
+                                 OrdinaryGenerationGraphPlan::hosted_transaction] ||
+                         !loop.ordinary_children[
+                              OrdinaryGenerationGraphPlan::hosted_transaction]
+                              ->launchOnStream(loop.stream.get()))
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Ordinary initial captured transaction failed");
                     std::terminate();
@@ -51878,16 +52081,22 @@ namespace llaminar2
          */
         if (moe_overlay_inference_transaction_coordinator_)
         {
+            using HostedTransition =
+                MoEOverlayInferenceTransactionCoordinator::
+                    HostedGraphSequenceTransition;
             std::string sequence_error;
-            const std::optional<int> next_depth =
-                ticket.complete == 0
-                    ? std::optional<int>{ticket.next_draft_depth}
-                    : std::nullopt;
+            const HostedTransition transition =
+                ticket.complete != 0
+                    ? HostedTransition::terminal()
+                    : loop.ordinary_sampling_identity
+                          ? HostedTransition::ordinaryDecode()
+                          : HostedTransition::speculativeMTP(
+                                ticket.next_draft_depth);
             if (!moe_overlay_inference_transaction_coordinator_
                      ->advanceHostedGraphSequence(
                          static_cast<std::uint64_t>(
                              ticket.transaction_count),
-                         next_depth,
+                         transition,
                          static_cast<std::uint64_t>(
                              ticket.committed_output_tokens),
                          &sequence_error))
@@ -51972,6 +52181,13 @@ namespace llaminar2
         case HostedDeviceGenerationFragment::Kind::CapturedLocal:
             submitted = selected->capture &&
                 selected->capture->launchOnStream(loop.stream.get());
+            break;
+        case HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay:
+            submitted = replayHostedOrdinaryExpertOverlayTransaction(
+                selected->forward_signature,
+                selected->capture,
+                &producer_stream,
+                &replay_error);
             break;
         case HostedDeviceGenerationFragment::Kind::MTPFullSidecarReplay:
             submitted = replayHostedMTPSidecar(
@@ -56791,6 +57007,116 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"slot", std::to_string(target_sample_slot)},
              {"token", std::to_string(target_token)}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::publishForcedDeviceResidentConditionToken(
+        int32_t token,
+        int target_sample_slot)
+    {
+        if (!state_.device_id.is_gpu() || target_sample_slot < 0 ||
+            target_sample_slot >= stochastic_target_row_capacity_ ||
+            !stochastic_target_sample_tokens_dev_ || !state_.kv_cache ||
+            !state_.kv_cache->supportsDeviceResidentSequenceStatePublication())
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Forced policy token requires persistent GPU token storage and a device-owned live KV position");
+            return false;
+        }
+        const int32_t *live_position_device =
+            state_.kv_cache->deviceSequenceCachedTokenCountPtr(/*seq_idx=*/0);
+        IBackend *backend = getBackendFor(state_.device_id);
+        const int32_t *token_device =
+            static_cast<const int32_t *>(stochastic_target_sample_tokens_dev_) +
+            target_sample_slot;
+        void *producer_stream = prepareMainLogitsDeviceConsumer(
+            "publishForcedDeviceResidentConditionToken",
+            MainLogitsHandoffMode::Observe,
+            /*require_main_forward=*/false);
+        if (!backend || !live_position_device || !token_device ||
+            !producer_stream)
+        {
+            return false;
+        }
+
+        /*
+         * Ordinary generation deliberately has no MTP target-sample readiness
+         * events.  Publish the host policy scalar directly into the already
+         * reserved device slot, then use the logical mailbox's own event as the
+         * sole typed handoff. Reusing stageStochasticTargetTokenForDeviceSampling()
+         * here would make a non-MTP request depend on an unallocated MTP event
+         * and was the production crash behind bounded reasoning responses.
+         */
+        clearStochasticTargetSampleReadySlot(
+            target_sample_slot,
+            StochasticSampleReadyClearMode::Force);
+        if (!backend->enqueuePublishInt32ControlScalarDevice(
+                token,
+                const_cast<int32_t *>(token_device),
+                state_.device_id.gpu_ordinal(),
+                producer_stream) ||
+            !publishPreparedArenaGraphInput(
+                BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS,
+                stochastic_target_sample_tokens_dev_,
+                producer_stream,
+                state_.device_id,
+                "forced_ordinary_condition_token"))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Forced policy token could not enter persistent ordinary device state");
+            return false;
+        }
+
+        /*
+         * A forced token bypasses the sampler but remains ordinary generated
+         * output. Update the same durable histogram on the token producer's
+         * stream so later penalties see byte-identical serial history. With no
+         * active penalties the histogram is deliberately untouched.
+         */
+        if (mtp_request_penalty_policy_.enabled())
+        {
+            if (!mtp_generated_token_counts_dev_ ||
+                mtp_generated_token_count_capacity_ != state_.vocab_size ||
+                !backend->enqueueCommitGenerationTokenHistoryDevice(
+                    token_device,
+                    state_.vocab_size,
+                    mtp_generated_token_counts_dev_,
+                    state_.device_id.gpu_ordinal(),
+                    producer_stream) ||
+                !publishPreparedArenaGraphInput(
+                    BufferId::MTP_GENERATED_TOKEN_COUNTS,
+                    mtp_generated_token_counts_dev_,
+                    producer_stream,
+                    state_.device_id,
+                    "forced_generation_token_history"))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Forced policy token could not advance device generation history");
+                return false;
+            }
+        }
+
+        if (!publishDeviceResidentLogicalSequenceStateFromDeviceRows(
+                token_device,
+                live_position_device,
+                /*request_count=*/1,
+                producer_stream,
+                DeviceResidentLogicalStatePublicationKind::
+                    TargetSampleInitialization,
+                "forced_ordinary_condition"))
+        {
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "generation",
+            "forced_device_resident_condition_publications",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"target_slot", std::to_string(target_sample_slot)},
+             {"history", mtp_request_penalty_policy_.enabled()
+                             ? "device_committed"
+                             : "penalty_free"}});
         return true;
     }
 

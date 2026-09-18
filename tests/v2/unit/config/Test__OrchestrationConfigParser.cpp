@@ -197,6 +197,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(
         config.moe_rebalance.migration_payoff_horizon_tokens,
         moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens);
+    EXPECT_EQ(config.moe_rebalance.migration_payoff_horizon_tokens, 65'536u);
     EXPECT_EQ(
         config.moe_rebalance.migration_transfer_slots,
         moe_rebalance_policy::kDefaultMigrationTransferSlots);

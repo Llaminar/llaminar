@@ -93,6 +93,32 @@ TEST(Test__MTPDepthController, GreedyDynamicDefaultInitialDepthStartsAtDepthTwoW
     EXPECT_EQ(controller.maxDepth(), 3);
 }
 
+/**
+ * @test A direct controller caller gets the full adaptive range by default.
+ *
+ * This protects non-CLI callers from repeating the historical bug where the
+ * automatic maximum inherited configured_draft_tokens=1 and made dynamic mode
+ * indistinguishable from fixed depth one.
+ */
+TEST(Test__MTPDepthController, AutomaticMaximumUsesFullSupportedRange)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.min_depth = 1;
+    config.max_depth = 0;
+    config.initial_depth = 0;
+    config.use_generated_policy = false;
+
+    MTPDepthController controller(
+        config,
+        /*configured_draft_tokens=*/1,
+        MTPVerifyMode::Greedy);
+
+    EXPECT_EQ(controller.minDepth(), 1);
+    EXPECT_EQ(controller.maxDepth(), 15);
+    EXPECT_EQ(controller.currentDepth(), 2);
+}
+
 TEST(Test__MTPDepthController, StochasticDynamicDefaultInitialDepthStartsAtDepthOne)
 {
     MTPDepthPolicyConfig config;

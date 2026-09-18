@@ -4578,6 +4578,20 @@ namespace llaminar2::test
             std::string::npos)
             << "The homogeneous device executor must enqueue its captured transaction at the same committed boundary.";
         EXPECT_NE(
+            runner.find(
+                "Hosted ExpertOverlay decode progress could not wake the device controller"),
+            std::string::npos)
+            << "A heterogeneous hosted transaction must wake the topology-wide device controller at each authenticated retirement edge.";
+        EXPECT_NE(
+            maybe_body.find(
+                "hosted_device_generation_decode_progress_retired_.exchange("),
+            std::string::npos)
+            << "The outer decode boundary must acknowledge ticket-retired progress instead of publishing it twice.";
+        EXPECT_NE(
+            maybe_body.find("authenticated_transaction_ticket"),
+            std::string::npos)
+            << "Lifecycle evidence must distinguish direct authenticated-ticket cadence from the deferred command sideband.";
+        EXPECT_NE(
             maybe_body.find(
                 "MoEOverlayAuthorityExecutionKind::\n                        DeviceResident"),
             std::string::npos);
@@ -10263,6 +10277,41 @@ namespace llaminar2::test
         const size_t rebalance_guard = body.rfind("if (invalidate_on_rebalance)", total_rebalances);
         ASSERT_NE(rebalance_guard, std::string::npos)
             << "Controller movement counters must not churn placement-fingerprint keys.";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixRequestReusesPublishedFingerprintObservation)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path orchestrator_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        const std::string source = readFile(orchestrator_path);
+        ASSERT_FALSE(source.empty()) << orchestrator_path;
+
+        const size_t start =
+            source.find("bool DeviceGraphOrchestrator::ensurePrefixCacheReady()");
+        ASSERT_NE(start, std::string::npos);
+        const size_t end = source.find(
+            "bool DeviceGraphOrchestrator::refreshPrefixPayloadLayoutForLiveHybridState(",
+            start);
+        ASSERT_NE(end, std::string::npos);
+        const std::string body = source.substr(start, end - start);
+
+        const size_t epoch_observation =
+            body.find("const uint64_t live_movement_epoch = moeRuntimeMovementEpoch();");
+        const size_t current_identity =
+            body.find("prefix_identity_.placement_epoch == live_movement_epoch");
+        const size_t reuse = body.find("return true;", current_identity);
+        const size_t rebuild =
+            body.find("buildCurrentPrefixFingerprint(prefix_config)");
+        ASSERT_NE(epoch_observation, std::string::npos);
+        ASSERT_NE(current_identity, std::string::npos);
+        ASSERT_NE(reuse, std::string::npos);
+        ASSERT_NE(rebuild, std::string::npos);
+        EXPECT_LT(epoch_observation, current_identity);
+        EXPECT_LT(current_identity, reuse);
+        EXPECT_LT(reuse, rebuild)
+            << "An unchanged published epoch must return before rebuilding the "
+               "large ExpertOverlay fingerprint material.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PhaseSplitDecodeKeepsVocabParallelEmbeddingReduction)

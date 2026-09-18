@@ -445,6 +445,8 @@ namespace llaminar2
                    header.projected_transfer_and_repack_ns == 0u &&
                    header.projected_inference_interference_ns == 0u &&
                    header.projected_net_benefit_ns == 0u &&
+                   header.phase_tradeoff_candidates == 0u &&
+                   header.improvement_floor_rejected_cycles == 0u &&
                    header.payoff_rejected_cycles == 0u &&
                    header.residency_rejected_cycles == 0u;
         case MoEOverlayDeviceControllerTransactionKind::DynamicPlacement:
@@ -479,6 +481,12 @@ namespace llaminar2
                        entries.size() &&
                    header.layer_scan_start < num_layers &&
                    header.layer_scan_next < num_layers &&
+                   header.improvement_floor_rejected_cycles <=
+                       header.rejected_cycles &&
+                   header.payoff_rejected_cycles <=
+                       header.rejected_cycles &&
+                   header.residency_rejected_cycles <=
+                       header.rejected_cycles &&
                    measured_economy_is_coherent;
         }
         case MoEOverlayDeviceControllerTransactionKind::
@@ -505,6 +513,8 @@ namespace llaminar2
                    header.projected_transfer_and_repack_ns == 0u &&
                    header.projected_inference_interference_ns == 0u &&
                    header.projected_net_benefit_ns == 0u &&
+                   header.phase_tradeoff_candidates == 0u &&
+                   header.improvement_floor_rejected_cycles == 0u &&
                    header.payoff_rejected_cycles == 0u &&
                    header.residency_rejected_cycles == 0u;
         }
@@ -515,6 +525,8 @@ namespace llaminar2
                    header.projected_transfer_and_repack_ns == 0u &&
                    header.projected_inference_interference_ns == 0u &&
                    header.projected_net_benefit_ns == 0u &&
+                   header.phase_tradeoff_candidates == 0u &&
+                   header.improvement_floor_rejected_cycles == 0u &&
                    header.payoff_rejected_cycles == 0u &&
                    header.residency_rejected_cycles == 0u;
         case MoEOverlayDeviceControllerTransactionKind::Invalid:

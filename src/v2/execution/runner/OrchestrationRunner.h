@@ -1948,19 +1948,23 @@ namespace llaminar2
          */
         bool device_generation_embedded_moe_maintenance_pending_ack_{false};
         /**
-         * @brief Device-authenticated decode progress already sent to hosted maintenance.
+         * @brief Device-authenticated decode progress already retired by hosted maintenance.
          *
          * HIP's retained transaction scheduler publishes cumulative committed
          * output in its immutable ticket. The transaction coordinator converts
-         * that frontier into exactly-once deltas and increments this host-only
-         * lifecycle receipt after waking the background maintenance service.
-         * The ordinary outer decode boundary consumes the receipt and must
-         * match it exactly, preventing the same logical tokens from advancing
-         * the movement cadence twice. This is acknowledgement metadata only;
-         * it neither mirrors nor controls device-owned generation state.
+         * that frontier into exactly-once deltas and wakes the one process-local
+         * maintenance authority at each retired sparse sequence. On the
+         * topology-wide device authority's continuation rank only, this
+         * counter accumulates the same immutable deltas until the ordinary
+         * outer decode boundary authenticates their total. The older host
+         * authority retains the counter on each process because its follower
+         * worker consumes the same outer boundary. Both cases prevent terminal
+         * bookkeeping from advancing cadence twice. This is acknowledgement
+         * metadata only; it neither mirrors nor controls device-owned
+         * generation or placement state.
          */
         std::atomic<std::uint64_t>
-            hosted_device_generation_decode_progress_notified_{0u};
+            hosted_device_generation_decode_progress_retired_{0u};
         /**
          * @brief Per-request state initialized by prefillBatch().
          *

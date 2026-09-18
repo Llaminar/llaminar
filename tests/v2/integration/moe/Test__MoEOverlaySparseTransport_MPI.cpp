@@ -16,6 +16,7 @@
 #include "tensors/Tensors.h"
 #include "../../mocks/MockComputeStage.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
+#include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoESparseRequestIdentity.h"
 #include "utils/MPIContext.h"
@@ -946,6 +947,8 @@ namespace llaminar2::test
         std::uint64_t retired_prefill_tokens = 0u;
         std::uint64_t retired_decode_tokens = 0u;
         std::uint64_t retired_decode_notifications = 0u;
+        std::uint64_t retired_decode_windows = 0u;
+        MoEOverlayMaintenanceBoundaryGate decode_gate(4u);
         if (rank_ == 0)
         {
             MoEOverlayInferenceTransactionPublisher publisher({
@@ -1012,12 +1015,19 @@ namespace llaminar2::test
                 },
                 .retired_decode_progress_sink =
                     [&retired_decode_tokens,
-                     &retired_decode_notifications](
+                     &retired_decode_notifications,
+                     &retired_decode_windows,
+                     &decode_gate](
                         std::uint64_t completed_tokens,
                         std::string *)
                 {
                     retired_decode_tokens += completed_tokens;
                     ++retired_decode_notifications;
+                    decode_gate.notify(
+                        MoEOverlayInferencePhase::Decode,
+                        completed_tokens);
+                    if (decode_gate.consumeReady())
+                        ++retired_decode_windows;
                     return true;
                 },
             });
@@ -1031,6 +1041,8 @@ namespace llaminar2::test
             EXPECT_EQ(retired_decode_tokens, 9u);
             EXPECT_EQ(retired_decode_notifications, 4u)
                 << "Repeated graph tickets in one sequence must not duplicate progress";
+            EXPECT_EQ(retired_decode_windows, 2u)
+                << "The existing ticket channel must admit recurring controller windows before the outer command returns";
             EXPECT_EQ(result.retired_decode_progress_tokens, 9u);
             EXPECT_EQ(follower.state(),
                       MoEOverlayInferenceProtocolState::Complete);

@@ -1,8 +1,14 @@
 /**
  * @file Test__ToolCallParser.cpp
- * @brief Unit tests for tool call parsing (Hermes 2 Pro, Generic formats)
+ * @brief Unit tests for architecture-selected tool-call protocols
+ *
+ * These tests use model-native text captured from production requests.  They
+ * protect the boundary that turns inert generated text into executable OpenAI
+ * tool calls, so malformed input must always fail closed as ordinary content.
  */
 
+#include "models/qwen35/Qwen35Schema.h"
+#include "models/qwen35moe/Qwen35MoESchema.h"
 #include "utils/ToolCallParser.h"
 #include "utils/ToolCallTypes.h"
 #include <gtest/gtest.h>
@@ -111,6 +117,140 @@ TEST(Test__ToolCallParser, Hermes2Pro_NestedArguments)
 }
 
 // =============================================================================
+// Qwen 3.5/3.8 native function/parameter format
+// =============================================================================
+
+/** Reproduce the exact payload emitted by both production models. */
+TEST(Test__ToolCallParser, Qwen3NativeProductionPayloadAndSchemaAuthority)
+{
+    const Qwen35SchemaFactory dense_factory;
+    const Qwen35MoESchemaFactory moe_factory;
+    ASSERT_EQ(dense_factory.getToolCallFormat(), ToolCallFormat::QWEN_3_XML);
+    ASSERT_EQ(moe_factory.getToolCallFormat(), ToolCallFormat::QWEN_3_XML);
+
+    const std::string text = R"(<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>)";
+
+    const auto result = parseToolCalls(text, dense_factory.getToolCallFormat());
+    ASSERT_TRUE(result.hasToolCalls());
+    ASSERT_EQ(result.tool_calls.size(), 1u);
+    EXPECT_EQ(result.tool_calls[0].name, "get_weather");
+    EXPECT_EQ(nlohmann::json::parse(result.tool_calls[0].arguments),
+              nlohmann::json({{"city", "Paris"}}));
+    EXPECT_TRUE(result.content.empty());
+}
+
+TEST(Test__ToolCallParser, Qwen3NativePreservesTypedAndMultilineParameters)
+{
+    const std::string text = R"(I will use the requested tool.
+<tool_call>
+<function=search_records>
+<parameter=query>
+north
+south
+</parameter>
+<parameter=limit>
+3
+</parameter>
+<parameter=filters>
+{"active":true,"tags":["a","b"]}
+</parameter>
+</function>
+</tool_call>)";
+
+    const auto result = parseToolCalls(text, ToolCallFormat::QWEN_3_XML);
+    ASSERT_TRUE(result.hasToolCalls());
+    ASSERT_EQ(result.tool_calls.size(), 1u);
+    EXPECT_EQ(result.content, "I will use the requested tool.");
+    const auto arguments = nlohmann::json::parse(result.tool_calls[0].arguments);
+    EXPECT_EQ(arguments["query"], "north\nsouth");
+    EXPECT_EQ(arguments["limit"], 3);
+    EXPECT_EQ(arguments["filters"]["active"], true);
+    EXPECT_EQ(arguments["filters"]["tags"], nlohmann::json({"a", "b"}));
+}
+
+TEST(Test__ToolCallParser, Qwen3NativeSupportsParallelCallsInGenerationOrder)
+{
+    const std::string text = R"(<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=get_time>
+<parameter=timezone>
+Europe/Paris
+</parameter>
+</function>
+</tool_call>)";
+
+    const auto result = parseToolCalls(text, ToolCallFormat::QWEN_3_XML);
+    ASSERT_EQ(result.tool_calls.size(), 2u);
+    EXPECT_EQ(result.tool_calls[0].name, "get_weather");
+    EXPECT_EQ(result.tool_calls[1].name, "get_time");
+    EXPECT_NE(result.tool_calls[0].id, result.tool_calls[1].id);
+}
+
+TEST(Test__ToolCallParser, Qwen3NativeMalformedBlockFailsClosedAsContent)
+{
+    const std::string text = R"(<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</function>
+</tool_call>)";
+
+    const auto result = parseToolCalls(text, ToolCallFormat::QWEN_3_XML);
+    EXPECT_FALSE(result.hasToolCalls());
+    EXPECT_EQ(result.content, text);
+}
+
+/** Tokenizer boundaries cannot delay safe prose or expose protocol markup. */
+TEST(Test__ToolCallParser, StreamingQwen3NativePublishesContentAndCallIncrementally)
+{
+    StreamingToolCallSplitter splitter(ToolCallFormat::QWEN_3_XML);
+
+    auto first = splitter.process("I will check. <tool_");
+    ASSERT_EQ(first.size(), 1u);
+    EXPECT_EQ(first[0].kind,
+              StreamingToolCallSplitter::Event::Kind::Content);
+    EXPECT_EQ(first[0].content, "I will check. ");
+
+    auto second = splitter.process(
+        "call><function=get_weather><parameter=city>Par");
+    EXPECT_TRUE(second.empty());
+    auto third = splitter.process(
+        "is</parameter></function></tool_call>");
+    ASSERT_EQ(third.size(), 1u);
+    EXPECT_EQ(third[0].kind,
+              StreamingToolCallSplitter::Event::Kind::ToolCall);
+    EXPECT_EQ(third[0].tool_call.name, "get_weather");
+    EXPECT_EQ(nlohmann::json::parse(third[0].tool_call.arguments),
+              nlohmann::json({{"city", "Paris"}}));
+    EXPECT_TRUE(splitter.flush().empty());
+}
+
+/** A truncated stream must remain inert literal output. */
+TEST(Test__ToolCallParser, StreamingIncompleteToolCallFailsClosedOnFlush)
+{
+    StreamingToolCallSplitter splitter(ToolCallFormat::QWEN_3_XML);
+    EXPECT_TRUE(splitter.process("<tool_call><function=delete_all>").empty());
+    const auto final = splitter.flush();
+    ASSERT_EQ(final.size(), 1u);
+    EXPECT_EQ(final[0].kind,
+              StreamingToolCallSplitter::Event::Kind::Content);
+    EXPECT_EQ(final[0].content,
+              "<tool_call><function=delete_all>");
+}
+
+// =============================================================================
 // hasToolCallMarkers
 // =============================================================================
 
@@ -119,6 +259,16 @@ TEST(Test__ToolCallParser, HasMarkers_Hermes2Pro)
     EXPECT_TRUE(hasToolCallMarkers("<tool_call>\nfoo\n</tool_call>", ToolCallFormat::HERMES_2_PRO));
     EXPECT_FALSE(hasToolCallMarkers("no markers here", ToolCallFormat::HERMES_2_PRO));
     EXPECT_FALSE(hasToolCallMarkers("<tool_call> without end", ToolCallFormat::HERMES_2_PRO));
+}
+
+TEST(Test__ToolCallParser, HasMarkers_Qwen3Native)
+{
+    EXPECT_TRUE(hasToolCallMarkers(
+        "<tool_call><function=f></function></tool_call>",
+        ToolCallFormat::QWEN_3_XML));
+    EXPECT_FALSE(hasToolCallMarkers(
+        "<function=f></function>",
+        ToolCallFormat::QWEN_3_XML));
 }
 
 // =============================================================================

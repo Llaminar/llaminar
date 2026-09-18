@@ -37,6 +37,22 @@ namespace llaminar2
     bool isDecodeEquivalent(PrefixStateProvenance provenance);
 
     /**
+     * @brief Typed terminal-block action selected at prefix harvest.
+     *
+     * A full prefix hit restores an immutable terminal archive and does not
+     * mutate that prompt state before harvest. Replacing the same archive in
+     * that case wastes D2H bandwidth and can temporarily require two physical
+     * RAM allocations while the restore event still owns the admitted block.
+     * Partial hits and incomplete terminal records must archive the newly
+     * computed live state instead.
+     */
+    enum class PrefixTerminalHarvestDisposition
+    {
+        ArchiveLiveState,
+        ReuseAdmittedArchive,
+    };
+
+    /**
      * @brief Opaque device-owned checkpoint of one KV cache sequence.
      *
      * The checkpoint contains backend-private canonical ring metadata, never
@@ -98,6 +114,23 @@ namespace llaminar2
         std::vector<PrefixBlockHandle> blocks;
 
         bool hit() const { return supported && cached_tokens > 0 && !blocks.empty(); }
+
+        /**
+         * @brief Decide whether harvest can retain an exact terminal archive.
+         *
+         * The decision is purely about the admitted immutable payload. It
+         * never probes mutable cache state and therefore cannot turn an old
+         * lookup into a new authority. The caller must separately prove that
+         * the same key remains installed under the admitted fingerprint.
+         *
+         * @param terminal_key Terminal block reconstructed from request bytes.
+         * @param prompt_token_count Exact logical prompt width being harvested.
+         * @return Reuse only for a complete full-hit terminal record.
+         */
+        PrefixTerminalHarvestDisposition terminalHarvestDisposition(
+            const PrefixCacheKey &terminal_key,
+            int prompt_token_count) const;
+
         PrefixLookupResult clampedTo(int token_count) const;
     };
 

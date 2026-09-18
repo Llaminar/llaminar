@@ -36,7 +36,7 @@ namespace llaminar2
         0x50454f4du;
 
     /** Version of @ref MoEOverlayDeviceControllerPolicyResult. */
-    inline constexpr std::uint32_t kMoEOverlayDevicePolicyResultVersion = 3u;
+    inline constexpr std::uint32_t kMoEOverlayDevicePolicyResultVersion = 4u;
 
     /** One graph-capturable transition in the sole controller state machine. */
     enum class MoEOverlayDeviceControllerAction : std::uint32_t
@@ -355,9 +355,10 @@ namespace llaminar2
         std::uint64_t projected_transfer_and_repack_ns = 0u;
         std::uint64_t projected_inference_interference_ns = 0u;
         std::uint64_t projected_net_benefit_ns = 0u;
+        std::uint32_t phase_tradeoff_candidates = 0u;
+        std::uint32_t improvement_floor_rejected_cycles = 0u;
         std::uint32_t payoff_rejected_cycles = 0u;
         std::uint32_t residency_rejected_cycles = 0u;
-        std::uint64_t reserved[1] = {};
 
         /** @return Whether the producer published a supported exact result. */
         LLAMINAR_MOE_CONTROLLER_HD bool valid() const noexcept

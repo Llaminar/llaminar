@@ -68,6 +68,37 @@ namespace llaminar2
         Include, ///< Non-streaming response includes terminal summary and passive lifetime movement evidence.
     };
 
+    /** @brief Validated OpenAI tool-selection policy for one request. */
+    enum class ToolChoiceMode
+    {
+        Auto,             ///< Model may answer or call any admitted tool.
+        None,             ///< Tools are not exposed and generated markers remain text.
+        Required,         ///< Model must call at least one admitted tool.
+        SpecificFunction, ///< Model must call the named admitted function.
+    };
+
+    /**
+     * @brief Typed tool-selection policy; invalid JSON never reaches inference.
+     *
+     * Keeping this typed avoids reinterpreting a raw JSON union independently
+     * during prompt construction, streaming, and terminal response parsing.
+     */
+    struct ToolChoicePolicy
+    {
+        ToolChoiceMode mode{ToolChoiceMode::Auto};
+        std::string function_name; ///< Populated only for SpecificFunction.
+
+        /** @brief Whether generated tool calls are admitted for this request. */
+        bool permitsCalls() const { return mode != ToolChoiceMode::None; }
+
+        /** @brief Whether the prompt must require a tool invocation. */
+        bool requiresCall() const
+        {
+            return mode == ToolChoiceMode::Required ||
+                   mode == ToolChoiceMode::SpecificFunction;
+        }
+    };
+
     /** @brief Validated immutable request policy consumed by the serving handler. */
     struct ChatCompletionRequest
     {
@@ -98,9 +129,8 @@ namespace llaminar2
         /// JSON array of {type: "function", function: {name, description, parameters}}.
         nlohmann::json tools;
 
-        /// Tool choice control: "none", "auto", "required", or
-        /// {"type": "function", "function": {"name": "..."}} to force a specific tool.
-        nlohmann::json tool_choice;
+        /// Validated tool choice control; raw request JSON is not retained.
+        ToolChoicePolicy tool_choice;
 
         /// Allow model to call multiple tools in a single response.
         bool parallel_tool_calls{false};
@@ -183,6 +213,16 @@ namespace llaminar2
     class ChatCompletionHandler
     {
     public:
+        /**
+         * @brief Maximum committed tokens between streaming publications.
+         *
+         * This spans the widest supported MTP transaction (depth 15 plus its
+         * target row), so streaming never clips useful speculative work. Each
+         * window executes the same complete retained production graph and
+         * preserves its device-owned continuation for the following window.
+         */
+        static constexpr int kStreamingPublicationWindowTokens = 16;
+
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
                               const std::string &model_name = "");
 

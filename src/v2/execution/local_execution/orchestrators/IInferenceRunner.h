@@ -1578,6 +1578,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Commit one ordinary GPU decode row from a resident mailbox.
+         *
+         * This is the non-speculative companion to
+         * advanceMTPMainConditionFromDeviceResidentLogicalState().  It exists
+         * for request-policy continuations (for example a bounded-thinking
+         * closing phrase) that arrive while ordinary captured generation owns
+         * an already-emitted condition token.  Implementations must replay the
+         * retained ordinary decode graph from the exact mailbox token and live
+         * position; a host token upload or eager model-stage replay is invalid.
+         *
+         * @param token_shadow Host-visible token identity for diagnostics only.
+         * @param logical_state Current event-published device mailbox.
+         * @param request_index Request row to consume.
+         * @return true after the retained ordinary graph has been submitted.
+         */
+        virtual bool advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+            int32_t token_shadow,
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0)
+        {
+            (void)token_shadow;
+            (void)logical_state;
+            (void)request_index;
+            return false;
+        }
+
+        /**
          * @brief Advance one GPU main-model condition row from a target sample slot.
          *
          * Implementations must first compose the sampled token and canonical live
@@ -4060,6 +4087,28 @@ namespace llaminar2
             int target_sample_slot = 0)
         {
             (void)target_token;
+            (void)target_sample_slot;
+            return false;
+        }
+
+        /**
+         * @brief Publish one host-selected policy token as the resident condition.
+         *
+         * The scalar crosses the request-policy boundary through a backend
+         * control kernel, becomes the device-owned target slot, advances the
+         * durable generated-token history, and is paired with the canonical
+         * live KV position in the logical-state mailbox.  The token remains an
+         * already-emitted pending condition; this operation does not forward it.
+         *
+         * @param token Host-selected policy token.
+         * @param target_sample_slot Persistent target slot used for publication.
+         * @return true when token, history, and mailbox publication are queued.
+         */
+        virtual bool publishForcedDeviceResidentConditionToken(
+            int32_t token,
+            int target_sample_slot = 0)
+        {
+            (void)token;
             (void)target_sample_slot;
             return false;
         }

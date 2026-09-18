@@ -45,6 +45,7 @@ namespace llaminar2
         };
 
         DeviceGenerationPolicy policy;
+        const MTPDepthPolicyConfig depth = resolveMTPDepthPolicyConfig(mtp);
         switch (mtp.depth_policy.mode)
         {
         case MTPDepthPolicyMode::Fixed:
@@ -55,21 +56,21 @@ namespace llaminar2
             break;
         case MTPDepthPolicyMode::Observe:
             policy.mode = DeviceGenerationPolicyMode::Observe;
-            policy.minimum_depth = mtp.depth_policy.min_depth;
+            policy.minimum_depth = depth.min_depth;
             policy.maximum_depth =
                 resolveMTPMaximumExecutionDraftDepth(mtp);
             policy.initial_depth = resolveMTPDepthPolicyInitialDepth(
-                mtp.depth_policy,
+                depth,
                 mtp.draft_tokens,
                 mtp.verify_mode);
             break;
         case MTPDepthPolicyMode::Dynamic:
             policy.mode = DeviceGenerationPolicyMode::Dynamic;
-            policy.minimum_depth = mtp.depth_policy.min_depth;
+            policy.minimum_depth = depth.min_depth;
             policy.maximum_depth =
                 resolveMTPMaximumExecutionDraftDepth(mtp);
             policy.initial_depth = resolveMTPDepthPolicyInitialDepth(
-                mtp.depth_policy,
+                depth,
                 mtp.draft_tokens,
                 mtp.verify_mode);
             break;
@@ -79,17 +80,17 @@ namespace llaminar2
             break;
         }
 
-        policy.window_size = mtp.depth_policy.window_size;
-        policy.minimum_samples = mtp.depth_policy.min_samples;
-        policy.cooldown_steps = mtp.depth_policy.cooldown_steps;
+        policy.window_size = depth.window_size;
+        policy.minimum_samples = depth.min_samples;
+        policy.cooldown_steps = depth.cooldown_steps;
         policy.promote_consecutive_windows =
-            mtp.depth_policy.promote_consecutive_windows;
+            depth.promote_consecutive_windows;
         policy.promote_full_accept_rate_ppm =
-            rate_to_ppm(mtp.depth_policy.promote_full_accept_rate);
+            rate_to_ppm(depth.promote_full_accept_rate);
         policy.demote_zero_accept_rate_ppm =
-            rate_to_ppm(resolveMTPZeroAcceptDemotionRate(mtp));
+            rate_to_ppm(*depth.demote_zero_accept_rate);
         policy.demote_acceptance_rate_ppm =
-            rate_to_ppm(mtp.depth_policy.demote_acceptance_rate);
+            rate_to_ppm(depth.demote_acceptance_rate);
         return policy;
     }
 }

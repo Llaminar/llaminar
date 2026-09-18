@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "execution/config/MTPDepthDefaults.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -510,7 +511,8 @@ namespace llaminar2::sampling_math
     struct DeviceGenerationPolicy
     {
         static constexpr int kRateScale = 1'000'000;
-        static constexpr int kMaximumSupportedDraftDepth = 15;
+        static constexpr int kMaximumSupportedDraftDepth =
+            kMaximumSupportedMTPDraftDepth;
 
         DeviceGenerationPolicyMode mode =
             DeviceGenerationPolicyMode::Fixed;

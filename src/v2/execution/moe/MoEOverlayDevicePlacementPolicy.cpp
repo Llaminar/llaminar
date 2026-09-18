@@ -44,6 +44,8 @@ namespace llaminar2
             std::uint64_t inference_interference_ns = 0u;
             std::uint64_t projected_net_benefit_ns = 0u;
             bool residency_eligible = true;
+            bool phase_non_regressing = false;
+            bool improvement_floor_met = false;
             bool payoff_eligible = false;
 
             /** @return Whether both independent measured gates accept. */
@@ -314,126 +316,60 @@ namespace llaminar2
             if (cycle.empty())
                 return score;
 
-            const auto first_source = static_cast<std::size_t>(
-                current[cycle.front()]);
-            const std::int32_t selected_tier =
-                input.participants[first_source].tier_index;
-            bool pure_same_tier = selected_tier >= 0;
-            for (const std::uint32_t expert : cycle)
+            /*
+             * Every routed participant executes concurrently. The placement-
+             * dependent service objective is therefore the slowest complete
+             * participant, not a sum over the experts that happen to form the
+             * ownership cycle. This one calculation applies to both axes:
+             * same-tier redistribution and cross-tier promotion/demotion.
+             * Pricing only the moved experts made a large cycle look almost
+             * valueless even when it removed work from the actual straggler.
+             */
+            for (std::uint32_t phase = 0u;
+                 phase < kMoEOverlayDeviceControllerDemandPhaseCount;
+                 ++phase)
             {
-                const auto source = static_cast<std::size_t>(current[expert]);
-                const auto destination = static_cast<std::size_t>(
-                    desired[expert]);
-                pure_same_tier = pure_same_tier &&
-                    input.participants[source].tier_index == selected_tier &&
-                    input.participants[destination].tier_index ==
-                        selected_tier;
-            }
-
-            if (pure_same_tier)
-            {
-                for (std::uint32_t phase = 0u;
-                     phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                     ++phase)
+                std::vector<std::uint64_t> before_load(
+                    input.participants.size(), 0u);
+                std::vector<std::uint64_t> after_load(
+                    input.participants.size(), 0u);
+                for (std::uint32_t expert = 0u;
+                     expert < input.num_experts;
+                     ++expert)
                 {
-                    std::vector<std::uint64_t> before_load(
-                        input.participants.size(), 0u);
-                    std::vector<std::uint64_t> after_load(
-                        input.participants.size(), 0u);
-                    for (std::uint32_t expert = 0u;
-                         expert < input.num_experts;
-                         ++expert)
-                    {
-                        const std::uint64_t demand =
-                            economy.phase_expert_demand[demandOffset(
-                                input, phase, layer, expert)];
-                        const auto before_owner = static_cast<std::size_t>(
-                            current[expert]);
-                        const auto after_owner = static_cast<std::size_t>(
-                            candidate[expert]);
-                        if (input.participants[before_owner].tier_index ==
-                            selected_tier)
-                        {
-                            before_load[before_owner] = saturatingAdd(
-                                before_load[before_owner], demand);
-                        }
-                        if (input.participants[after_owner].tier_index ==
-                            selected_tier)
-                        {
-                            after_load[after_owner] = saturatingAdd(
-                                after_load[after_owner], demand);
-                        }
-                    }
-                    std::uint64_t before_maximum = 0u;
-                    std::uint64_t after_maximum = 0u;
-                    for (std::size_t participant = 0u;
-                         participant < input.participants.size();
-                         ++participant)
-                    {
-                        if (input.participants[participant].tier_index ==
-                            selected_tier)
-                        {
-                            before_maximum = std::max(
-                                before_maximum, before_load[participant]);
-                            after_maximum = std::max(
-                                after_maximum, after_load[participant]);
-                        }
-                    }
-                    const std::uint64_t service = economy.service_costs[
-                        serviceOffset(
-                            input,
-                            static_cast<std::uint32_t>(selected_tier),
-                            layer,
-                            phase)];
-                    score.service_before_by_phase_ns[phase] = saturatingAdd(
-                        score.service_before_by_phase_ns[phase],
-                        saturatingMultiply(before_maximum, service));
-                    score.service_after_by_phase_ns[phase] = saturatingAdd(
-                        score.service_after_by_phase_ns[phase],
-                        saturatingMultiply(after_maximum, service));
-                }
-            }
-            else
-            {
-                for (const std::uint32_t expert : cycle)
-                {
-                    const auto source = static_cast<std::size_t>(
+                    const std::uint64_t demand =
+                        economy.phase_expert_demand[demandOffset(
+                            input, phase, layer, expert)];
+                    const auto before_owner = static_cast<std::size_t>(
                         current[expert]);
-                    const auto destination = static_cast<std::size_t>(
-                        desired[expert]);
-                    const auto source_tier = static_cast<std::uint32_t>(
-                        input.participants[source].tier_index);
-                    const auto destination_tier = static_cast<std::uint32_t>(
-                        input.participants[destination].tier_index);
-                    for (std::uint32_t phase = 0u;
-                         phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                         ++phase)
-                    {
-                        const std::uint64_t demand =
-                            economy.phase_expert_demand[demandOffset(
-                                input, phase, layer, expert)];
-                        score.service_before_by_phase_ns[phase] =
-                            saturatingAdd(
-                                score.service_before_by_phase_ns[phase],
-                                saturatingMultiply(
-                                    demand,
-                                    economy.service_costs[serviceOffset(
-                                        input,
-                                        source_tier,
-                                        layer,
-                                        phase)]));
-                        score.service_after_by_phase_ns[phase] =
-                            saturatingAdd(
-                                score.service_after_by_phase_ns[phase],
-                                saturatingMultiply(
-                                    demand,
-                                    economy.service_costs[serviceOffset(
-                                        input,
-                                        destination_tier,
-                                        layer,
-                                        phase)]));
-                    }
+                    const auto after_owner = static_cast<std::size_t>(
+                        candidate[expert]);
+                    before_load[before_owner] = saturatingAdd(
+                        before_load[before_owner], demand);
+                    after_load[after_owner] = saturatingAdd(
+                        after_load[after_owner], demand);
                 }
+                std::uint64_t before_critical_path = 0u;
+                std::uint64_t after_critical_path = 0u;
+                for (std::size_t participant = 0u;
+                     participant < input.participants.size();
+                     ++participant)
+                {
+                    const auto tier = static_cast<std::uint32_t>(
+                        input.participants[participant].tier_index);
+                    const std::uint64_t service = economy.service_costs[
+                        serviceOffset(input, tier, layer, phase)];
+                    before_critical_path = std::max(
+                        before_critical_path,
+                        saturatingMultiply(before_load[participant], service));
+                    after_critical_path = std::max(
+                        after_critical_path,
+                        saturatingMultiply(after_load[participant], service));
+                }
+                score.service_before_by_phase_ns[phase] =
+                    before_critical_path;
+                score.service_after_by_phase_ns[phase] =
+                    after_critical_path;
             }
 
             const bool reciprocal_pair = cycle.size() == 2u &&
@@ -479,13 +415,11 @@ namespace llaminar2
                 }
             }
 
-            if (!moe_rebalance_policy::phaseObjectivesDoNotRegress(
+            score.phase_non_regressing =
+                moe_rebalance_policy::phaseObjectivesDoNotRegress(
                     score.service_before_by_phase_ns.data(),
                     score.service_after_by_phase_ns.data(),
-                    kMoEOverlayDeviceControllerDemandPhaseCount))
-            {
-                return score;
-            }
+                    kMoEOverlayDeviceControllerDemandPhaseCount);
             for (std::uint32_t phase = 0u;
                  phase < kMoEOverlayDeviceControllerDemandPhaseCount;
                  ++phase)
@@ -504,6 +438,7 @@ namespace llaminar2
             {
                 return score;
             }
+            score.improvement_floor_met = true;
             const std::uint64_t gain =
                 score.service_before_ns - score.service_after_ns;
             std::uint64_t observed_activations = 0u;
@@ -969,8 +904,15 @@ namespace llaminar2
                         layer);
                     plan.evidence.residency_rejected_cycles +=
                         economy.residency_eligible ? 0u : 1u;
+                    plan.evidence.phase_tradeoff_candidates +=
+                        economy.phase_non_regressing ? 0u : 1u;
+                    plan.evidence.improvement_floor_rejected_cycles +=
+                        economy.improvement_floor_met ? 0u : 1u;
                     plan.evidence.payoff_rejected_cycles +=
-                        economy.payoff_eligible ? 0u : 1u;
+                        economy.improvement_floor_met &&
+                                !economy.payoff_eligible
+                            ? 1u
+                            : 0u;
                     if (!economy.eligible())
                     {
                         ++plan.evidence.rejected_cycles;
@@ -1075,6 +1017,16 @@ namespace llaminar2
                         static_cast<std::int32_t>(destination);
                 }
                 current = std::move(candidate);
+                /*
+                 * Economy rejection is placement-relative. A cycle that did
+                 * not shorten the old critical path can become profitable
+                 * after this accepted cycle removes the former straggler.
+                 * Retaining its search exclusion would freeze a stale
+                 * bottleneck view and stop an otherwise economical wave after
+                 * one move. Re-enumerate from the new owner map; immutable
+                 * hysteresis and capacity gates are evaluated again below.
+                 */
+                std::fill(excluded.begin(), excluded.end(), false);
                 working_score = candidate_score;
                 plan.evidence.projected_service_gain_ns = saturatingAdd(
                     plan.evidence.projected_service_gain_ns,

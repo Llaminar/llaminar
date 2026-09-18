@@ -547,6 +547,38 @@ TEST(Test__ChatTemplate, JinjaHandlesMultiTurnConversation)
     EXPECT_EQ(count, 5) << "4 messages + 1 generation prompt = 5. Result: " << result;
 }
 
+/**
+ * A compiled Jinja program is immutable model-lifetime state. Filter blocks
+ * previously moved their filter node out of the AST while executing, which
+ * made reuse exception-sensitive and led the HTTP path to parse the complete
+ * model template for every request. Exercise the destructive node directly
+ * and alternate inputs to prove that no request state survives execution.
+ */
+TEST(Test__ChatTemplate, CompiledJinjaProgramIsReusableAcrossRequests)
+{
+    const std::string jinja_template = R"(
+<|im_start|>{% filter upper %}{{ messages[0]['content'] }}{% endfilter %}<|im_end|>
+{%- if add_generation_prompt %}<|im_start|>assistant{% endif %})";
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    const std::vector<ChatMessage> alpha = {{"user", "alpha"}};
+    const std::vector<ChatMessage> beta = {{"user", "beta"}};
+    const std::string expected_alpha = tmpl->apply(alpha, true);
+    const std::string expected_beta = tmpl->apply(beta, true);
+    ASSERT_NE(expected_alpha.find("ALPHA"), std::string::npos);
+    ASSERT_NE(expected_beta.find("BETA"), std::string::npos);
+
+    for (int request = 0; request < 256; ++request)
+    {
+        const bool use_alpha = (request % 2) == 0;
+        EXPECT_EQ(
+            tmpl->apply(use_alpha ? alpha : beta, true),
+            use_alpha ? expected_alpha : expected_beta)
+            << "compiled template retained request state at iteration " << request;
+    }
+}
+
 TEST(Test__ChatTemplate, JinjaExposesBoSEoSTokens)
 {
     // Template that uses bos_token and eos_token
@@ -711,6 +743,43 @@ TEST(Test__ChatTemplate, Qwen35AssistantContinuationKeepsExistingReasoning)
     messages.push_back({"assistant", "<think>\nCheck the compass.\n</think>\n\nThe keeper turned north."});
     EXPECT_TRUE(tmpl->apply(messages, true, true).starts_with(
         seed + "Check the compass.\n</think>\n\nThe keeper turned north."));
+}
+
+/**
+ * OpenAI carries arguments as a JSON string; the Qwen template requires a
+ * structured map so it can recreate the native parameter blocks on the next
+ * agent turn.
+ */
+TEST(Test__ChatTemplate, Qwen35ToolResultContinuationUsesNativeParameterBlocks)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    ChatMessage assistant{"assistant", ""};
+    assistant.tool_calls.push_back(
+        R"({"id":"call_weather_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}})");
+    ChatMessage tool_result{"tool", R"({"temperature_c":18,"condition":"sunny"})"};
+    tool_result.tool_call_id = "call_weather_1";
+    tool_result.name = "get_weather";
+
+    const std::vector<ChatMessage> messages = {
+        {"user", "What is the weather in Paris?"},
+        assistant,
+        tool_result,
+    };
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])";
+    const auto rendered = tmpl->apply(messages, true, false, tools);
+
+    EXPECT_NE(rendered.find("<function=get_weather>\n<parameter=city>\nParis\n</parameter>"),
+              std::string::npos)
+        << rendered;
+    EXPECT_NE(rendered.find("<tool_response>\n{\"temperature_c\":18,\"condition\":\"sunny\"}\n</tool_response>"),
+              std::string::npos)
+        << rendered;
+    EXPECT_EQ(rendered.find("<function=get_weather>\n{\"city\":\"Paris\"}"),
+              std::string::npos)
+        << "Opaque OpenAI argument JSON must not leak into the native Qwen grammar";
 }
 
 // ============================================================================

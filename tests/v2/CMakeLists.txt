@@ -901,6 +901,17 @@ add_v2_test(V2_Unit_MoEForbiddenDependencyScan
     MPI_PROCS 1
 )
 
+# Prefix lookup must reuse the already-published identity until the sole MoE
+# movement authority advances its epoch. Rebuilding the full 122B placement
+# description for every HTTP request caused avoidable allocator growth.
+add_v2_test(V2_Integration_PrefixFingerprintRequestReuse
+    COMMAND $<TARGET_FILE:v2_unit_moe_forbidden_dependency_scan>
+        --gtest_filter=Test__MoEGraphNative_ForbiddenDependencyScan.PrefixRequestReusesPublishedFingerprintObservation
+    LABELS "V2;Integration;PrefixCache;ExpertOverlay;Memory;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Focused routed-expert policy regressions. These suites use typed device
 # addresses and mock collective contexts only; physical GPU work belongs in the
 # integration gate and must never be introduced into these unit targets.
@@ -1171,6 +1182,18 @@ target_link_libraries(v2_unit_moe_overlay_inference_transaction
 add_v2_test(V2_Unit_MoEOverlayInferenceTransaction
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
     LABELS "V2;Unit;Execution;MoE;Overlay;MTP;Transaction;Protocol"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Hosted ordinary generation shares the production ExpertOverlay transaction
+# authority with MTP. Keep its typed depth-zero transition and full-prefix-hit
+# bootstrap in preflight so an HTTP request cannot be the first place that a
+# sparse sequence or terminal mailbox lifetime defect is observed.
+add_v2_test(V2_Integration_MoEOverlayHostedOrdinaryGenerationLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+        --gtest_filter=Test__MoEOverlayInferenceTransaction.HostedOrdinaryTransitionRetainsSerialDecodePolicy:Test__MoEOverlayInferenceTransaction.HostedPrefixSampleOpensFirstOrdinaryDecodeSequence
+    LABELS "V2;Integration;ProductionParityPreflight;Execution;MoE;ExpertOverlay;GraphCapture;DeviceGeneration;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -4950,6 +4973,17 @@ add_v2_test(V2_Unit_ChatTemplate
     MPI_PROCS 1  # ChatTemplate is single-rank only
 )
 
+# Repeated HTTP requests reuse the model-lifetime Jinja AST. Keep this focused
+# allocator/lifecycle regression in preflight: reparsing Qwen's large template
+# per request caused unbounded-looking zero-page retention in the server heap.
+add_v2_test(V2_Integration_HTTPChatTemplateReuse
+    COMMAND $<TARGET_FILE:v2_test_chat_template>
+        --gtest_filter=Test__ChatTemplate.CompiledJinjaProgramIsReusableAcrossRequests
+    LABELS "V2;Integration;ProductionParityPreflight;HTTP;ChatTemplate;Memory;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Test: ToolCallParser (tool call parsing for Hermes 2 Pro, Generic, etc.)
 add_executable(v2_test_tool_call_parser unit/utils/Test__ToolCallParser.cpp)
 target_include_directories(v2_test_tool_call_parser PRIVATE
@@ -4964,6 +4998,17 @@ add_v2_test(V2_Unit_ToolCallParser
     COMMAND $<TARGET_FILE:v2_test_tool_call_parser>
     LABELS "V2;Unit;ToolCalling;TextProcessing"
     MPI_PROCS 1
+)
+
+# Qwen 3.5/3.8 used to emit a valid nested function/parameter call which the
+# server fed to the incompatible Hermes JSON parser and returned as plain text.
+# Keep the captured production grammar and schema selection in preflight.
+add_v2_test(V2_Integration_QwenNativeToolCallProtocol
+    COMMAND $<TARGET_FILE:v2_test_tool_call_parser>
+        --gtest_filter=Test__ToolCallParser.Qwen3NativeProductionPayloadAndSchemaAuthority:Test__ToolCallParser.StreamingQwen3NativePublishesContentAndCallIncrementally:Test__ToolCallParser.StreamingIncompleteToolCallFailsClosedOnFlush
+    LABELS "V2;Integration;ProductionParityPreflight;HTTP;ToolCalling;Qwen35;Qwen38;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
@@ -9775,6 +9820,17 @@ add_v2_test(V2_Unit_PrefixStateSnapshot
     MPI_PROCS 1
 )
 
+# A production full-hit request used to replace its exact terminal archive,
+# transiently double-spending pinned RAM and aborting MPI after inference had
+# already succeeded. Keep the typed reuse transition in canonical preflight.
+add_v2_test(V2_Integration_PrefixExactTerminalArchiveReuse
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_snapshot>
+        --gtest_filter=Test__PrefixStateSnapshot.ExactFullHitReusesCompleteTerminalArchive
+    LABELS "V2;Integration;ProductionParityPreflight;PrefixCache;Lifecycle;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Test: Prefix cache participant coordination
 add_executable(v2_test_prefix_cache_coordinator unit/prefix_cache/Test__PrefixCacheCoordinator.cpp)
 target_link_libraries(v2_test_prefix_cache_coordinator llaminar2_core GTest::gtest GTest::gtest_main)
@@ -10559,10 +10615,13 @@ add_v2_test(V2_Integration_TPSnapshotReplicatedMTPSidecarSharding
 # Ordinary GPU generation is a distinct zero-draft captured-parent policy.
 # Keep the rank fan-out contract in model-free preflight so an accidental
 # speculative-only geometry check cannot strand a live HTTP decode request.
+# The hosted continuation case also proves that bounded HTTP publication opens
+# one shared ExpertOverlay sequence and enters every LocalTP participant
+# concurrently before waiting for its first continuation ticket.
 add_v2_test(V2_Integration_RankOrdinaryDeviceGeneration
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
-        --gtest_filter=Test__RankOrchestratorDeviceGeneration.MaterializesOrdinaryParentWithZeroDraftDepthAcrossParticipants
-    LABELS "V2;Integration;Parity;LocalTP;GraphCapture;DeviceGeneration;Regression"
+        --gtest_filter=Test__RankOrchestratorDeviceGeneration.MaterializesOrdinaryParentWithZeroDraftDepthAcrossParticipants:Test__RankOrchestratorDeviceGeneration.TerminalOrdinaryGenerationAdoptsFreshChildMailboxes:Test__RankOrchestratorDeviceGeneration.HostedOrdinaryContinuationAdmitsOverlaySequenceAndObservesConcurrently
+    LABELS "V2;Integration;ProductionParityPreflight;Parity;LocalTP;ExpertOverlay;GraphCapture;DeviceGeneration;Streaming;Regression"
     MPI_PROCS 1
     TIMEOUT 60
     NO_MODELS
@@ -10985,6 +11044,28 @@ add_v2_test(V2_Unit_ChatCompletionHandler
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
     LABELS "V2;Unit;Server;ChatCompletion;SamplingParams"
     MPI_PROCS 1
+)
+
+# The public API previously parsed tool_choice but never applied it, allowing
+# forbidden calls for "none" and omitting the required/specific prompt policy.
+add_v2_test(V2_Integration_HTTPToolChoicePolicy
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.HandleRequest_RequiredChoicePublishesPromptPolicy:Test__ChatCompletionHandler.HandleRequest_NoneChoiceNeitherExposesNorExecutesTools
+    LABELS "V2;Integration;ProductionParityPreflight;HTTP;ToolCalling;Policy;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# OpenWebUI sends tools on agentic requests. Historically that made the server
+# buffer the complete answer, merge reasoning into content, and hide progress
+# until generation ended. Guard both the retained-graph publication cadence and
+# the OpenAI reasoning/content/tool-call SSE framing in production preflight.
+add_v2_test(V2_Integration_HTTPStreamingProtocolRegression
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.Streaming_BoundsDeviceGenerationPublicationWindow:Test__ChatCompletionHandler.StreamingQwenToolsPreserveLiveReasoningAndContent
+    LABELS "V2;Integration;ProductionParityPreflight;HTTP;SSE;Streaming;Reasoning;ToolCalling;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 add_executable(v2_test_server_mode
@@ -15971,6 +16052,13 @@ add_v2_test(V2_Integration_MTPScalarCommitOwnership
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_OrdinaryForcedResidentContinuation
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__PrefillDecodeTransition.OrdinaryGPUForcedSequencePreservesDeviceResidentContinuation
+    LABELS "V2;Integration;ProductionParityPreflight;Generation;Streaming;CUDA;ROCm;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_CPUSeededSamplingPositionIdentity
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
         --gtest_filter=Test__PrefillDecodeTransition.CPUSeededScalarSamplingUsesLogicalPosition:Test__PrefillDecodeTransition.CPUSeededBatchedSamplingUsesLogicalPosition:Test__PrefillDecodeTransition.CPUStochasticPenaltyOwnership
@@ -16151,6 +16239,19 @@ add_v2_test(V2_Integration_PlanCommandPublication_Local
     LABELS "V2;Integration;Orchestration;Lifecycle;Planning;Config;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MPI NO_MODELS
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
+if(HAVE_CUDA)
+    # Exact NativeVNNI admission consumes the concrete CUDA launch policy and
+    # therefore belongs in device-backed preflight rather than the Unit gate.
+    add_executable(v2_integration_cuda_workspace_memory_estimator
+        integration/planning/Test__CUDAWorkspaceMemoryEstimator.cpp)
+    target_link_libraries(v2_integration_cuda_workspace_memory_estimator
+        llaminar2_core GTest::gtest_main)
+    add_v2_test(V2_Integration_CUDAWorkspaceMemoryEstimator
+        COMMAND $<TARGET_FILE:v2_integration_cuda_workspace_memory_estimator>
+        LABELS "V2;Integration;ProductionParityPreflight;CUDA;Planning;Workspace;PhysicalMemoryAuthority;Regression"
+        MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+endif()
 
 # Startup observation lifecycle on production kernels; no real model admission.
 # One observer owns device 0: launching duplicate non-MPI gtest processes would
@@ -16628,6 +16729,22 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+
+    set_source_files_properties(
+        integration/backends/rocm/Test__HIPMultiStreamGraphReplayLifetime.hip
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_integration_hip_multistream_graph_replay_lifetime
+        integration/backends/rocm/Test__HIPMultiStreamGraphReplayLifetime.hip
+    )
+    target_link_libraries(v2_integration_hip_multistream_graph_replay_lifetime
+        PRIVATE GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_HIPMultiStreamGraphReplayLifetime
+        COMMAND $<TARGET_FILE:v2_integration_hip_multistream_graph_replay_lifetime>
+        LABELS "V2;Integration;Backends;GraphCapture;ROCm;HIP;MultiStream;Lifecycle;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
     message(STATUS "V2 Tests: Added HIP Graph Capture integration tests (ROCm)")
 endif()
 
@@ -17029,6 +17146,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;Backend;GPU;CUDA;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
         )
+        add_v2_test(V2_Integration_ForcedPolicyHistory_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*ForcedPolicyTokenHistoryCommitIsExplicitStreamOrderedAndExact*CUDA
+            LABELS "V2;Integration;ProductionParityPreflight;Backend;GPU;CUDA;Generation;Reasoning;Streaming;Penalty;Lifecycle;Regression"
+            MPI_PROCS 1
+            NO_MODELS
+        )
         add_v2_test(V2_Integration_DeviceGenerationController_CUDA
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*CUDA:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*CUDA:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*CUDA:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*CUDA:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*CUDA:*OrdinaryDeviceGeneration*CUDA:*HostedContinuation*CUDA
@@ -17062,6 +17186,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 --gtest_filter=*MTPDeviceOwnedSidecarsTrackMutableLivePositionAcrossGraphReplays*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;Sidecar;PrefixCache;ByteExact;DeviceResident;GraphCapture;Regression"
             MPI_PROCS 1
+        )
+        add_v2_test(V2_Integration_ForcedPolicyHistory_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*ForcedPolicyTokenHistoryCommitIsExplicitStreamOrderedAndExact*ROCm
+            LABELS "V2;Integration;ProductionParityPreflight;Backend;GPU;ROCm;Generation;Reasoning;Streaming;Penalty;Lifecycle;Regression"
+            MPI_PROCS 1
+            NO_MODELS
         )
         add_v2_test(V2_Integration_DeviceGenerationController_ROCm
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
@@ -18629,6 +18760,13 @@ if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_PlanningExecutionMeasurement_CPU
     V2_Integration_RankOrdinaryDeviceGeneration
+    V2_Integration_MoEOverlayHostedOrdinaryGenerationLifecycle
+    V2_Integration_PrefixFingerprintRequestReuse
+    V2_Integration_QwenNativeToolCallProtocol
+    V2_Integration_PrefixExactTerminalArchiveReuse
+    V2_Integration_HTTPToolChoicePolicy
+    V2_Integration_HTTPStreamingProtocolRegression
+    V2_Integration_OrdinaryForcedResidentContinuation
     V2_Integration_GroupedVerifierRows_CPU_RoPE
     V2_Integration_GroupedVerifierRows_CPU_AllFormats
     V2_Integration_CPUAttentionCacheSource
@@ -18724,6 +18862,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
 endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_CUDAWorkspaceMemoryEstimator
     V2_Integration_PlanningExecutionMeasurement_CUDA
     V2_Integration_PlanningMPIExpertSample_CUDA
     V2_Integration_GPUPreparedWeightBinding_CUDA
@@ -18766,6 +18905,7 @@ if(HAVE_CUDA)
     V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
     V2_Integration_CUDA_MoEAsyncHistogramBorrowedStreamRetirement
     ${V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
+    V2_Integration_ForcedPolicyHistory_CUDA
     V2_Integration_DeviceGenerationController_CUDA
     V2_Integration_DeviceGenerationSelector_CUDA
     V2_Integration_MTPVerifierPreparation_CUDA
@@ -18805,8 +18945,10 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_MoEAsyncHistogramBorrowedStreamRetirement
     V2_Integration_ROCmFloatingExpertRetirement
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
+    V2_Integration_ForcedPolicyHistory_ROCm
     V2_Integration_DeviceGenerationController_ROCm
     V2_Integration_HIPGraphCapture
+    V2_Integration_HIPMultiStreamGraphReplayLifetime
     V2_Integration_MTPVerifierPreparation_ROCm
     V2_Integration_GPUGraphCaptureExecution_ROCm
     V2_Integration_ROCmRequestBatchUnequalKVContinuation
@@ -18838,20 +18980,31 @@ foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_PARITY_PREFLIGHT_TESTS)
     endif()
     set_property(TEST ${V2_PREFLIGHT_TEST} APPEND PROPERTY
         LABELS ProductionParityPreflight)
-    # Preflight is deliberately model-free. Reject a registration that forgot
-    # add_v2_test(... NO_MODELS) while CMake still has the typed test metadata,
-    # rather than discovering the invalid fixture only when a campaign starts.
-    get_property(V2_PREFLIGHT_FIXTURES
-        TEST ${V2_PREFLIGHT_TEST} PROPERTY FIXTURES_REQUIRED)
-    if(V2_PREFLIGHT_FIXTURES)
-        message(FATAL_ERROR
-            "Production parity preflight test requires a fixture: "
-            "${V2_PREFLIGHT_TEST} (${V2_PREFLIGHT_FIXTURES})")
-    endif()
-    get_property(V2_PREFLIGHT_HAS_TIMEOUT
-        TEST ${V2_PREFLIGHT_TEST} PROPERTY TIMEOUT SET)
-    if(NOT V2_PREFLIGHT_HAS_TIMEOUT)
-        set_tests_properties(${V2_PREFLIGHT_TEST} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# The label, not the list above, is the installed gate's inventory authority.
+# Apply its admission invariants to every labeled test so a focused regression
+# registered near its fixture cannot silently bypass metadata validation.
+get_property(V2_REGISTERED_PREFLIGHT_CANDIDATES DIRECTORY PROPERTY TESTS)
+foreach(V2_PREFLIGHT_TEST IN LISTS V2_REGISTERED_PREFLIGHT_CANDIDATES)
+    get_property(V2_PREFLIGHT_LABELS
+        TEST ${V2_PREFLIGHT_TEST} PROPERTY LABELS)
+    if("${V2_PREFLIGHT_LABELS}" MATCHES "ProductionParityPreflight")
+        # Preflight is deliberately model-free. Reject a registration that
+        # forgot add_v2_test(... NO_MODELS) while CMake still owns the typed
+        # fixture metadata, rather than discovering it during a campaign.
+        get_property(V2_PREFLIGHT_FIXTURES
+            TEST ${V2_PREFLIGHT_TEST} PROPERTY FIXTURES_REQUIRED)
+        if(V2_PREFLIGHT_FIXTURES)
+            message(FATAL_ERROR
+                "Production parity preflight test requires a fixture: "
+                "${V2_PREFLIGHT_TEST} (${V2_PREFLIGHT_FIXTURES})")
+        endif()
+        get_property(V2_PREFLIGHT_HAS_TIMEOUT
+            TEST ${V2_PREFLIGHT_TEST} PROPERTY TIMEOUT SET)
+        if(NOT V2_PREFLIGHT_HAS_TIMEOUT)
+            set_tests_properties(${V2_PREFLIGHT_TEST} PROPERTIES TIMEOUT 120)
+        endif()
     endif()
 endforeach()
 endif()

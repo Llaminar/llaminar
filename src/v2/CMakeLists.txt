@@ -775,8 +775,8 @@ if(HAVE_ROCM)
     # =========================================================================
     # RCCL Auto-Clone and Build for ROCm Multi-GPU Support
     # =========================================================================
-    # The Ubuntu-packaged RCCL (rccl 2.27.7.70101-38~24.04) has broken gfx906
-    # (MI50/MI60) kernel binaries. When using multi-GPU on these architectures,
+    # The Ubuntu-packaged RCCL has no usable gfx906 (MI50/MI60) kernel binaries.
+    # When using multi-GPU on these architectures,
     # the library crashes with SIGSEGV in ihipLaunchKernel() because the GPU
     # kernels fail to load (hipErrorNoBinaryForGpu).
     #
@@ -804,7 +804,7 @@ if(HAVE_ROCM)
     
     set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
-    set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
+    set(RCCL_GIT_REF "rocm-7.2.4")  # Match our ROCm version
     set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
         "C compiler used for the nested RCCL source build")
     set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH

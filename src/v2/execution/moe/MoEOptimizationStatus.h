@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <vector>
 #include <variant>
@@ -505,6 +506,51 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Last completed device-authored Dynamic placement decision.
+     *
+     * A completed movement ledger intentionally contains only durable moves.
+     * This receipt preserves the equally important no-movement outcome without
+     * consulting optional PerfStats. It is copied from the authenticated
+     * command header after every completed decision window; it never drives
+     * policy or mirrors mutable device state.
+     */
+    struct MoEOptimizationDecisionReceipt
+    {
+        std::uint64_t transaction = 0u;
+        std::uint64_t candidate_epoch = 0u;
+        std::uint64_t snapshot_observations = 0u;
+        std::uint32_t command_count = 0u;
+        std::uint32_t accepted_cycles = 0u;
+        std::uint32_t rejected_cycles = 0u;
+        std::uint32_t phase_tradeoff_candidates = 0u;
+        std::uint32_t improvement_floor_rejected_cycles = 0u;
+        std::uint32_t payoff_rejected_cycles = 0u;
+        std::uint32_t residency_rejected_cycles = 0u;
+        std::uint64_t priority_cost_before = 0u;
+        std::uint64_t priority_cost_after = 0u;
+        std::uint64_t same_priority_makespan_before = 0u;
+        std::uint64_t same_priority_makespan_after = 0u;
+        std::uint64_t projected_service_gain_ns = 0u;
+        std::uint64_t projected_transfer_and_repack_ns = 0u;
+        std::uint64_t projected_inference_interference_ns = 0u;
+        std::uint64_t projected_net_benefit_ns = 0u;
+        std::uint32_t layer_scan_start = 0u;
+        std::uint32_t layer_scan_next = 0u;
+
+        /** @return Whether the receipt names one completed decision window. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return transaction > 0u && candidate_epoch > 0u;
+        }
+
+        /** @return Whether policy deliberately completed without movement. */
+        [[nodiscard]] constexpr bool noMovement() const noexcept
+        {
+            return valid() && command_count == 0u;
+        }
+    };
+
     /** Monotonic relationship between two optimization progress snapshots. */
     enum class MoEOptimizationProgressRelation : std::uint8_t
     {
@@ -619,6 +665,10 @@ namespace llaminar2
         MoEOptimizationMovementTotals completed_movement;
         /** Passive headroom from the actual histogram/submission owner. */
         MoEOptimizationDemandWindow demand_window;
+        /** Number of completed Dynamic policy decisions, including no-ops. */
+        std::uint64_t completed_decision_windows = 0u;
+        /** Last authenticated policy result, including a zero-move decision. */
+        std::optional<MoEOptimizationDecisionReceipt> last_decision;
         /**
          * Latest externally published maintenance-progress generation.
          *

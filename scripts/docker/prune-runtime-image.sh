@@ -6,7 +6,7 @@
 # hide them from the final filesystem but would not reduce the image size.
 set -euo pipefail
 
-ROCM_ROOT="${ROCM_ROOT:-/opt/rocm-7.1.1}"
+ROCM_ROOT="${ROCM_ROOT:-/opt/rocm-7.2.4}"
 ROCM_RUNTIME_GPU_TARGETS="${ROCM_RUNTIME_GPU_TARGETS:-}"
 
 target_is_enabled() {

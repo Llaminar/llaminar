@@ -1030,15 +1030,16 @@ stream operations.
 `MappedTransferProgressEpoch` separates permanent topology slots from a bounded
 physical execution inbox. On CUDA, independently queued kernels can also be
 starved by future inference-event consumers. The epoch therefore supplies an
-`IGraphCaptureAuxiliaryBranch` to each retained inference graph: a private GPU
-word opens at the root and closes at the inference terminal. The copy worker
-retires at a bounded byte quantum before the graph joins it; it never waits for
-a whole maintenance command or a host acknowledgment. Device-only claims and
-partial byte cursors survive intervals and are shared with finite idle passes.
-A host enqueue cannot claim GPU execution. Host maintenance owns immutable IO
-commands and acquires exact generation receipts, not a shadow of GPU cursors.
-Graph caches retain private interval words, graph-only branch sources and the
-shared epoch authority.
+`IGraphCaptureAuxiliaryBranch` to each retained inference graph. A private
+mapped wake word is armed at the root. The branch performs one eager finite
+inbox scan and remains as exactly one co-resident CTA until the inference
+terminal publishes `InferenceComplete`. That bounded service interval observes
+incremental CPU preparation without a host wake protocol and avoids the former
+four-CTA SM tax. Device-only claims are shared with independently queued finite
+passes, so exactly one executor completes a generation. A host enqueue cannot
+claim GPU execution. Host maintenance owns immutable IO commands and acquires
+exact generation receipts, not a shadow of GPU claims. Graph caches retain
+private lifetime words, graph-only branch sources and the shared epoch authority.
 `IForwardExecutionHost` supplies that device-lifetime authority for both ordinary
 forward and hosted retained MTP replay. `ForwardExecutionEngine` resolves it
 directly on every submission; a hosted caller cannot supply a second factory
@@ -1050,8 +1051,10 @@ uninstantiated native graph: direct capture and retained CPU-ticket composition
 use the same operation. The original body is preserved in place, including
 CUDA conditional-handle ownership. Open precedes every original root; every
 original terminal precedes Close; only the final join awaits both Close and the
-worker. The worker therefore progresses throughout external CPU waits, without
+worker. The worker therefore accepts work during external CPU waits without
 per-child branches, paired capture-event state or per-replay host submissions.
+Its one-CTA geometry is invariant across topology size; independently queued
+finite passes may use wider grids only when no captured lifetime is retained.
 ROCm retains the independently progressing native SDMA implementation. Model
 teardown joins the final exact idle/setup event before releasing service storage;
 there is no model-lifetime persistent kernel that can obstruct reclamation.

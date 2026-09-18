@@ -3922,7 +3922,7 @@ namespace llaminar2
         mtp_stats_ = {};
         device_generation_terminal_ledger_authoritative_ = false;
         device_generation_embedded_moe_maintenance_pending_ack_ = false;
-        hosted_device_generation_decode_progress_notified_.store(
+        hosted_device_generation_decode_progress_retired_.store(
             0u, std::memory_order_release);
         device_generation_admission_.reset();
         ready_mtp_condition_.reset();
@@ -4723,7 +4723,7 @@ namespace llaminar2
         mtp_stats_ = {};
         device_generation_terminal_ledger_authoritative_ = false;
         device_generation_embedded_moe_maintenance_pending_ack_ = false;
-        hosted_device_generation_decode_progress_notified_.store(
+        hosted_device_generation_decode_progress_retired_.store(
             0u, std::memory_order_release);
         device_generation_admission_.reset();
         prefix_request_summary_ = {};
@@ -15789,8 +15789,11 @@ namespace llaminar2
         const bool gpu_mtp_force =
             shouldUseMTPDecode() &&
             runner_->primaryDeviceId().is_gpu();
+        const bool gpu_ordinary_force =
+            !activeMTPRequestConfig().enabled &&
+            runner_->primaryDeviceId().is_gpu();
 
-        if (gpu_mtp_force && token_is_stop)
+        if ((gpu_mtp_force || gpu_ordinary_force) && token_is_stop)
         {
             /*
              * A terminal control token ends generation and therefore never
@@ -15907,6 +15910,107 @@ namespace llaminar2
                 {{"publication", "control_scalar_kernel"},
                  {"shifted_state", "device_target_slot"},
                  {"main_forward", "device_token_ids"}});
+        }
+        else if (gpu_ordinary_force)
+        {
+            using Leading =
+                sampling_math::DeviceGenerationLeadingRowDisposition;
+            if (!prefill_logits_ready_ ||
+                !device_generation_admission_.awaitsAdmission())
+            {
+                result.error =
+                    "GPU ordinary forced decode requires an admission-ready resident boundary";
+                return result;
+            }
+
+            /*
+             * A bounded publication window returns its final token before that
+             * token enters KV. Commit that exact mailbox row first. The
+             * retained ordinary graph consumes device token and position rows;
+             * the host scalar is diagnostic identity only.
+             */
+            if (ready_mtp_condition_)
+            {
+                if (!ready_mtp_condition_->valid() ||
+                    !ready_mtp_condition_->isDeviceResidentOnly() ||
+                    !ready_mtp_condition_->wasAlreadyEmitted() ||
+                    !samplingParamsEqual(
+                        ready_mtp_condition_->sampling_params,
+                        active_sampling_params_))
+                {
+                    result.error =
+                        "GPU ordinary forced decode received a stale or foreign resident condition";
+                    return result;
+                }
+                const auto resident =
+                    *ready_mtp_condition_->resident_state;
+                if (!resident.coversRequest(0))
+                {
+                    result.error =
+                        "GPU ordinary forced decode has no request-zero resident condition";
+                    return result;
+                }
+                if (!begin_serial_overlay_graph())
+                    return result;
+                runner_->setMTPMainDecodeSyncDeferralEnabled(true);
+                if (!runner_
+                         ->advanceOrdinaryMainConditionFromDeviceResidentLogicalState(
+                             last_token_, resident, /*request_index=*/0))
+                {
+                    runner_->setMTPMainDecodeSyncDeferralEnabled(false);
+                    result.error =
+                        "GPU ordinary forced decode could not commit its prior resident condition";
+                    return result;
+                }
+                if (!advanceDecodeTransactionPlanningPositionAfterForward(
+                        "forced_ordinary_resident_condition_forward"))
+                {
+                    result.error = last_error_;
+                    return result;
+                }
+                ready_mtp_condition_.reset();
+            }
+
+            /*
+             * The request-selected scalar becomes the next already-emitted
+             * condition without entering a host token replay. Publication also
+             * advances device penalty history, so the next captured ordinary
+             * window sees exactly the output sequence visible to the client.
+             */
+            if (!runner_->publishForcedDeviceResidentConditionToken(
+                    token, /*target_sample_slot=*/0))
+            {
+                result.error =
+                    "GPU ordinary forced decode could not publish its device-resident policy token";
+                return result;
+            }
+            auto state = runner_->deviceResidentLogicalSequenceState();
+            if (!state.coversRequest(0))
+            {
+                result.error =
+                    "GPU ordinary forced decode did not publish a live condition mailbox";
+                return result;
+            }
+            ready_mtp_condition_ = ReadyMTPCondition::deviceResident(
+                active_sampling_params_, std::move(state),
+                Leading::AlreadyEmitted);
+            if (!ready_mtp_condition_->valid())
+            {
+                result.error =
+                    "GPU ordinary forced decode published an incomplete resident condition";
+                return result;
+            }
+            prefill_logits_ready_ = true;
+            result.returned_token_commit = ReturnedTokenCommitState::Pending;
+            PerfStatsCollector::addCounter(
+                "generation",
+                "forced_ordinary_device_resident_conditions",
+                1.0,
+                "decode",
+                {},
+                {{"publication", "control_scalar_kernel"},
+                 {"condition", "already_emitted"},
+                 {"host_replay", "false"}});
         }
         else
         {
@@ -16335,13 +16439,38 @@ namespace llaminar2
                 return true;
             }
 
+            const std::uint64_t hosted_progress =
+                hosted_device_generation_decode_progress_retired_.exchange(
+                    0u, std::memory_order_acq_rel);
+            if (hosted_progress != 0u)
+            {
+                if (hosted_progress != committed_tokens)
+                {
+                    return setError(
+                        "Hosted device-controller progress disagrees with the terminal committed-token boundary: ticketed=" +
+                        std::to_string(hosted_progress) +
+                        ", terminal=" + std::to_string(committed_tokens));
+                }
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "hosted_device_generation_progress_acknowledgements",
+                    static_cast<double>(committed_tokens),
+                    "maintenance",
+                    device,
+                    {{"blocking", "false"},
+                     {"authority_execution", "device_resident"},
+                     {"scheduler", "authenticated_transaction_ticket"},
+                     {"replayed", "false"}});
+                return true;
+            }
+
             /*
-             * Queue the committed boundary without issuing another collective.
-             * The next ordinary decode/forced-token payload sidebands this
-             * continuation-authored count to every rank, and each rank wakes
-             * its process-local controller before launching that inference.
-             * This preserves symmetric admission while removing one complete
-             * MPI command from every generated token.
+             * A non-hosted generation path has no per-sequence transaction
+             * ticket. Queue its committed boundary without issuing another
+             * collective; the next ordinary decode/forced-token payload
+             * sidebands this continuation-authored count to every rank. Hosted
+             * paths returned above because their authenticated tickets already
+             * woke every process-local controller at the true retirement edge.
              */
             auto &pending = moe_overlay_pending_decode_progress_tokens_;
             std::uint64_t observed = pending.load(std::memory_order_relaxed);
@@ -16438,7 +16567,7 @@ namespace llaminar2
             }
 
             const std::uint64_t hosted_progress =
-                hosted_device_generation_decode_progress_notified_.exchange(
+                hosted_device_generation_decode_progress_retired_.exchange(
                     0u, std::memory_order_acq_rel);
             if (hosted_progress != 0u)
             {
@@ -16587,7 +16716,7 @@ namespace llaminar2
                              ? policy.draft_tokens
                              : (policy.depth_policy.max_depth > 0
                                     ? policy.depth_policy.max_depth
-                                    : policy.draft_tokens))
+                                    : defaultMTPAdaptiveMaximumDraftDepth()))
                       : 0)}});
         return true;
     }
@@ -16670,7 +16799,7 @@ namespace llaminar2
         ordinary_generation_seeds_.reset();
         device_generation_terminal_ledger_authoritative_ = false;
         device_generation_embedded_moe_maintenance_pending_ack_ = false;
-        hosted_device_generation_decode_progress_notified_.store(
+        hosted_device_generation_decode_progress_retired_.store(
             0u, std::memory_order_release);
         clearBatchedDecodeState();
         sampler_ = Sampler(active_sampling_params_.seed);
@@ -23081,31 +23210,48 @@ namespace llaminar2
         }
 
         /*
-         * A hosted HIP generation command may retire hundreds of complete MTP
-         * graph sequences before returning its one terminal response. Feed
-         * their device-authenticated committed-token deltas directly into each
-         * rank's process-local maintenance worker. The continuation coordinator
-         * receives the frontier from the HIP scheduler ticket; expert followers
-         * receive the same frontier on their already-required transaction
-         * ticket. The callback is deliberately a wake-only edge: placement
-         * policy, MPI, transfer, and publication stay on the background
-         * maintenance authority.
+         * A hosted generation command may retire hundreds of complete ordinary
+         * or MTP graph sequences before returning its one terminal response.
+         * Feed their device-authenticated committed-token deltas directly into
+         * each rank's one process-local maintenance authority. The continuation
+         * coordinator receives the frontier from the scheduler ticket; expert
+         * followers receive the same frontier on their already-required
+         * transaction ticket. The callback is deliberately a wake-only edge:
+         * placement policy, MPI, transfer, and publication stay on the
+         * background authority. The topology-wide device authority retains a
+         * terminal acknowledgement only on the continuation rank because its
+         * followers have no outer decoder. The older host authority retains
+         * the acknowledgement on every process: its follower worker already
+         * consumes that exact outer boundary after the hosted command returns.
          */
         MoEOverlayRetiredDecodeProgressSink
             retired_decode_progress_sink;
         if (config_.moe_rebalance.mode ==
                 MoERebalanceRuntimeMode::Dynamic &&
-            moe_expert_overlay_maintenance_service_)
+            (moe_expert_overlay_maintenance_service_ ||
+             moe_overlay_device_controller_graph_service_))
         {
+            if (moe_expert_overlay_maintenance_service_ &&
+                moe_overlay_device_controller_graph_service_)
+            {
+                return setError(
+                    "Hosted ExpertOverlay decode progress has both host and device maintenance authorities");
+            }
+            const bool retain_terminal_ack =
+                static_cast<bool>(moe_expert_overlay_maintenance_service_) ||
+                local_rank == source_rank;
             retired_decode_progress_sink =
-                [this](
+                [this, retain_terminal_ack](
                     std::uint64_t completed_tokens,
                     std::string *error) -> bool
             {
                 if (error)
                     error->clear();
                 if (completed_tokens == 0u ||
-                    !moe_expert_overlay_maintenance_service_)
+                    (static_cast<bool>(
+                         moe_expert_overlay_maintenance_service_) ==
+                     static_cast<bool>(
+                         moe_overlay_device_controller_graph_service_)))
                 {
                     if (error)
                     {
@@ -23115,25 +23261,48 @@ namespace llaminar2
                     return false;
                 }
 
-                auto &notified =
-                    hosted_device_generation_decode_progress_notified_;
-                std::uint64_t observed = notified.load(
+                if (moe_overlay_device_controller_graph_service_)
+                {
+                    if (!moe_overlay_device_controller_graph_service_
+                             ->notifyInferenceProgress(
+                                 MoEOverlayDeviceControllerGraphService::
+                                     InferencePhase::Decode,
+                                 completed_tokens))
+                    {
+                        if (error)
+                        {
+                            *error =
+                                "Hosted ExpertOverlay decode progress could not wake the device controller";
+                        }
+                        return false;
+                    }
+                }
+                else
+                {
+                    moe_expert_overlay_maintenance_service_
+                        ->notifyInferenceProgress({
+                            .phase =
+                                MoEOverlayInferenceProgressPhase::Decode,
+                            .completed_logical_tokens = completed_tokens,
+                        });
+                }
+
+                if (!retain_terminal_ack)
+                    return true;
+
+                auto &retired =
+                    hosted_device_generation_decode_progress_retired_;
+                std::uint64_t observed = retired.load(
                     std::memory_order_relaxed);
                 while (completed_tokens <=
                        std::numeric_limits<std::uint64_t>::max() - observed)
                 {
-                    if (notified.compare_exchange_weak(
+                    if (retired.compare_exchange_weak(
                             observed,
                             observed + completed_tokens,
                             std::memory_order_release,
                             std::memory_order_relaxed))
                     {
-                        moe_expert_overlay_maintenance_service_
-                            ->notifyInferenceProgress({
-                                .phase =
-                                    MoEOverlayInferenceProgressPhase::Decode,
-                                .completed_logical_tokens = completed_tokens,
-                            });
                         return true;
                     }
                 }
@@ -24939,8 +25108,9 @@ namespace llaminar2
              * committed request boundaries. Host-authoritative ExpertOverlay
              * maintenance is process-local, so a worker wakes that service at
              * its existing command boundary. The topology-wide device
-             * controller is deliberately excluded: its continuation-authored
-             * progress is carried by the next ordinary inference payload.
+             * controller is deliberately excluded: a hosted follower wakes it
+             * from each authenticated transaction ticket, while a non-hosted
+             * path receives continuation progress in the next inference payload.
              */
             if (!moe_expert_overlay_maintenance_service_ ||
                 committed_tokens == 0u)

@@ -262,8 +262,9 @@ namespace llaminar2
             auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
             overlay->enabled = true;
             overlay->owner_order = request.routed_expert_owner_order;
-            overlay->residency_policy = request.moe_rebalance.mode == MoERebalanceRuntimeMode::Off
-                ? RoutedExpertResidencyPolicy::StaticById : RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            overlay->residency_policy =
+                defaultRoutedExpertResidencyPolicy(
+                    request.moe_rebalance.mode);
             overlay->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Automatic;
             if (pools.size() == 1)
             {

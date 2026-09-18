@@ -6,9 +6,10 @@
  * pool of background stream/event execution lanes. Maintenance
  * release-publishes a bounded device region, the exact GPU worker assigns it to
  * a free lane and enqueues a TransferEngine copy, and a later non-blocking event
- * query acquires completion. CUDA also owns graph-bounded copy branches whose
- * GPU cursor survives intervals: graph retirement never waits for a complete
- * maintenance command. ROCm retains native asynchronous SDMA progress.
+ * query acquires completion. CUDA also owns a graph-bounded service branch: one
+ * co-resident CTA continuously observes incrementally published inbox work and
+ * retires at the primary graph terminal. ROCm retains native asynchronous SDMA
+ * progress and therefore needs no captured service branch.
  */
 
 #include "MappedTransferProgressEpoch.h"
@@ -33,10 +34,12 @@
 namespace llaminar2
 {
     /**
-     * @brief One cache-owned CUDA interval with an explicit fork/close/join DAG.
+     * @brief One cache-owned CUDA service interval with a fork/close/join DAG.
      *
-     * Only the primary graph opens/closes its private word. The worker holds no
-     * host lifetime ticket and releases partial claims before its terminal edge.
+     * The root opens a private device-visible lifetime word, the worker services
+     * every physical inbox until Close, and the terminal closes the interval.
+     * Exactly one CTA remains co-resident so incremental CPU preparation cannot
+     * strand later batches, while the former four-CTA inference tax is avoided.
      * Epoch storage outlives every captured pointer because the branch retains
      * the epoch; the graph cache retires executables before releasing the branch.
      */
@@ -44,7 +47,7 @@ namespace llaminar2
         : public IGraphCaptureAuxiliaryBranch
     {
     public:
-        /** @brief Prepare graph-only Open, worker and Close on the resource owner. */
+        /** @brief Prepare graph-only open, bounded worker and close fragments. */
         explicit CapturedBranch(std::shared_ptr<MappedTransferProgressEpoch> epoch)
             : epoch_(std::move(epoch))
         {
@@ -52,7 +55,15 @@ namespace llaminar2
             context.submitAndWait([&]
             {
                 TransferEngine transfers;
-                interval_ = transfers.allocateDeviceTransferBuffer(sizeof(std::uint32_t), device());
+                const DeviceId devices[] = {device()};
+                wake_ = transfers.allocateMappedHostRegion(
+                    sizeof(std::uint64_t), devices);
+                std::atomic_ref<std::uint64_t>(
+                    *static_cast<std::uint64_t *>(wake_->mutableHostData()))
+                    .store(
+                        static_cast<std::uint64_t>(
+                            MappedTransferWakeState::InferenceComplete),
+                        std::memory_order_release);
                 // All source fragments are cold, graph-only recordings. They
                 // share one setup stream and consume no runtime queue at replay.
                 void *stream = context.getOrCreateAuxiliaryStream(
@@ -69,14 +80,24 @@ namespace llaminar2
                         context, *fragments_[index], "mapped transfer branch fragment");
                     if (!capture.begin())
                         throw std::runtime_error("Mapped transfer branch fragment recording failed");
-                    if (index == 1u)
+                    if (index == 0u)
+                    {
+                        transfers.enqueueMappedTransferWakeState(
+                            *wake_, MappedTransferWakeState::InferenceActive,
+                            device(), stream);
+                    }
+                    else if (index == 1u)
+                    {
                         transfers.enqueueMappedTransferService(*epoch_->service_inbox_,
-                            *epoch_->service_cursors_, epoch_->maximumBytes(), interval_.get(),
+                            *epoch_->service_cursors_, epoch_->maximumBytes(), wake_.get(),
                             MappedTransferServiceRun::CapturedInterval, stream);
+                    }
                     else
-                        transfers.enqueueMappedTransferInterval(*interval_,
-                            index == 0u ? MappedTransferInterval::Open : MappedTransferInterval::Closed,
-                            stream);
+                    {
+                        transfers.enqueueMappedTransferWakeState(
+                            *wake_, MappedTransferWakeState::InferenceComplete,
+                            device(), stream);
+                    }
                     capture.finish();
                 }
             });
@@ -88,7 +109,7 @@ namespace llaminar2
             epoch_->context_->submitAndWait([&]
             {
                 for (auto &fragment : fragments_) fragment.reset();
-                interval_.reset();
+                wake_.reset();
             });
         }
         /** @copydoc IGraphCaptureAuxiliaryBranch::authorityIdentity */
@@ -124,7 +145,7 @@ namespace llaminar2
         /** One cold attachment replaces paired, cross-thread capture flags/events. */
         enum class AttachmentState { Prepared, Attached };
         std::shared_ptr<MappedTransferProgressEpoch> epoch_;
-        std::shared_ptr<DeviceTransferBuffer> interval_;
+        std::shared_ptr<MappedHostTransferRegion> wake_;
         std::array<std::unique_ptr<IGPUGraphCapture>, 3> fragments_;
         AttachmentState state_ = AttachmentState::Prepared;
     };
@@ -1290,7 +1311,9 @@ namespace llaminar2
                         [](const ExecutionLaneRuntime &lane) { return lane.busy(); }))
                 {
                     transfer_engine.enqueueMappedTransferService(*service_inbox_, *service_cursors_,
-                        maximumBytes(), nullptr, MappedTransferServiceRun::PublishedPass, executionStream());
+                        maximumBytes(), nullptr,
+                        MappedTransferServiceRun::FinitePass,
+                        executionStream());
                     idle_service_ = IdleServiceSubmission::InFlight;
                     if (!context_->recordEventChecked(execution_lanes_.front().terminal_event, executionStream()))
                         throw std::runtime_error("Mapped transfer idle terminal publication failed");

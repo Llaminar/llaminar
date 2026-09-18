@@ -1739,24 +1739,26 @@ namespace llaminar2
             size_t capacity, DeviceId device, void *stream) const;
 
         /**
-         * @brief Record a graph-private device lifecycle transition.
-         * @param interval Bound private device word retained by one graph cache.
-         * @param value Open at root, Closed at the inference terminal frontier.
-         * @param stream Exact primary capture stream.
+         * @brief Record a graph-private mapped wake-state transition.
+         * @param wake Registered host word retained by one graph cache.
+         * @param value InferenceActive at the root or InferenceComplete at the terminal.
+         * @param device Exact GPU consuming the mapped alias.
+         * @param stream Exact capture stream.
          * @throws std::invalid_argument for incomplete ownership or invalid state.
          * @throws std::runtime_error for native launch failure.
          */
-        void enqueueMappedTransferInterval(
-            DeviceTransferBuffer &interval, MappedTransferInterval value,
-            void *stream) const;
+        void enqueueMappedTransferWakeState(
+            MappedHostTransferRegion &wake, MappedTransferWakeState value,
+            DeviceId device, void *stream) const;
 
         /**
          * @brief Submit a bounded resumable worker through the transfer authority.
          * @param inbox Mapped slab of commands followed by completion records.
          * @param cursors Device-only array whose extent defines physical capacity.
          * @param maximum_bytes Immutable admitted extent limit per command.
-         * @param interval Private graph word, required only for CapturedInterval.
-         * @param run Explicit finite-idle or graph-bounded lifetime.
+         * @param wake Private graph lifetime word, required only for
+         *        CapturedInterval.
+         * @param run Explicit captured-interval or finite-pass lifetime.
          * @param stream Exact prepared auxiliary or idle execution stream.
          * @throws std::invalid_argument for mismatched endpoint, bounds or lifetime.
          * @throws std::runtime_error for native launch failure.
@@ -1764,7 +1766,7 @@ namespace llaminar2
         void enqueueMappedTransferService(
             const MappedHostTransferRegion &inbox,
             DeviceTransferBuffer &cursors, size_t maximum_bytes,
-            const DeviceTransferBuffer *interval,
+            const MappedHostTransferRegion *wake,
             MappedTransferServiceRun run, void *stream) const;
 
         /**

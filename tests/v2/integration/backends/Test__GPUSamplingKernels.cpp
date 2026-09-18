@@ -5529,6 +5529,68 @@ namespace
         backend_->free(d_token_ids, device_id_);
     }
 
+    /**
+     * @brief Forced policy tokens join penalty history on their producer stream.
+     *
+     * A reasoning-budget close bypasses the sampler, but the next captured
+     * generation window must observe it exactly once for presence/frequency
+     * penalties.  H2D publication, both commits, and D2H observation share the
+     * fixture's explicit stream, proving the backend implementation needs no
+     * default stream, host synchronization, or host-side history mirror.
+     */
+    TEST_P(GPUSamplingTest,
+           ForcedPolicyTokenHistoryCommitIsExplicitStreamOrderedAndExact)
+    {
+        constexpr int vocab_size = 32;
+        const int token = 17;
+        std::vector<int> counts(static_cast<size_t>(vocab_size), 0);
+        counts[3] = 4;
+
+        void *token_device = backend_->allocate(sizeof(token), device_id_);
+        void *counts_device = backend_->allocate(
+            counts.size() * sizeof(int), device_id_);
+        ASSERT_NE(token_device, nullptr);
+        ASSERT_NE(counts_device, nullptr);
+
+        ASSERT_TRUE(copyHostToDevice(
+            token_device, &token, sizeof(token), device_id_));
+        ASSERT_TRUE(copyHostToDevice(
+            counts_device,
+            counts.data(),
+            counts.size() * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(backend_->enqueueCommitGenerationTokenHistoryDevice(
+            token_device,
+            vocab_size,
+            counts_device,
+            device_id_,
+            stream_));
+        ASSERT_TRUE(backend_->enqueueCommitGenerationTokenHistoryDevice(
+            token_device,
+            vocab_size,
+            counts_device,
+            device_id_,
+            stream_));
+        ASSERT_TRUE(copyDeviceToHost(
+            counts.data(),
+            counts_device,
+            counts.size() * sizeof(int),
+            device_id_));
+
+        EXPECT_EQ(counts[3], 4);
+        EXPECT_EQ(counts[static_cast<size_t>(token)], 2);
+        EXPECT_EQ(std::accumulate(counts.begin(), counts.end(), 0), 6);
+        EXPECT_FALSE(backend_->enqueueCommitGenerationTokenHistoryDevice(
+            token_device,
+            vocab_size,
+            counts_device,
+            device_id_,
+            /*stream=*/nullptr));
+
+        backend_->free(counts_device, device_id_);
+        backend_->free(token_device, device_id_);
+    }
+
     // =========================================================================
     //  ARGMAX TESTS — mirrors Greedy Sampling from Test__Sampler.cpp
     // =========================================================================

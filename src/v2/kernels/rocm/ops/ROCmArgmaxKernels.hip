@@ -759,6 +759,19 @@ __global__ void rocm_commit_mtp_greedy_penalty_history_kernel(
         stopped_flags[0] == 0 && output_count > accepted_state_count ? 1 : 0;
 }
 
+/** Commit one forced policy token with the same serial history order as sampling. */
+__global__ void rocm_commit_generation_token_history_kernel(
+    const int *__restrict__ token,
+    int vocab_size,
+    int *__restrict__ generated_token_counts)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    const int value = token[0];
+    if (value >= 0 && value < vocab_size)
+        ++generated_token_counts[value];
+}
+
 template <bool PUBLISH_MTP_CHAIN, bool DEVICE_ACTIVE_ROWS = false>
 __global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
     const float *__restrict__ partial_vals,
@@ -1516,6 +1529,31 @@ bool rocmOps_commit_mtp_greedy_penalty_history(
             stderr,
             "ROCm MTP greedy penalty history commit launch failed: %s\n",
             hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_commit_generation_token_history(
+    const int *token,
+    int vocab_size,
+    int *generated_token_counts,
+    int device_idx,
+    void *stream)
+{
+    if (!token || vocab_size <= 0 || !generated_token_counts || !stream)
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_commit_generation_token_history_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        token, vocab_size, generated_token_counts);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "ROCm generation-token history commit launch failed: %s\n",
+                hipGetErrorString(err));
         return false;
     }
     return true;

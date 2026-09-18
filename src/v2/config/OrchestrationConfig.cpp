@@ -631,6 +631,23 @@ namespace llaminar2
         auto &plan = *plan_ptr;
 
         /*
+         * An authored topology without a residency spelling follows the same
+         * typed default as automatic planning and implicit multi-device MoE.
+         * Disabled remains an internal sentinel for incomplete plans and for
+         * callers that supply concrete placements; it is not the accidental
+         * public default for a newly declared ExpertOverlay topology.
+         */
+        if (plan.enabled &&
+            plan.residency_policy ==
+                RoutedExpertResidencyPolicy::Disabled &&
+            plan.placements.empty())
+        {
+            plan.residency_policy =
+                defaultRoutedExpertResidencyPolicy(
+                    config.moe_rebalance.mode);
+        }
+
+        /*
          * Integer priority already defines a total preference order. Derive
          * final coverage from its least-preferred member so configuration
          * cannot carry a second, contradictory fallback ordering. Duplicate
@@ -1334,7 +1351,9 @@ namespace llaminar2
                  * coupled to adaptive-policy defaults.
                  */
                 const int effective_max_depth =
-                    depth_policy.max_depth > 0 ? depth_policy.max_depth : mtp.draft_tokens;
+                    depth_policy.max_depth > 0
+                        ? depth_policy.max_depth
+                        : defaultMTPAdaptiveMaximumDraftDepth();
                 const int effective_initial_depth =
                     resolveMTPDepthPolicyInitialDepth(
                         depth_policy,

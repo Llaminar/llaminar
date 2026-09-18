@@ -3,7 +3,9 @@
  * @brief Types for OpenAI-compatible tool/function calling support
  *
  * Defines data structures for tool definitions, tool calls in messages,
- * and tool call format detection/parsing per model family.
+ * and tool-call protocol selection per model family.  The protocol enum is
+ * deliberately architecture-owned: the HTTP layer must never guess a parser
+ * from whatever delimiters happened to appear in one generated response.
  */
 
 #pragma once
@@ -21,13 +23,16 @@ namespace llaminar2
      * The format determines how we parse raw model output into structured
      * tool_calls objects in the OpenAI response.
      *
-     * Each model's graph config can specify which format it uses;
-     * HERMES_2_PRO is the default (covers Qwen 2.5, Qwen 3, Hermes, etc.).
+     * Each model's schema factory specifies the grammar emitted by its chat
+     * template.  Similar outer delimiters do not imply compatible payloads:
+     * Hermes carries JSON while current Qwen hybrid models carry nested
+     * function/parameter tags.
      */
     enum class ToolCallFormat
     {
         NONE,          ///< Model does not support tool calling
         HERMES_2_PRO,  ///< <tool_call>\n{"name":"...","arguments":{...}}\n</tool_call>
+        QWEN_3_XML,    ///< <tool_call><function=name><parameter=key>value...</parameter></function></tool_call>
         LLAMA_3X,      ///< <|python_tag|>{"name":"...","parameters":{...}}
         FUNCTIONARY,   ///< Functionary v3.x format
         MISTRAL_NEMO,  ///< [TOOL_CALLS] format
@@ -46,6 +51,8 @@ namespace llaminar2
             return "None";
         case ToolCallFormat::HERMES_2_PRO:
             return "Hermes 2 Pro";
+        case ToolCallFormat::QWEN_3_XML:
+            return "Qwen 3 XML";
         case ToolCallFormat::LLAMA_3X:
             return "Llama 3.x";
         case ToolCallFormat::FUNCTIONARY:

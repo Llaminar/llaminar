@@ -112,6 +112,61 @@ TEST(Test__PrefixStateSnapshot, ClampedToTrimsHybridBlocksWithoutRestorableState
     EXPECT_FALSE(block_boundary.has_terminal_logits);
 }
 
+/**
+ * @brief Exact full hits reuse their immutable terminal archive at harvest.
+ *
+ * Replacing this record while the lookup still owns it can transiently spend
+ * two physical RAM blocks and was observed to abort a production MPI request
+ * after otherwise successful long generation. The typed decision must remain
+ * conservative for partial or incomplete terminal records.
+ */
+TEST(Test__PrefixStateSnapshot, ExactFullHitReusesCompleteTerminalArchive)
+{
+    PrefixLookupResult hit;
+    hit.supported = true;
+    hit.cache_enabled = true;
+    hit.cached_tokens = 9;
+    hit.block_size = 4;
+    hit.fingerprint_key = 0x1234;
+    hit.requires_terminal_hidden = true;
+    hit.requires_terminal_logits = true;
+    hit.has_terminal_hidden = true;
+    hit.has_terminal_logits = true;
+    hit.blocks.push_back(makeBlock(0, 0, 4, false, false, false, false));
+    hit.blocks.push_back(makeBlock(1, 4, 4, false, false, false, false));
+    hit.blocks.push_back(makeBlock(2, 8, 1, true, true, true, true));
+
+    const PrefixCacheKey terminal_key = hit.blocks.back().key;
+    EXPECT_EQ(
+        hit.terminalHarvestDisposition(terminal_key, 9),
+        PrefixTerminalHarvestDisposition::ReuseAdmittedArchive);
+
+    auto partial = hit;
+    partial.cached_tokens = 8;
+    EXPECT_EQ(
+        partial.terminalHarvestDisposition(terminal_key, 9),
+        PrefixTerminalHarvestDisposition::ArchiveLiveState);
+
+    auto missing_terminal = hit;
+    missing_terminal.has_terminal_logits = false;
+    missing_terminal.blocks.back().has_terminal_logits = false;
+    EXPECT_EQ(
+        missing_terminal.terminalHarvestDisposition(terminal_key, 9),
+        PrefixTerminalHarvestDisposition::ArchiveLiveState);
+
+    auto missing_hybrid = hit;
+    missing_hybrid.blocks.back().has_hybrid_state = false;
+    EXPECT_EQ(
+        missing_hybrid.terminalHarvestDisposition(terminal_key, 9),
+        PrefixTerminalHarvestDisposition::ArchiveLiveState);
+
+    auto foreign_key = terminal_key;
+    ++foreign_key.token_hash;
+    EXPECT_EQ(
+        hit.terminalHarvestDisposition(foreign_key, 9),
+        PrefixTerminalHarvestDisposition::ArchiveLiveState);
+}
+
 TEST(Test__PrefixStateSnapshot, ProvenanceMarksOnlyReplaySafeStatesDecodeEquivalent)
 {
     EXPECT_TRUE(isDecodeEquivalent(PrefixStateProvenance::PayloadCheckpoint));

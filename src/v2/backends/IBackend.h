@@ -32,7 +32,7 @@ namespace llaminar2
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
     struct MappedTransferServiceCursor;
-    enum class MappedTransferInterval : std::uint32_t;
+    enum class MappedTransferWakeState : std::uint64_t;
     enum class MappedTransferServiceRun : std::uint8_t;
     enum class MappedTransferDirection : std::uint8_t;
 
@@ -1351,6 +1351,38 @@ namespace llaminar2
             (void)accepted_state_counts_device;
             (void)stopped_flags_device;
             (void)output_token_capacity;
+            (void)vocab_size;
+            (void)generated_token_counts_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Commit one device-owned policy token to generation history.
+         *
+         * Forced request-policy output bypasses the sampler but must remain
+         * indistinguishable from sampled output to later presence/frequency
+         * penalties. Implementations enqueue one deterministic single-writer
+         * update on @p stream; the token is read from device memory and no
+         * allocation, transfer, atomics, or synchronization is permitted.
+         *
+         * @param token_device Device scalar containing the committed token id.
+         * @param vocab_size Exclusive upper bound for a valid token id.
+         * @param generated_token_counts_device Device histogram indexed by token id.
+         * @param device_id Backend-local device ordinal owning both buffers.
+         * @param stream Exact non-null producer stream for the ordered update.
+         * @return true when the update was enqueued; false for invalid state or
+         *         a backend launch failure.
+         */
+        virtual bool enqueueCommitGenerationTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream)
+        {
+            (void)token_device;
             (void)vocab_size;
             (void)generated_token_counts_device;
             (void)device_id;
@@ -4150,18 +4182,18 @@ namespace llaminar2
         }
 
         /**
-         * @brief Record a GPU-owned graph interval transition, never a host flag.
-         * @param interval Persistent private word belonging to exactly one graph.
-         * @param value Typed Open at fork or Closed before join.
+         * @brief Record one graph-owned mapped wake-state transition.
+         * @param wake Persistent private mapped word belonging to exactly one graph.
+         * @param value Typed root arm or terminal release state.
          * @param device_id Exact GPU ordinal.
          * @param stream Non-null primary capture stream.
          * @return Whether the lifecycle kernel was accepted.
          */
-        virtual bool enqueueMappedTransferInterval(
-            std::uint32_t *interval, MappedTransferInterval value,
+        virtual bool enqueueMappedTransferWakeState(
+            std::uint64_t *wake, MappedTransferWakeState value,
             int device_id, void *stream)
         {
-            (void)interval; (void)value; (void)device_id; (void)stream;
+            (void)wake; (void)value; (void)device_id; (void)stream;
             return false;
         }
 
@@ -4172,8 +4204,8 @@ namespace llaminar2
          * @param cursors Persistent device claimant/cursor array.
          * @param capacity Physical concurrency bound, not topology slot count.
          * @param maximum_bytes Admission bound for every immutable command.
-         * @param interval Graph-private lifecycle word, absent for PublishedPass.
-         * @param run Finite idle pass or GPU-terminated captured interval.
+         * @param wake Graph-private lifetime word for CapturedInterval.
+         * @param run Captured interval or independently queued finite pass.
          * @param device_id Exact GPU ordinal.
          * @param stream Non-null prepared worker stream.
          * @return Whether the native kernel was accepted; never changes mechanisms.
@@ -4182,11 +4214,11 @@ namespace llaminar2
             const MappedTransferProgressCommand *commands,
             MappedTransferProgressCompletion *completions,
             MappedTransferServiceCursor *cursors, size_t capacity,
-            size_t maximum_bytes, const std::uint32_t *interval,
+            size_t maximum_bytes, const std::uint64_t *wake,
             MappedTransferServiceRun run, int device_id, void *stream)
         {
             (void)commands; (void)completions; (void)cursors; (void)capacity;
-            (void)maximum_bytes; (void)interval; (void)run; (void)device_id; (void)stream;
+            (void)maximum_bytes; (void)wake; (void)run; (void)device_id; (void)stream;
             return false;
         }
 

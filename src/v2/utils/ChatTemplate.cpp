@@ -6,8 +6,11 @@
  *
  * Implements chat template detection from GGUF metadata strings and
  * format-specific prompt construction for various LLM families.
- * Primary rendering uses the vendored Jinja2 engine with fallback
- * to hardcoded format implementations.
+ * Primary rendering compiles the vendored Jinja2 program once per model and
+ * executes that immutable program with a request-local context. This avoids
+ * reparsing a large template on every HTTP request while preserving isolation
+ * between concurrent renders. Hardcoded format implementations remain the
+ * explicit renderer for templates without Jinja support.
  */
 
 #include "ChatTemplate.h"
@@ -178,13 +181,6 @@ namespace llaminar2
 
         try
         {
-            // Re-parse the template fresh each call to avoid AST mutation bugs
-            // in the vendored Jinja engine (execute_impl methods can modify shared
-            // AST nodes, causing non-deterministic rendering on subsequent calls).
-            jinja::lexer lexer;
-            auto lexer_res = lexer.tokenize(raw_template_);
-            jinja::program prog = jinja::parse_from_tokens(lexer_res);
-
             jinja::context ctx(jinja_state_->source);
 
             // Build the messages array as ordered JSON, including tool-calling fields
@@ -208,8 +204,37 @@ namespace llaminar2
                     {
                         try
                         {
-                            jmsg["tool_calls"].push_back(
-                                nlohmann::ordered_json::parse(tc_str));
+                            auto tool_call = nlohmann::ordered_json::parse(tc_str);
+
+                            /*
+                             * OpenAI transports function.arguments as a JSON
+                             * string, while Hugging Face/Jinja chat templates
+                             * consume a structured argument mapping. Normalize
+                             * that representation once at the template
+                             * boundary. Keeping the original string in the
+                             * HTTP message type is important for lossless API
+                             * round trips; presenting it as a mapping here lets
+                             * Qwen emit one native <parameter=...> block per
+                             * argument instead of embedding an opaque JSON blob
+                             * inside <function=...>.
+                             */
+                            if (tool_call.contains("function") &&
+                                tool_call["function"].is_object() &&
+                                tool_call["function"].contains("arguments") &&
+                                tool_call["function"]["arguments"].is_string())
+                            {
+                                const auto arguments_text =
+                                    tool_call["function"]["arguments"].get<std::string>();
+                                auto structured_arguments =
+                                    nlohmann::ordered_json::parse(
+                                        arguments_text, nullptr, false);
+                                if (structured_arguments.is_object())
+                                {
+                                    tool_call["function"]["arguments"] =
+                                        std::move(structured_arguments);
+                                }
+                            }
+                            jmsg["tool_calls"].push_back(std::move(tool_call));
                         }
                         catch (const nlohmann::ordered_json::parse_error &)
                         {
@@ -258,7 +283,9 @@ namespace llaminar2
 
             // Execute template
             jinja::runtime runtime(ctx);
-            const jinja::value results = runtime.execute(prog);
+            // The AST is immutable after compilation. All variables and
+            // intermediate values belong to this request-local context.
+            const jinja::value results = runtime.execute(jinja_state_->prog);
             auto parts = jinja::runtime::gather_string_parts(results);
 
             return parts->as_string().str();
@@ -284,11 +311,6 @@ namespace llaminar2
 
         try
         {
-            // Re-parse template fresh (same rationale as renderJinja)
-            jinja::lexer lexer;
-            auto lexer_res = lexer.tokenize(raw_template_);
-            jinja::program prog = jinja::parse_from_tokens(lexer_res);
-
             jinja::context ctx(jinja_state_->source);
 
             nlohmann::ordered_json msg_array = nlohmann::ordered_json::array();
@@ -312,7 +334,7 @@ namespace llaminar2
 
             jinja::global_from_json(ctx, inp, false);
             jinja::runtime runtime(ctx);
-            const jinja::value results = runtime.execute(prog);
+            const jinja::value results = runtime.execute(jinja_state_->prog);
             auto parts = jinja::runtime::gather_string_parts(results);
             return parts->as_string().str();
         }

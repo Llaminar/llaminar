@@ -59,9 +59,10 @@ namespace llaminar2
      * Hosted HIP generation publishes a cumulative committed-token count in
      * its immutable scheduler ticket.  The transaction coordinator converts
      * consecutive snapshots into an exactly-once positive delta only after
-     * the matching sparse graph sequence retires.  Production binds this sink
-     * to host-authoritative background residency maintenance; it must not run
-     * policy, perform MPI, allocate, or wait.
+     * the matching sparse graph sequence retires. Production binds this sink
+     * to the process-local background maintenance authority: either the
+     * topology-wide device controller or the host-authoritative service, never
+     * both. It must not run policy, perform MPI, allocate, or wait.
      */
     using MoEOverlayRetiredDecodeProgressSink =
         std::function<bool(std::uint64_t completed_tokens,
@@ -592,6 +593,77 @@ namespace llaminar2
     class MoEOverlayInferenceTransactionCoordinator final
     {
     public:
+        /**
+         * @brief Immutable successor selected by one authenticated hosted ticket.
+         *
+         * A retained hosted transaction can advance only to an ordinary serial
+         * decode sequence, a positive-depth speculative sequence, or the
+         * command terminal.  Encoding those alternatives in a type rather than
+         * an integer/optional pair prevents ordinary depth zero from being
+         * misread as an invalid MTP depth.
+         */
+        class HostedGraphSequenceTransition final
+        {
+        public:
+            /** @brief Exact semantic successor represented by this transition. */
+            enum class Kind : std::uint8_t
+            {
+                OrdinaryDecode, ///< Open one serial MainDecode graph sequence.
+                SpeculativeMTP, ///< Open one positive-depth MTP graph sequence.
+                Terminal,       ///< Retire the completed sequence without a successor.
+            };
+
+            /** @brief Build the only valid ordinary successor (serial depth zero). */
+            [[nodiscard]] static constexpr HostedGraphSequenceTransition ordinaryDecode() noexcept
+            {
+                return {Kind::OrdinaryDecode, 0};
+            }
+
+            /**
+             * @brief Build a speculative successor with its controller-selected depth.
+             * @param draft_depth Positive depth; the coordinator validates family capacity.
+             */
+            [[nodiscard]] static constexpr HostedGraphSequenceTransition speculativeMTP(
+                int draft_depth) noexcept
+            {
+                return {Kind::SpeculativeMTP, draft_depth};
+            }
+
+            /** @brief Build the command-terminal successor. */
+            [[nodiscard]] static constexpr HostedGraphSequenceTransition terminal() noexcept
+            {
+                return {Kind::Terminal, -1};
+            }
+
+            /** @return Semantic successor category without exposing mutable state. */
+            [[nodiscard]] constexpr Kind kind() const noexcept { return kind_; }
+
+            /**
+             * @return Exact sequence depth, or -1 when @ref kind is Terminal.
+             *
+             * Ordinary decode deliberately returns zero.  Callers must inspect
+             * @ref kind rather than inferring policy from this numeric value.
+             */
+            [[nodiscard]] constexpr int draftDepth() const noexcept
+            {
+                return draft_depth_;
+            }
+
+            /** @brief Compare two authenticated ticket decisions exactly. */
+            [[nodiscard]] constexpr bool operator==(
+                const HostedGraphSequenceTransition &) const noexcept = default;
+
+        private:
+            /** @brief Construct only through the explicit semantic factories. */
+            constexpr HostedGraphSequenceTransition(Kind kind, int draft_depth) noexcept
+                : kind_(kind), draft_depth_(draft_depth)
+            {
+            }
+
+            Kind kind_; ///< Immutable policy selected by the device ticket.
+            int draft_depth_; ///< Depth meaningful only for ordinary/MTP successors.
+        };
+
         /** @brief Setup-owned publishers and fixed command capacities. */
         struct Config
         {
@@ -609,7 +681,7 @@ namespace llaminar2
             /** Optional process-local device-controller wake sideband. */
             MoEOverlayRetiredPrefillProgressSink
                 retired_prefill_progress_sink;
-            /** Optional host-maintenance wake for retired hosted MTP sequences. */
+            /** Optional process-local maintenance wake for retired hosted sequences. */
             MoEOverlayRetiredDecodeProgressSink
                 retired_decode_progress_sink;
             /**
@@ -801,14 +873,21 @@ namespace llaminar2
          * already-published result. Participant order is therefore irrelevant:
          * no child is elected as a host-side lifecycle authority.
          *
+         * The first ordinary ticket may contain only the scalar sample of a
+         * fully restored prefix. In that one typed initial state there is no
+         * sparse graph to retire; the ticket still opens the first serial
+         * decode sequence. Later tickets always retire the sequence whose
+         * forward produced their sampled logits. This keeps prefix restore in
+         * the same production controller without inventing a fake graph group.
+         *
          * A different decision for an already observed id, or a stale id, is a
          * fatal protocol disagreement. The transition never waits for device
          * work; the authenticated ticket is itself the proof that every sparse
          * return and controller publication in the prior sequence completed.
          *
          * @param transaction_id Positive monotonically increasing ticket id.
-         * @param next_draft_depth Controller-selected next depth, or nullopt
-         *        when the ticket closes the outer generation command.
+         * @param transition Typed next graph-sequence policy named by the
+         *        authenticated device ticket.
          * @param committed_output_tokens Cumulative logical response count in
          *        the same authenticated ticket.
          * @param error Optional stable lifecycle diagnostic.
@@ -817,7 +896,7 @@ namespace llaminar2
          */
         bool advanceHostedGraphSequence(
             std::uint64_t transaction_id,
-            std::optional<int> next_draft_depth,
+            HostedGraphSequenceTransition transition,
             std::uint64_t committed_output_tokens,
             std::string *error = nullptr);
 
@@ -1039,8 +1118,9 @@ namespace llaminar2
         std::size_t graph_sequence_count_ = 0;
         /** Last authenticated hosted transition accepted in this command. */
         std::uint64_t last_hosted_sequence_transition_id_ = 0;
-        /** Decision paired with @ref last_hosted_sequence_transition_id_. */
-        std::optional<int> last_hosted_sequence_next_draft_depth_;
+        /** Typed decision paired with @ref last_hosted_sequence_transition_id_. */
+        std::optional<HostedGraphSequenceTransition>
+            last_hosted_sequence_transition_;
         /** Cumulative token count paired with the last hosted transition. */
         std::uint64_t last_hosted_sequence_committed_output_tokens_ = 0u;
         ExecutionSequencePlan execution_sequence_{};
@@ -1178,7 +1258,7 @@ namespace llaminar2
             /** Optional process-local device-controller wake sideband. */
             MoEOverlayRetiredPrefillProgressSink
                 retired_prefill_progress_sink;
-            /** Optional hosted-maintenance wake from the source frontier. */
+            /** Optional process-local maintenance wake from the source frontier. */
             MoEOverlayRetiredDecodeProgressSink
                 retired_decode_progress_sink;
         };

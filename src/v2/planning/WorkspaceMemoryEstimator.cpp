@@ -23,11 +23,15 @@
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/gemm/CUDAQuantisedGemmWorkspaceContract.h"
+#endif
 #include "kernels/kvcache/KVCacheWorkspaceContract.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmWorkspaceContract.h"
 #include "kernels/rope/RoPEWorkspaceContract.h"
 #include "utils/VramBillOfMaterials.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
 #include <array>
@@ -982,6 +986,252 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
 }
 
 /**
+ * @brief Price CUDA quantized GEMM scratch from the live dispatch authority.
+ *
+ * Unlike ROCm's codebook-independent descriptor contract, CUDA NativeVNNI
+ * prefill workspace depends on the exact GPU launch policy and source
+ * arithmetic codebook.  Production local admission is late enough to query
+ * that policy.  Metadata-only callers deliberately keep using the documented
+ * device-free envelope rather than probing a GPU that they do not own.
+ */
+size_t exactCUDAQuantizedGemmWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+#ifndef HAVE_CUDA
+    (void)profile;
+    (void)geometry;
+    return 0u;
+#else
+    if (!geometry.device.is_cuda() ||
+        !geometry.runtime_device_policy_available)
+    {
+        return 0u;
+    }
+
+    const WeightShardingConfig sharding =
+        SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+    const int prefill_rows = checkedWorkspaceDimension(
+        checkedMultiply(
+            static_cast<std::size_t>(std::max(1, geometry.batch_size)),
+            static_cast<std::size_t>(
+                std::max(1, geometry.resident_graph_rows)),
+            "CUDA prefill rows"),
+        "CUDA prefill rows");
+    const int terminal_rows = std::max(
+        1,
+        geometry.mtp_target_query_rows > 0
+            ? geometry.mtp_target_query_rows
+            : geometry.batch_size);
+    const bool full_terminal =
+        geometry.mtp_terminal_logits_layout ==
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+
+    const auto nativeCodebooks = [](const TensorSizeInfo& tensor)
+        -> std::optional<cuda::quantized_gemm_workspace::NativeCodebooks>
+    {
+        const auto* format =
+            native_vnni_formats::forQuantType(tensor.quant_type);
+        if (!format)
+        {
+            throw std::runtime_error(
+                "CUDA workspace admission has no NativeVNNI codebook for " +
+                tensor.quant_type + " tensor " + tensor.name);
+        }
+        const std::uint8_t codebook =
+            canonicalDeviceVnniCodebookId(format->codebook_id);
+        return cuda::quantized_gemm_workspace::NativeCodebooks{
+            .execution = codebook,
+            .arithmetic = codebook,
+        };
+    };
+
+    WorkspaceRequirements requirements;
+    bool has_explicit_terminal = false;
+    const TensorSizeInfo* tied_embedding = nullptr;
+    for (const auto& tensor : profile.tensors)
+    {
+        if (!workspaceOwnsTensor(tensor, profile, geometry))
+            continue;
+        if (isEmbeddingWeight(tensor.name))
+        {
+            if (isQuantizedMatrixWeight(tensor))
+                tied_embedding = &tensor;
+            continue;
+        }
+        if (!isQuantizedMatrixWeight(tensor))
+            continue;
+
+        const bool terminal = isTerminalProjectionWeight(tensor.name);
+        has_explicit_terminal = has_explicit_terminal || terminal;
+        const bool mtp_sidecar = isRetainedMTPSidecarLayer(
+            tensor, profile, geometry);
+        const int projection_rows =
+            terminal || mtp_sidecar ? terminal_rows : prefill_rows;
+        const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+            tensor, profile, geometry, sharding, full_terminal);
+        if (!shape.valid())
+            continue;
+        logVramBomLine(
+            "workspace_admission_cuda_projection",
+            "device=" + geometry.device.toString() +
+                " tensor=" + tensor.name +
+                " rows=" + std::to_string(projection_rows) +
+                " output_columns=" +
+                std::to_string(shape.output_columns) +
+                " input_columns=" +
+                std::to_string(shape.input_columns) +
+                " terminal=" + (terminal ? "true" : "false"));
+        requirements.merge(
+            cuda::quantized_gemm_workspace::projectionRequirements(
+                projection_rows,
+                shape.output_columns,
+                shape.input_columns,
+                geometry.device.ordinal,
+                nativeCodebooks(tensor)));
+    }
+
+    if (!has_explicit_terminal && tied_embedding)
+    {
+        TensorSizeInfo terminal = *tied_embedding;
+        terminal.name = "output.weight";
+        const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+            terminal, profile, geometry, sharding, full_terminal);
+        requirements.merge(
+            cuda::quantized_gemm_workspace::projectionRequirements(
+                terminal_rows,
+                shape.output_columns,
+                shape.input_columns,
+                geometry.device.ordinal,
+                nativeCodebooks(terminal)));
+    }
+
+    for (const auto& anchor : profile.tensors)
+    {
+        if (!workspaceOwnsTensor(anchor, profile, geometry) ||
+            !isQuantizedMatrixWeight(anchor))
+        {
+            continue;
+        }
+
+        std::vector<int> fused_columns;
+        if (anchor.name.ends_with(".attn_qkv.weight"))
+        {
+            constexpr std::array<std::string_view, 4> suffixes = {
+                ".attn_qkv.weight",
+                ".attn_gate.weight",
+                ".ssm_alpha.weight",
+                ".ssm_beta.weight"};
+            for (const std::string_view suffix : suffixes)
+            {
+                const TensorSizeInfo* member = findLayerWorkspaceTensor(
+                    profile, anchor.layer_index, suffix);
+                if (!member)
+                {
+                    fused_columns.clear();
+                    break;
+                }
+                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+                    *member, profile, geometry, sharding, false);
+                if (!shape.valid() || member->K != anchor.K)
+                {
+                    fused_columns.clear();
+                    break;
+                }
+                fused_columns.push_back(shape.output_columns);
+            }
+        }
+        else if (anchor.name.ends_with(".attn_q.weight"))
+        {
+            constexpr std::array<std::string_view, 3> suffixes = {
+                ".attn_q.weight",
+                ".attn_k.weight",
+                ".attn_v.weight"};
+            for (const std::string_view suffix : suffixes)
+            {
+                const TensorSizeInfo* member = findLayerWorkspaceTensor(
+                    profile, anchor.layer_index, suffix);
+                if (!member)
+                {
+                    fused_columns.clear();
+                    break;
+                }
+                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+                    *member, profile, geometry, sharding, false);
+                if (!shape.valid() || member->K != anchor.K)
+                {
+                    fused_columns.clear();
+                    break;
+                }
+                fused_columns.push_back(shape.output_columns);
+            }
+        }
+        else if (anchor.name.ends_with(".ffn_gate_exps.weight"))
+        {
+            const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+                anchor, profile, geometry, sharding, false);
+            fused_columns.assign(
+                static_cast<std::size_t>(
+                    std::max(1, profile.expert_used_count)) * 2u,
+                shape.output_columns);
+        }
+        else if (anchor.name.find(".ffn_gate") != std::string::npos &&
+                 anchor.name.ends_with(".weight"))
+        {
+            std::string up_name = anchor.name;
+            const std::size_t gate = up_name.find(".ffn_gate");
+            up_name.replace(
+                gate, std::string_view(".ffn_gate").size(), ".ffn_up");
+            const auto up = std::find_if(
+                profile.tensors.begin(),
+                profile.tensors.end(),
+                [&](const TensorSizeInfo& candidate)
+                { return candidate.name == up_name; });
+            if (up != profile.tensors.end() && up->K == anchor.K)
+            {
+                const WorkspaceMatrixShape gate_shape =
+                    localWorkspaceMatrixShape(
+                        anchor, profile, geometry, sharding, false);
+                const WorkspaceMatrixShape up_shape =
+                    localWorkspaceMatrixShape(
+                        *up, profile, geometry, sharding, false);
+                fused_columns = {
+                    gate_shape.output_columns,
+                    up_shape.output_columns};
+            }
+        }
+
+        if (!fused_columns.empty())
+        {
+            const int fused_rows = isRetainedMTPSidecarLayer(
+                                       anchor, profile, geometry)
+                                       ? terminal_rows
+                                       : prefill_rows;
+            WorkspaceRequirements fused_requirements;
+            cuda::quantized_gemm_workspace::
+                appendFusedProjectionRequirements(
+                    fused_requirements,
+                    fused_rows,
+                    fused_columns,
+                    checkedWorkspaceDimension(
+                        anchor.K, "CUDA fused projection K"));
+            /*
+             * A retained graph binds one stable fused-scatter arena name.
+             * Every layer may require a different extent, but those layers
+             * execute serially and DeviceWorkspaceManager materializes only
+             * the widest named buffer.  Merge the layer-local declaration so
+             * admission follows that exact ownership rule; appending directly
+             * would incorrectly charge one physical arena per model layer.
+             */
+            requirements.merge(fused_requirements);
+        }
+    }
+
+    return requirements.total_bytes_with_alignment();
+#endif
+}
+
+/**
  * @brief Compose the exact ROCm GEMM ABI for both routed endpoint graph forms.
  *
  * A mapped GPU follower retains `MoEExpertComputeStage`: its gate projection
@@ -1565,6 +1815,8 @@ size_t WorkspaceMemoryEstimator::estimate(
      * the historical floor remains only for non-GEMM graph primitives that do
      * not yet expose typed metadata-only contracts.
      */
+    const size_t cuda_quantized_gemm_bytes =
+        exactCUDAQuantizedGemmWorkspaceBytes(profile, geometry);
     const size_t rocm_quantized_gemm_bytes =
         exactROCmQuantizedGemmWorkspaceBytes(profile, geometry);
     /*
@@ -1575,12 +1827,14 @@ size_t WorkspaceMemoryEstimator::estimate(
      * inventory retain the legacy conservative envelope until their backend
      * exposes equivalent metadata-only contracts.
      */
+    const size_t exact_quantized_gemm_bytes = std::max(
+        cuda_quantized_gemm_bytes, rocm_quantized_gemm_bytes);
     const size_t dense_baseline_bytes =
-        geometry.device.is_rocm() && rocm_quantized_gemm_bytes > 0u
+        exact_quantized_gemm_bytes > 0u
             ? 0u
             : legacy_dense_baseline_bytes;
     size_t bytes = std::max(
-        dense_baseline_bytes, rocm_quantized_gemm_bytes);
+        dense_baseline_bytes, exact_quantized_gemm_bytes);
     bytes = checkedAdd(bytes, exactCPUProjectionWorkspaceBytes(profile, geometry),
         "CPU invocation-owned projection requirements");
 
@@ -1727,6 +1981,8 @@ size_t WorkspaceMemoryEstimator::estimate(
             std::to_string(geometry.mtp_target_query_rows) +
             " dense_baseline_bytes=" +
             std::to_string(dense_baseline_bytes) +
+            " cuda_quantized_gemm_bytes=" +
+            std::to_string(cuda_quantized_gemm_bytes) +
             " rocm_quantized_gemm_bytes=" +
             std::to_string(rocm_quantized_gemm_bytes) +
             " moe_bytes=" + std::to_string(moe_bytes) +

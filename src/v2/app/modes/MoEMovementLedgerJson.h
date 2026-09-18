@@ -33,6 +33,55 @@ namespace llaminar2::movement_json_detail
         throw std::invalid_argument("Completed movement has no valid authority");
     }
 
+    /** @return Stable wire name for one authority lifecycle state. */
+    inline const char *lifecycleName(MoEOptimizationLifecycleState state)
+    {
+        switch (state)
+        {
+        case MoEOptimizationLifecycleState::NotApplicable: return "not_applicable";
+        case MoEOptimizationLifecycleState::MovementDisabled: return "movement_disabled";
+        case MoEOptimizationLifecycleState::LearningEconomy: return "learning_economy";
+        case MoEOptimizationLifecycleState::Active: return "active";
+        case MoEOptimizationLifecycleState::Drained: return "drained";
+        case MoEOptimizationLifecycleState::Failed: return "failed";
+        }
+        throw std::invalid_argument("MoE optimization has an invalid lifecycle state");
+    }
+
+    /** @return Stable wire name for one authority activity state. */
+    inline const char *activityName(MoEOptimizationActivityState activity)
+    {
+        switch (activity)
+        {
+        case MoEOptimizationActivityState::NotApplicable: return "not_applicable";
+        case MoEOptimizationActivityState::Dormant: return "dormant";
+        case MoEOptimizationActivityState::LearningEconomy: return "learning_economy";
+        case MoEOptimizationActivityState::CollectingDemand: return "collecting_demand";
+        case MoEOptimizationActivityState::ReconcilingDemand: return "reconciling_demand";
+        case MoEOptimizationActivityState::PlanningMovement: return "planning_movement";
+        case MoEOptimizationActivityState::AwaitingAuthorityProposal: return "awaiting_authority_proposal";
+        case MoEOptimizationActivityState::ExchangingProposal: return "exchanging_proposal";
+        case MoEOptimizationActivityState::MovingWeights: return "moving_weights";
+        case MoEOptimizationActivityState::PublishingResidency: return "publishing_residency";
+        case MoEOptimizationActivityState::Draining: return "draining";
+        case MoEOptimizationActivityState::Failed: return "failed";
+        case MoEOptimizationActivityState::DeviceOwned: return "device_owned";
+        }
+        throw std::invalid_argument("MoE optimization has an invalid activity state");
+    }
+
+    /** @return Stable wire name for the authority-owned demand cadence. */
+    inline const char *demandScopeName(MoEOptimizationDemandScope scope)
+    {
+        switch (scope)
+        {
+        case MoEOptimizationDemandScope::RoutedRows: return "routed_rows";
+        case MoEOptimizationDemandScope::PrefillCadence: return "prefill_cadence";
+        case MoEOptimizationDemandScope::DecodeCadence: return "decode_cadence";
+        }
+        throw std::invalid_argument("MoE optimization has an invalid demand scope");
+    }
+
     /**
      * @param direction Owner-authored physical movement classification.
      * @return Wire direction independent of objective; invalid enums throw std::invalid_argument.
@@ -182,6 +231,99 @@ namespace llaminar2::movement_json_detail
 
 namespace llaminar2
 {
+    /**
+     * @brief Serialize the passive state of the sole optimization authority.
+     * @param status One non-mutating, authority-owned lifecycle snapshot.
+     * @return Status and cadence evidence independent of optional PerfStats.
+     *
+     * An empty movement ledger is ambiguous by itself: it can mean that no
+     * decision window completed, that economy learning is unfinished, or that
+     * every completed decision correctly selected no movement. This projection
+     * exposes the lifecycle and demand generation needed to distinguish those
+     * cases without treating telemetry as execution authority.
+     */
+    inline nlohmann::json moeOptimizationStatusJson(
+        const MoEOptimizationStatus &status)
+    {
+        const bool has_authority =
+            status.authority != MoEOptimizationAuthority::None;
+        nlohmann::json last_decision = nullptr;
+        if (status.last_decision)
+        {
+            const auto &decision = *status.last_decision;
+            if (!decision.valid())
+                throw std::invalid_argument(
+                    "Optimization status contains an invalid decision receipt");
+            last_decision = {
+                {"transaction", decision.transaction},
+                {"candidate_epoch", decision.candidate_epoch},
+                {"snapshot_observations", decision.snapshot_observations},
+                {"command_count", decision.command_count},
+                {"accepted_cycles", decision.accepted_cycles},
+                {"rejected_cycles", decision.rejected_cycles},
+                {"phase_tradeoff_candidates",
+                 decision.phase_tradeoff_candidates},
+                {"improvement_floor_rejected_cycles",
+                 decision.improvement_floor_rejected_cycles},
+                {"payoff_rejected_cycles",
+                 decision.payoff_rejected_cycles},
+                {"residency_rejected_cycles",
+                 decision.residency_rejected_cycles},
+                {"priority_cost_before", decision.priority_cost_before},
+                {"priority_cost_after", decision.priority_cost_after},
+                {"same_priority_makespan_before",
+                 decision.same_priority_makespan_before},
+                {"same_priority_makespan_after",
+                 decision.same_priority_makespan_after},
+                {"projected_service_gain_ns",
+                 decision.projected_service_gain_ns},
+                {"projected_transfer_and_repack_ns",
+                 decision.projected_transfer_and_repack_ns},
+                {"projected_inference_interference_ns",
+                 decision.projected_inference_interference_ns},
+                {"projected_net_benefit_ns",
+                 decision.projected_net_benefit_ns},
+                {"layer_scan_start", decision.layer_scan_start},
+                {"layer_scan_next", decision.layer_scan_next},
+            };
+        }
+        return {
+            {"schema", 1},
+            {"scope", "model_lifetime"},
+            {"authority", has_authority
+                ? movement_json_detail::authorityName(status.authority)
+                : "none"},
+            {"lifecycle", movement_json_detail::lifecycleName(status.state)},
+            {"activity", movement_json_detail::activityName(status.activity)},
+            {"published_movement_waves", status.published_movement_waves},
+            {"completed_movement", {
+                {"transactions", status.completed_movement.transactions},
+                {"commands", status.completed_movement.commands},
+                {"physical_bytes", status.completed_movement.physical_bytes},
+                {"promotions", status.completed_movement.promotions},
+                {"demotions", status.completed_movement.demotions},
+                {"same_priority_moves", status.completed_movement.same_priority_moves}}},
+            {"demand_window", {
+                {"valid", status.demand_window.valid()},
+                {"generation", status.demand_window.generation},
+                {"collected_rows", status.demand_window.collected_routed_rows},
+                {"capacity_rows", status.demand_window.capacity_routed_rows},
+                {"remaining_rows", status.demand_window.remainingRoutedRows()},
+                {"scope", movement_json_detail::demandScopeName(
+                    status.demand_window.scope)},
+                {"pending_submission_rows",
+                 status.demand_window.pending_submission_rows}}},
+            {"published_progress_generation",
+             status.published_progress_generation},
+            {"reconciled_progress_generation",
+             status.reconciled_progress_generation},
+            {"completed_decision_windows",
+             status.completed_decision_windows},
+            {"last_decision", std::move(last_decision)},
+            {"diagnostic", status.diagnostic},
+        };
+    }
+
     /**
      * @brief Project immutable admitted geometry separately from completed moves.
      * @param topology Canonical frozen-plan description; never observed-axis inference.

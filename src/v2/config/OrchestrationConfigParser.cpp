@@ -2372,7 +2372,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-residency",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "Routed-expert residency policy: static-by-id, histogram, explicit-masks, rebalanced",
+            .description = "Routed-expert residency policy: static-by-id, histogram, explicit-masks, rebalanced (default: rebalanced; static-by-id when residency maintenance is off)",
             .valid_values = {"static-by-id", "histogram", "explicit-masks", "rebalanced"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
@@ -2763,7 +2763,7 @@ namespace llaminar2
             .long_name = "--mtp-max-draft-tokens",
             .category = "MTP",
             .value_label = "<n>",
-            .description = "Maximum MTP draft depth for observe/dynamic depth policy",
+            .description = "Maximum MTP draft depth for observe/dynamic policy (default: full supported range, 15)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

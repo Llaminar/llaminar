@@ -222,6 +222,69 @@ TEST(Test__PrefixMTPConfig, ValidateFixedDepthIgnoresAdaptiveOnlyKnobs)
         << "Dynamic depth must still reject the same invalid adaptive knobs.";
 }
 
+/**
+ * @test Automatic dynamic MTP spans the complete supported controller range.
+ *
+ * The parser must preserve the absent maximum as automatic intent, while
+ * planning, request admission, and the device controller all resolve that
+ * intent to 1--15.  In particular, the unrelated fixed-depth default of one
+ * must never collapse a dynamic policy to a degenerate single-depth lane.
+ */
+TEST(Test__PrefixMTPConfig,
+     DynamicDepthWithoutExplicitMaximumResolvesOneThroughFifteen)
+{
+    ArgvHelper args({
+        "llaminar2",
+        "--mtp",
+        "--mtp-depth-policy", "dynamic",
+    });
+
+    auto parser = createOrchestrationConfigParser();
+    const auto config = parser->parseArgs(args.argc(), args.argv());
+
+    ASSERT_TRUE(config.validate().empty());
+    EXPECT_EQ(config.mtp.draft_tokens, 1)
+        << "The fixed-depth field retains its own default.";
+    EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 0)
+        << "Serialized configuration must preserve automatic intent.";
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(config.mtp), 15);
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(config.mtp), 15);
+
+    const auto resolved = resolveMTPDepthPolicyConfig(config.mtp);
+    EXPECT_EQ(resolved.min_depth, 1);
+    EXPECT_EQ(resolved.max_depth, 15);
+
+    const auto device = resolveMTPDeviceGenerationDepthPolicy(config.mtp);
+    EXPECT_TRUE(device.valid());
+    EXPECT_EQ(device.minimum_depth, 1);
+    EXPECT_EQ(device.maximum_depth, 15);
+    EXPECT_GE(device.initial_depth, device.minimum_depth);
+    EXPECT_LE(device.initial_depth, device.maximum_depth);
+}
+
+/** @test An explicit adaptive ceiling remains authoritative over the default. */
+TEST(Test__PrefixMTPConfig, DynamicDepthExplicitMaximumOverridesFullRange)
+{
+    ArgvHelper args({
+        "llaminar2",
+        "--mtp",
+        "--mtp-depth-policy", "dynamic",
+        "--mtp-max-draft-tokens", "3",
+    });
+
+    auto parser = createOrchestrationConfigParser();
+    const auto config = parser->parseArgs(args.argc(), args.argv());
+
+    ASSERT_TRUE(config.validate().empty());
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(config.mtp), 3);
+    EXPECT_EQ(resolveMTPDepthPolicyConfig(config.mtp).max_depth, 3);
+    EXPECT_EQ(
+        resolveMTPDeviceGenerationDepthPolicy(config.mtp).maximum_depth,
+        3);
+}
+
 TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
 {
     ArgvHelper args({

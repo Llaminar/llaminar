@@ -44,6 +44,11 @@ namespace llaminar2
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
+        // The graph-bounded service is normally idle beside inference. One
+        // warp supplies enough outstanding mapped-memory operations for an
+        // admitted 64-KiB quantum without reserving eight warps for polling.
+        // Finite transfer passes retain the wider copy geometry above.
+        constexpr unsigned int kCapturedMappedTransferServiceThreads = 32u;
         // Small link-saturating grid: excess blocks consume inference resources
         // without increasing PCIe throughput. Both backend economy sweeps cover
         // 192 KiB through 4 MiB plus odd tails and both transfer directions.
@@ -1846,6 +1851,12 @@ namespace llaminar2
         int *generated_token_counts,
         int device_idx,
         void *stream);
+    extern "C" bool cudaOps_commit_generation_token_history(
+        const int *token,
+        int vocab_size,
+        int *generated_token_counts,
+        int device_idx,
+        void *stream);
 
     extern "C" bool cudaOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
@@ -2865,6 +2876,28 @@ namespace llaminar2
             static_cast<const int *>(accepted_state_counts_device),
             static_cast<const int *>(stopped_flags_device),
             output_token_capacity,
+            vocab_size,
+            static_cast<int *>(generated_token_counts_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueCommitGenerationTokenHistoryDevice(
+        const void *token_device,
+        int vocab_size,
+        void *generated_token_counts_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_device || vocab_size <= 0 ||
+            !generated_token_counts_device || !stream)
+        {
+            return false;
+        }
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_commit_generation_token_history(
+            static_cast<const int *>(token_device),
             vocab_size,
             static_cast<int *>(generated_token_counts_device),
             device_id,
@@ -5638,20 +5671,22 @@ namespace llaminar2
         // must be no lazy module operation when a held graph is already live.
         cudaFuncAttributes attributes{};
         if (cudaFuncGetAttributes(&attributes, mappedTransferServiceKernel) != cudaSuccess ||
-            cudaFuncGetAttributes(&attributes, mappedTransferIntervalKernel) != cudaSuccess)
+            cudaFuncGetAttributes(&attributes, mappedTransferWakeStateKernel) != cudaSuccess)
             return false;
         return cudaMemsetAsync(cursors, 0, capacity * sizeof(*cursors), native) == cudaSuccess;
     }
 
-    bool CUDABackend::enqueueMappedTransferInterval(
-        std::uint32_t *interval, MappedTransferInterval value,
+    bool CUDABackend::enqueueMappedTransferWakeState(
+        std::uint64_t *wake, MappedTransferWakeState value,
         int device_id, void *stream)
     {
-        const auto native = requireExplicitStream(stream, "enqueueMappedTransferInterval");
-        if (!interval || (value != MappedTransferInterval::Open && value != MappedTransferInterval::Closed) ||
+        const auto native = requireExplicitStream(stream, "enqueueMappedTransferWakeState");
+        if (!wake ||
+            (value != MappedTransferWakeState::InferenceActive &&
+             value != MappedTransferWakeState::InferenceComplete) ||
             !setDevice(device_id))
             return false;
-        mappedTransferIntervalKernel<<<1u, 1u, 0u, native>>>(interval, value);
+        mappedTransferWakeStateKernel<<<1u, 1u, 0u, native>>>(wake, value);
         return cudaGetLastError() == cudaSuccess;
     }
 
@@ -5659,20 +5694,26 @@ namespace llaminar2
         const MappedTransferProgressCommand *commands,
         MappedTransferProgressCompletion *completions,
         MappedTransferServiceCursor *cursors, size_t capacity,
-        size_t maximum_bytes, const std::uint32_t *interval,
+        size_t maximum_bytes, const std::uint64_t *wake,
         MappedTransferServiceRun run, int device_id, void *stream)
     {
         const auto native = requireExplicitStream(stream, "enqueueMappedTransferService");
         if (!commands || !completions || !cursors || !capacity || !maximum_bytes ||
-            (run != MappedTransferServiceRun::PublishedPass && run != MappedTransferServiceRun::CapturedInterval) ||
-            ((run == MappedTransferServiceRun::CapturedInterval) != (interval != nullptr)) ||
+            (run != MappedTransferServiceRun::CapturedInterval &&
+             run != MappedTransferServiceRun::FinitePass) ||
+            ((run == MappedTransferServiceRun::CapturedInterval) !=
+             (wake != nullptr)) ||
             !setDevice(device_id))
             return false;
-        // Four independent CTAs bound interference while servicing concurrent
-        // lanes. The grid is physical-service geometry, never model layer count.
-        const auto blocks = static_cast<unsigned>(std::min<size_t>(capacity, 4u));
-        mappedTransferServiceKernel<<<blocks, 256u, 0u, native>>>(
-            commands, completions, cursors, capacity, maximum_bytes, interval, run);
+        // A captured interval deliberately owns one co-resident block rather
+        // than one block per physical lane. Independent finite passes may use
+        // four CTAs because they do not remain resident beside inference.
+        const auto blocks = run == MappedTransferServiceRun::CapturedInterval
+            ? 1u : static_cast<unsigned>(std::min<size_t>(capacity, 4u));
+        const auto threads = run == MappedTransferServiceRun::CapturedInterval
+            ? kCapturedMappedTransferServiceThreads : kMappedHostCopyThreads;
+        mappedTransferServiceKernel<<<blocks, threads, 0u, native>>>(
+            commands, completions, cursors, capacity, maximum_bytes, wake, run);
         return cudaGetLastError() == cudaSuccess;
     }
 

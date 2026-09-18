@@ -362,6 +362,42 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Cross-tier economy is the complete concurrent layer makespan.
+     *
+     * Every tier has the same synthetic per-activation service cost, so summing
+     * only the experts named by a capacity-preserving cycle reports no change.
+     * The adversarial owner map nevertheless leaves one participant with 1500
+     * activations while the desired map has a 1300-activation critical path.
+     * Production executes those participants concurrently and must admit that
+     * real makespan reduction.
+     */
+    TEST(Test__MoEOverlayDevicePlacementPolicy,
+         CrossTierEconomyUsesWholeLayerConcurrentCriticalPath)
+    {
+        auto policy_input = input(
+            /*priorities=*/{0, 0, 17, 17},
+            /*owners=*/{2, 2, 3, 3, 0, 0, 1, 1},
+            /*counts=*/{800, 700, 600, 500, 40, 30, 20, 10},
+            /*maximum_cycles=*/1u);
+        ASSERT_TRUE(policy_input.economy.has_value());
+        std::fill(
+            policy_input.economy->service_costs.begin(),
+            policy_input.economy->service_costs.end(),
+            10u);
+        policy_input.dynamic_minimum_improvement_per_mille = 0u;
+
+        const auto plan =
+            MoEOverlayDevicePlacementPolicyReference::planDynamic(
+                policy_input);
+        ASSERT_TRUE(plan.hasMovement());
+        EXPECT_EQ(plan.evidence.accepted_cycles, 1u);
+        EXPECT_GT(plan.evidence.projected_service_gain_ns, 0u);
+        EXPECT_GT(plan.evidence.projected_net_benefit_ns, 0u);
+        EXPECT_LT(plan.evidence.priority_cost_after,
+                  plan.evidence.priority_cost_before);
+    }
+
+    /**
      * @brief A bounded device wave must not starve one independent Dynamic axis.
      *
      * This reproduces the CUDA2/ROCm4 depth-one production failure.  The
@@ -377,13 +413,13 @@ namespace llaminar2::test
         auto policy_input = input(
             /*priorities=*/{0, 0, 17, 17, 17, 17},
             /*owners=*/{
-                2, 3, 1, 0, 0, 1,
-                5, 4, 5, 4, 3, 2,
+                3, 4, 5, 3, 5, 0,
+                1, 2, 4, 1, 0, 2,
             },
             /*counts=*/{
-                1200, 1100, 1000, 900,
-                850, 825, 800, 700,
-                600, 500, 100, 50,
+                1487, 1135, 990, 832,
+                821, 631, 493, 327,
+                221, 194, 146, 50,
             },
             /*maximum_cycles=*/2u);
         policy_input.dynamic_maximum_cycles_per_layer = 2u;
@@ -417,7 +453,7 @@ namespace llaminar2::test
     /**
      * @brief Axis reservation searches later layers before spending its slot.
      *
-     * Layer zero exposes two profitable tier exchanges but no participant
+     * Layer zero exposes one profitable tier exchange but no participant
      * correction. Layer one is already tier-optimal and exposes one profitable
      * same-tier correction. A two-cycle wave must not consume both slots in
      * layer zero merely because the participant objective lives later in the
@@ -427,17 +463,17 @@ namespace llaminar2::test
          TwoCycleWaveSearchesLaterLayersBeforeEconomyFallback)
     {
         constexpr std::array<std::int32_t, 12> layer_zero_owners = {
-            2, 3, 1, 0, 0, 1,
-            4, 5, 5, 4, 3, 2,
+            0, 1, 5, 0, 2, 3,
+            4, 1, 5, 4, 3, 2,
         };
         constexpr std::array<std::int32_t, 12> layer_one_owners = {
-            0, 1, 1, 0, 2, 3,
-            5, 4, 5, 4, 3, 2,
+            0, 1, 1, 0, 4, 5,
+            5, 3, 4, 3, 2, 2,
         };
         constexpr std::array<std::uint64_t, 12> counts = {
-            1200, 1100, 1000, 900,
-            850, 825, 800, 700,
-            600, 500, 100, 50,
+            1449, 1391, 1371, 1216,
+            1133, 993, 858, 837,
+            761, 507, 364, 80,
         };
         auto policy_input = input(
             /*priorities=*/{0, 0, 17, 17, 17, 17},
@@ -620,6 +656,17 @@ namespace llaminar2::test
             MoEOverlayDevicePlacementPolicyReference::planDynamic(
                 policy_input);
         EXPECT_FALSE(below_improvement_floor.hasMovement());
+        EXPECT_GT(
+            below_improvement_floor.evidence
+                .improvement_floor_rejected_cycles,
+            0u);
+        EXPECT_EQ(
+            below_improvement_floor.evidence
+                .phase_tradeoff_candidates,
+            0u);
+        EXPECT_EQ(
+            below_improvement_floor.evidence.payoff_rejected_cycles,
+            0u);
 
         policy_input.dynamic_minimum_improvement_per_mille = 90u;
         const auto economical =
@@ -671,7 +718,7 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayDevicePlacementPolicy,
-         SerialOrGroupedDecodeGainCannotCrossSubsidizeAPrefillRegression)
+         ObservedAggregateWorkloadMayTradePhaseCostWhenNetPayoffIsPositive)
     {
         for (const auto gain_phase : {
                  kMoEOverlayDeviceControllerEconomyDecodePhase,
@@ -693,8 +740,10 @@ namespace llaminar2::test
         /*
          * The desired swap produces a large decode win: expert zero leaves the
          * slow tier. Prefill deliberately routes more work to expert one, so
-         * the same swap makes prefill slower. The old scalar sum admitted this
-         * because the decode gain was larger than the prefill loss.
+         * the same swap makes prefill slower. A finite shared layout cannot
+         * optimize mutually conflicting phase distributions independently;
+         * the exact observed phase mix and measured service prices therefore
+         * admit the aggregate win after all migration costs.
          */
         demand[phase_offset(
                    gain_phase) +
@@ -709,12 +758,14 @@ namespace llaminar2::test
                    kMoEOverlayDeviceControllerEconomyPrefillPhase) +
                1u] = 20u;
 
-        const auto rejected =
+        const auto phase_tradeoff =
             MoEOverlayDevicePlacementPolicyReference::planDynamic(
                 policy_input);
-        EXPECT_FALSE(rejected.hasMovement());
-        EXPECT_EQ(rejected.evidence.accepted_cycles, 0u);
-        EXPECT_GT(rejected.evidence.payoff_rejected_cycles, 0u);
+        EXPECT_TRUE(phase_tradeoff.hasMovement());
+        EXPECT_GT(phase_tradeoff.evidence.accepted_cycles, 0u);
+        EXPECT_GT(
+            phase_tradeoff.evidence.phase_tradeoff_candidates, 0u);
+        EXPECT_EQ(phase_tradeoff.evidence.payoff_rejected_cycles, 0u);
 
         /* Both phases favor the same move, which must remain economical. */
         demand[phase_offset(
@@ -728,6 +779,7 @@ namespace llaminar2::test
                 policy_input);
         EXPECT_TRUE(accepted.hasMovement());
         EXPECT_GT(accepted.evidence.accepted_cycles, 0u);
+        EXPECT_EQ(accepted.evidence.phase_tradeoff_candidates, 0u);
         EXPECT_EQ(accepted.evidence.payoff_rejected_cycles, 0u);
         }
     }

@@ -167,6 +167,12 @@ namespace llaminar2
             void *generated_token_counts_device,
             int device_id,
             void *stream) override;
+        bool enqueueCommitGenerationTokenHistoryDevice(
+            const void *token_device,
+            int vocab_size,
+            void *generated_token_counts_device,
+            int device_id,
+            void *stream) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,

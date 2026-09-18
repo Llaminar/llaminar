@@ -21,7 +21,7 @@ namespace llaminar2
         0x43454f4du;
 
     /** Version of every fixed-width controller record in this header. */
-    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 8u;
+    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 9u;
 
     /** Maximum participants represented by one node-local inference epoch barrier. */
     inline constexpr std::uint32_t
@@ -360,10 +360,14 @@ namespace llaminar2
         std::uint64_t projected_inference_interference_ns = 0u;
         /** Exact positive remainder after both measured movement charges. */
         std::uint64_t projected_net_benefit_ns = 0u;
+        /** Candidates trading one measured phase for aggregate service gain. */
+        std::uint16_t phase_tradeoff_candidates = 0u;
+        /** Candidate cycles rejected by the relative improvement floor. */
+        std::uint16_t improvement_floor_rejected_cycles = 0u;
         /** Candidate cycles rejected because payoff was uneconomical. */
-        std::uint32_t payoff_rejected_cycles = 0u;
+        std::uint16_t payoff_rejected_cycles = 0u;
         /** Candidate cycles rejected by committed movement hysteresis. */
-        std::uint32_t residency_rejected_cycles = 0u;
+        std::uint16_t residency_rejected_cycles = 0u;
     };
 
     static_assert(

@@ -258,6 +258,19 @@ namespace llaminar2
         {
             return fail(MoEOverlayDeviceControllerError::InvalidCommand);
         }
+        constexpr auto kMaximumPublishedRejectionCount =
+            std::numeric_limits<std::uint16_t>::max();
+        if (evidence.phase_tradeoff_candidates >
+                kMaximumPublishedRejectionCount ||
+            evidence.improvement_floor_rejected_cycles >
+                kMaximumPublishedRejectionCount ||
+            evidence.payoff_rejected_cycles >
+                kMaximumPublishedRejectionCount ||
+            evidence.residency_rejected_cycles >
+                kMaximumPublishedRejectionCount)
+        {
+            return fail(MoEOverlayDeviceControllerError::InvalidCommand);
+        }
 
         // Durable no-op commands are positive certification receipts, but
         // they must not manufacture an epoch that has no physical placement.
@@ -299,6 +312,10 @@ namespace llaminar2
             evidence.projected_inference_interference_ns;
         command_->projected_net_benefit_ns =
             evidence.projected_net_benefit_ns;
+        command_->phase_tradeoff_candidates =
+            evidence.phase_tradeoff_candidates;
+        command_->improvement_floor_rejected_cycles =
+            evidence.improvement_floor_rejected_cycles;
         command_->payoff_rejected_cycles =
             evidence.payoff_rejected_cycles;
         command_->residency_rejected_cycles =

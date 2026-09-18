@@ -18,6 +18,7 @@
 #include "execution/local_execution/orchestrators/PipelineGraphExecutionPlan.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
+#include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "collective/ILocalTPContext.h"
@@ -3633,6 +3634,282 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
     return config;
 }
 
+/** @brief Rendezvous proving hosted ticket observation enters every TP worker. */
+struct HostedTicketObservationRendezvous
+{
+    explicit HostedTicketObservationRendezvous(int expected_participants)
+        : expected(expected_participants)
+    {
+    }
+
+    int expected = 0;
+    std::atomic<int> arrivals{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
+/**
+ * @brief Device-free publisher supporting rank-level overlay admission tests.
+ *
+ * The regression stops before a remote graph ticket is published; this owner
+ * nevertheless implements the complete interface so the real coordinator can
+ * validate its global topology and command lifecycle.
+ */
+class RankHostedTestPublisher final
+    : public IMoEOverlayInferenceTransactionPublisher
+{
+public:
+    RankHostedTestPublisher()
+        : topology_{
+              .workspace_generation = 71,
+              .topology_fingerprint_low = 0x1122334455667788ULL,
+              .topology_fingerprint_high = 0x8877665544332211ULL,
+              .source_world_rank = 0,
+              .target_world_rank = 1}
+    {
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    bool beginCommand(
+        const MoEOverlayInferenceCommandIdentity &command,
+        std::string *error) override
+    {
+        if (error)
+            error->clear();
+        if (active_ || !command.valid())
+            return false;
+        active_ = true;
+        return true;
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    MoEOverlayPublishedInferenceTransaction publish(
+        const MoEOverlayInferenceExecutionDescriptor &) override
+    {
+        return {.error = "rank hosted regression does not publish a graph"};
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    bool retire(
+        const MoEOverlayPublishedInferenceTransaction &,
+        std::string *) override
+    {
+        return false;
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    bool complete(std::uint64_t, std::uint64_t, std::string *) override
+    {
+        active_ = false;
+        return true;
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    bool abort(std::uint64_t, int, std::string *) override
+    {
+        active_ = false;
+        return true;
+    }
+
+    /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
+    const MoEOverlayInferenceTopologyIdentity &topologyIdentity()
+        const noexcept override
+    {
+        return topology_;
+    }
+
+private:
+    MoEOverlayInferenceTopologyIdentity topology_;
+    bool active_ = false;
+};
+
+/** @brief Build the exact two-participant continuation/follower test plan. */
+static MoEOverlayInferenceCoordinatorGraphPlan rankHostedGraphPlan()
+{
+    return MoEOverlayInferenceCoordinatorGraphPlan::
+        sealAfterSynchronizedMaterialization(
+            /*graph_family_generation=*/71,
+            {{.role = MoEOverlayInferenceCoordinatorSegmentRole::Continuation,
+              .materialization =
+                  MoEOverlayInferenceSegmentMaterializationKind::
+                      NativeDeviceExecutable,
+              .world_rank = 0,
+              .local_participant_count = 2},
+             {.role =
+                  MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower,
+              .materialization =
+                  MoEOverlayInferenceSegmentMaterializationKind::
+                      EagerHostGraph,
+              .world_rank = 1,
+              .local_participant_count = 1}});
+}
+
+/**
+ * @brief Hosted participant that rejects serialized observation or a missing
+ *        initial overlay graph-sequence admission.
+ */
+class HostedOrdinaryContinuationParticipant final
+    : public MockDeviceGraphOrchestrator
+{
+public:
+    explicit HostedOrdinaryContinuationParticipant(
+        std::shared_ptr<HostedTicketObservationRendezvous> rendezvous)
+        : rendezvous_(std::move(rendezvous))
+    {
+    }
+
+    /** @inheritdoc IInferenceRunner */
+    bool setMoEOverlayInferenceTransactionCoordinator(
+        std::shared_ptr<MoEOverlayInferenceTransactionCoordinator> coordinator,
+        int participant_index) override
+    {
+        if (!coordinator || participant_index < 0 || participant_index >= 2)
+            return false;
+        coordinator_ = std::move(coordinator);
+        participant_index_ = participant_index;
+        return true;
+    }
+
+    /** @inheritdoc IInferenceRunner */
+    bool beginDeviceResidentGeneration(
+        const DeviceGenerationAdmissionRequest &request) override
+    {
+        return request.valid() && request.depth_policy.isOrdinary() &&
+            request.initial_leading_row_disposition ==
+                sampling_math::DeviceGenerationLeadingRowDisposition::
+                    AlreadyEmitted;
+    }
+
+    /** @inheritdoc IInferenceRunner */
+    DeviceGenerationExecutionPolicy deviceGenerationExecutionPolicy(
+        DeviceGenerationLoopTopology) const noexcept override
+    {
+        return DeviceGenerationExecutionPolicy::
+            HostScheduledCapturedTransactions;
+    }
+
+    /** @inheritdoc IInferenceRunner */
+    bool materializeDeviceResidentGeneration(
+        int request_count,
+        int draft_depth,
+        DeviceGenerationLoopTopology,
+        DeviceGenerationSamplingMode) override
+    {
+        return request_count == 1 && draft_depth == 0;
+    }
+
+    /** @inheritdoc IInferenceRunner */
+    bool observeDeviceGenerationDispatchTicket(
+        sampling_math::DeviceGenerationDispatchTicket *out_ticket) override
+    {
+        if (!out_ticket || !coordinator_ || participant_index_ < 0 ||
+            coordinator_->activeMTPDraftDepth() != 0)
+        {
+            return false;
+        }
+
+        std::unique_lock lock(rendezvous_->mutex);
+        rendezvous_->arrivals.fetch_add(1, std::memory_order_acq_rel);
+        rendezvous_->cv.notify_all();
+        const bool symmetric_entry = rendezvous_->cv.wait_for(
+            lock,
+            std::chrono::milliseconds(500),
+            [this]
+            {
+                return rendezvous_->arrivals.load(
+                           std::memory_order_acquire) >= rendezvous_->expected;
+            });
+        if (!symmetric_entry)
+            return false;
+
+        out_ticket->healthy = 1;
+        out_ticket->complete = 1;
+        out_ticket->transaction_count = 1;
+        out_ticket->next_draft_depth = 0;
+        out_ticket->committed_output_tokens = 1;
+        return true;
+    }
+
+private:
+    std::shared_ptr<HostedTicketObservationRendezvous> rendezvous_;
+    std::shared_ptr<MoEOverlayInferenceTransactionCoordinator> coordinator_;
+    int participant_index_ = -1;
+};
+
+/**
+ * @brief A bounded HTTP continuation opens and enters one sparse transaction.
+ *
+ * The first device-generation window leaves an already-emitted leading token.
+ * Its successor must have one rank-admitted depth-zero graph sequence before
+ * both LocalTP participants replay and wait for ticket one. The rendezvous
+ * makes the old sequential observation implementation fail deterministically.
+ */
+TEST(Test__RankOrchestratorDeviceGeneration,
+     HostedOrdinaryContinuationAdmitsOverlaySequenceAndObservesConcurrently)
+{
+    auto rendezvous =
+        std::make_shared<HostedTicketObservationRendezvous>(2);
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        auto runner =
+            std::make_unique<HostedOrdinaryContinuationParticipant>(
+                rendezvous);
+        runner->set_primary_device_id(DeviceId::cuda(participant));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+    ASSERT_NE(orchestrator, nullptr);
+
+    auto publisher = std::make_shared<RankHostedTestPublisher>();
+    auto coordinator =
+        std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+            MoEOverlayInferenceTransactionCoordinator::Config{
+                .publishers = {publisher},
+                .graph_plan = rankHostedGraphPlan(),
+                .continuation_participant_count = 2,
+                .ticket_authority_participant_index = 0,
+                .participant_completion_boundaries = {
+                    MoEOverlayInferenceCompletionBoundaryKind::
+                        HostSynchronous,
+                    MoEOverlayInferenceCompletionBoundaryKind::
+                        HostSynchronous},
+                .max_transactions_per_command = 1,
+                .max_mtp_draft_depth = 0});
+    ASSERT_TRUE(coordinator->beginCommand({
+        .request_generation = 9,
+        .command_id = 3,
+        .initial_placement_epoch = 41}));
+    ASSERT_TRUE(orchestrator->setMoEOverlayInferenceTransactionCoordinator(
+        coordinator, /*continuation_participant_index=*/0));
+
+    DeviceGenerationAdmissionRequest admission;
+    admission.request_count = 1;
+    admission.max_new_tokens = 16;
+    admission.depth_policy =
+        sampling_math::DeviceGenerationPolicy::ordinary();
+    admission.initial_leading_row_disposition =
+        sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+    ASSERT_TRUE(orchestrator->beginDeviceResidentGeneration(admission));
+    ASSERT_TRUE(orchestrator->materializeDeviceResidentGeneration(
+        1,
+        0,
+        DeviceGenerationLoopTopology::FixedDepth,
+        DeviceGenerationSamplingMode::Greedy));
+
+    sampling_math::DeviceGenerationDispatchTicket ticket;
+    EXPECT_TRUE(orchestrator->observeDeviceGenerationDispatchTicket(&ticket));
+    EXPECT_EQ(rendezvous->arrivals.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(coordinator->activeMTPDraftDepth(), 0);
+    EXPECT_EQ(ticket.transaction_count, 1);
+    EXPECT_TRUE(coordinator->abortCommand(41, 7));
+}
+
 /**
  * @brief Device-generation participant that records the rank materialization
  *        contract without requiring a real accelerator.
@@ -3644,6 +3921,21 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
 class OrdinaryDeviceGenerationParticipant final : public MockDeviceGraphOrchestrator
 {
 public:
+    /**
+     * @brief Admit one ordinary request and publish its initial mailbox identity.
+     * @param request Immutable ordinary request geometry.
+     * @return True for a valid ordinary request.
+     */
+    bool beginDeviceResidentGeneration(
+        const DeviceGenerationAdmissionRequest &request) override
+    {
+        if (!request.valid() || !request.depth_policy.isOrdinary())
+            return false;
+        mailbox_generation_ = 1;
+        mailbox_live_ = true;
+        return true;
+    }
+
     /**
      * @brief Advertise one complete captured-parent policy for the test GPU.
      * @param topology Requested captured-loop topology.
@@ -3678,6 +3970,64 @@ public:
                isValidDeviceGenerationSamplingMode(sampling_mode);
     }
 
+    /** @brief Accept the already materialized mock parent launch. */
+    bool launchDeviceResidentGeneration() override
+    {
+        return mailbox_live_ && materialization_count_ == 1;
+    }
+
+    /**
+     * @brief Publish a fresh terminal mailbox and one non-stopped response.
+     * @param out_result Destination terminal ledger.
+     * @return True after the terminal mailbox generation advances.
+     */
+    bool finishDeviceResidentGeneration(
+        DeviceGenerationTerminalResult *out_result) override
+    {
+        if (!out_result || !mailbox_live_)
+            return false;
+        ++mailbox_generation_;
+        terminal_position_ = 2;
+        terminal_condition_ = 17;
+        terminal_publication_ok_ = 1;
+
+        DeviceGenerationTerminalRequestResult row;
+        row.tokens = {terminal_condition_};
+        row.next_leading_row_disposition =
+            sampling_math::DeviceGenerationLeadingRowDisposition::
+                AlreadyEmitted;
+        row.transaction_count = 1;
+        out_result->device = primaryDeviceId();
+        out_result->requests = {std::move(row)};
+        return true;
+    }
+
+    /**
+     * @brief Expose the participant-local terminal mailbox identity.
+     * @return Complete handle whose generation changes at terminal publication.
+     */
+    DeviceResidentLogicalSequenceStateHandle
+    deviceResidentLogicalSequenceState() const override
+    {
+        if (!mailbox_live_ || mailbox_generation_ == 0)
+            return {};
+        DeviceResidentLogicalSequenceStateHandle handle;
+        handle.target_positions_device = &terminal_position_;
+        handle.target_sequence_lengths_device = &terminal_position_;
+        handle.accepted_state_counts_device = &terminal_accepted_count_;
+        handle.next_condition_tokens_device = &terminal_condition_;
+        handle.all_drafts_accepted_flags_device = &terminal_flag_;
+        handle.stopped_flags_device = &terminal_flag_;
+        handle.publication_ok_flags_device = &terminal_publication_ok_;
+        handle.request_count = 1;
+        handle.device = primaryDeviceId();
+        handle.stream = const_cast<int *>(&mailbox_stream_token_);
+        handle.ready_event = const_cast<int *>(&mailbox_event_token_);
+        handle.live_state_epoch = 1;
+        handle.publication_generation = mailbox_generation_;
+        return handle;
+    }
+
     /** @brief Return how many rank-worker materialization calls arrived. */
     int materializationCount() const noexcept { return materialization_count_; }
 
@@ -3687,6 +4037,15 @@ public:
 private:
     int materialization_count_{0};
     int last_draft_depth_{-1};
+    mutable int32_t terminal_position_{1};
+    mutable int32_t terminal_accepted_count_{0};
+    mutable int32_t terminal_condition_{11};
+    mutable int32_t terminal_flag_{0};
+    mutable int32_t terminal_publication_ok_{1};
+    mutable int mailbox_stream_token_{0};
+    mutable int mailbox_event_token_{0};
+    uint64_t mailbox_generation_{0};
+    bool mailbox_live_{false};
 };
 
 /**
@@ -3734,6 +4093,67 @@ TEST(Test__RankOrchestratorDeviceGeneration,
         EXPECT_EQ(participant->materializationCount(), 1);
         EXPECT_EQ(participant->lastDraftDepth(), 0);
     }
+}
+
+/**
+ * @brief Rank completion adopts the terminal mailbox from every LocalTP child.
+ *
+ * Each participant advances its mailbox publication generation while finishing
+ * the captured request.  The rank must replace any pre-launch aggregate before
+ * returning the terminal ledger, otherwise a continuation observes a stale or
+ * absent rank mailbox even though both device-local publications are live.
+ */
+TEST(Test__RankOrchestratorDeviceGeneration,
+     TerminalOrdinaryGenerationAdoptsFreshChildMailboxes)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    std::array<OrdinaryDeviceGenerationParticipant *, 2> participants{};
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        auto runner =
+            std::make_unique<OrdinaryDeviceGenerationParticipant>();
+        participants[static_cast<size_t>(participant)] = runner.get();
+        runner->set_primary_device_id(DeviceId::cuda(participant));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+    ASSERT_NE(orchestrator, nullptr);
+
+    DeviceGenerationAdmissionRequest admission;
+    admission.request_count = 1;
+    admission.max_new_tokens = 1;
+    admission.depth_policy = sampling_math::DeviceGenerationPolicy::ordinary();
+    ASSERT_TRUE(orchestrator->beginDeviceResidentGeneration(admission));
+    ASSERT_TRUE(orchestrator->materializeDeviceResidentGeneration(
+        1,
+        0,
+        DeviceGenerationLoopTopology::FixedDepth,
+        DeviceGenerationSamplingMode::Greedy));
+    ASSERT_TRUE(orchestrator->launchDeviceResidentGeneration());
+
+    DeviceGenerationTerminalResult terminal;
+    ASSERT_TRUE(orchestrator->finishDeviceResidentGeneration(&terminal));
+    ASSERT_TRUE(terminal.valid());
+    ASSERT_EQ(terminal.requests.size(), 1u);
+    EXPECT_FALSE(terminal.requests.front().model_stopped);
+
+    for (const auto *participant : participants)
+    {
+        ASSERT_NE(participant, nullptr);
+        const auto child_mailbox =
+            participant->deviceResidentLogicalSequenceState();
+        ASSERT_TRUE(child_mailbox.valid());
+        EXPECT_EQ(child_mailbox.publication_generation, 2u);
+    }
+    const auto rank_mailbox =
+        orchestrator->deviceResidentLogicalSequenceState();
+    EXPECT_TRUE(rank_mailbox.valid());
+    EXPECT_TRUE(rank_mailbox.coversRequest(0));
 }
 
 /**
@@ -4971,6 +5391,49 @@ TEST_F(Test__RankOrchestrator, TopLevelRunnerCannotPublishLegacyMoEPlacement)
     EXPECT_NE(
         runner_source.find("moe_expert_overlay_maintenance_service_"),
         std::string::npos);
+}
+
+/**
+ * @brief Request-hot LocalTP fan-out must not create allocator-owning threads.
+ *
+ * A long-running HTTP server previously used `std::async` for the first
+ * mirrored MTP publication and host-token batch forwarding. glibc retained an
+ * allocator arena for those short-lived participant threads, so host RSS grew
+ * with request count even though request state was correctly destroyed. The
+ * rank already owns one persistent participant worker per device; all request
+ * fan-out must use that bounded lifetime.
+ */
+TEST_F(Test__RankOrchestrator,
+       RequestHotParticipantFanoutUsesOnlyPersistentWorkers)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto require_persistent_fanout = [&source](
+        const char *begin_marker,
+        const char *end_marker)
+    {
+        const size_t begin = source.find(begin_marker);
+        ASSERT_NE(begin, std::string::npos) << begin_marker;
+        const size_t end = source.find(end_marker, begin + 1u);
+        ASSERT_NE(end, std::string::npos) << end_marker;
+        const std::string body = source.substr(begin, end - begin);
+        EXPECT_EQ(body.find("std::async("), std::string::npos);
+        EXPECT_EQ(body.find("std::launch::async"), std::string::npos);
+        EXPECT_NE(body.find("tp_worker_pool_->dispatch("), std::string::npos);
+        EXPECT_NE(body.find("tp_worker_pool_->collectAll("), std::string::npos);
+        EXPECT_NE(body.find("effectiveTPWorkerJoinTimeoutMs()"),
+                  std::string::npos);
+    };
+
+    require_persistent_fanout(
+        "bool RankOrchestrator::publishMainLogitsBatchSamplesToDeviceResidentState(",
+        "bool RankOrchestrator::requiresMPICoordinatedDecodeSampling(");
+    require_persistent_fanout(
+        "bool RankOrchestrator::forwardHostTokenBatchAcrossDevices(",
+        "const float *RankOrchestrator::getLogits(");
 }
 
 /**

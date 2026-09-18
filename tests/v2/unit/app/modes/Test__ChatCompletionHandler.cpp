@@ -987,7 +987,45 @@ TEST_F(Test__ChatCompletionHandler, RuntimeSummary_MovementIsTerminalPassiveAndB
     ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
     ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
     ON_CALL(*tokenizer_, decode_token(10)).WillByDefault(Return("A"));
-    EXPECT_CALL(*runner_, moeOptimizationStatus()).Times(0);
+    const MoEOptimizationStatus optimization_status{
+        .authority = MoEOptimizationAuthority::Host,
+        .state = MoEOptimizationLifecycleState::Active,
+        .activity = MoEOptimizationActivityState::CollectingDemand,
+        .published_movement_waves = 1u,
+        .completed_movement = {
+            .transactions = 1u,
+            .commands = 2u,
+            .physical_bytes = 4096u,
+            .promotions = 1u,
+            .demotions = 1u,
+        },
+        .demand_window = {
+            .generation = 7u,
+            .collected_routed_rows = 11u,
+            .capacity_routed_rows = 256u,
+            .scope = MoEOptimizationDemandScope::RoutedRows,
+        },
+        .completed_decision_windows = 3u,
+        .last_decision = MoEOptimizationDecisionReceipt{
+            .transaction = 3u,
+            .candidate_epoch = 4u,
+            .snapshot_observations = 256u,
+            .rejected_cycles = 2u,
+            .phase_tradeoff_candidates = 1u,
+            .payoff_rejected_cycles = 1u,
+            .priority_cost_before = 90u,
+            .priority_cost_after = 90u,
+            .same_priority_makespan_before = 12u,
+            .same_priority_makespan_after = 12u,
+            .projected_service_gain_ns = 700u,
+            .projected_transfer_and_repack_ns = 900u,
+            .layer_scan_start = 8u,
+            .layer_scan_next = 9u,
+        },
+    };
+    EXPECT_CALL(*runner_, moeOptimizationStatus())
+        .Times(1)
+        .WillOnce(Return(optimization_status));
     const auto ledger = completedMovementFixture(MoEOptimizationAuthority::Host);
     OrchestrationConfig resolved_config;
     auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
@@ -1029,6 +1067,8 @@ TEST_F(Test__ChatCompletionHandler, RuntimeSummary_MovementIsTerminalPassiveAndB
               moeMovementLedgerJson(ledger));
     EXPECT_EQ(json::parse(response.json_body)["runtime_summary"]["expert_movement_topology"],
               moeMovementTopologyJson({.authority = MoEOptimizationAuthority::Host, .axes = MoEOptimizationMovementAxes::Both}));
+    EXPECT_EQ(json::parse(response.json_body)["runtime_summary"]["expert_optimization"],
+              moeOptimizationStatusJson(optimization_status));
 }
 
 /** A requested but truncated movement proof is an HTTP failure, not an empty Static claim. */
@@ -2765,6 +2805,72 @@ TEST_F(Test__ChatCompletionHandler, Streaming_EmitsEachTokenFromMultiTokenDecode
     EXPECT_EQ(c2["choices"][0]["delta"]["content"], "B");
 }
 
+/**
+ * @brief Streaming bounds a complete graph admission so HTTP can flush progress.
+ *
+ * The runner may execute an entire response budget device-side. Giving it the
+ * full remaining request made every nominal SSE token arrive only after the
+ * terminal result. The window retains grouped/MTP execution while proving the
+ * first response is published before later generation windows are submitted.
+ */
+TEST_F(Test__ChatCompletionHandler, Streaming_BoundsDeviceGenerationPublicationWindow)
+{
+    auto handler = makeHandler();
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_)).WillByDefault(Return("x"));
+
+    std::vector<int> nonzero_budgets;
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(_))
+        .Times(6)
+        .WillRepeatedly(Invoke([&](int budget)
+        {
+            if (budget > 0)
+                nonzero_budgets.push_back(budget);
+        }));
+    int decode_calls = 0;
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(3)
+        .WillRepeatedly(Invoke([&]
+        {
+            ++decode_calls;
+            const int count = decode_calls < 3 ? 16 : 8;
+            GenerationResult result;
+            result.tokens.assign(static_cast<size_t>(count), 10);
+            return result;
+        }));
+
+    std::vector<int> nonempty_content_observation;
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "stream")};
+    request.max_tokens = 40;
+    request.stream = true;
+    request.enable_thinking = false;
+    const auto response = handler->handleStreamingRequest(
+        request,
+        [&](const std::string &line)
+        {
+            if (line.starts_with("data: ") &&
+                !line.starts_with("data: [DONE]"))
+            {
+                const auto delta =
+                    json::parse(line.substr(6))["choices"][0]["delta"];
+                if (!delta.value("content", "").empty())
+                    nonempty_content_observation.push_back(decode_calls);
+            }
+            return true;
+        });
+
+    ASSERT_TRUE(response.ok);
+    ASSERT_EQ(nonempty_content_observation.size(), 40u);
+    EXPECT_EQ(nonzero_budgets, (std::vector<int>{16, 16, 8}));
+    EXPECT_EQ(nonempty_content_observation.front(), 1);
+    EXPECT_EQ(nonempty_content_observation[16], 2);
+    EXPECT_EQ(nonempty_content_observation[32], 3);
+}
+
 TEST_F(Test__ChatCompletionHandler, Streaming_ReplacesInvalidUtf8InContentDelta)
 {
     auto handler = makeHandler();
@@ -3708,6 +3814,13 @@ TEST_F(Test__ChatCompletionHandler, ThinkingBudget_ContinuedReasoningCloseIsNotE
     for (bool streaming : {false, true})
     {
         SCOPED_TRACE(streaming);
+        std::vector<int> decode_budgets;
+        ON_CALL(*runner_, setDecodeStepTokenBudget(_))
+            .WillByDefault(Invoke([&](int budget)
+            {
+                if (budget > 0)
+                    decode_budgets.push_back(budget);
+            }));
         EXPECT_CALL(*runner_, decodeStep())
             .WillOnce(Return(makeToken(10)))
             .WillOnce(Return(makeToken(11)))
@@ -3748,6 +3861,11 @@ TEST_F(Test__ChatCompletionHandler, ThinkingBudget_ContinuedReasoningCloseIsNotE
         }
         EXPECT_EQ(content, "6. Final check complete.\n\n13");
         EXPECT_EQ(finish, "stop");
+        ASSERT_EQ(decode_budgets.size(), 6u);
+        EXPECT_EQ(decode_budgets.front(), 1)
+            << "Reasoning must use a one-token observation window";
+        EXPECT_EQ(decode_budgets[1], streaming ? 16 : 18)
+            << "A completed reasoning close must restore the normal answer window";
         EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(runner_.get()));
     }
 }
@@ -3883,8 +4001,41 @@ TEST_F(Test__ChatCompletionHandler, ParseRequest_ToolDefinitions_Parsed)
     EXPECT_TRUE(result->tools.is_array());
     EXPECT_EQ(result->tools.size(), 1u);
     EXPECT_EQ(result->tools[0]["function"]["name"], "get_weather");
-    EXPECT_EQ(result->tool_choice, "auto");
+    EXPECT_EQ(result->tool_choice.mode, ToolChoiceMode::Auto);
     EXPECT_TRUE(result->parallel_tool_calls);
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_SpecificToolChoiceIsTypedAndValidated)
+{
+    const auto body = json::parse(R"({
+        "messages": [{"role": "user", "content": "Use the weather service."}],
+        "tools": [
+            {"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"get_time","parameters":{"type":"object"}}}
+        ],
+        "tool_choice": {"type":"function","function":{"name":"get_weather"}}
+    })");
+
+    ChatCompletionResponse error;
+    const auto result = ChatCompletionHandler::parseRequest(body.dump(), error);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->tool_choice.mode, ToolChoiceMode::SpecificFunction);
+    EXPECT_EQ(result->tool_choice.function_name, "get_weather");
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_UnknownSpecificToolChoiceReturns400)
+{
+    const auto body = json::parse(R"({
+        "messages": [{"role": "user", "content": "Use a service."}],
+        "tools": [
+            {"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}
+        ],
+        "tool_choice": {"type":"function","function":{"name":"missing"}}
+    })");
+
+    ChatCompletionResponse error;
+    EXPECT_FALSE(ChatCompletionHandler::parseRequest(body.dump(), error).has_value());
+    EXPECT_EQ(error.http_status, 400);
 }
 
 TEST_F(Test__ChatCompletionHandler, ParseRequest_ToolMessage_Parsed)
@@ -3997,6 +4148,136 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ToolCallsDetected_InResponse)
     EXPECT_EQ(message["tool_calls"][0]["function"]["name"], "get_weather");
     EXPECT_EQ(message["tool_calls"][0]["function"]["arguments"], R"({"location":"Paris"})");
     EXPECT_FALSE(message["tool_calls"][0]["id"].get<std::string>().empty());
+}
+
+/** Reproduce the native payload returned by Qwen 3.5 MoE and Qwen 3.8 dense. */
+TEST_F(Test__ChatCompletionHandler, HandleRequest_QwenNativeToolCallBecomesOpenAIResponse)
+{
+    auto handler = makeHandler();
+    const std::string model_output = R"(<tool_call>
+<function=get_weather>
+<parameter=city>
+Paris
+</parameter>
+</function>
+</tool_call>)";
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::QWEN_3_XML));
+
+    int call_count = 0;
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillRepeatedly(Invoke([&]() -> GenerationResult
+                               {
+            if (call_count < static_cast<int>(model_output.size()))
+                return makeToken(100 + call_count++);
+            return makeToken(0, true); }));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Invoke([&](int token_id) -> std::string
+                              {
+            const int index = token_id - 100;
+            return index >= 0 && index < static_cast<int>(model_output.size())
+                       ? std::string(1, model_output[index])
+                       : std::string{}; }));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "What's the weather?")};
+    request.max_tokens = 200;
+    request.tools = json::array(
+        {json{{"type", "function"},
+              {"function", {{"name", "get_weather"}}}}});
+
+    const auto response = handler->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+    const auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "tool_calls");
+    const auto &message = body["choices"][0]["message"];
+    EXPECT_TRUE(message["content"].is_null());
+    ASSERT_EQ(message["tool_calls"].size(), 1u);
+    EXPECT_EQ(message["tool_calls"][0]["function"]["name"], "get_weather");
+    EXPECT_EQ(
+        json::parse(message["tool_calls"][0]["function"]["arguments"].get<std::string>()),
+        json({{"city", "Paris"}}));
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_RequiredChoicePublishesPromptPolicy)
+{
+    auto handler = makeHandler();
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, _, true))
+        .WillOnce(Invoke([](const std::vector<ChatMessage> &messages,
+                            bool,
+                            const std::string &tools_json,
+                            bool)
+                         {
+            EXPECT_FALSE(messages.empty());
+            if (messages.empty())
+                return std::vector<int>{};
+            EXPECT_EQ(messages.front().role, "system");
+            EXPECT_NE(messages.front().content.find("MUST call one"), std::string::npos);
+            EXPECT_NE(tools_json.find("get_weather"), std::string::npos);
+            return std::vector<int>{1, 2, 3}; }));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::QWEN_3_XML));
+    const std::string call =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n"
+        "</parameter>\n</function>\n</tool_call>";
+    ON_CALL(*tokenizer_, decode_token(100)).WillByDefault(Return(call));
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(100)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Give me current weather.")};
+    request.max_tokens = 10;
+    request.tools = json::array(
+        {json{{"type", "function"},
+              {"function", {{"name", "get_weather"}}}}});
+    request.tool_choice.mode = ToolChoiceMode::Required;
+
+    const auto response = handler->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+    EXPECT_EQ(json::parse(response.json_body)["choices"][0]["finish_reason"],
+              "tool_calls");
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_NoneChoiceNeitherExposesNorExecutesTools)
+{
+    auto handler = makeHandler();
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, "", true))
+        .WillOnce(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::QWEN_3_XML));
+    const std::string literal =
+        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>";
+    ON_CALL(*tokenizer_, decode_token(100)).WillByDefault(Return(literal));
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(100)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Do not use tools.")};
+    request.max_tokens = 10;
+    request.tools = json::array(
+        {json{{"type", "function"},
+              {"function", {{"name", "get_weather"}}}}});
+    request.tool_choice.mode = ToolChoiceMode::None;
+
+    const auto response = handler->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+    const auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "stop");
+    EXPECT_FALSE(body["choices"][0]["message"].contains("tool_calls"));
+    EXPECT_EQ(body["choices"][0]["message"]["content"], literal);
 }
 
 // --- Non-streaming: no tool calls in normal output ---
@@ -4115,6 +4396,114 @@ TEST_F(Test__ChatCompletionHandler, HandleStreamingRequest_ToolCallsDetected)
 
     EXPECT_TRUE(found_tool_calls) << "Expected tool_calls delta in SSE stream";
     EXPECT_TRUE(found_tool_calls_finish) << "Expected finish_reason=tool_calls in SSE stream";
+}
+
+/**
+ * @brief Tool-enabled Qwen streams keep reasoning, answer, and calls distinct.
+ *
+ * OpenWebUI supplies tools on ordinary agentic requests. The historical path
+ * buffered all generated text, then collapsed reasoning into one terminal
+ * content delta. This captured Qwen grammar proves each safe field is emitted
+ * before EOS and no native call markup leaks to the client.
+ */
+TEST_F(Test__ChatCompletionHandler, StreamingQwenToolsPreserveLiveReasoningAndContent)
+{
+    auto template_ = makeThinkingTemplate();
+    ASSERT_TRUE(template_->isThinkingModel());
+    ON_CALL(*tokenizer_, hasChatTemplate()).WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, getChatTemplate())
+        .WillByDefault(::testing::ReturnRef(*template_));
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::QWEN_3_XML));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+
+    const std::vector<std::string> pieces = {
+        "private thought",
+        "</think>\n\n",
+        "I will check. ",
+        "<tool_",
+        "call><function=get_weather><parameter=city>Paris</parameter>"
+        "</function></tool_call>"};
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Invoke([&](int token)
+        {
+            const int index = token - 100;
+            return index >= 0 && index < static_cast<int>(pieces.size())
+                ? pieces[static_cast<size_t>(index)]
+                : std::string{};
+        }));
+
+    int decode_calls = 0;
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(static_cast<int>(pieces.size()) + 1)
+        .WillRepeatedly(Invoke([&]
+        {
+            if (decode_calls < static_cast<int>(pieces.size()))
+                return makeToken(100 + decode_calls++);
+            ++decode_calls;
+            return makeToken(0, true);
+        }));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "weather")};
+    request.max_tokens = 32;
+    request.stream = true;
+    request.enable_thinking = true;
+    request.tools = json::array({json{
+        {"type", "function"},
+        {"function", {{"name", "get_weather"}}}}});
+
+    std::string reasoning;
+    std::string content;
+    std::string finish;
+    int reasoning_observation = 0;
+    int content_observation = 0;
+    int call_observation = 0;
+    std::string tool_name;
+    const auto response = makeHandler()->handleStreamingRequest(
+        request,
+        [&](const std::string &line)
+        {
+            if (!line.starts_with("data: ") ||
+                line.starts_with("data: [DONE]"))
+                return true;
+            const auto choice = json::parse(line.substr(6))["choices"][0];
+            const auto &delta = choice["delta"];
+            if (delta.contains("reasoning_content"))
+            {
+                reasoning += delta["reasoning_content"].get<std::string>();
+                if (reasoning_observation == 0)
+                    reasoning_observation = decode_calls;
+            }
+            if (delta.contains("content"))
+            {
+                content += delta["content"].get<std::string>();
+                if (content_observation == 0)
+                    content_observation = decode_calls;
+            }
+            if (delta.contains("tool_calls"))
+            {
+                call_observation = decode_calls;
+                tool_name = delta["tool_calls"][0]["function"]["name"];
+            }
+            if (!choice["finish_reason"].is_null())
+                finish = choice["finish_reason"].get<std::string>();
+            return true;
+        });
+
+    ASSERT_TRUE(response.ok);
+    EXPECT_EQ(reasoning, "private thought");
+    EXPECT_EQ(content, "I will check. ");
+    EXPECT_EQ(tool_name, "get_weather");
+    EXPECT_EQ(finish, "tool_calls");
+    EXPECT_EQ(reasoning_observation, 1);
+    EXPECT_EQ(content_observation, 3);
+    EXPECT_EQ(call_observation, 5);
+    EXPECT_EQ(content.find("<tool_call>"), std::string::npos);
+    EXPECT_EQ(reasoning.find("I will check"), std::string::npos);
 }
 
 // --- Without tools in request, tool-like output is passed through as content ---

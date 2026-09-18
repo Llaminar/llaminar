@@ -280,6 +280,92 @@ namespace llaminar2
         {
             return runner.maybeApplyMoERebalance(committed_tokens);
         }
+
+        /** @brief Validate the OpenAI function-name grammar before prompt insertion. */
+        bool isValidToolFunctionName(const std::string &name)
+        {
+            if (name.empty() || name.size() > 64)
+                return false;
+            return std::all_of(
+                name.begin(), name.end(),
+                [](const unsigned char ch)
+                {
+                    return std::isalnum(ch) || ch == '_' || ch == '-';
+                });
+        }
+
+        /** @brief Return the tool definitions admitted by the typed choice policy. */
+        json admittedToolDefinitions(const ChatCompletionRequest &request)
+        {
+            if (!request.tool_choice.permitsCalls() ||
+                !request.tools.is_array())
+            {
+                return json::array();
+            }
+            if (request.tool_choice.mode != ToolChoiceMode::SpecificFunction)
+                return request.tools;
+
+            json selected = json::array();
+            for (const auto &tool : request.tools)
+            {
+                if (tool["function"]["name"].get<std::string>() ==
+                    request.tool_choice.function_name)
+                {
+                    selected.push_back(tool);
+                    break;
+                }
+            }
+            return selected;
+        }
+
+        /**
+         * @brief Materialize the model-visible tool requirement once.
+         *
+         * The OpenAI policy is request state, not a sampling hint.  Templates
+         * already incorporate the available tool schema; this explicit system
+         * clause supplies the required/specific choice semantics without
+         * teaching the HTTP loop about any model-native output grammar.
+         */
+        std::vector<ChatMessage> toolPolicyMessages(
+            const ChatCompletionRequest &request)
+        {
+            std::vector<ChatMessage> messages = request.messages;
+            if (!request.tool_choice.requiresCall())
+                return messages;
+
+            std::string directive;
+            if (request.tool_choice.mode == ToolChoiceMode::SpecificFunction)
+            {
+                directive = "For this response, you MUST call the function '" +
+                            request.tool_choice.function_name +
+                            "'. Do not answer without that function call.";
+            }
+            else
+            {
+                directive = "For this response, you MUST call one of the available "
+                            "functions. Do not answer without a function call.";
+            }
+
+            if (!messages.empty() &&
+                (messages.front().role == "system" ||
+                 messages.front().role == "developer"))
+            {
+                messages.front().content += "\n\n" + directive;
+            }
+            else
+            {
+                messages.insert(messages.begin(), ChatMessage{"system", directive});
+            }
+            return messages;
+        }
+
+        /** @brief Whether this request may turn native markers into executable calls. */
+        bool toolCallParsingEnabled(const ChatCompletionRequest &request)
+        {
+            return request.tool_choice.permitsCalls() &&
+                   request.tools.is_array() &&
+                   !request.tools.empty();
+        }
     }
 
     // =========================================================================
@@ -631,13 +717,119 @@ namespace llaminar2
         if (body.contains("thinking_budget_tokens"))
             request.thinking_budget_tokens = body["thinking_budget_tokens"].get<int>();
 
-        // Tool calling parameters
-        if (body.contains("tools") && body["tools"].is_array())
+        // Tool calling parameters. Validate the JSON union once and publish a
+        // typed policy consumed identically by prompt construction and output
+        // parsing; silently ignoring an invalid choice would execute a
+        // different agent policy than the client requested.
+        if (body.contains("tools"))
+        {
+            if (!body["tools"].is_array())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tools must be an array"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
             request.tools = body["tools"];
+            for (const auto &tool : request.tools)
+            {
+                if (!tool.is_object() || tool.value("type", "") != "function" ||
+                    !tool.contains("function") || !tool["function"].is_object() ||
+                    !tool["function"].contains("name") ||
+                    !tool["function"]["name"].is_string() ||
+                    !isValidToolFunctionName(
+                        tool["function"]["name"].get<std::string>()))
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", "each tool must be a named function definition"},
+                        {"type", "invalid_request_error"}}}});
+                    return std::nullopt;
+                }
+            }
+        }
         if (body.contains("tool_choice"))
-            request.tool_choice = body["tool_choice"];
+        {
+            const auto &choice = body["tool_choice"];
+            if (choice.is_string())
+            {
+                const std::string value = choice.get<std::string>();
+                if (value == "auto")
+                    request.tool_choice.mode = ToolChoiceMode::Auto;
+                else if (value == "none")
+                    request.tool_choice.mode = ToolChoiceMode::None;
+                else if (value == "required")
+                    request.tool_choice.mode = ToolChoiceMode::Required;
+                else
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", "tool_choice must be auto, none, required, or a named function"},
+                        {"type", "invalid_request_error"}}}});
+                    return std::nullopt;
+                }
+            }
+            else if (choice.is_object() &&
+                     choice.value("type", "") == "function" &&
+                     choice.contains("function") &&
+                     choice["function"].is_object() &&
+                     choice["function"].contains("name") &&
+                     choice["function"]["name"].is_string())
+            {
+                request.tool_choice.mode = ToolChoiceMode::SpecificFunction;
+                request.tool_choice.function_name =
+                    choice["function"]["name"].get<std::string>();
+            }
+            else
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tool_choice must be auto, none, required, or a named function"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
         if (body.contains("parallel_tool_calls"))
+        {
+            if (!body["parallel_tool_calls"].is_boolean())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "parallel_tool_calls must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
             request.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+        }
+
+        if (request.tool_choice.requiresCall() &&
+            (!request.tools.is_array() || request.tools.empty()))
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "tool_choice requires at least one tool definition"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+        if (request.tool_choice.mode == ToolChoiceMode::SpecificFunction)
+        {
+            const bool found = std::any_of(
+                request.tools.begin(), request.tools.end(),
+                [&](const json &tool)
+                {
+                    return tool["function"]["name"].get<std::string>() ==
+                           request.tool_choice.function_name;
+                });
+            if (!found)
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tool_choice names a function absent from tools"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
 
         // Build conversation with full tool-calling support
         for (const auto &msg : body["messages"])
@@ -733,10 +925,12 @@ namespace llaminar2
         runner_.setStopTokens(tokenizer_.stop_tokens());
 
         // Encode with chat template (pass tools for tool-aware templates)
-        std::string tools_json;
-        if (request.tools.is_array() && !request.tools.empty())
-            tools_json = request.tools.dump();
-        auto token_ids = tokenizer_.encodeChat(request.messages, /*add_generation_prompt=*/true,
+        const json admitted_tools = admittedToolDefinitions(request);
+        const std::string tools_json = admitted_tools.empty()
+                                           ? std::string{}
+                                           : admitted_tools.dump();
+        const auto prompt_messages = toolPolicyMessages(request);
+        auto token_ids = tokenizer_.encodeChat(prompt_messages, /*add_generation_prompt=*/true,
                                                tools_json, request.enable_thinking);
 
         if (token_ids.empty())
@@ -1012,6 +1206,18 @@ namespace llaminar2
                 completion_tokens++;
                 const auto part = splitter.process(token_text);
                 append_output(part);
+                if (thinking_budget_active && !thinking_end_tag.empty() &&
+                    !splitter.inThinking())
+                {
+                    // The reasoning budget owns only the reasoning phase.
+                    // Once a model-declared close marker is complete, restore
+                    // the normal captured answer window instead of leaving the
+                    // whole response on one-token device transactions. A
+                    // template-free caller has no delimiter evidence, so its
+                    // explicit budget must remain authoritative until the
+                    // forced stop sequence has been committed.
+                    thinking_budget_active = false;
+                }
             }
 
             if (!step_tokens.empty())
@@ -1040,7 +1246,7 @@ namespace llaminar2
         // Parse tool calls from model output (if tools were requested)
         ToolCallParseResult tool_result;
         bool has_tool_calls = false;
-        if (request.tools.is_array() && !request.tools.empty())
+        if (toolCallParsingEnabled(request))
         {
             ToolCallFormat format = runner_.getToolCallFormat();
             tool_result = parseToolCalls(content, format);
@@ -1100,6 +1306,8 @@ namespace llaminar2
         if (request.runtime_output == CompletionRuntimeOutput::Include)
         {
             json_response["runtime_summary"] = runtimeSummaryJson(*runtime_summary);
+            json_response["runtime_summary"]["expert_optimization"] =
+                moeOptimizationStatusJson(runner_.moeOptimizationStatus());
             // This is an immutable, already-published ledger, not a request
             // reset or maintenance join. Keep it out of routine INFO logging:
             // only an explicit terminal representation pays the copy cost.
@@ -1220,9 +1428,77 @@ namespace llaminar2
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
-        // Tool call state: when tools are provided, accumulate output for post-processing
-        bool has_tools = request.tools.is_array() && !request.tools.empty();
-        std::string accumulated_text; // Always accumulate for tool call detection
+        // Tool-call framing is incremental. Reasoning bypasses this splitter;
+        // only answer content can become an executable model-native call.
+        const bool has_tools = toolCallParsingEnabled(request);
+        const ToolCallFormat tool_format = has_tools
+            ? runner_.getToolCallFormat()
+            : ToolCallFormat::NONE;
+        StreamingToolCallSplitter tool_splitter(tool_format);
+        size_t streamed_tool_call_index = 0;
+        bool emitted_tool_call = false;
+        bool client_connected = true;
+
+        const auto emit_tool_events = [&](
+            std::vector<StreamingToolCallSplitter::Event> events) -> bool
+        {
+            for (auto &event : events)
+            {
+                json delta;
+                if (event.kind ==
+                    StreamingToolCallSplitter::Event::Kind::Content)
+                {
+                    if (event.content.empty())
+                        continue;
+                    delta["content"] = std::move(event.content);
+                }
+                else
+                {
+                    const auto &call = event.tool_call;
+                    json call_delta = {
+                        {"index", static_cast<int>(streamed_tool_call_index++)},
+                        {"id", call.id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", call.name},
+                            {"arguments", call.arguments}}}};
+                    delta["tool_calls"] = json::array({std::move(call_delta)});
+                    emitted_tool_call = true;
+                }
+                if (!emit_chunk(delta, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto emit_split_output = [&](
+            StreamingThinkSplitter::SplitResult part) -> bool
+        {
+            if (part.text.empty())
+                return true;
+            if (part.field == "reasoning_content")
+            {
+                if (!emit_chunk({{"reasoning_content", std::move(part.text)}}, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+                return true;
+            }
+            if (!has_tools)
+            {
+                if (!emit_chunk({{"content", std::move(part.text)}}, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+                return true;
+            }
+            return emit_tool_events(tool_splitter.process(part.text));
+        };
 
         // Thinking budget state
         int thinking_tokens = 0;
@@ -1313,7 +1589,16 @@ namespace llaminar2
             else
             {
                 const int remaining = effective_max_tokens - completion_tokens;
-                const int step_budget = thinking_budget_active ? 1 : remaining;
+                // Bound time-to-publication without falling back to eager or
+                // serial-row execution. The device controller remains the
+                // inference/state authority for each complete retained-graph
+                // window, and its resident continuation joins adjacent windows.
+                const int step_budget = thinking_budget_active
+                    ? 1
+                    : std::min(
+                          remaining,
+                          ChatCompletionHandler::
+                              kStreamingPublicationWindowTokens);
                 const auto decode_start = SteadyClock::now();
                 GenerationResult result = decodeStepWithBudget(runner_, step_budget);
                 if (traceGeneratedTokensEnabled())
@@ -1394,18 +1679,21 @@ namespace llaminar2
                             stop_thinking_idx = 0;
                         }
                     }
+                    if (thinking_budget_active && !splitter.inThinking())
+                    {
+                        // The explicit budget governs only the reasoning
+                        // phase. Once the closing marker is complete, restore
+                        // the normal captured publication window for answer
+                        // content instead of imposing one-token transactions
+                        // for the remainder of the response.
+                        thinking_budget_active = false;
+                    }
                     if (!split.text.empty())
                     {
-                        accumulated_text += split.text;
-                        if (!has_tools)
+                        if (!emit_split_output(std::move(split)))
                         {
-                            json delta;
-                            delta[split.field] = split.text;
-                            if (!emit_chunk(delta, nullptr))
-                            {
-                                stop_generation = true;
-                                break;
-                            }
+                            stop_generation = true;
+                            break;
                         }
                     }
 
@@ -1417,32 +1705,21 @@ namespace llaminar2
                         auto flushed = splitter.process("");
                         if (!flushed.text.empty())
                         {
-                            accumulated_text += flushed.text;
-                            if (!has_tools)
+                            if (!emit_split_output(std::move(flushed)))
                             {
-                                json delta;
-                                delta[flushed.field] = flushed.text;
-                                if (!emit_chunk(delta, nullptr))
-                                {
-                                    stop_generation = true;
-                                    break;
-                                }
+                                stop_generation = true;
+                                break;
                             }
                         }
                     }
                 }
                 else
                 {
-                    accumulated_text += token_text;
-                    if (!has_tools)
+                    if (!emit_split_output(
+                            {"content", std::move(token_text)}))
                     {
-                        json delta;
-                        delta["content"] = token_text;
-                        if (!emit_chunk(delta, nullptr))
-                        {
-                            stop_generation = true;
-                            break;
-                        }
+                        stop_generation = true;
+                        break;
                     }
                 }
             }
@@ -1452,53 +1729,25 @@ namespace llaminar2
         if (use_think_split)
         {
             auto flushed = splitter.flush();
-            if (!flushed.text.empty())
-            {
-                accumulated_text += flushed.text;
-                if (!has_tools)
-                {
-                    json delta;
-                    delta[flushed.field] = flushed.text;
-                    emit_chunk(delta, nullptr);
-                }
-            }
+            if (!flushed.text.empty() && client_connected)
+                emit_split_output(std::move(flushed));
         }
+
+        if (has_tools && client_connected)
+            emit_tool_events(tool_splitter.flush());
 
         runner_.flushStageTimeline();
         if (Logger::getInstance().shouldLog(LogLevel::INFO))
             logRuntimeStateSummary(runner_.requestRuntimeSummary(), "streaming");
 
-        // Post-generation: if tools were provided, parse for tool calls and emit
-        if (has_tools)
+        if (!client_connected)
         {
-            ToolCallFormat format = runner_.getToolCallFormat();
-            auto tool_result = parseToolCalls(accumulated_text, format);
-            if (tool_result.hasToolCalls())
-            {
-                // Emit tool_calls deltas
-                for (size_t ti = 0; ti < tool_result.tool_calls.size(); ++ti)
-                {
-                    const auto &tc = tool_result.tool_calls[ti];
-                    json tc_delta = {
-                        {"index", static_cast<int>(ti)},
-                        {"id", tc.id},
-                        {"type", "function"},
-                        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}};
-                    json delta = {{"tool_calls", json::array({tc_delta})}};
-                    emit_chunk(delta, nullptr);
-                }
-                finish_reason = "tool_calls";
-            }
-            else
-            {
-                // No tool calls found — emit buffered content as single chunk
-                if (!accumulated_text.empty())
-                {
-                    json delta = {{"content", accumulated_text}};
-                    emit_chunk(delta, nullptr);
-                }
-            }
+            response.ok = true;
+            response.http_status = 200;
+            return response;
         }
+        if (emitted_tool_call)
+            finish_reason = "tool_calls";
 
         // Final chunk with finish_reason
         emit_chunk(json::object(), finish_reason.c_str());

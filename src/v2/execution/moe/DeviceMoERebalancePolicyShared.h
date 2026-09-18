@@ -50,11 +50,16 @@ namespace llaminar2::moe_rebalance_policy
     /**
      * Expected routed-token lifetime used by the migration payoff test.
      *
-     * This is deliberately finite. A very long horizon can make individually
-     * plausible cycles look profitable long after the layout has converged,
-     * causing continuous background traffic to erase the service-time gain.
+     * This is a service-residency lifetime, not the length of one request or
+     * histogram window: accepted ownership remains useful across requests.
+     * A measured mixed-vendor Qwen-122B placement needed roughly 46K routed
+     * tokens to repay its first complete promotion/demotion wave, so the old
+     * 2K default rejected movement that was profitable within an ordinary
+     * long-lived service. Keep the default finite so marginal cycles cannot
+     * claim an unbounded future, and retain the runtime override for shorter-
+     * lived or rapidly changing deployments.
      */
-    constexpr uint64_t kDefaultMigrationPayoffHorizonTokens = 2048u;
+    constexpr uint64_t kDefaultMigrationPayoffHorizonTokens = 65'536u;
     /**
      * Portable physical migration-cycle capacity retained by default.
      *
@@ -743,15 +748,16 @@ namespace llaminar2::moe_rebalance_policy
     }
 
     /**
-     * @brief Reject an economy candidate that regresses any measured phase.
+     * @brief Classify whether an economy candidate regresses a measured phase.
      *
-     * Decode and prefill are independent production objectives. Summing their
-     * service costs before admission would let a large win in one phase hide a
-     * regression in the other. The aggregate payoff gate still decides whether
-     * the complete cycle is worth its movement cost, while this helper enforces
-     * the orthogonal invariant that no measured phase becomes slower. Equality
-     * is intentional: a cycle may improve one phase while leaving another
-     * phase unchanged, and several such cycles can form one useful wave.
+     * A finite shared residency layout commonly has different optima for
+     * prefill, serial decode, and grouped verification. Consequently this is
+     * diagnostic evidence, not an admission veto: actual phase-weighted demand
+     * and measured service cost form the aggregate production objective, and
+     * the migration-payoff gate decides whether the observed workload becomes
+     * faster after all movement costs. Making every phase independently
+     * monotonic can freeze Dynamic even when no single placement can satisfy
+     * those conflicting optima.
      *
      * @param before Exact critical-path service cost before movement by phase.
      * @param after Exact critical-path service cost after movement by phase.

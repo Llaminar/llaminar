@@ -147,6 +147,67 @@ VPN. Collect remote rank evidence before container retirement and preserve
 artifacts after temporary staging cleanup. Recover interrupted leases only
 with their exact receipt; see `docs/production-ci.md` for prerequisites.
 
+### Long-context server stress
+
+Use the mature `tests/v2/e2e/server/long_context_checks.py` needle primitive
+when a live server fix needs a sustained correctness/lifetime proof. This is a
+focused stress diagnostic, not a replacement for the complete eight-check E2E
+certificate and not permission to maintain another model/topology matrix.
+
+Start the stress clock only after the Release server publishes `ServerReady`.
+First run one `run_needle_check` for each of `beginning`, `middle`, and `end` so
+all three exact prompts are admitted to prefix cache. Take the steady-state
+memory baseline after that warm cycle. Then rotate the same three placements
+for the requested duration (normally 900 seconds), failing on the first recall,
+HTTP, JSON, timeout, or server-process error. Use the cell's declared context,
+minimum prompt length, thinking-model setting, output budget, and request
+timeout; do not shorten the prompt or silently restart the server to manufacture
+a pass.
+
+Every canonical stress run also includes at least one production HTTP
+generation with an exact `max_tokens: 1024` budget. It is an accuracy oracle,
+not merely a long-output smoke test: use the cell's reviewed deterministic
+control prompt, seed, prompt-token IDs, 1,024 completion-token IDs, and finish
+reason, and compare them with `scripts/ci/generation_tokens.py`. Send
+`return_token_ids: true` and `return_runtime_summary: true`, then retain the
+complete response beside the per-iteration stress artifact. The request must
+retain the cell's long-context needle geometry so the same transaction proves
+long-prompt state and sustained decode. Structured-output and degeneration
+checks may supplement this exact token comparison but cannot replace it. The
+short needle answers commonly stop after only a few tokens and therefore
+cannot prove a decode maintenance cadence, MTP depth behavior, movement epoch,
+or post-movement arithmetic by themselves.
+
+Publish an atomically replaced JSON artifact after every request. Retain the
+iteration, placement, pass/detail, request wall time, elapsed stress time, and:
+
+- RSS for every `llaminar2 serve` MPI process;
+- CUDA compute-process memory for every participant;
+- ROCm VRAM usage for every participant.
+
+Classify the warm cycle separately: new RAM/disk prefix-cache admission may
+grow memory there. Exact repeat restores after the steady-state baseline must
+not show monotonic CPU or GPU growth. Inspect per-rank mappings or allocator
+state rather than dismissing a slope as noise; short-lived participant threads,
+unbounded diagnostic tags, retained request state, and driver allocations are
+different defects. A completed stress proof requires the full requested wall
+time, at least one pass at every needle placement, zero failed iterations,
+stable post-warm device memory, and no unexplained post-warm host-memory trend.
+
+Stop the server through its normal signal/HTTP shutdown path after collecting
+the terminal sample so MPI followers, background maintenance, graph resources,
+and PerfStats flush cleanly. Search the complete server log for asynchronous
+CUDA/HIP errors and fatal/warning lifecycle diagnostics. When Dynamic
+ExpertOverlay is selected, the 1,024-token response must prove device/host
+authority as declared by the topology, nonzero completed decision windows, and
+a complete authority-owned movement ledger. If the cell is intended to prove
+movement, require at least one published movement wave, transaction, command,
+and nonzero physical bytes, then validate the expected promotion/demotion and
+same-priority axes. Accuracy and memory stability alone do not prove that
+maintenance actually ran. A no-movement economy result is valid only for a
+cell explicitly testing that outcome and must retain its typed rejection
+reason.
+
 ## Run a campaign
 
 Configure and build Integration with every available backend. Use Ninja and

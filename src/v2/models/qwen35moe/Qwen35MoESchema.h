@@ -52,6 +52,12 @@ namespace llaminar2
             return qwenStopThinkingPrompt();
         }
 
+        /** @brief Use the same native tool-call grammar as dense Qwen 3.5. */
+        ToolCallFormat getToolCallFormat() const override
+        {
+            return ToolCallFormat::QWEN_3_XML;
+        }
+
         WeightShardingConfig getWeightShardingConfig() const override
         {
             // Start with dense Qwen3.5 sharding config (attention weights)

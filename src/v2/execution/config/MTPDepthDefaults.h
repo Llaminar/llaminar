@@ -13,6 +13,24 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Largest draft depth supported by the production MTP controller.
+     *
+     * An automatic adaptive policy is intentionally unconstrained within the
+     * complete supported controller range.  Keep the device ABI tied to this
+     * value rather than maintaining a second literal in kernel code.
+     */
+    inline constexpr int kMaximumSupportedMTPDraftDepth = 15;
+
+    /**
+     * @brief Canonical ceiling for an adaptive policy without an override.
+     * @return The complete supported draft range's inclusive upper bound.
+     */
+    [[nodiscard]] inline constexpr int defaultMTPAdaptiveMaximumDraftDepth() noexcept
+    {
+        return kMaximumSupportedMTPDraftDepth;
+    }
+
     /** @brief Measured card profiles; Portable covers uncharacterized domains. */
     enum class MTPDepthDefaultsProfile
     {

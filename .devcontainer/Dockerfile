@@ -94,7 +94,7 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
         echo "Skipping CUDA installation"; \
     fi
 
-# Conditional ROCm 7.1.1 (gfx906 Tensile overlay handled inside script).
+# Conditional ROCm 7.2.4 (gfx906 Tensile overlay handled inside script).
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
         MODE=full /tmp/install-scripts/install-rocm.sh; \
     else \

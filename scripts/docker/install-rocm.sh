@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-rocm.sh
 #
-# Install AMD ROCm 7.1.1. The user-space stack is installed inside the
+# Install AMD ROCm 7.2.4. The user-space stack is installed inside the
 # container; the kernel driver is expected on the host and passed through
 # via /dev/kfd + /dev/dri + the render/video groups.
 #
@@ -16,8 +16,8 @@
 set -euo pipefail
 
 MODE="${MODE:-full}"
-ROCM_VERSION="${ROCM_VERSION:-7.1.1}"
-ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.1.1.70101-1}"
+ROCM_VERSION="${ROCM_VERSION:-7.2.4}"
+ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.2.4.70204-1}"
 export DEBIAN_FRONTEND=noninteractive
 
 APT_OPTS=(
@@ -156,6 +156,8 @@ if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/nu
 fi
 rm -rf /tmp/rocblas-arch /tmp/rocblas-arch.pkg.tar.zst
 
-apt-get autoremove -y
+# Do not run autoremove here.  The caller owns the surrounding image and may
+# intentionally have build tools marked as automatically installed; a ROCm
+# installer must not make lifecycle decisions for unrelated packages.
 apt-get clean
 rm -rf /var/lib/apt/lists/*

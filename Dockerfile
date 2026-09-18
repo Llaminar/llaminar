@@ -3,9 +3,9 @@
 # Llaminar — CUDA + ROCm runtime image
 #
 # Two-stage build:
-#   1. builder — Ubuntu 24.04 + full CUDA 13 toolkit + ROCm 7.1.1 + C++23
+#   1. builder — Ubuntu 24.04 + full CUDA 13 toolkit + ROCm 7.2.4 + C++23
 #      toolchain, compiles `llaminar2` (Release).
-#   2. runtime — Ubuntu 24.04 + CUDA 13 shared libs + ROCm 7.1.1 user-space +
+#   2. runtime — Ubuntu 24.04 + CUDA 13 shared libs + ROCm 7.2.4 user-space +
 #      compiled binary only (no compilers, no -dev packages).
 #
 # All dependency-install logic lives in scripts/docker/install-*.sh, which are
@@ -45,7 +45,7 @@ ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
 ARG LLAMINAR_SKIP_INTEGRATION=0
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
-ARG RCCL_GIT_REF=rocm-7.1.1
+ARG RCCL_GIT_REF=rocm-7.2.4
 ARG RCCL_GPU_TARGETS=gfx906
 ARG ROCM_RUNTIME_GPU_TARGETS=
 ARG LLAMINAR_SOURCE_TREE=
@@ -175,8 +175,8 @@ RUN set -e; \
 
 # RCCL — build in a dedicated layer so the ROCm collective library is visible,
 # cacheable, and not hidden inside Llaminar's CMake configure step. The source
-# build is enabled by default for release images because Ubuntu's packaged
-# ROCm 7.1.1 RCCL has broken gfx906 binaries on MI50/MI60 systems.
+# build is enabled by default for release images because packaged ROCm 7.2.4
+# RCCL has no usable gfx906 binaries on MI50/MI60 systems.
 # MSCCL generated kernels are optional for standard collectives and make source
 # builds dramatically slower, so release images default them off.
 ARG RCCL_ENABLE_MSCCL_KERNEL=OFF

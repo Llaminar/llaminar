@@ -493,6 +493,15 @@ namespace llaminar2
             config.device_compute_units =
                 inventoryComputeUnits(inventory, device);
             if (device.is_cpu()) config.cpu_execution = inventory.cpu_execution;
+            /*
+             * Overlay capacity is resolved only after each rank has created
+             * its production backend contexts.  Local CUDA admission can
+             * therefore ask the kernel's dispatch authority for the exact
+             * NativeVNNI scratch envelope instead of relying on the older
+             * device-free graph-family floor.  Remote ranks perform the same
+             * calculation against their own local devices.
+             */
+            config.runtime_device_policy_available = device.is_gpu();
             if (device.is_gpu())
             {
                 config.graph_snapshot_memory =

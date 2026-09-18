@@ -3624,14 +3624,15 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixLookupRetainsEpochUsedToBuildFingerp
     ASSERT_TRUE(runner.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     const std::vector<int32_t> prompt = {1, 2};
-    const auto before = runner.lookupPrefix(prompt);
-    ASSERT_TRUE(before.supported);
+    const uint64_t sampled_epoch = runner.moeRuntimeMovementEpoch();
     graph->publishDuringNextFingerprint(runner);
     const auto admitted = runner.lookupPrefix(prompt);
     ASSERT_TRUE(admitted.supported);
-    EXPECT_EQ(runner.moeRuntimeMovementEpoch(), before.placement_epochs.latest() + 1);
-    EXPECT_EQ(admitted.fingerprint_key, before.fingerprint_key);
-    EXPECT_EQ(admitted.placement_epochs, before.placement_epochs);
+    EXPECT_EQ(runner.moeRuntimeMovementEpoch(), sampled_epoch + 1);
+    EXPECT_NE(admitted.fingerprint_key, 0u);
+    EXPECT_EQ(
+        admitted.placement_epochs,
+        PrefixPlacementEpochSpan::at(sampled_epoch));
 
     // Harvest observes the publication independently and rejects only the
     // archive write, never the successful request or background movement.
@@ -3639,7 +3640,7 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixLookupRetainsEpochUsedToBuildFingerp
     const auto next = runner.lookupPrefix(prompt);
     ASSERT_TRUE(next.supported);
     EXPECT_EQ(next.placement_epochs,
-              PrefixPlacementEpochSpan::at(before.placement_epochs.latest() + 1));
+              PrefixPlacementEpochSpan::at(sampled_epoch + 1));
     EXPECT_NE(next.fingerprint_key, admitted.fingerprint_key);
     EXPECT_EQ(next.cached_tokens, 0);
 }
