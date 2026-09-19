@@ -2172,6 +2172,207 @@ namespace llaminar2
                 .empty());
     }
 
+    /**
+     * @brief Reproduce the replicated-dense preflight/runtime byte mismatch.
+     *
+     * ExpertOverlay keeps a rank-local collective context even when the dense
+     * graph is replicated, because apportioned routed experts still exchange
+     * route payloads. That collective membership must not make the physical
+     * memory BOM price each complete dense weight set as a TP shard. Exercise
+     * CUDA and ROCm metadata identically; no accelerator is initialized.
+     */
+    TEST(MoEOverlayLocalCapacityPlanner,
+         ReplicatedDenseContinuationPricesFullPrimaryWeightsOnEveryLocalParticipant)
+    {
+        auto profile = smallModelProfile();
+        const auto addF32 = [&](std::string name,
+                                std::size_t elements,
+                                std::size_t K,
+                                int layer)
+        {
+            TensorSizeInfo tensor;
+            tensor.name = std::move(name);
+            tensor.elements = elements;
+            tensor.K = K;
+            tensor.quant_type = "F32";
+            tensor.native_bytes = elements * sizeof(float);
+            tensor.layer_index = layer;
+            profile.total_native_bytes += tensor.native_bytes;
+            profile.tensors.push_back(std::move(tensor));
+        };
+        addF32(
+            "token_embd.weight",
+            static_cast<std::size_t>(profile.vocab_size) * profile.d_model,
+            profile.d_model,
+            -1);
+        addF32(
+            "output.weight",
+            static_cast<std::size_t>(profile.vocab_size) * profile.d_model,
+            profile.d_model,
+            -1);
+        for (int layer = 0; layer < profile.n_layers; ++layer)
+        {
+            const std::string prefix = "blk." + std::to_string(layer);
+            addF32(
+                prefix + ".attn_q.weight",
+                static_cast<std::size_t>(profile.d_model) * profile.d_model,
+                profile.d_model,
+                layer);
+            addF32(
+                prefix + ".ffn_gate_shexp.weight",
+                static_cast<std::size_t>(profile.d_ff) * profile.d_model,
+                profile.d_model,
+                layer);
+        }
+        addRoutedExpertMetadata(profile);
+
+        constexpr std::size_t kBudget =
+            8ULL * 1024ULL * 1024ULL * 1024ULL;
+        for (const DeviceType backend :
+             {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(
+                backend == DeviceType::CUDA ? "CUDA" : "ROCm");
+            const auto address = [backend](int ordinal)
+            {
+                return backend == DeviceType::CUDA
+                           ? GlobalDeviceAddress::cuda(ordinal)
+                           : GlobalDeviceAddress::rocm(ordinal);
+            };
+            const auto device = [backend](int ordinal)
+            {
+                return backend == DeviceType::CUDA
+                           ? DeviceId::cuda(ordinal)
+                           : DeviceId::rocm(ordinal);
+            };
+
+            RankExecutionPlan rank_plan;
+            rank_plan.rank = 0;
+            rank_plan.first_layer = 0;
+            rank_plan.last_layer = profile.n_layers - 1;
+            rank_plan.primary_device = address(0);
+            rank_plan.local_tp_devices = {address(0), address(1)};
+            rank_plan.local_tp_backend =
+                backend == DeviceType::CUDA
+                    ? CollectiveBackendType::NCCL
+                    : CollectiveBackendType::RCCL;
+            rank_plan.runtime.batch_size = 1;
+            rank_plan.runtime.max_seq_len = profile.max_seq_len;
+            rank_plan.runtime.kv_cache_precision = KVCachePrecision::FP16;
+            rank_plan.runtime.prefix_cache.enabled = false;
+            rank_plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+
+            RankInventory inventory;
+            inventory.rank = 0;
+            inventory.cpu_memory_bytes = kBudget;
+            inventory.cpu.memory_bytes = kBudget;
+            inventory.cpu.free_memory_bytes = kBudget;
+            for (int ordinal = 0; ordinal < 2; ++ordinal)
+            {
+                inventory.gpus.push_back(DeviceInfo{
+                    .type = backend,
+                    .local_device_id = ordinal,
+                    .memory_bytes = kBudget,
+                    .free_memory_bytes = kBudget,
+                    .compute_units = 60,
+                });
+            }
+
+            MoERoutedExpertPlacementPlan overlay;
+            overlay.enabled = true;
+            overlay.topology =
+                RoutedExpertPlacementTopology::TieredOverlay;
+            overlay.continuation_domain = "continuation";
+            overlay.base_model_domain = "continuation";
+            overlay.shared_expert_domain = "continuation";
+            overlay.continuation_domain_spec.domain = "continuation";
+            overlay.continuation_domain_spec.setDensePolicy(
+                DenseParallelPolicy::Replicated);
+            RoutedExpertDomain domain;
+            domain.name = "continuation";
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            domain.participants = {address(0), address(1)};
+            domain.world_ranks = {0, 0};
+            domain.owner_rank = 0;
+            domain.backend = rank_plan.local_tp_backend;
+            domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+            overlay.domains = {domain};
+            overlay.routed_tiers = {RoutedExpertTier{
+                .name = "priority-zero",
+                .domain = domain.name,
+                .priority = 0,
+                .fallback = true,
+            }};
+
+            const auto result = MoEOverlayLocalCapacityPlanner::plan({
+                .model_profile = &profile,
+                .rank_plan = &rank_plan,
+                .overlay_plan = &overlay,
+                .rank_inventory = &inventory,
+                .rank_execution_kind =
+                    OverlayRankExecutionKind::ContinuationAuthority,
+                .resident_graph_rows = 8,
+                .gpu_weight_load = testGPUWeightLoadCapacityInput(),
+            });
+
+            ASSERT_EQ(result.device_inputs.size(), 2u);
+            ASSERT_EQ(result.fixed_memory_plan.devices.size(), 3u)
+                << "the shared host upload authority is an independent BOM";
+            const std::vector<int> no_routed_experts(
+                static_cast<std::size_t>(profile.n_layers), 0);
+            for (std::size_t participant = 0;
+                 participant < result.device_inputs.size();
+                 ++participant)
+            {
+                const auto &input = result.device_inputs[participant];
+                EXPECT_EQ(input.device, device(static_cast<int>(participant)));
+                EXPECT_EQ(input.shard_index, 0);
+                EXPECT_EQ(input.total_shards, 1);
+                EXPECT_FALSE(input.tensor_parallel_assignment.has_value());
+                ASSERT_TRUE(input.local_tp_backend.has_value());
+                EXPECT_EQ(*input.local_tp_backend, rank_plan.local_tp_backend);
+                EXPECT_EQ(input.local_kv_heads, 0);
+
+                const auto expected_full = WeightMemoryEstimator::estimate(
+                    profile,
+                    input.device,
+                    /*shard_index=*/0,
+                    /*total_shards=*/1,
+                    input.first_layer,
+                    input.last_layer,
+                    DeviceWeightResidency::
+                        continuationWithSelectedRoutedExperts(
+                            profile.expert_count,
+                            no_routed_experts));
+                const auto stale_shard = WeightMemoryEstimator::estimate(
+                    profile,
+                    input.device,
+                    static_cast<int>(participant),
+                    /*total_shards=*/2,
+                    input.first_layer,
+                    input.last_layer,
+                    DeviceWeightResidency::
+                        continuationWithSelectedRoutedExperts(
+                            profile.expert_count,
+                            no_routed_experts));
+                EXPECT_GT(expected_full.device_bytes, stale_shard.device_bytes);
+                const auto planned = std::find_if(
+                    result.fixed_memory_plan.devices.begin(),
+                    result.fixed_memory_plan.devices.end(),
+                    [&](const DeviceMemoryPlan &entry)
+                    {
+                        return entry.device() == input.device;
+                    });
+                ASSERT_NE(planned, result.fixed_memory_plan.devices.end());
+                EXPECT_EQ(
+                    planned->weight_bytes(),
+                    expected_full.device_bytes);
+            }
+        }
+    }
+
     TEST(MoEOverlayLocalCapacityPlanner,
          GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource)
     {

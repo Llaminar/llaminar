@@ -728,12 +728,15 @@ namespace llaminar2
             if (continuation != index_by_name.end())
             {
                 // Multiple continuation participants use the installed TP
-                // policy, including NodeTP CPU pools. Replicating full dense
-                // weights requires an explicit policy and its corresponding BOM.
+                // policy. AUTO scope remains conservatively cross-rank until
+                // inventory binding resolves the physical domain; rank-local
+                // domains are then upgraded to replicated decode by the same
+                // canonical helper. The physical memory authority owns the
+                // resulting full-weight BOM and admission decision.
                 plan.continuation_domain_spec.setDensePolicy(
-                    inventory[continuation->second].participants.size() > 1u
-                        ? DenseParallelPolicy::TensorParallel
-                        : DenseParallelPolicy::Replicated);
+                    defaultMoEContinuationDensePolicy(
+                        inventory[continuation->second].scope,
+                        inventory[continuation->second].participants.size()));
             }
         }
 

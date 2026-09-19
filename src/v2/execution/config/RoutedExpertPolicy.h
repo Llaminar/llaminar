@@ -193,6 +193,26 @@ namespace llaminar2
     };
 
     /**
+     * @enum RoutedExpertResidentSetPolicy
+     * @brief Graph-lowered cardinality of the live resident set for decode.
+     *
+     * This is immutable graph identity, not a second placement controller.
+     * When capacity admission proves that no replica slot exists, the router
+     * can publish the canonical owner directly and avoid carrying the
+     * least-loaded replica scheduler in every captured layer. A graph that
+     * admits even one replica must select @ref ReplicaAware; the optimized
+     * path traps if its single-resident invariant is ever violated.
+     */
+    enum class RoutedExpertResidentSetPolicy : uint8_t
+    {
+        /** One canonical complete resident exists for every routed expert. */
+        UniqueOwner = 0,
+
+        /** One or more complete residents may exist and require assignment. */
+        ReplicaAware,
+    };
+
+    /**
      * @enum MoEParticipantPublicationPolicy
      * @brief Graph-lowered publication transaction for partial MoE branches.
      *
@@ -226,6 +246,31 @@ namespace llaminar2
          * the shared branch retains its own independent collective.
          */
         CanonicalRootedRouteSlots,
+
+        /**
+         * Every participant receives the independently rounded original-order
+         * route slots through one native FP32 allreduce, then performs the same
+         * fixed increasing-slot fold. Exactly one participant owns every live
+         * slot and all peers contribute positive zero, so the collective does
+         * not change a producer's rounded bytes. This removes the separate
+         * reduce-to-root and compact broadcast required by the rooted policy.
+         */
+        CanonicalAllreduceRouteSlots,
+
+        /**
+         * A no-P2P homogeneous GPU domain publishes only the original route
+         * rows owned by each non-root participant through capture-stable
+         * mapped lanes. The fixed root folds those rows in router order while
+         * the shared branch reduces its compact `[M, d_model]` partial to the
+         * same root; one final compact broadcast publishes the fused result.
+         *
+         * This is deliberately distinct from a dense rank-bank collective:
+         * route ownership is sparse, device-authored invocation state, so
+         * transporting zero-filled banks scales with `top_k` while useful
+         * traffic does not. Native NCCL/RCCL remains authoritative whenever
+         * the topology reports any peer-access opportunity.
+         */
+        CanonicalMappedRoutesRootedShared,
 
         /**
          * Routed slots and rank-addressed shared banks use one rooted reduction.
@@ -474,6 +519,10 @@ namespace llaminar2
             return "canonical-rooted-packed-route-rows";
         case MoEParticipantPublicationPolicy::CanonicalRootedRouteSlots:
             return "canonical-rooted-route-slots";
+        case MoEParticipantPublicationPolicy::CanonicalAllreduceRouteSlots:
+            return "canonical-allreduce-route-slots";
+        case MoEParticipantPublicationPolicy::CanonicalMappedRoutesRootedShared:
+            return "canonical-mapped-routes-rooted-shared";
         case MoEParticipantPublicationPolicy::CanonicalRootedRankBanks:
             return "canonical-rooted-rank-banks";
         }

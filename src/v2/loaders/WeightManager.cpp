@@ -3305,6 +3305,28 @@ namespace llaminar2
             return tensor;
         };
 
+        /*
+         * GPU GEMM, quantized embedding, and routed-expert preparation reads
+         * immutable host bytes and publishes a separate device-owned packed
+         * representation.  One source tensor is therefore authoritative for
+         * every participant; cloning it per device only duplicates the model
+         * in RAM and makes replicated-dense startup scale with device count.
+         *
+         * Keep this decision under cache_mutex_: concurrent runner creation
+         * must observe the source as HOST_RESIDENT before any caller can
+         * manufacture a device clone.  Raw runtime operands deliberately skip
+         * this branch and continue into the device-qualified cache below.
+         */
+        if (device.is_gpu() && has_sharding_config_)
+        {
+            auto source = ensureWeightLoaded();
+            if (source && isGpuPreparationSource(name, *source))
+            {
+                source->setHostResident();
+                return source;
+            }
+        }
+
         // For the first device, return the original tensor
         if (first_device_.value() == device)
         {

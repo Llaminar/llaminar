@@ -672,6 +672,19 @@ extern "C"
         const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
+    bool hipMoE_softmax_topk_decode_unique_owner_wave64(
+        float *logits,
+        void *runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        int device_idx,
+        void *stream);
+
     bool hipMoE_softmax_topk_decode_equivalent_rows(
         float *logits,
         float *expert_indices, float *expert_weights,
@@ -4909,7 +4922,8 @@ namespace llaminar2
                       << " top_k=" << plan.top_k);
             return false;
         }
-
+        if (plan.kind == MoERouteLaunchKind::RuntimeDecode)
+            prepared_decode_resident_set_policy_ = plan.resident_set_policy;
         const DeviceId device = DeviceId::rocm(device_ordinal_);
         if (!requireTensorOnDevice(
                 gate_weights,
@@ -5492,6 +5506,32 @@ namespace llaminar2
                 "ROCmMoEKernel::decodeRouteSelect"))
         {
             return false;
+        }
+
+        if (!runtime_ready && rocm_env.moe_router_wave_topk &&
+            num_experts <= 256 &&
+            prepared_decode_resident_set_policy_ ==
+                RoutedExpertResidentSetPolicy::UniqueOwner)
+        {
+            runtime_ready =
+                hipMoE_softmax_topk_decode_unique_owner_wave64(
+                    d_route_logits_,
+                    static_cast<void *>(runtime_layer),
+                    legacy_indices,
+                    legacy_weights,
+                    num_experts,
+                    top_k,
+                    normalize_weights,
+                    write_legacy_outputs,
+                    update_runtime_histogram,
+                    device_ordinal_,
+                    getStream());
+            if (!runtime_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] unique-owner "
+                          "wave64 decode router failed");
+                return false;
+            }
         }
 
         if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)

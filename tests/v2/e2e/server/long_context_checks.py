@@ -638,7 +638,11 @@ def build_multi_needle_prompt(
     count = record_count_for_context(min_prompt_tokens, context_length, max_tokens, tier)
     sentinels = {
         "alpha": "REDWOOD-47QK",
-        "middle": "HARBOR-92MJ",
+        # Keep each leading character semantically indispensable.  Some
+        # instruction-tuned models normalize HARBOR to the valid suffix word
+        # ARBOR even when retrieval is otherwise exact; MARBLE preserves the
+        # same strict multi-position copy contract without that lexical trap.
+        "middle": "MARBLE-92MJ",
         "omega": "JUNIPER-63VX",
     }
     positions = {

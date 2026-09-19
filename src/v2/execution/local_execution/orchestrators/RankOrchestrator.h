@@ -355,9 +355,8 @@ namespace llaminar2
              * publication. Resolved from exact peer topology before any child
              * graph is built.
              */
-            MoEOverlayNodeLocalRouteTransport
-                moe_node_local_route_transport =
-                    MoEOverlayNodeLocalRouteTransport::Unresolved;
+            MoEOverlayNodeLocalRouteTransportPolicy
+                moe_node_local_route_transport_policy{};
 
             // =================================================================
             // Helper Methods

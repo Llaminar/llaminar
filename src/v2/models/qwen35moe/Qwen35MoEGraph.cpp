@@ -4720,6 +4720,16 @@ namespace llaminar2
             total_tokens > 1 &&
             !mtp_sidecar_context &&
             !config_.compute_all_position_logits;
+        /* Grouped MTP verification and sidecars are decode work even when
+         * their graph has multiple rows. Resolve transport from semantics,
+         * never from tensor shape alone. */
+        const MoEOverlayNodeLocalRoutePhase node_local_route_phase =
+            ordinary_prefill_graph
+                ? MoEOverlayNodeLocalRoutePhase::OrdinaryPrefill
+                : MoEOverlayNodeLocalRoutePhase::Decode;
+        const MoEOverlayNodeLocalRouteTransport node_local_route_transport =
+            config_.moe.node_local_route_transport_policy.forPhase(
+                node_local_route_phase);
         const bool phase_split_local_tp_apportioned_gpu_prefill =
             resolved_local_tp_replicated_fast_candidate &&
             resolved_local_tp_replicated_tier &&
@@ -6921,6 +6931,12 @@ namespace llaminar2
                     : MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable;
             route_params.routed_row_execution_policy =
                 routed_row_execution_policy;
+            route_params.routed_resident_set_policy =
+                routed_row_execution_policy ==
+                        RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+                    hot_replica_cap == 0
+                    ? RoutedExpertResidentSetPolicy::UniqueOwner
+                    : RoutedExpertResidentSetPolicy::ReplicaAware;
             route_params.force_grouped_verifier_prefill_for_decode =
                 forceGroupedMoEVerifierPrefill(device);
             route_params.absolute_position_ids_device =
@@ -7165,6 +7181,23 @@ namespace llaminar2
                        usesRankBanks();
             }
 
+            /**
+             * @brief Return whether one disjoint-owner allreduce publishes slots.
+             * @return True only for the native FP32 route-slot transaction.
+             */
+            [[nodiscard]] bool usesAllreduceRouteSlots() const noexcept
+            {
+                return policy == MoEParticipantPublicationPolicy::
+                                     CanonicalAllreduceRouteSlots;
+            }
+
+            /** @return Whether routed rows use the capture-stable mapped fabric. */
+            [[nodiscard]] bool usesMappedSparseRoutes() const noexcept
+            {
+                return policy == MoEParticipantPublicationPolicy::
+                                     CanonicalMappedRoutesRootedShared;
+            }
+
             [[nodiscard]] bool usesPackedRouteGather() const noexcept
             {
                 return policy == MoEParticipantPublicationPolicy::
@@ -7184,9 +7217,20 @@ namespace llaminar2
          */
         struct DeferredOverlayCombinedPublication
         {
+            /** Cross-participant scheduling owned by this publication. */
+            enum class CaptureRendezvous : std::uint8_t
+            {
+                /** All participants retain one complete homogeneous graph. */
+                NativeFullGraph,
+                /** A heterogeneous transaction requires a named capture wave. */
+                ExplicitWave,
+            };
+
             int root_device_index = -1;
             int participant_count = 0;
             std::string routed_terminal;
+            CaptureRendezvous capture_rendezvous =
+                CaptureRendezvous::ExplicitWave;
             std::string capture_wave_identity;
 
             /** @return Whether every fixed topology field is complete. */
@@ -7195,7 +7239,12 @@ namespace llaminar2
                 return root_device_index >= 0 && participant_count > 1 &&
                        root_device_index < participant_count &&
                        !routed_terminal.empty() &&
-                       !capture_wave_identity.empty();
+                       ((capture_rendezvous ==
+                             CaptureRendezvous::NativeFullGraph &&
+                         capture_wave_identity.empty()) ||
+                        (capture_rendezvous ==
+                             CaptureRendezvous::ExplicitWave &&
+                         !capture_wave_identity.empty()));
             }
         };
         std::optional<DeferredOverlayCombinedPublication>
@@ -7900,6 +7949,29 @@ namespace llaminar2
                         MoEParticipantPublicationPolicy::
                             CanonicalRootedRouteSlots;
                 }
+                else if (ordinary_prefill_graph &&
+                         shared_expert_requires_tp_allreduce &&
+                         has_shared_expert_branch &&
+                         layer.shared_expert_gate_inp &&
+                         planned_shared_device == device &&
+                         node_local_route_transport ==
+                             MoEOverlayNodeLocalRouteTransport::MappedSparse &&
+                         config_.moe.node_local_route_exchange)
+                {
+                    /*
+                     * The no-P2P topology already selected a sparse mapped
+                     * transport before graph construction. Preserve that
+                     * choice in the optimized LocalTP graph instead of
+                     * transmitting a zero-filled `[top_k + participants]`
+                     * rank bank through RCCL. The routed reducer and compact
+                     * shared reduction below retain one fixed root and one
+                     * final publication, so arithmetic and collective order
+                     * remain explicit and symmetric.
+                     */
+                    canonical_publication_lowering.policy =
+                        MoEParticipantPublicationPolicy::
+                            CanonicalMappedRoutesRootedShared;
+                }
                 else if (shared_expert_requires_tp_allreduce &&
                          has_shared_expert_branch &&
                          layer.shared_expert_gate_inp &&
@@ -7911,9 +7983,22 @@ namespace llaminar2
                 }
                 else
                 {
+                    /*
+                     * A replicated ROCm decode graph has no dense/shared
+                     * partial to join into a rooted transaction. Every live
+                     * canonical slot has one physical owner, so one native
+                     * FP32 allreduce publishes the exact rounded slot bank on
+                     * every participant and avoids a second compact broadcast.
+                     * Prefill and non-ROCm graphs retain their independently
+                     * selected transports and arithmetic policies.
+                     */
                     canonical_publication_lowering.policy =
-                        MoEParticipantPublicationPolicy::
-                            CanonicalRootedRouteSlots;
+                        device.is_rocm() &&
+                                !denseTPAllreduceEnabledForCurrentGraph()
+                            ? MoEParticipantPublicationPolicy::
+                                  CanonicalAllreduceRouteSlots
+                            : MoEParticipantPublicationPolicy::
+                                  CanonicalRootedRouteSlots;
                 }
                 canonical_local_tp_route_publication =
                     canonical_publication_lowering.
@@ -7984,7 +8069,178 @@ namespace llaminar2
                                         : rebalance_apply_dependency);
                 ffn_terminal = prefix + "moe_expert_ffn_overlay_fast";
 
-                if (needsMoEParticipantAllreduce())
+                if (needsMoEParticipantAllreduce() &&
+                    canonical_publication_lowering.usesMappedSparseRoutes())
+                {
+                    if (!local_tp_ctx || !moe_runtime_table ||
+                        !canonical_route_contributions ||
+                        config_.tp_device_idx < 0 ||
+                        config_.tp_device_idx >= local_tp_ctx->degree())
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE mapped sparse LocalTP publication has an incomplete graph/runtime contract for layer " +
+                            std::to_string(layer_idx));
+                    }
+
+                    const auto *const local_descriptor =
+                        owner_map_lifetime->participantForId(local_participant);
+                    const auto *const root_descriptor =
+                        owner_map_lifetime->participantForId(
+                            continuationRootParticipant(*overlay_plan));
+                    if (!local_descriptor || !root_descriptor ||
+                        local_descriptor->tier_idx != root_descriptor->tier_idx ||
+                        local_descriptor->domain_name !=
+                            root_descriptor->domain_name ||
+                        local_descriptor->domain_participant_index !=
+                            config_.tp_device_idx ||
+                        root_descriptor->domain_participant_index < 0 ||
+                        root_descriptor->domain_participant_index >=
+                            local_tp_ctx->degree())
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE mapped sparse LocalTP publication has an unaligned participant identity for layer " +
+                            std::to_string(layer_idx));
+                    }
+                    const int root_tp_index =
+                        root_descriptor->domain_participant_index;
+
+                    std::vector<MoENodeLocalRouteEndpoint> route_endpoints;
+                    route_endpoints.reserve(
+                        static_cast<std::size_t>(local_tp_ctx->degree()));
+                    for (const auto &participant :
+                         owner_map_lifetime->participants())
+                    {
+                        if (participant.tier_idx ==
+                                local_descriptor->tier_idx &&
+                            participant.domain_name ==
+                                local_descriptor->domain_name)
+                        {
+                            route_endpoints.push_back({
+                                .participant_id =
+                                    participant.domain_participant_index,
+                                .device = participant.device,
+                            });
+                        }
+                    }
+                    if (route_endpoints.size() !=
+                        static_cast<std::size_t>(local_tp_ctx->degree()))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE mapped sparse LocalTP endpoint count differs from its continuation cell for layer " +
+                            std::to_string(layer_idx));
+                    }
+
+                    const auto &route_exchange =
+                        config_.moe.node_local_route_exchange;
+                    route_exchange->materialize(
+                        std::move(route_endpoints),
+                        root_tp_index,
+                        static_cast<std::uint32_t>(
+                            graphStableActivationRowCapacity(config_, device)),
+                        static_cast<std::uint32_t>(config_.moe.top_k),
+                        static_cast<std::uint32_t>(config_.d_model));
+
+                    const auto &runtime_layer =
+                        moe_runtime_table->hostLayerState(layer_idx);
+                    const std::uint64_t required_route_slots =
+                        static_cast<std::uint64_t>(total_tokens) *
+                        static_cast<std::uint64_t>(config_.moe.top_k);
+                    if (!runtime_layer.route_participant_ids ||
+                        required_route_slots == 0u ||
+                        required_route_slots >
+                            static_cast<std::uint64_t>(
+                                runtime_layer.prefill_route_capacity))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE mapped sparse LocalTP publication has no complete device route-assignment ledger for layer " +
+                            std::to_string(layer_idx));
+                    }
+                    const MoEDomainRouteAssignmentLedger route_assignment{
+                        .participant_ids =
+                            runtime_layer.route_participant_ids,
+                        .capacity = runtime_layer.prefill_route_capacity,
+                    };
+                    const MoERuntimeRouteWeightBinding runtime_weights =
+                        bindMoERuntimeRouteWeights(
+                            moe_runtime_table->deviceLayerState(layer_idx),
+                            runtime_layer,
+                            captured_overlay_route_weight_projection);
+                    const MoEOverlayRoutePlacementDeviceBinding
+                        route_placement =
+                            moe_runtime_table->overlayRoutePlacementBinding(
+                                layer_idx);
+                    if (!runtime_weights.validFor(
+                            static_cast<std::uint32_t>(total_tokens),
+                            static_cast<std::uint32_t>(config_.moe.top_k)) ||
+                        !route_placement.valid())
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE mapped sparse LocalTP publication has incomplete request-pinned route evidence for layer " +
+                            std::to_string(layer_idx));
+                    }
+
+                    MoECanonicalRouteReduceStage::Params reduce_params;
+                    reduce_params.device_id = device;
+                    reduce_params.canonical_route_contributions =
+                        canonical_route_contributions;
+                    reduce_params.output = moe_output;
+                    reduce_params.seq_len = total_tokens;
+                    reduce_params.top_k = config_.moe.top_k;
+                    reduce_params.d_model = config_.d_model;
+                    reduce_params.canonical_route_arithmetic =
+                        MoECanonicalRouteArithmeticPolicy::
+                            PreweightedContributionThenOrderedAdd;
+                    reduce_params.canonical_route_layout =
+                        MoECanonicalRoutePublicationLayout::
+                            DenseOriginalRouteSlots;
+                    reduce_params.reduction_role =
+                        config_.tp_device_idx == root_tp_index
+                            ? MoECanonicalRouteReductionRole::RootOwner
+                            : MoECanonicalRouteReductionRole::
+                                  NonRootParticipant;
+                    reduce_params.node_local_route_exchange = route_exchange;
+                    reduce_params.domain_route_assignment = route_assignment;
+                    reduce_params.external_route_source =
+                        MoEExternalCanonicalRouteSource::DeferredDenseMerge;
+                    reduce_params.runtime_route_weights = runtime_weights;
+                    reduce_params.overlay_route_placement = route_placement;
+                    reduce_params.route_participant_id =
+                        config_.tp_device_idx;
+                    reduce_params.canonical_route_contributions_buffer_id =
+                        buffers.idFor(
+                            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS);
+                    reduce_params.output_buffer_id =
+                        buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+
+                    const std::string reduce_name =
+                        prefix + "moe_mapped_routes_ordered_reduce";
+                    graph.addNode(
+                        reduce_name,
+                        ComputeStageFactory::createMoECanonicalRouteReduce(
+                            reduce_params),
+                        device);
+                    graph.addDependency(
+                        reduce_name,
+                        prefix + "moe_expert_ffn_overlay_fast");
+                    ffn_terminal = reduce_name;
+
+                    deferred_overlay_combined_publication =
+                        DeferredOverlayCombinedPublication{
+                            .root_device_index = root_tp_index,
+                            .participant_count = local_tp_ctx->degree(),
+                            .routed_terminal = reduce_name,
+                            .capture_rendezvous =
+                                DeferredOverlayCombinedPublication::
+                                    CaptureRendezvous::NativeFullGraph,
+                            .capture_wave_identity = {},
+                        };
+                    if (!deferred_overlay_combined_publication->valid())
+                    {
+                        throw std::logic_error(
+                            "Qwen35 MoE mapped sparse LocalTP publication produced an incomplete rooted transaction");
+                    }
+                }
+                else if (needsMoEParticipantAllreduce())
                 {
                     TensorBase *allreduce_buffer =
                         canonical_local_tp_route_publication
@@ -8026,6 +8282,12 @@ namespace llaminar2
                     {
                         ar_name =
                             prefix + "moe_canonical_routes_reduce_to_root";
+                    }
+                    else if (canonical_publication_lowering.
+                                 usesAllreduceRouteSlots())
+                    {
+                        ar_name = prefix +
+                                  "moe_canonical_routes_allreduce";
                     }
                     else
                     {
@@ -8106,6 +8368,18 @@ namespace llaminar2
                         collective_stage =
                             ComputeStageFactory::createTPLocalRootedCollective(
                                 rooted_params);
+                    }
+                    else if (canonical_publication_lowering.
+                                 usesAllreduceRouteSlots())
+                    {
+                        collective_stage =
+                            createDisjointOwnerSlotAllreduceStage(
+                                allreduce_buffer,
+                                allreduce_count,
+                                device,
+                                ar_name,
+                                allreduce_buffer_id,
+                                std::move(rebalance_sidebands));
                     }
                     else
                     {
@@ -8258,6 +8532,48 @@ namespace llaminar2
                             device);
                         graph.addDependency(broadcast_name, reduce_name);
                         ffn_terminal = broadcast_name;
+                    }
+                    else if (canonical_publication_lowering.
+                                 usesAllreduceRouteSlots())
+                    {
+                        /*
+                         * The native collective has already copied each
+                         * independently rounded original-order route slot to
+                         * every participant. All graphs now perform the same
+                         * deterministic increasing-slot fold locally; no root
+                         * authority or return broadcast remains.
+                         */
+                        MoECanonicalRouteReduceStage::Params reduce_params;
+                        reduce_params.device_id = device;
+                        reduce_params.canonical_route_contributions =
+                            canonical_route_contributions;
+                        reduce_params.output = moe_output;
+                        reduce_params.seq_len = total_tokens;
+                        reduce_params.top_k = config_.moe.top_k;
+                        reduce_params.d_model = config_.d_model;
+                        reduce_params.canonical_route_arithmetic =
+                            MoECanonicalRouteArithmeticPolicy::
+                                PreweightedContributionThenOrderedAdd;
+                        reduce_params.canonical_route_layout =
+                            MoECanonicalRoutePublicationLayout::
+                                DenseOriginalRouteSlots;
+                        reduce_params.reduction_role =
+                            MoECanonicalRouteReductionRole::
+                                AllreduceParticipant;
+                        reduce_params.canonical_route_contributions_buffer_id =
+                            allreduce_buffer_id;
+                        reduce_params.output_buffer_id =
+                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+
+                        const std::string reduce_name =
+                            prefix + "moe_canonical_routes_reduce";
+                        graph.addNode(
+                            reduce_name,
+                            ComputeStageFactory::createMoECanonicalRouteReduce(
+                                reduce_params),
+                            device);
+                        graph.addDependency(reduce_name, ffn_terminal);
+                        ffn_terminal = reduce_name;
                     }
                     else if (canonical_publication_lowering.
                                  usesPackedRouteGather())
@@ -11644,7 +11960,7 @@ namespace llaminar2
                     }
 
                     const auto route_transport =
-                        config_.moe.node_local_route_transport;
+                        node_local_route_transport;
                     if (route_transport ==
                         MoEOverlayNodeLocalRouteTransport::Unresolved)
                     {
@@ -11656,11 +11972,12 @@ namespace llaminar2
                         MoEOverlayNodeLocalRouteTransport::MappedSparse;
                     const auto &route_exchange =
                         config_.moe.node_local_route_exchange;
-                    if (use_mapped_sparse_routes !=
+                    if (config_.moe.node_local_route_transport_policy
+                                .requiresMappedExchange() !=
                         static_cast<bool>(route_exchange))
                     {
                         throw std::runtime_error(
-                            "Qwen35 MoE node-local route transport and mapped fabric ownership disagree");
+                            "Qwen35 MoE node-local route transport policy and mapped fabric ownership disagree");
                     }
 
                     MoEDomainRouteAssignmentLedger
@@ -11850,8 +12167,13 @@ namespace llaminar2
                             ? MoECanonicalRouteReductionRole::RootOwner
                             : MoECanonicalRouteReductionRole::
                                   NonRootParticipant;
+                    /* The shared owner remains alive because ordinary prefill
+                     * may embed it, but a native decode graph must not receive
+                     * that capability. Stage behavior follows its phase's
+                     * typed transport, never pointer presence elsewhere in
+                     * the retained graph family. */
                     reduce_params.node_local_route_exchange =
-                        route_exchange;
+                        use_mapped_sparse_routes ? route_exchange : nullptr;
                     reduce_params.domain_route_assignment =
                         domain_route_assignment;
                     reduce_params.external_route_source =
@@ -13331,7 +13653,7 @@ namespace llaminar2
                     broadcast_params.tensor_buffer_id =
                         buffers.idFor(BufferId::ATTN_PROJ);
                     if (shouldUseMoEOverlayMappedDensePublication(
-                            config_.moe.node_local_route_transport,
+                            node_local_route_transport,
                             broadcast_params.count * sizeof(float)))
                     {
                         broadcast_params
@@ -13347,11 +13669,17 @@ namespace llaminar2
                         device);
                     graph.addDependency(
                         broadcast_name, prefix + "shared_expert_gate");
-                    graph.setGraphCaptureWaveContract(
-                        broadcast_name,
-                        GraphCaptureWaveContract{
-                            .identity = publication.capture_wave_identity,
-                        });
+                    if (publication.capture_rendezvous ==
+                        DeferredOverlayCombinedPublication::
+                            CaptureRendezvous::ExplicitWave)
+                    {
+                        graph.setGraphCaptureWaveContract(
+                            broadcast_name,
+                            GraphCaptureWaveContract{
+                                .identity =
+                                    publication.capture_wave_identity,
+                            });
+                    }
                     shared_ffn_last = broadcast_name;
                     ffn_terminal = broadcast_name;
                 }

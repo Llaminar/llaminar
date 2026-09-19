@@ -2404,6 +2404,62 @@ namespace llaminar2::test::parity
         EXPECT_EQ(added_tags, 4u);
     }
 
+    /** The reported Q8 workload must stay distinct from the Q4 HTTP certificate. */
+    TEST(ModelParityDefinition, OrnithQ8AccuracyUsesExactWorkloadAndStandardMatrix)
+    {
+        const auto cpu = qwen36::ornith15MoEQ8AccuracyParityDefinition(
+            qwen36::qwen36SingleDeviceTopology("CPU0", GlobalDeviceAddress::cpu()),
+            "pytorch_ornith15_q8_natural_decode_cpu_snapshots");
+        const auto rocm = qwen36::ornith15MoEQ8AccuracyParityDefinition(
+            qwen36::ornith15MoERocm4ExpertOverlayTopology(),
+            "pytorch_ornith15_q8_natural_decode_rocm4_snapshots");
+        EXPECT_EQ(cpu.model.model_path, rocm.model.model_path);
+        EXPECT_EQ(cpu.model.model_path,
+                  "/opt/llaminar-models/Ornith-1.5-35B-Q8_0.gguf");
+        EXPECT_NE(cpu.model.reference_directory, rocm.model.reference_directory);
+        EXPECT_EQ(cpu.model.prompt, rocm.model.prompt);
+        EXPECT_EQ(cpu.model.token_ids, rocm.model.token_ids);
+        ASSERT_EQ(cpu.model.token_ids.size(), 424u);
+        EXPECT_EQ(cpu.model.decode_steps, 89);
+        EXPECT_EQ(rocm.model.decode_steps, 89);
+        EXPECT_EQ(rocm.model.maximum_mtp_draft_depth, 15);
+        EXPECT_EQ(rocm.topology.collective, Collective::RCCL);
+        EXPECT_EQ(rocm.topology.mpi_ranks, 1);
+        ASSERT_EQ(rocm.topology.participants.size(), 4u);
+        for (std::size_t index = 0; index < 4; ++index)
+        {
+            EXPECT_EQ(rocm.topology.participants[index].address,
+                      GlobalDeviceAddress::rocm(static_cast<int>(index)));
+            EXPECT_EQ(rocm.topology.participants[index].world_rank, 0);
+        }
+
+        const auto cpu_cases = expandModelParityDefinition(cpu);
+        const auto rocm_cases = expandModelParityDefinition(rocm);
+        ASSERT_EQ(cpu_cases.size(), 6u);
+        ASSERT_EQ(rocm_cases.size(), 24u);
+        std::set<std::tuple<RoutedExpertOwnerOrder,
+                            ModelParityExpertMovement, ModelParityMTP>> axes;
+        for (const auto &cell : rocm_cases)
+        {
+            ASSERT_TRUE(cell.expert_overlay);
+            EXPECT_TRUE(axes.emplace(cell.expert_overlay->owner_order,
+                                     cell.expert_overlay->movement, cell.mtp).second);
+            EXPECT_EQ(cell.activation_precision, ActivationPrecision::FP32);
+            EXPECT_EQ(cell.kv_cache_precision, KVCachePrecision::FP16);
+            EXPECT_EQ(cell.prefix_restore_geometry,
+                      ModelParityPrefixRestoreGeometry::AuthenticatedPromptBlock);
+            EXPECT_FALSE(cell.e2e_certification);
+            const auto config = cell.toTestConfig();
+            EXPECT_EQ(config.token_ids, cpu.model.token_ids);
+            EXPECT_EQ(config.decode_steps, 89);
+        }
+        for (const auto &cell : cpu_cases)
+        {
+            EXPECT_FALSE(cell.e2e_certification);
+            EXPECT_EQ(cell.model.decode_steps, 89);
+        }
+    }
+
     TEST(ModelParityDefinition, CPUNodeCertificationRetainsFullMatrixAndOneAuthority)
     {
         const auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();

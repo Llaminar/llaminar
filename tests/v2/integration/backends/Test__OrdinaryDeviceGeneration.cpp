@@ -190,6 +190,119 @@ TEST_P(OrdinaryDeviceGeneration, SharedTicketProgramReplaysAcrossAlgorithmsAndRe
 }
 
 /**
+ * @test Ordinary hosted tickets retire a device-selected maintenance tail first.
+ *
+ * A node-local ExpertOverlay has no remote transaction coordinator, but HIP
+ * still needs its immutable ticket to distinguish the completed decode's due
+ * work from the next decode's admission. Reuse the same captured publisher and
+ * child graphs across twenty resets, including terminal tickets. The marker
+ * makes body-before-tail ordering visibly incorrect without loading a model.
+ */
+TEST_P(OrdinaryDeviceGeneration, HostedMaintenanceTicketRetiresCompletedOrdinaryTail)
+{
+    IBackend *const backend = GetParam() == "CUDA" ? getCUDABackend() : getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    const DeviceId device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    auto &context = GPUDeviceContextPool::instance().getContext(device);
+    context.submitAndWait([&]
+    {
+        void *const stream = context.defaultStream();
+        ASSERT_NE(stream, nullptr);
+        struct State
+        {
+            std::array<int, kDeviceGenerationControlCount> control{};
+            uint32_t due = 0;
+            DeviceGenerationDispatchTicket ticket{};
+            int32_t prior_body = 0;
+            int32_t next_body = 0;
+            int32_t retired_tail = 0;
+        };
+        const auto release = [backend](State *p) { if (p) backend->free(p, 0); };
+        std::unique_ptr<State, decltype(release)> storage(
+            static_cast<State *>(backend->allocate(sizeof(State), 0)), release);
+        ASSERT_TRUE(storage);
+        State *const state = storage.get();
+        ASSERT_TRUE(backend->prepareMappedHostCopyKernels(0));
+
+        auto body = context.createGraphCapture(stream);
+        auto maintenance = context.createGraphCapture(stream);
+        auto publisher = context.createGraphCapture(stream);
+        ASSERT_TRUE(body && maintenance && publisher);
+        ASSERT_TRUE(body->beginCapture());
+        ASSERT_TRUE(backend->copyDeviceVisibleRegionByKernelOnStream(
+            &state->prior_body, &state->next_body, sizeof(int32_t), 0, stream));
+        ASSERT_TRUE(body->endCapture() && body->instantiate());
+        ASSERT_TRUE(maintenance->beginCapture());
+        ASSERT_TRUE(backend->copyDeviceVisibleRegionByKernelOnStream(
+            &state->retired_tail, &state->prior_body, sizeof(int32_t), 0, stream));
+        ASSERT_TRUE(maintenance->endCapture() && maintenance->instantiate());
+        std::string error;
+        ASSERT_TRUE(DeviceGenerationGraphProgram::ticketPublisher(
+            *publisher, context, *backend, device,
+            {DeviceGenerationPolicy::ordinary(), state->control.data(),
+             kDeviceGenerationControlCount, 1},
+            &state->due, &state->ticket, error)) << error;
+
+        const std::array<DeviceControlledLoopFragment, 2> branch{{
+            {.name = "next ordinary decode", .capture = body.get()},
+            {.name = "completed ordinary maintenance", .capture = maintenance.get(),
+             .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
+             .condition_word_device = &state->due},
+        }};
+        const std::span<const DeviceControlledLoopFragment> ordered(branch);
+        for (int repeat = 0; repeat < 20; ++repeat)
+        for (bool due : {false, true})
+        for (bool terminal : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << GetParam() << " reset=" << repeat
+                << " due=" << due << " terminal=" << terminal);
+            State initial{};
+            ASSERT_TRUE(initialize_device_generation_control(
+                32, 32, DeviceGenerationPolicy::ordinary(), initial.control.data()));
+            initial.control[kDeviceGenerationControlTransactionCount] = repeat + 1;
+            initial.control[kDeviceGenerationControlResponseTokenCount] = repeat + 1;
+            initial.control[kDeviceGenerationControlRequestComplete] = terminal;
+            initial.due = due;
+            initial.prior_body = 100 + repeat;
+            initial.next_body = 200 + repeat;
+            initial.retired_tail = -1;
+            ASSERT_TRUE(backend->hostToDevice(state, &initial, sizeof(initial), 0, stream));
+            ASSERT_TRUE(backend->enqueueInitializeDeviceGenerationDispatchTicket(
+                7, 11, state->control.data(), kDeviceGenerationControlCount,
+                1, &state->ticket, 0, stream));
+            ASSERT_TRUE(publisher->launchOnStream(stream));
+            DeviceGenerationDispatchTicket ticket{};
+            ASSERT_TRUE(backend->deviceToHost(&ticket, &state->ticket,
+                sizeof(ticket), 0, stream));
+            ASSERT_TRUE(backend->synchronizeStream(stream, 0)); // Ticket oracle only.
+            ASSERT_TRUE(ticket.matchesLifecycle(7, 11));
+            ASSERT_EQ(ticket.next_draft_depth, 0);
+            ASSERT_EQ(ticket.maintenance_due, due);
+            ASSERT_EQ(ticket.complete != 0, terminal);
+
+            const DeviceControlledLoopTicketSelection selected{
+                .next_iteration_admitted = ticket.complete == 0,
+                .completed_iteration_word_nonzero = ticket.maintenance_due != 0,
+                .selector = ticket.next_draft_depth};
+            const size_t count = selected.countSelected(ordered);
+            ASSERT_EQ(count, static_cast<size_t>(!terminal) + static_cast<size_t>(due));
+            for (size_t ordinal = 0; ordinal < count; ++ordinal)
+            {
+                const auto *fragment = selected.selectOrdinal(ordered, ordinal);
+                ASSERT_NE(fragment, nullptr);
+                ASSERT_TRUE(fragment->capture->launchOnStream(stream));
+            }
+            State observed{};
+            ASSERT_TRUE(backend->deviceToHost(&observed, state, sizeof(observed), 0, stream));
+            ASSERT_TRUE(backend->synchronizeStream(stream, 0)); // Terminal oracle only.
+            EXPECT_EQ(observed.retired_tail, due ? initial.prior_body : -1);
+            EXPECT_EQ(observed.prior_body,
+                terminal ? initial.prior_body : initial.next_body);
+        }
+    });
+}
+
+/**
  * @brief Persistent logical-state fixture matching the production arena's row layout.
  *
  * Three inactive request entries guard every field. Setup/readback are outside

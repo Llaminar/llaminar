@@ -1079,6 +1079,8 @@ namespace llaminar2::test
     TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingKeepsLocalTPRankLocal)
     {
         const auto requested = rankAgnosticLocalCudaTPPlan();
+        requested->continuation_dense_policy_intent =
+            MoEContinuationDensePolicyIntent::Automatic;
         requested->domains.front().routed_compute_policy =
             RoutedExpertComputePolicy::Apportioned;
         const auto inventory = syntheticSingleRankTwoCudaInventory();
@@ -1094,6 +1096,10 @@ namespace llaminar2::test
         ASSERT_EQ(routed.participants.size(), 2u);
         EXPECT_EQ(routed.participants[0].hostname, "test-node");
         EXPECT_EQ(routed.participants[1].hostname, "test-node");
+        EXPECT_EQ(
+            resolved->continuation_domain_spec.effectiveDensePolicy(),
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
+            << "Inventory-resolved LocalTP must default to collective-free decode";
 
         // The dense and routed views must encode identical rank-local intent.
         ASSERT_EQ(resolved->dense_domains.size(), 1u);

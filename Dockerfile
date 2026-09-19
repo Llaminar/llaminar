@@ -89,6 +89,7 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
      scripts/docker/install-cutlass.sh \
+     scripts/docker/apply-rccl-capture-patch.sh \
      /tmp/install-scripts/
 COPY scripts/docker/patches/ /tmp/install-scripts/patches/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
@@ -209,6 +210,7 @@ RUN --mount=type=cache,target=/root/.ccache \
         done; \
         rm -f /tmp/rccl.tar.gz; \
         printf '%s\n' "${RCCL_GIT_REF}" > /src/external/rccl/.llaminar-rccl-source-ref; \
+        bash /tmp/install-scripts/apply-rccl-capture-patch.sh /src/external/rccl; \
         echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
         if [ -n "${rccl_build_funcs}" ]; then \
             echo "==> [rccl] ONLY_FUNCS=${rccl_build_funcs}"; \
@@ -242,7 +244,8 @@ RUN --mount=type=cache,target=/root/.ccache \
         fi; \
         ln -sf librccl.so.1.0 /src/external/rccl/build/librccl.so.1; \
         ln -sf librccl.so.1 /src/external/rccl/build/librccl.so; \
-        printf '%s\n' "${RCCL_GIT_REF}" \
+        rccl_capture_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch | cut -d ' ' -f 1)"; \
+        printf '%s\n' "${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}" \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \

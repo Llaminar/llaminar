@@ -14131,6 +14131,163 @@ namespace
         }
     }
 
+    /**
+     * @brief Minimal decode router for a graph-proven unique-owner resident set.
+     *
+     * Replica-aware scheduling carries participant load arrays and maintenance
+     * arguments that a capacity-proven single-resident graph cannot consume.
+     * This distinct kernel ABI removes that state while retaining exactly the
+     * same 256-thread probability reduction and top-k arithmetic as the full
+     * production router.  The active runtime bank remains device-owned and is
+     * authenticated on every replay.
+     *
+     * @tparam UpdateRuntimeHistogram Whether this graph publishes Dynamic
+     *         residency evidence.
+     */
+    template <bool UpdateRuntimeHistogram>
+    __global__ void softmax_topk_decode_unique_owner_runtime_kernel(
+        float *__restrict__ logits,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs)
+    {
+        __shared__ float values[kMaxExperts];
+        __shared__ float reductions[kThreads];
+        __shared__ int red_idx[kThreads];
+        __shared__ int selected[kMaxTopK];
+        __shared__ float selected_weights[kMaxTopK];
+
+        float local_max = -INFINITY;
+        for (int expert = threadIdx.x; expert < num_experts;
+             expert += blockDim.x)
+        {
+            local_max = fmaxf(local_max, logits[expert]);
+        }
+        reductions[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] = fmaxf(
+                    reductions[threadIdx.x],
+                    reductions[threadIdx.x + stride]);
+            __syncthreads();
+        }
+        const float max_value = reductions[0];
+
+        float local_sum = 0.0f;
+        for (int expert = threadIdx.x; expert < num_experts;
+             expert += blockDim.x)
+        {
+            const float probability = expf(logits[expert] - max_value);
+            values[expert] = probability;
+            local_sum += probability;
+        }
+        reductions[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float denominator = reductions[0];
+        for (int expert = threadIdx.x; expert < num_experts;
+             expert += blockDim.x)
+        {
+            const float probability =
+                denominator > 0.0f ? values[expert] / denominator : 0.0f;
+            values[expert] = probability;
+            logits[expert] = probability;
+        }
+        __syncthreads();
+
+        moe_select_topk_probabilities_block(
+            values,
+            num_experts,
+            top_k,
+            selected,
+            selected_weights,
+            reductions,
+            red_idx);
+
+        if (threadIdx.x != 0)
+            return;
+
+        const uint32_t execution_bank =
+            runtime_require_decode_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return;
+        const bool shape_ok = runtime_shape_ok(
+            runtime, execution_bank, num_experts, top_k);
+        if (!runtime_route_assignment_ledger_ok(runtime, top_k))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "unique-owner decode route ledger is absent or undersized");
+            return;
+        }
+        const auto &bank = runtime_placement_banks(runtime)[execution_bank];
+        if (shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "unique-owner decode graph observed a replicated expert");
+            return;
+        }
+
+        float topk_sum = 0.0f;
+        for (int slot = 0; slot < top_k; ++slot)
+            topk_sum += selected_weights[slot];
+        const bool collect_histogram =
+            UpdateRuntimeHistogram &&
+            runtime_histogram_admits_rows(*runtime);
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected[slot];
+            const float weight = normalize_weights && topk_sum > 0.0f
+                                     ? selected_weights[slot] / topk_sum
+                                     : selected_weights[slot];
+            bool local_compute = false;
+            if (shape_ok && expert_id >= 0 && expert_id < num_experts)
+            {
+                local_compute = bank.local_compute_mask[expert_id] != 0u;
+                runtime->topk_expert_ids[slot] =
+                    local_compute ? expert_id : -1;
+                runtime->topk_weights[slot] =
+                    local_compute ? weight : 0.0f;
+                runtime->route_participant_ids[slot] =
+                    runtime_expert_owner(bank, expert_id);
+            }
+            if (write_legacy_outputs)
+            {
+                legacy_indices[slot] = static_cast<float>(expert_id);
+                legacy_weights[slot] = weight;
+            }
+            if constexpr (UpdateRuntimeHistogram)
+            {
+                if (!collect_histogram || expert_id < 0 ||
+                    expert_id >= num_experts)
+                {
+                    continue;
+                }
+                atomicAdd(
+                    reinterpret_cast<unsigned long long *>(
+                        &runtime_selected_histogram(*runtime, 0u)[expert_id]),
+                    static_cast<unsigned long long>(1));
+                if (shape_ok && local_compute)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(
+                            &runtime_local_histogram(*runtime, 0u)[expert_id]),
+                        static_cast<unsigned long long>(1));
+                }
+            }
+        }
+    }
+
     __global__ void decode_route_select_runtime_kernel(
         const int *__restrict__ expert_indices,
         const float *__restrict__ expert_weights,
@@ -21106,6 +21263,63 @@ extern "C"
         }
 #undef LLAMINAR_LAUNCH_DECODE_ROUTE
         return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
+    }
+
+    /**
+     * @brief Launch the minimal unique-owner CUDA decode router.
+     *
+     * The device kernel traps if the active runtime bank contains a replica;
+     * callers may not recover by replaying the replica-aware graph.
+     */
+    bool cudaMoE_softmax_topk_decode_unique_owner_runtime(
+        float *logits,
+        void *runtime_layer,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        int device_idx,
+        void *stream)
+    {
+        if (!logits || !runtime_layer || !stream || num_experts <= 0 ||
+            num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
+            top_k > kMaxTopK || top_k > num_experts ||
+            (write_legacy_outputs && (!legacy_indices || !legacy_weights)))
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        if (update_runtime_histogram)
+        {
+            softmax_topk_decode_unique_owner_runtime_kernel<true>
+                <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                    logits,
+                    static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
+                    legacy_indices,
+                    legacy_weights,
+                    num_experts,
+                    top_k,
+                    normalize_weights,
+                    write_legacy_outputs);
+        }
+        else
+        {
+            softmax_topk_decode_unique_owner_runtime_kernel<false>
+                <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                    logits,
+                    static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
+                    legacy_indices,
+                    legacy_weights,
+                    num_experts,
+                    top_k,
+                    normalize_weights,
+                    write_legacy_outputs);
+        }
+        return finishLaunch(
+            "cudaMoE_softmax_topk_decode_unique_owner_runtime");
     }
 
     bool cudaMoE_decode_route_select_runtime(const int *expert_indices, const float *expert_weights,

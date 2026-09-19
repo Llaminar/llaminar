@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -86,7 +87,11 @@ namespace llaminar2
             if (partition_total <= 0 || partition_start < 0 || partition_count <= 0 ||
                 partition_start > partition_total - partition_count)
             {
-                throw std::invalid_argument("GDN partition range is invalid");
+                throw std::invalid_argument(
+                    "GDN partition range is invalid: start=" +
+                    std::to_string(partition_start) +
+                    " count=" + std::to_string(partition_count) +
+                    " total=" + std::to_string(partition_total));
             }
             if (global_value_heads % global_key_heads != 0)
             {
@@ -136,7 +141,11 @@ namespace llaminar2
             if (partition_total <= 0 || partition_start < 0 || partition_count <= 0 ||
                 partition_start > partition_total - partition_count)
             {
-                throw std::invalid_argument("GDN partition range is invalid");
+                throw std::invalid_argument(
+                    "GDN partition range is invalid: start=" +
+                    std::to_string(partition_start) +
+                    " count=" + std::to_string(partition_count) +
+                    " total=" + std::to_string(partition_total));
             }
             if (global_value_heads % global_key_heads != 0)
             {

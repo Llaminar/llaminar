@@ -4,8 +4,8 @@
  *
  * These tests inject driver-shaped matrices and never enumerate or occupy a
  * physical accelerator.  They lock down the production rule that native
- * NCCL/RCCL remains authoritative whenever any peer edge exists, while the
- * mapped sparse protocol is reserved for proven no-P2P or heterogeneous cells.
+ * NCCL/RCCL remains authoritative whenever any peer edge exists, while a
+ * proven no-P2P homogeneous cell uses mapped sparse routing for both phases.
  */
 
 #include "backends/ComputeBackend.h"
@@ -95,22 +95,45 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoEOverlayNodeLocalRouteTransport,
-         NativeCollectivesWinWheneverHomogeneousP2PExists)
+         HomogeneousPolicyUsesMappedSparseOnlyWithoutP2P)
     {
         const std::vector<DeviceId> cuda_devices{
             DeviceId::cuda(0), DeviceId::cuda(1)};
         EXPECT_EQ(
-            selectMoEOverlayNodeLocalRouteTransport(
+            selectMoEOverlayNodeLocalRouteTransportPolicy(
                 cuda_devices, PeerAccessCoverage::Complete),
-            MoEOverlayNodeLocalRouteTransport::NativeCollective);
+            (MoEOverlayNodeLocalRouteTransportPolicy{
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+                .decode =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+            }));
         EXPECT_EQ(
-            selectMoEOverlayNodeLocalRouteTransport(
+            selectMoEOverlayNodeLocalRouteTransportPolicy(
                 cuda_devices, PeerAccessCoverage::Partial),
-            MoEOverlayNodeLocalRouteTransport::NativeCollective);
+            (MoEOverlayNodeLocalRouteTransportPolicy{
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+                .decode =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+            }));
+        const auto no_p2p = selectMoEOverlayNodeLocalRouteTransportPolicy(
+            cuda_devices, PeerAccessCoverage::None);
         EXPECT_EQ(
-            selectMoEOverlayNodeLocalRouteTransport(
-                cuda_devices, PeerAccessCoverage::None),
+            no_p2p.ordinary_prefill,
             MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_EQ(
+            no_p2p.decode,
+            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_EQ(
+            no_p2p.forPhase(
+                MoEOverlayNodeLocalRoutePhase::OrdinaryPrefill),
+            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_EQ(
+            no_p2p.forPhase(MoEOverlayNodeLocalRoutePhase::Decode),
+            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_TRUE(no_p2p.resolved());
+        EXPECT_TRUE(no_p2p.requiresMappedExchange());
     }
 
     TEST(Test__MoEOverlayNodeLocalRouteTransport,
@@ -118,12 +141,18 @@ namespace llaminar2::test
     {
         const std::vector<DeviceId> mixed_devices{
             DeviceId::cuda(3), DeviceId::rocm(1)};
+        const auto mixed_policy =
+            selectMoEOverlayNodeLocalRouteTransportPolicy(
+                mixed_devices, std::nullopt);
         EXPECT_EQ(
-            selectMoEOverlayNodeLocalRouteTransport(
-                mixed_devices, std::nullopt),
+            mixed_policy.ordinary_prefill,
             MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_EQ(
+            mixed_policy.decode,
+            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+        EXPECT_TRUE(mixed_policy.requiresMappedExchange());
         EXPECT_THROW(
-            (void)selectMoEOverlayNodeLocalRouteTransport(
+            (void)selectMoEOverlayNodeLocalRouteTransportPolicy(
                 mixed_devices, PeerAccessCoverage::None),
             std::invalid_argument);
     }
@@ -134,21 +163,21 @@ namespace llaminar2::test
         const std::vector<DeviceId> cuda_devices{
             DeviceId::cuda(0), DeviceId::cuda(1)};
         EXPECT_THROW(
-            (void)selectMoEOverlayNodeLocalRouteTransport(
+            (void)selectMoEOverlayNodeLocalRouteTransportPolicy(
                 cuda_devices, std::nullopt),
             std::invalid_argument);
         EXPECT_THROW(
-            (void)selectMoEOverlayNodeLocalRouteTransport(
+            (void)selectMoEOverlayNodeLocalRouteTransportPolicy(
                 std::vector<DeviceId>{DeviceId::cuda(0)},
                 PeerAccessCoverage::None),
             std::invalid_argument);
         EXPECT_THROW(
-            (void)selectMoEOverlayNodeLocalRouteTransport(
+            (void)selectMoEOverlayNodeLocalRouteTransportPolicy(
                 std::vector<DeviceId>{DeviceId::cpu(), DeviceId::cuda(0)},
                 std::nullopt),
             std::invalid_argument);
         EXPECT_THROW(
-            (void)selectMoEOverlayNodeLocalRouteTransport(
+            (void)selectMoEOverlayNodeLocalRouteTransportPolicy(
                 std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(0)},
                 PeerAccessCoverage::Complete),
             std::invalid_argument);

@@ -1547,7 +1547,9 @@ namespace llaminar2
         int router_q8_hidden_blocks_cap_ = 0;
         std::vector<RouterFP16GateCacheEntry> router_fp16_gate_cache_;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
-
+        /** Capture-time resident-set contract for one-token routing. */
+        RoutedExpertResidentSetPolicy prepared_decode_resident_set_policy_ =
+            RoutedExpertResidentSetPolicy::ReplicaAware;
         // Phase 4: GPU-side expert grouping state (for prepareExpertGroups)
         int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices
         int *d_group_offsets_ = nullptr;       ///< [num_experts] exclusive prefix sums

@@ -189,9 +189,14 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_FALSE(config.dry_run);
     EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
     EXPECT_EQ(config.routed_expert_owner_order, RoutedExpertOwnerOrder::Ordinal);
-    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
-    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
-    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
+    EXPECT_EQ(
+        config.moe_hot_expert_cache.kind,
+        MoEHotExpertCacheConfig::Kind::Off);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 0.0f);
+    EXPECT_EQ(
+        config.moe_hot_expert_cache.resolveCap(
+            256, /*dynamic_rebalance_enabled=*/true),
+        0);
     EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
     EXPECT_EQ(
@@ -1325,8 +1330,10 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_EmptyString_ReturnsDefault
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
-    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
-    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+    EXPECT_EQ(
+        config.moe_hot_expert_cache.kind,
+        MoEHotExpertCacheConfig::Kind::Off);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 0.0f);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)

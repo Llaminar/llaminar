@@ -126,6 +126,16 @@ namespace llaminar2
              */
             RoutedExpertRowExecutionPolicy routed_row_execution_policy =
                 RoutedExpertRowExecutionPolicy::ParticipantAssigned;
+            /**
+             * @brief Immutable decode resident-set cardinality.
+             *
+             * Graph lowering may select `UniqueOwner` only after physical
+             * capacity admission proves that no replica cache exists. The
+             * backend then captures a smaller router kernel with no replica
+             * scheduler state or scratch.
+             */
+            RoutedExpertResidentSetPolicy routed_resident_set_policy =
+                RoutedExpertResidentSetPolicy::ReplicaAware;
             bool force_grouped_verifier_prefill_for_decode = false;
             /**
              * @brief Device-owned absolute position row shared with RoPE.

@@ -937,6 +937,54 @@ namespace
     }
 
     /**
+     * @brief Concrete replicated-dense graphs retain frozen weight ownership.
+     *
+     * A LocalTP context can coordinate only routed-expert publication while
+     * the dense graph remains replicated.  Such a graph intentionally has no
+     * TensorParallelConfig.  The injected-context factory must therefore gate
+     * canonical WeightPlan materialization on the concrete ModelContext and
+     * WeightManager authorities, never on dense tensor sharding.  Otherwise it
+     * rebuilds pointer-derived binding ids after preparation and the first
+     * captured GDN projection observes a different source tensor in
+     * PreparedWeightStore.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         ConcreteReplicatedDenseOverlayDoesNotRequireDenseTPForFrozenWeights)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t materialization_begin =
+            source.find("bool configured_from_frozen = false;");
+        const size_t schema_begin = source.find(
+            "auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);",
+            materialization_begin);
+        ASSERT_NE(materialization_begin, std::string::npos);
+        ASSERT_NE(schema_begin, std::string::npos);
+
+        const std::string authority_gate = withoutFactorySourceWhitespace(
+            source.substr(
+                materialization_begin,
+                schema_begin - materialization_begin));
+        EXPECT_NE(
+            authority_gate.find(
+                "if(concrete_model_ctx&&concrete_weight_mgr)"),
+            std::string::npos)
+            << "concrete model and weight ownership must select the frozen path";
+        EXPECT_EQ(
+            authority_gate.find("if(graph_config.tp_config)"),
+            std::string::npos)
+            << "replicated dense ExpertOverlay intentionally has no dense TP config";
+        EXPECT_NE(
+            source.find(
+                "std::optional<DeviceId> lookup_device = device;"),
+            std::string::npos)
+            << "a replicated GPU graph must resolve raw operands through its exact device cache";
+    }
+
+    /**
      * @brief LLEP selection must validate, never synthesize, graph policy.
      *
      * The routed domain declaration is the authoritative description of

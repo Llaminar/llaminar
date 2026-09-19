@@ -1253,6 +1253,19 @@ extern "C"
         const int32_t *absolute_position_ids,
         int device_idx, void *stream);
 
+    bool cudaMoE_softmax_topk_decode_unique_owner_runtime(
+        float *logits,
+        void *runtime_layer,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_decode_route_select_runtime(
         const int *expert_indices, const float *expert_weights,
         void *runtime_layer,
@@ -4865,7 +4878,8 @@ namespace llaminar2
                       << " top_k=" << plan.top_k);
             return false;
         }
-
+        if (plan.kind == MoERouteLaunchKind::RuntimeDecode)
+            prepared_decode_resident_set_policy_ = plan.resident_set_policy;
         const DeviceId device = deviceId();
         if (!requireTensorOnDevice(
                 gate_weights, device, stream, "gate_weights"))
@@ -5229,26 +5243,49 @@ namespace llaminar2
             if (!route_ok)
                 return false;
         }
-        if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
-                                                 runtime_layer,
-                                                 legacy_indices, legacy_weights,
-                                                 num_experts, top_k, normalize_weights,
-                                                 write_legacy_outputs, update_runtime_histogram,
-                                                 row_execution_policy ==
-                                                     RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
-                                                 nullptr,
-                                                 nullptr,
-                                                 0u,
-                                                 nullptr,
-                                                 nullptr,
-                                                 0u,
-                                                 nullptr,
-                                                 nullptr,
-                                                 nullptr,
-                                                 -1,
-                                                 1u,
-                                                 absolute_position_ids_device,
-                                                 device_ordinal_, stream))
+        const bool unique_owner_route =
+            prepared_decode_resident_set_policy_ ==
+            RoutedExpertResidentSetPolicy::UniqueOwner;
+        const bool route_ready = unique_owner_route
+                                     ? cudaMoE_softmax_topk_decode_unique_owner_runtime(
+                                           d_route_logits_,
+                                           runtime_layer,
+                                           legacy_indices,
+                                           legacy_weights,
+                                           num_experts,
+                                           top_k,
+                                           normalize_weights,
+                                           write_legacy_outputs,
+                                           update_runtime_histogram,
+                                           device_ordinal_,
+                                           stream)
+                                     : cudaMoE_softmax_topk_decode_runtime(
+                                           d_route_logits_,
+                                           runtime_layer,
+                                           legacy_indices,
+                                           legacy_weights,
+                                           num_experts,
+                                           top_k,
+                                           normalize_weights,
+                                           write_legacy_outputs,
+                                           update_runtime_histogram,
+                                           row_execution_policy ==
+                                               RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+                                           nullptr,
+                                           nullptr,
+                                           0u,
+                                           nullptr,
+                                           nullptr,
+                                           0u,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           -1,
+                                           1u,
+                                           absolute_position_ids_device,
+                                           device_ordinal_,
+                                           stream);
+        if (!route_ready)
             return false;
 
         if (write_legacy_outputs)

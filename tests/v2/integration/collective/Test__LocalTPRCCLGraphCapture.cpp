@@ -2337,6 +2337,8 @@ TEST(Test__LocalTPRCCLGraphCapture, PrefillGraphCaptureBoundaryRendezvousBlocksU
  * of the same production reducer over the complete serial slot bank supplies
  * the byte oracle. Sweeping every verifier row count through depth fifteen,
  * plus M=31, catches count-dependent collective and launch-geometry holes.
+ * The widest case records 64 ordered broadcasts and bounds executable-node
+ * growth while checking that the captured transaction still replays exactly.
  */
 TEST(Test__LocalTPRCCLGraphCapture,
      RCCLCanonicalRouteRootedPublication_GraphCaptured_MTotal_ByteExact)
@@ -2421,6 +2423,9 @@ TEST(Test__LocalTPRCCLGraphCapture,
     ROCmMoEKernel root_reducer(kRoot);
     root_reducer.bindGPUStream(
         ExplicitGPUStream(static_cast<void *>(streams[0])));
+    ROCmMoEKernel peer_reducer(1);
+    peer_reducer.bindGPUStream(
+        ExplicitGPUStream(static_cast<void *>(streams[1])));
 
     std::vector<int> verifier_rows;
     for (int m = 1; m <= 16; ++m)
@@ -2482,6 +2487,14 @@ TEST(Test__LocalTPRCCLGraphCapture,
                 participant_host[static_cast<size_t>(participant)].end(),
                 route_tensor->mutable_data());
             ASSERT_TRUE(route_tensor->ensureOnDevice(
+                DeviceId::rocm(participant),
+                stream));
+            // The serial oracle runs before capture, but the captured reducer
+            // also consumes this tensor. Join its upload event to the exact
+            // participant stream now; capture may not import that external
+            // producer event after hipStreamBeginCapture().
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                route_tensor,
                 DeviceId::rocm(participant),
                 stream));
             ASSERT_EQ(
@@ -2555,7 +2568,12 @@ TEST(Test__LocalTPRCCLGraphCapture,
                         kTopK,
                         kDModel);
                 }
-                if (ok)
+                // The widest verifier case also stresses repeated captured
+                // completion-event handoffs. Every replayed broadcast is
+                // idempotent, so the byte oracle remains the serial reducer.
+                const int broadcast_count = m == kMaximumM ? 64 : 1;
+                for (int broadcast = 0; ok && broadcast < broadcast_count;
+                     ++broadcast)
                 {
                     ok = ctx->broadcastRawOnStream(
                         compact_outputs[static_cast<size_t>(participant)]
@@ -2616,6 +2634,22 @@ TEST(Test__LocalTPRCCLGraphCapture,
             ASSERT_EQ(result.instantiate_status, hipSuccess)
                 << "M=" << m << " participant=" << participant;
             ASSERT_NE(result.exec, nullptr);
+            if (m == kMaximumM)
+            {
+                ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+                size_t node_count = 0;
+                ASSERT_EQ(hipGraphGetNodes(result.graph, nullptr, &node_count),
+                          hipSuccess);
+                // HIP exposes transitive same-stream dependencies as graph
+                // edges (approximately n*(n-1)/2 here), even though replay
+                // remains one ordered stream. Bound executable node growth
+                // instead: the 64 rooted broadcasts must not acquire a
+                // nested per-collective graph or fallback transaction.
+                EXPECT_GE(node_count, 64u);
+                EXPECT_LE(node_count, 64u * 3u + 16u)
+                    << "participant=" << participant
+                    << " nodes=" << node_count;
+            }
         }
 
         Barrier launch_ready(2);
@@ -2673,11 +2707,176 @@ TEST(Test__LocalTPRCCLGraphCapture,
                 << " M=" << m << " participant=" << participant;
         }
 
+        /*
+         * Exercise the economical production candidate as a second complete
+         * captured transaction.  One allreduce publishes the independent
+         * route slots on both participants, after which both invoke the same
+         * ordered reducer.  This must remain byte-identical to both the serial
+         * oracle and the rooted reduce/fold/broadcast transaction above.
+         */
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            const hipStream_t stream =
+                streams[static_cast<size_t>(participant)];
+            FP32Tensor *const route_tensor =
+                route_slots[static_cast<size_t>(participant)].get();
+            std::copy(
+                participant_host[static_cast<size_t>(participant)].begin(),
+                participant_host[static_cast<size_t>(participant)].end(),
+                route_tensor->mutable_data());
+            ASSERT_TRUE(route_tensor->ensureOnDevice(
+                DeviceId::rocm(participant), stream));
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                route_tensor,
+                DeviceId::rocm(participant),
+                stream));
+            ASSERT_EQ(
+                hipMemsetAsync(
+                    compact_outputs[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr(),
+                    0xA5,
+                    output_elements * sizeof(float),
+                    stream),
+                hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+
+        Barrier allreduce_capture_started(2);
+        Barrier allreduce_capture_finished(2);
+        std::array<CaptureResult, 2> allreduce_results{};
+        auto capture_allreduce_participant = [&](int participant)
+        {
+            const size_t index = static_cast<size_t>(participant);
+            CaptureResult &result = allreduce_results[index];
+            const hipStream_t stream = streams[index];
+            result.begin_status = hipSetDevice(participant);
+            if (result.begin_status == hipSuccess)
+            {
+                result.begin_status = hipStreamBeginCapture(
+                    stream, hipStreamCaptureModeRelaxed);
+            }
+            allreduce_capture_started.arriveAndWait();
+
+            if (result.begin_status == hipSuccess)
+            {
+                GraphCaptureGuard guard;
+                bool ok = ctx->allreduceOnStream(
+                    route_slots[index].get(),
+                    "canonical_routes_allreduce",
+                    route_elements,
+                    stream,
+                    "fp32");
+                ROCmMoEKernel &reducer =
+                    participant == kRoot ? root_reducer : peer_reducer;
+                if (ok)
+                {
+                    ok = reducer.reduceCanonicalRouteContributions(
+                        route_slots[index].get(),
+                        compact_outputs[index].get(),
+                        m,
+                        kTopK,
+                        kDModel);
+                }
+                result.collective_ok = ok;
+            }
+
+            allreduce_capture_finished.arriveAndWait();
+            if (result.begin_status == hipSuccess && result.collective_ok)
+            {
+                result.end_status = hipSetDevice(participant);
+                if (result.end_status == hipSuccess)
+                {
+                    result.end_status = hipStreamEndCapture(
+                        stream, &result.graph);
+                }
+            }
+            if (result.end_status == hipSuccess && result.graph)
+            {
+                result.instantiate_status = hipSetDevice(participant);
+                if (result.instantiate_status == hipSuccess)
+                {
+                    result.instantiate_status = hipGraphInstantiate(
+                        &result.exec,
+                        result.graph,
+                        nullptr,
+                        nullptr,
+                        0);
+                }
+            }
+        };
+
+        std::thread allreduce_capture0(capture_allreduce_participant, 0);
+        std::thread allreduce_capture1(capture_allreduce_participant, 1);
+        allreduce_capture0.join();
+        allreduce_capture1.join();
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            const CaptureResult &result =
+                allreduce_results[static_cast<size_t>(participant)];
+            ASSERT_EQ(result.begin_status, hipSuccess)
+                << "allreduce M=" << m << " participant=" << participant;
+            ASSERT_TRUE(result.collective_ok)
+                << "allreduce M=" << m << " participant=" << participant;
+            ASSERT_EQ(result.end_status, hipSuccess)
+                << "allreduce M=" << m << " participant=" << participant;
+            ASSERT_EQ(result.instantiate_status, hipSuccess)
+                << "allreduce M=" << m << " participant=" << participant;
+            ASSERT_NE(result.exec, nullptr);
+        }
+
+        Barrier allreduce_launch_ready(2);
+        std::array<hipError_t, 2> allreduce_replay_status{
+            hipSuccess,
+            hipSuccess};
+        auto replay_allreduce_participant = [&](int participant)
+        {
+            const size_t index = static_cast<size_t>(participant);
+            hipError_t &status = allreduce_replay_status[index];
+            status = hipSetDevice(participant);
+            allreduce_launch_ready.arriveAndWait();
+            if (status == hipSuccess)
+            {
+                status = hipGraphLaunch(
+                    allreduce_results[index].exec,
+                    streams[index]);
+            }
+            if (status == hipSuccess)
+                status = hipStreamSynchronize(streams[index]);
+        };
+        std::thread allreduce_replay0(replay_allreduce_participant, 0);
+        std::thread allreduce_replay1(replay_allreduce_participant, 1);
+        allreduce_replay0.join();
+        allreduce_replay1.join();
+        ASSERT_EQ(allreduce_replay_status[0], hipSuccess) << "M=" << m;
+        ASSERT_EQ(allreduce_replay_status[1], hipSuccess) << "M=" << m;
+
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            downloadDeviceVector<float>(
+                participant,
+                static_cast<const float *>(
+                    compact_outputs[static_cast<size_t>(participant)]
+                        ->gpu_data_ptr()),
+                &actual[static_cast<size_t>(participant)]);
+            EXPECT_EQ(
+                std::memcmp(
+                    expected.data(),
+                    actual[static_cast<size_t>(participant)].data(),
+                    output_elements * sizeof(float)),
+                0)
+                << "Allreduce canonical publication drifted from serial-row bytes"
+                << " M=" << m << " participant=" << participant;
+            destroyCaptureResult(
+                allreduce_results[static_cast<size_t>(participant)]);
+        }
+
         destroyCaptureResult(capture_results[0]);
         destroyCaptureResult(capture_results[1]);
     }
 
     root_reducer.clearGPUStreamBinding();
+    peer_reducer.clearGPUStreamBinding();
     ASSERT_EQ(hipSetDevice(kRoot), hipSuccess);
     serial_output.reset();
     serial_route_slots.reset();

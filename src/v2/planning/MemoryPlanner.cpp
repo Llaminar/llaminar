@@ -403,6 +403,12 @@ MemoryPlan MemoryPlanner::plan(
         if (max_seq > 0)
             activation_seq = std::min(activation_seq, max_seq);
         activation_seq = std::max(1, activation_seq);
+        const bool replicated_dense_decode =
+            std::find(
+                cfg.additional_weight_sets.begin(),
+                cfg.additional_weight_sets.end(),
+                AdditionalPersistentWeightSet::ReplicatedDenseDecode) !=
+            cfg.additional_weight_sets.end();
         if (cfg.tensor_parallel_assignment.has_value())
         {
             const auto &assignment = *cfg.tensor_parallel_assignment;
@@ -423,6 +429,13 @@ MemoryPlan MemoryPlanner::plan(
             : (cfg.local_kv_heads > 0
                    ? cfg.local_kv_heads
                    : profile.n_kv_heads);
+        if (replicated_dense_decode)
+        {
+            // The phase-split graph stores complete attention K/V on every
+            // participant. The TP assignment still determines GDN state and
+            // prefill projection ownership; only the main KV bank is full.
+            local_kv_heads = profile.n_kv_heads;
+        }
         const int local_query_heads =
             cfg.tensor_parallel_assignment.has_value()
                 ? cfg.tensor_parallel_assignment->head_count
@@ -893,7 +906,8 @@ MemoryPlan MemoryPlanner::plan(
 
                     size_t terminal_vocab = static_cast<size_t>(
                         std::max(0, profile.vocab_size));
-                    if (cfg.mtp_terminal_logits_layout ==
+                    if (!replicated_dense_decode &&
+                        cfg.mtp_terminal_logits_layout ==
                         MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
                     {
                         terminal_vocab =
@@ -1017,6 +1031,14 @@ MemoryPlan MemoryPlanner::plan(
         {
             local_d_ff = std::max(1, profile.d_ff / cfg.total_shards);
         }
+        if (replicated_dense_decode)
+        {
+            // QwenGraphBase reserves one maximum-capacity arena for both
+            // phase graphs, so its resident activation widths are full even
+            // while the prefill weights remain TP-sharded.
+            local_n_heads = profile.n_heads;
+            local_d_ff = profile.d_ff;
+        }
 
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
@@ -1028,15 +1050,20 @@ MemoryPlan MemoryPlanner::plan(
                     .local_d_ff = local_d_ff,
                     .local_n_heads = local_n_heads,
                     .local_n_kv_heads = local_kv_heads,
-                    .local_vocab = cfg.tensor_parallel_assignment.has_value()
-                        ? cfg.tensor_parallel_assignment->vocab_count
-                        : 0,
+                    .local_vocab = replicated_dense_decode
+                        ? profile.vocab_size
+                        : (cfg.tensor_parallel_assignment.has_value()
+                               ? cfg.tensor_parallel_assignment->vocab_count
+                               : 0),
+                    .replicated_dense_decode = replicated_dense_decode,
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
                     .mtp_target_query_rows = cfg.mtp_target_query_rows,
                     .mtp_terminal_logits_layout =
-                        cfg.mtp_terminal_logits_layout,
+                        replicated_dense_decode
+                            ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
+                            : cfg.mtp_terminal_logits_layout,
                     .generation_request_capacity = cfg.generation_request_capacity,
                 },
                 cfg.device);
@@ -1079,27 +1106,34 @@ MemoryPlan MemoryPlanner::plan(
                         cfg.tensor_parallel_assignment.has_value(),
                     .local_d_ff = local_d_ff,
                     .local_d_ff_start =
-                        cfg.tensor_parallel_assignment.has_value()
+                        !replicated_dense_decode &&
+                                cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->d_ff_start
                             : 0,
                     .local_query_head_start =
-                        cfg.tensor_parallel_assignment.has_value()
+                        replicated_dense_decode
+                            ? 0
+                            : (cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->head_start
-                            : cfg.shard_index * local_n_heads,
+                            : cfg.shard_index * local_n_heads),
                     .local_query_heads = local_n_heads,
                     .local_kv_head_start =
-                        cfg.tensor_parallel_assignment.has_value()
+                        replicated_dense_decode
+                            ? 0
+                            : (cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->kv_head_start
-                            : cfg.shard_index * local_kv_heads,
+                            : cfg.shard_index * local_kv_heads),
                     .local_kv_heads = local_kv_heads,
                     .local_vocab_start =
-                        cfg.tensor_parallel_assignment.has_value()
+                        !replicated_dense_decode &&
+                                cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->vocab_start
                             : 0,
-                    .local_vocab =
-                        cfg.tensor_parallel_assignment.has_value()
+                    .local_vocab = replicated_dense_decode
+                        ? profile.vocab_size
+                        : (cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->vocab_count
-                            : 0,
+                            : 0),
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
@@ -1112,7 +1146,9 @@ MemoryPlan MemoryPlanner::plan(
                             ? cfg.mtp_target_query_rows
                             : 0,
                     .mtp_terminal_logits_layout =
-                        cfg.mtp_terminal_logits_layout,
+                        replicated_dense_decode
+                            ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
+                            : cfg.mtp_terminal_logits_layout,
                 });
             retained_workspace_bytes = std::min(
                 workspace_bytes,

@@ -40,6 +40,7 @@
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockMPITopology.h"
 #include "tensors/TensorSlice.h"
+#include "utils/ScopedGPUStream.h"
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -457,6 +458,18 @@ namespace
                         role,
                         engine.get(),
                         engine);
+                    // Production residency publication exposes both the exact
+                    // participant key and its domain alias from one owned
+                    // engine lifetime.  Graph lowering consumes the domain
+                    // alias after the owner mask has selected this device.
+                    registry.registerEngineForDomain(
+                        participant.domain_name,
+                        participant.device,
+                        /*layer_idx=*/0,
+                        expert,
+                        role,
+                        engine.get(),
+                        engine);
                 }
             }
         }
@@ -488,6 +501,57 @@ namespace
 
         plan->routed_tiers.push_back(RoutedExpertTier{
             .name = "hot",
+            .domain = domain_name,
+            .priority = 0,
+            .max_experts_per_layer = 2,
+            .memory_budget_bytes = 4096,
+            .fallback = true,
+        });
+        plan->placements.push_back(RoutedExpertLayerPlacement{
+            .layer = 0,
+            .routed_expert_tier = {0, 0},
+        });
+        return plan;
+    }
+
+    /**
+     * @brief Build a four-participant ROCm overlay with TP prefill and replicated decode.
+     *
+     * This is the smallest model-free representation of the production Ornith
+     * topology whose decode publication economics selected route-slot
+     * allreduce. Physical memory and weight materialization remain outside this
+     * graph-policy fixture.
+     */
+    std::shared_ptr<MoERoutedExpertPlacementPlan>
+    makeROCmPhaseSplitApportionedOverlayPlan(const std::string &domain_name)
+    {
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain = domain_name;
+        plan->base_model_domain = domain_name;
+        plan->shared_expert_domain = domain_name;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        plan->continuation_domain_spec.domain = domain_name;
+        plan->continuation_domain_spec.logical_root_participant = 0;
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
+        plan->continuation_domain_spec.hidden_layout =
+            MoEContinuationActivationLayout::ReplicatedHidden;
+        plan->continuation_domain_spec.shared_expert_uses_dense_tp = true;
+
+        std::vector<GlobalDeviceAddress> participants;
+        for (int ordinal = 0; ordinal < 4; ++ordinal)
+            participants.push_back(GlobalDeviceAddress::rocm(ordinal));
+        plan->domains.push_back(expertDomain(
+            domain_name,
+            ExecutionDomainScope::RANK_LOCAL,
+            CollectiveBackendType::RCCL,
+            RoutedExpertComputePolicy::Apportioned,
+            participants,
+            {}));
+        plan->routed_tiers.push_back(RoutedExpertTier{
+            .name = "priority_0",
             .domain = domain_name,
             .priority = 0,
             .max_experts_per_layer = 2,
@@ -585,7 +649,8 @@ namespace
             int seq_len,
             int batch_size,
             DeviceId device,
-            ForwardExecutionPhase phase)
+            ForwardExecutionPhase phase,
+            void *device_state_publication_stream = nullptr)
         {
             ForwardExecutionPhaseScope phase_scope(*this, phase);
             DecodeReplicatedDenseScope decode_dense_scope(
@@ -598,7 +663,7 @@ namespace
                 seq_len,
                 batch_size,
                 device,
-                /*device_state_publication_stream=*/nullptr);
+                device_state_publication_stream);
         }
 
         ComputeGraph buildAttentionGraphForTokenCount(
@@ -2164,6 +2229,115 @@ TEST(Test__Qwen35MoEGraph,
         prefill_graph.getNode("layer0_shared_expert_allreduce"),
         nullptr)
         << "Typed prefill remains tensor parallel even when M fits verifier capacity";
+}
+
+/**
+ * @brief ROCm replicated decode uses one canonical slot allreduce per MoE layer.
+ *
+ * This regression locks down the production graph shape selected by the
+ * measured four-device transport result. All participants fold the same
+ * original-order slot bank, so no root-only arithmetic or compact return
+ * broadcast remains in the transaction.
+ */
+TEST(Test__Qwen35MoEGraph,
+     ROCmPhaseSplitDecodeUsesCanonicalRouteSlotAllreduce)
+{
+    std::vector<GlobalDeviceAddress> devices;
+    for (int ordinal = 0; ordinal < 4; ++ordinal)
+        devices.push_back(GlobalDeviceAddress::rocm(ordinal));
+
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices(devices);
+    tp_ctx->setBackend(CollectiveBackendType::RCCL);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.default_device = DeviceId::rocm(0);
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.ffn_column_parallel = true;
+    config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    config.moe.local_expert_count = -1;
+    // This fixture proves only the immutable decode publication policy.  Do
+    // not implicitly request the production-default Dynamic controller: that
+    // authority has its own lifecycle tests and is unrelated to whether one
+    // complete captured publication uses allreduce or rooted collectives.
+    config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Off;
+    config.moe.routed_expert_plan =
+        makeROCmPhaseSplitApportionedOverlayPlan("rocm_phase_split");
+    config.moe.expert_overlay_runtime_plan =
+        resolveMoEExpertOverlayRuntimePlan(
+            config.moe.routed_expert_plan,
+            MoEExpertOverlayRuntimeResolverOptions{
+                .current_world_rank = 0,
+                .validate_mvp_root_reachability = false,
+            });
+    config.refreshMoEExecutionPolicy();
+
+    const auto model_ctx =
+        makeNodeTPOverlayModelContext(*config.moe.routed_expert_plan);
+    TestableQwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(
+        makeDecodeDenseBindingSource());
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    layer.shared_expert_gate_inp =
+        arena.fp32({static_cast<size_t>(config.d_model)});
+    auto buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/1,
+        config.d_model,
+        config.moe.num_experts,
+        config.moe.top_k);
+    ScopedGPUStream publication_stream(DeviceId::rocm(0));
+    ComputeGraph graph = graph_builder.buildFFNGraphForPhase(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        DeviceId::rocm(0),
+        ForwardExecutionPhase::Decode,
+        publication_stream.get());
+
+    ASSERT_NE(
+        graph.getNode("layer0_moe_canonical_routes_allreduce"),
+        nullptr);
+    const auto *allreduce_stage = dynamic_cast<const TPAllreduceStage *>(
+        graph.getNode("layer0_moe_canonical_routes_allreduce")->stage.get());
+    ASSERT_NE(allreduce_stage, nullptr);
+    EXPECT_EQ(
+        allreduce_stage->getArithmeticPolicy(),
+        TPAllreduceArithmeticPolicy::NativeCollective);
+    EXPECT_EQ(allreduce_stage->getPrecision(), "fp32");
+    ASSERT_NE(
+        graph.getNode("layer0_moe_canonical_routes_reduce"),
+        nullptr);
+    EXPECT_EQ(
+        graph.getNode("layer0_moe_canonical_routes_reduce_to_root"),
+        nullptr);
+    EXPECT_EQ(
+        graph.getNode("layer0_moe_canonical_routes_broadcast"),
+        nullptr);
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_reduce",
+        "layer0_moe_canonical_routes_allreduce"));
+
+    const auto *reduce_stage =
+        dynamic_cast<const MoECanonicalRouteReduceStage *>(
+            graph.getNode("layer0_moe_canonical_routes_reduce")
+                ->stage.get());
+    ASSERT_NE(reduce_stage, nullptr);
+    EXPECT_EQ(
+        reduce_stage->params().reduction_role,
+        MoECanonicalRouteReductionRole::AllreduceParticipant);
+    EXPECT_EQ(
+        reduce_stage->params().canonical_route_arithmetic,
+        MoECanonicalRouteArithmeticPolicy::
+            PreweightedContributionThenOrderedAdd);
+    ASSERT_TRUE(
+        getROCmBackend()->synchronizeStream(publication_stream.get(), 0));
 }
 
 TEST(Test__Qwen35MoEGraph, DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingAllreduce)

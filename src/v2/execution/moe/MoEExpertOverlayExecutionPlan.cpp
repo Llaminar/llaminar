@@ -1160,6 +1160,33 @@ namespace llaminar2
             }
         }
 
+        /* Automatic policy is deliberately finalized only after hardware
+         * binding. Before this point AUTO scope cannot distinguish a LocalTP
+         * group, which benefits from complete decode replicas, from NodeTP or
+         * global TP, which must remain tensor parallel. Explicit policy is
+         * immutable and never rewritten here. */
+        if (bound->continuation_dense_policy_intent ==
+            MoEContinuationDensePolicyIntent::Automatic)
+        {
+            const auto continuation = std::find_if(
+                bound->domains.begin(),
+                bound->domains.end(),
+                [&](const RoutedExpertDomain &domain)
+                {
+                    return domain.name == bound->continuation_domain;
+                });
+            if (continuation == bound->domains.end())
+            {
+                throw std::invalid_argument(
+                    "Automatic MoE dense-policy resolution has no bound continuation domain '" +
+                    bound->continuation_domain + "'");
+            }
+            bound->continuation_domain_spec.setDensePolicy(
+                defaultMoEContinuationDensePolicy(
+                    continuation->scope,
+                    continuation->participants.size()));
+        }
+
         /*
          * Dense-domain declarations are another view of the same named
          * hardware pools. Keep their participant addresses and rank bindings

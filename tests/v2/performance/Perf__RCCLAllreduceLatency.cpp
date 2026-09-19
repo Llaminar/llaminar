@@ -39,9 +39,11 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <barrier>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <thread>
 
 #include "fort.hpp"
 
@@ -183,9 +185,12 @@ namespace
         int num_devices_ = 0;
         bool initialized_ = false;
 
-        // Maximum buffer size (16 MB — enough for prefill allreduces)
-        // Prefill: 596 × 3584 × 4 = 8,553,472 bytes (~8.5 MB)
-        static constexpr size_t MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+        // Maximum buffer size covers Ornith's canonical prefill publication:
+        // 512 rows × (top-8 routes + four shared rank banks) × 2048 FP32.
+        // Keeping this exact production geometry in the harness prevents a
+        // small-message tuning result from being mistaken for the bandwidth-
+        // dominated collective that bounds the real four-card model.
+        static constexpr size_t MAX_BUFFER_BYTES = 64 * 1024 * 1024;
         static constexpr size_t MAX_BUFFER_FLOATS = MAX_BUFFER_BYTES / sizeof(float);
 
         void SetUp() override
@@ -1723,6 +1728,214 @@ namespace
                   << "  reduce median: " << reduce_only.median_us << " us\n"
                   << "  reduce + D2H median: "
                   << reduce_and_publish.median_us << " us\n";
+    }
+
+    /**
+     * @brief Measure the exact Ornith four-participant prefill publication.
+     *
+     * The production graph reduces eight independently owned route slots plus
+     * four independently owned shared-expert rank banks.  This test isolates
+     * the 48 MiB rooted transaction so RCCL topology/environment tuning can be
+     * evaluated without model kernels or profiler perturbation.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency,
+           OrnithPrefillCanonicalPublication_512x12x2048)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        constexpr size_t kCanonicalPublicationFloats =
+            512u * 12u * 2048u;
+        const auto reduce_only = benchReduceRootHostTimed(
+            kCanonicalPublicationFloats,
+            false,
+            "Ornith canonical FP32 reduce to continuation root");
+
+        std::cout << "\nOrnith canonical prefill publication ("
+                  << num_devices_ << " ROCm devices, 512x12x2048 FP32)\n"
+                  << "  reduce median: " << reduce_only.median_us
+                  << " us\n";
+    }
+
+    /**
+     * @brief Compare the captured four-participant decode publication shapes.
+     *
+     * One Ornith route row has eight original-order slots of 2048 FP32 values.
+     * Every slot has exactly one nonzero expert owner, so an allreduce of those
+     * independent slots preserves their bytes before the ordered local fold.
+     * This isolates the transport decision: the production rooted transaction
+     * reduces the slots and broadcasts a compact final row; the candidate
+     * publishes slots on all participants with one allreduce. The tiny ordered
+     * fold is deliberately omitted from both graphs and must be proven in the
+     * production regression before a lowering change can be retained.
+     */
+    TEST_F(Perf__RCCLAllreduceLatency, CapturedOrnithDecodeRoutePublication)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        constexpr size_t kRouteFloats = 8u * 2048u;
+        constexpr size_t kFinalFloats = 2048u;
+        constexpr int kRoutedLayers = 40;
+        constexpr int kWarmup = 8;
+        constexpr int kSamples = 60;
+        constexpr int kRoot = 0;
+
+        const auto measure = [&](bool rooted) -> LatencyResult
+        {
+            std::vector<hipGraph_t> graphs(static_cast<size_t>(num_devices_), nullptr);
+            std::vector<hipGraphExec_t> executables(static_cast<size_t>(num_devices_), nullptr);
+            std::vector<hipError_t> hip_status(static_cast<size_t>(num_devices_), hipSuccess);
+            std::vector<rccl::ncclResult_t> rccl_status(
+                static_cast<size_t>(num_devices_), rccl::ncclSuccess);
+            std::barrier capture_ready(num_devices_);
+            std::barrier operations_recorded(num_devices_);
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<size_t>(num_devices_));
+
+            // Every device records its own graph concurrently, exactly as the
+            // production LocalTP capture records symmetric participant graphs.
+            for (int participant = 0; participant < num_devices_; ++participant)
+            {
+                workers.emplace_back([&, participant]
+                {
+                    const size_t index = static_cast<size_t>(participant);
+                    auto &device = devices_[index];
+                    hip_status[index] = hipSetDevice(device.ordinal);
+                    if (hip_status[index] == hipSuccess)
+                    {
+                        hip_status[index] = hipStreamBeginCapture(
+                            device.stream, hipStreamCaptureModeRelaxed);
+                    }
+                    capture_ready.arrive_and_wait();
+
+                    if (hip_status[index] == hipSuccess)
+                    {
+                        for (int layer = 0; layer < kRoutedLayers; ++layer)
+                        {
+                            rccl_status[index] = rooted
+                                ? rccl::ncclReduce(
+                                      device.d_buffer, device.d_buffer,
+                                      kRouteFloats, rccl::ncclFloat,
+                                      rccl::ncclSum, kRoot, comms_[index],
+                                      device.stream)
+                                : rccl::ncclAllReduce(
+                                      device.d_buffer, device.d_buffer,
+                                      kRouteFloats, rccl::ncclFloat,
+                                      rccl::ncclSum, comms_[index],
+                                      device.stream);
+                            if (rccl_status[index] != rccl::ncclSuccess)
+                                break;
+                            if (rooted)
+                            {
+                                rccl_status[index] = rccl::ncclBroadcast(
+                                    device.d_buffer, device.d_buffer,
+                                    kFinalFloats, rccl::ncclFloat, kRoot,
+                                    comms_[index], device.stream);
+                                if (rccl_status[index] != rccl::ncclSuccess)
+                                    break;
+                            }
+                        }
+                    }
+                    operations_recorded.arrive_and_wait();
+
+                    if (hip_status[index] == hipSuccess &&
+                        rccl_status[index] == rccl::ncclSuccess)
+                    {
+                        hip_status[index] = hipStreamEndCapture(
+                            device.stream, &graphs[index]);
+                        if (hip_status[index] == hipSuccess)
+                        {
+                            hip_status[index] = hipGraphInstantiate(
+                                &executables[index], graphs[index],
+                                nullptr, nullptr, 0);
+                        }
+                    }
+                });
+            }
+            for (auto &worker : workers)
+                worker.join();
+
+            bool captured = true;
+            for (int participant = 0; participant < num_devices_; ++participant)
+            {
+                const size_t index = static_cast<size_t>(participant);
+                EXPECT_EQ(hip_status[index], hipSuccess)
+                    << "participant=" << participant
+                    << " rooted=" << rooted;
+                EXPECT_EQ(rccl_status[index], rccl::ncclSuccess)
+                    << "participant=" << participant
+                    << " rooted=" << rooted;
+                captured &= hip_status[index] == hipSuccess &&
+                            rccl_status[index] == rccl::ncclSuccess &&
+                            graphs[index] && executables[index];
+            }
+
+            std::vector<double> samples;
+            if (captured)
+            {
+                samples.reserve(kSamples);
+                for (int iteration = -kWarmup; iteration < kSamples; ++iteration)
+                {
+                    for (int participant = 0; participant < num_devices_; ++participant)
+                    {
+                        const size_t index = static_cast<size_t>(participant);
+                        HIP_CHECK(hipSetDevice(devices_[index].ordinal));
+                        HIP_CHECK(hipMemsetAsync(
+                            devices_[index].d_buffer, 0,
+                            kRouteFloats * sizeof(float),
+                            devices_[index].stream));
+                    }
+                    const auto start = std::chrono::steady_clock::now();
+                    for (int participant = 0; participant < num_devices_; ++participant)
+                    {
+                        const size_t index = static_cast<size_t>(participant);
+                        HIP_CHECK(hipSetDevice(devices_[index].ordinal));
+                        HIP_CHECK(hipGraphLaunch(
+                            executables[index], devices_[index].stream));
+                    }
+                    for (int participant = 0; participant < num_devices_; ++participant)
+                    {
+                        const size_t index = static_cast<size_t>(participant);
+                        HIP_CHECK(hipSetDevice(devices_[index].ordinal));
+                        HIP_CHECK(hipStreamSynchronize(devices_[index].stream));
+                    }
+                    const auto finish = std::chrono::steady_clock::now();
+                    if (iteration >= 0)
+                    {
+                        samples.push_back(
+                            std::chrono::duration<double, std::micro>(
+                                finish - start).count() / kRoutedLayers);
+                    }
+                }
+            }
+
+            for (int participant = 0; participant < num_devices_; ++participant)
+            {
+                const size_t index = static_cast<size_t>(participant);
+                HIP_CHECK(hipSetDevice(devices_[index].ordinal));
+                if (executables[index])
+                    HIP_CHECK(hipGraphExecDestroy(executables[index]));
+                if (graphs[index])
+                    HIP_CHECK(hipGraphDestroy(graphs[index]));
+            }
+            return computeStats(
+                samples, kRouteFloats * sizeof(float),
+                rooted ? "captured rooted reduce+broadcast"
+                       : "captured route-slot allreduce");
+        };
+
+        const LatencyResult rooted = measure(true);
+        const LatencyResult allreduce = measure(false);
+        ASSERT_EQ(rooted.iterations, kSamples);
+        ASSERT_EQ(allreduce.iterations, kSamples);
+        std::cout << "\nOrnith decode publication, " << num_devices_
+                  << " ROCm devices, " << kRoutedLayers
+                  << " captured routed layers; median per layer:\n"
+                  << "  rooted reduce+broadcast: " << rooted.median_us
+                  << " us (p95 " << rooted.p95_us << " us)\n"
+                  << "  route-slot allreduce: " << allreduce.median_us
+                  << " us (p95 " << allreduce.p95_us << " us)\n";
     }
 
     // ============================================================================

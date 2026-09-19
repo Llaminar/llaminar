@@ -451,6 +451,10 @@ namespace llaminar2
 
         const std::vector<int> no_routed_experts(
             static_cast<std::size_t>(profile.n_layers), 0);
+        const DenseParallelPolicy continuation_dense_policy =
+            overlay_plan.continuation_domain_spec.effectiveDensePolicy();
+        const bool continuation_uses_dense_tp =
+            denseParallelPolicyEnablesTP(continuation_dense_policy);
         std::vector<DevicePlanConfig> configs;
         const auto makeConfig = [&](
             DeviceId device,
@@ -669,10 +673,24 @@ namespace llaminar2
         for (const auto &shard : continuationShards(
                  rank_plan, input.rank_execution_kind))
         {
+            /*
+             * A LocalTP context can be retained solely as the sparse expert
+             * collective.  It does not make the dense graph tensor-parallel.
+             * Publish the dense model's actual physical layout into the BOM:
+             * replicated participants each own shard 0/1, while TP policies
+             * preserve the execution plan's exact participant coordinates.
+             * This same typed policy drives runtime's
+             * bindLocalTPContextWithoutDenseSharding() path, so preflight and
+             * materialization cannot disagree about which bytes are whole.
+             */
+            const int dense_shard_index =
+                continuation_uses_dense_tp ? shard.shard_index : 0;
+            const int dense_total_shards =
+                continuation_uses_dense_tp ? shard.total_shards : 1;
             auto config = makeConfig(
                 shard.device,
-                shard.shard_index,
-                shard.total_shards,
+                dense_shard_index,
+                dense_total_shards,
                 DeviceExecutionMemoryRole::ContinuationGraph);
             config.first_layer = shard.first_layer;
             config.last_layer = shard.last_layer;
@@ -686,10 +704,13 @@ namespace llaminar2
                     tp_devices.push_back(participant.toLocalDeviceId());
                 config.local_tp_backend = BackendSelector::resolve(
                     rank_plan.local_tp_backend, tp_devices);
-                bindRankLocalTPAssignment(
-                    config,
-                    rank_plan.local_tp_devices,
-                    rank_plan.local_tp_weights);
+                if (continuation_uses_dense_tp)
+                {
+                    bindRankLocalTPAssignment(
+                        config,
+                        rank_plan.local_tp_devices,
+                        rank_plan.local_tp_weights);
+                }
             }
             else if (rank_plan.usesLocalPP())
             {
@@ -708,10 +729,6 @@ namespace llaminar2
                     {
                         continue;
                     }
-                    bindRankLocalTPAssignment(
-                        config,
-                        stage_tp.devices,
-                        stage_tp.tp_weights);
                     std::vector<DeviceId> tp_devices;
                     tp_devices.reserve(stage_tp.devices.size());
                     for (const auto &participant : stage_tp.devices)
@@ -719,6 +736,13 @@ namespace llaminar2
                             participant.toLocalDeviceId());
                     config.local_tp_backend = BackendSelector::resolve(
                         stage_tp.tp_backend, tp_devices);
+                    if (continuation_uses_dense_tp)
+                    {
+                        bindRankLocalTPAssignment(
+                            config,
+                            stage_tp.devices,
+                            stage_tp.tp_weights);
+                    }
                     break;
                 }
             }

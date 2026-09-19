@@ -63,16 +63,17 @@ namespace llaminar2
             tier.fallback = true;
             plan->routed_tiers.push_back(std::move(tier));
 
-            /*
-             * The ordinary LocalTP dense/shared trunk remains tensor parallel.
-             * Expert apportionment is an independent axis and is represented by
-             * the domain above; it must not silently replicate dense weights.
-             */
+            /* The universal LocalTP authority uses the same phase-specific
+             * dense default as an authored rank-local overlay. Physical-memory
+             * admission accounts the complete decode replicas before any
+             * graph or prepared weight can be materialized. */
             plan->continuation_domain_spec.domain =
                 kImplicitDomainName;
             plan->continuation_domain_spec.logical_root_participant = 0;
             plan->continuation_domain_spec.setDensePolicy(
-                DenseParallelPolicy::TensorParallel);
+                defaultMoEContinuationDensePolicy(
+                    plan->domains.back().scope,
+                    request.local_tp_participants.size()));
             plan->continuation_domain_spec.hidden_layout =
                 MoEContinuationActivationLayout::ReplicatedHidden;
             plan->authority_execution =

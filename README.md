@@ -32,9 +32,10 @@ Llaminar supports the following model architectures initially:
 ## Benchmarks
 
 For homogeneous multi-GPU MoE, `--moe-hot-expert-cache` is a replica-cache
-upper bound. Physical admission fits the largest positive cache alongside
-the complete model and graph allocations; it never disables Dynamic movement
-to fit. The resolved capacity is reported during setup.
+upper bound and defaults to `off`. An explicit positive count or percentage
+opts into replicas; physical admission then fits the largest positive cache
+alongside the complete model and graph allocations. It never disables Dynamic
+movement to fit, and the resolved capacity is reported during setup.
 
 Production benchmarks use the canonical model-parity cells tagged for E2E
 certification. The [production CI guide](docs/production-ci.md) describes the

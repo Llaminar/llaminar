@@ -362,6 +362,7 @@ namespace llaminar2
         {
             const MoERouteLaunchPlan launch_plan{
                 .kind = routeLaunchKind(),
+                .resident_set_policy = params_.routed_resident_set_policy,
                 .physical_rows = params_.seq_len,
                 .d_model = params_.d_model,
                 .num_experts = params_.num_experts,

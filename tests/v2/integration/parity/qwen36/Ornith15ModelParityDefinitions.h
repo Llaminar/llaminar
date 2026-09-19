@@ -9,14 +9,57 @@
  * ordinary E2E selector chooses its exact production configuration. The
  * fine-tune's larger weights require the two-CUDA overlay instead of one CUDA;
  * ROCm covers both one device and the two-device overlay, alongside CPU NodeTP.
+ * The independent Q8 accuracy workload retains the production four-ROCm drift
+ * reproducer and its CPU control without granting an HTTP certification tag.
  */
 #pragma once
 
 #include "Qwen36ModelParityDefinitions.h"
+#include "Ornith15AccuracyWorkload.h"
 #include <span>
 
 namespace llaminar2::test::parity::qwen36
 {
+    /**
+     * @brief Declare exact-weight, long-decode Ornith Q8 mathematical coverage.
+     * @param topology Production participant and collective identity.
+     * @param reference_directory Isolated CPU/FP32 Hugging Face checkpoint pack.
+     * @return Standard MTP and, for overlays, placement/movement matrix input.
+     *
+     * The same frozen prompt and 89-step horizon serve the CPU control and
+     * failing four-ROCm topology. Existing strict checkpoint/CSV and mandatory
+     * prefix-restore contracts remain intact; this diagnostic does not acquire
+     * generation baselines or expand HTTP certification eligibility.
+     */
+    inline ModelParityDefinition ornith15MoEQ8AccuracyParityDefinition(
+        ModelParityTopologyDefinition topology,
+        std::string reference_directory)
+    {
+        const bool overlay = static_cast<bool>(topology.expert_overlay_plan);
+        auto definition = qwen36MoEParityDefinition(
+            std::move(topology), std::move(reference_directory),
+            overlay ? qwen36MoEExpertOverlayThresholds()
+                    : qwen36MoESingleDeviceThresholds());
+        definition.model.test_id = "Ornith15MoE_35B_Q8_0_NaturalDecode";
+        definition.model.model_path =
+            "/opt/llaminar-models/Ornith-1.5-35B-Q8_0.gguf";
+        definition.model.prompt = kOrnith15AccuracyPrompt;
+        definition.model.token_ids = ornith15AccuracyTokenIds();
+        definition.model.decode_steps = kOrnith15AccuracyDecodeSteps;
+        definition.e2e_certifiable.clear();
+        return definition;
+    }
+
+    /** @return The reported four-MI50 RCCL topology, with automatic capacity. */
+    inline ModelParityTopologyDefinition ornith15MoERocm4ExpertOverlayTopology()
+    {
+        return qwen36MoEGPUExpertOverlayTopology(
+            "LocalTP_RCCL_4xROCm_ExpertOverlay", "ornith15_moe_rocm_local_tp",
+            Collective::RCCL, CollectiveBackendType::RCCL,
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1),
+             GlobalDeviceAddress::rocm(2), GlobalDeviceAddress::rocm(3)});
+    }
+
     /**
      * @brief Add Ornith's single-ROCm and overlay certification definitions.
      * @param definitions Canonical Qwen3.6 topology/feature definitions.

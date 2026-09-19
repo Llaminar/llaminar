@@ -289,7 +289,13 @@ namespace llaminar2
         const int resolver_local_n_heads = config.local_n_heads > 0
                                                ? config.local_n_heads
                                                : config_.local_n_heads;
-        if (config_.qkv_column_parallel && resolver_local_n_heads > 0 && config_.n_heads > 0)
+        // A phase-split arena must accommodate a complete replicated decode
+        // graph on every participant.  Its full-width GDN buffers therefore
+        // have no TP offset, even though the prefill graph still owns only the
+        // participant's sharded weights and head interval.
+        if (config_.qkv_column_parallel &&
+            !config_.dense_tp_decode_replicated &&
+            resolver_local_n_heads > 0 && config_.n_heads > 0)
         {
             const GDNHeadAssignment assignment =
                 GDNHeadAssignment::fromPartition(

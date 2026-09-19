@@ -881,6 +881,24 @@ if(HAVE_ROCM)
         set(RCCL_COMMIT "${RCCL_GIT_REF}")
         message(STATUS "V2: RCCL source is not a git checkout and has no ref marker; using ${RCCL_COMMIT} for cache validation")
     endif()
+
+    # A pinned upstream ref alone is not a complete runtime identity: the HIP
+    # event-wait capture patch changes the source-built RCCL DSO. Apply it
+    # idempotently and include its contents in the build cache key.
+    set(RCCL_CAPTURE_PATCH_FILE
+        "${REPO_ROOT}/scripts/docker/patches/rccl-hip-capture-event-wait.patch")
+    execute_process(
+        COMMAND bash "${REPO_ROOT}/scripts/docker/apply-rccl-capture-patch.sh"
+            "${RCCL_EXTERNAL_DIR}"
+        RESULT_VARIABLE RCCL_CAPTURE_PATCH_RESULT
+        ERROR_VARIABLE RCCL_CAPTURE_PATCH_ERROR
+    )
+    if(NOT RCCL_CAPTURE_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "V2: RCCL capture patch failed: ${RCCL_CAPTURE_PATCH_ERROR}")
+    endif()
+    file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}")
     
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
@@ -891,8 +909,8 @@ if(HAVE_ROCM)
         string(STRIP "${RCCL_BUILD_COMMIT_RAW}" RCCL_BUILD_COMMIT)
     endif()
     
-    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_COMMIT)
-        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_COMMIT}, rebuilding...")
+    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_BUILD_ID)
+        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_BUILD_ID}, rebuilding...")
         file(REMOVE_RECURSE "${RCCL_BUILD_DIR}")
     endif()
     
@@ -945,7 +963,7 @@ if(HAVE_ROCM)
         endif()
         
         # Write version file for cache validation
-        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_COMMIT}\n")
+        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_BUILD_ID}\n")
         
         message(STATUS "V2: RCCL built successfully in ${RCCL_BUILD_DIR}")
     else()

@@ -140,14 +140,14 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
-     * @brief Return one homogeneous two-GPU ExpertOverlay topology.
+     * @brief Return one homogeneous rank-local GPU ExpertOverlay topology.
      *
      * Capacity is deliberately automatic: the sole priority-zero fallback tier
      * fills to the production planner's exact admitted device capacity after
      * every named allocation. No model-specific expert-count or byte cap is
      * embedded in parity configuration.
      */
-    inline ModelParityTopologyDefinition qwen36MoEGPU2ExpertOverlayTopology(
+    inline ModelParityTopologyDefinition qwen36MoEGPUExpertOverlayTopology(
         std::string test_id,
         std::string domain_name,
         Collective collective,
@@ -174,7 +174,7 @@ namespace llaminar2::test::parity::qwen36
     /** @return Two-CUDA NCCL ExpertOverlay topology. */
     inline ModelParityTopologyDefinition qwen36MoECuda2ExpertOverlayTopology()
     {
-        return qwen36MoEGPU2ExpertOverlayTopology(
+        return qwen36MoEGPUExpertOverlayTopology(
             "LocalTP_NCCL_2xCUDA_ExpertOverlay",
             "qwen36_moe_cuda_local_tp",
             Collective::NCCL,
@@ -185,7 +185,7 @@ namespace llaminar2::test::parity::qwen36
     /** @return Two-ROCm RCCL ExpertOverlay topology. */
     inline ModelParityTopologyDefinition qwen36MoERocm2ExpertOverlayTopology()
     {
-        return qwen36MoEGPU2ExpertOverlayTopology(
+        return qwen36MoEGPUExpertOverlayTopology(
             "LocalTP_RCCL_2xROCm_ExpertOverlay",
             "qwen36_moe_rocm_local_tp",
             Collective::RCCL,

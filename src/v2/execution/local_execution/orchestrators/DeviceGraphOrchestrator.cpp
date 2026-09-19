@@ -16324,15 +16324,19 @@ namespace llaminar2
                 hybrid_config_storage->gdn_time_step_rank = config.gdn.time_step_rank;
                 hybrid_config_storage->n_heads = config.n_heads;
                 hybrid_config_storage->local_n_heads = config.local_n_heads;
-                if (const auto *assignment = config.getAssignment())
-                {
-                    hybrid_config_storage->local_head_start = assignment->head_start;
-                }
-                else if (config.local_n_heads > 0)
-                {
-                    hybrid_config_storage->local_head_start =
-                        config.tp_device_idx * config.local_n_heads;
-                }
+                /*
+                 * GraphConfig owns the resolved dense head interval.  In an
+                 * ExpertOverlay graph tp_device_idx can identify a sparse
+                 * collective participant while dense weights and GDN state
+                 * remain fully replicated.  Reconstructing an offset from
+                 * that participant index therefore invents a second, false
+                 * dense-sharding authority (participant 1 would begin after
+                 * the end of the full head range).  Assignment builders set
+                 * head_start for genuinely sharded graphs and full-dimension
+                 * builders set it to zero, so consume that typed interval
+                 * directly for both regimes.
+                 */
+                hybrid_config_storage->local_head_start = config.head_start;
                 kv_config.hybrid_config = hybrid_config_storage.get();
 
                 LOG_DEBUG("[DeviceGraphOrchestrator] Hybrid KV cache config: "
@@ -51605,50 +51609,9 @@ namespace llaminar2
             return false;
         }
 
-        if (configured_depth_policy.isOrdinary())
-        {
-            /*
-             * The external prefill transaction owns the first overlay reader.
-             * Close it before composing the retained ordinary parent so every
-             * later decode iteration can acquire and release exactly once. This
-             * is identical to the speculative parent preparation; ordinary
-             * generation differs only in the forward/sampler body.
-             */
-            if (moe_overlay_epoch_execution_binding_)
-            {
-                auto &loop = mtp_device_generation_loop_graph_;
-                void *const parent_stream = loop.stream.get();
-                if (!parent_stream ||
-                    !waitForLiveInferenceStateReadyForObservation(
-                        parent_stream,
-                        "ordinary_device_generation_parent_materialization",
-                        DeviceTimelineRole::DeviceGenerationController) ||
-                    !prepareMoEOverlayEpochForInternalParent(
-                        parent_stream,
-                        "ordinary_device_generation_parent_materialization"))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Ordinary device-generation parent could not close the externally scheduled ExpertOverlay boundary"
-                              << " device=" << state_.device_id.toString());
-                    return false;
-                }
-            }
-            std::string error;
-            if (draft_depth != 0 ||
-                !materializeOrdinaryDeviceGenerationLoopGraph(
-                    sampling_mode,
-                    &error,
-                    moe_overlay_epoch_execution_binding_
-                        ? OrdinaryGenerationComposition::ExpertOverlay
-                        : OrdinaryGenerationComposition::CompleteLocal))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
-                return false;
-            }
-            return true;
-        }
-
         /*
-         * The fixed parent places maintenance after each transaction. The
+         * Both ordinary and speculative parents place maintenance after each
+         * committed transaction. The
          * externally orchestrated first transaction therefore crosses the same
          * boundary here, on each participant's persistent worker, before
          * composition. Besides preserving exact once-only cadence semantics,
@@ -51690,19 +51653,23 @@ namespace llaminar2
         {
             auto &loop = mtp_device_generation_loop_graph_;
             void *const parent_stream = loop.stream.get();
+            const char *const parent_name =
+                configured_depth_policy.isOrdinary()
+                    ? "ordinary_device_generation_parent_materialization"
+                    : "device_generation_parent_materialization";
             if (!parent_stream ||
                 !waitForLiveInferenceStateReadyForObservation(
                     parent_stream,
-                    "device_generation_parent_materialization",
+                    parent_name,
                     DeviceTimelineRole::DeviceGenerationController) ||
                 (owns_dynamic_device_maintenance &&
                  !waitForPendingDeviceMoERebalanceMaintenance(
                      parent_stream,
                      DeviceTimelineRole::MTPSidecarGraph,
-                     "device_generation_parent_materialization")) ||
+                     parent_name)) ||
                 !prepareMoEOverlayEpochForInternalParent(
                     parent_stream,
-                    "device_generation_parent_materialization"))
+                    parent_name))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation could not close and capture the externally scheduled ExpertOverlay boundary"
                           << " device=" << state_.device_id.toString());
@@ -51711,6 +51678,21 @@ namespace llaminar2
         }
 
         std::string error;
+        if (configured_depth_policy.isOrdinary())
+        {
+            if (draft_depth != 0 ||
+                !materializeOrdinaryDeviceGenerationLoopGraph(
+                    sampling_mode,
+                    &error,
+                    moe_overlay_epoch_execution_binding_
+                        ? OrdinaryGenerationComposition::ExpertOverlay
+                        : OrdinaryGenerationComposition::CompleteLocal))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
+                return false;
+            }
+            return true;
+        }
         if (!materializeMTPDeviceGenerationLoopGraph(
                 request_count,
                 draft_depth,

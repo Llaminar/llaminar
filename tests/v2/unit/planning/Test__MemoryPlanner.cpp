@@ -1513,6 +1513,47 @@ TEST(Test__MemoryPlanner,
         std::invalid_argument);
 }
 
+/**
+ * @test A replicated decode weight view also changes the physical state BOM.
+ *
+ * Both backends retain full attention K/V and full-width arena/workspace rows
+ * alongside TP-sharded prefill. Reserving only the extra weights lets automatic
+ * expert capacity consume memory required by the first captured graph.
+ */
+TEST(Test__MemoryPlanner,
+     PhaseSplitDenseDecodePricesFullKVAndCapturedActivationFamily)
+{
+    const auto profile = createMoEOverlayProfile();
+    for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto sharded = overlayDeviceConfig(device);
+        sharded.shard_index = 0;
+        sharded.total_shards = 2;
+        sharded.local_kv_heads = profile.n_kv_heads / 2;
+        sharded.local_tp_backend = device.is_cuda()
+            ? CollectiveBackendType::NCCL
+            : CollectiveBackendType::RCCL;
+
+        auto phase_split = sharded;
+        phase_split.additional_weight_sets =
+            resolveAdditionalPersistentWeightSets(
+                DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+                phase_split.total_shards,
+                MTPRuntimeConfig{});
+
+        const auto sharded_plan = MemoryPlanner::plan(profile, {sharded});
+        const auto split_plan = MemoryPlanner::plan(profile, {phase_split});
+        ASSERT_EQ(sharded_plan.devices.size(), 1u);
+        ASSERT_EQ(split_plan.devices.size(), 1u);
+        const auto &tp = sharded_plan.devices.front();
+        const auto &split = split_plan.devices.front();
+        EXPECT_GT(split.kv_cache_bytes(), tp.kv_cache_bytes());
+        EXPECT_GT(split.activation_bytes(), tp.activation_bytes());
+        EXPECT_GT(split.workspace_bytes(), tp.workspace_bytes());
+        EXPECT_GT(split.total_bytes(), tp.total_bytes());
+    }
+}
+
 TEST(Test__MemoryPlanner,
      MirroredMTPVocabularyPricesPrimaryShardAndBothFullViews)
 {

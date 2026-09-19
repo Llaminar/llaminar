@@ -791,8 +791,8 @@ namespace llaminar2
                 config.moe_device_controller_fabric;
             graph_config.moe.node_local_route_exchange =
                 config.moe_node_local_route_exchange;
-            graph_config.moe.node_local_route_transport =
-                config.moe_node_local_route_transport;
+            graph_config.moe.node_local_route_transport_policy =
+                config.moe_node_local_route_transport_policy;
             graph_config.dense_tp_enabled = !overlayPlanDisablesDenseTP(*plan);
             graph_config.dense_tp_decode_replicated =
                 graph_config.dense_tp_enabled &&
@@ -1870,7 +1870,18 @@ namespace llaminar2
 
         int tp_rank_or_device_index = 0;
         int tp_domain = -1;
-        std::optional<DeviceId> lookup_device = DeviceId::cpu();
+        /*
+         * A frozen binding that targets a GPU must resolve through that
+         * device's cache identity even when dense tensor parallelism is off.
+         * Replicated-dense ExpertOverlay creates one graph per participant;
+         * resolving every graph through the CPU cache aliases raw router,
+         * norm, bias, and recurrent operands to one mutable TensorBase.  The
+         * concurrent graph preparations then migrate that single allocation
+         * between devices.  WeightManager still shares immutable
+         * preparation-only sources, but raw graph operands receive an exact
+         * device-qualified owner.
+         */
+        std::optional<DeviceId> lookup_device = device;
         if (tp_config)
         {
             const auto &assignment = options.tp_rank_override >= 0
@@ -4199,9 +4210,9 @@ namespace llaminar2
             return model_ctx->getWeightForDevice(name, device);
         };
 
-        // Configure weights: PP-aware vs full.
-        // When pp_stage_config is present but model context is non-concrete (e.g. MockModelContext
-        // in unit tests), skip PP weight materialization and fall through to the full model path.
+            // Configure weights: PP-aware vs full.
+            // When pp_stage_config is present but model context is non-concrete (e.g. MockModelContext
+            // in unit tests), skip PP weight materialization and fall through to the full model path.
         auto pp_concrete_ctx = config.pp_stage_config.has_value()
                                    ? std::dynamic_pointer_cast<ModelContext>(model_ctx)
                                    : nullptr;
@@ -4398,66 +4409,81 @@ namespace llaminar2
                           "using interface weight path (test/mock)");
             }
             bool configured_from_frozen = false;
-            if (graph_config.tp_config)
+            auto concrete_model_ctx =
+                std::dynamic_pointer_cast<ModelContext>(model_ctx);
+            auto concrete_weight_mgr = concrete_model_ctx
+                                           ? concrete_model_ctx->concreteWeightManager()
+                                           : nullptr;
+            if (concrete_model_ctx && concrete_weight_mgr)
             {
-                auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
-                auto concrete_weight_mgr = concrete_model_ctx ? concrete_model_ctx->concreteWeightManager() : nullptr;
-                if (concrete_model_ctx && concrete_weight_mgr)
+                /*
+                 * A concrete production model always materializes one frozen
+                 * weight authority, independently of dense tensor sharding.
+                 * Replicated-dense ExpertOverlay graphs deliberately retain a
+                 * LocalTP context for sparse publication while clearing
+                 * tp_config.  Using tp_config as the gate here sent those
+                 * graphs through the legacy pointer-derived setWeights() path
+                 * after preparation, assigning new binding ids to already
+                 * prepared handles.  The graph then named a different source
+                 * tensor than PreparedWeightStore.  A null TP config simply
+                 * asks buildSingleDeviceWeightPlan() for full dense tensors;
+                 * it never means that a concrete model may abandon its frozen
+                 * ownership contract.
+                 */
+                auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);
+                auto validation = validateLayerWeights(
+                    *schema_factory,
+                    graph_config.n_layers > 0
+                        ? graph_config.n_layers
+                        : concrete_model_ctx->totalBlockCount(),
+                    [concrete_model_ctx](const std::string &name)
+                    { return concrete_model_ctx->hasTensor(name); });
+
+                if (!validation.success)
                 {
-                    auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);
-                    auto validation = validateLayerWeights(
-                        *schema_factory,
-                        graph_config.n_layers > 0
-                            ? graph_config.n_layers
-                            : concrete_model_ctx->totalBlockCount(),
-                        [concrete_model_ctx](const std::string &name)
-                        { return concrete_model_ctx->hasTensor(name); });
+                    LOG_ERROR("[InferenceRunner] " << validation.error_message());
+                    return nullptr;
+                }
 
-                    if (!validation.success)
-                    {
-                        LOG_ERROR("[InferenceRunner] " << validation.error_message());
-                        return nullptr;
-                    }
-
-                    if (!appendMTPWeightsIfRequested(
-                            config,
-                            *concrete_model_ctx,
-                            architecture,
-                            validation,
-                            "[InferenceRunner] LocalTP"))
-                    {
-                        return nullptr;
-                    }
-
-                    auto weight_plan = buildSingleDeviceWeightPlan(
-                        *concrete_weight_mgr,
+                if (!appendMTPWeightsIfRequested(
+                        config,
                         *concrete_model_ctx,
+                        architecture,
                         validation,
-                        device,
-                        graph_config.tp_config.get(),
-                        nullptr,
-                        SingleDeviceWeightPlanOptions{
-                            .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
-                            .replicate_routed_experts =
-                                needsReplicatedRoutedExpertWeights(graph_config),
-                        });
-                    weight_plan = includeGraphLocalOverlayParticipantWeights(
-                        std::move(weight_plan),
-                        *concrete_model_ctx,
-                        graph_config,
-                        device,
-                        config.prepared_weight_admission);
-                    if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
-                        return nullptr;
-                    auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
-                    auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
-                    auto legacy_weights = toLegacyModelWeights(weight_bindings);
+                        "[InferenceRunner] LocalTP"))
+                {
+                    return nullptr;
+                }
 
-                    if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
-                    {
-                        LOG_ERROR("[InferenceRunner] Missing global weights from materialized LocalTP bindings");
-                        return nullptr;
-                    }
+                auto weight_plan = buildSingleDeviceWeightPlan(
+                    *concrete_weight_mgr,
+                    *concrete_model_ctx,
+                    validation,
+                    device,
+                    graph_config.tp_config.get(),
+                    nullptr,
+                    SingleDeviceWeightPlanOptions{
+                        .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                        .replicate_routed_experts =
+                            needsReplicatedRoutedExpertWeights(graph_config),
+                    });
+                weight_plan = includeGraphLocalOverlayParticipantWeights(
+                    std::move(weight_plan),
+                    *concrete_model_ctx,
+                    graph_config,
+                    device,
+                    config.prepared_weight_admission);
+                if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
+                    return nullptr;
+                auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
+                auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
+                auto legacy_weights = toLegacyModelWeights(weight_bindings);
+
+                if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
+                {
+                    LOG_ERROR("[InferenceRunner] Missing global weights from materialized LocalTP bindings");
+                    return nullptr;
+                }
 
                     // LocalTP dense weights are tensor-sharded through the
                     // weight plan, but ordinary MoE routed experts still need
@@ -4585,7 +4611,6 @@ namespace llaminar2
                         orchestrator->setDecodeReplicatedDenseWeightSet(std::move(decode_replicated_dense_weights));
                     orchestrator->initializePreparedWeightStore(device);
                     configured_from_frozen = true;
-                }
             }
 
             if (!configured_from_frozen)

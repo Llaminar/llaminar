@@ -32,6 +32,11 @@ struct ActivationGraphMemoryGeometry
     int local_n_heads = 0;          ///< Participant-local query head count.
     int local_n_kv_heads = 0;       ///< Participant-local KV head count.
     int local_vocab = 0;            ///< Participant-local vocabulary slice.
+    /**
+     * The phase-split policy retains full-width decode arena rows beside a
+     * TP-sharded prefill graph, including a separate full-KV handoff pair.
+     */
+    bool replicated_dense_decode = false;
     int first_layer = 0;            ///< First main-model layer assigned here.
     int last_layer = -1;            ///< Last main-model layer assigned here.
     int total_shards = 1;           ///< Dense tensor-parallel participant count.

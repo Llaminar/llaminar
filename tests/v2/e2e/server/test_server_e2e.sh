@@ -2037,7 +2037,6 @@ require_prefill_capture = (
     "require-prefill-graph-capture" in suite_option_set
     or "prefill-graph-probe" in suite_option_set
 )
-require_prefill_replay = "prefill-graph-probe" in suite_option_set
 require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
 require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_set
 require_stochastic_mtp = "stochastic-mtp-probe" in suite_option_set
@@ -2094,11 +2093,18 @@ expect_decode_replay = (
     or "require-decode-graph-replay" in suite_option_set
 )
 
+if require_prefill_capture and not is_gpu:
+    print("FAIL: suite required a GPU prefill graph, but execution has no GPU")
+    sys.exit(0)
+
 if is_gpu:
+    # Setup can materialize a retained prefill executable without launching
+    # a synthetic request. This policy matches that evidence to real replay
+    # by owner and bucket; do not require a second literal "capture" record.
     graph_capture_validation = validate_graph_capture_policy(
         records,
         execution.device_kinds,
-        require_prefill_lifecycle=expect_prefill_phase,
+        require_prefill_lifecycle=(expect_prefill_phase or require_prefill_capture),
         decode_requirement=(DecodeGraphRequirement.REPLAY if expect_decode_replay
                             else DecodeGraphRequirement.CAPTURE),
     )
@@ -2249,16 +2255,6 @@ if suite_option_set.intersection({"e2e-certification", "generation-regression"})
         except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
             print(f"FAIL: generation transport/journal evidence: {error}")
             sys.exit(0)
-
-if require_prefill_capture:
-    if not has_record("prefill_graph_phase", "forward_graph", {"capture_phase": "capture"}):
-        print("FAIL: suite required prefill graph capture but no capture phase was recorded")
-        sys.exit(0)
-
-if require_prefill_replay:
-    if not has_record("prefill_graph_phase", "forward_graph", {"capture_phase": "replay"}):
-        print("FAIL: suite required prefill graph replay but no replay phase was recorded")
-        sys.exit(0)
 
 if is_gpu and is_mtp:
     if not (

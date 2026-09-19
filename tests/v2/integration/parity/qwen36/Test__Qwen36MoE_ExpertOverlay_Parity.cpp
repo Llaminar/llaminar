@@ -38,7 +38,7 @@ using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    /** @return Canonical two-GPU and two-socket CPU single-tier overlay cases. */
+    /** @return Canonical overlay cases, including the Ornith four-ROCm reproducer. */
     const std::vector<ModelParityCase> &qwen36MoEExpertOverlayCases()
     {
         static const auto cases = []
@@ -55,8 +55,12 @@ namespace
                     qwen36MoEExpertOverlayThresholds()),
             };
 
+            auto all_definitions = withOrnith15CertificationModels(definitions);
+            all_definitions.push_back(ornith15MoEQ8AccuracyParityDefinition(
+                ornith15MoERocm4ExpertOverlayTopology(),
+                "pytorch_ornith15_q8_natural_decode_rocm4_snapshots"));
             std::vector<ModelParityCase> expanded;
-            for (const auto &definition : withOrnith15CertificationModels(definitions))
+            for (const auto &definition : all_definitions)
             {
                 auto definition_cases =
                     expandModelParityDefinition(definition);

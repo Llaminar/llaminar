@@ -1010,6 +1010,44 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndI
 
 }
 
+/**
+ * @brief A sparse collective participant index must not become dense ownership.
+ *
+ * ExpertOverlay can retain a multi-participant LocalTP context solely for
+ * routed-expert publication while every participant owns the complete dense
+ * graph.  Participant one used to reconstruct `local_head_start` as
+ * `tp_device_idx * local_n_heads`, producing the impossible interval
+ * `[n_heads, 2 * n_heads)` during hybrid GDN cache construction.  This fixture
+ * exercises the ordinary cache-construction boundary without a device or
+ * model and proves that the graph-declared `[head_start, local_n_heads)`
+ * interval remains authoritative.
+ */
+TEST_F(
+    Test__DeviceGraphOrchestrator,
+    ReplicatedDenseHybridGDNDoesNotShardBySparseParticipantIndex)
+{
+    GraphConfig replicated = makeMaintenanceMoEGraphConfig();
+    replicated.layer_types = {"gdn", "full_attention"};
+    replicated.head_start = 0;
+    replicated.local_n_heads = replicated.n_heads;
+    replicated.local_n_kv_heads = replicated.n_kv_heads;
+    replicated.dense_tp_enabled = false;
+    replicated.qkv_column_parallel = false;
+    replicated.tp_device_idx = 1;
+    replicated.local_rank = 1;
+    replicated.tp_config.reset();
+
+    DeviceGraphOrchestrator participant_one(
+        std::make_shared<Qwen35MoEGraph>(replicated, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(participant_one.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        /*max_seq_len=*/16,
+        DeviceId::cpu()))
+        << "Sparse participant identity must not alter replicated dense GDN geometry";
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)
 {
     config_.n_layers = 3;

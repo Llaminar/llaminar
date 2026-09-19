@@ -234,6 +234,92 @@ TEST(Test__WeightManagerMaterialize, ProducesFrozenBindingsFromPlan)
     EXPECT_EQ(frozen.optionalLayer(0, "missing.weight"), nullptr);
 }
 
+/**
+ * @brief Replicated GPU graphs share sources but never raw device operands.
+ *
+ * Replicated-dense ExpertOverlay creates one complete graph per GPU while the
+ * routed collective remains multi-participant.  GEMM preparation may safely
+ * read one immutable host tensor because each participant publishes its own
+ * packed device allocation.  Router, norm, bias, and recurrent operands are
+ * read directly by the graph and therefore require distinct TensorBase
+ * identities.  This is the device-free reproduction of a four-ROCm startup
+ * race where every graph bound the same `@CPU` router tensor and concurrent
+ * preparation migrated it to the last device.
+ */
+TEST(Test__WeightManagerMaterialize,
+     ReplicatedDenseGraphsKeepRawOperandsDeviceQualified)
+{
+    constexpr const char *kRouter = "blk.0.ffn_gate_inp.weight";
+    constexpr const char *kBias = "blk.0.ssm_dt.bias";
+    constexpr const char *kGemm = "blk.0.ffn_up.weight";
+
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor(kRouter, {8, 16})
+                      .addFP32RandomTensor(kBias, {8})
+                      .addFP32RandomTensor(kGemm, {32, 16})
+                      .build();
+
+    WeightManager manager(*loader);
+    WeightShardingConfig sharding;
+    manager.setWeightShardingConfig(sharding);
+
+    const DeviceId first_device = DeviceId::rocm(0);
+    const DeviceId second_device = DeviceId::rocm(1);
+
+    auto router_first = manager.getWeightForDevice(kRouter, first_device);
+    auto router_second = manager.getWeightForDevice(kRouter, second_device);
+    auto bias_first = manager.getWeightForDevice(kBias, first_device);
+    auto bias_second = manager.getWeightForDevice(kBias, second_device);
+    auto gemm_first = manager.getWeightForDevice(kGemm, first_device);
+    auto gemm_second = manager.getWeightForDevice(kGemm, second_device);
+
+    ASSERT_TRUE(router_first);
+    ASSERT_TRUE(router_second);
+    ASSERT_TRUE(bias_first);
+    ASSERT_TRUE(bias_second);
+    ASSERT_TRUE(gemm_first);
+    ASSERT_TRUE(gemm_second);
+    EXPECT_NE(router_first.get(), router_second.get());
+    EXPECT_NE(bias_first.get(), bias_second.get());
+    EXPECT_EQ(gemm_first.get(), gemm_second.get());
+    EXPECT_TRUE(gemm_first->isHostResident())
+        << "a preparation-only source must not be copied once per GPU";
+
+    auto materialize_for = [&](DeviceId device, uint64_t model_id)
+    {
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.model_id = ModelContextId{model_id};
+        strategy.devices = {device};
+
+        WeightPlan plan(strategy);
+        for (const char *name : {kRouter, kBias, kGemm})
+        {
+            WeightRequirement requirement;
+            requirement.canonical_name = name;
+            requirement.target_device = device;
+            requirement.lookup_device = device;
+            requirement.host_policy =
+                WeightHostPolicy::RequiredUntilGraphMaterialized;
+            plan.add(requirement);
+        }
+        return manager.materialize(plan);
+    };
+
+    auto first = materialize_for(first_device, 301);
+    auto second = materialize_for(second_device, 302);
+    EXPECT_EQ(first.layer(0, "ffn_gate_inp.weight").tensor,
+              router_first.get());
+    EXPECT_EQ(second.layer(0, "ffn_gate_inp.weight").tensor,
+              router_second.get());
+    EXPECT_NE(first.layer(0, "ffn_gate_inp.weight").tensor,
+              second.layer(0, "ffn_gate_inp.weight").tensor);
+    EXPECT_NE(first.layer(0, "ssm_dt.bias").tensor,
+              second.layer(0, "ssm_dt.bias").tensor);
+    EXPECT_EQ(first.layer(0, "ffn_up.weight").tensor,
+              second.layer(0, "ffn_up.weight").tensor);
+}
+
 TEST(Test__WeightManagerMaterialize,
      SharedExpertInputGateOwnsFP32StorageWithoutReformattingGateMatrix)
 {

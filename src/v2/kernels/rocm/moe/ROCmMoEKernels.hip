@@ -3250,6 +3250,98 @@ namespace
     }
 
     /**
+     * @brief Publish a route when capacity admits exactly one resident/expert.
+     *
+     * The graph chooses this contract only when no replica-cache slot exists.
+     * Keeping the implementation separate from replica-aware assignment lets
+     * LLVM omit participant load arrays and their private-memory spills from
+     * the overwhelmingly common static-owner decode kernel.  The active bank
+     * is still read on every replay, so an atomic Dynamic owner swap remains
+     * visible without recapture.
+     *
+     * @tparam UpdateRuntimeHistogram Whether this graph owns demand evidence.
+     */
+    template <bool UpdateRuntimeHistogram>
+    __device__ __forceinline__ void
+    runtime_publish_unique_owner_decode_dispatch(
+        DeviceMoELayerRuntimeView *runtime,
+        const int *selected_ids,
+        const float *selected_weights,
+        int num_experts,
+        int top_k,
+        float *legacy_indices,
+        float *legacy_weights,
+        bool write_legacy_outputs)
+    {
+        const uint32_t execution_bank =
+            runtime_require_decode_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return;
+        const bool shape_ok = runtime_shape_ok(
+            runtime, execution_bank, num_experts, top_k);
+        if (!runtime_route_assignment_ledger_ok(runtime, top_k))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "unique-owner decode route ledger is absent or undersized");
+            return;
+        }
+
+        const auto &bank = runtime_placement_banks(runtime)[execution_bank];
+        if (shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "unique-owner decode graph observed a replicated expert");
+            return;
+        }
+
+        const bool collect_histogram =
+            UpdateRuntimeHistogram &&
+            runtime_histogram_admits_rows(*runtime);
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected_ids[slot];
+            const float weight = selected_weights[slot];
+            bool local_compute = false;
+            if (shape_ok && expert_id >= 0 && expert_id < num_experts)
+            {
+                local_compute = bank.local_compute_mask[expert_id] != 0u;
+                runtime->topk_expert_ids[slot] =
+                    local_compute ? expert_id : -1;
+                runtime->topk_weights[slot] =
+                    local_compute ? weight : 0.0f;
+                runtime->route_participant_ids[slot] =
+                    runtime_expert_owner(bank, expert_id);
+            }
+
+            if (write_legacy_outputs && legacy_indices && legacy_weights)
+            {
+                legacy_indices[slot] = static_cast<float>(expert_id);
+                legacy_weights[slot] = weight;
+            }
+
+            if constexpr (UpdateRuntimeHistogram)
+            {
+                if (!collect_histogram || expert_id < 0 ||
+                    expert_id >= num_experts)
+                {
+                    continue;
+                }
+                atomicAdd(
+                    reinterpret_cast<unsigned long long *>(
+                        &runtime_selected_histogram(*runtime, 0u)[expert_id]),
+                    1ULL);
+                if (shape_ok && local_compute)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(
+                            &runtime_local_histogram(*runtime, 0u)[expert_id]),
+                        1ULL);
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Authenticate all durable transfer-slot claims in parallel.
      *
      * One lane scans a disjoint strided subset of the flattened
@@ -13350,6 +13442,115 @@ namespace
         }
         __syncthreads();
     }
+
+    /**
+     * @brief Select wave64 top-k from at most 256 experts without rescanning.
+     *
+     * Each lane owns the four expert ids congruent to its lane id.  It loads
+     * and sorts those candidates once, then advances its register-resident
+     * queue only when that lane wins the wave tournament.  The former router
+     * reread all 256 shared probabilities for each of the eight Qwen top-k
+     * slots and required a wave barrier after mutating the winning entry.
+     *
+     * The pair comparator is the same value-descending/id-ascending total
+     * order used by @ref moe_select_topk_probabilities_block, so this changes
+     * neither winner ids nor weights.  NaNs retain the former "not a
+     * candidate" semantics by carrying the sentinel id.  Only thread zero
+     * consumes the selected shared arrays after this helper, therefore no CTA
+     * publication barrier is needed.
+     */
+    __device__ __forceinline__ void
+    moe_select_topk_probabilities_wave64_register_queue(
+        const float *__restrict__ expert_probs,
+        int num_experts,
+        int top_k,
+        int *__restrict__ selected_ids,
+        float *__restrict__ selected_weights)
+    {
+        constexpr int kWaveWidth = 64;
+        const int lane = threadIdx.x & (kWaveWidth - 1);
+        if (threadIdx.x >= kWaveWidth)
+            return;
+
+        int id0 = lane;
+        int id1 = lane + kWaveWidth;
+        int id2 = lane + 2 * kWaveWidth;
+        int id3 = lane + 3 * kWaveWidth;
+        float value0 = id0 < num_experts ? expert_probs[id0] : -INFINITY;
+        float value1 = id1 < num_experts ? expert_probs[id1] : -INFINITY;
+        float value2 = id2 < num_experts ? expert_probs[id2] : -INFINITY;
+        float value3 = id3 < num_experts ? expert_probs[id3] : -INFINITY;
+
+        if (id0 >= num_experts || value0 != value0)
+            id0 = kDeviceMoEMaxExperts;
+        if (id1 >= num_experts || value1 != value1)
+            id1 = kDeviceMoEMaxExperts;
+        if (id2 >= num_experts || value2 != value2)
+            id2 = kDeviceMoEMaxExperts;
+        if (id3 >= num_experts || value3 != value3)
+            id3 = kDeviceMoEMaxExperts;
+
+#define LLAMINAR_MOE_SORT_PAIR_DESC(A, B)                                    \
+        do                                                                    \
+        {                                                                     \
+            if (moe_topk_pair_better(value##B, id##B, value##A, id##A))       \
+            {                                                                 \
+                const float swap_value = value##A;                            \
+                const int swap_id = id##A;                                    \
+                value##A = value##B;                                          \
+                id##A = id##B;                                                \
+                value##B = swap_value;                                        \
+                id##B = swap_id;                                              \
+            }                                                                 \
+        } while (false)
+
+        /* Five compare-swaps form a complete descending network for four. */
+        LLAMINAR_MOE_SORT_PAIR_DESC(0, 1);
+        LLAMINAR_MOE_SORT_PAIR_DESC(2, 3);
+        LLAMINAR_MOE_SORT_PAIR_DESC(0, 2);
+        LLAMINAR_MOE_SORT_PAIR_DESC(1, 3);
+        LLAMINAR_MOE_SORT_PAIR_DESC(1, 2);
+#undef LLAMINAR_MOE_SORT_PAIR_DESC
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            float best_value = value0;
+            int best_id = id0;
+            for (int offset = kWaveWidth / 2; offset > 0; offset >>= 1)
+            {
+                const float other_value = __shfl_down(best_value, offset);
+                const int other_id = __shfl_down(best_id, offset);
+                if (moe_topk_pair_better(
+                        other_value,
+                        other_id,
+                        best_value,
+                        best_id))
+                {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+
+            const int winner = __shfl(best_id, 0);
+            if (lane == 0)
+            {
+                selected_ids[slot] = best_id;
+                selected_weights[slot] = best_value;
+            }
+            if (winner < num_experts &&
+                lane == (winner & (kWaveWidth - 1)))
+            {
+                value0 = value1;
+                id0 = id1;
+                value1 = value2;
+                id1 = id2;
+                value2 = value3;
+                id2 = id3;
+                value3 = -INFINITY;
+                id3 = kDeviceMoEMaxExperts;
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -14364,6 +14565,17 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     }
 }
 
+/**
+ * @brief Publish one wave64 decode route with compile-time maintenance policy.
+ *
+ * Static graphs instantiate `<false, false>` so LLVM can remove every
+ * histogram atomic, ready-wave pointer, and rebalance control branch from the
+ * captured router.  Observe/Dynamic graphs retain exactly the evidence and
+ * apply work they own.  This mirrors CUDA's production policy split and keeps
+ * inactive maintenance state from consuming SGPRs or scratch on every routed
+ * layer.
+ */
+template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance>
 __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     float *__restrict__ logits,                       // [num_experts] IN logits, OUT probabilities
     DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -14373,7 +14585,6 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     int num_experts, int top_k,
     bool normalize_weights,
     bool write_legacy_outputs,
-    bool update_runtime_histogram,
     bool fully_replicated_local_rows,
     const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
@@ -14393,18 +14604,21 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
         return;
     }
 
-    try_apply_ready_rebalance_wave_for_layer_thread0(
-        runtime_layers,
-        rebalance_plan_entries,
-        rebalance_plan_capacity,
-        rebalance_command_header,
-        rebalance_local_transfer_slots,
-        rebalance_local_transfer_slot_count,
-        rebalance_config,
-        rebalance_apply_status,
-        rebalance_controller_state,
-        rebalance_target_layer,
-        rebalance_command_buffer_count);
+    if constexpr (ApplyReadyRebalance)
+    {
+        try_apply_ready_rebalance_wave_for_layer_thread0(
+            runtime_layers,
+            rebalance_plan_entries,
+            rebalance_plan_capacity,
+            rebalance_command_header,
+            rebalance_local_transfer_slots,
+            rebalance_local_transfer_slot_count,
+            rebalance_config,
+            rebalance_apply_status,
+            rebalance_controller_state,
+            rebalance_target_layer,
+            rebalance_command_buffer_count);
+    }
 
     __shared__ float expert_probs[kDeviceMoEMaxExperts];
     __shared__ float shared_max[8];
@@ -14487,9 +14701,144 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
         runtime_publish_decode_dispatch(
             runtime, selected_ids, selected_weights, num_experts, top_k,
             legacy_indices, legacy_weights, write_legacy_outputs,
-            update_runtime_histogram,
+            UpdateRuntimeHistogram,
             fully_replicated_local_rows,
             absolute_position_ids ? absolute_position_ids[0] : -1);
+    }
+}
+
+/**
+ * @brief Minimal wave64 router for a graph-proven unique-owner resident set.
+ *
+ * Unlike the replica-aware kernel, this entrypoint does not carry rebalance
+ * pointers, position state, or participant load-balancing scratch in its HIP
+ * kernel ABI.  That distinction is material on gfx906: unused formal kernel
+ * arguments still consume SGPRs, and the inlined replica scheduler otherwise
+ * spills into private memory even in a Static graph.
+ *
+ * The probability reduction and top-k selection are intentionally identical
+ * to @ref rocm_moe_softmax_topk_decode_runtime_wave64_kernel so selecting the
+ * economical resident-set specialization cannot change routing arithmetic.
+ *
+ * @tparam UpdateRuntimeHistogram Whether the captured graph owns histogram
+ *         publication for Dynamic maintenance.
+ */
+template <bool UpdateRuntimeHistogram>
+__global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
+    float *__restrict__ logits,
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,
+    float *__restrict__ legacy_weights,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs)
+{
+    if (!logits || !runtime || num_experts <= 0 ||
+        num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
+        top_k > kDeviceMoEMaxTopK)
+    {
+        return;
+    }
+
+    __shared__ float expert_probs[kDeviceMoEMaxExperts];
+    __shared__ float shared_max[8];
+    __shared__ float shared_sum[8];
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    float max_val = -FLT_MAX;
+    for (int expert = threadIdx.x; expert < num_experts;
+         expert += blockDim.x)
+    {
+        max_val = fmaxf(max_val, logits[expert]);
+    }
+    max_val = rocm_moe_wave_reduce_max_f32(max_val);
+    if (lane == 0)
+        shared_max[warp_id] = max_val;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps =
+            (blockDim.x + warpSize - 1) / warpSize;
+        max_val = lane < num_warps ? shared_max[lane] : -FLT_MAX;
+        max_val = rocm_moe_wave_reduce_max_f32(max_val);
+        if (lane == 0)
+            shared_max[0] = max_val;
+    }
+    __syncthreads();
+    max_val = shared_max[0];
+
+    float sum = 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts;
+         expert += blockDim.x)
+    {
+        const float value = expf(logits[expert] - max_val);
+        expert_probs[expert] = value;
+        sum += value;
+    }
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
+    if (lane == 0)
+        shared_sum[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps =
+            (blockDim.x + warpSize - 1) / warpSize;
+        sum = lane < num_warps ? shared_sum[lane] : 0.0f;
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
+        if (lane == 0)
+            shared_sum[0] = sum;
+    }
+    __syncthreads();
+
+    const float inv_sum =
+        shared_sum[0] > 0.0f ? 1.0f / shared_sum[0] : 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts;
+         expert += blockDim.x)
+    {
+        const float probability = expert_probs[expert] * inv_sum;
+        expert_probs[expert] = probability;
+        logits[expert] = probability;
+    }
+    __syncthreads();
+
+    __shared__ int selected_ids[kDeviceMoEMaxTopK];
+    __shared__ float selected_weights[kDeviceMoEMaxTopK];
+    moe_select_topk_probabilities_wave64_register_queue(
+        expert_probs,
+        num_experts,
+        top_k,
+        selected_ids,
+        selected_weights);
+
+    if (threadIdx.x == 0)
+    {
+        if (normalize_weights)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+                topk_sum += selected_weights[slot];
+            if (topk_sum > 0.0f)
+            {
+                const float inv_topk_sum = 1.0f / topk_sum;
+                for (int slot = 0; slot < top_k; ++slot)
+                    selected_weights[slot] *= inv_topk_sum;
+            }
+        }
+
+        runtime_publish_unique_owner_decode_dispatch<
+            UpdateRuntimeHistogram>(
+            runtime,
+            selected_ids,
+            selected_weights,
+            num_experts,
+            top_k,
+            legacy_indices,
+            legacy_weights,
+            write_legacy_outputs);
     }
 }
 
@@ -16307,37 +16656,174 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
         return false;
     }
 
+    const bool apply_ready_rebalance = runtime_layers != nullptr;
+    const bool complete_rebalance_binding =
+        runtime_layers && rebalance_plan_entries &&
+        rebalance_plan_capacity > 0u && rebalance_command_header &&
+        rebalance_config && rebalance_apply_status &&
+        rebalance_controller_state && rebalance_command_buffer_count > 0u;
+    const bool any_rebalance_binding =
+        runtime_layers || rebalance_plan_entries ||
+        rebalance_plan_capacity > 0u || rebalance_command_header ||
+        rebalance_local_transfer_slots ||
+        rebalance_local_transfer_slot_count > 0u || rebalance_config ||
+        rebalance_apply_status || rebalance_controller_state ||
+        rebalance_target_layer >= 0;
+    if (any_rebalance_binding && !complete_rebalance_binding)
+        return false;
+
     const int threads = 256;
     DeviceMoERebalanceConfigView rebalance_cfg{};
     if (rebalance_config)
         rebalance_cfg = *static_cast<const DeviceMoERebalanceConfigView *>(rebalance_config);
-    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_runtime_wave64_kernel,
-        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        logits,
-        static_cast<DeviceMoELayerRuntimeView *>(runtime),
-        static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
-        legacy_indices, legacy_weights,
-        num_experts, top_k,
-        normalize_weights,
-        write_legacy_outputs,
-        update_runtime_histogram,
-        fully_replicated_local_rows,
-        absolute_position_ids,
-        static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
-        rebalance_plan_capacity,
-        static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
-        static_cast<const DeviceMoEExpertDirectoryEntryView *>(rebalance_local_transfer_slots),
-        rebalance_local_transfer_slot_count,
-        rebalance_cfg,
-        static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),
-        static_cast<DeviceMoERebalanceGraphControllerStateView *>(rebalance_controller_state),
-        rebalance_target_layer,
-        rebalance_command_buffer_count);
+
+#define LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE(HISTOGRAM, APPLY)              \
+    hipLaunchKernelGGL(                                                         \
+        HIP_KERNEL_NAME(                                                        \
+            rocm_moe_softmax_topk_decode_runtime_wave64_kernel<                 \
+                HISTOGRAM, APPLY>),                                             \
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),             \
+        logits,                                                                 \
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),                      \
+        static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),               \
+        legacy_indices, legacy_weights,                                         \
+        num_experts, top_k,                                                     \
+        normalize_weights,                                                      \
+        write_legacy_outputs,                                                   \
+        fully_replicated_local_rows,                                            \
+        absolute_position_ids,                                                  \
+        static_cast<const DeviceMoERebalancePlanEntryView *>(                   \
+            rebalance_plan_entries),                                            \
+        rebalance_plan_capacity,                                                \
+        static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(               \
+            rebalance_command_header),                                          \
+        static_cast<const DeviceMoEExpertDirectoryEntryView *>(                 \
+            rebalance_local_transfer_slots),                                    \
+        rebalance_local_transfer_slot_count,                                    \
+        rebalance_cfg,                                                          \
+        static_cast<DeviceMoERebalanceApplyStatusView *>(                       \
+            rebalance_apply_status),                                            \
+        static_cast<DeviceMoERebalanceGraphControllerStateView *>(              \
+            rebalance_controller_state),                                        \
+        rebalance_target_layer,                                                 \
+        rebalance_command_buffer_count)
+
+    if (update_runtime_histogram)
+    {
+        if (apply_ready_rebalance)
+            LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE(true, true);
+        else
+            LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE(true, false);
+    }
+    else if (apply_ready_rebalance)
+    {
+        LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE(false, true);
+    }
+    else
+    {
+        LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE(false, false);
+    }
+#undef LLAMINAR_LAUNCH_ROCM_WAVE64_DECODE_ROUTE
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE softmax_topk_decode_runtime_wave64 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Launch the spill-free unique-owner wave64 decode router.
+ *
+ * The caller must have prepared a graph whose capacity contract excludes
+ * replicas.  The device kernel re-authenticates that invariant against the
+ * active runtime bank and traps instead of selecting the replica-aware path if
+ * the contract is violated.
+ */
+bool hipMoE_softmax_topk_decode_unique_owner_wave64(
+    float *logits,
+    void *runtime,
+    float *legacy_indices,
+    float *legacy_weights,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram,
+    int device_idx,
+    void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    if (!logits || !runtime || !stream || num_experts <= 0 ||
+        num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
+        top_k > kDeviceMoEMaxTopK || top_k > num_experts)
+    {
+        return false;
+    }
+    if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
+        return false;
+
+    /*
+     * Give the router one wave for every populated 64-expert interval.  A
+     * fixed four-wave workgroup made Qwen's 128-expert router carry two idle
+     * waves through every workgroup barrier and through both second-level
+     * reductions.  Removing only wholly inactive waves preserves the exact
+     * reduction tree for every populated expert (the omitted inputs were
+     * respectively -INF and +0), while materially reducing decode latency on
+     * gfx906.  Keep this launch rule shared by the histogram and static
+     * specializations so changing maintenance policy cannot change routing
+     * arithmetic.
+     */
+    constexpr int kWaveWidth = 64;
+    const int threads =
+        ((num_experts + kWaveWidth - 1) / kWaveWidth) * kWaveWidth;
+    if (update_runtime_histogram)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel<true>),
+            dim3(1),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            logits,
+            static_cast<DeviceMoELayerRuntimeView *>(runtime),
+            legacy_indices,
+            legacy_weights,
+            num_experts,
+            top_k,
+            normalize_weights,
+            write_legacy_outputs);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel<false>),
+            dim3(1),
+            dim3(threads),
+            0,
+            static_cast<hipStream_t>(stream),
+            logits,
+            static_cast<DeviceMoELayerRuntimeView *>(runtime),
+            legacy_indices,
+            legacy_weights,
+            num_experts,
+            top_k,
+            normalize_weights,
+            write_legacy_outputs);
+    }
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "HIP unique-owner MoE decode router launch failed: %s\n",
+            hipGetErrorString(err));
         return false;
     }
     return true;

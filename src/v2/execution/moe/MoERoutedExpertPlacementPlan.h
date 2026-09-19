@@ -282,6 +282,37 @@ namespace llaminar2
         Explicit,  ///< User override wins, irrespective of declaration order.
     };
 
+    /**
+     * @brief Choose the economical dense policy for a resolved MoE continuation domain.
+     *
+     * A rank-local accelerator group can tensor-parallelize the wide prefill
+     * matrices while retaining complete decode weights on every participant.
+     * That removes the per-layer decode collective without serializing prompt
+     * ingestion. Cross-rank domains retain tensor parallel decode because a
+     * complete dense replica per MPI participant is not yet a supported
+     * continuation transaction. A single participant is simply replicated.
+     *
+     * The physical memory authority subsequently admits or rejects the exact
+     * replicated-decode BOM. Automatic planning may compare this policy with
+     * an explicit all-phase TP candidate; this function never performs its own
+     * capacity arithmetic.
+     *
+     * @param scope Inventory-resolved physical domain scope.
+     * @param participant_count Number of physical continuation participants.
+     * @return Canonical topology default, before any explicit user override.
+     */
+    [[nodiscard]] inline DenseParallelPolicy
+    defaultMoEContinuationDensePolicy(
+        ExecutionDomainScope scope,
+        std::size_t participant_count) noexcept
+    {
+        if (participant_count <= 1u)
+            return DenseParallelPolicy::Replicated;
+        if (scope == ExecutionDomainScope::RANK_LOCAL)
+            return DenseParallelPolicy::PrefillTensorParallelDecodeReplicated;
+        return DenseParallelPolicy::TensorParallel;
+    }
+
     struct MoEContinuationDomainSpec
     {
         std::string domain;

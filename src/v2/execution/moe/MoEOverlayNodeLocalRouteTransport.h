@@ -31,6 +31,86 @@ namespace llaminar2
         MappedSparse      ///< Device-epoch sparse publication through mapped pages.
     };
 
+    /** Logical graph phase that owns one continuation-route publication. */
+    enum class MoEOverlayNodeLocalRoutePhase
+    {
+        OrdinaryPrefill, ///< Multi-token prompt ingestion, excluding MTP verification.
+        Decode           ///< Serial decode, grouped verification, and MTP sidecars.
+    };
+
+    /**
+     * @brief Immutable phase-aware transport policy for one continuation cell.
+     *
+     * Sparse route publication has a different economy curve at prefill and
+     * decode shapes. Keeping both choices in one typed value prevents a rank,
+     * child runner, or graph builder from silently applying a prefill result to
+     * decode. A policy is either wholly unresolved or wholly resolved.
+     */
+    struct MoEOverlayNodeLocalRouteTransportPolicy
+    {
+        /** Transport embedded in ordinary prefill graphs. */
+        MoEOverlayNodeLocalRouteTransport ordinary_prefill =
+            MoEOverlayNodeLocalRouteTransport::Unresolved;
+
+        /** Transport embedded in decode, verifier, and sidecar graphs. */
+        MoEOverlayNodeLocalRouteTransport decode =
+            MoEOverlayNodeLocalRouteTransport::Unresolved;
+
+        /**
+         * @brief Return whether both graph phases have an explicit transport.
+         * @return True only for a complete, graph-buildable policy.
+         */
+        [[nodiscard]] constexpr bool resolved() const noexcept
+        {
+            return ordinary_prefill !=
+                       MoEOverlayNodeLocalRouteTransport::Unresolved &&
+                   decode !=
+                       MoEOverlayNodeLocalRouteTransport::Unresolved;
+        }
+
+        /**
+         * @brief Return whether the policy is the default unconfigured value.
+         * @return True only when neither phase has been selected.
+         */
+        [[nodiscard]] constexpr bool unresolved() const noexcept
+        {
+            return ordinary_prefill ==
+                       MoEOverlayNodeLocalRouteTransport::Unresolved &&
+                   decode ==
+                       MoEOverlayNodeLocalRouteTransport::Unresolved;
+        }
+
+        /**
+         * @brief Resolve the exact transport embedded in one graph family.
+         * @param phase Typed graph phase; grouped MTP work is decode.
+         * @return Transport selected before graph construction.
+         */
+        [[nodiscard]] constexpr MoEOverlayNodeLocalRouteTransport forPhase(
+            MoEOverlayNodeLocalRoutePhase phase) const noexcept
+        {
+            return phase == MoEOverlayNodeLocalRoutePhase::OrdinaryPrefill
+                       ? ordinary_prefill
+                       : decode;
+        }
+
+        /**
+         * @brief Return whether any retained graph needs the mapped fabric.
+         * @return True when prefill or decode embeds mapped sparse transport.
+         */
+        [[nodiscard]] constexpr bool requiresMappedExchange() const noexcept
+        {
+            return ordinary_prefill ==
+                       MoEOverlayNodeLocalRouteTransport::MappedSparse ||
+                   decode ==
+                       MoEOverlayNodeLocalRouteTransport::MappedSparse;
+        }
+
+        friend constexpr bool operator==(
+            const MoEOverlayNodeLocalRouteTransportPolicy &,
+            const MoEOverlayNodeLocalRouteTransportPolicy &) noexcept =
+            default;
+    };
+
     /**
      * @brief Default policy for no-P2P dense root publication.
      *
@@ -82,8 +162,8 @@ namespace llaminar2
      * @return Immutable graph transport policy.
      * @throws std::invalid_argument for an incomplete or contradictory policy.
      */
-    [[nodiscard]] inline MoEOverlayNodeLocalRouteTransport
-    selectMoEOverlayNodeLocalRouteTransport(
+    [[nodiscard]] inline MoEOverlayNodeLocalRouteTransportPolicy
+    selectMoEOverlayNodeLocalRouteTransportPolicy(
         std::span<const DeviceId> devices,
         std::optional<PeerAccessCoverage> homogeneous_coverage)
     {
@@ -120,16 +200,35 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "heterogeneous MoE route transport cannot carry one homogeneous P2P matrix");
             }
-            return MoEOverlayNodeLocalRouteTransport::MappedSparse;
+            return {
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::MappedSparse,
+                .decode = MoEOverlayNodeLocalRouteTransport::MappedSparse,
+            };
         }
         if (!homogeneous_coverage)
         {
             throw std::invalid_argument(
                 "homogeneous MoE route transport requires driver-backed P2P coverage");
         }
-        return *homogeneous_coverage == PeerAccessCoverage::None
-                   ? MoEOverlayNodeLocalRouteTransport::MappedSparse
-                   : MoEOverlayNodeLocalRouteTransport::NativeCollective;
+        if (*homogeneous_coverage == PeerAccessCoverage::None)
+        {
+            /* Without a peer edge the native collective necessarily stages
+             * routed rows through its host transport.  The capture-stable
+             * mapped exchange avoids that bounce for both prompt and decode
+             * shapes.  P2P-capable cells remain native below. */
+            return {
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::MappedSparse,
+                .decode =
+                    MoEOverlayNodeLocalRouteTransport::MappedSparse,
+            };
+        }
+        return {
+            .ordinary_prefill =
+                MoEOverlayNodeLocalRouteTransport::NativeCollective,
+            .decode = MoEOverlayNodeLocalRouteTransport::NativeCollective,
+        };
     }
 
     /**

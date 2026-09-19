@@ -1837,7 +1837,7 @@ namespace llaminar2
             .long_name = "--moe-hot-expert-cache",
             .category = "MoE Configuration",
             .value_label = "<count|percent|off>",
-            .description = "Remote hot expert replica upper bound per layer/device (default: 10%); native GPU admission fits the largest positive cache after complete model coverage",
+            .description = "Remote hot expert replica upper bound per layer/device (default: off); explicit positive values use native GPU admission after complete model coverage",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

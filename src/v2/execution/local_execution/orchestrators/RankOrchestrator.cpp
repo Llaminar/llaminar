@@ -1226,9 +1226,13 @@ namespace llaminar2
             << " devices=" << devices.size()
             << " preinstalled="
             << (config_.moe_node_local_route_exchange != nullptr)
-            << " requested_transport="
+            << " requested_prefill_transport="
             << moeOverlayNodeLocalRouteTransportName(
-                   config_.moe_node_local_route_transport)
+                   config_.moe_node_local_route_transport_policy
+                       .ordinary_prefill)
+            << " requested_decode_transport="
+            << moeOverlayNodeLocalRouteTransportName(
+                   config_.moe_node_local_route_transport_policy.decode)
             << " dense_policy="
             << (config_.moe_routed_expert_plan
                     ? denseParallelPolicyToString(
@@ -1330,35 +1334,40 @@ namespace llaminar2
                                 cell_devices);
                     }
 
-                    MoEOverlayNodeLocalRouteTransport selected_transport =
-                        config_.moe_node_local_route_transport;
-                    if (selected_transport ==
-                        MoEOverlayNodeLocalRouteTransport::Unresolved)
+                    MoEOverlayNodeLocalRouteTransportPolicy selected_policy =
+                        config_.moe_node_local_route_transport_policy;
+                    if (!selected_policy.unresolved() &&
+                        !selected_policy.resolved())
                     {
-                        selected_transport =
-                            selectMoEOverlayNodeLocalRouteTransport(
+                        throw std::runtime_error(
+                            "RankOrchestrator: continuation route transport policy is only partially resolved");
+                    }
+                    if (selected_policy.unresolved())
+                    {
+                        selected_policy =
+                            selectMoEOverlayNodeLocalRouteTransportPolicy(
                                 cell_devices, peer_coverage);
                     }
                     else if (!homogeneous)
                     {
                         const auto measured =
-                            selectMoEOverlayNodeLocalRouteTransport(
+                            selectMoEOverlayNodeLocalRouteTransportPolicy(
                                 cell_devices, std::nullopt);
-                        if (selected_transport != measured)
+                        if (selected_policy != measured)
                         {
                             throw std::runtime_error(
-                                "RankOrchestrator: preselected continuation route transport contradicts heterogeneous device topology");
+                                "RankOrchestrator: preselected continuation route transport policy contradicts heterogeneous device topology");
                         }
                     }
                     else if (peer_coverage)
                     {
                         const auto measured =
-                            selectMoEOverlayNodeLocalRouteTransport(
+                            selectMoEOverlayNodeLocalRouteTransportPolicy(
                                 cell_devices, peer_coverage);
-                        if (selected_transport != measured)
+                        if (selected_policy != measured)
                         {
                             throw std::runtime_error(
-                                "RankOrchestrator: preselected continuation route transport contradicts driver-reported P2P topology");
+                                "RankOrchestrator: preselected continuation route transport policy contradicts driver-reported P2P topology");
                         }
                     }
                     else if (!config_.moe_node_local_route_exchange)
@@ -1366,16 +1375,15 @@ namespace llaminar2
                         throw std::runtime_error(
                             "RankOrchestrator: homogeneous continuation route transport has no driver-backed P2P matrix");
                     }
-                    config_.moe_node_local_route_transport =
-                        selected_transport;
+                    config_.moe_node_local_route_transport_policy =
+                        selected_policy;
 
                     const DeviceId root_device =
                         continuation_domain
                             ->participants[static_cast<std::size_t>(root_index)]
                             .toLocalDeviceId();
 
-                    if (selected_transport ==
-                        MoEOverlayNodeLocalRouteTransport::MappedSparse)
+                    if (selected_policy.requiresMappedExchange())
                     {
                         if (!config_.moe_node_local_route_exchange)
                         {
@@ -1394,7 +1402,7 @@ namespace llaminar2
                     else if (config_.moe_node_local_route_exchange)
                     {
                         throw std::runtime_error(
-                            "RankOrchestrator: native continuation route transport cannot retain a mapped sparse exchange");
+                            "RankOrchestrator: all-native continuation route transport policy cannot retain a mapped sparse exchange");
                     }
 
                     const std::string peer_access =
@@ -1403,30 +1411,44 @@ namespace llaminar2
                                    ? peerAccessCoverageName(*peer_coverage)
                                    : "preselected")
                             : "heterogeneous";
-                    const PerfStatsCollector::Tags transport_tags{
-                        {"domain", continuation_domain->name},
-                        {"transport",
-                         moeOverlayNodeLocalRouteTransportName(
-                             selected_transport)},
-                        {"peer_access", peer_access},
-                        {"backend",
-                         homogeneous
-                             ? (cell_devices.front().is_cuda() ? "cuda"
-                                                                : "rocm")
-                             : "heterogeneous"},
-                        {"participants", std::to_string(devices.size())}};
-                    PerfStatsCollector::addCounter(
-                        "moe_overlay_transport",
-                        "selection",
-                        1.0,
-                        {},
-                        root_device.toString(),
-                        transport_tags);
+                    const auto record_transport =
+                        [&](std::string phase,
+                            MoEOverlayNodeLocalRouteTransport transport)
+                        {
+                            const PerfStatsCollector::Tags transport_tags{
+                                {"domain", continuation_domain->name},
+                                {"phase", std::move(phase)},
+                                {"transport",
+                                 moeOverlayNodeLocalRouteTransportName(
+                                     transport)},
+                                {"peer_access", peer_access},
+                                {"backend",
+                                 homogeneous
+                                     ? (cell_devices.front().is_cuda()
+                                            ? "cuda"
+                                            : "rocm")
+                                     : "heterogeneous"},
+                                {"participants",
+                                 std::to_string(cell_devices.size())}};
+                            PerfStatsCollector::addCounter(
+                                "moe_overlay_transport",
+                                "selection",
+                                1.0,
+                                {},
+                                root_device.toString(),
+                                transport_tags);
+                        };
+                    record_transport(
+                        "ordinary_prefill", selected_policy.ordinary_prefill);
+                    record_transport("decode", selected_policy.decode);
                     LOG_INFO(
                         "RankOrchestrator: selected continuation route "
-                        "transport="
+                        "transport policy prefill="
                         << moeOverlayNodeLocalRouteTransportName(
-                               selected_transport)
+                               selected_policy.ordinary_prefill)
+                        << " decode="
+                        << moeOverlayNodeLocalRouteTransportName(
+                               selected_policy.decode)
                         << " peer_access=" << peer_access << " domain="
                         << continuation_domain->name
                         << " root=" << root_device.toString()
@@ -1830,8 +1852,8 @@ namespace llaminar2
                                                      config_.moe_device_controller_fabric;
                                                  runner_config.moe_node_local_route_exchange =
                                                      config_.moe_node_local_route_exchange;
-                                                 runner_config.moe_node_local_route_transport =
-                                                     config_.moe_node_local_route_transport;
+                                                 runner_config.moe_node_local_route_transport_policy =
+                                                     config_.moe_node_local_route_transport_policy;
                                                  runner_config.cancellation_requested = [this]()
                                                  {
                                                      return tp_ctx_ && tp_ctx_->isAbortRequested();
@@ -2134,8 +2156,8 @@ namespace llaminar2
                 config_.moe_device_controller_fabric;
             runner_config.moe_node_local_route_exchange =
                 config_.moe_node_local_route_exchange;
-            runner_config.moe_node_local_route_transport =
-                config_.moe_node_local_route_transport;
+            runner_config.moe_node_local_route_transport_policy =
+                config_.moe_node_local_route_transport_policy;
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
             // =====================================================================
@@ -2198,8 +2220,8 @@ namespace llaminar2
                     config_.moe_device_controller_fabric;
                 nested_config.moe_node_local_route_exchange =
                     config_.moe_node_local_route_exchange;
-                nested_config.moe_node_local_route_transport =
-                    config_.moe_node_local_route_transport;
+                nested_config.moe_node_local_route_transport_policy =
+                    config_.moe_node_local_route_transport_policy;
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would
                 // build LM_HEAD stages even though this PP stage doesn't own LM_HEAD.

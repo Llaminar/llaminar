@@ -796,8 +796,8 @@ namespace llaminar2
              * graph construction. Multi-GPU distributed continuation graphs
              * reject `Unresolved` rather than inferring policy from a pointer.
              */
-            MoEOverlayNodeLocalRouteTransport node_local_route_transport =
-                MoEOverlayNodeLocalRouteTransport::Unresolved;
+            MoEOverlayNodeLocalRouteTransportPolicy
+                node_local_route_transport_policy{};
 
             /// Versioned, transactional authority for live overlay residency.
             std::shared_ptr<MoEOverlayResidencyAuthority>

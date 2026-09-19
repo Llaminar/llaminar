@@ -8131,6 +8131,10 @@ namespace llaminar2
             std::optional<ForwardGraphSignature> ordinary_forward_identity;
             /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
             std::optional<OrdinaryGenerationComposition> ordinary_composition;
+            /** Exact maintenance executable borrowed by an ordinary parent, if any. */
+            const IGPUGraphCapture *ordinary_maintenance_capture = nullptr;
+            /** Exact resident condition word embedded beside that executable. */
+            const uint32_t *ordinary_maintenance_due = nullptr;
             /** Immutable initial frontier selects sampling versus consumption. */
             sampling_math::DeviceGenerationLeadingRowDisposition ordinary_leading =
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
@@ -8205,6 +8209,8 @@ namespace llaminar2
                 ordinary_sampling_identity.reset();
                 ordinary_forward_identity.reset();
                 ordinary_composition.reset();
+                ordinary_maintenance_capture = nullptr;
+                ordinary_maintenance_due = nullptr;
                 workspace_generation = 0;
                 request_count = 0;
                 draft_depth = 0;

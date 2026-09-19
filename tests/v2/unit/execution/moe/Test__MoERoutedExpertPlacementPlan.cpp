@@ -600,7 +600,7 @@ namespace llaminar2::test
         EXPECT_TRUE(normalized.plan->routed_tiers[0].fallback);
         EXPECT_EQ(
             normalized.plan->continuation_domain_spec.effectiveDensePolicy(),
-            DenseParallelPolicy::TensorParallel);
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         EXPECT_TRUE(
             validateMoERoutedExpertPlacementPlan(*normalized.plan).ok());
     }

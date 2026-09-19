@@ -291,6 +291,16 @@ but has independent model, reference-pack, and result identities. These
 definitions also expand the standard numerical cases; the HTTP runner has no
 Ornith-specific configuration branch.
 
+The separate `Ornith15MoE_35B_Q8_0_NaturalDecode` diagnostic definition covers
+the exact `Ornith-1.5-35B-Q8_0.gguf` weights on CPU and four-ROCm rank-local
+RCCL ExpertOverlay. `Ornith15AccuracyWorkload.h` owns its untemplated 424-token
+prompt and 89-step incremental-decode horizon. The canonical expander supplies
+six CPU MTP cases and all 24 overlay placement/movement/MTP cases, including
+mandatory prefix restore and the ordinary HF checkpoint CSVs. These cases have
+no HTTP certification tag. Select the affected mathematical cell for token-drift
+diagnosis; do not substitute the existing Q4_K_M reference or acquire new golden
+token streams to hide a mismatch.
+
 ```mermaid
 flowchart LR
     D[Typed model/topology definition] --> E[Canonical matrix expander]

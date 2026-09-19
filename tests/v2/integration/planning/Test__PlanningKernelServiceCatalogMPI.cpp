@@ -17,6 +17,7 @@
 #include "utils/MPIContext.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <iostream>
 #include <omp.h>
 
@@ -205,7 +206,22 @@ namespace
                     else
                     {
                         ++multi_device_prices;
-                        EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+                        EXPECT_EQ(cost.evidence().find("prefill_interconnect_s=0;"), std::string::npos);
+                        const bool replicated_decode = std::any_of(candidate.devicePlans().begin(),
+                            candidate.devicePlans().end(), [](const auto &device) {
+                                return std::find(device.additional_weight_sets.begin(),
+                                    device.additional_weight_sets.end(),
+                                    AdditionalPersistentWeightSet::ReplicatedDenseDecode) !=
+                                    device.additional_weight_sets.end();
+                            });
+                        // Replicated dense decode removes the TP join, while an
+                        // ExpertOverlay still communicates routed activations.
+                        // Cost evidence must follow that admitted policy rather
+                        // than infer behavior from a broad strategy label.
+                        if (candidate.strategy() == OrchestrationStrategy::TensorParallel && replicated_decode)
+                            EXPECT_NE(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+                        else
+                            EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
                     }
                     if (candidate.strategy() == OrchestrationStrategy::ExpertOverlay) ++overlay_prices;
                     return cost;

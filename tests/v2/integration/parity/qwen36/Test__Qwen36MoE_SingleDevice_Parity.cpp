@@ -56,8 +56,12 @@ namespace
                     "pytorch_qwen36_moe_singledevice_rocm_snapshots",
                     qwen36MoESingleDeviceThresholds()),
             };
+            auto all_definitions = withOrnith15CertificationModels(definitions);
+            all_definitions.push_back(ornith15MoEQ8AccuracyParityDefinition(
+                qwen36SingleDeviceTopology("CPU0", GlobalDeviceAddress::cpu()),
+                "pytorch_ornith15_q8_natural_decode_cpu_snapshots"));
             std::vector<ModelParityCase> expanded;
-            for (const auto &definition : withOrnith15CertificationModels(definitions))
+            for (const auto &definition : all_definitions)
             {
                 auto definition_cases =
                     expandModelParityDefinition(definition);

@@ -1666,6 +1666,42 @@ TEST(Test__Qwen35Schema, ResolverConfig_AttnOutputDim_WithTP)
 }
 
 /**
+ * @brief A full-width decode arena must not inherit the participant's TP head offset.
+ *
+ * The second and later TP participants once combined their nonzero prefill
+ * head start with the full decode head count.  This is an invalid GDN interval
+ * and prevented graph construction before any inference could run.
+ */
+TEST_F(Qwen35GraphBuildTest, PhaseSplitDenseDecodeUsesFullGDNResolverGeometryOnEveryTPRank)
+{
+    config_.n_kv_heads = 4;
+    config_.qkv_column_parallel = true;
+    config_.dense_tp_enabled = true;
+    config_.local_n_heads = 1;
+    config_.local_n_kv_heads = 1;
+
+    for (int rank = 0; rank < config_.n_heads; ++rank)
+    {
+        SCOPED_TRACE(rank);
+        config_.head_start = rank;
+
+        // Prefill remains dependency-closed and TP-local.
+        config_.dense_tp_decode_replicated = false;
+        const auto sharded = Qwen35Graph(config_, nullptr).getResolverConfig(1);
+        EXPECT_EQ(sharded.custom_formulas.at("gdn_inner_size"), 32u);
+        EXPECT_EQ(sharded.custom_formulas.at("gdn_time_step_rank"), 2u);
+
+        // The same participant's retained decode graph needs complete GDN
+        // dimensions, independent of the shard's global start offset.
+        config_.dense_tp_decode_replicated = true;
+        const auto replicated = Qwen35Graph(config_, nullptr).getResolverConfig(1);
+        EXPECT_EQ(replicated.local_n_heads, config_.n_heads);
+        EXPECT_EQ(replicated.custom_formulas.at("gdn_inner_size"), 128u);
+        EXPECT_EQ(replicated.custom_formulas.at("gdn_time_step_rank"), 8u);
+    }
+}
+
+/**
  * @brief A replicated MTP predictor reserves full sidecar buffers without
  *        widening the tensor-parallel main graph.
  */

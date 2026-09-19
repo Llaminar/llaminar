@@ -1485,7 +1485,9 @@ namespace llaminar2
         int decode_gateup_d_model_cap_ = 0;
         int decode_hidden_rows_cap_ = 0;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
-
+        /** Capture-time resident-set contract for one-token routing. */
+        RoutedExpertResidentSetPolicy prepared_decode_resident_set_policy_ =
+            RoutedExpertResidentSetPolicy::ReplicaAware;
         // Split-K partials scratch for the grouped gate/up decode projection.
         // Layout: [top_k][k_partitions][intermediate] per buffer.
         float *d_grouped_gateup_gate_partials_ = nullptr;

@@ -4166,6 +4166,57 @@ namespace llaminar2
         return nullptr;
     }
 
+    std::unique_ptr<IComputeStage>
+    QwenGraphBase::createDisjointOwnerSlotAllreduceStage(
+        TensorBase *buffer,
+        size_t count,
+        DeviceId device,
+        const std::string &stage_name,
+        std::optional<BufferId> tensor_buffer_id,
+        std::vector<TPAllreduceSidebandWorkspaceBinding>
+            sideband_workspace_bindings) const
+    {
+        if (!config_.tp_ctx || !config_.tp_ctx->isLocal() ||
+            config_.tp_ctx->degree() <= 1)
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Disjoint-owner slot allreduce requires an "
+                "active LocalTP domain");
+        }
+
+        const auto backend = config_.tp_ctx->backend();
+        if (!device.is_gpu() ||
+            (backend != CollectiveBackendType::NCCL &&
+             backend != CollectiveBackendType::RCCL))
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Disjoint-owner slot allreduce requires a "
+                "native GPU collective backend");
+        }
+        if (!buffer || buffer->native_type() != TensorType::FP32 ||
+            count == 0u || count > buffer->numel())
+        {
+            throw std::logic_error(
+                "[QwenGraphBase] Disjoint-owner slot allreduce requires a "
+                "non-empty in-bounds FP32 element prefix");
+        }
+
+        TPAllreduceStage::Params params;
+        params.device_id = device;
+        params.tp_ctx = config_.tp_ctx;
+        params.tensor = buffer;
+        params.count = count;
+        params.stage_name = stage_name;
+        params.precision = "fp32";
+        params.arithmetic_policy =
+            TPAllreduceArithmeticPolicy::NativeCollective;
+        params.tensor_buffer_id = tensor_buffer_id;
+        params.sideband_device_index = config_.tp_device_idx;
+        params.sideband_workspace_bindings =
+            std::move(sideband_workspace_bindings);
+        return std::make_unique<TPAllreduceStage>(std::move(params));
+    }
+
     // =========================================================================
     // Shared Attention Building Blocks
     // =========================================================================

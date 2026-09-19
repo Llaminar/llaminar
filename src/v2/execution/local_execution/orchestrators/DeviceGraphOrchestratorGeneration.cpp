@@ -127,7 +127,6 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         activeMainLogitsAreColumnParallel() ||
         (pp_stage_config_ && (!pp_stage_config_->has_lm_head ||
             (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail))) ||
-        usesParticipantLocalDeviceMoERebalanceController() ||
         (composition == OrdinaryGenerationComposition::ExpertOverlay) !=
             static_cast<bool>(moe_overlay_epoch_execution_binding_))
         return fail("Ordinary generation requires an admitted scalar sampler and an exact local, pipeline-tail, or ExpertOverlay composition");
@@ -159,6 +158,30 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     const auto &signature = prepared->signature;
     const auto &forward = prepared->graph;
     std::string detail;
+    const bool owns_maintenance =
+        usesParticipantLocalDeviceMoERebalanceController();
+    const uint32_t *maintenance_due = nullptr;
+    const IGPUGraphCapture *maintenance_capture = nullptr;
+    if (owns_maintenance)
+    {
+        const auto &maintenance = device_moe_rebalance_maintenance_graph_;
+        const auto *const controller =
+            deviceMoERebalanceControllerStateDevice();
+        if (composition != OrdinaryGenerationComposition::ExpertOverlay ||
+            !controller || !maintenance.graph ||
+            maintenance.workspace_generation != generation)
+            return fail("Ordinary ExpertOverlay has no current device maintenance owner");
+        maintenance_due = reinterpret_cast<const uint32_t *>(
+            reinterpret_cast<const std::byte *>(controller) +
+            offsetof(DeviceMoERebalanceGraphControllerState,
+                     maintenance_due));
+        const auto retained =
+            maintenance.segment_cache.deviceLoopGraphTemplate(
+                *maintenance.graph, &detail);
+        if (!retained || !retained->capture)
+            return fail("Ordinary ExpertOverlay has no retained maintenance graph: " + detail);
+        maintenance_capture = retained->capture;
+    }
 
     const auto seeds = arena_->getSharedTensor(BufferId::SAMPLING_REQUEST_SEEDS);
     SamplerStage::Params params;
@@ -193,6 +216,8 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     if (loop.valid && loop.workspace_generation == generation &&
         loop.ordinary_sampling_identity == params && loop.ordinary_forward_identity == signature &&
         loop.ordinary_composition == composition &&
+        loop.ordinary_maintenance_capture == maintenance_capture &&
+        loop.ordinary_maintenance_due == maintenance_due &&
         loop.source_fragments.size() == 1 && loop.source_fragments.front().capture == forward.capture)
     {
         // Leading-row ownership is request data, not graph topology. CUDA
@@ -243,9 +268,21 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
      * would both duplicate the lease and borrow an independently invalidated
      * boundary cache after a normal decode recapture.
      */
-    const DeviceControlledLoopFragment iteration[] = {
+    std::array<DeviceControlledLoopFragment, 3> iteration = {{
         {.name = "ordinary_resident_forward", .capture = forward.capture},
-        {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()}};
+        {.name = "ordinary_decode_sample", .capture = loop.ordinary_children[Plan::decode_sampler].get()},
+        {}}};
+    if (owns_maintenance)
+    {
+        // The model's final routed layer publishes the serial commit clock.
+        // Maintenance consumes that due word only after the sampled response
+        // and the forward's captured epoch release have completed.
+        iteration[2] = {
+            .name = "ordinary_device_moe_maintenance",
+            .capture = maintenance_capture,
+            .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
+            .condition_word_device = maintenance_due};
+    }
     if (composition == OrdinaryGenerationComposition::PipelineTail)
     {
         // The rank installs activation/command edges around these recordings.
@@ -254,7 +291,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     else if (!hosted)
     {
         if (!DeviceGenerationGraphProgram::native(*loop.capture, control,
-                {.initialization = initialization, .iteration = iteration}, detail))
+                {.initialization = initialization,
+                 .iteration = std::span<const DeviceControlledLoopFragment>(
+                     iteration.data(), 2u + static_cast<size_t>(owns_maintenance))},
+                detail))
             return fail(detail);
     }
     else if (composition == OrdinaryGenerationComposition::ExpertOverlay)
@@ -264,7 +304,7 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
             !loop.ordinary_children[Plan::prefill_sampler]->instantiate() ||
             !loop.ordinary_children[Plan::decode_sampler]->instantiate() ||
             !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context, *backend, state_.device_id,
-                control, nullptr, device_generation_storage_.dispatch_tickets_device, detail))
+                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail))
         {
             return fail("Ordinary ExpertOverlay hosted graph compilation failed: " +
                         (retained_error.empty() ? detail : retained_error));
@@ -275,7 +315,6 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
             .capture = loop.ordinary_children[Plan::decode_sampler].get(),
             .forward_signature = signature,
         });
-        loop.branch_fragment_counts[0] = 1;
     }
     else
     {
@@ -287,11 +326,25 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         if (!transaction || !transaction->buildOrderedTimelineTransaction(steps) || !transaction->instantiate() ||
             !loop.ordinary_children[Plan::prefill_sampler]->instantiate() ||
             !DeviceGenerationGraphProgram::ticketPublisher(*loop.capture, context, *backend, state_.device_id,
-                control, nullptr, device_generation_storage_.dispatch_tickets_device, detail))
+                control, maintenance_due, device_generation_storage_.dispatch_tickets_device, detail))
             return fail("Ordinary hosted graph compilation failed: " + detail);
         loop.hosted_fragments.push_back({.name = "ordinary_complete_transaction",
             .kind = HostedDeviceGenerationFragment::Kind::CapturedLocal, .capture = transaction.get()});
-        loop.branch_fragment_counts[0] = 1;
+    }
+    if (hosted && composition != OrdinaryGenerationComposition::PipelineTail)
+    {
+        if (owns_maintenance)
+        {
+            // Hosted tickets retire this conditional tail before they admit
+            // the next body; a period boundary can never be crossed early.
+            loop.hosted_fragments.push_back({
+                .name = "ordinary_device_moe_maintenance",
+                .kind = HostedDeviceGenerationFragment::Kind::CapturedLocal,
+                .capture = maintenance_capture,
+                .execution = DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero,
+                .condition_word_device = maintenance_due});
+        }
+        loop.branch_fragment_counts[0] = loop.hosted_fragments.size();
     }
     // The forward identity and bindings are immutable; all mutable counters,
     // seeds and frontier contents stay in their existing arena-owned banks.
@@ -302,12 +355,16 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
     loop.ordinary_sampling_identity = params;
     loop.ordinary_forward_identity = signature;
     loop.ordinary_composition = composition;
+    loop.ordinary_maintenance_capture = maintenance_capture;
+    loop.ordinary_maintenance_due = maintenance_due;
     loop.ordinary_leading = admission.initial_leading_row_disposition;
     loop.workspace_generation = generation;
     loop.request_count = 1;
     loop.depth_policy_mode = static_cast<int>(DeviceGenerationPolicyMode::Ordinary);
     loop.sampling_mode = sampling_mode;
-    loop.fragment_count = hosted ? 1 : 3;
+    loop.fragment_count = hosted
+        ? loop.branch_fragment_counts[0]
+        : 3u + static_cast<size_t>(owns_maintenance);
     loop.execution_kind = hosted ? MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher
                                 : MTPDeviceGenerationLoopGraphCache::ExecutionKind::NativeConditionalParent;
     loop.valid = true;
@@ -339,9 +396,27 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
         loop.ordinary_composition !=
             OrdinaryGenerationComposition::ExpertOverlay ||
         !loop.ordinary_forward_identity ||
-        *loop.ordinary_forward_identity != signature ||
-        !moe_overlay_inference_transaction_coordinator_)
+        *loop.ordinary_forward_identity != signature)
     {
+        LOG_ERROR("[DeviceGraphOrchestrator] Hosted ordinary ExpertOverlay ownership mismatch"
+                  << " device=" << state_.device_id.toString()
+                  << " forward_engine=" << static_cast<bool>(forward_engine_)
+                  << " sampler=" << static_cast<bool>(sampler)
+                  << " sampler_executable="
+                  << (sampler && sampler->hasExecutable())
+                  << " stream=" << static_cast<bool>(loop.stream)
+                  << " composition="
+                  << (loop.ordinary_composition
+                          ? static_cast<int>(*loop.ordinary_composition)
+                          : -1)
+                  << " forward_identity="
+                  << static_cast<bool>(loop.ordinary_forward_identity)
+                  << " signature_match="
+                  << (loop.ordinary_forward_identity &&
+                      *loop.ordinary_forward_identity == signature)
+                  << " coordinator="
+                  << static_cast<bool>(
+                         moe_overlay_inference_transaction_coordinator_));
         return fail(
             "hosted ordinary ExpertOverlay replay has incomplete or divergent retained ownership");
     }
@@ -357,7 +432,9 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
         .logical_step_id = 0,
         .placement_epoch =
             moe_overlay_inference_transaction_coordinator_
-                ->currentPlacementEpoch(),
+                ? moe_overlay_inference_transaction_coordinator_
+                      ->currentPlacementEpoch()
+                : 0,
         .request_count = 1,
         .logical_rows_per_request = 1,
         .physical_rows_per_request = 1,
@@ -368,7 +445,9 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
         moe_overlay_inference_transaction_coordinator_,
         descriptor,
         moe_overlay_inference_transaction_participant_index_);
-    if (!graph_scope.ready() || !graph_scope.active())
+    if (!graph_scope.ready() ||
+        (moe_overlay_inference_transaction_coordinator_ &&
+         !graph_scope.active()))
     {
         return fail(
             graph_scope.error().empty()
@@ -379,23 +458,30 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
     const auto request_identity = currentMoESparseRequestIdentity();
     const auto &binding = graph_scope.binding();
     if (!request_identity ||
-        request_identity->generation() != binding.request_generation ||
-        binding.descriptor.graph_role !=
-            MoEOverlayInferenceGraphRole::MainDecode ||
-        binding.descriptor.draft_depth != -1 ||
-        binding.descriptor.sidecar_depth != -1)
+        (graph_scope.active() &&
+         (request_identity->generation() != binding.request_generation ||
+          binding.descriptor.graph_role !=
+              MoEOverlayInferenceGraphRole::MainDecode ||
+          binding.descriptor.draft_depth != -1 ||
+          binding.descriptor.sidecar_depth != -1)))
     {
         return fail(
             "hosted ordinary ExpertOverlay binding disagrees with its request generation or serial decode role");
     }
     const IComputeStage::MoEOverlayCollectiveRuntimeParams sparse_params{
-        .generation_id = binding.request_generation,
-        .step_id = binding.descriptor.logical_step_id,
+        .generation_id = graph_scope.active()
+                             ? binding.request_generation
+                             : request_identity->generation(),
+        .step_id = graph_scope.active()
+                       ? binding.descriptor.logical_step_id
+                       : 0,
         .execution_semantics =
             IComputeStage::MoEOverlayCollectiveRuntimeParams::
                 ExecutionSemantics::Decode,
         .mtp_depth = -1,
-        .placement_epoch = binding.descriptor.placement_epoch,
+        .placement_epoch = graph_scope.active()
+                               ? binding.descriptor.placement_epoch
+                               : 0,
     };
     if (!sparse_params.valid() || !sparse_params.hasExecutionSemantics())
     {
@@ -408,6 +494,8 @@ bool DeviceGraphOrchestrator::replayHostedOrdinaryExpertOverlayTransaction(
             DeviceGraphExecutor::GraphExecutableLaunchPhase,
             void *execution_stream) -> bool
     {
+        // The complete main forward already captures its acquire/release
+        // around sparse work. Only a remote follower needs a host-side ticket.
         if (!graph_scope.ownsTicketAuthority())
             return true;
         std::string arm_error;

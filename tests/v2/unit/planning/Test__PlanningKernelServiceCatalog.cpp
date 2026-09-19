@@ -17,6 +17,7 @@
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <nlohmann/json.hpp>
 #include <gtest/gtest.h>
+#include <algorithm>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -792,7 +793,7 @@ TEST(PlanningRequestCostModel, SingleDeviceHasNoLinksAndLiveContextCostsMoreAcro
         }
 }
 
-TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndNeverInventsSparseTrafficForOrdinaryReplicas)
+TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndPricesTheTypedDecodePolicy)
 {
     const auto cluster = requestInventory(true);
     constexpr std::array precision{PlanningAllreducePrecision::FP32};
@@ -811,8 +812,22 @@ TEST(PlanningRequestCostModel, TPRequiresNativeEvidenceAndNeverInventsSparseTraf
         {
             const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::TensorParallel);
             const auto cost = costs.evaluate(candidate, {64, 16});
+            const bool replicated_decode = std::any_of(candidate.devicePlans().begin(), candidate.devicePlans().end(),
+                [](const auto &device) {
+                    return std::find(device.additional_weight_sets.begin(), device.additional_weight_sets.end(),
+                        AdditionalPersistentWeightSet::ReplicatedDenseDecode) != device.additional_weight_sets.end();
+                });
             EXPECT_GT(cost.requestSeconds(), 0);
-            EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+            // TP prefill always consumes the measured native collective.  The
+            // homogeneous MoE default deliberately switches decode to its
+            // admitted replicated weight view, so only that typed policy has
+            // zero decode-interconnect cost.
+            EXPECT_EQ(cost.evidence().find("prefill_interconnect_s=0;"), std::string::npos);
+            if (replicated_decode)
+                EXPECT_NE(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+            else
+                EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
+            EXPECT_NE(cost.evidence().find("measured native FP32 group service"), std::string::npos);
             EXPECT_EQ(cost.evidence().find("point-to-point traffic"), std::string::npos);
             EXPECT_THROW(missing.evaluate(candidate, {64, 16}), std::invalid_argument);
         }

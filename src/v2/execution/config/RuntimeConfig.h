@@ -1791,9 +1791,9 @@ namespace llaminar2
             Off
         };
 
-        Kind kind = Kind::Percent;
+        Kind kind = Kind::Off;
         int count = 0;
-        float percent = 10.0f;
+        float percent = 0.0f;
 
         bool enabled() const { return kind != Kind::Off; }
 

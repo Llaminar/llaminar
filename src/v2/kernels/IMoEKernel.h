@@ -95,6 +95,9 @@ namespace llaminar2
     struct MoERouteLaunchPlan
     {
         MoERouteLaunchKind kind = MoERouteLaunchKind::GroupedPrefill;
+        /** Immutable resident-set cardinality selected by graph lowering. */
+        RoutedExpertResidentSetPolicy resident_set_policy =
+            RoutedExpertResidentSetPolicy::ReplicaAware;
         int physical_rows = 0;
         int d_model = 0;
         int num_experts = 0;

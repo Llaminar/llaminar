@@ -266,14 +266,6 @@ namespace llaminar2
                 defaultRoutedExpertResidencyPolicy(
                     request.moe_rebalance.mode);
             overlay->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Automatic;
-            if (pools.size() == 1)
-            {
-                // A one-domain TP proposal is still TP, including across
-                // ranks. Only expert ownership is normalized to the universal
-                // authority; do not turn its dense trunk into replicated work.
-                overlay->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
-                overlay->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
-            }
             for (size_t index = 0; index < pools.size(); ++index)
             {
                 const auto name = "domain_" + std::to_string(index);
@@ -346,19 +338,21 @@ namespace llaminar2
             else
             {
                 const auto domain = domainFor(pool, membership, "compute");
-                if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
+                if (model.memoryProfile().expert_count > 0)
+                {
+                    /* MoE always enters through its sole ExpertOverlay
+                     * authority before admission, including one rank-local
+                     * tier. This lets the physical memory authority account
+                     * phase-specific dense replicas instead of discovering
+                     * them only after a simple-TP candidate was admitted. */
+                    config = overlayConfig(request, {pool}, membership);
+                }
+                else if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
                 {
                     // A whole-model local TP proposal is not a one-stage
                     // pipeline. The shared compiler must be free to install
                     // the sole ExpertOverlay authority for a MoE model.
                     config.tp_devices = domain.participants;
-                }
-                else if (model.memoryProfile().expert_count > 0)
-                {
-                    // The legacy one-stage PP spelling loses the cross-rank
-                    // MoE owner map. Emit the same explicit single-domain
-                    // authority consumed by authored topology configurations.
-                    config = overlayConfig(request, {pool}, membership);
                 }
                 else
                 {
@@ -368,8 +362,23 @@ namespace llaminar2
             }
             publish({strategy, std::move(membership), std::move(config)});
         }
-        const bool pipelines = policy->allows(OrchestrationStrategy::PipelineParallel);
-        const bool overlays = model.memoryProfile().expert_count > 0 && policy->allows(OrchestrationStrategy::ExpertOverlay);
+        const bool routed_model = model.memoryProfile().expert_count > 0;
+        /*
+         * A routed model may only leave automatic discovery with one complete
+         * ExpertOverlay authority.  The ordinary PP candidate below describes
+         * dense layer ownership but has no routed-expert domains, tiers, or
+         * continuation role.  Publishing it would defer that missing topology
+         * until rank compilation, where normalization must (correctly) reject
+         * an implicit cross-rank/pipeline authority.  Do not advertise that
+         * incomplete execution form as an automatic candidate.  Authored MoE
+         * PP remains responsible for supplying its explicit overlay topology.
+         */
+        const bool pipelines =
+            !routed_model &&
+            policy->allows(OrchestrationStrategy::PipelineParallel);
+        const bool overlays =
+            routed_model &&
+            policy->allows(OrchestrationStrategy::ExpertOverlay);
         if (!pipelines && !overlays) return;
         using PoolKey = std::vector<std::pair<int, std::string>>;
         std::set<std::vector<PoolKey>> emitted_overlays;

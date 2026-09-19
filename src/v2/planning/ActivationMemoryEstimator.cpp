@@ -252,6 +252,20 @@ size_t ActivationMemoryEstimator::estimate(
               static_cast<size_t>(std::max(0, profile.vocab_size)),
               geometry.total_shards);
 
+    if (geometry.replicated_dense_decode && device.is_gpu())
+    {
+        // The prefill graph writes TP-local K/V, then a captured handoff
+        // publishes separate full-width rows to the replicated decode bank.
+        // These two BufferIds coexist with the ordinary K/V arena owners.
+        bytes = checkedAdd(
+            bytes,
+            fp32RowBankBytes(
+                rows,
+                checkedMultiply(2u, full_kv, "phase-split full KV handoff"),
+                "phase-split full KV handoff"),
+            "phase-split full KV handoff");
+    }
+
     /* The model schema registers a participant-local terminal-logit shard. */
     bytes = checkedAdd(
         bytes,
@@ -274,48 +288,50 @@ size_t ActivationMemoryEstimator::estimate(
         return bytes;
     }
 
+    const int schema_shards =
+        geometry.replicated_dense_decode ? 1 : geometry.total_shards;
     const size_t full_attention_q = shardColumns(
         projectionOutputRows(
             profile,
             ".attn_q.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
     const size_t full_attention_gate = shardColumns(
         projectionOutputRows(
             profile,
             ".attn_gate.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
     const size_t gdn_qkv = shardColumns(
         projectionOutputRows(
             profile,
             ".attn_qkv.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
     const size_t gdn_z = shardColumns(
         projectionInputRows(
             profile,
             ".ssm_out.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
     const size_t gdn_alpha = shardColumns(
         projectionOutputRows(
             profile,
             ".ssm_alpha.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
     const size_t gdn_beta = shardColumns(
         projectionOutputRows(
             profile,
             ".ssm_beta.weight",
             inventory_first_layer,
             inventory_last_layer),
-        geometry.total_shards);
+        schema_shards);
 
     if (full_attention_q == 0 || full_attention_gate == 0 ||
         gdn_qkv == 0 || gdn_z == 0)

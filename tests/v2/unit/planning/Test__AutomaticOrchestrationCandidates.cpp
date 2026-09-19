@@ -198,8 +198,13 @@ TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority
         config.moe_rebalance.mode = mode;
         const auto proposals = candidates(config, inventory, true);
         ASSERT_EQ(proposals.size(), 1u);
-        ASSERT_EQ(proposals.front().config.tp_devices.size(), 2u);
-        EXPECT_TRUE(proposals.front().config.domain_definitions.empty());
+        EXPECT_TRUE(proposals.front().config.tp_devices.empty());
+        ASSERT_TRUE(proposals.front().config.moe_routed_expert_plan);
+        EXPECT_EQ(
+            proposals.front()
+                .config.moe_routed_expert_plan->continuation_domain_spec
+                .effectiveDensePolicy(),
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
         compile(proposals.front(), true);
         ExecutionPlanBuilder builder;
         const auto resolved = ResolvedRankOrchestration::resolve(proposals.front().config, model(true),
@@ -259,6 +264,43 @@ TEST(AutomaticOrchestrationCandidates, PipelinesTryEveryRealMainLayerBoundaryInB
         EXPECT_EQ(last.last_layer, 3) << "The MTP block cannot enter the main pipeline";
         EXPECT_TRUE(splits.emplace(proposal.membership.discoveryRanks().front(), last.first_layer).second);
         compile(proposal);
+    }
+}
+
+/**
+ * @brief Default MoE auto search never publishes an authority-less PP plan.
+ *
+ * The default policy admits every implemented strategy.  A dense pipeline
+ * proposal does not encode routed-expert domains or continuation ownership,
+ * so treating it as a MoE candidate made an otherwise valid local GPU search
+ * fail while compiling an unrelated proposal.  Every emitted routed-model
+ * candidate must instead compile with the sole typed ExpertOverlay authority.
+ */
+TEST(AutomaticOrchestrationCandidates,
+     DefaultMoESearchExcludesAuthoritylessPipelineCandidates)
+{
+    auto inventory = hosts(1);
+    cards(inventory, 0, DeviceType::ROCm, 2);
+    auto config = request(
+        {DeviceType::ROCm},
+        {OrchestrationStrategy::SingleDevice,
+         OrchestrationStrategy::TensorParallel,
+         OrchestrationStrategy::PipelineParallel,
+         OrchestrationStrategy::ExpertOverlay});
+
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_FALSE(proposals.empty());
+    for (const auto &proposal : proposals)
+    {
+        EXPECT_NE(proposal.strategy, OrchestrationStrategy::PipelineParallel);
+        if (proposal.strategy != OrchestrationStrategy::SingleDevice)
+        {
+            ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+            EXPECT_TRUE(
+                proposal.config.moe_routed_expert_plan
+                    ->usesExpertOverlayAuthority());
+        }
+        compile(proposal, true);
     }
 }
 

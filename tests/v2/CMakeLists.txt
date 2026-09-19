@@ -847,6 +847,14 @@ add_v2_test(V2_Unit_MoEExpertOverlayRuntimePlan
     LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Configuration"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_MoELocalTPReplicatedDecodeDefault
+    COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
+        --gtest_filter=Test__MoEExpertOverlayRuntimePlan.HardwareBindingKeepsLocalTPRankLocal
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;MoE;ExpertOverlay;LocalTP;Configuration;Performance;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 # Test: static same-layer routed-expert placement planning
 add_executable(v2_unit_moe_routed_expert_placement_planner unit/execution/moe/Test__MoERoutedExpertPlacementPlanner.cpp)
@@ -882,8 +890,8 @@ add_v2_test(V2_Unit_MoEOverlayCapacityResolver
 # their allocations return to the same physical ledger on teardown.
 add_v2_test(V2_Integration_MoEOverlayHostDemandAdmission
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
-        --gtest_filter=MoEOverlayHostDemandMemoryPlan.*:MoEOverlayLocalCapacityPlanner.GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource
-    LABELS "V2;Integration;Parity;ExpertOverlay;Dynamic;PhysicalMemoryAuthority;Lifecycle;Regression"
+        --gtest_filter=MoEOverlayHostDemandMemoryPlan.*:MoEOverlayLocalCapacityPlanner.GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource:MoEOverlayLocalCapacityPlanner.ReplicatedDenseContinuationPricesFullPrimaryWeightsOnEveryLocalParticipant
+    LABELS "V2;Integration;ProductionParityPreflight;Parity;ExpertOverlay;Dynamic;PhysicalMemoryAuthority;Lifecycle;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -1193,6 +1201,17 @@ add_v2_test(V2_Unit_MoEOverlayInferenceTransaction
 add_v2_test(V2_Integration_MoEOverlayHostedOrdinaryGenerationLifecycle
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
         --gtest_filter=Test__MoEOverlayInferenceTransaction.HostedOrdinaryTransitionRetainsSerialDecodePolicy:Test__MoEOverlayInferenceTransaction.HostedPrefixSampleOpensFirstOrdinaryDecodeSequence
+    LABELS "V2;Integration;ProductionParityPreflight;Execution;MoE;ExpertOverlay;GraphCapture;DeviceGeneration;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# A node-local GPU ExpertOverlay uses the ordinary hosted graph path without
+# inventing a remote MPI transaction coordinator. Keep this zero-coordinator
+# lifecycle as an explicit production preflight regression.
+add_v2_test(V2_Integration_MoEOverlayNodeLocalOrdinaryGraphScope
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+        --gtest_filter=Test__MoEOverlayInferenceTransaction.NodeLocalOrdinaryGraphScopeNeedsNoRemoteCoordinator
     LABELS "V2;Integration;ProductionParityPreflight;Execution;MoE;ExpertOverlay;GraphCapture;DeviceGeneration;Regression"
     MPI_PROCS 1
     NO_MODELS
@@ -6219,6 +6238,14 @@ add_v2_test(V2_Unit_WeightPlan
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_ReplicatedDenseWeightBindingOwnership
+    COMMAND $<TARGET_FILE:v2_unit_weight_plan>
+        --gtest_filter=Test__WeightManagerMaterialize.ReplicatedDenseGraphsKeepRawOperandsDeviceQualified
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;Loaders;Weights;ExpertOverlay;DenseReplication;PreparedWeights;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 add_executable(v2_unit_prepared_weight_store unit/loaders/Test__PreparedWeightStore.cpp)
 target_link_libraries(v2_unit_prepared_weight_store llaminar2_core GTest::gtest_main)
@@ -8246,6 +8273,8 @@ if(ZLIB_FOUND)
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf")
     set(V2_PARITY_MODEL_ORNITH15_MOE
         "${WORKSPACE_ROOT_PARITY}/models/Ornith-1.5-35B-Q4_K_M.gguf")
+    set(V2_PARITY_MODEL_ORNITH15_MOE_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/Ornith-1.5-35B-Q8_0.gguf")
 
     # =========================================================================
     # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
@@ -9000,7 +9029,7 @@ if(ZLIB_FOUND)
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
         CPU_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
         CUDA_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
-        ROCM_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
+        ROCM_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE} ${V2_PARITY_MODEL_ORNITH15_MOE_Q8}
     )
 
     add_executable(v2_integration_parity_qwen36moe_single_device_matrix
@@ -9020,6 +9049,7 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 3600
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
+        CPU_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE_Q8}
         ROCM_MODEL_FILES ${V2_PARITY_MODEL_ORNITH15_MOE}
     )
 
@@ -10795,6 +10825,14 @@ add_v2_test(V2_Unit_InferenceRunnerFactory_MultiDevice
     LABELS "V2;Unit;InferenceRunnerFactory;MultiDevice;LocalTP;Factory;Internal"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ReplicatedDenseOverlayFrozenWeightAuthority
+    COMMAND $<TARGET_FILE:v2_unit_inference_runner_factory_multidevice>
+        --gtest_filter=Test__InferenceRunnerFactory_SourceContract.ConcreteReplicatedDenseOverlayDoesNotRequireDenseTPForFrozenWeights
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;InferenceRunnerFactory;ExpertOverlay;DenseReplication;PreparedWeights;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 # Test: PPStageConfig (Pipeline Parallelism stage configuration struct)
 # Tests PPStageConfig validation (isValid) and layer counting (layerCount).
@@ -10928,6 +10966,14 @@ add_v2_test(V2_Unit_DeviceGraphOrchestrator
     COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
     LABELS "V2;Unit;Qwen2;DeviceGraphOrchestrator;GraphExecution;DeclarativeDesign"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_ReplicatedDenseHybridGDNHeadOwnership
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+        --gtest_filter=Test__DeviceGraphOrchestrator.ReplicatedDenseHybridGDNDoesNotShardBySparseParticipantIndex
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;Qwen35;GDN;ExpertOverlay;DenseReplication;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: DeviceGraphOrchestrator Phase-Aware Weights (Gap 3 - CPU Decode Participation)
@@ -15774,6 +15820,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
             TIMEOUT 120
             NO_MODELS
         )
+        add_v2_test(V2_Integration_ROCm_RCCLRootedCaptureDependency
+            COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
+                --gtest_filter=Test__LocalTPRCCLGraphCapture.RCCLCanonicalRouteRootedPublication_GraphCaptured_MTotal_ByteExact
+            LABELS "V2;Integration;ProductionParityPreflight;LocalTP;RCCL;ROCm;GraphCapture;RootedCollective;ByteExact;Regression"
+            MPI_PROCS 1
+            TIMEOUT 120
+            NO_MODELS
+        )
         add_v2_test(V2_Integration_ROCm_MappedLinearMemcpyParentGraphCapture
             COMMAND $<TARGET_FILE:v2_integration_local_tp_backend_behavior>
                 --gtest_filter=Test__LocalTPRCCLGraphCapture.MappedLinearMemcpy_RetainedParentImportExecutes
@@ -17160,6 +17214,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
             MPI_PROCS 1
             NO_MODELS
         )
+        add_v2_test(V2_Integration_OrdinaryExpertOverlayHostedMaintenance_CUDA
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*HostedMaintenanceTicketRetiresCompletedOrdinaryTail*CUDA
+            LABELS "V2;Integration;ProductionParityPreflight;Backend;GPU;CUDA;ExpertOverlay;Generation;Maintenance;GraphCapture;Regression"
+            MPI_PROCS 1
+            NO_MODELS
+        )
         add_v2_test(V2_Integration_DeviceGenerationSelector_CUDA
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*DeviceControlledSelectorWhileCoversDepthFifteenAndFailsInvalidDepth*CUDA
@@ -17198,6 +17259,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
             COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                 --gtest_filter=*DeviceGenerationControllerCarriesTransactionsByteExactlyAndCaptures*ROCm:*DeviceGenerationMaintenanceClippingCarriesConditionByteExactlyAndCaptures*ROCm:*DeviceGenerationDispatchTicketIsCapturedAndExplicitStreamOrdered*ROCm:*SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly*ROCm:*CapturedCommitBoundaryCountsPendingCorrectionExactlyOnce*ROCm:*OrdinaryDeviceGeneration*ROCm:*HostedContinuation*ROCm
             LABELS "V2;Integration;Backend;GPU;ROCm;MTP;GenerationController;ByteExact;DeviceResident;GraphCapture;Regression"
+            MPI_PROCS 1
+            NO_MODELS
+        )
+        add_v2_test(V2_Integration_OrdinaryExpertOverlayHostedMaintenance_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                --gtest_filter=*HostedMaintenanceTicketRetiresCompletedOrdinaryTail*ROCm
+            LABELS "V2;Integration;ProductionParityPreflight;Backend;GPU;ROCm;ExpertOverlay;Generation;Maintenance;GraphCapture;Regression"
             MPI_PROCS 1
             NO_MODELS
         )
@@ -17746,6 +17814,13 @@ add_v2_test(V2_Unit_Qwen35Schema
     LABELS "V2;Unit;Qwen35;GraphSchema;GDN;PhaseD"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_PhaseSplitDenseGDNResolverGeometry
+    COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
+        --gtest_filter=Qwen35GraphBuildTest.PhaseSplitDenseDecodeUsesFullGDNResolverGeometryOnEveryTPRank
+    LABELS "V2;Integration;ProductionParityPreflight;Qwen35;GDN;ExpertOverlay;Graph;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 # Test: Qwen35MoEGraph — MoE graph construction regressions
 add_executable(v2_test_qwen35moe_graph unit/models/qwen35moe/Test__Qwen35MoEGraph.cpp)
@@ -17765,6 +17840,13 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_ROCmCanonicalRouteSlotAllreduce
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+        --gtest_filter=Test__Qwen35MoEGraph.ROCmPhaseSplitDecodeUsesCanonicalRouteSlotAllreduce
+    LABELS "V2;Integration;ProductionParityPreflight;Qwen35MoE;ExpertOverlay;ROCm;RCCL;Graph;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 # Test: Qwen35MoEGraphNativeProductionLowering — graph-native overlay lowering regressions
 add_executable(v2_test_qwen35moe_graph_native_production_lowering integration/models/qwen35moe/Test__Qwen35MoEGraphNativeProductionLowering.cpp)
@@ -17780,6 +17862,14 @@ add_v2_test(V2_Integration_Qwen35MoEGraphNativeProductionLowering
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
     LABELS "V2;Integration;Qwen35MoE;Graph;MixtureOfExperts;GraphNativeOverlay;GPU"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_Qwen35MoENoP2PMappedRouteTransport
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+        --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.DistributedLocalTPContinuationUsesMappedSparseWithoutP2P
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;Qwen35MoE;ExpertOverlay;ROCm;RCCL;GraphCapture;Transport;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Local and inter-host CPU tickets share typed capture ownership. Certify the
@@ -18095,6 +18185,13 @@ target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE
 add_v2_test(V2_Unit_MemoryPlanner
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
     LABELS "V2;Unit;Planning;MemoryPlanner;MemoryBudget"
+    MPI_PROCS 1
+    NO_MODELS
+)
+add_v2_test(V2_Integration_PhaseSplitDenseMemoryAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.PhaseSplitDenseDecodePricesFullKVAndCapturedActivationFamily
+    LABELS "V2;Integration;ProductionParityPreflight;Planning;MemoryBudget;ExpertOverlay;CUDA;ROCm;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -18758,9 +18855,13 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_PhaseSplitDenseMemoryAdmission
+    V2_Integration_PhaseSplitDenseGDNResolverGeometry
+    V2_Integration_ROCmCanonicalRouteSlotAllreduce
     V2_Integration_PlanningExecutionMeasurement_CPU
     V2_Integration_RankOrdinaryDeviceGeneration
     V2_Integration_MoEOverlayHostedOrdinaryGenerationLifecycle
+    V2_Integration_MoEOverlayNodeLocalOrdinaryGraphScope
     V2_Integration_PrefixFingerprintRequestReuse
     V2_Integration_QwenNativeToolCallProtocol
     V2_Integration_PrefixExactTerminalArchiveReuse
@@ -18907,6 +19008,7 @@ if(HAVE_CUDA)
     ${V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_CUDA
     V2_Integration_DeviceGenerationController_CUDA
+    V2_Integration_OrdinaryExpertOverlayHostedMaintenance_CUDA
     V2_Integration_DeviceGenerationSelector_CUDA
     V2_Integration_MTPVerifierPreparation_CUDA
     V2_Integration_GPUGraphCaptureExecution_CUDA
@@ -18947,6 +19049,7 @@ if(HAVE_ROCM)
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_ROCm
     V2_Integration_DeviceGenerationController_ROCm
+    V2_Integration_OrdinaryExpertOverlayHostedMaintenance_ROCm
     V2_Integration_HIPGraphCapture
     V2_Integration_HIPMultiStreamGraphReplayLifetime
     V2_Integration_MTPVerifierPreparation_ROCm

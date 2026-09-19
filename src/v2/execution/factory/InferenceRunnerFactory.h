@@ -276,10 +276,9 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
             moe_node_local_route_exchange;
 
-        /** Typed continuation-local route transport chosen by the parent. */
-        MoEOverlayNodeLocalRouteTransport
-            moe_node_local_route_transport =
-                MoEOverlayNodeLocalRouteTransport::Unresolved;
+        /** Phase-aware continuation-local route policy chosen by the parent. */
+        MoEOverlayNodeLocalRouteTransportPolicy
+            moe_node_local_route_transport_policy{};
 
         /// Optional graph-level cancellation hook. Queried before each stage,
         /// usually backed by a TP collective abort flag.

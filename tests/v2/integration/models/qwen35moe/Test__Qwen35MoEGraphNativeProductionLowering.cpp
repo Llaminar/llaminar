@@ -2213,12 +2213,15 @@ namespace llaminar2::test
      * and both graphs to rejoin through the same rooted LocalTP publication.
      */
     /**
-     * Prove one distributed LocalTP continuation under an explicit transport.
-     * @param route_transport Native collective or mapped sparse publication.
+     * Prove one distributed LocalTP continuation under an explicit policy.
+     * @param route_policy Phase-aware native or mapped publication policy.
      */
     void assertDistributedLocalTPContinuationCapture(
-        MoEOverlayNodeLocalRouteTransport route_transport)
+        MoEOverlayNodeLocalRouteTransportPolicy route_policy)
     {
+        ASSERT_TRUE(route_policy.resolved());
+        const MoEOverlayNodeLocalRouteTransport route_transport =
+            route_policy.ordinary_prefill;
         constexpr int kMTPSourceLayer = 1;
         auto plan = makeDistributedLocalTPContinuationPlan(
             /*layer_count=*/kMTPSourceLayer + 1);
@@ -2252,9 +2255,8 @@ namespace llaminar2::test
         config0.moe.has_shared_expert = true;
         config0.moe.shared_intermediate_size = kIntermediate;
 
-        config0.moe.node_local_route_transport = route_transport;
-        if (route_transport ==
-            MoEOverlayNodeLocalRouteTransport::MappedSparse)
+        config0.moe.node_local_route_transport_policy = route_policy;
+        if (route_policy.requiresMappedExchange())
         {
             /*
              * RankOrchestrator normally creates this process-local owner
@@ -2363,6 +2365,19 @@ namespace llaminar2::test
                 /*source_world_rank=*/0,
                 /*target_world_rank=*/1);
         const std::vector<int> remote_participants{2, 3, 4, 5};
+        const auto activation_graph_families =
+            makeMoEOverlayActivationGraphFamilyManifests(graph_family);
+        const auto activation_layout =
+            planMoEOverlayNodeLocalActivationLayout({
+                .participant_count = remote_participants.size(),
+                .max_rows_per_participant =
+                    static_cast<std::size_t>(kSeqLen),
+                .max_entries_per_participant =
+                    static_cast<std::size_t>(kSeqLen * kTopK),
+                .d_model = kDModel,
+                .activation_graph_family_count =
+                    activation_graph_families.size(),
+            });
         auto peer_workspace =
             std::make_shared<MoEOverlayRankBatchWireWorkspace>(
                 MoEOverlayRankBatchWireWorkspace::Config{
@@ -2406,8 +2421,8 @@ namespace llaminar2::test
                             },
                             .target_tier_priority = 1,
                             .activation_graph_families =
-                                makeMoEOverlayActivationGraphFamilyManifests(
-                                    graph_family),
+                                activation_graph_families,
+                            .activation_layout = activation_layout,
                             .local_lanes = {
                                 {.participant_id = 2,
                                  .device = DeviceId::cpu()},
@@ -2462,8 +2477,8 @@ namespace llaminar2::test
                 },
                 .target_tier_priority = 1,
                 .activation_graph_families =
-                    makeMoEOverlayActivationGraphFamilyManifests(
-                        graph_family),
+                    activation_graph_families,
+                .activation_layout = activation_layout,
                 .local_lanes = {
                     {.participant_id = 2,
                      .device = DeviceId::rocm(0)},
@@ -3088,7 +3103,8 @@ namespace llaminar2::test
             [&](const MoECanonicalRouteReduceStage *stage,
                 int expected_rows,
                 int expected_participant,
-                MoECanonicalRouteReductionRole expected_role)
+                MoECanonicalRouteReductionRole expected_role,
+                MoEOverlayNodeLocalRouteTransport expected_transport)
         {
             const auto &params = stage->params();
             EXPECT_EQ(params.seq_len, expected_rows);
@@ -3098,7 +3114,7 @@ namespace llaminar2::test
             EXPECT_EQ(params.route_participant_id, expected_participant);
             {
                 const bool uses_mapped_sparse_transport =
-                    route_transport ==
+                    expected_transport ==
                     MoEOverlayNodeLocalRouteTransport::MappedSparse;
                 if (uses_mapped_sparse_transport)
                 {
@@ -3265,24 +3281,39 @@ namespace llaminar2::test
             decode_ordered_stage0,
             /*expected_rows=*/1,
             /*expected_participant=*/0,
-            MoECanonicalRouteReductionRole::RootOwner);
+            MoECanonicalRouteReductionRole::RootOwner,
+            route_policy.decode);
         assert_route_stage(
             decode_ordered_stage1,
             /*expected_rows=*/1,
             /*expected_participant=*/1,
-            MoECanonicalRouteReductionRole::NonRootParticipant);
+            MoECanonicalRouteReductionRole::NonRootParticipant,
+            route_policy.decode);
+        assert_route_stage(
+            mtp_reduce0,
+            /*expected_rows=*/1,
+            /*expected_participant=*/0,
+            MoECanonicalRouteReductionRole::RootOwner,
+            route_policy.decode);
+        assert_route_stage(
+            mtp_reduce1,
+            /*expected_rows=*/1,
+            /*expected_participant=*/1,
+            MoECanonicalRouteReductionRole::NonRootParticipant,
+            route_policy.decode);
         assert_route_stage(
             ordered_stage0,
             /*expected_rows=*/kSeqLen,
             /*expected_participant=*/0,
-            MoECanonicalRouteReductionRole::RootOwner);
+            MoECanonicalRouteReductionRole::RootOwner,
+            route_policy.ordinary_prefill);
         assert_route_stage(
             ordered_stage1,
             /*expected_rows=*/kSeqLen,
             /*expected_participant=*/1,
-            MoECanonicalRouteReductionRole::NonRootParticipant);
-        if (route_transport ==
-            MoEOverlayNodeLocalRouteTransport::MappedSparse)
+            MoECanonicalRouteReductionRole::NonRootParticipant,
+            route_policy.ordinary_prefill);
+        if (route_policy.requiresMappedExchange())
         {
             ASSERT_NE(config0.moe.node_local_route_exchange, nullptr);
             EXPECT_TRUE(config0.moe.node_local_route_exchange->materialized());
@@ -3449,14 +3480,23 @@ namespace llaminar2::test
          DistributedLocalTPContinuationUsesMappedSparseWithoutP2P)
     {
         assertDistributedLocalTPContinuationCapture(
-            MoEOverlayNodeLocalRouteTransport::MappedSparse);
+            {
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::MappedSparse,
+                .decode = MoEOverlayNodeLocalRouteTransport::MappedSparse,
+            });
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          DistributedLocalTPContinuationKeepsNativeCollectiveWithP2P)
     {
         assertDistributedLocalTPContinuationCapture(
-            MoEOverlayNodeLocalRouteTransport::NativeCollective);
+            {
+                .ordinary_prefill =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+                .decode =
+                    MoEOverlayNodeLocalRouteTransport::NativeCollective,
+            });
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

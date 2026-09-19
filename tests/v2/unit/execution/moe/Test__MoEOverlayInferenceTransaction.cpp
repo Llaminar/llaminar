@@ -1892,6 +1892,38 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief A node-local ordinary replay has no fictitious remote ticket owner.
+     *
+     * The same hosted graph path also serves single-rank GPU tiers. Its local
+     * sparse forward remains a real transaction, but no MPI coordinator exists
+     * to arm or finish. The inert scope must accept the forward without
+     * fabricating a remote binding or admitting another command.
+     */
+    TEST(Test__MoEOverlayInferenceTransaction,
+         NodeLocalOrdinaryGraphScopeNeedsNoRemoteCoordinator)
+    {
+        const MoEOverlayInferenceExecutionDescriptor decode{
+            .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+            .request_count = 1,
+            .logical_rows_per_request = 1,
+            .physical_rows_per_request = 1,
+            .draft_depth = -1,
+            .sidecar_depth = -1,
+        };
+        for (int repeat = 0; repeat < 20; ++repeat)
+        {
+            MoEOverlayInferenceParticipantGraphScope scope(
+                nullptr, decode, /*participant_index=*/repeat % 4);
+            ASSERT_TRUE(scope.ready());
+            EXPECT_FALSE(scope.active());
+            EXPECT_FALSE(scope.ownsTicketAuthority());
+            std::string error;
+            ASSERT_TRUE(scope.finish(true, &error)) << error;
+            EXPECT_FALSE(scope.finish(true, &error));
+        }
+    }
+
+    /**
      * @brief Ordinary hosted decode retains depth zero across ticket advances.
      *
      * The hosted scheduler is shared with speculative generation, but an

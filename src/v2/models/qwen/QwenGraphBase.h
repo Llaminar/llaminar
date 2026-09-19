@@ -952,6 +952,36 @@ namespace llaminar2
             std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {},
             std::optional<std::string> precision_override = std::nullopt) const;
 
+        /**
+         * @brief Create one FP32 allreduce for disjoint single-owner slots.
+         *
+         * Unlike an ordinary TP row sum, every live element in this tensor has
+         * exactly one physical producer; every other participant contributes
+         * positive zero. A native FP32 collective is therefore the complete
+         * arithmetic authority and preserves the producer's rounded bytes. It
+         * must not be rewritten as the canonical rank-bank gather/fold used for
+         * overlapping dense TP rows.
+         *
+         * @param buffer In-place FP32 slot bank with stable graph lifetime.
+         * @param count Exact active prefix of elements to publish.
+         * @param device Local participant device.
+         * @param stage_name Stable graph/collective identity.
+         * @param tensor_buffer_id Arena identity for coherence tracking.
+         * @param sideband_workspace_bindings Optional same-collective sidebands.
+         * @return Complete native-FP32 LocalTP allreduce stage.
+         * @throws std::logic_error when the topology or slot storage violates
+         *         the disjoint-owner collective contract.
+         */
+        std::unique_ptr<IComputeStage>
+        createDisjointOwnerSlotAllreduceStage(
+            TensorBase *buffer,
+            size_t count,
+            DeviceId device,
+            const std::string &stage_name,
+            std::optional<BufferId> tensor_buffer_id = std::nullopt,
+            std::vector<TPAllreduceSidebandWorkspaceBinding>
+                sideband_workspace_bindings = {}) const;
+
         // =====================================================================
         // Shared Attention Building Blocks
         // =====================================================================
