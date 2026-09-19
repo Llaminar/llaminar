@@ -5,10 +5,10 @@
 # the configured budget, BuildKit keeps it and the next run can reuse layers.
 set -euo pipefail
 
-# The self-hosted runner owns this cache.  Keep the default aligned with the
-# Dockerfile's one shared ccache budget so a missing ARC environment variable
-# cannot silently turn a bounded CI cache into an unbounded one.
-limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-50GB}"
+# The self-hosted runner owns this cache.  Dependency layers are substantially
+# larger than compiler objects, so BuildKit has its own intentionally looser
+# soft budget.  CCACHE_MAXSIZE remains the separate hard compiler-cache cap.
+limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-200GB}"
 enabled="${LLAMINAR_DOCKER_BUILD_CACHE_GC:-1}"
 
 if [[ "$enabled" == "0" ]]; then

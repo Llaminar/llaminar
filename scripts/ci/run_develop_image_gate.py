@@ -4,7 +4,7 @@
 This intentionally small gate is distinct from the full production
 certification pipeline.  It owns exactly the develop-branch promise: build the
 AVX512 and AVX2 full-backend image pairs, run the complete CMake-owned Unit and
-ProductionParityPreflight gates inside each installed builder, then publish the
+ProductionParityPreflight gates inside each installed test runner, then publish the
 two already-tested runtime siblings.  It never discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.
@@ -22,7 +22,7 @@ import uuid
 import docker_paths
 from production_artifacts import digest, image_identity, validate_prerequisites, write_json
 from run_production_pipeline import (
-    ImageRole, SHIPPING_ISAS, build, device_lease, logged_container_command,
+    TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, device_lease, logged_container_command,
     require_image_pair, run, source_identity,
 )
 
@@ -39,14 +39,14 @@ def runtime_tag(base: str, isa: str) -> str:
 
 
 def run_prerequisites(images: dict, directory: Path) -> dict:
-    """Run the single canonical model-free transaction inside one builder image.
+    """Run the single canonical model-free transaction inside one test runner.
 
-    The builder already contains its immutable Integration executable inventory
+    The test runner already contains its immutable Integration executable inventory
     and installed receipt.  Bind only the evidence directory; attaching models
     or a corpus would make this deliberately model-free develop gate depend on
     a second, undocumented input surface.
     """
-    image = images[ImageRole.BUILDER.value]["id"]
+    image = images[ImageRole.TEST_RUNNER.value]["id"]
     name = "llaminar-develop-prerequisites-" + uuid.uuid4().hex
     command = ["python3", "scripts/ci/run_production_prerequisites.py",
                "--build-dir", "build_v2_integration",
@@ -118,12 +118,15 @@ def main(argv: list[str] | None = None) -> int:
             directory = args.output / isa.lower()
             directory.mkdir()
             build_args = argparse.Namespace(cpu_isa=isa)
-            images = build(build_args, source, directory)
-            require_image_pair(images, source, isa)
+            images = build(build_args, source, directory,
+                           test_inventory=TestRunnerInventory.MODEL_FREE)
+            require_image_pair(images, source, isa,
+                               test_inventory=TestRunnerInventory.MODEL_FREE)
             prerequisites = run_prerequisites(images, directory)
             receipt["variants"][isa] = {
-                "builder_image": images[ImageRole.BUILDER.value]["id"],
+                "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
                 "runtime_image": images[ImageRole.RUNTIME.value]["id"],
+                "test_runner_inventory": TestRunnerInventory.MODEL_FREE.value,
                 "prerequisites_digest": digest(prerequisites),
                 "preflight_test_count": prerequisites["preflight_test_count"],
             }
@@ -136,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             # A network failure can leave a published tag, but never a tag for
             # an image that skipped its own local Unit/preflight gate.
             for isa in args.cpu_isas:
-                images = {ImageRole.BUILDER.value: {"id": receipt["variants"][isa]["builder_image"]},
+                images = {ImageRole.TEST_RUNNER.value: {"id": receipt["variants"][isa]["test_runner_image"]},
                           ImageRole.RUNTIME.value: {"id": receipt["variants"][isa]["runtime_image"]}}
                 receipt["variants"][isa]["publication"] = publish_runtime(images, isa, args.image,
                                                                              args.output / isa.lower())

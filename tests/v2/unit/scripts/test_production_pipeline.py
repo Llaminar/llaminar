@@ -20,6 +20,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import multiprocessing
+import os
 import re
 import shlex
 import signal
@@ -124,14 +125,16 @@ def install_corpus_io_fixture(test, *, mock_stat=False):
         test.addCleanup(stat.stop)
 
 
-def image_pair(source, isa="AVX512"):
+def image_pair(source, isa="AVX512", *,
+               test_inventory=pipeline.TestRunnerInventory.FULL_MATRIX):
     """Independent mock Docker metadata for the test and Release siblings."""
     common = {"org.opencontainers.image.revision": source["revision"],
               "org.llaminar.source_tree": source["tree"], "org.llaminar.cpu_isa": isa,
               "org.llaminar.build_type": "Release", "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON"}
-    return {"builder": {"id": "builder-id", "layers": ["test-layer"],
-                        "labels": {**common, "org.llaminar.image_role": "builder",
-                                   "org.llaminar.integration_skipped": "0"}},
+    return {"test-runner": {"id": "test-runner-id", "layers": ["test-layer"],
+                        "labels": {**common, "org.llaminar.image_role": "test-runner",
+                                   "org.llaminar.integration_skipped": "0",
+                                   "org.llaminar.test_runner_inventory": test_inventory.value}},
             "runtime": {"id": "runtime-id", "layers": ["runtime-layer"],
                         "labels": {**common, "org.llaminar.image_role": "runtime"}}}
 
@@ -196,7 +199,7 @@ def certified_variants(directory, source, baseline):
         inventory = {**manifest(), "source_revision": source["revision"]}
         images = image_pair(source, isa)
         images["runtime"]["id"] = "sha256:" + isa
-        images["builder"]["id"] = "builder-" + isa
+        images["test-runner"]["id"] = "test-runner-" + isa
         evidence = {**e2e_report(inventory), "source_revision": source["revision"],
                     "image": images["runtime"]["id"]}
         row = {"case": "cell", "identity": {"cpu_isa": isa},
@@ -1495,8 +1498,14 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                 argv = ["--build-dir", str(build), "--output", str(output)]
                 if installed:
                     argv += ["--installed-build-receipt", str(receipt)]
+                registration = parity.PreflightRegistration(
+                    "V2_Integration_B",
+                    frozenset(("Integration", "ProductionParityPreflight")),
+                    None,
+                    parity.PreflightExecutionLane.HOST,
+                )
                 with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-                     patch.object(parity, "discover_production_parity_preflight_tests", return_value=("V2_Integration_B",)), \
+                     patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
                      patch.object(prebuilt_test_image, "validate") as validate, \
                      patch.object(parity, "_run_process", return_value=0) as execute:
                     self.assertEqual(prerequisites_runner.main(argv), 0)
@@ -1511,7 +1520,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                                                   parity.PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET])
                 unit, preflight = commands[-2:]
                 self.assertEqual(unit[unit.index("-R") + 1], "^V2_Unit_")
-                self.assertEqual(preflight[preflight.index("-L") + 1], "^ProductionParityPreflight$")
+                self.assertEqual(preflight[preflight.index("-R") + 1], "^(V2_Integration_B)$")
                 for command in (unit, preflight):
                     self.assertIn("--output-log", command)
                     self.assertIn("--output-junit", command)
@@ -1556,8 +1565,14 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                                                "--installed-build-receipt", str(receipt)])
                 authority.assert_not_called()
             artifacts.write_json(receipt, {"invalid": True})
+            registration = parity.PreflightRegistration(
+                "V2_Integration_B",
+                frozenset(("Integration", "ProductionParityPreflight")),
+                None,
+                parity.PreflightExecutionLane.HOST,
+            )
             with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-                 patch.object(parity, "discover_production_parity_preflight_tests", return_value=("V2_Integration_B",)), \
+                 patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
                  patch.object(prebuilt_test_image, "validate", side_effect=ValueError("stale installation")), \
                  patch.object(parity, "_run_process") as execute:
                 with self.assertRaisesRegex(ValueError, "stale installation"):
@@ -1796,7 +1811,7 @@ class PipelineInventoryTests(unittest.TestCase):
 
             with patch.object(pipeline, "source_identity", return_value=source), \
                  patch.object(pipeline, "build", return_value=image_pair(source)), \
-                 patch.object(pipeline, "run_builder", side_effect=export), \
+                 patch.object(pipeline, "run_test_runner", side_effect=export), \
                  patch.object(pipeline, "model_identities") as pin:
                 with self.assertRaisesRegex(ValueError, "noncanonical path"):
                     pipeline.run_variant(args, source)
@@ -1879,7 +1894,7 @@ class PipelineInventoryTests(unittest.TestCase):
 
             with patch.object(pipeline, "source_identity", return_value=source), \
                  patch.object(pipeline, "build", return_value=images) as build, \
-                 patch.object(pipeline, "run_builder", side_effect=export) as discover, \
+                 patch.object(pipeline, "run_test_runner", side_effect=export) as discover, \
                  patch.object(pipeline, "image_identity", side_effect=lambda identity: next(
                      item for item in images.values() if item["id"] == identity)):
                 state = pipeline.run_variant(args, source)
@@ -1900,11 +1915,11 @@ class PipelineInventoryTests(unittest.TestCase):
                 self.assertEqual(pipeline.run_variant(args, source), state)
                 # A receipt cannot invent metadata for an immutable Docker ID.
                 # Re-inspection must compare labels/layers as well as the ID.
-                for field, value in (("labels", {**images["builder"]["labels"],
+                for field, value in (("labels", {**images["test-runner"]["labels"],
                                                 "org.llaminar.cpu_isa": "AVX2"}),
                                      ("layers", ["foreign-layer"])):
                     forged = copy.deepcopy(state)
-                    forged["images"]["builder"][field] = value
+                    forged["images"]["test-runner"][field] = value
                     artifacts.write_json(args.output / "pipeline.json", forged)
                     with self.subTest(field=field), self.assertRaisesRegex(ValueError, "identity/labels/layers"):
                         pipeline.run_variant(args, source)
@@ -1976,7 +1991,7 @@ class PipelineInventoryTests(unittest.TestCase):
 
                     with patch.object(pipeline, "source_identity", side_effect=lambda: copy.deepcopy(current_source)), \
                          patch.object(pipeline, "build", return_value=images), \
-                         patch.object(pipeline, "run_builder", side_effect=builder), \
+                         patch.object(pipeline, "run_test_runner", side_effect=builder), \
                          patch.object(pipeline, "run", side_effect=host) as run:
                         if changed:
                             with self.assertRaisesRegex(ValueError, "source changed after admission"):
@@ -2036,7 +2051,7 @@ class PipelineInventoryTests(unittest.TestCase):
 
             with patch.object(pipeline, "source_identity", return_value=source), \
                  patch.object(pipeline, "build", return_value=images), \
-                 patch.object(pipeline, "run_builder", side_effect=builder), \
+                 patch.object(pipeline, "run_test_runner", side_effect=builder), \
                  patch.object(pipeline, "run", side_effect=host) as execute:
                 state = pipeline.run_variant(args, source)
             self.assertEqual([call.args[1].stem for call in execute.call_args_list],
@@ -2081,7 +2096,7 @@ class CrossHostRunnerTests(unittest.TestCase):
         admitted = remote_runtime_identity(identifier="sha256:admitted")
         corruptions = (
             ("org.opencontainers.image.revision", "old-revision", "requested full-backend Release source"),
-            ("org.llaminar.image_role", "builder", "requested full-backend Release source"),
+            ("org.llaminar.image_role", "test-runner", "requested full-backend Release source"),
             ("org.llaminar.cpu_isa", "SSE2", "supported explicit CPU ISA"),
             ("org.llaminar.source_tree", "", "source tree identity"),
         )
@@ -3060,12 +3075,12 @@ class CertificateTests(unittest.TestCase):
                 pipeline.require_image({"labels": {**labels, field: "wrong"}}, self.source,
                                        "AVX512", pipeline.ImageRole.RUNTIME)
 
-    def test_builder_identity_is_required_before_certifying_complete_reports(self):
-        """A matching runtime cannot excuse a stale or untested builder image."""
+    def test_test_runner_identity_is_required_before_certifying_complete_reports(self):
+        """A matching runtime cannot excuse a stale or untested test runner."""
         self.write()
-        for key in self.images["builder"]["labels"]:
+        for key in self.images["test-runner"]["labels"]:
             changed = copy.deepcopy(self.images)
-            changed["builder"]["labels"][key] = "wrong"
+            changed["test-runner"]["labels"][key] = "wrong"
             with self.subTest(label=key), self.assertRaises(ValueError):
                 pipeline.certificates(self.source, changed, self.path, cpu_isa="AVX512")
         # The caller's shipping slot remains authority even if both images
@@ -3078,10 +3093,10 @@ class ImageIdentityTests(unittest.TestCase):
     """Expected source/ISA/role comes from admission, not the inspected image."""
 
     def test_docker_roles_export_the_actual_build_arguments(self):
-        """Guard producer metadata; runtime image admission tests its consumers."""
+        """Guard test-runner/runtime metadata emitted by their concrete stages."""
         dockerfile = (ROOT / "Dockerfile").read_text()
-        builder, runtime = dockerfile.split("FROM toolchain AS builder", 1)[1].split(
-            "FROM ubuntu:24.04 AS runtime", 1)
+        runtime, test_runner = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
+            "FROM runtime AS test-runner", 1)
         fields = {
             "org.opencontainers.image.revision": "VCS_REF",
             "org.llaminar.source_tree": "LLAMINAR_SOURCE_TREE",
@@ -3090,13 +3105,205 @@ class ImageIdentityTests(unittest.TestCase):
             "org.llaminar.cuda": "LLAMINAR_ENABLE_CUDA",
             "org.llaminar.rocm": "LLAMINAR_ENABLE_ROCM",
         }
-        for role, stage in ((pipeline.ImageRole.BUILDER, builder),
+        for role, stage in ((pipeline.ImageRole.TEST_RUNNER, test_runner),
                             (pipeline.ImageRole.RUNTIME, runtime)):
             with self.subTest(role=role):
                 self.assertIn(f'org.llaminar.image_role="{role.value}"', stage)
                 for label, argument in fields.items():
                     self.assertIn(f'{label}="${{{argument}}}"', stage)
-        self.assertIn('org.llaminar.integration_skipped="${LLAMINAR_SKIP_INTEGRATION}"', builder)
+        self.assertIn('org.llaminar.integration_skipped="${LLAMINAR_SKIP_INTEGRATION}"', test_runner)
+        self.assertIn(
+            'org.llaminar.test_runner_inventory="${LLAMINAR_TEST_RUNNER_INVENTORY}"',
+            test_runner,
+        )
+
+    def test_test_runner_reuses_runtime_closure_and_sealed_test_workspace(self):
+        """The executable test image must not smuggle a second compiler closure.
+
+        Runtime equivalence is intentional: the gate's binaries resolve CUDA,
+        ROCm and MPI exactly as the published image does.  CTest and the
+        archived workspace are the only additional contracts, which keeps the
+        loadable gate image smaller than the transient compiler stage.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
+        self.assertIn("USER root", test_runner)
+        # Generator-policy tests compile temporary C++ translation units,
+        # benchmark-script tests parse JSON, and CMake checks its selected
+        # generator. Keep exactly that small fixture closure; importing the
+        # builder would conceal a missing dependency and turn the test image
+        # back into a compiler image.
+        for package in ("build-essential", "cmake", "git", "jq"):
+            with self.subTest(package=package):
+                self.assertIn(package, test_runner)
+        self.assertIn(
+            "COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja",
+            test_runner,
+        )
+        self.assertIn("FROM builder AS test-workspace", dockerfile)
+        self.assertIn("COPY --from=test-workspace /src/ /src/", test_runner)
+        self.assertIn(
+            "COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \\",
+            test_runner,
+        )
+        # The runner needs CTest's sealed files, never a second copy of the
+        # compiler-stage Release output or static-link-only backend archives.
+        workspace = dockerfile.split("FROM builder AS test-workspace", 1)[1].split(
+            "FROM ubuntu:24.04 AS runtime", 1)[0]
+        for unused in (
+            "/src/build_v2_release",
+            "/src/runtime-bin",
+            "/src/runtime-libs",
+            "/src/runtime-licenses",
+            "/src/external/onednn",
+            "/src/external/rccl",
+            "/src/build_v2_integration/_deps",
+            "/src/build_v2_integration/libcuda_backend.a",
+            "/src/build_v2_integration/librocm_backend.a",
+        ):
+            with self.subTest(unused=unused):
+                self.assertIn(unused, workspace)
+        self.assertIn("ENTRYPOINT []", test_runner)
+        self.assertIn(
+            "LD_LIBRARY_PATH=/src/build_v2_integration:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib",
+            test_runner,
+        )
+        self.assertNotIn("apt-get install -y --no-install-recommends cuda", test_runner)
+        self.assertNotIn("apt-get install -y --no-install-recommends rocm", test_runner)
+
+    def test_cpu_isa_does_not_invalidate_generic_cuda_or_rocm_toolchain_layers(self):
+        """AVX lanes share external dependencies through BuildKit, not host binds."""
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        toolchain = dockerfile.split("FROM ubuntu:24.04 AS toolchain", 1)[1].split(
+            "FROM toolchain AS builder", 1)[0]
+        generic_install_end = toolchain.index("RUN rm -rf /tmp/install-scripts")
+        rccl = toolchain.index("ARG RCCL_ENABLE_MSCCL_KERNEL")
+        cpu_isa = toolchain.index("ARG LLAMINAR_CPU_ISA")
+        onednn = toolchain.index("ARG ONEDNN_GIT_REF")
+        self.assertLess(generic_install_end, cpu_isa)
+        self.assertLess(rccl, cpu_isa)
+        self.assertLess(cpu_isa, onednn)
+
+        runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1]
+        runtime_generic_install_end = runtime.index("RUN rm -rf /tmp/install-scripts")
+        runtime_cpu_isa = runtime.index("ARG LLAMINAR_CPU_ISA")
+        self.assertLess(runtime_generic_install_end, runtime_cpu_isa)
+
+    def test_test_runner_inventory_only_compiles_matrices_for_full_certification(self):
+        """The narrow develop gate cannot pay for or advertise diagnostic matrices.
+
+        Both values are admitted as one typed Docker contract.  Keeping this
+        assertion next to the label/identity checks prevents a future target
+        edit from silently making the develop image gate expensive again, or
+        from stripping matrix executables from the full pipeline that owns
+        typed HTTP-E2E discovery.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        builder = dockerfile.split("FROM toolchain AS builder", 1)[1].split(
+            "FROM ubuntu:24.04 AS runtime", 1)[0]
+        test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
+        self.assertIn("ON:full-matrix|OFF:model-free", builder)
+        self.assertIn(
+            'ON) integration_targets="v2_unit_gate v2_production_parity_preflight_gate '
+            'v2_model_parity_matrices"',
+            builder,
+        )
+        self.assertIn(
+            'OFF) integration_targets="v2_unit_gate v2_production_parity_preflight_gate"',
+            builder,
+        )
+        self.assertIn(
+            'org.llaminar.test_runner_inventory="${LLAMINAR_TEST_RUNNER_INVENTORY}"', test_runner,
+        )
+
+    def test_builder_logs_the_expensive_phase_durations_in_its_plain_build_output(self):
+        """Build artifacts need phase evidence, not only one opaque wall clock.
+
+        Buildx's plain progress log has no durable timestamp per shell command.
+        These completion markers make cold-cache RCCL, oneDNN, Integration and
+        Release costs directly attributable in the uploaded target log without
+        changing their cache keys or imposing a timeout policy.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        for phase in ("rccl", "onednn", "integration", "release"):
+            with self.subTest(phase=phase):
+                self.assertIn(f'{phase}_started_epoch="$(date +%s)"', dockerfile)
+                self.assertIn(
+                    f'==> [{phase}] done; elapsed_seconds=$(( $(date +%s) - '
+                    f'{phase}_started_epoch ))',
+                    dockerfile,
+                )
+
+    def test_snapshot_does_not_materialize_docker_ignored_parity_evidence(self):
+        """Source identity may cover evidence that the Docker build cannot consume.
+
+        This is a functional archive test rather than a source scan: the
+        filtered Git pathspec must retain ordinary tracked source while
+        excluding the same parity-result subtree as .dockerignore.  Otherwise
+        every ISA lane needlessly archives and extracts large CSV diagnostics
+        before BuildKit discards them.
+        """
+        ignored = "tests/v2/integration/parity/results/"
+        self.assertIn(ignored, (ROOT / ".dockerignore").read_text(encoding="utf-8"))
+        self.assertEqual(
+            pipeline.DOCKER_CONTEXT_ARCHIVE_PATHS,
+            (".", ":(exclude)tests/v2/integration/parity/results/**"),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            (project / "src").mkdir()
+            (project / "src" / "implementation.cpp").write_text("// source\n")
+            result = project / "tests/v2/integration/parity/results/run/stages.csv"
+            result.parent.mkdir(parents=True)
+            result.write_text("diagnostic,evidence\n")
+            subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=project, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Fixture", "-c",
+                 "user.email=fixture@example.invalid", "commit", "-qm", "fixture"],
+                cwd=project,
+                check=True,
+            )
+            tree = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=project, text=True).strip()
+            destination = project / "docker-context"
+            with patch.object(pipeline, "ROOT", project):
+                pipeline.snapshot(tree, destination)
+            self.assertEqual((destination / "src/implementation.cpp").read_text(), "// source\n")
+            self.assertFalse((destination / "tests/v2/integration/parity/results/run/stages.csv").exists())
+
+    def test_cuda_installer_aligns_nccl_fatbins_with_the_application_contract(self):
+        """Cold NCCL builds must not compile architectures absent from Llaminar."""
+        installer = (ROOT / "scripts/docker/install-cuda.sh").read_text(encoding="utf-8")
+        self.assertIn('local requested_architectures="${CUDAARCHS:-}"', installer)
+        self.assertIn('""|all|all-major|native)', installer)
+        self.assertIn('gencodes+=("-gencode arch=compute_${architecture},code=sm_${architecture}")',
+                      installer)
+        self.assertIn('export NVCC_GENCODE="${gencodes[*]}"', installer)
+        self.assertIn(
+            '    configure_nccl_gencode\n'
+            '    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"',
+            installer,
+        )
+        function = installer.split("configure_nccl_gencode() {", 1)[1].split(
+            "\n}\n\n# --- Register NVIDIA", 1)[0]
+        invocation = (
+            "configure_nccl_gencode() {" + function + "\n}\n"
+            "configure_nccl_gencode\nprintf '%s' \"${NVCC_GENCODE}\""
+        )
+        result = subprocess.run(
+            ["bash", "-c", invocation],
+            env={**os.environ, "CUDAARCHS": "80;86;90"},
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.stdout.splitlines()[-1],
+            "-gencode arch=compute_80,code=sm_80 "
+            "-gencode arch=compute_86,code=sm_86 "
+            "-gencode arch=compute_90,code=sm_90",
+        )
 
     def test_both_shipping_pairs_require_every_declared_build_property(self):
         """Exercise both roles and both ISAs, including absent identity fields."""
@@ -3114,6 +3321,13 @@ class ImageIdentityTests(unittest.TestCase):
                             changed[role.value]["labels"][key] = "wrong"
                         with self.subTest(isa=isa, role=role, field=key, remove=remove), self.assertRaises(ValueError):
                             pipeline.require_image_pair(changed, source, isa)
+        model_free = image_pair(
+            source, test_inventory=pipeline.TestRunnerInventory.MODEL_FREE)
+        pipeline.require_image_pair(
+            model_free, source, "AVX512",
+            test_inventory=pipeline.TestRunnerInventory.MODEL_FREE)
+        with self.assertRaises(ValueError):
+            pipeline.require_image_pair(model_free, source, "AVX512")
         with self.assertRaises(TypeError):
             pipeline.require_image(images["runtime"], source, isa, "runtime")
         with self.assertRaises(ValueError):
@@ -3124,27 +3338,82 @@ class ImageIdentityTests(unittest.TestCase):
         source = {"revision": "revision", "tree": "tree", "dirty": False}
         images = image_pair(source)
         for changed in ({}, {"runtime": images["runtime"]},
-                        {"runtime": images["builder"], "builder": images["runtime"]},
-                        {**images, "extra": images["builder"]},
-                        {**images, "builder": {**images["builder"], "id": images["runtime"]["id"]}}):
+                        {"runtime": images["test-runner"], "test-runner": images["runtime"]},
+                        {**images, "extra": images["test-runner"]},
+                        {**images, "test-runner": {**images["test-runner"], "id": images["runtime"]["id"]}}):
             with self.subTest(roles=list(changed)), self.assertRaises(ValueError):
                 pipeline.require_image_pair(changed, source, "AVX512")
 
-    def test_bad_builder_stops_before_building_runtime(self):
+    def test_bad_test_runner_stops_before_building_runtime(self):
         """Fail at the first wrong image, rather than paying for a second build."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
             source = {"revision": "revision", "tree": "tree", "dirty": False}
             args = argparse.Namespace(cpu_isa="AVX512")
-            wrong = image_pair(source, "AVX2")["builder"]
+            wrong = image_pair(source, "AVX2")["test-runner"]
             with patch.object(pipeline, "run") as execute, \
                  patch.object(pipeline, "image_identity", return_value=wrong):
-                with self.assertRaisesRegex(ValueError, "builder image"):
+                with self.assertRaisesRegex(ValueError, "test-runner image"):
                     pipeline.build(args, source, root)
             self.assertEqual(execute.call_count, 1)
             command = execute.call_args.args[0]
-            self.assertEqual(command[command.index("--target") + 1], "builder")
+            self.assertEqual(command[command.index("--target") + 1], "test-runner")
+
+    def test_build_journals_each_target_before_and_after_its_live_log(self):
+        """Image timing must survive a silent Buildx import or later interruption."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            args = argparse.Namespace(cpu_isa="AVX512")
+            expected = image_pair(source)
+            with patch.object(pipeline, "run") as execute, \
+                 patch.object(pipeline, "image_identity",
+                              side_effect=[expected["test-runner"], expected["runtime"]]):
+                built = pipeline.build(args, source, root)
+            for target in ("test-runner", "runtime"):
+                self.assertEqual({key: built[target][key] for key in ("id", "layers", "labels")},
+                                 expected[target])
+                self.assertEqual(built[target]["tag"], f"llaminar-ci:tree-avx512-{target}")
+            timeline = [json.loads(line) for line in (root / "build-timeline.jsonl").read_text().splitlines()]
+            self.assertEqual(
+                [(row["event"], row["target"], row["log"]) for row in timeline],
+                [("started", "test-runner", "build-test-runner.log"),
+                 ("completed", "test-runner", "build-test-runner.log"),
+                 ("started", "runtime", "build-runtime.log"),
+                 ("completed", "runtime", "build-runtime.log")],
+            )
+            for row in timeline:
+                self.assertEqual(row["schema"], 1)
+                self.assertGreaterEqual(row["elapsed_seconds"], 0)
+                self.assertIsInstance(row["recorded_at_utc"], str)
+            self.assertEqual(timeline[1]["image"], expected["test-runner"]["id"])
+            self.assertEqual(timeline[3]["image"], expected["runtime"]["id"])
+            self.assertEqual([call.args[1].name for call in execute.call_args_list],
+                             ["build-test-runner.log", "build-runtime.log"])
+            for call in execute.call_args_list:
+                command = call.args[0]
+                matrix_argument = "LLAMINAR_BUILD_MODEL_PARITY_MATRICES=ON"
+                inventory_argument = "LLAMINAR_TEST_RUNNER_INVENTORY=full-matrix"
+                self.assertIn(matrix_argument, command)
+                self.assertIn(inventory_argument, command)
+
+    def test_failed_build_journals_its_terminal_failure(self):
+        """An interrupted target is distinguishable from one that never began."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            args = argparse.Namespace(cpu_isa="AVX512")
+            with patch.object(pipeline, "run", side_effect=RuntimeError("local import failed")):
+                with self.assertRaisesRegex(RuntimeError, "local import failed"):
+                    pipeline.build(args, source, root)
+            timeline = [json.loads(line) for line in (root / "build-timeline.jsonl").read_text().splitlines()]
+            self.assertEqual([(row["event"], row["target"]) for row in timeline],
+                             [("started", "test-runner"), ("failed", "test-runner")])
+            self.assertEqual(timeline[-1]["exception"], "RuntimeError")
+            self.assertEqual(timeline[-1]["message"], "local import failed")
 
     def test_persistent_build_cache_is_partitioned_and_cold_start_safe(self):
         """An ARC hostPath adds Buildx cache state without a bogus cold import."""
@@ -3161,7 +3430,7 @@ class ImageIdentityTests(unittest.TestCase):
                 }, clear=False), \
                  patch.object(pipeline, "run") as execute, \
                  patch.object(pipeline, "image_identity",
-                              side_effect=[expected["builder"], expected["runtime"]]):
+                              side_effect=[expected["test-runner"], expected["runtime"]]):
                 pipeline.build(args, source, root)
             commands = [call.args[0] for call in execute.call_args_list]
             self.assertEqual(len(commands), 2)
@@ -3267,12 +3536,13 @@ class InfrastructureTests(unittest.TestCase):
                 (path / "src/new_implementation.cpp").write_text("// new source\n")
                 self.assertNotEqual(pipeline.source_identity()["tree"], before["tree"])
 
-    def test_builder_installs_the_source_identity_policy(self):
+    def test_compiler_stage_installs_the_source_identity_policy(self):
         """The functional Git-identity fixture must also have its data in Docker.
 
         This packaging check catches the omitted COPY during the fast native
         gate; the preceding functional regression executes again in the real
-        installed builder and proves that the input actually arrived there.
+        installed test runner and proves that the input arrived through the
+        compiler workspace handoff.
         """
         dockerfile = (ROOT / "Dockerfile").read_text()
         builder = dockerfile.split("FROM toolchain AS builder", 1)[1].split("FROM ubuntu:24.04 AS runtime", 1)[0]
@@ -3328,7 +3598,7 @@ class InfrastructureTests(unittest.TestCase):
                  patch.object(pipeline.docker_paths, "device_args", return_value=["--user", "1003:1004"]) as devices, \
                  patch.object(pipeline.docker_paths, "mounts", return_value=[]), \
                  patch.object(pipeline, "run") as execute, patch.object(pipeline.subprocess, "run"):
-                pipeline.run_builder({"builder": {"id": "image"}}, ["python3", "gate.py"], args, root, "gate.log")
+                pipeline.run_test_runner({"test-runner": {"id": "image"}}, ["python3", "gate.py"], args, root, "gate.log")
             devices.assert_called_once_with("image", "CPU+CUDA+ROCm", user="1003:1004")
             argv = execute.call_args.args[0]
             self.assertEqual([argv[i + 1] for i, part in enumerate(argv) if part == "--group-add"], ["1004", "109"])
@@ -3601,8 +3871,14 @@ class InfrastructureTests(unittest.TestCase):
             self.assertIn(pattern, patterns)
 
     def test_prebuilt_image_still_executes_both_complete_gates(self):
+        registration = parity.PreflightRegistration(
+            "V2_Integration_B",
+            frozenset(("Integration", "ProductionParityPreflight")),
+            None,
+            parity.PreflightExecutionLane.HOST,
+        )
         with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-             patch.object(parity, "discover_production_parity_preflight_tests", return_value=("V2_Integration_B",)), \
+             patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
              patch.object(parity.os, "sched_getaffinity", return_value=set(range(8))), \
              patch.object(prebuilt_test_image, "validate") as validate, \
              patch.object(parity, "_run_process", return_value=0) as execute:
@@ -3614,9 +3890,12 @@ class InfrastructureTests(unittest.TestCase):
         commands = [call.args[0] for call in execute.call_args_list]
         self.assertTrue(all(cmd[0] == "ctest" and "--no-tests=error" in cmd for cmd in commands))
         self.assertIn("^V2_Unit_", commands[0])
-        self.assertIn("^ProductionParityPreflight$", commands[1])
-        for command in commands:
-            self.assertEqual(command[command.index("--parallel") + 1], "8")
+        self.assertIn("^(V2_Integration_B)$", commands[1])
+        # The full device-free Unit namespace consumes available CPU capacity;
+        # the typed preflight host lane is deliberately serial so it cannot
+        # race device/mixed-rank maintenance work.
+        self.assertEqual(commands[0][commands[0].index("--parallel") + 1], "8")
+        self.assertEqual(commands[1][commands[1].index("--parallel") + 1], "1")
 
     def test_remote_docker_is_not_a_node_local_device_transport(self):
         with patch.dict(docker_paths.os.environ, {"DOCKER_HOST": "tcp://remote:2376"}):
@@ -3679,12 +3958,17 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("name: LLAMINAR_DOCKER_BUILD_CACHE_ROOT", values)
         self.assertIn("value: /var/cache/llaminar/ccache/buildkit", values)
         self.assertIn("name: LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE", values)
-        self.assertIn("value: 50GB", values)
+        self.assertIn("value: 200GB", values)
         self.assertIn(docker_paths.SHARED_DAEMON_ROOTS_ENV, values)
         self.assertIn("/mnt/llaminar-production-parity", values)
         self.assertIn("initContainers: []", values)
         self.assertIn("name: llaminar-ccache", values)
         self.assertIn("type: Directory", values)
+        # A CPU limit would install a CFS quota on the runner pod. The runner
+        # needs only a small scheduling reservation: host-Docker-launched
+        # BuildKit and test containers retain their independent host cgroups.
+        self.assertIn("resources:\n          requests:\n            cpu: \"2\"\n            memory: 4Gi", values)
+        self.assertNotIn("limits:", values)
         self.assertNotIn("name: dind", values)
         self.assertNotIn("mountPath: /var/lib/docker", values)
         self.assertNotIn("name: llaminar-docker-cache", values)
@@ -3717,7 +4001,7 @@ class InfrastructureTests(unittest.TestCase):
         script = (ROOT / "scripts/ci/prune_docker_build_cache.sh").read_text(
             encoding="utf-8")
         self.assertIn(
-            'limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-50GB}"', script)
+            'limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-200GB}"', script)
         self.assertIn("CCACHE_MAXSIZE remains the hard compiler-cache cap", script)
         self.assertIn("best-effort ${limit} layer-cache prune", script)
         self.assertIn("exit 0", script)
@@ -3908,6 +4192,11 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("--publish", workflow)
         self.assertIn("submodules: false", workflow)
         self.assertIn("lfs: false", workflow)
+        self.assertIn("actions/upload-artifact@v4", workflow)
+        self.assertIn("parity-results/develop-image-gate/develop-image-gate.json", workflow)
+        self.assertIn("parity-results/develop-image-gate/**/build-timeline.jsonl", workflow)
+        self.assertIn("parity-results/develop-image-gate/**/prerequisites/**", workflow)
+        self.assertNotIn("path: parity-results/develop-image-gate\n", workflow)
 
 
 if __name__ == "__main__":

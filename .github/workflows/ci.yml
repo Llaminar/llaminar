@@ -61,3 +61,23 @@ jobs:
         if: always()
         shell: bash
         run: bash scripts/ci/prune_docker_build_cache.sh
+      - name: Retain develop-image build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # This is compact diagnostic evidence, never a Docker or compiler
+          # cache. The host-owned BuildKit/ccache stores remain local.
+          name: develop-image-gate-${{ github.run_id }}
+          # The per-ISA source snapshot is a Buildx input, not evidence. Its
+          # identity is sealed in develop-image-gate.json and it can contain
+          # hundreds of MiB of tracked diagnostic CSVs which Docker itself
+          # excludes. Upload logs, receipts and CTest/JUnit proof only.
+          path: |
+            parity-results/develop-image-gate/develop-image-gate.json
+            parity-results/develop-image-gate/**/build-*.log
+            parity-results/develop-image-gate/**/build-timeline.jsonl
+            parity-results/develop-image-gate/**/prerequisites.log
+            parity-results/develop-image-gate/**/prerequisites.process.log
+            parity-results/develop-image-gate/**/prerequisites/**
+          if-no-files-found: error
+          retention-days: 30

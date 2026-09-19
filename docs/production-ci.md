@@ -13,12 +13,14 @@ routes local development checks, model diagnostics, and this full image gate.
 
 `.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
 `scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
-full-backend builder/runtime pairs, runs the complete Unit and
-`ProductionParityPreflight` transaction inside each builder, then publishes
+full-backend test-runner/runtime pairs, runs the complete Unit and
+`ProductionParityPreflight` transaction inside each test runner, then publishes
 only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
 `ghcr.io/llaminar/llaminar:develop-avx2`. It does not run model discovery,
 generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
-or image certification, and its tags must never be described as certified
+or image certification. Its test runner contains the complete model-free
+Unit/preflight inventory but not diagnostic model-parity matrices needed only
+by the full pipeline's typed E2E discovery. Its tags must never be described as certified
 release artifacts.
 
 Run that exact narrow gate locally when validating its plumbing:
@@ -71,13 +73,42 @@ blobs from growing without bound. The Dockerfile's `ccache` mounts are one
 shared `llaminar-ccache` cache in the host Docker daemon's retained
 `llaminar-ci` BuildKit worker; ccache hashes compiler identity and flags, so
 the two ISA lanes cannot collide. `CCACHE_MAXSIZE=50G` is the hard
-compiler-cache cap. The post-job BuildKit prune is best-effort 50 GB
+compiler-cache cap. The post-job BuildKit prune is best-effort 200 GB
 layer-cache housekeeping and deliberately cannot fail an otherwise valid image
 gate. BuildKit
 intentionally does not export writable cache-mount contents; keeping that
 worker and its bounded cache is what preserves compiler objects across runner
 replacement. Do not replace either path with DIND, an `emptyDir`, or a second
 Docker graph store.
+
+The same retained BuildKit graph is the dependency cache. Its keyed immutable
+layers retain the pinned CUDA, ROCm, NCCL/RCCL, oneDNN, CUTLASS, Python, and
+vendored-dependency builds whenever their declared inputs match. Do not bind a
+mutable host directory over compiled dependency output: that would allow a
+library built for another compiler, ISA, ROCm version, or source revision to
+masquerade as a valid layer hit. Ccache accelerates recompilation inside a
+missed layer; BuildKit authenticates whether the layer may be reused at all.
+
+The runner pod has explicit CPU/memory **requests** for stable scheduling but
+intentionally no CPU or memory limits. A Kubernetes CPU limit is a CFS quota
+and would throttle the action process. The expensive BuildKit and test
+containers are created through the host Docker socket, so they are host-daemon
+workloads with their own cgroups rather than descendants of the runner pod.
+The single-runner scale set and host-level cache discipline remain the resource
+isolation boundary; do not reintroduce per-pod limits as a workaround for a
+node-capacity problem.
+
+Each CI image target writes its complete Buildx output to
+`build-<target>.log` and appends start/terminal timing transitions to
+`build-timeline.jsonl` in the per-ISA gate evidence directory. The develop
+workflow uploads this evidence after every run, including a failure. The
+timeline measures the whole target transaction—compile, filesystem assembly
+and `--load` import—so local Docker import time is not misreported as compiler
+time. The non-published test-runner target is deliberately runtime-derived: it
+contains the sealed test closure but not the compiler toolchain, SDKs, object
+archives, or duplicate Release build. Building it first imports the runtime
+layers which the later publication target reuses. These are compact diagnostics,
+not a cache upload; no BuildKit or ccache payload is sent to GitHub.
 
 The workflow deliberately selects Buildx's `docker-container` driver rather
 than the default Docker driver: the latter cannot export the local cache
@@ -128,7 +159,7 @@ untouched for manual retirement, but no live runner consumes it.
 
 ```mermaid
 flowchart TD
-    S[One immutable source snapshot] --> B[AVX512 and AVX2 Docker builders and Release images]
+    S[One immutable source snapshot] --> B[AVX512 and AVX2 test-runner/runtime image pairs]
     B --> U[Complete Unit gate in each ISA image]
     U --> P[Complete ProductionParityPreflight in each ISA image]
     P --> G[HTTP token regression: MTP off and dynamic, reviewed 384-token controls]
@@ -174,7 +205,7 @@ persistent `/opt/llaminar-parity-references` directory. The test image mounts
 it at `/reference-cache` and sets `LLAMINAR_PARITY_REFERENCE_CACHE_ROOT`.
 Model-owned pack names, generation leases and authentication are unchanged.
 Cold caches generate normally; exiting a test container does not erase them.
-The builder runs tests with the invoking UID/GID, keeping newly generated packs
+The test runner runs tests with the invoking UID/GID, keeping newly generated packs
 and read-only staged GGUFs usable by later local runs. Bind-mount path spelling
 does not invalidate a cache hit when the complete file stat identity agrees.
 ROCm supplementary groups come from the Docker daemon's actual device nodes,
@@ -185,8 +216,8 @@ successful completion, copy its result file, then remove the helper. Attached
 stdout is not a metadata authority: short-lived Docker attach can lose output
 even when the process succeeds. Probe failures are fatal, with no retries or
 permission changes; an empty NVIDIA inventory remains distinct from failure.
-Both builder and runtime install the same source-built RCCL at the same library
-path. Runtime loading uses CMake's exact `RCCL_LIBRARY` selection; it never
+The compiler builder and runtime install the same source-built RCCL at the same
+library path. Runtime loading uses CMake's exact `RCCL_LIBRARY` selection; it never
 guesses a checkout location or substitutes another packaged collective library.
 
 ```bash
@@ -200,17 +231,24 @@ Use `--through build`, `--through prerequisites`, `--through generation`, `--thr
 `--through benchmarks` to exercise a prefix. Continue with the same arguments
 and `--resume`. A source change, changed evidence, missing image, or changed
 model-file identity invalidates reuse. Partial runs never issue a certificate.
-Both the test builder and runtime must match the requested source tree and ISA,
-declare their distinct image roles, and include CUDA and ROCm. The builder must
-also attest that its Integration build was not skipped. These checks reject a
+Both the test runner and runtime must match the requested source tree and ISA,
+declare their distinct image roles, and include CUDA and ROCm. The test runner
+must also carry the sealed receipt that attests its Integration build was not
+skipped. These checks reject a
 wrong image before expensive gates; they do not replace executing the installed
 tests. Resume re-inspects each immutable image and checks its recorded labels
 and layer ancestry as well as its ID. Certification uses the requested ISA slot,
 never an ISA inferred from the candidate's own label.
 The prerequisites phase runs Unit and preflight once per ISA; the generation
-phase consumes that builder-bound receipt rather than repeating gates for each
-model cell. ISA runs are sequential on the same
-node. Both E2E suites must finish successfully before either benchmark suite
+phase consumes that test-runner-bound receipt rather than repeating gates for each
+model cell. Unit retains CTest's unrestricted parallelism. Preflight separates
+its typed, resource-validated inventory into a serial host lane, a CUDA socket
+lane, a ROCm socket lane, and a serial exclusive lane. CUDA and ROCm execute
+concurrently only when they are single-rank, backend-exclusive cases and the
+host exposes disjoint physical-package CPU sets; mixed-backend and multi-rank
+cases remain exclusive. Each lane has its own `integration-<lane>.log` and
+JUnit XML evidence. ISA runs are sequential on the same node. Both E2E suites
+must finish successfully before either benchmark suite
 starts. A passing AVX512 report never certifies AVX2 (or vice versa).
 
 For a model-free prerequisite transaction only:
@@ -221,14 +259,14 @@ python3 scripts/ci/run_production_prerequisites.py \
   --output parity-results/prerequisite-check
 ```
 
-Inside a matching installed builder, add `--installed-build-receipt
+Inside a matching installed test runner, add `--installed-build-receipt
 /src/installed-tests.json`. The command delegates to the same canonical
 Unit/preflight authority and writes its receipt, CTest logs and JUnit files.
 The installed receipt replaces incremental build preparation, not either test
 gate. There are no model, backend or cell selectors, and an existing output
 directory is rejected. This command never stages models or launches a runtime
 container. Its receipt alone is not image certification; the outer pipeline
-must bind it to the exact builder/source/ISA before admitting runtime tests.
+must bind it to the exact test-runner/source/ISA before admitting runtime tests.
 
 Evidence lives in `avx512/` and `avx2/` beneath the output directory, with one
 collection receipt at the root. A local piecewise run may specify `--cpu-isa

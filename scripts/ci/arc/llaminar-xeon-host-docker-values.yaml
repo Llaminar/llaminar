@@ -36,6 +36,16 @@ template:
         image: ghcr.io/actions/actions-runner:latest
         command:
           - /home/runner/run.sh
+        # Requests reserve enough capacity for the action control plane without
+        # constraining its burst behaviour.  In particular, do not add a CPU
+        # limit: Kubernetes implements one as a CFS quota, which would throttle
+        # the runner.  BuildKit and the test containers are launched through
+        # the host Docker daemon and own their own host-level cgroups; they are
+        # not children of this pod's cgroup.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
         env:
           - name: DOCKER_HOST
             value: unix:///var/run/docker.sock
@@ -48,7 +58,7 @@ template:
           - name: LLAMINAR_DOCKER_BUILD_CACHE_ROOT
             value: /var/cache/llaminar/ccache/buildkit
           - name: LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE
-            value: 50GB
+            value: 200GB
           # These paths are mounted at their exact host spelling in both the
           # runner and the daemon namespace.  docker_paths.py rejects every
           # undeclared source rather than guessing a Kubernetes translation.

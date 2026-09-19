@@ -18,7 +18,7 @@ import run_develop_image_gate as gate
 
 def images(isa: str) -> dict:
     """Return just the immutable IDs needed by the outer develop transaction."""
-    return {"builder": {"id": f"builder-{isa.lower()}"},
+    return {"test-runner": {"id": f"test-runner-{isa.lower()}"},
             "runtime": {"id": f"runtime-{isa.lower()}"}}
 
 
@@ -48,8 +48,9 @@ class DevelopImageGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "output"
 
-            def build(args, admitted, directory):
+            def build(args, admitted, directory, *, test_inventory):
                 self.assertEqual(admitted, source)
+                self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
                 events.append(("build", args.cpu_isa))
                 return images(args.cpu_isa)
 
@@ -83,6 +84,8 @@ class DevelopImageGateTests(unittest.TestCase):
             receipt = json.loads((output / "develop-image-gate.json").read_text())
             self.assertTrue(receipt["complete"])
             self.assertTrue(receipt["published"])
+            self.assertEqual(receipt["variants"]["AVX512"]["test_runner_inventory"],
+                             gate.TestRunnerInventory.MODEL_FREE.value)
             self.assertEqual(receipt["variants"]["AVX2"]["publication"]["tag"],
                              "ghcr.io/llaminar/llaminar:develop-avx2")
 
@@ -93,7 +96,7 @@ class DevelopImageGateTests(unittest.TestCase):
             output = Path(temporary) / "output"
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "device_lease", side_effect=lambda: nullcontext()), \
-                 patch.object(gate, "build", side_effect=lambda args, *_: images(args.cpu_isa)), \
+                 patch.object(gate, "build", side_effect=lambda args, *_, **__: images(args.cpu_isa)), \
                  patch.object(gate, "require_image_pair"), \
                  patch.object(gate, "run_prerequisites", side_effect=RuntimeError("preflight red")), \
                  patch.object(gate, "publish_runtime") as publish:

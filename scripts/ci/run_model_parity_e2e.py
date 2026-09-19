@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--export-manifest", type=Path,
                         help="Export tagged configurations without running inference")
     parser.add_argument("--source-revision",
-                        help="CI source revision for export when the builder image omits .git")
+                        help="CI source revision for export when the test-runner image omits .git")
     parser.add_argument("--backend", default=".*")
     parser.add_argument("--campaign", default=".*")
     parser.add_argument("--cell", default=".*")

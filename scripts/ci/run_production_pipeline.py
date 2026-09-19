@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from enum import Enum
 import fcntl
 import json
@@ -52,6 +53,12 @@ SHIPPING_ISAS = ("AVX512", "AVX2")
 # persistent named BuildKit worker's cache mount (cache mounts cannot be
 # exported).
 DOCKER_BUILD_CACHE_ROOT_ENV = "LLAMINAR_DOCKER_BUILD_CACHE_ROOT"
+# Docker build input must not include diagnostic parity CSVs.  Docker itself
+# already excludes this generated directory through .dockerignore; excluding it
+# during the preceding Git archive avoids materializing almost 0.9 GB per ISA
+# only for BuildKit to discard it.  Keep this narrow pathspec synchronized with
+# the corresponding .dockerignore entry and protect that coupling by Unit test.
+DOCKER_CONTEXT_ARCHIVE_PATHS = (".", ":(exclude)tests/v2/integration/parity/results/**")
 
 
 class Phase(str, Enum):
@@ -72,9 +79,26 @@ def pipeline_phases(mathematical_parity: bool = False) -> tuple[Phase, ...]:
 
 
 class ImageRole(str, Enum):
-    """Installed test bundle and shipped runtime have distinct admission roles."""
-    BUILDER = "builder"
+    """Installed test runner and shipped runtime have distinct admission roles."""
+    TEST_RUNNER = "test-runner"
     RUNTIME = "runtime"
+
+
+class TestRunnerInventory(str, Enum):
+    """Explicit compiled-test inventories for otherwise identical test runners.
+
+    The full production pipeline needs the typed matrix executables for
+    generation and HTTP E2E discovery. The develop image gate instead builds
+    and runs its complete model-free Unit/preflight contract without compiling
+    diagnostic mathematical-parity matrices that it cannot run.
+    """
+    FULL_MATRIX = "full-matrix"
+    MODEL_FREE = "model-free"
+
+    @property
+    def docker_matrix_argument(self) -> str:
+        """Translate the typed inventory to the Dockerfile's checked argument."""
+        return "ON" if self is TestRunnerInventory.FULL_MATRIX else "OFF"
 
 
 def run(command: list[str], log: Path, **kwargs) -> None:
@@ -100,6 +124,48 @@ def run(command: list[str], log: Path, **kwargs) -> None:
                     _terminate_process_group(process)
 
 
+def append_build_timeline_event(path: Path, event: str, target: ImageRole, log: Path,
+                                started: float, **details: object) -> None:
+    """Append one durable, timestamped transition for a Docker image target.
+
+    Buildx deliberately keeps its full plain-progress output in ``log``.  This
+    compact companion journal answers the separate operational question of
+    which top-level target consumed wall time, including local image import.
+    It is appended before starting a target and immediately after its terminal
+    transition, so an interrupted job still leaves useful evidence rather than
+    an unexplained truncated build log.
+
+    Args:
+        path: Per-ISA JSON-lines journal owned by the image build transaction.
+        event: Typed lifecycle transition: ``started``, ``completed`` or
+            ``failed``.
+        target: The Docker target whose lifecycle is being recorded.
+        log: Full Buildx output associated with this target.
+        started: Monotonic timestamp captured immediately before Buildx launch.
+        **details: Terminal identity or failure metadata for the event.
+    """
+    if event not in {"started", "completed", "failed"}:
+        raise ValueError(f"unsupported build timeline event: {event}")
+    if not isinstance(target, ImageRole):
+        raise TypeError("build timeline target must be an ImageRole")
+    record = {
+        "schema": 1,
+        "event": event,
+        "target": target.value,
+        "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": time.monotonic() - started,
+        "log": log.name,
+        **details,
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
+        stream.flush()
+        # There are only two transitions per target, so force the compact
+        # lifecycle journal through the host cache before continuing.  Full
+        # compiler output remains streaming/flush-only in its much larger log.
+        os.fsync(stream.fileno())
+
+
 def source_identity() -> dict:
     """Snapshot source with a private index; never stage or commit user edits.
 
@@ -119,10 +185,18 @@ def source_identity() -> dict:
 
 
 def snapshot(tree: str, destination: Path) -> None:
-    """Materialize only Git source, without checkout history or LFS downloads."""
+    """Materialize the exact non-diagnostic Docker source without Git history.
+
+    The source identity remains the complete Git tree, including all tracked
+    evidence.  The Docker context is intentionally narrower: diagnostic
+    parity-result CSVs are not build inputs under ``.dockerignore`` and are
+    excluded before extracting the archive.  This preserves build identity
+    while avoiding per-ISA archive I/O that cannot affect a compiled image.
+    """
     destination.mkdir()
     with tempfile.TemporaryFile() as stream:
-        subprocess.run(["git", "archive", tree], cwd=ROOT, stdout=stream, check=True)
+        subprocess.run(["git", "archive", tree, "--", *DOCKER_CONTEXT_ARCHIVE_PATHS],
+                       cwd=ROOT, stdout=stream, check=True)
         stream.seek(0)
         with tarfile.open(fileobj=stream) as archive:
             archive.extractall(destination, filter="data")
@@ -140,38 +214,43 @@ def device_lease():
         yield
 
 
-def require_image(image: dict, source: dict, isa: str, role: ImageRole) -> None:
+def require_image(image: dict, source: dict, isa: str, role: ImageRole, *,
+                  test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX) -> None:
     """Authenticate either image against caller-owned source, ISA and role.
 
-    Builder labels describe its embedded Release build and the unskipped
+    Test-runner labels describe their embedded Release build and the unskipped
     Integration installation. The installed-test receipt independently checks
     real test files; labels neither replace that receipt nor waive execution.
     Never infer the expected ISA from the image being checked.
     """
     if not isinstance(role, ImageRole):
         raise TypeError("image admission requires a typed role")
+    if not isinstance(test_inventory, TestRunnerInventory):
+        raise TypeError("test-runner image admission requires a TestRunnerInventory")
     if isa not in SHIPPING_ISAS:
         raise ValueError("image admission requires an explicit shipping CPU ISA")
     expected = {"org.opencontainers.image.revision": source["revision"],
                 "org.llaminar.source_tree": source["tree"], "org.llaminar.build_type": "Release",
                 "org.llaminar.cpu_isa": isa, "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
                 "org.llaminar.image_role": role.value}
-    if role is ImageRole.BUILDER:
+    if role is ImageRole.TEST_RUNNER:
         expected["org.llaminar.integration_skipped"] = "0"
+        expected["org.llaminar.test_runner_inventory"] = test_inventory.value
     labels = image.get("labels") if isinstance(image, dict) else None
     if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected.items()):
         raise ValueError(f"{role.value} image does not match the admitted source/ISA/full-backend build")
 
 
-def require_image_pair(images: dict, source: dict, isa: str) -> None:
+def require_image_pair(images: dict, source: dict, isa: str, *,
+                       test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX) -> None:
     """Reject swapped, incomplete or cross-ISA test/runtime siblings."""
     if not isinstance(images, dict) or set(images) != {role.value for role in ImageRole}:
-        raise ValueError("certification requires exactly one builder/runtime image pair")
+        raise ValueError("certification requires exactly one test-runner/runtime image pair")
     for role in ImageRole:
-        require_image(images[role.value], source, isa, role)
+        require_image(images[role.value], source, isa, role, test_inventory=test_inventory)
     identities = [images[role.value].get("id") for role in ImageRole]
     if any(not isinstance(identity, str) or not identity for identity in identities) or identities[0] == identities[1]:
-        raise ValueError("builder/runtime roles require distinct immutable image identities")
+        raise ValueError("test-runner/runtime roles require distinct immutable image identities")
 
 
 def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
@@ -228,29 +307,57 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
     return arguments
 
 
-def build(args, source: dict, directory: Path) -> dict:
-    """Build test/runtime siblings from the same frozen full-fat Docker context."""
+def build(args, source: dict, directory: Path, *,
+          test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX) -> dict:
+    """Build test/runtime siblings and journal each target's wall-clock cost.
+
+    The full Buildx log remains one file per target.  The accompanying
+    ``build-timeline.jsonl`` makes local layer import/export visible as part of
+    the target duration, instead of attributing that time to compilation by
+    omission.  It is CI evidence only and never a cache or input to admission.
+    """
+    if not isinstance(test_inventory, TestRunnerInventory):
+        raise TypeError("image build requires a TestRunnerInventory")
     context = directory / "source"
     if not context.exists():
         snapshot(source["tree"], context)
     prefix = f"llaminar-ci:{source['tree'][:16]}-{args.cpu_isa.lower()}"
+    timeline = directory / "build-timeline.jsonl"
     images = {}
     for role in ImageRole:
         target = role.value
         tag = prefix + "-" + target
+        log = directory / f"build-{target}.log"
         command = ["docker", "buildx", "build", "--load", "--network=host", "--progress=plain",
                    "--target", target, "-t", tag, "--build-arg", f"VCS_REF={source['revision']}",
                    "--build-arg", f"LLAMINAR_SOURCE_TREE={source['tree']}",
+                   "--build-arg", "LLAMINAR_BUILD_MODEL_PARITY_MATRICES="
+                   f"{test_inventory.docker_matrix_argument}",
+                   "--build-arg", "LLAMINAR_TEST_RUNNER_INVENTORY="
+                   f"{test_inventory.value}",
                    "--build-arg", f"LLAMINAR_TEST_UID={os.getuid()}",
                    "--build-arg", f"LLAMINAR_TEST_GID={os.getgid()}",
                    "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}",
                    *persistent_build_cache_arguments(args.cpu_isa), str(context)]
-        run(command, directory / f"build-{target}.log")
+        started = time.monotonic()
+        append_build_timeline_event(timeline, "started", role, log, started)
+        print(f"[production-ci] BUILD target={target} log={log} timeline={timeline}", flush=True)
+        try:
+            run(command, log)
+        except BaseException as error:
+            append_build_timeline_event(timeline, "failed", role, log, started,
+                                        exception=type(error).__name__, message=str(error))
+            raise
         images[target] = {"tag": tag, **image_identity(tag)}
+        append_build_timeline_event(timeline, "completed", role, log, started,
+                                    image=images[target]["id"])
+        print(f"[production-ci] BUILD target={target} status=PASS "
+              f"elapsed_seconds={time.monotonic() - started:.3f}", flush=True)
         # Reject a foreign test bundle immediately, before paying for the next
         # image or admitting any discovery/test process from the wrong build.
-        require_image(images[target], source, args.cpu_isa, role)
-    require_image_pair(images, source, args.cpu_isa)
+        require_image(images[target], source, args.cpu_isa, role,
+                      test_inventory=test_inventory)
+    require_image_pair(images, source, args.cpu_isa, test_inventory=test_inventory)
     return images
 
 
@@ -266,9 +373,9 @@ def logged_container_command(command: list[str], log: str) -> list[str]:
             "llaminar-ci", log, *command]
 
 
-def run_builder(images: dict, command: list[str], args, directory: Path, log: str) -> None:
+def run_test_runner(images: dict, command: list[str], args, directory: Path, log: str) -> None:
     """Run installed tests; bind data/results only, never source or binaries."""
-    image = images["builder"]["id"]
+    image = images[ImageRole.TEST_RUNNER.value]["id"]
     name = "llaminar-ci-tests-" + uuid.uuid4().hex
     launch = ["docker", "run", "--rm", "--name", name,
               *docker_paths.device_args(image, "CPU+CUDA+ROCm", user=f"{os.getuid()}:{os.getgid()}"),
@@ -625,7 +732,7 @@ def certificates(source: dict, images: dict, directory: Path, *, cpu_isa: str,
         raise ValueError("benchmark certificate is incomplete, stale or regressed")
     return {"schema": 1, "source": source, "tested_image": images["runtime"]["id"],
             "cpu_isa": cpu_isa,
-            "test_image": images["builder"]["id"], "manifest_digest": digest(manifest),
+            "test_image": images[ImageRole.TEST_RUNNER.value]["id"], "manifest_digest": digest(manifest),
             "inventory_digest": digest(inventory),
             "prerequisites": {"report_digest": digest(prerequisites),
                               "tests": prerequisites["preflight_test_count"]},
@@ -889,7 +996,7 @@ def run_variant(args, source: dict) -> dict:
                 # not after numerical parity has already consumed them.
                 # This also makes a build-only run sufficient to discover
                 # exact candidates for standalone diagnostic exercises.
-                run_builder(state["images"], ["python3", "scripts/ci/model_parity_inventory.py",
+                run_test_runner(state["images"], ["python3", "scripts/ci/model_parity_inventory.py",
                     "--build-dir", "build_v2_integration", "--scope", InventoryScope.ALL.value,
                     "--export-manifest", "/ci-results/container-all-cells.json",
                     "--source-revision", source["revision"]], args, directory, "discovery.log")
@@ -903,7 +1010,7 @@ def run_variant(args, source: dict) -> dict:
                 write_json(directory / "cross-host-manifest.json", remote)
                 files = ["container-all-cells.json", "all-cells.json", "manifest.json", "cross-host-manifest.json"]
             elif phase == Phase.PREREQUISITES:
-                run_builder(state["images"], ["python3", "scripts/ci/run_production_prerequisites.py",
+                run_test_runner(state["images"], ["python3", "scripts/ci/run_production_prerequisites.py",
                     "--build-dir", "build_v2_integration", "--installed-build-receipt", "/src/installed-tests.json",
                     "--output", "/ci-results/prerequisites"], args, directory, "prerequisites.log")
                 validate_prerequisites(json.loads((directory / "prerequisites/prerequisites.json").read_text()))
@@ -923,7 +1030,7 @@ def run_variant(args, source: dict) -> dict:
                 generation_evidence(directory, inventory, state["images"]["runtime"]["id"], args.cpu_isa, corpus_root)
                 files = ["generation/report.json"]
             elif phase == Phase.PARITY:
-                run_builder(state["images"], ["python3", "scripts/ci/run_production_parity_campaigns.py",
+                run_test_runner(state["images"], ["python3", "scripts/ci/run_production_parity_campaigns.py",
                     "--build-dir", "build_v2_integration", "--installed-build-receipt", "/src/installed-tests.json",
                     "--reuse-passed-preflight-report", "/ci-results/prerequisites/prerequisites.json",
                     "--model-ramdisk-root", str(args.model_ramdisk_root), "--persistent-model-cache-dir", "cache",

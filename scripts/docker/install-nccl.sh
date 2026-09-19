@@ -8,8 +8,10 @@
 # copy its shared library from the builder, without a runtime compiler.
 #
 # NCCL_INSTALL_PREFIX selects the installation prefix (default /usr/local).
-# NVCC_GENCODE may restrict a local build to its actual device architectures;
-# absent that setting, NCCL's complete CUDA-toolkit architecture set is built.
+# Docker's CUDA installer derives NVCC_GENCODE from Llaminar's CUDAARCHS
+# contract, so the collective fatbin and application kernels name the same
+# supported devices. A standalone local invocation may omit it deliberately to
+# request NCCL's complete CUDA-toolkit architecture set.
 set -euo pipefail
 
 nccl_revision=dbc86fd06e8b0c4517b95d8958a09ccacf9520c9

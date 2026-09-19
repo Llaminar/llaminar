@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Seal the build inventory before stripping a Docker builder's intermediates.
+"""Seal the build inventory before stripping a Docker test runner's duplicates.
 
-An installed test image cannot incrementally rebuild: its object files have
-deliberately been discarded. This receipt changes only build preparation, not
-test execution. Every Unit and ProductionParityPreflight test still runs. The
-outer CI driver pins the immutable image ID and never overlays build/source
+An installed test-runner image cannot incrementally rebuild: compiler-only
+objects are deliberately absent. This receipt changes only build preparation,
+not test execution. Every Unit and ProductionParityPreflight test still runs.
+The outer CI driver pins the immutable image ID and never overlays build/source
 files, while this receipt checks its installed CTest and executable inventory.
 """
 from __future__ import annotations

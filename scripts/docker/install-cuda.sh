@@ -27,6 +27,53 @@ APT_OPTS=(
     -o Acquire::https::Timeout=30
 )
 
+## Restrict the patched NCCL fatbin to Llaminar's declared CUDA contract.
+#
+# CUDAARCHS is exported by the Dockerfile from LLAMINAR_CUDA_ARCHS, the same
+# value supplied to CMake's CMAKE_CUDA_ARCHITECTURES.  Leaving NCCL's
+# NVCC_GENCODE unset makes its upstream Makefile compile every architecture
+# known to the installed toolkit, including devices for which this Llaminar
+# image has no kernels.  Apart from wasting a cold build, that makes the
+# collective library advertise a broader device set than the application.
+#
+# CMake's broad selectors intentionally remain broad: NCCL's upstream default
+# is the only equivalent representation for ``all``, ``all-major`` and
+# ``native``.  Concrete CUDA architectures may include a suffix such as 90a;
+# nvcc accepts that spelling in both compute and sm targets.
+configure_nccl_gencode() {
+    local requested_architectures="${CUDAARCHS:-}"
+    local architecture
+    local -a gencodes=()
+    local -a architectures=()
+
+    case "${requested_architectures}" in
+        ""|all|all-major|native)
+            return 0
+            ;;
+    esac
+
+    IFS=';' read -r -a architectures <<< "${requested_architectures}"
+    for architecture in "${architectures[@]}"; do
+        # CMake accepts 86-real/86-virtual spellings.  NCCL's Makefile needs
+        # the underlying compute capability because it constructs the exact
+        # SASS target itself.
+        architecture="${architecture%%-*}"
+        if [[ ! "${architecture}" =~ ^[0-9]+[A-Za-z]?$ ]]; then
+            echo "Unsupported CUDAARCHS entry '${architecture}' for NCCL. " \
+                 "Use concrete capabilities (for example 86 or 90a), or all/all-major/native." >&2
+            return 1
+        fi
+        gencodes+=("-gencode arch=compute_${architecture},code=sm_${architecture}")
+    done
+
+    if ((${#gencodes[@]} == 0)); then
+        echo "CUDAARCHS must not resolve to an empty NCCL target set" >&2
+        return 1
+    fi
+    export NVCC_GENCODE="${gencodes[*]}"
+    echo "==> [nccl] CUDA targets: ${CUDAARCHS}"
+}
+
 # --- Register NVIDIA apt repo --------------------------------------------
 curl -fsSL --retry 5 --retry-delay 5 -o /tmp/cuda-keyring.deb \
     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -48,6 +95,7 @@ if [[ "${MODE}" == "full" ]]; then
 
     # The package supplies tooling; production loads the separately named,
     # pinned source build that supports repeated capture into a native parent.
+    configure_nccl_gencode
     bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"
 
     if [[ "${INSTALL_CUDA_PROFILERS}" == "1" ]]; then

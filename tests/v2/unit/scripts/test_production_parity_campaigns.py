@@ -157,6 +157,23 @@ def preflight_ctest_document(*names: str) -> str:
     )
 
 
+def preflight_registrations(
+    *names: str,
+    lane: campaigns.PreflightExecutionLane = campaigns.PreflightExecutionLane.HOST,
+) -> tuple[campaigns.PreflightRegistration, ...]:
+    """Create the typed model-free preflight inventory used by scheduler tests."""
+
+    return tuple(
+        campaigns.PreflightRegistration(
+            name=name,
+            labels=frozenset(("V2", "Integration", campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL)),
+            mpi_ranks=None,
+            lane=lane,
+        )
+        for name in names
+    )
+
+
 def unit_ctest_document(*names: str) -> str:
     """Build a complete model-free Unit registration document."""
 
@@ -219,6 +236,43 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "gdn_numerically_passed",
             ],
         )
+
+    def test_preflight_ctest_selector_uses_portable_group_syntax(self) -> None:
+        """Run the generated lane selector through CTest's actual regex engine."""
+
+        selector = campaigns._preflight_name_regex(
+            ("V2_Integration_Alpha", "V2_Integration_Beta")
+        )
+        self.assertEqual(
+            selector,
+            "^(V2_Integration_Alpha|V2_Integration_Beta)$",
+        )
+        self.assertNotIn("(?:", selector)
+        with tempfile.TemporaryDirectory(prefix="llaminar-preflight-selector-") as directory:
+            root = Path(directory)
+            (root / "CMakeLists.txt").write_text(
+                "cmake_minimum_required(VERSION 3.20)\n"
+                "project(PreflightSelector NONE)\n"
+                "enable_testing()\n"
+                "add_test(NAME V2_Integration_Alpha COMMAND ${CMAKE_COMMAND} -E true)\n"
+                "add_test(NAME V2_Integration_Beta COMMAND ${CMAKE_COMMAND} -E true)\n",
+                encoding="utf-8",
+            )
+            configured = subprocess.run(
+                ["cmake", "-S", str(root), "-B", str(root / "build")],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            selected = subprocess.run(
+                ["ctest", "--test-dir", str(root / "build"), "--no-tests=error", "-R", selector],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
+            self.assertIn("2/2", selected.stdout)
 
     def test_prefix_restore_schema_names_the_actual_seed_authority(self) -> None:
         """The cached seed epoch is distinct from the old serial oracle epoch."""
@@ -331,11 +385,117 @@ class ProductionParityCampaignTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
             campaigns.discover_production_parity_preflight_tests(Path("build"))
 
+    def test_preflight_execution_plan_only_overlaps_single_rank_homogeneous_backends(self) -> None:
+        """Mixed and multi-rank GPU tests retain exclusive package ownership."""
+
+        mpi_one = ["/usr/bin/mpirun", "-np", "1", "test"]
+        mpi_two = ["/usr/bin/mpirun", "-np", "2", "test"]
+        cases = (
+            ("host", frozenset(("Integration",)), ["test"], campaigns.PreflightExecutionLane.HOST),
+            ("cuda", frozenset(("Integration", "CUDA")), mpi_one, campaigns.PreflightExecutionLane.CUDA_SOCKET),
+            ("rocm", frozenset(("Integration", "ROCm")), mpi_one, campaigns.PreflightExecutionLane.ROCM_SOCKET),
+            ("mixed", frozenset(("Integration", "CUDA", "ROCm")), mpi_one, campaigns.PreflightExecutionLane.EXCLUSIVE),
+            ("cuda-mpi", frozenset(("Integration", "CUDA")), mpi_two, campaigns.PreflightExecutionLane.EXCLUSIVE),
+            ("rocm-mpi", frozenset(("Integration", "ROCm")), mpi_two, campaigns.PreflightExecutionLane.EXCLUSIVE),
+        )
+        registrations = []
+        for name, labels, command, expected_lane in cases:
+            ranks, lane = campaigns._preflight_execution_lane(name, labels, command, ["Integration_Serial"])
+            with self.subTest(name=name):
+                self.assertEqual(lane, expected_lane)
+                self.assertEqual(ranks, int(command[2]) if command[:2] == ["/usr/bin/mpirun", "-np"] else None)
+            registrations.append(campaigns.PreflightRegistration(name, labels, ranks, lane))
+        plan = campaigns.preflight_execution_plan(registrations)
+        self.assertEqual(plan[campaigns.PreflightExecutionLane.CUDA_SOCKET], ("cuda",))
+        self.assertEqual(plan[campaigns.PreflightExecutionLane.ROCM_SOCKET], ("rocm",))
+        self.assertEqual(set(plan[campaigns.PreflightExecutionLane.EXCLUSIVE]), {"mixed", "cuda-mpi", "rocm-mpi"})
+        with self.assertRaisesRegex(RuntimeError, "ROCm resource lock"):
+            campaigns._preflight_execution_lane(
+                "invalid-cuda", frozenset(("Integration", "CUDA")), mpi_one, ["rocm_gpu_0"]
+            )
+
+    def test_preflight_parallel_lanes_terminate_the_sibling_process_group_on_failure(self) -> None:
+        """A red accelerator lane cannot leave its opposite MPI family running."""
+
+        commands = {
+            campaigns.PreflightExecutionLane.CUDA_SOCKET: [
+                sys.executable, "-c", "import sys; sys.exit(7)",
+            ],
+            campaigns.PreflightExecutionLane.ROCM_SOCKET: [
+                sys.executable, "-c", "import time; time.sleep(20)",
+            ],
+        }
+        started = campaigns.time.monotonic()
+        results = campaigns._run_preflight_parallel_processes(commands, 10.0)
+        self.assertEqual(results[campaigns.PreflightExecutionLane.CUDA_SOCKET], 7)
+        self.assertEqual(results[campaigns.PreflightExecutionLane.ROCM_SOCKET], 130)
+        self.assertLess(campaigns.time.monotonic() - started, 6.0)
+
+    @mock.patch.object(campaigns, "_run_preflight_parallel_processes")
+    @mock.patch.object(campaigns, "preflight_accelerator_cpu_sets", return_value=("0-27,56-83", "28-55,84-111"))
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
         campaigns,
-        "discover_production_parity_preflight_tests",
-        return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
+        "discover_production_parity_preflight_registrations",
+        return_value=(
+            campaigns.PreflightRegistration(
+                "V2_Integration_Host", frozenset(("Integration",)), 1,
+                campaigns.PreflightExecutionLane.HOST,
+            ),
+            campaigns.PreflightRegistration(
+                "V2_Integration_CUDA", frozenset(("Integration", "CUDA")), 1,
+                campaigns.PreflightExecutionLane.CUDA_SOCKET,
+            ),
+            campaigns.PreflightRegistration(
+                "V2_Integration_ROCm", frozenset(("Integration", "ROCm")), 1,
+                campaigns.PreflightExecutionLane.ROCM_SOCKET,
+            ),
+            campaigns.PreflightRegistration(
+                "V2_Integration_Mixed", frozenset(("Integration", "CUDA", "ROCm")), 1,
+                campaigns.PreflightExecutionLane.EXCLUSIVE,
+            ),
+        ),
+    )
+    @mock.patch.object(campaigns, "discover_production_parity_unit_tests", return_value=("V2_Unit_One",))
+    def test_preflight_runs_disjoint_socket_lanes_together_then_mixed_work(
+        self,
+        discover_units: mock.Mock,
+        discover_registrations: mock.Mock,
+        run_process: mock.Mock,
+        cpu_sets: mock.Mock,
+        parallel: mock.Mock,
+    ) -> None:
+        """The parallel scheduler is bounded to the two device-owned socket lanes."""
+
+        parallel.return_value = {
+            campaigns.PreflightExecutionLane.CUDA_SOCKET: 0,
+            campaigns.PreflightExecutionLane.ROCM_SOCKET: 0,
+        }
+        code, _, names = campaigns.run_production_parity_preflight(Path("build"), 60.0)
+        self.assertEqual(code, 0)
+        self.assertEqual(names, (
+            "V2_Unit_One", "V2_Integration_Host", "V2_Integration_CUDA",
+            "V2_Integration_ROCm", "V2_Integration_Mixed",
+        ))
+        self.assertEqual(discover_units.call_count, 2)
+        self.assertEqual(discover_registrations.call_count, 2)
+        self.assertEqual(run_process.call_count, 4)  # build, Unit, host, mixed
+        cpu_sets.assert_called_once_with()
+        commands = parallel.call_args.args[0]
+        self.assertEqual(set(commands), {
+            campaigns.PreflightExecutionLane.CUDA_SOCKET,
+            campaigns.PreflightExecutionLane.ROCM_SOCKET,
+        })
+        self.assertEqual(commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][:3], ["taskset", "--cpu-list", "0-27,56-83"])
+        self.assertEqual(commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][:3], ["taskset", "--cpu-list", "28-55,84-111"])
+        self.assertIn("V2_Integration_CUDA", commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1])
+        self.assertIn("V2_Integration_ROCm", commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1])
+
+    @mock.patch.object(campaigns, "_run_process", return_value=0)
+    @mock.patch.object(
+        campaigns,
+        "discover_production_parity_preflight_registrations",
+        return_value=preflight_registrations("V2_Integration_ParityCellLifecycle_MPI1"),
     )
     @mock.patch.object(
         campaigns,
@@ -373,10 +533,8 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
-        self.assertIn(
-            f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
-            command,
-        )
+        self.assertIn("-R", command)
+        self.assertRegex(command[command.index("-R") + 1], "ParityCellLifecycle_MPI1")
 
     def test_preflight_receipt_uses_registrations_after_build_regeneration(self) -> None:
         """A build-triggered CMake refresh must not certify a stale inventory."""
@@ -384,8 +542,11 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns, "discover_production_parity_unit_tests",
             side_effect=[("V2_Unit_Old",), ("V2_Unit_New", "V2_Unit_Added")],
         ), mock.patch.object(
-            campaigns, "discover_production_parity_preflight_tests",
-            side_effect=[("V2_Integration_Old",), ("V2_Integration_New",)],
+            campaigns, "discover_production_parity_preflight_registrations",
+            side_effect=[
+                preflight_registrations("V2_Integration_Old"),
+                preflight_registrations("V2_Integration_New"),
+            ],
         ), mock.patch.object(campaigns, "_run_process", return_value=0):
             return_code, _, tests = campaigns.run_production_parity_preflight(
                 Path("build"), 60.0
@@ -507,7 +668,9 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 with self.subTest(outcomes=outcomes), mock.patch.object(
                     campaigns, "discover_production_parity_unit_tests", return_value=tests[:1]
                 ), mock.patch.object(
-                    campaigns, "discover_production_parity_preflight_tests", return_value=tests[1:]
+                    campaigns,
+                    "discover_production_parity_preflight_registrations",
+                    return_value=preflight_registrations(*tests[1:]),
                 ), mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as run, mock.patch.object(
                     campaigns.time, "time_ns", return_value=123456789
                 ):

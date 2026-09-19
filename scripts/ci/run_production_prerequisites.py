@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Run the canonical Unit/preflight transaction without admitting any model.
 
-Run this command in the installed builder before the outer CI driver starts
+Run this command in the installed test runner before the outer CI driver starts
 Release HTTP cells in the sibling runtime image. Local callers use the same
 authority with an ordinary build tree. CTest owns both complete inventories;
 this entrypoint has no selectors, skip switches, receipt synthesis or model
 staging. Image/source/ISA binding belongs to the outer pipeline that launches
-the immutable builder ID and retains this command's canonical receipt.
+the immutable test-runner ID and retains this command's canonical receipt.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--installed-build-receipt", type=Path,
-                        help="Authenticate an immutable builder's installed test files; still run both gates")
+                        help="Authenticate an immutable test runner's installed test files; still run both gates")
     parser.add_argument("--output", type=Path, required=True,
                         help="New directory for the canonical receipt, CTest logs and JUnit evidence")
     args = parser.parse_args(argv)
