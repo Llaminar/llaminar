@@ -44,6 +44,14 @@ from production_artifacts import digest, image_identity, model_identities, ratch
 
 ROOT = Path(__file__).resolve().parents[2]
 SHIPPING_ISAS = ("AVX512", "AVX2")
+# A self-hosted ARC runner mounts this directory from the physical host.  It
+# is deliberately optional so normal developer builds continue to use the
+# host Docker daemon's local BuildKit cache without inventing a second cache
+# topology.  When declared, the path is a persistent, bounded external cache
+# for immutable Docker layers; compiler objects themselves remain in the
+# persistent named BuildKit worker's cache mount (cache mounts cannot be
+# exported).
+DOCKER_BUILD_CACHE_ROOT_ENV = "LLAMINAR_DOCKER_BUILD_CACHE_ROOT"
 
 
 class Phase(str, Enum):
@@ -166,6 +174,60 @@ def require_image_pair(images: dict, source: dict, isa: str) -> None:
         raise ValueError("builder/runtime roles require distinct immutable image identities")
 
 
+def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
+    """Return one isolated durable Buildx cache contract for a shipping lane.
+
+    The runner process is ephemeral, whereas its configured hostPath survives
+    pod replacement. A cache is therefore scoped by ISA; BuildKit's own graph
+    keys retain the target/stage distinction within that slot. The cache
+    directory is an OCI layout owned by the runner, not a second Docker graph
+    store. ``reset=true`` bounds each slot to the most recent complete cache
+    manifest instead of silently accumulating superseded blobs forever.
+
+    BuildKit intentionally does not export ``RUN --mount=type=cache`` data.
+    The Dockerfile names that ccache mount separately and the persistent
+    BuildKit worker hosted by the one host Docker daemon retains it. This
+    external cache complements it by retaining layer hits across runner-pod
+    lifecycle transitions.
+    """
+    if cpu_isa not in SHIPPING_ISAS:
+        raise ValueError("persistent Buildx cache requires an explicit shipping CPU ISA")
+    raw_root = os.environ.get(DOCKER_BUILD_CACHE_ROOT_ENV)
+    if raw_root is None:
+        return []
+    if not raw_root:
+        raise ValueError(f"{DOCKER_BUILD_CACHE_ROOT_ENV} must not be empty when declared")
+    root = Path(raw_root)
+    if not root.is_absolute():
+        raise ValueError(f"{DOCKER_BUILD_CACHE_ROOT_ENV} must be an absolute directory")
+    try:
+        root = root.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"{DOCKER_BUILD_CACHE_ROOT_ENV} must name the pre-mounted persistent host directory"
+        ) from error
+    if not root.is_dir():
+        raise ValueError(f"{DOCKER_BUILD_CACHE_ROOT_ENV} is not a directory: {root}")
+    if not os.access(root, os.W_OK | os.X_OK):
+        raise ValueError(f"{DOCKER_BUILD_CACHE_ROOT_ENV} is not writable by the CI runner: {root}")
+    if os.environ.get(docker_paths.SHARED_DAEMON_ROOTS_ENV) is not None and \
+            docker_paths.shared_daemon_path(root) is None:
+        raise ValueError(
+            f"{DOCKER_BUILD_CACHE_ROOT_ENV} is not declared in "
+            f"{docker_paths.SHARED_DAEMON_ROOTS_ENV}"
+        )
+    slot = root / cpu_isa.lower()
+    slot.mkdir(parents=True, exist_ok=True)
+    cache_to = f"type=local,dest={slot},mode=max,reset=true"
+    arguments = ["--cache-to", cache_to]
+    # An empty newly-created directory has no OCI index.  Supplying it as an
+    # import source turns an ordinary cold start into a Buildx warning/error;
+    # export first, then admit it as an input on following runs.
+    if (slot / "index.json").is_file():
+        arguments[0:0] = ["--cache-from", f"type=local,src={slot}"]
+    return arguments
+
+
 def build(args, source: dict, directory: Path) -> dict:
     """Build test/runtime siblings from the same frozen full-fat Docker context."""
     context = directory / "source"
@@ -181,7 +243,8 @@ def build(args, source: dict, directory: Path) -> dict:
                    "--build-arg", f"LLAMINAR_SOURCE_TREE={source['tree']}",
                    "--build-arg", f"LLAMINAR_TEST_UID={os.getuid()}",
                    "--build-arg", f"LLAMINAR_TEST_GID={os.getgid()}",
-                   "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}", str(context)]
+                   "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}",
+                   *persistent_build_cache_arguments(args.cpu_isa), str(context)]
         run(command, directory / f"build-{target}.log")
         images[target] = {"tag": tag, **image_identity(tag)}
         # Reject a foreign test bundle immediately, before paying for the next

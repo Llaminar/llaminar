@@ -3146,6 +3146,46 @@ class ImageIdentityTests(unittest.TestCase):
             command = execute.call_args.args[0]
             self.assertEqual(command[command.index("--target") + 1], "builder")
 
+    def test_persistent_build_cache_is_partitioned_and_cold_start_safe(self):
+        """An ARC hostPath adds Buildx cache state without a bogus cold import."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            source = {"revision": "revision", "tree": "tree", "dirty": False}
+            args = argparse.Namespace(cpu_isa="AVX512")
+            expected = image_pair(source)
+            with patch.dict(pipeline.os.environ, {
+                    pipeline.DOCKER_BUILD_CACHE_ROOT_ENV: str(cache_root),
+                }, clear=False), \
+                 patch.object(pipeline, "run") as execute, \
+                 patch.object(pipeline, "image_identity",
+                              side_effect=[expected["builder"], expected["runtime"]]):
+                pipeline.build(args, source, root)
+            commands = [call.args[0] for call in execute.call_args_list]
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertIn("--cache-to", command)
+                specification = command[command.index("--cache-to") + 1]
+                self.assertEqual(
+                    specification,
+                    f"type=local,dest={cache_root}/avx512,mode=max,reset=true",
+                )
+                self.assertNotIn("--cache-from", command)
+
+            # A prior complete OCI export is the only admissible cache input.
+            (cache_root / "avx512" / "index.json").write_text("{}")
+            with patch.dict(pipeline.os.environ, {
+                    pipeline.DOCKER_BUILD_CACHE_ROOT_ENV: str(cache_root),
+                }, clear=False):
+                arguments = pipeline.persistent_build_cache_arguments(
+                    "AVX512")
+            self.assertEqual(arguments, [
+                "--cache-from", f"type=local,src={cache_root}/avx512",
+                "--cache-to", f"type=local,dest={cache_root}/avx512,mode=max,reset=true",
+            ])
+
 
 class InfrastructureTests(unittest.TestCase):
     def setUp(self):
@@ -3322,6 +3362,29 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("install -m 0755 /src/external/rccl/build/librccl.so.1.0 "
                       "/usr/local/lib/librccl.so.1.0", dockerfile)
         self.assertEqual(dockerfile.count("-DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"), 2)
+
+    def test_rccl_capture_patch_is_staged_for_its_late_build_consumer(self):
+        """Keep the RCCL capture patch alive until its dedicated source build.
+
+        The generic tool-install helpers are intentionally removed before the
+        cacheable OneDNN layer.  The RCCL capture patch is different: its only
+        consumer is a later RCCL source-build command.  This source-policy
+        regression prevents a Dockerfile reordering from deleting that helper
+        before the build can apply it.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        toolchain = dockerfile.split("FROM toolchain AS builder", 1)[0]
+        generic_copy = toolchain.split("RUN NINJA_VERSION=", 1)[0]
+        self.assertNotIn("apply-rccl-capture-patch.sh", generic_copy)
+        self.assertIn("patches/nccl-capture-reentry.patch", generic_copy)
+        rccl_start = toolchain.index("COPY scripts/docker/rccl-functions.txt")
+        patch_copy = toolchain.index("COPY scripts/docker/apply-rccl-capture-patch.sh", rccl_start)
+        patch_consumer = toolchain.index(
+            "bash /tmp/install-scripts/apply-rccl-capture-patch.sh", patch_copy)
+        patch_cleanup = toolchain.index("RUN rm -rf /tmp/install-scripts", patch_consumer)
+        self.assertLess(rccl_start, patch_copy)
+        self.assertLess(patch_copy, patch_consumer)
+        self.assertLess(patch_consumer, patch_cleanup)
 
     def test_build_planning_never_probes_docker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3611,12 +3674,53 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("type: Socket", values)
         self.assertIn("mountPath: /home/runner/_work", values)
         self.assertIn("path: /home/runner/_work", values)
+        self.assertIn("mountPath: /var/cache/llaminar/ccache", values)
+        self.assertIn("path: /var/cache/llaminar/ccache", values)
+        self.assertIn("name: LLAMINAR_DOCKER_BUILD_CACHE_ROOT", values)
+        self.assertIn("value: /var/cache/llaminar/ccache/buildkit", values)
+        self.assertIn("name: LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE", values)
+        self.assertIn("value: 50GB", values)
         self.assertIn(docker_paths.SHARED_DAEMON_ROOTS_ENV, values)
         self.assertIn("/mnt/llaminar-production-parity", values)
         self.assertIn("initContainers: []", values)
+        self.assertIn("name: llaminar-ccache", values)
+        self.assertIn("type: Directory", values)
         self.assertNotIn("name: dind", values)
         self.assertNotIn("mountPath: /var/lib/docker", values)
         self.assertNotIn("name: llaminar-docker-cache", values)
+
+    def test_dockerfile_ccache_mounts_are_stable_host_daemon_cache_ids(self):
+        """Compiler cache mounts cannot disappear merely because ARC replaces its pod."""
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        mount = (
+            "--mount=type=cache,id=llaminar-ccache,"
+            "target=/root/.ccache,sharing=locked"
+        )
+        # RCCL, Integration, and Release compilation must share the one
+        # bounded compiler cache instead of allocating anonymous mounts.
+        self.assertEqual(dockerfile.count(mount), 3)
+
+    def test_develop_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
+        """The ARC cache needs a retained BuildKit worker, never the unsupported Docker driver."""
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("driver: docker-container", workflow)
+        self.assertIn("name: llaminar-ci", workflow)
+        self.assertIn("cleanup: false", workflow)
+        self.assertIn("keep-state: true", workflow)
+        self.assertIn("cache-binary: false", workflow)
+        self.assertIn("Bound node-local BuildKit cache", workflow)
+        self.assertNotIn("type=gha", workflow)
+        self.assertNotIn("actions/cache", workflow)
+
+    def test_local_buildkit_gc_preserves_the_hard_50gb_compiler_cache_cap(self):
+        """Optional layer GC cannot fail a valid gate; ccache owns the hard budget."""
+        script = (ROOT / "scripts/ci/prune_docker_build_cache.sh").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            'limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-50GB}"', script)
+        self.assertIn("CCACHE_MAXSIZE remains the hard compiler-cache cap", script)
+        self.assertIn("best-effort ${limit} layer-cache prune", script)
+        self.assertIn("exit 0", script)
 
     def test_attached_execution_requires_delayed_output_and_exact_exit(self):
         for outcome in ("complete", "premature", "missing-output", "timeout"):

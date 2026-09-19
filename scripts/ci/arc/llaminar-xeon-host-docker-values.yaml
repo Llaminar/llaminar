@@ -41,11 +41,19 @@ template:
             value: unix:///var/run/docker.sock
           - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
             value: "120"
+          # This is a physical-host mount, not an emptyDir.  It retains the
+          # Buildx external cache when ARC
+          # replaces a runner pod. Dockerfile compiler mounts remain in the
+          # named BuildKit worker hosted by the same host Docker daemon.
+          - name: LLAMINAR_DOCKER_BUILD_CACHE_ROOT
+            value: /var/cache/llaminar/ccache/buildkit
+          - name: LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE
+            value: 50GB
           # These paths are mounted at their exact host spelling in both the
           # runner and the daemon namespace.  docker_paths.py rejects every
           # undeclared source rather than guessing a Kubernetes translation.
           - name: LLAMINAR_DOCKER_SHARED_ROOTS
-            value: /home/runner/_work:/opt/llaminar-models:/mnt/llaminar-production-parity
+            value: /home/runner/_work:/opt/llaminar-models:/mnt/llaminar-production-parity:/var/cache/llaminar/ccache
         volumeMounts:
           - name: work
             mountPath: /home/runner/_work
@@ -60,6 +68,8 @@ template:
           - name: llaminar-nvidia-libs
             mountPath: /opt/llaminar-nvidia-libs
             readOnly: true
+          - name: llaminar-ccache
+            mountPath: /var/cache/llaminar/ccache
     volumes:
       # This exact host path is also the runner's in-pod path.  Host Docker
       # can therefore bind the checkout and evidence paths without a DIND
@@ -85,4 +95,12 @@ template:
       - name: llaminar-nvidia-libs
         hostPath:
           path: /opt/llaminar-nvidia-libs
+          type: Directory
+      # Prepared once on the physical host and mounted at the same spelling in
+      # the k3d runner.  Directory intentionally fails closed if the host
+      # contract was not prepared; an emptyDir here would erase cache evidence
+      # when ARC recycles the pod.
+      - name: llaminar-ccache
+        hostPath:
+          path: /var/cache/llaminar/ccache
           type: Directory

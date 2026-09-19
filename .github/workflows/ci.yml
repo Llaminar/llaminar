@@ -31,7 +31,19 @@ jobs:
           lfs: false
       - uses: docker/setup-buildx-action@v4
         with:
-          driver: docker
+          # The host-mounted OCI cache needs Buildx's local cache backend,
+          # which the Docker driver cannot export.  This is one named BuildKit
+          # worker *inside the host Docker daemon*, not a DIND graph store.
+          # Retaining its state preserves Dockerfile ccache mounts when ARC
+          # replaces the ephemeral GitHub runner pod.
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          # The runner's persistent host storage is the only build cache.
+          # Do not send even Buildx's own helper binary through Actions cache.
+          cache-binary: false
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -45,3 +57,7 @@ jobs:
             --output parity-results/develop-image-gate \
             --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
             --publish
+      - name: Bound node-local BuildKit cache
+        if: always()
+        shell: bash
+        run: bash scripts/ci/prune_docker_build_cache.sh

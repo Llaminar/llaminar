@@ -89,9 +89,10 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
      scripts/docker/install-cutlass.sh \
-     scripts/docker/apply-rccl-capture-patch.sh \
      /tmp/install-scripts/
-COPY scripts/docker/patches/ /tmp/install-scripts/patches/
+# CUDA's NCCL installer consumes this patch during early toolchain setup.
+COPY scripts/docker/patches/nccl-capture-reentry.patch \
+     /tmp/install-scripts/patches/nccl-capture-reentry.patch
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
@@ -186,7 +187,16 @@ ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
 # an explicit empty override remains the full upstream RCCL developer build.
 ARG RCCL_ONLY_FUNCS=default
 COPY scripts/docker/rccl-functions.txt /src/rccl-functions.txt
-RUN --mount=type=cache,target=/root/.ccache \
+# The capture patch is consumed only by the RCCL source build.  Stage it here
+# so routine install-script changes cannot invalidate the OneDNN cache above.
+COPY scripts/docker/apply-rccl-capture-patch.sh /tmp/install-scripts/
+COPY scripts/docker/patches/rccl-hip-capture-event-wait.patch \
+     /tmp/install-scripts/patches/rccl-hip-capture-event-wait.patch
+# ccache hashes the compiler and full command line, so one 50 GB shared cache
+# is correct across both ISA lanes. It lives in the persistent named BuildKit
+# worker hosted by the one host Docker daemon; locked sharing keeps independent
+# builds coherent without exposing Docker's graph store to another daemon.
+RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     set -e; \
     rccl_build_funcs="${RCCL_ONLY_FUNCS}"; \
     if [ "${rccl_build_funcs}" = "default" ]; then rccl_build_funcs="$(cat /src/rccl-functions.txt)"; fi; \
@@ -265,6 +275,11 @@ RUN set -e; \
         ldconfig; \
     fi
 
+# RCCL capture preparation consumes this helper directory above.  Removing it
+# only after that dependency has been materialized keeps the toolchain image
+# reproducible without leaking build helpers into later layers.
+RUN rm -rf /tmp/install-scripts
+
 # Python dependencies for the reference tests + parity gates. Pulls the
 # CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
 # separate layer keyed only on requirements.txt so source edits don't
@@ -308,7 +323,7 @@ COPY benchmarks/production ./benchmarks/production
 # stack traces from gtest / gdb attach still resolve function names.
 # Removing .o / .d / .gch files is safe: ctest never re-invokes the
 # compiler at test time.
-RUN --mount=type=cache,target=/root/.ccache \
+RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     if [ "${LLAMINAR_SKIP_INTEGRATION}" = "1" ]; then \
         echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
     else \
@@ -359,7 +374,7 @@ RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
 
 # Release build — what the runtime image ships. Optimized, no assertions,
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
-RUN --mount=type=cache,target=/root/.ccache \
+RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1"; \

@@ -40,8 +40,10 @@ The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
 but it deliberately uses the host's Docker Unix socket rather than a DIND
 sidecar. Docker's graph store is single-writer state: two daemons must never
 share a writable `data-root`. Socket ownership gives the runner the host
-daemon's one existing image, BuildKit and layer cache, which is both safe and
-the fastest possible reuse of locally built images.
+daemon's one existing image and layer store. The workflow creates one named,
+persistent `docker-container` BuildKit worker (`llaminar-ci`) within that
+daemon; it is not a second Docker graph store and is retained across ephemeral
+runner-pod replacement.
 
 The checked-in deployment values are
 `scripts/ci/arc/llaminar-xeon-host-docker-values.yaml`. They mount the host
@@ -49,14 +51,56 @@ workspace at the same `/home/runner/_work` spelling in the pod and on the
 host, mount `/var/run/docker.sock`, and declare those paths through
 `LLAMINAR_DOCKER_SHARED_ROOTS`. `docker_paths.py` accepts only those exact
 same-path roots; an undeclared Kubernetes path is a fatal configuration error.
-The scale set also mounts the existing canonical model tmpfs read-only. Before
-applying the scale set, prepare the host once:
+The scale set also mounts the existing canonical model tmpfs read-only and a
+persistent host ccache root at `/var/cache/llaminar/ccache`. Before applying
+the scale set, prepare the host once:
 
 ```bash
 # Run on the host that owns the Kubernetes node and Docker daemon.
 sudo install -d -o 1001 -g 1001 -m 0750 /home/runner/_work
+sudo install -d -o 1001 -g 1001 -m 0750 /var/cache/llaminar/ccache
+sudo install -d -o 1001 -g 1001 -m 0750 /var/cache/llaminar/ccache/buildkit
 bash scripts/ci/setup_production_parity_tmpfs.sh --share-uid 1001
 ```
+
+The cache root is an explicit `hostPath`, so it survives ARC pod recreation
+and node-local runner restarts. `run_production_pipeline.py` partitions the
+external Buildx OCI cache only by ISA and imports it only after a complete
+prior export exists. It resets each slot on export, preventing stale manifest
+blobs from growing without bound. The Dockerfile's `ccache` mounts are one
+shared `llaminar-ccache` cache in the host Docker daemon's retained
+`llaminar-ci` BuildKit worker; ccache hashes compiler identity and flags, so
+the two ISA lanes cannot collide. `CCACHE_MAXSIZE=50G` is the hard
+compiler-cache cap. The post-job BuildKit prune is best-effort 50 GB
+layer-cache housekeeping and deliberately cannot fail an otherwise valid image
+gate. BuildKit
+intentionally does not export writable cache-mount contents; keeping that
+worker and its bounded cache is what preserves compiler objects across runner
+replacement. Do not replace either path with DIND, an `emptyDir`, or a second
+Docker graph store.
+
+The workflow deliberately selects Buildx's `docker-container` driver rather
+than the default Docker driver: the latter cannot export the local cache
+backend at all. `llaminar-ci` is the only CI BuildKit worker and remains on the
+host Docker daemon after the action exits; action concurrency permits one
+writer. Its `cache-binary` action feature is disabled, and the pipeline uses
+only `type=local` cache import/export under the mounted host path: no compiler
+or Buildx cache payload is sent to GitHub. Do not turn on automatic builder
+cleanup or create per-run builders.
+
+When the Kubernetes node is itself a k3d container, Kubernetes `hostPath`
+alone reaches only that node container's filesystem. Bind the same physical
+host directory into every node eligible to run `llaminar-xeon` when creating
+or recreating the cluster, for example:
+
+```bash
+k3d cluster create llaminar \
+  --volume '/var/cache/llaminar/ccache:/var/cache/llaminar/ccache@server:*;agent:*'
+```
+
+Verify the k3d node container has that bind before applying the Helm values.
+The scale-set volume deliberately uses `type: Directory`, so a missing k3d
+bind fails admission instead of creating a non-persistent node-local cache.
 
 `setup_production_parity_tmpfs.sh` adopts the single pre-existing named tmpfs
 with a bind mount when one is already exported; it never copies GGUFs or
