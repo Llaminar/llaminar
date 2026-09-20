@@ -22,7 +22,7 @@ jobs:
     # Manual dispatches from another branch must not mutate the develop tag.
     if: github.ref == 'refs/heads/develop'
     name: Build → Unit → Preflight → Publish develop images
-    runs-on: [llaminar-bench]
+    runs-on: [llaminar-xeon-host]
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6

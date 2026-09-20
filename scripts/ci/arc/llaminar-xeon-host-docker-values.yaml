@@ -11,12 +11,19 @@ controllerServiceAccount:
   name: arc-gha-rs-controller
   namespace: arc-systems
 
-githubConfigUrl: https://github.com/Llaminar
+# This repository-scoped endpoint is intentional.  The CI token is allowed to
+# administer this repository's runners, but it is not an organization-owner
+# credential; using the organization endpoint makes ARC fail with HTTP 403
+# before it can create the listener or an ephemeral runner pod.
+githubConfigUrl: https://github.com/Llaminar/llaminar
 githubConfigSecret: arc-github-app
 runnerGroup: default
-runnerScaleSetName: llaminar-xeon
-scaleSetLabels:
-  - llaminar-bench
+# Route workflows by this unique scale-set name.  The old organization-level
+# `llaminar-bench` scale set may remain registered after a control-plane loss;
+# retaining that shared label would let GitHub dispatch work to its dead
+# identities instead of this repository-scoped listener.
+runnerScaleSetName: llaminar-xeon-host
+scaleSetLabels: []
 minRunners: 1
 maxRunners: 1
 

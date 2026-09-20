@@ -53,6 +53,14 @@ workspace at the same `/home/runner/_work` spelling in the pod and on the
 host, mount `/var/run/docker.sock`, and declare those paths through
 `LLAMINAR_DOCKER_SHARED_ROOTS`. `docker_paths.py` accepts only those exact
 same-path roots; an undeclared Kubernetes path is a fatal configuration error.
+The scale set is repository-scoped (`https://github.com/Llaminar/llaminar`),
+so its `github_token` needs repository runner administration rather than an
+organization-owner credential.  Workflows target the unique
+`llaminar-xeon-host` scale-set name, not a shared label: an old organization
+scale set can otherwise retain the old `llaminar-bench` label after a control
+plane loss and receive jobs under dead runner identities.  An organization URL
+requires a different GitHub App or org-admin token and will leave this
+repository-scoped scale set unable to create runner pods.
 The scale set also mounts the existing canonical model tmpfs read-only and a
 persistent host ccache root at `/var/cache/llaminar/ccache`. Before applying
 the scale set, prepare the host once:

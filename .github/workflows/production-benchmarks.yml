@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   benchmarks:
-    runs-on: [llaminar-bench]
+    runs-on: [llaminar-xeon-host]
     timeout-minutes: 360
     steps:
       - uses: docker/login-action@v4
