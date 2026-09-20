@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -253,6 +254,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
             root = Path(temporary).resolve()
             cache = root / "cache"
             cache.mkdir()
+            unmounted = root / "not-mounted-into-driver"
+            unmounted.mkdir()
             lane = root / "evidence"
             lane.mkdir()
             socket = root / "docker.sock"
@@ -260,7 +263,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
             args = SimpleNamespace(output=root, models=root, model_ramdisk_root=root, e2e_bundle=None)
             with patch.dict(suite.os.environ, {
                 "DOCKER_HOST": "unix://" + str(socket),
-                suite.docker_paths.SHARED_DAEMON_ROOTS_ENV: str(root),
+                suite.docker_paths.SHARED_DAEMON_ROOTS_ENV: os.pathsep.join((str(root), str(unmounted))),
             }, clear=False), \
                  patch.object(suite.docker_paths, "device_args", return_value=[]), \
                  patch.object(suite.docker_paths, "mounts", return_value=[]), \
@@ -272,6 +275,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 f"{suite.docker_paths.SHARED_DAEMON_ROOTS_ENV}={root}",
                 command,
             )
+            self.assertNotIn(str(unmounted), command)
             image_index = command.index("tools-image")
             self.assertEqual(command[image_index - 2:image_index], [
                 "--env", f"{suite.docker_paths.SHARED_DAEMON_ROOTS_ENV}={root}",

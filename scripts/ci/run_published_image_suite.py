@@ -167,6 +167,26 @@ def restore_lane_ownership(driver: str, lane: Path, owner_uid: int, owner_gid: i
                    stderr=subprocess.STDOUT, timeout=30)
 
 
+def driver_shared_root_environment(pairs: list[tuple[Path, str, bool]]) -> str | None:
+    """Project ARC's shared-root topology into the mounted driver namespace.
+
+    The runner's declaration can include cache roots that this short-lived
+    suite driver intentionally does not receive.  Passing that superset makes
+    the nested resolver reject a valid model/log path because it correctly
+    refuses a missing declared root.  Keep only roots containing at least one
+    source mounted into this driver.  The resulting environment is still an
+    exact subset of the infrastructure declaration, never a caller-invented
+    bind permission.
+    """
+    if os.environ.get(docker_paths.SHARED_DAEMON_ROOTS_ENV) is None:
+        return None
+    roots = docker_paths.shared_daemon_roots()
+    sources = tuple(source.resolve(strict=True) for source, _, _ in pairs)
+    selected = tuple(root for root in roots
+                     if any(source.is_relative_to(root) for source in sources))
+    return os.pathsep.join(map(str, selected)) or None
+
+
 def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -> None:
     """Run canonical harnesses as the existing tmpfs owner, including under ARC.
 
@@ -198,9 +218,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     # ordinary Docker environment does not inherit its caller's variables.
     # Propagate this infrastructure-owned declaration so docker_paths.py can
     # choose the direct, audited mapping rather than inspect the ARC pod name.
-    shared_roots = os.environ.get(docker_paths.SHARED_DAEMON_ROOTS_ENV)
-    if shared_roots is not None:
-        docker_paths.shared_daemon_roots()
+    shared_roots = driver_shared_root_environment(pairs)
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
