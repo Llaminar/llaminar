@@ -242,6 +242,37 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(command[-3:], ["tools-image", "python3", "runner.py"])
             self.assertEqual(lane.stat().st_mode & 0o007, 0o005)
 
+    def test_control_container_propagates_the_arc_shared_root_contract(self):
+        """Nested HTTP launches retain the exact runner/daemon mount topology."""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            cache = root / "cache"
+            cache.mkdir()
+            lane = root / "evidence"
+            lane.mkdir()
+            socket = root / "docker.sock"
+            socket.touch()
+            args = SimpleNamespace(output=root, models=root, model_ramdisk_root=root, e2e_bundle=None)
+            with patch.dict(suite.os.environ, {
+                "DOCKER_HOST": "unix://" + str(socket),
+                suite.docker_paths.SHARED_DAEMON_ROOTS_ENV: str(root),
+            }, clear=False), \
+                 patch.object(suite.docker_paths, "device_args", return_value=[]), \
+                 patch.object(suite.docker_paths, "mounts", return_value=[]), \
+                 patch.object(suite.pipeline, "run") as run, \
+                 patch.object(suite.subprocess, "run"):
+                suite.run_in_driver(args, "tools-image", ["python", "runner.py"], lane, "run.log")
+            command = run.call_args.args[0]
+            self.assertIn(
+                f"{suite.docker_paths.SHARED_DAEMON_ROOTS_ENV}={root}",
+                command,
+            )
+            image_index = command.index("tools-image")
+            self.assertEqual(command[image_index - 2:image_index], [
+                "--env", f"{suite.docker_paths.SHARED_DAEMON_ROOTS_ENV}={root}",
+            ])
+
     def test_render_contains_both_isas_exact_identity_geometry_and_rates(self):
         image = chart.render_chart(benchmark_result())
         ET.fromstring(image)

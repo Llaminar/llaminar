@@ -3916,6 +3916,74 @@ class InfrastructureTests(unittest.TestCase):
                 self.assertEqual(docker_paths.host_path(source), str(source))
             containing.assert_not_called()
 
+    def test_container_identity_never_promotes_an_arc_pod_label_to_docker(self):
+        """A friendly ARC hostname is not a Docker namespace translation key."""
+        identifier = "a" * 64
+        self.assertEqual(
+            docker_paths.containing_container_candidates("xeon", "0::/kubepods.slice/xeon\n"),
+            (),
+        )
+        self.assertEqual(
+            docker_paths.containing_container_candidates(
+                "xeon", f"0::/kubepods.slice/docker-{identifier}.scope\n"),
+            (identifier,),
+        )
+
+    def test_unknown_container_namespace_fails_before_docker_inspect(self):
+        """An unshared ARC pod must request the explicit same-path contract."""
+        def exists(path):
+            return str(path) == "/.dockerenv"
+
+        def read_text(path, *unused_args, **unused_kwargs):
+            if str(path) == "/etc/hostname":
+                return "xeon\n"
+            if str(path) == "/proc/self/cgroup":
+                return "0::/kubepods.slice/xeon\n"
+            raise AssertionError(f"unexpected path read: {path}")
+
+        with patch.object(docker_paths.Path, "exists", exists), \
+             patch.object(docker_paths.Path, "read_text", read_text), \
+             patch.object(docker_paths.subprocess, "check_output") as inspect, \
+             patch.dict(docker_paths.os.environ, {"DOCKER_HOST": "unix:///var/run/docker.sock"}, clear=False):
+            with self.assertRaisesRegex(ValueError, "LLAMINAR_DOCKER_SHARED_ROOTS"):
+                docker_paths.containing_container()
+        inspect.assert_not_called()
+
+    def test_shared_model_cache_root_never_requires_container_translation(self):
+        """Same-path ARC tmpfs mounts are already visible to the host daemon."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with patch.dict(docker_paths.os.environ, {
+                "DOCKER_HOST": "unix:///var/run/docker.sock",
+                docker_paths.SHARED_DAEMON_ROOTS_ENV: str(root),
+            }, clear=False), \
+                 patch.object(docker_paths, "containing_container") as containing:
+                docker_paths.publish_model_cache(root)
+            containing.assert_not_called()
+
+    def test_docker_mount_mapping_preserves_symlinked_socket_identity(self):
+        """A /var/run-style alias must still resolve to the exact host socket bind."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            actual = root / "run"
+            actual.mkdir()
+            socket = actual / "docker.sock"
+            socket.touch()
+            alias = root / "var-run"
+            alias.symlink_to(actual, target_is_directory=True)
+            container = {"Mounts": [
+                {"Destination": str(root), "Source": "/host/parent", "Type": "bind"},
+                {"Destination": str(alias / "docker.sock"),
+                 "Source": "/var/run/docker.sock", "Type": "bind"}]}
+            with patch.object(docker_paths, "shared_daemon_roots", return_value=()), \
+                 patch.object(docker_paths, "containing_container", return_value=container), \
+                 patch.object(docker_paths, "private_model_mount") as private, \
+                 patch.dict(docker_paths.os.environ, {"DOCKER_HOST": "unix://" + str(socket)}):
+                for source in (socket, alias / "docker.sock"):
+                    self.assertEqual(docker_paths.host_path(source), "/var/run/docker.sock")
+                self.assertEqual(docker_paths.host_path(actual), "/host/parent/run")
+                private.assert_not_called()
+
     def test_arc_shared_roots_reject_ambiguous_or_remote_declarations(self):
         """A shared-root declaration cannot widen Docker authority by accident."""
         with tempfile.TemporaryDirectory() as directory:

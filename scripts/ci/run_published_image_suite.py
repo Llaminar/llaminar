@@ -168,12 +168,26 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     if args.e2e_bundle:
         bundle = args.e2e_bundle.resolve(strict=True)
         pairs.append((bundle, str(bundle), True))
+    # The nested canonical HTTP harness launches the immutable runtime image
+    # through the same host socket.  ARC's source/model/evidence roots are
+    # deliberately mounted at identical paths in all three namespaces, but an
+    # ordinary Docker environment does not inherit its caller's variables.
+    # Propagate this infrastructure-owned declaration so docker_paths.py can
+    # choose the direct, audited mapping rather than inspect the ARC pod name.
+    shared_roots = os.environ.get(docker_paths.SHARED_DAEMON_ROOTS_ENV)
+    if shared_roots is not None:
+        docker_paths.shared_daemon_roots()
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         "--group-add", str(socket.stat().st_gid), *docker_paths.mounts(pairs),
         "--workdir", str(ROOT), "--env", "DOCKER_HOST=unix:///var/run/docker.sock",
         driver, "python3", *command[1:]]
+    if shared_roots is not None:
+        # Insert before the image; everything after the image is the immutable
+        # control command, whose argv must remain untouched.
+        image_index = launch.index(driver)
+        launch[image_index:image_index] = ["--env", f"{docker_paths.SHARED_DAEMON_ROOTS_ENV}={shared_roots}"]
     try:
         pipeline.run(launch, lane / log)
     finally:

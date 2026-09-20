@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import hashlib
@@ -27,6 +28,17 @@ import uuid
 # explicitly: accepting an arbitrary caller path here would conceal an
 # incomplete mount contract.
 SHARED_DAEMON_ROOTS_ENV = "LLAMINAR_DOCKER_SHARED_ROOTS"
+
+# Docker accepts a full object ID or an unambiguous hexadecimal prefix.  A
+# runner/pod hostname is otherwise just a hostname: treating a friendly label
+# such as "xeon" as a Docker object silently turns a topology error into an
+# empty bind source at a much later launch boundary.
+_DOCKER_CONTAINER_ID = re.compile(r"^[0-9a-f]{12,64}$", re.IGNORECASE)
+_DOCKER_CGROUP_ID = re.compile(
+    r"(?:^|/)(?:docker-)?([0-9a-f]{12,64})(?:\.scope)?(?:/|$)|"
+    r"(?:^|/)(?:docker|cri-containerd)-([0-9a-f]{12,64})\.scope(?:/|$)",
+    re.IGNORECASE,
+)
 
 
 def local_docker_endpoint() -> None:
@@ -84,13 +96,61 @@ def shared_daemon_path(path: Path) -> str | None:
     return None
 
 
+def containing_container_candidates(hostname: str, cgroup: str) -> tuple[str, ...]:
+    """Return only structurally valid Docker IDs exposed by this namespace.
+
+    A Kubernetes/ARC runner may use a descriptive hostname that has no Docker
+    object on the host daemon.  Docker cgroup syntax has a small, explicit
+    grammar; scan only those forms and never promote an arbitrary cgroup
+    component to an object ID.  Callers still authenticate every candidate
+    with ``docker inspect`` because a container-runtime ID need not belong to
+    the Docker daemon serving this process.
+    """
+    candidates: list[str] = []
+    if _DOCKER_CONTAINER_ID.fullmatch(hostname):
+        candidates.append(hostname.lower())
+    for match in _DOCKER_CGROUP_ID.finditer(cgroup):
+        candidate = next(value for value in match.groups() if value is not None).lower()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
 def containing_container() -> dict | None:
-    """Identify our containing Docker namespace, or ordinary daemon-local host."""
+    """Identify our containing Docker namespace, or fail with a typed contract.
+
+    Namespace translation is valid only when this process can prove that its
+    Docker container is visible to the same node-local daemon.  ARC's
+    same-path shared-root contract is deliberately preferred and bypasses this
+    function entirely; an unrecognised pod/container must not be guessed.
+    """
     local_docker_endpoint()
     if not Path("/.dockerenv").exists():
         return None
-    container = Path("/etc/hostname").read_text().strip()
-    return json.loads(subprocess.check_output(["docker", "inspect", container], text=True))[0]
+    hostname = Path("/etc/hostname").read_text(encoding="utf-8").strip()
+    try:
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # A compliant Docker container always has cgroups, but retaining an
+        # empty value gives the hostname path a precise, portable diagnostic.
+        cgroup = ""
+    for candidate in containing_container_candidates(hostname, cgroup):
+        try:
+            inspected = json.loads(subprocess.check_output(
+                ["docker", "inspect", candidate], text=True, stderr=subprocess.DEVNULL))
+        except subprocess.CalledProcessError:
+            # A CRI/containerd ID is not necessarily a Docker object.  It is
+            # evidence to try, never permission to invent another mapping.
+            continue
+        if (isinstance(inspected, list) and len(inspected) == 1
+                and isinstance(inspected[0], dict)
+                and isinstance(inspected[0].get("Id"), str)
+                and inspected[0]["Id"].lower().startswith(candidate)):
+            return inspected[0]
+    raise ValueError(
+        "cannot identify this Docker container through the node-local daemon; "
+        f"declare {SHARED_DAEMON_ROOTS_ENV} for an exact same-path ARC mount "
+        "instead of relying on namespace translation")
 
 
 def private_model_mount(path: Path) -> Path:
@@ -114,10 +174,17 @@ def publish_model_cache(path: Path) -> None:
     privileged node-local helper. Existing exports must refer to the same
     device/inode; nothing is overwritten or automatically unmounted.
     """
+    resolved = path.resolve(strict=True)
+    # ARC roots are already daemon-visible at the exact same spelling.  Do not
+    # enter the private-tmpfs publication path merely because the runner itself
+    # happens to be containerized.
+    local_docker_endpoint()
+    if shared_daemon_path(resolved) is not None:
+        return
     container = containing_container()
     if container is None:
         return
-    root = private_model_mount(path)
+    root = private_model_mount(resolved)
     pid = container["State"]["Pid"]
     if type(pid) is not int or pid <= 0:
         raise ValueError("invalid containing container host PID")
@@ -142,10 +209,15 @@ def host_path(path: Path) -> str:
     container = containing_container()
     if container is None:
         return str(resolved)
-    # Prefer the most specific mount when a workspace contains another volume.
-    for mount in sorted(container["Mounts"], key=lambda item: len(item["Destination"]), reverse=True):
-        destination = Path(mount["Destination"])
-        if resolved.is_relative_to(destination) and mount["Type"] in ("bind", "volume"):
+    # Compare both sides in this container's namespace. Docker retains the
+    # launch spelling (for example /var/run/docker.sock), while resolve()
+    # canonicalizes the caller to /run/docker.sock. The daemon-side source is
+    # deliberately NOT resolved here: its symlinks belong to another namespace.
+    # Resolve before sorting so nested mounts still win through directory aliases.
+    candidates = [(Path(mount["Destination"]).resolve(), mount)
+                  for mount in container["Mounts"] if mount["Type"] in ("bind", "volume")]
+    for destination, mount in sorted(candidates, key=lambda item: len(item[0].parts), reverse=True):
+        if resolved.is_relative_to(destination):
             return str(Path(mount["Source"]) / resolved.relative_to(destination))
     root = private_model_mount(resolved)
     return str(Path(export_path(container, root)) / resolved.relative_to(root))
