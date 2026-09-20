@@ -8,19 +8,22 @@ publication boundaries and the exact-data renderer without GPUs or weights.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import run_published_image_suite as suite
+import run_model_parity_e2e as e2e
 import published_benchmark_chart as chart
 from production_artifacts import digest, write_json
 
@@ -119,6 +122,113 @@ def benchmark_report(pair, manifest, e2e, isa):
 
 class PublishedImageSuiteTests(unittest.TestCase):
     """Wrong provenance or incomplete evidence cannot publish a convincing chart."""
+
+    def test_e2e_runner_collects_failed_timeout_and_passing_cells(self):
+        """One red cell must not hide later independent HTTP configurations."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_model = root / "model.gguf"
+            profile = {"server_args": ["--device", "cpu:0"], "context_length": 8192,
+                       "minimum_prompt_tokens": 4096, "generation_tokens": 2048,
+                       "request_timeout_seconds": 600, "readiness_timeout_seconds": 180,
+                       "thinking_modes": "both", "movement_evidence": "not_applicable"}
+            campaign = SimpleNamespace(group=SimpleNamespace(backends="CPU"))
+            selected = [(campaign, f"Suite.Cell/{index}",
+                         {"id": f"cell-{index}", "model": str(source_model),
+                          "e2e": profile}) for index in range(3)]
+            workspace = SimpleNamespace(models=root / "staged", persistent=True,
+                                        protect_published_models=MagicMock())
+            staged = [SimpleNamespace(source_path=str(source_model), filename="model.gguf")]
+            report_path = root / "e2e.json"
+            image = "sha256:" + "a" * 64
+            with patch.object(e2e, "discover", return_value=selected), \
+                 patch.object(e2e, "image_identity", return_value={"id": image}), \
+                 patch.object(e2e, "validate_attached_execution"), \
+                 patch.object(e2e.parity, "model_staging_workspace",
+                              return_value=nullcontext(workspace)), \
+                 patch.object(e2e.parity, "stage_models_in_ramdisk",
+                              return_value=(staged, None)) as stage, \
+                 patch.object(e2e, "run_e2e_process", side_effect=[1, 124, 0]) as run, \
+                 patch.object(e2e, "validate_long_context_evidence") as checks:
+                result = e2e.main(["--container-image", image,
+                                   "--source-revision", "a" * 40,
+                                   "--model-ramdisk-root", str(root),
+                                   "--report", str(report_path)])
+            self.assertEqual(result, 1)
+            self.assertEqual(stage.call_count, 1)
+            self.assertEqual(run.call_count, 3)
+            checks.assert_called_once()
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["selected"], 3)
+            self.assertEqual([row["outcome"] for row in report["cells"]],
+                             ["failed", "cell_timeout", "passed"])
+            self.assertEqual(report["failed_cells"], ["Suite.Cell/0", "Suite.Cell/1"])
+            self.assertFalse(report["correctness_passed"])
+
+    def test_published_e2e_runs_both_isas_before_reporting_complete_red_cells(self):
+        """A complete red AVX512 report retains AVX2 evidence but blocks admission."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pair = image_pair()
+            inventory = full_inventory()
+            manifest = suite.pipeline.e2e_projection(inventory, pair["source"]["revision"])
+            write_json(root / "images.json", pair)
+            write_json(root / "all-cells.json", inventory)
+            write_json(root / "manifest.json", manifest)
+
+            def drive(_args, _driver, _command, lane, _log):
+                isa = lane.name.upper()
+                failed = isa == "AVX512"
+                row = manifest["cells"][0]
+                report = {"schema": 1, "image": pair["images"][isa]["id"],
+                          "source_revision": pair["source"]["revision"],
+                          "manifest_digest": digest(manifest), "selected": 1,
+                          "correctness_passed": not failed,
+                          "cells": [{"case": row["case"],
+                                     "configuration": row["configuration"],
+                                     "return_code": 1 if failed else 0,
+                                     "outcome": "failed" if failed else "passed"}]}
+                write_json(lane / "e2e.json", report)
+                if failed:
+                    raise subprocess.CalledProcessError(1, "HTTP E2E")
+
+            with patch.object(suite, "build_driver", return_value="tools") as build, \
+                 patch.object(suite, "run_in_driver", side_effect=drive) as run:
+                with self.assertRaisesRegex(ValueError, "cell failures remain"):
+                    suite.run_e2e(SimpleNamespace(model_ramdisk_root=root), pair,
+                                  manifest, root)
+            build.assert_called_once()
+            self.assertEqual(run.call_count, 2)
+            receipt = json.loads((root / "e2e-receipt.json").read_text())
+            self.assertFalse(receipt["complete"])
+            self.assertEqual(set(receipt["reports"]), set(suite.ISAS))
+            self.assertEqual(receipt["failed_cells"], {"AVX512": [manifest["cells"][0]["case"]],
+                                                       "AVX2": []})
+            with self.assertRaisesRegex(ValueError, "incomplete or stale"):
+                suite.admit_e2e(root, pair)
+
+    def test_incomplete_e2e_report_stops_before_other_isa(self):
+        """A driver crash cannot masquerade as one ordinary failed cell."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pair = image_pair()
+            manifest = suite.pipeline.e2e_projection(full_inventory(),
+                                                     pair["source"]["revision"])
+
+            def interrupted(_args, _driver, _command, lane, _log):
+                write_json(lane / "e2e.json", {"schema": 1, "selected": 1,
+                                               "correctness_passed": False, "cells": []})
+                raise subprocess.CalledProcessError(1, "driver")
+
+            with patch.object(suite, "build_driver", return_value="tools"), \
+                 patch.object(suite, "run_in_driver", side_effect=interrupted) as run:
+                with self.assertRaisesRegex(ValueError, "complete selected inventory"):
+                    suite.run_e2e(SimpleNamespace(model_ramdisk_root=root), pair,
+                                  manifest, root)
+            self.assertEqual(run.call_count, 1)
+            receipt = json.loads((root / "e2e-receipt.json").read_text())
+            self.assertFalse(receipt["complete"])
+            self.assertEqual(receipt["reports"], {})
 
     def test_model_free_gate_cannot_shadow_full_matrix_inventory_tag(self):
         """Same source and ISA still have disjoint typed test-runner identities."""

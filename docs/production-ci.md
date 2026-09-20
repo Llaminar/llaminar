@@ -190,7 +190,10 @@ build and do not extend the ordinary develop push gate:
 - **Published images — HTTP E2E** (`production-e2e.yml`) runs every canonical
   E2E-tagged cell through the full HTTP/long-context needle harness, first on
   AVX512, then on AVX2. It retains the image identities, canonical manifest,
-  per-cell evidence and completed pair receipt as an Actions artifact.
+  per-cell evidence and completed pair receipt as an Actions artifact. Ordinary
+  failed or timed-out cells do not stop independent cells or the other ISA:
+  the report records the complete failure map, then the workflow fails. A
+  missing or incomplete report is an infrastructure failure and stops immediately.
 - **Published images — Benchmarks** (`production-benchmarks.yml`) requires that
   completed E2E pair before starting either ISA's production benchmark suite.
   It accepts an E2E run ID, or selects the latest successful manual E2E run on

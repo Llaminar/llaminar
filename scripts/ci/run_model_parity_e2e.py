@@ -243,10 +243,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[model-parity-e2e] {index}/{len(selected)} "
                       f"{'PASS' if return_code == 0 else 'FAIL'} {exact}", flush=True)
                 args.report.write_text(json.dumps(report, indent=2) + "\n")
-                if return_code:
-                    return return_code
-        report["correctness_passed"] = True
-        return 0
+                # A retired cell owns no live server or MPI process. Preserve
+                # its evidence and continue with the next independent cell so
+                # one CI run yields the complete failure map, not just a high
+                # water mark at the first red configuration.
+        failures = [row for row in report["cells"] if row["return_code"] != 0]
+        report["correctness_passed"] = not failures
+        report["failed_cells"] = [row["case"] for row in failures]
+        print(f"[model-parity-e2e] SUMMARY passed={len(report['cells']) - len(failures)} "
+              f"failed={len(failures)} selected={len(selected)}", flush=True)
+        return 1 if failures else 0
     finally:
         report["elapsed_seconds"] = time.monotonic() - started
         args.report.write_text(json.dumps(report, indent=2) + "\n")

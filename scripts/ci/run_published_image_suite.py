@@ -24,6 +24,7 @@ import uuid
 
 import docker_paths
 from production_artifacts import (digest, image_identity, positive, validate_image_e2e,
+                                  validate_image_e2e_coverage,
                                   validate_manifest, write_json)
 import run_production_pipeline as pipeline
 from run_develop_image_gate import runtime_tag
@@ -277,9 +278,14 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
 
 
 def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
-    """Finish both entire HTTP suites before publishing their reusable receipt."""
+    """Collect every independent HTTP cell on both ISAs before judging the pair.
+
+    An incomplete report is an infrastructure failure and stops the run. A
+    complete report with red cells is retained, then the other ISA is tested;
+    only two all-green reports may publish a reusable benchmark receipt.
+    """
     receipt = {"schema": 1, "complete": False, "images_digest": digest(pair),
-               "manifest_digest": digest(manifest), "reports": {}}
+               "manifest_digest": digest(manifest), "reports": {}, "failed_cells": {}}
     write_json(directory / "e2e-receipt.json", receipt)
     driver = build_driver(pair, directory)
     for isa in ISAS:
@@ -287,16 +293,37 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
         lane.mkdir()
         report = lane / "e2e.json"
         print(f"[published-images] E2E {isa}: {len(manifest['cells'])} canonical cells", flush=True)
-        run_in_driver(args, driver, [sys.executable, str(ROOT / "scripts/ci/run_model_parity_e2e.py"),
-            "--manifest", str(directory / "manifest.json"),
-            "--source-revision", pair["source"]["revision"],
-            "--container-image", pair["images"][isa]["id"],
-            "--model-ramdisk-root", str(args.model_ramdisk_root),
-            "--report", str(report)], lane, "e2e.log")
+        cell_failure = None
+        try:
+            run_in_driver(args, driver, [sys.executable, str(ROOT / "scripts/ci/run_model_parity_e2e.py"),
+                "--manifest", str(directory / "manifest.json"),
+                "--source-revision", pair["source"]["revision"],
+                "--container-image", pair["images"][isa]["id"],
+                "--model-ramdisk-root", str(args.model_ramdisk_root),
+                "--report", str(report)], lane, "e2e.log")
+        except subprocess.CalledProcessError as error:
+            cell_failure = error
+        # A failed process without a complete canonical report is not an
+        # isolated red cell. Stop rather than guessing whether the next lane
+        # could run safely after a driver or cleanup failure.
         evidence = json.loads(report.read_text())
-        validate_image_e2e(evidence, manifest, pair["images"][isa]["id"])
+        validate_image_e2e_coverage(evidence, manifest, pair["images"][isa]["id"])
+        if (cell_failure is None) != evidence["correctness_passed"]:
+            raise ValueError(f"E2E {isa} exit status disagrees with complete cell evidence")
         receipt["reports"][isa] = digest(evidence)
+        receipt["failed_cells"][isa] = [row["case"] for row in evidence["cells"]
+                                        if row["outcome"] != "passed"]
         write_json(directory / "e2e-receipt.json", receipt)
+        print(f"[published-images] E2E {isa}: passed="
+              f"{len(evidence['cells']) - len(receipt['failed_cells'][isa])} "
+              f"failed={len(receipt['failed_cells'][isa])}", flush=True)
+    failed = {isa: cells for isa, cells in receipt["failed_cells"].items() if cells}
+    if failed:
+        print(f"[published-images] E2E complete failure map: {failed}", flush=True)
+        raise ValueError("published image E2E cell failures remain on one or both ISAs")
+    for isa in ISAS:
+        evidence = json.loads((directory / isa.lower() / "e2e.json").read_text())
+        validate_image_e2e(evidence, manifest, pair["images"][isa]["id"])
     receipt["complete"] = True
     write_json(directory / "e2e-receipt.json", receipt)
 

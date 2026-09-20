@@ -113,17 +113,46 @@ def validate_manifest(manifest: dict, revision: str) -> list[dict]:
     return cells
 
 
-def validate_e2e(report: dict, cells: list[dict]) -> None:
-    """A subset, duplicate, stale configuration or exit-zero omission is red."""
+def validate_e2e_coverage(report: dict, cells: list[dict]) -> None:
+    """Authenticate every attempted cell, including failures retained for diagnosis.
+
+    Completeness is separate from success: a failed cell still contributes its
+    exact identity and evidence, but can never authorize a benchmark.
+    """
     expected = {row["case"]: row["configuration"] for row in cells}
     rows = report.get("cells", [])
-    if (report.get("correctness_passed") is not True or report.get("selected") != len(expected)
+    if (type(report.get("correctness_passed")) is not bool
+            or report.get("selected") != len(expected)
             or len(rows) != len(expected) or {row["case"] for row in rows} != set(expected)):
         raise ValueError("E2E certificate does not cover the complete selected inventory")
     for row in rows:
-        if (row.get("return_code") != 0 or row.get("outcome") != "passed"
-                or row.get("configuration") != expected[row["case"]]):
+        code = row.get("return_code")
+        outcome = row.get("outcome")
+        if (type(code) is not int or row.get("configuration") != expected[row["case"]]
+                or (outcome == "passed") != (code == 0)
+                or (outcome == "cell_timeout") != (code == 124)
+                or outcome not in ("passed", "failed", "cell_timeout")):
             raise ValueError(f"failed or stale E2E evidence: {row['case']}")
+    if report["correctness_passed"] != all(row["outcome"] == "passed" for row in rows):
+        raise ValueError("E2E aggregate outcome disagrees with its complete cell evidence")
+
+
+def validate_e2e(report: dict, cells: list[dict]) -> None:
+    """Only a complete, all-green report can certify an image."""
+    validate_e2e_coverage(report, cells)
+    if (report["correctness_passed"] is not True
+            or any(row["outcome"] != "passed" for row in report["cells"])):
+        raise ValueError("failed E2E evidence cannot certify the image")
+
+
+def validate_image_e2e_coverage(report: dict, manifest: dict, image: str) -> None:
+    """Validate complete image-bound evidence without discarding failed cells."""
+    cells = validate_manifest(manifest, manifest["source_revision"])
+    validate_e2e_coverage(report, cells)
+    if (report.get("schema") != 1 or report.get("image") != image
+            or report.get("source_revision") != manifest["source_revision"]
+            or report.get("manifest_digest") != digest(manifest)):
+        raise ValueError("full E2E evidence does not belong to this image and manifest")
 
 
 def validate_image_e2e(report: dict, manifest: dict, image: str) -> None:
@@ -134,12 +163,8 @@ def validate_image_e2e(report: dict, manifest: dict, image: str) -> None:
     The immutable image ID also rejects results from an earlier dirty build of
     the same Git revision.
     """
-    cells = validate_manifest(manifest, manifest["source_revision"])
-    validate_e2e(report, cells)
-    if (report.get("schema") != 1 or report.get("image") != image
-            or report.get("source_revision") != manifest["source_revision"]
-            or report.get("manifest_digest") != digest(manifest)):
-        raise ValueError("full E2E evidence does not belong to this image and manifest")
+    validate_image_e2e_coverage(report, manifest, image)
+    validate_e2e(report, manifest["cells"])
 
 
 def ratchet(baseline: dict, results: list[dict]) -> tuple[dict, list[dict]]:
