@@ -9,6 +9,8 @@
  * Projection proofs also use production-selected/reordered communicators:
  * process-environment attributes belong to WORLD, but payload ranks and all
  * collective operations must stay inside the admitted execution membership.
+ * A queued next proposal must not steal the maintenance worker from a pending
+ * all-rank retirement fence; current-epoch inference remains admitted meanwhile.
  */
 
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
@@ -3511,6 +3513,111 @@ namespace llaminar2::test
             fixture.authority->advanceBackground().status,
             MoEOverlayResidencyApplyStatus::Idle);
         EXPECT_EQ(fixture.authority->pendingAbortCount(), 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        QueuedDemandKeepsRetirementConsensusProgressingBeforeNextProposal)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Distributed retirement requires exactly two ranks";
+
+        // Neither device kind nor rank zero owns this lifecycle rule. Exercise
+        // both coordinator placements using the production MPI lanes.
+        for (const int coordinator : {0, 1})
+        {
+            SCOPED_TRACE(coordinator);
+            auto fixture = realTransaction(coordinator);
+            // The fixture's preview is not part of this live service. Release
+            // its observation lease before the bounded bank pool is reused.
+            fixture.transaction = {};
+            const std::array<std::uint64_t, 4> first_counts{1, 2, 100, 90};
+            if (context->rank() == coordinator)
+                recordObservedPrefillBatch(
+                    *fixture.histogram, 0, first_counts);
+            ImmediateLocalResidencyTransport local;
+            auto consensus = std::make_shared<MoEOverlayMPIResidencyConsensus>(
+                MoEOverlayMPIResidencyConsensus::Config{
+                    .mpi_context = context,
+                    .perf_device = "retirement-progress-regression",
+                });
+            auto transport = std::make_shared<MoEOverlayDistributedResidencyTransport>(
+                MoEOverlayDistributedResidencyTransport::Config{
+                    .local_transport = &local,
+                    .consensus = consensus,
+                    .perf_device = "retirement-progress-regression",
+                });
+            auto publisher = std::make_shared<MoEOverlayMPIResidencyProposalPublisher>(
+                MoEOverlayMPIResidencyProposalPublisher::Config{
+                    .mpi_context = context,
+                    .coordinator_world_rank = coordinator,
+                    .num_layers = 1,
+                    .num_experts = 4,
+                    .perf_device = "retirement-progress-regression",
+                    .transaction_demand = fixture.histogram->config().transaction_demand,
+                });
+            auto authority = std::shared_ptr<MoEOverlayResidencyAuthority>(
+                std::move(fixture.authority));
+            MoEOverlayResidencyMaintenanceService service({
+                .authority = authority,
+                .transport = transport,
+                .proposal_publisher = publisher,
+                .distributed_context = context,
+                .idle_poll_interval = std::chrono::microseconds(100),
+                .perf_device = "retirement-progress-regression",
+            });
+            auto old_ticket = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_ticket.has_value());
+            if (context->rank() != coordinator)
+                old_ticket.reset();
+            context->barrier();
+            service.start();
+            EXPECT_TRUE(waitForService([&]
+                { return service.stats().committed_waves == 1u; }));
+            EXPECT_EQ(authority->snapshot()->epoch, 2u);
+            context->barrier();
+
+            const std::array<std::uint64_t, 4> second_counts{100, 90, 2, 1};
+            if (context->rank() == coordinator)
+                recordObservedPrefillBatch(
+                    *fixture.histogram, 0, second_counts);
+            const auto first_poll = service.stats().poll_iterations;
+            service.notifyMaintenanceProgress();
+            EXPECT_TRUE(waitForService([&]
+                { return service.stats().poll_iterations >= first_poll + 64u; }));
+            EXPECT_EQ(authority->pendingRetirementCount(), 1u);
+            EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::ReclaimingResources);
+            if (context->rank() == coordinator)
+            {
+                EXPECT_TRUE(fixture.histogram->windowFull());
+                EXPECT_EQ(service.stats().proposals, 1u);
+                EXPECT_EQ(publisher->stats().publications_started, 1u);
+            }
+            for (int request = 0; request < 128; ++request)
+            {
+                auto ticket = authority->tryAcquireTicketSnapshot();
+                EXPECT_TRUE(ticket.has_value());
+                if (ticket)
+                    EXPECT_EQ((*ticket)->epoch, 2u);
+            }
+            // The control barrier only coordinates the test's held reader.
+            // Production retirement uses its own non-blocking communicator.
+            context->barrier();
+            old_ticket.reset();
+            service.notifyMaintenanceProgress();
+            EXPECT_TRUE(waitForService([&]
+            {
+                return service.stats().committed_waves == 2u &&
+                       authority->pendingRetirementCount() == 0u;
+            }));
+            EXPECT_EQ(authority->snapshot()->epoch, 3u);
+            EXPECT_TRUE(service.healthy()) << service.failureMessage();
+            service.stopAndDrain(MoEOverlayMaintenanceDrainScope::DistributedTopology);
+            publisher->stopAndDrain();
+            EXPECT_TRUE(consensus->idle());
+            EXPECT_EQ(local.retirements, 2);
+        }
     }
 
     TEST(

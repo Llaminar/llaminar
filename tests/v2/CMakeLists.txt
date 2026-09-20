@@ -1102,6 +1102,17 @@ add_v2_test(V2_Integration_ExpertOverlayLocalMaintenanceDrain
     NO_MODELS
     TIMEOUT 30
 )
+# Publication leaves a live retirement protocol. Keep polling that protocol
+# before planning the next wave, without closing current-epoch admission.
+add_v2_test(V2_Integration_ExpertOverlayRetirementProgress
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_maintenance_service>
+        --gtest_filter=Test__MoEOverlayResidencyMaintenanceService.RetirementProgressPrecedesNextProposalWithoutBlockingInference
+        --gtest_brief=1
+    LABELS "V2;Integration;Parity;ExpertOverlay;Dynamic;Async;TypedLifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_service_telemetry_publication
     V2_Unit_MoEOverlayServiceTelemetryPublication
@@ -13624,6 +13635,14 @@ add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     TIMEOUT 60
     NO_MODELS
 )
+add_v2_test(V2_Integration_ExpertOverlayRetirementProgress_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+        --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.QueuedDemandKeepsRetirementConsensusProgressingBeforeNextProposal
+    LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;Regression"
+    MPI_PROCS 2
+    TIMEOUT 30
+    NO_MODELS
+)
 
 if(HAVE_ROCM)
     # Real two-rank data-plane composition: rank one owns ROCm:1 while rank
@@ -18901,6 +18920,8 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_ExpertOverlayRetirementProgress
+    V2_Integration_ExpertOverlayRetirementProgress_MPI
     V2_Integration_PhaseSplitDenseMemoryAdmission
     V2_Integration_PhaseSplitDenseGDNResolverGeometry
     V2_Integration_ROCmCanonicalRouteSlotAllreduce

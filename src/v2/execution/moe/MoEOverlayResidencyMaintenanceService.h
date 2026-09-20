@@ -7,6 +7,8 @@
  * rotates completed histogram windows, retries shadow-capacity backpressure,
  * polls exact transfer/publication events, and retires old banks. No method on
  * the inference path waits for this worker.
+ * Proposal construction is admitted only after the authority reports complete
+ * quiescence, so no expensive plan can starve an existing collective's progress.
  */
 
 #pragma once
@@ -49,6 +51,7 @@ namespace llaminar2
         Preparing, ///< Inactive participant banks are being completed.
         AwaitingGraphSequenceBoundary, ///< Prepared banks await a complete graph edge.
         Publishing, ///< Ready device selectors are being published globally.
+        ReclaimingResources, ///< Old-bank retirement or abort events need progress.
         Draining,   ///< Shutdown rejected new work and is reaping resources.
         Failed,     ///< Fatal protocol or transport error stopped proposals.
         Stopped,    ///< Every wave, abort, and retirement has quiesced.
@@ -128,6 +131,7 @@ namespace llaminar2
         case MoEOverlayMaintenanceState::Deferred:
         case MoEOverlayMaintenanceState::Staging:
         case MoEOverlayMaintenanceState::Preparing:
+        case MoEOverlayMaintenanceState::ReclaimingResources:
             return MoEOptimizationActivityState::MovingWeights;
         case MoEOverlayMaintenanceState::AwaitingGraphSequenceBoundary:
         case MoEOverlayMaintenanceState::Publishing:

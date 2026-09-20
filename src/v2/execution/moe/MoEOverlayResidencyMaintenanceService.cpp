@@ -8,6 +8,8 @@
  * local proposal. Active work, asynchronous aborts and old-reader retirement
  * continue through the same authority polls used during inference, without an
  * extra transfer, stream wait or device synchronization.
+ * After publication, reclaiming still owns this worker. Only a fully quiescent
+ * authority permits the next frozen-window proposal to consume maintenance CPU.
  */
 
 #include "MoEOverlayResidencyMaintenanceService.h"
@@ -824,6 +826,20 @@ namespace llaminar2
 
         /* Reap lease-safe retirements and completed asynchronous aborts. */
         const auto idle_result = config_.authority->advanceBackground();
+        if (idle_result.status == MoEOverlayResidencyApplyStatus::Reclaiming)
+        {
+            // Two-bank publication cannot reuse the old bank yet. Keep the
+            // same worker polling its existing protocol instead of freezing
+            // demand and blocking inside the next plan. New-epoch inference
+            // remains admitted throughout; this is not an inference fence.
+            if (allow_new_proposal)
+            {
+                state_.store(
+                    MoEOverlayMaintenanceState::ReclaimingResources,
+                    std::memory_order_release);
+            }
+            return;
+        }
         if (idle_result.status != MoEOverlayResidencyApplyStatus::Idle)
         {
             if (isFailureStatus(idle_result.status))

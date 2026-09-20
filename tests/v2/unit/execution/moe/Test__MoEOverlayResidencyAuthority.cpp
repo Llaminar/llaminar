@@ -1729,7 +1729,7 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Idle);
+            MoEOverlayResidencyApplyStatus::Reclaiming);
         EXPECT_EQ(authority.pendingRetirementCount(), 1u);
         llep_lease.reset();
         EXPECT_EQ(authority.activeTicketCount(), 0u);
@@ -5024,7 +5024,7 @@ namespace llaminar2::test
         EXPECT_EQ(authority.activeTicketCount(), 1u);
 
         const auto still_retiring = authority.advanceBackground();
-        EXPECT_EQ(still_retiring.status, MoEOverlayResidencyApplyStatus::Idle);
+        EXPECT_EQ(still_retiring.status, MoEOverlayResidencyApplyStatus::Reclaiming);
         EXPECT_EQ(authority.pendingRetirementCount(), 1u);
         EXPECT_EQ(transport.retirement_admission_pending_polls, 0);
         EXPECT_EQ(transport.calls,

@@ -732,7 +732,8 @@ namespace llaminar2
         Published,
         DynamicNoMovement,
         StaticNoMovement,
-        Idle,
+        Idle, ///< No wave, abort, or retirement protocol remains to progress.
+        Reclaiming, ///< Published/aborted wave resources still need event polling.
         Deferred,
         Busy,
         Stale,
@@ -762,6 +763,7 @@ namespace llaminar2
                    status == MoEOverlayResidencyApplyStatus::DynamicNoMovement ||
                    status == MoEOverlayResidencyApplyStatus::StaticNoMovement ||
                    status == MoEOverlayResidencyApplyStatus::Idle ||
+                   status == MoEOverlayResidencyApplyStatus::Reclaiming ||
                    status == MoEOverlayResidencyApplyStatus::Deferred;
         }
     };
@@ -1339,6 +1341,10 @@ namespace llaminar2
          *
          * This method belongs on a maintenance worker. Every wave poll is an
          * event query; calling it must never synchronize an inference stream.
+         * Idle is a complete quiescence boundary. Reclaiming retains the poll
+         * obligation for old-reader retirement or an asynchronous abort even
+         * though there is no active publication wave. A caller must not start
+         * costly proposal construction while that obligation remains live.
          */
         MoEOverlayResidencyApplyResult advanceBackground();
 

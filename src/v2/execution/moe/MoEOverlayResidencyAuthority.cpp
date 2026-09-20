@@ -14,6 +14,8 @@
  * Jointly admitted seed cohorts and ordinary candidates share the same
  * fairness and capacity classification. Fairness is not a dependency edge;
  * only the exact candidate/cohort economy gate can authorize coupled work.
+ * Publication and quiescence are distinct: retired banks and aborted transfers
+ * retain their event-poll obligation until advanceBackground returns Idle.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
@@ -6456,7 +6458,12 @@ namespace llaminar2
         {
             const auto current = snapshot();
             return {
-                .status = MoEOverlayResidencyApplyStatus::Idle,
+                // The old bank may still own a distributed retirement vote.
+                // Reporting Idle here used to let the sole progress worker
+                // leave that vote for an arbitrarily expensive next proposal.
+                .status = pending_retirements_.empty() && pending_aborts_.empty()
+                              ? MoEOverlayResidencyApplyStatus::Idle
+                              : MoEOverlayResidencyApplyStatus::Reclaiming,
                 .published_epoch = current ? current->epoch : 0,
             };
         }

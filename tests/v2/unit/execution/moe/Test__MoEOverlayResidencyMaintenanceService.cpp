@@ -9,6 +9,8 @@
  * inference-thread progress cannot make them pass. Shutdown is forced at each
  * active phase: closing proposal admission must not erase ownership of an
  * already-started wave or release its old-reader and abort obligations.
+ * A published epoch is not quiescence: retirement progress must retain the
+ * worker before another proposal can freeze demand or perform expensive work.
  */
 
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
@@ -364,6 +366,22 @@ namespace llaminar2::test
                                : MoEOverlayResidencyWaveProgress::Pending;
                 }
 
+                /**
+                 * @brief Count retirement progress without changing lease semantics.
+                 * @param local_state Authority-owned admission and reader state.
+                 * @param error Receives any invalid retirement transition.
+                 * @return The ordinary local retirement fence's current edge.
+                 */
+                MoEOverlayRetirementFenceProgress pollRetirementFence(
+                    MoEOverlayLocalRetirementState local_state,
+                    std::string *error) noexcept override
+                {
+                    std::lock_guard<std::mutex> lock(owner_->mutex_);
+                    ++owner_->retirement_polls_;
+                    return IMoEOverlayResidencyWave::pollRetirementFence(
+                        local_state, error);
+                }
+
                 /** @brief Record lease-safe retirement on the worker. */
                 void retirePrevious() noexcept override
                 {
@@ -388,6 +406,7 @@ namespace llaminar2::test
                 int publication_polls = 0;
                 int aborts = 0;
                 int abort_polls = 0;
+                int retirement_polls = 0;
                 int retirements = 0;
                 uint64_t first_generation = 0;
                 const DecodeExpertHistogramWindow *first_window = nullptr;
@@ -509,6 +528,7 @@ namespace llaminar2::test
                     .publication_polls = publication_polls_,
                     .aborts = aborts_,
                     .abort_polls = abort_polls_,
+                    .retirement_polls = retirement_polls_,
                     .retirements = retirements_,
                     .first_generation = first_generation_,
                     .first_window = first_window_,
@@ -536,6 +556,7 @@ namespace llaminar2::test
             int publication_polls_ = 0;
             int aborts_ = 0;
             int abort_polls_ = 0;
+            int retirement_polls_ = 0;
             int retirements_ = 0;
             uint64_t first_generation_ = 0;
             const DecodeExpertHistogramWindow *first_window_ = nullptr;
@@ -1426,6 +1447,83 @@ namespace llaminar2::test
         service->stopAndDrain(
             MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
         EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Stopped);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        RetirementProgressPrecedesNextProposalWithoutBlockingInference)
+    {
+        // Exercise both local planning and the distributed coordinator entry.
+        // The real HTTP failure used the latter; both share the same worker.
+        for (const bool distributed : {false, true})
+        {
+            SCOPED_TRACE(distributed ? "coordinator" : "local");
+            auto histogram = fullMovementHistogram();
+            auto authority = dynamicAuthority(histogram.get());
+            auto transport = std::make_shared<ControlledTransport>();
+            transport->setStageReady(true);
+            transport->setPrepareReady(true);
+            transport->setPublicationReady(true);
+            auto publisher = distributed
+                ? std::make_shared<ImmediateProposalPublisher>(true)
+                : nullptr;
+            MoEOverlayResidencyMaintenanceService service({
+                .authority = authority,
+                .transport = transport,
+                .proposal_publisher = publisher,
+                .idle_poll_interval = 100us,
+                .perf_device = "device-free-test",
+            });
+
+            // Declare leases after the worker owner: even a failed assertion
+            // must drop readers before its destructor joins retirement.
+            auto old_ticket = authority->tryAcquireTicketSnapshot();
+            ASSERT_TRUE(old_ticket.has_value());
+            ASSERT_EQ((*old_ticket)->epoch, 1u);
+            service.start();
+            ASSERT_TRUE(waitUntil([&]
+                { return service.stats().committed_waves == 1u; }));
+            ASSERT_EQ(authority->snapshot()->epoch, 2u);
+            ASSERT_EQ(authority->pendingRetirementCount(), 1u);
+
+            // Demand for a second, profitable wave arrives before the old
+            // ticket returns. It must remain in its histogram bank, rather
+            // than letting a costly planner starve the pending MPI fence.
+            const std::vector<uint64_t> reversed_counts{4, 200, 6, 180, 2, 8};
+            recordObservedPrefillBatch(*histogram, 0, reversed_counts);
+            const auto first_poll = transport->observations().retirement_polls;
+            service.notifyMaintenanceProgress();
+            ASSERT_TRUE(waitUntil([&]
+            {
+                return transport->observations().retirement_polls >=
+                       first_poll + 64;
+            }));
+            EXPECT_TRUE(histogram->windowFull());
+            EXPECT_EQ(service.stats().proposals, 1u);
+            EXPECT_EQ(transport->observations().begin_calls, 1);
+            if (publisher)
+                EXPECT_EQ(publisher->publicationBegins(), 1);
+            EXPECT_FALSE(service.optimizationStatus().quiescentBetweenWaves());
+
+            // Cleanup is maintenance work, not an inference admission fence.
+            for (int request = 0; request < 128; ++request)
+            {
+                auto current_ticket = authority->tryAcquireTicketSnapshot();
+                ASSERT_TRUE(current_ticket.has_value());
+                EXPECT_EQ((*current_ticket)->epoch, 2u);
+            }
+            EXPECT_EQ((*old_ticket)->epoch, 1u);
+
+            old_ticket.reset();
+            service.notifyMaintenanceProgress();
+            ASSERT_TRUE(waitUntil([&]
+                { return service.stats().committed_waves == 2u; }));
+            EXPECT_EQ(authority->snapshot()->epoch, 3u);
+            EXPECT_TRUE(service.healthy()) << service.failureMessage();
+            service.stopAndDrain(
+                MoEOverlayMaintenanceDrainScope::ProcessLocalComposition);
+            EXPECT_EQ(authority->pendingRetirementCount(), 0u);
+        }
     }
 
     TEST(
