@@ -343,12 +343,13 @@ class PublishedImageSuiteTests(unittest.TestCase):
                              ("production-benchmarks.yml", "llaminar-published-benchmarks")):
             with self.subTest(workflow=name):
                 text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
-                self.assertIn("clean: false", text)
                 self.assertIn("Retire legacy checkout evidence", text)
-                self.assertIn('git -C "$GITHUB_WORKSPACE" clean -ffdx', text)
-                self.assertIn('git -C "$GITHUB_WORKSPACE" reset --hard HEAD', text)
                 self.assertIn(f'$RUNNER_TEMP/{prefix}-$GITHUB_RUN_ID', text)
                 self.assertNotIn(f"--output parity-results/{prefix.removeprefix('llaminar-')}", text)
+                self.assertLess(text.index("docker/login-action@v4"),
+                                text.index("Retire legacy checkout evidence"))
+                self.assertLess(text.index("Retire legacy checkout evidence"),
+                                text.index("actions/checkout@v6"))
 
     def test_metadata_companion_does_not_build_a_replacement_runtime(self):
         from types import SimpleNamespace

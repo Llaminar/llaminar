@@ -22,22 +22,6 @@ jobs:
     runs-on: [llaminar-bench]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: false
-          lfs: false
-          # See the E2E workflow: clean only after the privileged evidence
-          # owner has retired legacy generated output.
-          clean: false
-      - uses: docker/setup-buildx-action@v4
-        with:
-          driver: docker-container
-          name: llaminar-ci
-          driver-opts: network=host
-          cleanup: false
-          keep-state: true
-          cache-binary: false
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -54,8 +38,19 @@ jobs:
               "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
               -rf /legacy/published-e2e /legacy/published-benchmarks
           fi
-          git -C "$GITHUB_WORKSPACE" clean -ffdx
-          git -C "$GITHUB_WORKSPACE" reset --hard HEAD
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
       - name: Benchmark the E2E-proven image pair and publish chart plus JSON
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

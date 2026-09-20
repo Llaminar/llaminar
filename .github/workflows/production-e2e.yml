@@ -17,23 +17,6 @@ jobs:
     runs-on: [llaminar-bench]
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: false
-          lfs: false
-          # A prior nested cache-owner process may have left generated evidence
-          # owned by root. Retire that narrow legacy subtree after Docker login
-          # below, then restore checkout's normal clean invariant explicitly.
-          clean: false
-      - uses: docker/setup-buildx-action@v4
-        with:
-          driver: docker-container
-          name: llaminar-ci
-          driver-opts: network=host
-          cleanup: false
-          keep-state: true
-          cache-binary: false
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -50,8 +33,19 @@ jobs:
               "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
               -rf /legacy/published-e2e /legacy/published-benchmarks
           fi
-          git -C "$GITHUB_WORKSPACE" clean -ffdx
-          git -C "$GITHUB_WORKSPACE" reset --hard HEAD
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
       - name: Test both published runtime images with the full canonical HTTP suite
         run: |
           python3 scripts/ci/run_published_image_suite.py e2e \
