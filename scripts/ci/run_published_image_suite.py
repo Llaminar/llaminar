@@ -102,6 +102,32 @@ def pull_pair(args, directory: Path) -> dict:
     return pair
 
 
+def inventory_companion(build_args, source: dict, work: Path) -> dict:
+    """Reuse an exact local test companion or build it on a cold runner.
+
+    Inventory discovery is metadata-only, but exporting its multi-gigabyte
+    image and BuildKit cache on every manual retry costs minutes. A local tag
+    is only a lookup key: authenticate the immutable image ID and all source,
+    ISA, backend, role, and inventory labels before admitting reuse. An absent
+    image builds normally; a conflicting tag or Docker failure is fatal.
+    """
+    role = pipeline.ImageRole.TEST_RUNNER
+    tag = pipeline.source_image_tag(source, build_args.cpu_isa, role)
+    listed = subprocess.check_output(
+        ["docker", "image", "ls", "--quiet", "--no-trunc", tag], text=True,
+    ).strip().splitlines()
+    if len(listed) > 1:
+        raise ValueError(f"local inventory tag resolved to multiple images: {tag}")
+    if listed:
+        image = {"tag": tag, **image_identity(tag)}
+        if image["id"] != listed[0]:
+            raise ValueError(f"local inventory tag changed during inspection: {tag}")
+        pipeline.require_image(image, source, build_args.cpu_isa, role)
+        print(f"[published-images] REUSE inventory image={image['id']}", flush=True)
+        return {role.value: image}
+    return pipeline.build(build_args, source, work, roles=(role,))
+
+
 def discover_inventory(args, pair: dict, directory: Path) -> dict:
     """Export metadata from the exact image source; never infer cases in Python.
 
@@ -115,8 +141,7 @@ def discover_inventory(args, pair: dict, directory: Path) -> dict:
                                  model_ramdisk_root=args.model_ramdisk_root,
                                  reference_cache_root=work / "reference-cache")
     build_args.reference_cache_root.mkdir()
-    images = pipeline.build(build_args, pair["source"], work,
-                            roles=(pipeline.ImageRole.TEST_RUNNER,))
+    images = inventory_companion(build_args, pair["source"], work)
     pipeline.run_test_runner(images, ["python3", "scripts/ci/model_parity_inventory.py",
         "--build-dir", "build_v2_integration", "--scope", "all",
         "--export-manifest", "/ci-results/container-all-cells.json",

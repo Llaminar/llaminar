@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -38,6 +39,22 @@ def image_pair():
                 "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON"}}
     return {"schema": 1, "source": source, "images": images,
             "repository": "Llaminar/llaminar", "branch": "develop", "workflow_revision": "c" * 40}
+
+
+def inventory_image(source):
+    """Describe an exact full-matrix test companion already in local Docker."""
+    role = suite.pipeline.ImageRole.TEST_RUNNER
+    tag = suite.pipeline.source_image_tag(source, "AVX2", role)
+    identity = "sha256:" + "3" * 64
+    return {"tag": tag, "id": identity, "layers": ["test-layer"], "labels": {
+        "org.opencontainers.image.revision": source["revision"],
+        "org.llaminar.source_tree": source["tree"],
+        "org.llaminar.build_type": "Release", "org.llaminar.cpu_isa": "AVX2",
+        "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
+        "org.llaminar.image_role": role.value,
+        "org.llaminar.integration_skipped": "0",
+        "org.llaminar.test_runner_inventory": suite.pipeline.TestRunnerInventory.FULL_MATRIX.value,
+    }}
 
 
 def full_inventory():
@@ -102,6 +119,55 @@ def benchmark_report(pair, manifest, e2e, isa):
 
 class PublishedImageSuiteTests(unittest.TestCase):
     """Wrong provenance or incomplete evidence cannot publish a convincing chart."""
+
+    def test_exact_local_inventory_companion_is_reused_without_build(self):
+        """A warm manual rerun does not export the same multi-gigabyte image."""
+        source = image_pair()["source"]
+        image = inventory_image(source)
+        args = SimpleNamespace(cpu_isa="AVX2")
+        with patch.object(suite.subprocess, "check_output", return_value=image["id"] + "\n"), \
+             patch.object(suite, "image_identity", return_value={
+                 key: value for key, value in image.items() if key != "tag"}), \
+             patch.object(suite.pipeline, "build") as build:
+            result = suite.inventory_companion(args, source, Path("/unused"))
+        self.assertEqual(result, {"test-runner": image})
+        build.assert_not_called()
+
+    def test_missing_inventory_companion_builds_once(self):
+        """A cold runner still obtains the same source-authenticated companion."""
+        source = image_pair()["source"]
+        args = SimpleNamespace(cpu_isa="AVX2")
+        expected = {"test-runner": inventory_image(source)}
+        with patch.object(suite.subprocess, "check_output", return_value=""), \
+             patch.object(suite.pipeline, "build", return_value=expected) as build:
+            self.assertEqual(suite.inventory_companion(args, source, Path("/unused")), expected)
+        build.assert_called_once_with(args, source, Path("/unused"),
+                                      roles=(suite.pipeline.ImageRole.TEST_RUNNER,))
+
+    def test_conflicting_inventory_tag_fails_instead_of_rebuilding(self):
+        """A local alias never substitutes a different source or test inventory."""
+        source = image_pair()["source"]
+        image = inventory_image(source)
+        image["labels"]["org.llaminar.test_runner_inventory"] = "incomplete"
+        args = SimpleNamespace(cpu_isa="AVX2")
+        with patch.object(suite.subprocess, "check_output", return_value=image["id"] + "\n"), \
+             patch.object(suite, "image_identity", return_value={
+                 key: value for key, value in image.items() if key != "tag"}), \
+             patch.object(suite.pipeline, "build") as build:
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                suite.inventory_companion(args, source, Path("/unused"))
+        build.assert_not_called()
+
+    def test_docker_listing_failure_does_not_masquerade_as_cold_cache(self):
+        """A daemon error must not trigger an expensive or misleading rebuild."""
+        source = image_pair()["source"]
+        args = SimpleNamespace(cpu_isa="AVX2")
+        with patch.object(suite.subprocess, "check_output", side_effect=
+                          suite.subprocess.CalledProcessError(1, "docker image ls")), \
+             patch.object(suite.pipeline, "build") as build:
+            with self.assertRaises(suite.subprocess.CalledProcessError):
+                suite.inventory_companion(args, source, Path("/unused"))
+        build.assert_not_called()
 
     def test_canonical_tags(self):
         base = suite.branch_image("Llaminar/llaminar", "develop")
