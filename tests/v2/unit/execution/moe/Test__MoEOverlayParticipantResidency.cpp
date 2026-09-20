@@ -1550,7 +1550,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     old_ticket.reset();
     EXPECT_EQ(
         fixture.authority->advanceBackground().status,
-        MoEOverlayResidencyApplyStatus::Idle);
+        MoEOverlayResidencyApplyStatus::Reclaiming);
     EXPECT_GT(
         script->poll_retirement_calls,
         retirement_polls_with_live_reader);
@@ -1614,7 +1614,7 @@ TEST(Test__MoEOverlayParticipantMigration,
      * device abort edge reaches Ready. */
     EXPECT_EQ(
         fixture.authority->advanceBackground().status,
-        MoEOverlayResidencyApplyStatus::Idle);
+        MoEOverlayResidencyApplyStatus::Reclaiming);
     EXPECT_GT(script->poll_abort_calls, 0);
     EXPECT_NE(
         script->phase, ScriptedDeviceBankPublication::Phase::Aborted);
