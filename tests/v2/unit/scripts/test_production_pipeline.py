@@ -3375,7 +3375,8 @@ class ImageIdentityTests(unittest.TestCase):
             for target in ("test-runner", "runtime"):
                 self.assertEqual({key: built[target][key] for key in ("id", "layers", "labels")},
                                  expected[target])
-                self.assertEqual(built[target]["tag"], f"llaminar-ci:tree-avx512-{target}")
+                suffix = "full-matrix-" if target == "test-runner" else ""
+                self.assertEqual(built[target]["tag"], f"llaminar-ci:tree-avx512-{suffix}{target}")
             timeline = [json.loads(line) for line in (root / "build-timeline.jsonl").read_text().splitlines()]
             self.assertEqual(
                 [(row["event"], row["target"], row["log"]) for row in timeline],

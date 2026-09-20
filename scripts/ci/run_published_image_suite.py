@@ -112,7 +112,8 @@ def inventory_companion(build_args, source: dict, work: Path) -> dict:
     image builds normally; a conflicting tag or Docker failure is fatal.
     """
     role = pipeline.ImageRole.TEST_RUNNER
-    tag = pipeline.source_image_tag(source, build_args.cpu_isa, role)
+    tag = pipeline.source_image_tag(source, build_args.cpu_isa, role,
+                                    test_inventory=pipeline.TestRunnerInventory.FULL_MATRIX)
     listed = subprocess.check_output(
         ["docker", "image", "ls", "--quiet", "--no-trunc", tag], text=True,
     ).strip().splitlines()

@@ -307,16 +307,21 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
     return arguments
 
 
-def source_image_tag(source: dict, cpu_isa: str, role: ImageRole) -> str:
-    """Name one local image by its complete source tree, ISA, and typed role.
+def source_image_tag(source: dict, cpu_isa: str, role: ImageRole, *,
+                     test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX) -> str:
+    """Name one local image by source tree, ISA, role and test inventory.
 
     Published-image consumers use the same tag to reuse an already-built test
     companion. The image's labels are still authenticated before it is run;
     the short tree prefix is only a lookup key, never proof of identity.
+    Runtime image identity is independent of test inventory, while full-matrix
+    and model-free test runners must never overwrite one another's local tag.
     """
-    if cpu_isa not in SHIPPING_ISAS or not isinstance(role, ImageRole):
-        raise ValueError("local image tags require a shipping ISA and typed role")
-    return f"llaminar-ci:{source['tree'][:16]}-{cpu_isa.lower()}-{role.value}"
+    if (cpu_isa not in SHIPPING_ISAS or not isinstance(role, ImageRole)
+            or not isinstance(test_inventory, TestRunnerInventory)):
+        raise ValueError("local image tags require a shipping ISA, typed role and inventory")
+    suffix = (f"-{test_inventory.value}" if role is ImageRole.TEST_RUNNER else "")
+    return f"llaminar-ci:{source['tree'][:16]}-{cpu_isa.lower()}{suffix}-{role.value}"
 
 
 def build(args, source: dict, directory: Path, *,
@@ -344,7 +349,8 @@ def build(args, source: dict, directory: Path, *,
     images = {}
     for role in roles:
         target = role.value
-        tag = source_image_tag(source, args.cpu_isa, role)
+        tag = source_image_tag(source, args.cpu_isa, role,
+                               test_inventory=test_inventory)
         log = directory / f"build-{target}.log"
         command = ["docker", "buildx", "build", "--load", "--network=host", "--progress=plain",
                    "--target", target, "-t", tag, "--build-arg", f"VCS_REF={source['revision']}",

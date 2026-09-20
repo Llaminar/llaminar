@@ -120,6 +120,24 @@ def benchmark_report(pair, manifest, e2e, isa):
 class PublishedImageSuiteTests(unittest.TestCase):
     """Wrong provenance or incomplete evidence cannot publish a convincing chart."""
 
+    def test_model_free_gate_cannot_shadow_full_matrix_inventory_tag(self):
+        """Same source and ISA still have disjoint typed test-runner identities."""
+        source = image_pair()["source"]
+        role = suite.pipeline.ImageRole.TEST_RUNNER
+        full = suite.pipeline.source_image_tag(source, "AVX2", role,
+            test_inventory=suite.pipeline.TestRunnerInventory.FULL_MATRIX)
+        model_free = suite.pipeline.source_image_tag(source, "AVX2", role,
+            test_inventory=suite.pipeline.TestRunnerInventory.MODEL_FREE)
+        self.assertNotEqual(full, model_free)
+        self.assertIn("full-matrix-test-runner", full)
+        self.assertIn("model-free-test-runner", model_free)
+        runtime = suite.pipeline.ImageRole.RUNTIME
+        self.assertEqual(
+            suite.pipeline.source_image_tag(source, "AVX2", runtime,
+                test_inventory=suite.pipeline.TestRunnerInventory.FULL_MATRIX),
+            suite.pipeline.source_image_tag(source, "AVX2", runtime,
+                test_inventory=suite.pipeline.TestRunnerInventory.MODEL_FREE))
+
     def test_exact_local_inventory_companion_is_reused_without_build(self):
         """A warm manual rerun does not export the same multi-gigabyte image."""
         source = image_pair()["source"]
