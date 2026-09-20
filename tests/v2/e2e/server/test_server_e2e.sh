@@ -1587,36 +1587,39 @@ nvidia_memory_telemetry_available() {
             END {exit found ? 0 : 1}'
 }
 
-get_amd_total_gpu_mb() {
-    if command -v amd-smi >/dev/null 2>&1; then
-        { amd-smi metric --mem-usage --csv 2>/dev/null || true; } |
-            awk -F',' 'NR > 1 && $3 ~ /^[0-9]+$/ {sum += $3} END {print sum + 0}'
-        return
+read_amd_total_gpu_mb() {
+    local used_mb
+    if command -v amd-smi >/dev/null 2>&1 &&
+       used_mb=$(amd-smi metric --mem-usage --csv 2>/dev/null |
+           awk -F',' 'NR > 1 && $3 ~ /^[0-9]+$/ {sum += $3; found = 1}
+                       END {if (found) print sum; else exit 1}'); then
+        echo "$used_mb"
+        return 0
     fi
 
-    if command -v rocm-smi >/dev/null 2>&1; then
-        { rocm-smi --showmeminfo vram 2>/dev/null || true; } |
-            awk -F': ' '/VRAM Total Used Memory/ {sum += int($2 / 1048576)} END {print sum + 0}'
-        return
-    fi
-
-    echo 0
-}
-
-amd_memory_telemetry_available() {
-    if command -v amd-smi >/dev/null 2>&1; then
-        amd-smi metric --mem-usage --csv 2>/dev/null |
-            awk -F',' 'NR > 1 && $3 ~ /^[0-9]+$/ {found = 1; exit} END {exit found ? 0 : 1}' &&
-            return 0
-    fi
-
-    if command -v rocm-smi >/dev/null 2>&1; then
-        rocm-smi --showmeminfo vram 2>/dev/null |
-            awk -F': ' '/VRAM Total Used Memory/ {found = 1; exit} END {exit found ? 0 : 1}' &&
-            return 0
+    if command -v rocm-smi >/dev/null 2>&1 &&
+       used_mb=$(rocm-smi --showmeminfo vram 2>/dev/null |
+           awk -F': ' '/VRAM Total Used Memory/ {
+                           # GPU prefix and memory label both contain a colon.
+                           # The byte count is the final field, never $2.
+                           bytes = $NF
+                           gsub(/[^0-9]/, "", bytes)
+                           if (bytes != "") {sum += int(bytes / 1048576); found = 1}
+                       }
+                       END {if (found) print sum; else exit 1}'); then
+        echo "$used_mb"
+        return 0
     fi
 
     return 1
+}
+
+get_amd_total_gpu_mb() {
+    read_amd_total_gpu_mb || echo 0
+}
+
+amd_memory_telemetry_available() {
+    read_amd_total_gpu_mb >/dev/null
 }
 
 backend_expects_cuda_memory() {

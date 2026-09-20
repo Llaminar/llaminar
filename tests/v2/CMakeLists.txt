@@ -2854,6 +2854,15 @@ set_tests_properties(V2_Integration_PublishedImageSuites PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Integration_ServerGpuMemoryTelemetry
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_gpu_memory_telemetry.py
+)
+set_tests_properties(V2_Integration_ServerGpuMemoryTelemetry PROPERTIES
+    LABELS "V2;Integration;ProductionParityPreflight;E2E;Server;ROCm;Memory;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_AzureCrossHostResources
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_azure_cross_host_resources.py
@@ -18958,6 +18967,7 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_ServerGpuMemoryTelemetry
     V2_Integration_ExpertOverlayRetirementProgress
     V2_Integration_ExpertOverlayRetirementProgress_MPI
     V2_Integration_PhaseSplitDenseMemoryAdmission
