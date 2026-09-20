@@ -15,7 +15,9 @@ concurrency:
 jobs:
   e2e:
     runs-on: [llaminar-xeon-host]
-    timeout-minutes: 360
+    # Both ISA suites must finish even if every independent 15-minute cell is
+    # red: the current 26-cell projection alone can consume 390 minutes.
+    timeout-minutes: 480
     steps:
       - uses: docker/login-action@v4
         with:
