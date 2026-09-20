@@ -144,6 +144,29 @@ def build_driver(pair: dict, directory: Path) -> str:
     return image["id"]
 
 
+def restore_lane_ownership(driver: str, lane: Path, owner_uid: int, owner_gid: int) -> None:
+    """Return nested-driver evidence to the invoking runner after completion.
+
+    The suite driver may need the persistent model-cache owner's UID to retain
+    cache locks and tmpfs ownership.  That identity must never escape into the
+    checkout or runner temporary directory: a later Actions checkout cannot
+    remove a root-owned evidence subtree.  This narrowly scoped control
+    container changes only the completed lane back to the UID/GID that created
+    it; it neither touches model/cache data nor changes the runtime image.
+    """
+    if owner_uid < 0 or owner_gid < 0:
+        raise ValueError("evidence owner UID/GID must be non-negative")
+    resolved = lane.resolve(strict=True)
+    command = [
+        "docker", "run", "--rm", "--user", "0:0",
+        *docker_paths.mounts([(resolved, str(resolved), False)]),
+        "--entrypoint", "/bin/chown", driver, "--recursive",
+        f"{owner_uid}:{owner_gid}", str(resolved),
+    ]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.STDOUT, timeout=30)
+
+
 def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -> None:
     """Run canonical harnesses as the existing tmpfs owner, including under ARC.
 
@@ -157,6 +180,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     """
     cache_uid = (args.model_ramdisk_root / "cache").stat().st_uid
     lane_stat = lane.stat()
+    lane_owner_uid, lane_owner_gid = lane_stat.st_uid, lane_stat.st_gid
     lane.chmod(stat.S_IMODE(lane_stat.st_mode) | stat.S_ISGID | stat.S_IWGRP)
     endpoint = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
     docker_paths.local_docker_endpoint()
@@ -202,6 +226,10 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
             pass
         subprocess.run(["docker", "rm", "--force", name], check=False, timeout=30,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The driver shares a cache owner with retained tmpfs pages, while the
+        # outer runner owns evidence.  Repair that boundary only after every
+        # process that could still write the lane is reaped.
+        restore_lane_ownership(driver, lane, lane_owner_uid, lane_owner_gid)
 
 
 def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:

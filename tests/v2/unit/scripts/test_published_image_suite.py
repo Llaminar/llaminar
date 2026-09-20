@@ -231,7 +231,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                  patch.object(suite.docker_paths, "device_args", return_value=[]) as devices, \
                  patch.object(suite.docker_paths, "mounts", side_effect=bind), \
                  patch.object(suite.pipeline, "run") as run, \
-                 patch.object(suite.subprocess, "run"):
+                 patch.object(suite.subprocess, "run") as cleanup:
                 suite.run_in_driver(args, "tools-image", ["python", "runner.py"], lane, "run.log")
             devices.assert_called_once_with("tools-image", "CPU+CUDA+ROCm",
                 user=f"{cache.stat().st_uid}:{lane.stat().st_gid}")
@@ -241,6 +241,10 @@ class PublishedImageSuiteTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(command[-3:], ["tools-image", "python3", "runner.py"])
             self.assertEqual(lane.stat().st_mode & 0o007, 0o005)
+            repair = next(call.args[0] for call in cleanup.call_args_list
+                          if call.args[0][:2] == ["docker", "run"])
+            self.assertEqual(repair[-3:], ["--recursive", f"{lane.stat().st_uid}:{lane.stat().st_gid}",
+                                            str(lane.resolve())])
 
     def test_control_container_propagates_the_arc_shared_root_contract(self):
         """Nested HTTP launches retain the exact runner/daemon mount topology."""
@@ -332,6 +336,19 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
             self.assertEqual(workflow["concurrency"]["group"], "llaminar-develop-image-gate")
             self.assertEqual(workflow["concurrency"]["cancel-in-progress"], "false")
+
+    def test_workflows_keep_generated_evidence_out_of_the_checkout(self):
+        """A cache-owner driver may not poison the persistent ARC worktree."""
+        for name, prefix in (("production-e2e.yml", "llaminar-published-e2e"),
+                             ("production-benchmarks.yml", "llaminar-published-benchmarks")):
+            with self.subTest(workflow=name):
+                text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+                self.assertIn("clean: false", text)
+                self.assertIn("Retire legacy checkout evidence", text)
+                self.assertIn('git -C "$GITHUB_WORKSPACE" clean -ffdx', text)
+                self.assertIn('git -C "$GITHUB_WORKSPACE" reset --hard HEAD', text)
+                self.assertIn(f'$RUNNER_TEMP/{prefix}-$GITHUB_RUN_ID', text)
+                self.assertNotIn(f"--output parity-results/{prefix.removeprefix('llaminar-')}", text)
 
     def test_metadata_companion_does_not_build_a_replacement_runtime(self):
         from types import SimpleNamespace
