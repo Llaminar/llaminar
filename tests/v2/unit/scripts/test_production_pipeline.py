@@ -3597,12 +3597,16 @@ class InfrastructureTests(unittest.TestCase):
                  patch.object(pipeline.os, "getgid", return_value=1004), \
                  patch.object(pipeline.os, "getgroups", return_value=[1004, 109]), \
                  patch.object(pipeline.docker_paths, "device_args", return_value=["--user", "1003:1004"]) as devices, \
-                 patch.object(pipeline.docker_paths, "mounts", return_value=[]), \
+                 patch.object(pipeline.docker_paths, "mounts", return_value=[]) as mounts, \
                  patch.object(pipeline, "run") as execute, patch.object(pipeline.subprocess, "run"):
                 pipeline.run_test_runner({"test-runner": {"id": "image"}}, ["python3", "gate.py"], args, root, "gate.log")
             devices.assert_called_once_with("image", "CPU+CUDA+ROCm", user="1003:1004")
             argv = execute.call_args.args[0]
             self.assertEqual([argv[i + 1] for i, part in enumerate(argv) if part == "--group-add"], ["1004", "109"])
+            scratch = root / "ctest-temporary"
+            self.assertTrue(scratch.is_dir())
+            self.assertIn((scratch, "/src/build_v2_integration/Testing/Temporary", False),
+                          mounts.call_args.args[0])
 
     def test_runtime_and_direct_docker_builds_share_complete_collective_selection(self):
         pattern = (ROOT / "scripts/docker/rccl-functions.txt").read_text().strip()

@@ -399,9 +399,17 @@ def logged_container_command(command: list[str], log: str) -> list[str]:
 
 
 def run_test_runner(images: dict, command: list[str], args, directory: Path, log: str) -> None:
-    """Run installed tests; bind data/results only, never source or binaries."""
+    """Run installed tests; bind data/results and caller-owned CTest scratch.
+
+    A cached test image may have been built by a different host UID. CTest -N
+    still writes LastTest.log under Testing/Temporary, even when it only reads
+    registration metadata. Keep that mutable log outside the sealed build tree
+    so exact-source inventory companions remain reusable across runner UIDs.
+    """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
     name = "llaminar-ci-tests-" + uuid.uuid4().hex
+    ctest_scratch = directory / "ctest-temporary"
+    ctest_scratch.mkdir(exist_ok=True)
     launch = ["docker", "run", "--rm", "--name", name,
               *docker_paths.device_args(image, "CPU+CUDA+ROCm", user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
@@ -409,6 +417,7 @@ def run_test_runner(images: dict, command: list[str], args, directory: Path, log
                                     (args.models, "/opt/llaminar-models", False),
                                     (args.model_ramdisk_root, str(args.model_ramdisk_root), False),
                                     (args.reference_cache_root, "/reference-cache", False),
+                                    (ctest_scratch, "/src/build_v2_integration/Testing/Temporary", False),
                                     (directory, "/ci-results", False)]),
               "-e", "LLAMINAR_PARITY_REFERENCE_CACHE_ROOT=/reference-cache",
               "-w", "/src", image,
