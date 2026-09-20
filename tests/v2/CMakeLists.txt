@@ -10197,6 +10197,13 @@ add_v2_test(V2_Unit_MTPGraphConstruction
 # in one production graph builder. Keep the exact shifted-cache ownership
 # regression in parity preflight so a campaign cannot load real weights with a
 # stale TP-local KV handoff installed in the replicated sidecar graph family.
+add_v2_test(V2_Integration_MTPSidecarWorkspaceRows
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=Test__MTPGraphConstruction.SidecarWorkspaceUsesInvocationRowsNotContextCapacity
+    LABELS "V2;Integration;ProductionParityPreflight;CPU;MTP;ExpertOverlay;Workspace;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_MTPReplicatedSidecarKVPublicationLifecycle
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
         --gtest_filter=Test__MTPGraphConstruction.ReplicatedKVOnlySidecarPublishesFullProjectionDirectly:Test__MTPGraphConstruction.LivePrefixCheckpointAdmitsOnlyDeclaredAppendSpan
@@ -18954,6 +18961,7 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_TPSnapshotRuntimeGQASharding
     V2_Integration_TPSnapshotReplicatedMTPSidecarSharding
     V2_Integration_MTPReplicatedSidecarKVPublicationLifecycle
+    V2_Integration_MTPSidecarWorkspaceRows
     V2_Integration_AssignmentAwareFusedQKVTP2ThroughTP8
     V2_Integration_DynamicConvergenceFiniteHorizonLifecycle
     V2_Integration_DynamicConvergenceProtectedTraffic

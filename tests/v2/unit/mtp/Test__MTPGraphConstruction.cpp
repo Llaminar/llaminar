@@ -3238,6 +3238,8 @@ TEST(Test__MTPGraphConstruction, BatchedTerminalHiddenRefreshCopiesVariableLengt
     }
 }
 
+#include "Test__MTPSidecarWorkspaceRows.inc"
+
 TEST(Test__MTPGraphConstruction, RequestBatchedMTPGreedySidecarRunsOneRowPerRequest)
 {
     DeviceManager::instance().initialize(-1, false);

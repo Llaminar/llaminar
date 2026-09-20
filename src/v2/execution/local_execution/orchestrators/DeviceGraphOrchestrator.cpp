@@ -25958,8 +25958,22 @@ namespace llaminar2
             sidecar_cache.workspace_generation != 0 &&
             current_workspace_generation == sidecar_cache.workspace_generation;
 
+        /*
+         * Sparse ExpertOverlay consumers borrow route packets, so they need
+         * not expose an arena input shape from which the allocator can infer M.
+         * Supply this transaction's flattened request/token rows explicitly,
+         * just as ForwardExecutionEngine does for main forward participants.
+         * Omitting M substitutes the full KV context capacity and asks a
+         * one-row predictor to grow the already published serial workspace.
+         * Keep the exact mathematical role as well: a sidecar is not prefill,
+         * even when a KV catch-up transaction carries several token rows.
+         */
         if (!sidecar_workspace_validated &&
-            !ensureDeviceWorkspaceAllocated(*sidecar_cache.graph))
+            !ensureDeviceWorkspaceAllocated(
+                *sidecar_cache.graph,
+                total_rows,
+                WorkspaceGraphFamilyPolicy::SerialDeviceFamilyExactParticipant,
+                WorkspaceGraphParticipantRole::MTPCondition))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP sidecar workspace before dynamic param update");
             return false;
@@ -26630,7 +26644,12 @@ namespace llaminar2
                             return false;
                         }
                     }
-                    ok = execute(*sidecar_cache.graph, ctx);
+                    // The common sidecar prelude already bound this exact
+                    // workspace before dynamic parameters were published.
+                    // Submit directly, as the captured GPU branch does. The
+                    // generic execute() wrapper would scan/bind it again
+                    // without the transaction's row geometry.
+                    ok = executor_.execute(*sidecar_cache.graph, ctx);
                 }
 
                 if (ok &&
