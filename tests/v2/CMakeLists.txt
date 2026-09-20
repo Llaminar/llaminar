@@ -5075,6 +5075,28 @@ add_v2_test(V2_Unit_NUMAAllocator
     MPI_PROCS 1  # NUMAAllocator is single-rank only (memory allocation)
 )
 
+# This test certifies physical page ownership, rather than a policy request.
+# Linux may legally fall back to another node when a concurrently running
+# unit-test process puts the requested node below its allocation watermarks;
+# NUMAAllocator correctly rejects that spill instead of publishing it.  Run the
+# small proof alone so the unrestricted Unit fan-out cannot manufacture that
+# external-capacity condition.  The assertion remains exact: this does not
+# relax the production placement contract.
+if(TEST V2_Unit_NUMAAllocator)
+    set_tests_properties(V2_Unit_NUMAAllocator PROPERTIES RUN_SERIAL TRUE)
+endif()
+
+add_test(NAME V2_Unit_NUMAAllocatorCTestIsolation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_numa_allocator_ctest_isolation.py
+            --ctest ${CMAKE_CTEST_COMMAND}
+            --build-dir ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(V2_Unit_NUMAAllocatorCTestIsolation PROPERTIES
+    LABELS "V2;Unit;BuildSystem;NUMA;Regression"
+    TIMEOUT 30
+)
+
 # Test: BufferArena (centralized buffer management, coherence tracking, borrow validation)
 add_executable(v2_test_buffer_arena unit/memory/Test__BufferArena.cpp)
 target_link_libraries(v2_test_buffer_arena 
