@@ -173,6 +173,90 @@ flowchart TD
     C --> O[Explicit full-certification publication: both images and one combined result commit]
 ```
 
+## Manual published-image workflows
+
+Two separate **manual-dispatch-only** workflows consume the branch's existing
+GHCR runtime images. They never replace a missing published image with a local
+build and do not extend the ordinary develop push gate:
+
+- **Published images — HTTP E2E** (`production-e2e.yml`) runs every canonical
+  E2E-tagged cell through the full HTTP/long-context needle harness, first on
+  AVX512, then on AVX2. It retains the image identities, canonical manifest,
+  per-cell evidence and completed pair receipt as an Actions artifact.
+- **Published images — Benchmarks** (`production-benchmarks.yml`) requires that
+  completed E2E pair before starting either ISA's production benchmark suite.
+  It accepts an E2E run ID, or selects the latest successful manual E2E run on
+  the same branch. A newer image tag invalidates the old E2E receipt. It commits
+  compact JSON, an SVG chart and the owned README block only after every
+  benchmark passes.
+
+For `develop`, the images are `ghcr.io/llaminar/llaminar:develop` and
+`:develop-avx2`. Both must exist, be full-backend Release images, and name the
+same committed Git source tree. The workflow pins their registry digests and
+Docker IDs before inference. The chart identifies the **tested image's source
+SHA**, which may precede the workflow or result-publication commit.
+
+```bash
+gh workflow run production-e2e.yml --ref develop
+gh run list --workflow production-e2e.yml --branch develop
+gh run watch E2E_RUN_ID --exit-status
+
+gh workflow run production-benchmarks.yml --ref develop -f e2e_run=E2E_RUN_ID
+```
+
+New workflows must be registered on the repository's default branch before
+GitHub exposes their manual-run UI. Select `develop` when dispatching; the
+selected branch owns both the image tags and the published result commit.
+The workflows share the develop gate's accelerator concurrency group and use
+the same host Docker/BuildKit cache. No build cache is uploaded to GitHub.
+
+Runtime images do not contain model-parity executables. Discovery therefore
+builds a full-matrix **test companion from the tested image's exact committed
+source**, using the existing installed-inventory exporter. One full-backend
+AVX2 companion describes the ISA-independent matrix; it performs metadata
+discovery only. All model inference uses the pulled runtime image IDs. No
+model/topology list is copied into workflow YAML or the new driver.
+
+The ARC pod's model/cache mounts remain read-only. Canonical HTTP and benchmark
+drivers execute in a small, local `suite-driver` tools container, using the
+existing tmpfs owner's UID and the same physical cache/lock. Only that control
+container receives writable cache access; the server still runs in a separate
+unchanged published runtime. This avoids a duplicate ramdisk or changing cache
+ownership merely because the GitHub runner has a different UID. The driver
+also supplies GPU memory-telemetry tools missing from the runner pod. Its
+distinct image role cannot be mistaken for a tested runtime or a release.
+
+The same orchestration is available locally:
+
+```bash
+python3 scripts/ci/run_published_image_suite.py e2e \
+  --branch develop --output parity-results/published-e2e
+
+python3 scripts/ci/run_published_image_suite.py benchmarks \
+  --branch develop --e2e-bundle parity-results/published-e2e \
+  --output parity-results/published-benchmarks
+```
+
+Use a new output directory for each attempt; partial evidence is retained, not
+silently promoted or overwritten. `--models` and `--model-ramdisk-root` use the
+same model staging authority as the full pipeline. There is no reduced-suite,
+timeout extension or diagnostic bypass in these publishing workflows. For a
+failing cell, use the existing E2E/benchmark runner's explicit diagnostic
+selection, then rerun the complete suite on the corrected published pair.
+Unit/preflight are not rerun per model cell: published develop images already
+passed those gates.
+
+Local runs do not commit implicitly; `--publish` explicitly enables the same
+branch publication as Actions. Publication uses a private index and a normal
+fast-forward push, retaining concurrent source changes and leaving the user's
+checkout/index untouched. The bookkeeping commit includes `[skip ci]` so a
+chart update does not rebuild the measured images. Full logs stay in Actions
+artifacts; `benchmarks/production/published/results.json` and `benchmarks.svg`
+are the compact checked-in evidence. These workflows do **not** run saved-token
+or remote-MPI regression, mint a full production-image certificate, modify
+runtime layers/tags, or advance the full-certification high-water file. The
+benchmark runner still checks the existing high-water policy for regressions.
+
 ## Run locally
 
 The node needs Docker/Buildx, Python 3, Git, `lscpu`, `lspci`, the complete

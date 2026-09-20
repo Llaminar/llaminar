@@ -250,6 +250,9 @@ documentation.
 | CLI flags and help | `src/v2/config/CliSpec.*`, `OrchestrationConfigParser.*` |
 | CLI conflict rules | `src/v2/config/ConfigValidator.*` |
 | Lossless config documents and startup publication | `src/v2/config/OrchestrationConfigDocument.*`, `OrchestrationStartupPolicy.*` |
+| Auto selection, candidates, and measured cost estimates | `src/v2/planning/AutomaticPlanningStartup.*`, `AutomaticOrchestrationCandidates.*`, `PlanningRequestCostModel.*` |
+| Domain/tier grammar and routed-expert policy | `src/v2/config/ExecutionDomainDefinition.*`, `ExpertTierDefinition.h`, `src/v2/execution/config/RoutedExpertPolicy.h` |
+| Durable movement defaults and runtime policy | `src/v2/execution/config/RuntimeConfig.h`, `src/v2/execution/moe/DeviceMoERebalancePolicyShared.h` |
 | Runtime environment variables | `src/v2/utils/DebugEnv.h` |
 | Test names, labels, and registration | `tests/v2/CMakeLists.txt` |
 | Testing workflow | `.agents/llaminar-testing/SKILL.md`, `tests/v2/integration/parity/README.md`, `docs/production-ci.md`, and CMake registration |
@@ -363,69 +366,258 @@ here—inspect the CMake file when adding or changing a feature.
 
 ## Run and Inspect Configuration
 
-Use subcommands and consult command-specific help before assuming a flag still
-exists.
+### Start with auto, then measure before overriding
+
+Use the public `plan`, `serve`, `oneshot`, and `benchmark` subcommands. Start
+with the model, required context, and only the user's actual constraints.
+Automatic planning is the default when no placement is declared; `--auto` is
+optional. Do not preselect a device count, strategy, collective, precision,
+expert quota, movement policy, or graph bucket to reproduce an old benchmark.
+First inspect and measure what the installed production defaults select, then
+make explicit, separately measured overrides if needed.
 
 ```bash
-./build_v2_release/llaminar2 --help
-./build_v2_release/llaminar2 oneshot --help
-./build_v2_release/llaminar2 benchmark --help
+./build_v2_release/llaminar2 plan --help
+./build_v2_release/llaminar2 serve --help
 
-./build_v2_release/llaminar2 oneshot \
-  -m models/model.gguf -d cuda:0 -p "Hello" -n 50
+# Direct auto serving; only ROCm compute is permitted in this example.
+./build_v2_release/llaminar2 serve \
+  -m models/model.gguf --only-backends rocm -c 32768
 
-./build_v2_release/llaminar2 oneshot \
-  -m models/model.gguf --dry-run --explain-placement
+# Inspect and save the selection for the same inference policy.
+./build_v2_release/llaminar2 plan \
+  -m models/model.gguf --only-backends rocm -c 32768 \
+  --output /tmp/llaminar-plan.json
+
+# Apply exactly that selection, without rerunning auto search.
+./build_v2_release/llaminar2 serve --config /tmp/llaminar-plan.json
 ```
 
-The executable normally bootstraps MPI and installs rank, NUMA, OpenMP, and
-BLAS placement. Do not use `--no-mpi-bootstrap` for ordinary execution. It is
-only for an attaching debugger or the profiler workflow described by the
-backend tuning skills.
+Substitute an existing GGUF and a context that admission can fit. Omit
+`--only-backends` to consider all discovered compute backends. Supply the same
+intended MTP, KV-cache, and prefix-cache settings to `plan` as to `serve`;
+changing capacity-affecting settings afterward requires renewed admission.
 
-Device selection forms and their mutual exclusions evolve with the topology
-planner. Use `--help`, `ConfigValidator`, `--validate-only`, `--dry-run`, and
-`--explain-placement` rather than relying on a copied flag matrix.
+Auto reads the GGUF metadata, gathers the MPI cluster inventory, admits
+candidates through `PhysicalMemoryAuthority`, and ranks bounded estimates of
+prefill and generation cost. These are predictions, not whole-model benchmarks
+or a guarantee that every visible device will be selected. A fresh search may
+select a different subset; use a saved apply document when comparing one fixed
+topology across runs.
+
+Use constraints deliberately:
+
+- `--only-backends cpu,cuda,rocm` restricts compute, not host control/storage.
+- `--only-strategies single,tp,pp,expert-overlay` restricts candidate families.
+  Do not add it merely because a model is MoE. A homogeneous single-domain MoE
+  candidate is currently labeled `tp` even though its runtime uses ExpertOverlay;
+  an `expert-overlay`-only filter excludes that candidate. Inspect the resolved
+  domains and routed-compute policy, not just the strategy label.
+- `--prefer-backend` and `--prefer-strategy` are soft tie-breaking preferences;
+  they do not override admission or hard constraints.
+- `--plan-workload <prefill,generation>` supplies an optional expected request
+  horizon for ranking. Both counts must be positive and fit the context; this
+  does not limit inference output. Omit it for the initial default baseline.
+- `--auto-hosts all` requires compute on every discovered physical host. The
+  default permits a host subset; neither form means "use every GPU/rank."
+
+Explicit devices/domains/tiers or an applied plan select apply mode instead.
+`--planning-mode apply` may make that intent explicit; do not combine authored
+placement with `--auto` or auto-search filters/hints. `plan` requires automatic
+intent; inspect authored placement with `serve --dry-run --explain-placement`.
+Use `--validate-only` for parsing/configuration checks, not as proof of hardware
+fit, graph support, or successful inference. Current help and `ConfigValidator`
+remain authoritative; accepted syntax alone is not a capability certificate.
+
+### Execution modes and explicit placement
+
+| Mode | What is distributed | Explicit surface when required |
+|---|---|---|
+| Single device | The complete model executes on one compute endpoint, without inter-device collectives. | `--device cuda:0`, `rocm:0`, or `cpu:0` |
+| Dense TP | Participants cooperate on each layer using tensor shards and collectives. | `--tp-devices` with `--tp-scope`, or a named TP domain |
+| Dense PP | Consecutive main-layer intervals execute in ordered domains; a domain may itself use TP. | `--define-domain` plus `--pp-stage` |
+| ExpertOverlay | Routed experts of the same layer are placed across one or more domains/tiers; results return to the continuation domain. This is not a layer pipeline. | `--expert-tier` (preferred compact form) |
+
+```bash
+# Single GPU. Use rocm:0 for ROCm or cpu:0 for one CPU NUMA endpoint.
+./build_v2_release/llaminar2 serve -m models/model.gguf --device cuda:0
+
+# Dense TP within one rank; the device list supplies the degree.
+./build_v2_release/llaminar2 serve -m models/dense.gguf \
+  --tp-scope rank_local --tp-devices rocm:0,rocm:1
+
+# Dense PP example ONLY for a model with 64 main transformer layers.
+# Change the contiguous, inclusive intervals to the actual GGUF geometry.
+./build_v2_release/llaminar2 serve -m models/dense-64-layer.gguf \
+  --define-domain 'early=rocm:0;scope=rank_local' \
+  --define-domain 'late=rocm:1;scope=rank_local' \
+  --pp-stage '0=early:0-31' --pp-stage '1=late:32-63'
+```
+
+CPU `--device cpu` is special shorthand for all local NUMA endpoints, not one
+device; `cpu:N` selects one. Do not combine `--device` with `--tp-devices` or
+named domains. An optional `-tp N` must match the device-list length. Named
+domains specify their own width, so do not append an unrelated `-tp` degree.
+
+`rank_local` means multiple devices in one MPI process; `node_local` means
+participants across ranks on one physical host; `global` spans the selected
+MPI ranks, potentially across hosts. These scopes are not interchangeable and
+do not describe expert compute distribution. A native GPU TP group uses one
+vendor's collective; do not treat CUDA and ROCm as one NCCL/RCCL group. Put
+distinct hardware groups in separate domains with an admitted boundary.
+For dense PP, stage intervals must cover the main model without gaps/overlaps;
+trailing MTP sidecar blocks are not extra pipeline layers. Automatic dense PP
+is not a substitute for an MoE expert topology.
+
+### ExpertOverlay tiers, capacity, and compute policy
+
+All multi-device routed MoE uses one ExpertOverlay placement authority,
+including a single-tier homogeneous deployment. Start with auto; use compact
+tiers only when the user needs an authored placement:
+
+```bash
+# One homogeneous tier: no cross-tier promotion, but within-tier rebalance.
+./build_v2_release/llaminar2 serve -m models/moe.gguf \
+  --expert-tier 'accelerator=rocm:0,rocm:1;priority=0'
+
+# GPU continuation and a two-NUMA-endpoint CPU expert tier.
+./build_v2_release/llaminar2 serve -m models/moe.gguf \
+  --expert-tier 'accelerator=cuda:0,cuda:1;priority=0' \
+  --expert-tier 'capacity=cpu:0,cpu:1;priority=10'
+```
+
+Use observed device/NUMA IDs. Bare `cpu` is not a domain/tier participant
+address, even though `--device cpu` is valid. Tier names are opaque labels,
+never hard-coded "hot/warm/cold" roles. Integer priorities must be distinct:
+smaller numbers are preferred and select the default continuation; the greatest
+priority is the derived final-coverage tier. Do not write `fallback=true`.
+That internal coverage role is neither a CPU requirement nor an error fallback.
+
+The continuation owns the main inference path and receives the combined routed
+output; additional expert tiers do not become independent samplers or MTP
+controllers. Base-model and shared-expert domains default from continuation.
+Scope, ownership, collective and physical expert capacity resolve through the
+shared normalization/inventory and `PhysicalMemoryAuthority`, not tier names.
+
+Omit capacity fields (or use `memory-mb=auto`) for automatic admission including
+weights, KV/recurrent state, workspaces, prefix storage and movement buffers.
+For a deliberate restriction, add `;memory-mb=N` or
+`;max-experts-per-layer=N` to a tier. Do not hard-code expert counts to fill
+VRAM or subtract another private reserve. Resolved live per-layer quotas are
+authoritative: migration changes which experts occupy those slots, not a
+promise that every lower-priority tier eventually drains.
+
+Keep these policy axes separate:
+
+- `--moe-routed-expert-compute apportioned` (default) assigns whole experts to
+  participants. `replicated` places complete experts on every participant.
+  `tensor-sharded` means splitting each expert's tensors, not apportionment;
+  the standard Qwen3.5 MoE path currently rejects that global option as
+  unimplemented. Do not infer support from its presence in help.
+- `--moe-continuation-dense-policy` changes dense/shared work, not routed expert
+  placement. Prefer its resolved automatic policy. Explicit choices include
+  `replicated`, `tensor-parallel`, `tensor-parallel-decode-mirrored-embedding`,
+  and `prefill-tensor-parallel-decode-replicated`; replication has a memory cost.
+- `--moe-routed-expert-owner-order ordinal|random` chooses initial owner ordering;
+  it does not enable or disable later movement. `--moe-hot-expert-cache` controls
+  optional extra expert replicas, not the number of uniquely owned experts.
+
+Advanced authored roles use `--moe-routed-expert-continuation-domain`,
+`--moe-routed-expert-base-model-domain`, and `--moe-routed-expert-shared-domain`.
+The expanded forms split the same intent into
+`--moe-routed-expert-domain 'name=devices;...'` and
+`--moe-routed-expert-tier 'tier@name;priority=N;...'`. Unlike compact tiers,
+these require explicit `--moe-routed-expert-placement single-domain` or
+`tiered-overlay` to enable placement. Domain options such as `scope`, `owner`,
+`ranks`, `backend`, and `routed_compute` override those
+particular axes; do not specify them all unless the topology actually requires
+it. A routed domain accepts single/rank-local/node-local scope, not a global
+TP domain; cross-host overlay connects distinct hardware domains.
+
+### Dynamic residency maintenance and overrides
+
+`--moe-residency-maintenance dynamic` is the default, with default residency
+`rebalanced`. The sole overlay authority uses routed demand and migration
+economics for cross-tier promotion/demotion and within-tier skew reduction.
+A single tier still supports the second axis. Dynamic does not guarantee a
+move every window or a speedup over a short request; validate completed moves,
+placement epochs and amortized inference time rather than assuming them.
+
+For a new placement without an explicit residency policy,
+`--moe-residency-maintenance off` defaults residency to `static-by-id`;
+`observe` records demand without publishing physical moves.
+`--moe-routed-expert-residency` can explicitly override placement policy, but
+does not by itself select the maintenance mode. An applied plan retains its
+authored residency policy. Prefer changing just the maintenance flag for a
+fixed-placement Static/Dynamic A/B rather than supplying redundant flags.
+
+| Tuning purpose | Relevant override |
+|---|---|
+| Histogram cadence and adaptive growth | `--moe-residency-maintenance-window`, `--moe-residency-maintenance-max-window`, `--moe-residency-maintenance-window-growth` |
+| Lifetime over which a move must repay its cost | `--moe-migration-payoff-horizon-tokens` (distinct from the histogram window) |
+| Preallocated movement capacity | `--moe-migration-transfer-slots` (more slots also consume admitted memory) |
+| Background GPU submission concurrency | `--moe-migration-execution-streams` (positive, no greater than slot count) |
+| Active cycles admitted in a wave | `--moe-migration-cycles-per-wave` (positive, no greater than slot count) |
+| Skew and benefit thresholds | `--moe-dynamic-imbalance-threshold-permille`, `--moe-dynamic-min-improvement-permille`; inspect help for device-specific economy controls |
+
+Numeric defaults live in `RuntimeConfig.h`, `DeviceMoERebalancePolicyShared.h`
+and CLI help, not a second tuning table here. Keep initial baselines at defaults;
+then vary one relevant policy, include enough tokens to observe its horizon,
+and compare correctness, completed movement, memory footprint and unprofiled
+throughput. Do not disable maintenance silently to report a faster default.
+
+Current-batch least-loaded assignment (LLEP) is separate from durable movement.
+Domain fields `routed_prefill_assignment` / `routed_decode_assignment` select
+`static-owner` or `least-loaded-resident` where supported; grouped MTP verifier
+rows are decode work, not ordinary prefill. There is no `llep` value for
+`--moe-residency-maintenance`. See `RoutedExpertPolicy.h` and domain validation
+for supported combinations rather than treating these policies as synonyms.
+
+### Cluster launch and shared runtime policy
+
+The executable normally bootstraps MPI and installs rank, NUMA, OpenMP, and
+BLAS placement. Do not use `--no-mpi-bootstrap` for ordinary execution; it is
+only for a debugger or the profiler workflow described by the backend skills.
+Use the same frontend for cluster-aware selection permitting ROCm and CPU
+compute, then inspect the selected continuation and remote participants:
+
+```bash
+./build_v2_release/llaminar2 plan -m /models/moe.gguf \
+  --mpi-hostfile /cluster/hosts --only-backends rocm,cpu \
+  --auto-hosts all -c 32768 --output /tmp/llaminar-cluster-plan.json
+./build_v2_release/llaminar2 serve --config /tmp/llaminar-cluster-plan.json
+```
+
+`--hostfile` and `--mpi-hostfile` name the same MPI cluster intent. MPI owns
+hostfile slot admission; each rank supplies its actual hardware and worker
+geometry. Do not infer physical hosts from rank numbers or copy launcher-local
+CPU IDs/widths onto remote hosts. Images/binaries and model paths must already
+be provisioned on peers; a hostfile does not distribute them. See the README's
+remote-MPI recipe for container transport setup. A node-local channel remains
+node-local even when a hostfile is supplied.
 
 `plan` and `serve` share the complete runtime parser. Plan adds only checked
 output options; never restore a private MTP, KV, strategy or economy table.
-Pass the same inference policy into planning, then consume its apply document
-without replaying automatic-search constraints. Command discovery must retain
-that request's backend intent and MPI geometry. Automatic search runs only on
-discovery root through `AutomaticPlanningStartup`; every discovery rank first
-participates in evidence preparation using the context-owned immutable inventory.
-The shared transaction publishes one complete apply document before rank
-admission. Runner factories are apply-only; never
-move automatic selection into a factory or independently repeat it on followers.
+Automatic search runs only on discovery root through `AutomaticPlanningStartup`;
+all discovery ranks participate in evidence preparation using one immutable
+inventory. Publish the complete apply document before rank admission. Runner
+factories remain apply-only; do not repeat search on followers or in a factory.
+Saved execution selection retains discovery-rank order and process count; apply
+it through `MPIContextFactory::selectRanks` before runner construction. Never
+interpret execution device maps as discovery rank IDs or narrow discovery launch
+from the selected inference endpoints alone.
 
-Production model activations currently support FP32 only. Other activation
-precision requests fail as unimplemented. KV-cache precision and expert weight
-formats are independent settings; their support does not imply support for
-another model activation dtype.
+Automatic ranking uses the shared `OrchestrationPlanningWorkload` policy
+(CLI `--plan-workload`, YAML `planning.workload`). Do not substitute KV capacity
+or a frontend-local horizon for that objective. Applied plans contain placement,
+not another search policy. Compact tiers also adapt to existing canonical
+domain/tier types; they must not acquire a second capacity or role authority.
 
-Compact `--expert-tier 'name=devices;priority=N'` declarations adapt into the
-existing domain/tier types. Keep their default role selection in shared config
-normalization and their physical capacity in `PhysicalMemoryAuthority`, never
-in the CLI. `--hostfile` and `--mpi-hostfile` name the same MPI cluster intent;
-MPI owns hostfile slot admission, and each rank supplies its own hardware and
-worker geometry. Launcher-local CPU indices or widths must not cross that
-cluster boundary. A node-local transport remains node-local with a hostfile.
-Saved execution selection retains discovery-rank order and the discovery
-process count. Apply it through `MPIContextFactory::selectRanks` before runner
-construction; never interpret execution device maps using discovery rank IDs,
-or narrow the saved discovery launch from its selected inference endpoints.
-
-Automatic selection normally permits a physical-host subset. `--auto-hosts all`
-requires a compute participant on every discovered host, without requiring every
-MPI rank or assigning launcher-local device IDs to peers. The canonical remote
-E2E projection supplies this hard constraint; model execution evidence must still
-prove work on every remote CPU participant.
-
-Automatic ranking uses the shared `OrchestrationPlanningWorkload` policy.
-`--plan-workload <prefill,generation>` and YAML `planning.workload` specify
-expected positive token counts within context capacity; they do not constrain
-inference output. Do not substitute KV capacity or a frontend-local horizon
-for this objective. Applied plans contain placement, not another search policy.
+Production model activations support FP32 only; other activation precision
+requests fail as unimplemented. KV precision, allreduce wire precision and expert
+weight formats are separate settings. Leave their defaults intact for the
+initial auto baseline. Prefix caching is enabled by default; MTP is independently
+enabled with `--mtp`, and `--mtp-depth-policy dynamic` selects adaptive depth.
 
 MTP hardware defaults are selected once by `ExecutionPlanBuilder` from the
 complete continuation domain and canonical device inventory. Their numeric
@@ -441,14 +633,24 @@ Use a Release binary and a fixed model, device, prompt bytes, decode length,
 sampling policy, and runtime configuration for comparisons.
 
 ```bash
+# Measure automatic production selection first, with only a backend constraint.
 ./build_v2_release/llaminar2 benchmark \
-  -m models/model.gguf -d cuda:0 \
-  --prompt "A fixed prompt used for every comparison."
+  -m models/model.gguf --only-backends rocm \
+  --prompt "A fixed prompt used for every comparison." \
+  -n 256 --temperature 0 --seed 42
 
+# Use a saved plan when the comparison must retain identical placement.
 ./build_v2_release/llaminar2 benchmark \
-  -m models/model.gguf -d cpu:0 \
-  --prompt-file benchmarks/prompts/fixed.txt
+  --config /tmp/llaminar-plan.json \
+  --prompt "A fixed prompt used for every comparison." \
+  -n 256 --temperature 0 --seed 42
 ```
+
+Greedy sampling (`--temperature 0 --seed 42`) is not diagnostic kernel
+determinism. `--deterministic` also sets `LLAMINAR_DETERMINISTIC=1`, which can
+disable optimized kernel dispatch and projection concurrency. Do not use it
+as an incidental benchmark convenience or compare that result with normal
+production dispatch without identifying the changed policy.
 
 Benchmark mode owns warmup, repeated measurement, cache clearing, prompt
 identity, and result reporting. Read `BenchmarkMode`, `BenchmarkRunner`, and
@@ -516,6 +718,16 @@ each builder, and publish the two tested `develop` runtime tags. It does not
 run model/generation/parity/E2E/benchmark certification and must not be
 expanded into a second production-pipeline implementation. See
 `docs/production-ci.md` for the exact boundary and local invocation.
+
+The separate manual `production-e2e.yml` and `production-benchmarks.yml`
+workflows consume the branch's existing GHCR image pair. They use
+`run_published_image_suite.py`, canonical typed inventory discovery and the
+existing HTTP/benchmark runners. Both entire same-image E2E suites precede
+either benchmark. Only complete benchmark results may update the owned README
+chart block and compact JSON; this phase evidence is not full image certification.
+Never substitute a rebuilt runtime for a missing published image or maintain
+a workflow-local model/topology matrix. See the manual published-image section
+of `docs/production-ci.md`.
 
 For an isolated model-free gate, `scripts/ci/run_production_prerequisites.py`
 delegates to the same complete Unit/preflight authority and preserves its

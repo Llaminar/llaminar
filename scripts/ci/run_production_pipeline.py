@@ -308,9 +308,13 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
 
 
 def build(args, source: dict, directory: Path, *,
-          test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX) -> dict:
+          test_inventory: TestRunnerInventory = TestRunnerInventory.FULL_MATRIX,
+          roles: tuple[ImageRole, ...] = tuple(ImageRole)) -> dict:
     """Build test/runtime siblings and journal each target's wall-clock cost.
 
+    A published-image workflow can request only the metadata/test companion;
+    it must not rebuild or substitute the runtime that is being tested.
+    Full certification still requires both siblings through require_image_pair.
     The full Buildx log remains one file per target.  The accompanying
     ``build-timeline.jsonl`` makes local layer import/export visible as part of
     the target duration, instead of attributing that time to compilation by
@@ -318,13 +322,16 @@ def build(args, source: dict, directory: Path, *,
     """
     if not isinstance(test_inventory, TestRunnerInventory):
         raise TypeError("image build requires a TestRunnerInventory")
+    if (not roles or len(set(roles)) != len(roles)
+            or any(not isinstance(role, ImageRole) for role in roles)):
+        raise ValueError("image build requires distinct typed image roles")
     context = directory / "source"
     if not context.exists():
         snapshot(source["tree"], context)
     prefix = f"llaminar-ci:{source['tree'][:16]}-{args.cpu_isa.lower()}"
     timeline = directory / "build-timeline.jsonl"
     images = {}
-    for role in ImageRole:
+    for role in roles:
         target = role.value
         tag = prefix + "-" + target
         log = directory / f"build-{target}.log"
@@ -357,7 +364,8 @@ def build(args, source: dict, directory: Path, *,
         # image or admitting any discovery/test process from the wrong build.
         require_image(images[target], source, args.cpu_isa, role,
                       test_inventory=test_inventory)
-    require_image_pair(images, source, args.cpu_isa, test_inventory=test_inventory)
+    if set(roles) == set(ImageRole):
+        require_image_pair(images, source, args.cpu_isa, test_inventory=test_inventory)
     return images
 
 

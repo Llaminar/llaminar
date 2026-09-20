@@ -10,6 +10,10 @@ Llaminar tries to solve a variety of problems encountered in other projects:
 
 Llaminar is **experimental** and very much in an **alpha** stage of development. Use it with that in mind and expect the odd segfault.
 
+[Quickstart](#quickstart) · [Planning and topology](#planning-and-topology) ·
+[Benchmarks](#benchmarks) · [Development](#development) ·
+[Architecture](#llaminar-architecture)
+
 ## Supported Hardware
 
 Llaminar supports:
@@ -27,331 +31,475 @@ Llaminar supports the following model architectures initially:
 
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
-* Qwen 3.5/3.6 (dense and MoE)
-
-## Benchmarks
-
-For homogeneous multi-GPU MoE, `--moe-hot-expert-cache` is a replica-cache
-upper bound and defaults to `off`. An explicit positive count or percentage
-opts into replicas; physical admission then fits the largest positive cache
-alongside the complete model and graph allocations. It never disables Dynamic
-movement to fit, and the resolved capacity is reported during setup.
-
-Production benchmarks use the canonical model-parity cells tagged for E2E
-certification. The [production CI guide](docs/production-ci.md) describes the
-local/hosted pipeline, independent AVX512/AVX2 image certificates, and checked-in
-[high-water marks](benchmarks/production/high_water.json). Official successful
-runs commit their compact result JSON under `benchmarks/production/results/`.
-Both full E2E server suites pass before either image's benchmarks run; ISA-specific
-high-water marks and certificates are never reused across the two images.
-For targeted cross-host iteration, the remote runner can prioritize failing or
-unseen canonical cases without reducing the required certification matrix;
-see the CI guide's Azure workflow.
-
-The [Llaminar testing workflow](.agents/llaminar-testing/SKILL.md) covers Unit
-and production-preflight gates, reviewed HTTP token regression (MTP off and
-dynamic depth), explicit diagnostic numerical model parity,
-HTTP/remote-MPI E2E, and image/benchmark certification.
+* Qwen 3.5/3.6 (dense and MoE), including Qwen 3.8 dense GGUFs
 
 ## Quickstart
 
-### Optional tuning and certification corpora
+Start with the published Docker image and let the auto planner choose placement.
+You only need a supported GGUF, enough RAM/VRAM, and a Linux x86_64 host with
+Docker. The image includes CPU, CUDA, ROCm, MPI, and the required user-space
+libraries; model weights and host GPU drivers are not included.
 
-All published corpora live in [Llaminar/corpora](https://github.com/Llaminar/corpora),
-pinned here as the optional `corpora/` submodule. Normal source checkouts,
-builds, and Unit/preflight tests do not fetch or require these large datasets.
-Only initialize them when working with corpus evidence:
+The commands below use **Bash**. Run the setup blocks in the same shell.
+
+### 1. Choose the image and model
+
+Select the image for your **CPU instruction set**, not your GPU vendor. Both
+images include all three compute backends.
+
+| Host CPU | Develop image |
+|---|---|
+| AVX512-VNNI | `ghcr.io/llaminar/llaminar:develop` |
+| AVX2 | `ghcr.io/llaminar/llaminar:develop-avx2` |
+
+These mutable tags pass the full Unit and production-preflight gates before CI
+publishes them. They are development builds, not full E2E/benchmark-certified
+releases. Pin an image digest when you need a repeatable deployment.
+
+Set the directory containing your GGUF and its path **inside the container**.
+The filename below is an example; use a file you have downloaded.
+
+```bash
+export MODEL_DIR=/opt/llaminar-models
+export LLAMINAR_MODEL=/models/Qwen3.8-27B-IQ4_XS.gguf
+export LLAMINAR_IMAGE=ghcr.io/llaminar/llaminar:develop
+# For an AVX2 host, use ghcr.io/llaminar/llaminar:develop-avx2 instead.
+
+docker pull "$LLAMINAR_IMAGE"
+
+COMMON_RUN=(
+  --network host
+  --shm-size=16g
+  --security-opt seccomp=unconfined
+  --cap-add SYS_NICE
+  -v "$MODEL_DIR:/models:ro"
+)
+```
+
+### 2. Expose the hardware
+
+Choose **one** setup below. This controls which devices Docker exposes; Llaminar
+will then plan across the available hardware.
+
+**NVIDIA:**
+
+```bash
+DEVICE_ARGS=(--gpus all)
+```
+
+**AMD:**
+
+```bash
+DEVICE_ARGS=(--device=/dev/kfd --device=/dev/dri --cap-add SYS_PTRACE)
+for node in /dev/kfd /dev/dri/card* /dev/dri/renderD*; do
+  if [[ -e "$node" ]]; then
+    DEVICE_ARGS+=(--group-add "$(stat -c '%g' "$node")")
+  fi
+done
+```
+
+For a mixed AMD/NVIDIA host, run the AMD block and then add NVIDIA access:
+
+```bash
+DEVICE_ARGS+=(--gpus all)
+```
+
+For CPU-only execution, use `DEVICE_ARGS=()` instead. The same image runs on
+CPU-only hosts without GPU drivers.
+
+<details>
+<summary>Host setup and container permissions</summary>
+
+Install [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) first.
+NVIDIA hosts need a compatible driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+AMD hosts need the AMDGPU kernel driver and accessible `/dev/kfd` and `/dev/dri`
+nodes; see [ROCm container setup](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/docker.html).
+The image supplies the user-space GPU libraries; their pinned versions live in
+the [Dockerfile](Dockerfile) and its install scripts.
+
+The image runs as a non-root user. The AMD block supplies the host's actual
+device-group IDs instead of assuming a particular `render` or `video` GID.
+`SYS_NICE` and the seccomp setting permit NUMA/placement operations;
+`SYS_PTRACE` is included for ROCm runtime access. Normal launches do not need
+`--privileged`.
+
+The examples use host networking and a private 16 GiB shared-memory allowance
+for MPI/GPU collectives. Do not add Docker `-p` port mappings with host networking,
+or combine `--ipc=host` with `--shm-size` expecting it to resize the host's memory.
+
+</details>
+
+### 3. Serve and send a request
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
+  --name llaminar "$LLAMINAR_IMAGE" serve \
+  -m "$LLAMINAR_MODEL" --context-length 8192 \
+  --host 127.0.0.1 --port 8080
+```
+
+No device or topology flags are required: `serve` defaults to automatic
+planning. It reads the model metadata, gathers hardware inventory, checks
+memory capacity, and selects placement. Start here before tuning device
+counts, expert quotas, precision, or collectives.
+
+- To restrict compute to one backend, add `--only-backends rocm`, `cuda`, or `cpu`.
+- Increase `--context-length` to suit your workload and available memory; the
+  limit includes both prompt and generated tokens.
+- For a model with MTP weights, add `--mtp --mtp-depth-policy dynamic` to enable
+  adaptive speculative decoding. MTP is otherwise off; prefix caching is on by
+  default.
+- To accept connections from other machines, use `--host 0.0.0.0`. Expose it only
+  on a trusted network or behind an authenticated proxy.
+
+Wait for the server to become ready, then use another terminal:
+
+```bash
+curl --fail http://127.0.0.1:8080/health
+
+curl --fail-with-body --no-buffer http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role":"user","content":"Explain tensor parallelism in two sentences."}],
+    "max_tokens": 128,
+    "temperature": 0,
+    "enable_thinking": false,
+    "stream": true
+  }'
+```
+
+OpenAI-compatible clients use `http://127.0.0.1:8080/v1` as the base URL.
+`GET /v1/models` lists the loaded model. Remove `"stream": true` for one complete
+JSON response. Stop the foreground server with Ctrl+C, or use `docker stop
+llaminar` from another terminal. Run one example at a time on the same devices.
+
+## Planning and topology
+
+### Inspect a plan, then apply it
+
+`plan` and `serve` share inference options. Plan using the context, KV policy,
+and MTP policy you intend to serve; do not size one configuration and silently
+deploy another.
+
+Using the Quickstart variables, save a plan without requiring a writable host
+directory inside the non-root container:
+
+```bash
+docker run "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
+  --name llaminar-plan "$LLAMINAR_IMAGE" plan \
+  -m "$LLAMINAR_MODEL" --context-length 8192 \
+  --output /tmp/llaminar-plan.json
+
+docker cp llaminar-plan:/tmp/llaminar-plan.json ./llaminar-plan.json
+docker rm llaminar-plan
+
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
+  -v "$PWD/llaminar-plan.json:/config/plan.json:ro" \
+  "$LLAMINAR_IMAGE" serve --config /config/plan.json
+```
+
+The planning container intentionally omits `--rm` so its output can be copied
+after exit. Inspect the summary and saved JSON before applying it. A saved
+plan fixes placement; applying it does not rerun automatic selection.
+
+Use constraints only when they express a real requirement:
+
+| Intent | Option |
+|---|---|
+| Only ROCm compute | `--only-backends rocm` |
+| Only TP or PP candidates | `--only-strategies tp,pp` |
+| Prefer a backend when candidates otherwise tie | `--prefer-backend rocm` |
+| Rank for an expected request length | `--plan-workload 512,384` |
+| Require compute on every discovered host | `--auto-hosts all` |
+
+`--plan-workload` is an optional costing horizon, not a prompt generator or
+output limit. Auto may choose fewer devices when that is predicted to be faster.
+Benchmark the result; a cost estimate is not a measured throughput guarantee.
+
+Do not add an `expert-overlay` strategy filter merely because the model is MoE:
+a homogeneous one-domain MoE candidate is currently labeled `tp` even though it
+executes through ExpertOverlay. That filter would exclude it. Do not combine
+auto-search filters with explicit placement or a saved apply plan.
+
+### Explicit placement when needed
+
+Use explicit topology for a required deployment shape or a controlled comparison,
+after measuring auto. These examples reuse the Quickstart Docker arguments.
+GPU IDs and model geometry must match your machine and GGUF.
+
+**Single device:** `--device rocm:0` or `cuda:0` selects one GPU; `cpu:0` selects
+one CPU NUMA endpoint. Bare `--device cpu` selects all local CPU NUMA endpoints.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m "$LLAMINAR_MODEL" --device rocm:0 --context-length 8192
+```
+
+**Dense tensor parallelism:** devices cooperate on each layer. The device list
+sets the degree; no separate degree flag or forced collective is needed.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m "$LLAMINAR_MODEL" --tp-scope rank_local \
+  --tp-devices rocm:0,rocm:1 --context-length 8192
+```
+
+For two NVIDIA cards, change the list to `cuda:0,cuda:1` and expose NVIDIA
+devices. One native GPU TP group uses one vendor, not a CUDA/ROCm mixture.
+
+**Dense pipeline parallelism:** successive layer ranges run on different
+domains. This example requires a dense model with **64 main transformer layers**;
+adapt the contiguous, inclusive ranges to your GGUF. MTP sidecar blocks are not
+extra pipeline layers.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m "$LLAMINAR_MODEL" --context-length 8192 \
+  --define-domain 'early=rocm:0;scope=rank_local' \
+  --define-domain 'late=rocm:1;scope=rank_local' \
+  --pp-stage '0=early:0-31' --pp-stage '1=late:32-63'
+```
+
+**MoE ExpertOverlay:** whole routed experts are apportioned across participants,
+rather than dividing the model into layer ranges. For an MoE GGUF, a GPU
+continuation tier and two CPU NUMA endpoints can be declared as:
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf --context-length 8192 \
+  --expert-tier 'accelerator=rocm:0,rocm:1;priority=0' \
+  --expert-tier 'capacity=cpu:0,cpu:1;priority=10'
+```
+
+Tier names are labels; smaller integer priorities are preferred. The lowest
+priority number selects the default continuation domain, which owns the main
+inference/sampling path. The greatest priority number is the derived
+final-coverage tier; there is no `fallback=true` switch. A single GPU tier is
+valid too; a CPU tier is not mandatory.
+
+Capacity is automatic. Avoid hard-coded expert counts; optional
+`;memory-mb=N` and `;max-experts-per-layer=N` restrict a tier when needed.
+Inside tier declarations use explicit addresses such as `cpu:0,cpu:1`, not
+bare `cpu`. Use the IDs actually present on the host.
+
+Dynamic residency maintenance is on by default. It considers both promotion
+between tiers and skew reduction within a tier, subject to migration economics.
+`--moe-residency-maintenance off` disables maintenance for a static control;
+`observe` collects demand without moving experts. Initial ownership
+(`--moe-routed-expert-owner-order ordinal|random`) is a separate choice.
+`--moe-hot-expert-cache` controls optional extra replicas and defaults to `off`;
+it is not the capacity of the tier's uniquely owned experts.
+
+For migration windows, transfer slots, concurrency, and advanced domain
+overrides, consult `serve --help` and the
+[configuration guide](AGENTS.md#run-and-inspect-configuration).
+Use `serve --dry-run --explain-placement` to inspect an authored topology.
+`--validate-only` checks syntax/configuration, not model fit or successful
+inference.
+
+### Remote CPU experts with an MPI hostfile
+
+The same auto planner can use remote CPU machines for an MoE model. Provision
+the same source revision of Llaminar and the GGUF at the same path on every
+host. Runtime images may use different CPU ISAs for different hosts, but must
+be revision-compatible. Arrange passwordless MPI/SSH launch and private network
+connectivity first.
+
+For example, `/cluster/hosts` may contain one GPU host and two CPU hosts:
+
+```text
+10.10.0.10 slots=1
+10.10.0.21 slots=1
+10.10.0.22 slots=1
+```
+
+Run the public frontend on the GPU controller, inside the prepared MPI runtime
+environment:
+
+```bash
+llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --mpi-hostfile /cluster/hosts --auto-hosts all \
+  --only-backends rocm,cpu --only-strategies expert-overlay \
+  --context-length 32768 --mtp --mtp-depth-policy dynamic \
+  --output /cluster/remote-experts.json
+
+llaminar2 serve --config /cluster/remote-experts.json
+```
+
+Here the explicit strategy constraint requests a cross-host expert topology,
+and `--auto-hosts all` requires participation on every machine. Inspect the
+selected continuation, tier capacities, and remote participants. For direct
+automatic serving, replace `plan` with `serve` and omit `--output`.
+
+A hostfile does **not** provision machines, distribute weights/images, or turn
+node-local shared memory into a network transport. In Docker deployments,
+remote MPI daemons must run inside their matching runtime containers, not
+beside them on the host. The
+[Azure cross-host workflow](docs/production-ci.md#azure-resources-for-cross-host-e2e)
+automates image/model staging, plan/apply and direct-serve checks, evidence of
+remote CPU expert work, and VM lifecycle management.
+
+## Benchmarks
+
+Use the `benchmark` subcommand to measure prefill and generation through the
+production runtime. Use a published runtime image or a **Release** source
+build, and stop other inference jobs on the same devices before measuring.
+
+### Run a benchmark and save the result
+
+This uses the Quickstart variables, automatic placement, the built-in text
+prompt, and a 256-token generation budget. It prints a timing table and exports
+JSON; the temporary container is retained just long enough to copy the result.
+
+```bash
+docker run "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
+  --name llaminar-benchmark "$LLAMINAR_IMAGE" benchmark \
+  -m "$LLAMINAR_MODEL" --context-length 8192 \
+  --n-predict 256 --temperature 0 --seed 42 \
+  --benchmark-json-output /tmp/benchmark.json
+
+docker cp llaminar-benchmark:/tmp/benchmark.json ./benchmark.json
+docker rm llaminar-benchmark
+```
+
+To benchmark your own prompt, use either `--prompt "your text"` or
+`--prompt-file /models/benchmark-prompt.txt` (a readable text file under
+`MODEL_DIR`). The file is consumed as raw text, not an HTTP chat template.
+Prompt tokens plus the requested output must fit the context.
+
+For a source build, the equivalent command is:
+
+```bash
+./build_v2_release/llaminar2 benchmark \
+  -m models/model.gguf --context-length 8192 \
+  --n-predict 256 --temperature 0 --seed 42 \
+  --benchmark-json-output /tmp/benchmark.json
+```
+
+Both examples leave MTP off. For an MTP-capable model, add
+`--mtp --mtp-depth-policy dynamic` and save a separate result. To compare runtime
+changes on **identical placement**, benchmark a saved plan with `--config` in
+place of `-m` and placement flags, using the plan mount shown above. Include
+MTP in the plan if it is part of the intended workload.
+
+### Read the numbers
+
+- **Prefill tok/s** measures processing the prompt. Use the actual reported
+  token count; neither a context limit nor a byte count is a prefill length.
+- **Decode tok/s** measures generated output. JSON also reports
+  `throughput_tokens_per_sec.decode_after_prefill`, excluding the token produced
+  by terminal prefill; match this denominator when comparing other engines.
+- **Warmup and samples:** the default is one warmup followed by three measured
+  iterations. Model loading, readiness preparation, and warmup are outside the
+  reported steady-state throughput.
+- **Prefix cache:** each iteration clears request state and purges reusable
+  prefixes before timing full prefill. These are full-prompt measurements, not
+  cached-prefix speed claims.
+- **Evidence:** JSON includes individual iterations, actual token counts,
+  generated token IDs, the resolved configuration, and MTP/cache observations.
+  Check `success` and the workload before comparing headline rates.
+
+For a longer sample set, pass `-e LLAMINAR_BENCHMARK_ITERATIONS=5` before the
+Docker image name; `LLAMINAR_BENCHMARK_WARMUP_ITERATIONS` controls warmup count.
+With a local binary, supply these as ordinary environment variables.
+
+Keep the GGUF, prompt bytes, output length, context, sampling, KV policy, MTP
+policy, image revision, and device placement fixed for an A/B. Measure the
+defaults first and label any tuning separately. Use `--temperature 0 --seed 42`
+for a greedy baseline, not `--deterministic`: that diagnostic flag also changes
+kernel dispatch. Leave profiling/debug overrides off for timing runs.
+
+### Published benchmark results
+
+<!-- published-benchmarks:begin -->
+
+Published-image results will appear here after the manual HTTP E2E and
+benchmark workflows complete for both AVX512 and AVX2. No unmeasured rates are
+shown. See [manual image testing](docs/production-ci.md#manual-published-image-workflows)
+to run them.
+
+<!-- published-benchmarks:end -->
+
+Ad hoc benchmarking does not certify an image. The
+[production CI pipeline](docs/production-ci.md) benchmarks only E2E-tagged
+canonical cells, after both ISA images finish their full E2E suites. Official
+runs maintain [high-water marks](benchmarks/production/high_water.json) and
+compact results under `benchmarks/production/results/`. AVX2 and AVX512 evidence
+is separate. The ordinary develop image gate runs Unit/preflight only.
+
+See the [testing workflow](.agents/llaminar-testing/SKILL.md) for certification
+and the [llama.cpp comparison workflow](.agents/llama-cpp-comparison/SKILL.md)
+for matched cross-engine workloads and profiling.
+
+## HTTP diagnostics
+
+Non-streaming `/v1/chat/completions` requests may include
+`"return_token_ids": true` to receive the actual templated prompt IDs and committed
+completion IDs, including framing/stop tokens. Counts agree with `usage` even
+when displayed text omits those tokens.
+
+`"return_runtime_summary": true` independently adds the completed request's
+prefix-cache and MTP observations. Both options are rejected for streaming
+requests; ordinary responses omit these diagnostic payloads. The summary is
+available without enabling profiling or INFO logging.
+
+Within `prefix_cache`, `hit` and `partial_hit` are mutually exclusive.
+Optional `expert_movement` records are cumulative over `model_lifetime`, not
+per-request deltas: do not sum successive responses. Movement axis and physical
+transfer direction are distinct; unknown ranks are `null` and estimated weight
+bytes are labeled as estimates. Export reads the existing immutable journal
+without driving maintenance.
+
+## Development
+
+### Build from source
+
+The recommended development environment is the repository's
+[devcontainer](.devcontainer/README.md). It supplies the toolchains and the
+patched NCCL/RCCL dependencies required for capture. Open it in VS Code and run
+the Build Release or Build Integration task, or follow the
+[terminal/SSH workflow](.devcontainer/SSH_CODEX.md).
+
+For a Release build inside that environment:
+
+```bash
+LLAMINAR_NINJA_BIN="$(command -v ninja)"
+cmake -B build_v2_release -S src/v2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
+cmake --build build_v2_release --parallel
+```
+
+Use a separate `build_v2_integration` tree with `CMAKE_BUILD_TYPE=Integration`
+for instrumented tests. Configure and build with the devcontainer's same Ninja
+executable; alternating versions can cause needless full rebuilds. See
+[AGENTS.md](AGENTS.md#build) for native-build dependency requirements and gates.
+
+To build a local full-backend runtime image instead of pulling GHCR:
+
+```bash
+scripts/docker/build-runtime-image.sh --cpu-isa AVX512 --tag llaminar:local
+```
+
+Use `--cpu-isa AVX2` for an AVX2 image. A local image is not CI-certified merely
+because it built successfully.
+
+### Optional corpora
+
+Ordinary checkouts, builds, Docker images, and Unit/preflight tests do not
+require downloading large corpora. Published data lives in
+[Llaminar/corpora](https://github.com/Llaminar/corpora), pinned by the optional
+`corpora/` submodule. Fetch only what your task needs:
 
 ```bash
 GIT_LFS_SKIP_SMUDGE=1 git submodule update --init -- corpora
 git -C corpora lfs pull --include 'native_vnni_dispatch/cpu/**' --exclude ''
 ```
 
-Narrow the include pattern to the generation you need. Publish new corpus
-families and their LFS objects in that repository, then update this repository's
-submodule pointer. See `corpora/README.md` after initialization for publication
-details. Corpus data is excluded from Docker build contexts.
-
-### Building Llaminar
-
-Llaminar uses a predefined devcontainer and the recommended development environment is vscode on a Linux machine with AVX512-VNNI or AVX2, and access to gfx906 / sm86 hardware.
-
-Open vscode in the devcontainer, and run the Build Integration / Build Release vscode tasks with `CTRL + Shift + P`.
-
-For terminal-only development over SSH, use `llaminar` to enter the same
-devcontainer with Codex CLI, `llaminar shell` for a persistent shell, or
-`llaminar rebuild` to recreate the environment without VS Code. See [the SSH
-and Codex workflow](.devcontainer/SSH_CODEX.md) for setup and recovery details.
-
-The image pins one Ninja release for both the system and workspace tools.
-Resolve the devcontainer's active executable while configuring and always
-build through CMake, so an existing tree keeps using that same tool. Mixing
-Ninja executables can make their command-log hashes differ and cause a
-needless full rebuild.
-
-The image also builds the patched NCCL capture dependency through
-`scripts/docker/install-nccl.sh`. Native CUDA builds outside the devcontainer
-must install that dependency first; an unpatched system NCCL does not support
-the retained-parent capture lifecycle.
-
-```bash
-LLAMINAR_NINJA_BIN="$(command -v ninja)"
-cmake -B build_v2_integration -S src/v2 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Integration \
-  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
-cmake --build build_v2_integration --parallel
-```
-
-### Running Llaminar
-
-The runtime image contains CPU, CUDA, and ROCm support. Select it for the
-**host CPU ISA**, not for the accelerator: use the unsuffixed tag on an
-AVX-512 host and `-avx2` on an AVX2 host. The recipes below use the current
-`develop` pair published by CI.
-
-```bash
-export MODEL_DIR=/opt/llaminar-models
-export QWEN38=/models/Qwen3.8-27B-IQ4_XS.gguf
-export QWEN36_MOE=/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
-# These are the two mutable develop tags published by the develop CI gate.
-# They have passed Unit + ProductionParityPreflight, but are not release
-# certificates. Every remaining Docker recipe uses this same tag pair.
-export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
-export LLAMINAR_AVX512="${LLAMINAR_IMAGE_REPOSITORY}:develop"
-export LLAMINAR_AVX2="${LLAMINAR_IMAGE_REPOSITORY}:develop-avx2"
-
-# Choose exactly one for this host, then pull it.
-export LLAMINAR_IMAGE="$LLAMINAR_AVX512" # AVX-512 host
-# export LLAMINAR_IMAGE="$LLAMINAR_AVX2" # AVX2 host
-docker pull "$LLAMINAR_IMAGE"
-
-COMMON_RUN=(
-  --rm --network host --ipc=host
-  --security-opt seccomp=unconfined
-  --cap-add SYS_NICE --cap-add SYS_PTRACE
-  -v "$MODEL_DIR:/models:ro"
-)
-```
-
-The image runs as a non-root user. ROCm needs KFD/DRI device access and the
-actual host GIDs; this discovers every local render node without assuming a
-particular card or render-device number:
-
-```bash
-ROCM_DEVICE_ARGS=(--device=/dev/kfd --device=/dev/dri)
-for node in /dev/kfd /dev/dri/card* /dev/dri/renderD*; do
-  [[ -e "$node" ]] && ROCM_DEVICE_ARGS+=(--group-add "$(stat -c '%g' "$node")")
-done
-```
-
-#### Serve Qwen 3.8 locally
-
-Production model activations are currently FP32. The examples use FP16 KV,
-tiered prefix caching, and dynamic-depth MTP. With host networking, the server
-listens directly on the selected port; do not add `-p`.
-
-**One ROCm card (32K context):**
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
-  --name qwen38-rocm "$LLAMINAR_IMAGE" serve \
-  -m "$QWEN38" -d rocm:0 \
-  --context-length 32768 \
-  --activation-precision fp32 --kv-cache-precision fp16 \
-  --prefix-cache --prefix-cache-storage tiered \
-  --mtp --mtp-depth-policy dynamic \
-  --host 0.0.0.0 --port 8080
-```
-
-**One CUDA card (8K context on a 24 GiB RTX 3090):**
-
-```bash
-docker run "${COMMON_RUN[@]}" --gpus all \
-  --name qwen38-cuda "$LLAMINAR_IMAGE" serve \
-  -m "$QWEN38" -d cuda:0 \
-  --context-length 8192 \
-  --activation-precision fp32 --kv-cache-precision fp16 \
-  --prefix-cache --prefix-cache-storage tiered \
-  --mtp --mtp-depth-policy dynamic \
-  --host 0.0.0.0 --port 8080
-```
-
-**Two cards with homogeneous TP:** use one vendor per tensor-parallel
-communicator. Do not combine CUDA and ROCm in a dense TP group.
-
-```bash
-# 2 x ROCm
-docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
-  --name qwen38-rocm-tp2 "$LLAMINAR_IMAGE" serve \
-  -m "$QWEN38" --tp 2 --tp-scope rank_local \
-  --tp-devices rocm:0,rocm:1 --backend rccl \
-  --context-length 32768 \
-  --activation-precision fp32 --kv-cache-precision fp16 \
-  --prefix-cache --prefix-cache-storage tiered \
-  --mtp --mtp-depth-policy dynamic --host 0.0.0.0 --port 8080
-
-# 2 x CUDA
-docker run "${COMMON_RUN[@]}" --gpus all \
-  --name qwen38-cuda-tp2 "$LLAMINAR_IMAGE" serve \
-  -m "$QWEN38" --tp 2 --tp-scope rank_local \
-  --tp-devices cuda:0,cuda:1 --backend nccl \
-  --context-length 32768 \
-  --activation-precision fp32 --kv-cache-precision fp16 \
-  --prefix-cache --prefix-cache-storage tiered \
-  --mtp --mtp-depth-policy dynamic --host 0.0.0.0 --port 8080
-```
-
-#### Plan once, then apply exactly
-
-`plan` and `serve` accept the same inference configuration. Automatic planning
-is the default when no explicit placement is supplied, so `--auto` is optional.
-Use `--only-backends` and `--only-strategies` for hard constraints;
-`--plan-workload` is a ranking horizon, not a request-output limit. A saved
-plan is a lossless, apply-only document: `serve --config` does not rerun the
-search or reinterpret its constraints.
-
-```bash
-mkdir -p plans
-
-docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
-  -v "$PWD/plans:/plans" "$LLAMINAR_IMAGE" plan \
-  -m "$QWEN38" --only-backends rocm --only-strategies single,tp \
-  --context-length 32768 --plan-workload 512,384 \
-  --mtp --mtp-depth-policy dynamic --kv-cache-precision fp16 \
-  --output /plans/qwen38-rocm.json
-
-docker run "${COMMON_RUN[@]}" "${ROCM_DEVICE_ARGS[@]}" \
-  -v "$PWD/plans:/plans:ro" "$LLAMINAR_IMAGE" serve \
-  --config /plans/qwen38-rocm.json --host 0.0.0.0 --port 8080
-```
-
-#### Remote CPU ExpertOverlay with an MPI hostfile
-
-The cross-host topology uses one local GPU continuation rank and one CPU rank
-per remote machine. Every runtime image must carry the same immutable source
-tree and release revision, but its CPU ISA is selected for the physical host:
-an AVX512 GPU-controller image may deliberately pair with AVX2 CPU-peer
-images. Each peer is feature-admitted before MPI starts, so an unsupported ISA
-fails with a precise diagnostic instead of becoming a remote `SIGILL`. All
-ranks use the same GGUF path and communicate over private, routable addresses.
-The hostfile names physical MPI endpoints; it does not copy an image or GGUF,
-and it does not turn a node-local transport into a cross-host transport. A
-Docker deployment must therefore launch every MPI daemon *inside* its matching
-runtime image; launching host-MPI processes beside containers is not a
-supported topology.
-
-```text
-# cluster/hosts: GPU controller first, then one CPU-only host per line.
-10.10.0.10 slots=1
-10.10.0.21 slots=1
-10.10.0.22 slots=1
-```
-
-After the cluster launcher has started the source-coherent, host-compatible
-runtime image on each machine, run the public frontend on the GPU controller.
-This is the exact default-auto policy exercised by the Azure E2E: it requires
-every host, permits only ROCm/CPU compute, and selects ExpertOverlay rather
-than manually hard-coding expert owners. It gives the planner the topology
-intent, while the physical-memory authority decides how many experts each
-admitted tier can hold.
-
-```bash
-llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
-  --mpi-hostfile /cluster/hosts \
-  --only-backends rocm,cpu --only-strategies expert-overlay \
-  --auto-hosts all --context-length 32768 --plan-workload 512,384 \
-  --activation-precision fp32 --kv-cache-precision fp16 \
-  --prefix-cache --prefix-cache-storage tiered \
-  --mtp --mtp-depth-policy dynamic \
-  --output /cluster/qwen36-rocm-remote-cpu.json
-
-llaminar2 serve --config /cluster/qwen36-rocm-remote-cpu.json
-```
-
-For the managed Azure route, do not hand-roll remote Docker/MPI processes. The
-certification runner provisions owned CPU peers, stages the immutable image and
-the declared GGUF shards, builds the exact hostfile, runs both `plan`/apply and
-direct auto-serve, proves remote CPU expert work in prefill and decode, then
-retires the lease. A local AVX-512 controller may use the AVX2 sibling on
-Azure CPU peers; the runner verifies matching source-tree labels and the
-peer's real CPU ISA before staging either image or model bytes:
-
-```bash
-python3 scripts/ci/run_production_cross_host_e2e.py \
-  --manifest build_v2_integration/production-ci/avx2/cross-host-manifest.json \
-  --source-revision "$(git rev-parse HEAD)" \
-  --container-image "${LLAMINAR_IMAGE_REPOSITORY}:develop" \
-  --remote-cpu-image "${LLAMINAR_IMAGE_REPOSITORY}:develop-avx2" \
-  --models /opt/llaminar-models \
-  --model-ramdisk-root /mnt/llaminar-production-parity \
-  --report parity-results/cross-host-e2e.json \
-  --azure-subscription "$AZURE_SUBSCRIPTION" \
-  --azure-ssh-source "$AZURE_SSH_SOURCE" \
-  --azure-ssh-public-key "$AZURE_SSH_PUBLIC_KEY" \
-  --ssh-private-key "$HOME/.ssh/id_ed25519"
-```
-
-See [production CI](docs/production-ci.md#azure-resources-for-cross-host-e2e)
-for credential, networking, lease-retirement, and retained-debugging policy.
-
-#### Compact expert-tier topology
-
-Use compact `--expert-tier` declarations when you want an authored topology.
-Tier names are labels; integer priority is the policy, and smaller is preferred.
-Scope, collective, rank ownership, capacity, and safety margin resolve from the
-inventory and `PhysicalMemoryAuthority`. Do not hard-code an expert count just
-to fill a device. The lowest numeric priority is the continuation tier by
-default, so there is no separate `fallback=true` switch.
-
-```bash
-llaminar2 serve -m model.gguf \
-  --expert-tier 'accelerator=cuda:0,cuda:1;priority=0' \
-  --expert-tier 'capacity=cpu;priority=10' \
-  --moe-residency-maintenance dynamic \
-  --mtp --mtp-depth-policy dynamic
-```
-
-#### Send a request
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [{"role":"user","content":"Explain ROCm graph capture in two sentences."}],
-    "max_tokens": 128,
-    "temperature": 0.0,
-    "enable_thinking": false
-  }'
-```
-
-#### Exact completion token IDs
-
-Non-streaming `/v1/chat/completions` requests may set `"return_token_ids": true`.
-The response then includes `token_ids.prompt` (the actual templated input) and
-`token_ids.completion` (ordered committed output, including stop tokens and any
-forced thinking continuation). Counts agree with `usage`; displayed text may
-omit tokens used for framing or termination. This option does not change
-sampling, MTP, graph execution, or prefix-cache behavior, and performs no extra
-model-state download. Streaming requests with this option return HTTP 400.
-Without it, the response format and token-storage cost are unchanged.
-
-The independent `"return_runtime_summary": true` option includes a versioned
-`runtime_summary` with the completed request's prefix-cache outcome and MTP
-statistics. This is the runner's existing terminal observation, not a live-state
-probe or a reconstruction from PerfStats. It remains available when profiling
-and INFO logging are disabled. Streaming requests with this option return HTTP
-400; ordinary responses omit it.
-Within `prefix_cache`, `hit` denotes a full hit and `partial_hit` denotes a
-partial restore; these flags are mutually exclusive, not an aggregate hit flag.
-The optional `expert_movement` member contains the placement owner's completed
-edge, economy and host-admission records. Its explicit `model_lifetime` scope
-is cumulative: successive responses overlap and must not be summed as separate
-request totals. Logical `movement_axis` and physical `direction` are independent;
-unknown MPI ranks are `null`, and estimated weight bytes remain labeled as
-estimates. This export reads the existing immutable ledger once before request
-cleanup, without advancing or waiting for maintenance. Ordinary responses and
-INFO logging do not copy this journal. Truncated or malformed owner evidence
-fails the requested export rather than being presented as zero movement.
+Narrow the include pattern to the desired generation. Publish corpus payloads
+in that repository, then update the source gitlink; do not add them to the
+source tree or Docker build context.
 
 ## Llaminar Architecture
 
@@ -451,533 +599,24 @@ Without the option, an explicit environment bucket list remains authoritative.
 ExpertOverlay's separate `--moe-overlay-prefill-segment-rows` limit may further
 bound its chunk size; raise both limits to request larger overlay segments.
 
-For inference, Llaminar optimizes the hot decode path with CUDA and HIP graph
-capture where the backend and stage sequence support it. Prefill and decode
-build normal `ComputeGraph` objects first. Stable GPU segments can then be
-warmed, captured, cached, and replayed so later tokens avoid repeated kernel
-launch overhead. Dynamic state such as token positions, KV-cache counters,
-router decisions, logits buffers, and MTP verifier state is explicitly staged
-for capture-safe replay rather than being read from stale host pointers.
+Production GPU inference uses retained captured graphs, including compatible
+NCCL/RCCL collectives. Request reset publishes new execution state without
+rebuilding the topology. Token positions, KV-cache counters, routing, sampling,
+and MTP verification remain device-owned during execution.
 
-Collectives are handled carefully around graph capture. NCCL and RCCL
-collectives may run through segmented graph execution when the policy allows
-it; otherwise the executor leaves non-capturable stages outside the captured
-segments and runs them manually in order. Unsupported capture configurations
-fall back to the normal fast-decode path with diagnostics instead of producing
-silently incorrect replay.
+Homogeneous GPU execution uses complete captured generation transactions.
+CUDA can express conditional MTP execution within its parent graph. HIP uses
+retained transaction graphs selected by a small immutable scheduler ticket:
+the device chooses the next transaction, and the host submits it without
+becoming an authority for model or sampling state.
+
+Segmentation is reserved for declared heterogeneous device/collective
+boundaries that cannot share one native graph. An unsupported capture
+configuration is an error, not a reason to silently switch to eager inference.
 
 The result is one execution model that scales down to a single CPU socket and
 up to heterogeneous multi-GPU, multi-socket, and multi-rank deployments while
 keeping placement, collectives, and graph replay explicit.
-
-## Running Llaminar
-
-### Ubuntu 24.04 Mixed-GPU Host
-
-The release container is built for machines that may use NVIDIA CUDA and AMD
-ROCm in the same process. It ships the Llaminar binary plus CUDA 13.0
-user-space libraries, NCCL for CUDA 13.0, and ROCm 7.2.4 user-space libraries.
-It does not ship kernel drivers.
-
-On the host you need:
-
-- An x86_64 CPU with AVX512-VNNI or AVX2. Use runtime image tags that match
-  the CPU ISA on the host.
-- Ubuntu 24.04 on x86_64.
-- Docker Engine with the Buildx plugin.
-- NVIDIA Linux driver `580.95.05` or newer for CUDA 13.0 Update 2.
-- NVIDIA Container Toolkit configured for Docker.
-- AMDGPU DKMS kernel driver from the ROCm 7.2.4 stack.
-
-OpenMPI and libnuma are hard Llaminar dependencies. The Docker images include
-them; source builds should install `openmpi-bin`, `libopenmpi-dev`, and
-`libnuma-dev`.
-
-You do not need to install the full CUDA Toolkit or the full ROCm user-space
-stack on the host. Those user-space libraries are in the image. The full image
-also runs on CPU-only cluster members without GPU drivers. Exposing CUDA needs
-NVIDIA Container Toolkit; exposing ROCm needs the AMDGPU kernel driver and
-`/dev/kfd` plus `/dev/dri`. Supply both ecosystems only when that host will use
-both GPU backends. CUDA driver binding is deferred until CUDA preparation, not
-required merely to load a combined CPU/CUDA/ROCm executable.
-
-1. Install Docker Engine:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
-  docker-buildx-plugin docker-compose-plugin
-sudo systemctl enable --now docker
-sudo usermod -aG docker "$USER"
-```
-
-Log out and back in after adding your user to the `docker` group, or keep using
-`sudo docker` until the group membership is active.
-
-2. Install an NVIDIA driver new enough for CUDA 13.0:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl
-curl -fsSL -o /tmp/cuda-keyring.deb \
-  https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i /tmp/cuda-keyring.deb
-sudo apt-get update
-sudo apt-get install -y cuda-drivers
-sudo reboot
-```
-
-After reboot, confirm the installed driver is `580.95.05` or newer:
-
-```bash
-nvidia-smi
-```
-
-3. Install and configure NVIDIA Container Toolkit for Docker:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-Verify Docker can inject the NVIDIA driver libraries:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi
-```
-
-4. Install the AMDGPU DKMS driver for ROCm containers:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)"
-curl -fsSL -o /tmp/amdgpu-install.deb \
-  https://repo.radeon.com/amdgpu-install/7.2.4/ubuntu/noble/amdgpu-install_7.2.4.70204-1_all.deb
-sudo apt-get install -y /tmp/amdgpu-install.deb
-sudo amdgpu-install --usecase=dkms -y
-sudo usermod -aG render,video "$USER"
-sudo reboot
-```
-
-After reboot, confirm the AMD device nodes exist:
-
-```bash
-ls -l /dev/kfd /dev/dri/render*
-```
-
-5. Pull the CI-published develop runtime image for this host's ISA:
-
-```bash
-export LLAMINAR_CPU_ISA=AVX512  # or AVX2
-case "$LLAMINAR_CPU_ISA" in
-  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
-  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
-  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
-esac
-
-# Develop CI publishes this exact AVX512/AVX2 tag pair.  Keep every recipe on
-# the pair rather than substituting a local build tag.
-export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
-export LLAMINAR_IMAGE_TAG=develop
-export LLAMINAR_FULL_IMAGE="${LLAMINAR_IMAGE_REPOSITORY}:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
-
-docker pull "$LLAMINAR_FULL_IMAGE"
-```
-
-Docker also pulls the image automatically on first `docker run`. Develop CI
-publishes full CPU/CUDA/ROCm images for both ISAs; the example backend variables
-name that same artifact. Backend selection remains a runtime CLI choice.
-Unsuffixed `develop` is AVX512 and `develop-avx2` is its AVX2 sibling. Local
-backend-subset builds below are separate local artifacts.
-
-To build images locally instead of pulling GHCR, use the release image build
-script:
-
-```bash
-scripts/docker/build-runtime-image.sh --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:local --cuda-archs "80;86;89;90"
-```
-
-Use the semicolon-separated CUDA architecture list for the NVIDIA GPUs in your
-local build. Common values are `80` for A100, `86` for RTX 30/A10, `89` for RTX
-40/L4/L40, and `90` for H100/H200. `--cpu-isa AVX512` is the default; pass
-`--cpu-isa AVX2` for an AVX2-compatible local image.
-
-Backend-specific local builds are also available:
-
-```bash
-scripts/docker/build-runtime-image.sh --variant cpu  --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:cpu
-scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:cuda --cuda-archs "80;86;89;90"
-scripts/docker/build-runtime-image.sh --variant rocm --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:rocm
-```
-
-6. Verify the Llaminar image can use both GPU ecosystems:
-
-```bash
-export AMD_KFD_GID="$(stat -c '%g' /dev/kfd)"
-export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' | head -n1)")"
-
-docker run --rm --gpus all \
-  --security-opt seccomp=unconfined \
-  --cap-add SYS_NICE \
-  --cap-add SYS_PTRACE \
-  "$LLAMINAR_FULL_IMAGE" --help
-
-docker run --rm \
-  --gpus all \
-  --device /dev/kfd \
-  --device /dev/dri \
-  --group-add "$AMD_KFD_GID" \
-  --group-add "$AMD_RENDER_GID" \
-  --security-opt seccomp=unconfined \
-  --cap-add SYS_NICE \
-  --cap-add SYS_PTRACE \
-  --entrypoint rocminfo \
-  "$LLAMINAR_FULL_IMAGE"
-```
-
-Llaminar does not require `--privileged` for normal container runs. It does
-require a few targeted Docker permissions:
-
-- `--shm-size=16g` gives OpenMPI, NCCL, and RCCL enough `/dev/shm` for
-  tensor-parallel collectives. Avoid `--ipc=host` unless the host `/dev/shm`
-  is known to be large enough; Docker's `--shm-size` does not resize host IPC.
-- `--security-opt seccomp=unconfined` allows Linux NUMA policy syscalls
-  (`mbind`, `set_mempolicy`, `get_mempolicy`, and `move_pages`) so CPU
-  execution can bind and verify model pages on the intended NUMA node.
-- `--cap-add SYS_NICE` allows the MPI/NUMA runtime to apply placement and
-  scheduling policy without Docker capability denials.
-- `--cap-add SYS_PTRACE` is required on common ROCm Docker hosts for AMD GPU
-  runtime/debug interfaces used through `/dev/kfd`.
-
-When CPU model-page NUMA binding is requested, Llaminar fails model loading by
-default if binding cannot be applied. Set `LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1`
-only when you explicitly accept degraded CPU NUMA placement.
-
-### Running Llaminar
-
-The image entrypoint is `llaminar2`, so the command after the image name is
-`benchmark`, `serve`, or another Llaminar subcommand. The examples below use the
-same model paths and Docker runtime settings as the release-container E2E
-harness:
-
-- Docker bridge networking with explicit port publishing for `serve`.
-- Private `/dev/shm` sized to `16g` for OpenMPI, NCCL, and RCCL.
-- `seccomp=unconfined` for strict NUMA binding and verification.
-- `SYS_NICE` for MPI/NUMA placement and `SYS_PTRACE` for ROCm hosts.
-- Root inside the container, matching the release E2E runs.
-
-Set `MODEL_DIR` to the host directory containing the GGUF files. The E2E runner
-uses `/opt/llaminar-models`, and the examples keep that same path inside the
-container:
-
-```bash
-export MODEL_DIR=/opt/llaminar-models
-
-export MODEL_SMALL="$MODEL_DIR/qwen2.5-1.5b-instruct-q8_0.gguf"
-export MODEL_CPU_DENSE="$MODEL_DIR/Qwen3.8-27B-IQ4_XS.gguf"
-export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
-export MODEL_TP_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
-```
-
-Use the CI-published develop tag for this host's ISA:
-
-```bash
-export LLAMINAR_CPU_ISA=AVX512  # or AVX2
-case "$LLAMINAR_CPU_ISA" in
-  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
-  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
-  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
-esac
-
-# Develop CI publishes this exact AVX512/AVX2 tag pair.  Keep every recipe on
-# the pair rather than substituting a local build tag.
-export LLAMINAR_IMAGE_REPOSITORY=ghcr.io/llaminar/llaminar
-export LLAMINAR_IMAGE_TAG=develop
-export LLAMINAR_FULL_IMAGE="${LLAMINAR_IMAGE_REPOSITORY}:${LLAMINAR_IMAGE_TAG}${LLAMINAR_IMAGE_TAG_SUFFIX}"
-export LLAMINAR_CPU_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_CUDA_IMAGE="$LLAMINAR_FULL_IMAGE"
-export LLAMINAR_ROCM_IMAGE="$LLAMINAR_FULL_IMAGE"
-```
-
-For local builds, override these variables with tags such as `llaminar:cpu`,
-`llaminar:cuda`, `llaminar:rocm`, or `llaminar:local`.
-
-For compact copy/paste examples, define the common Docker arguments once:
-
-```bash
-COMMON_RUN=(
-  --rm -it
-  --network bridge
-  --ulimit core=-1
-  --user 0:0
-  --security-opt seccomp=unconfined
-  --cap-add SYS_NICE
-  --cap-add SYS_PTRACE
-  --shm-size=16g
-  -v "$MODEL_DIR:$MODEL_DIR:ro"
-)
-
-CUDA_RUN=(--gpus all)
-```
-
-#### CPU-only image
-
-Single CPU socket, using `cpu:0`:
-
-```bash
-docker run "${COMMON_RUN[@]}" \
-  "$LLAMINAR_CPU_IMAGE" \
-  benchmark -d cpu:0 -m "$MODEL_CPU_DENSE"
-
-docker run "${COMMON_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CPU_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 -d cpu:0 -m "$MODEL_SMALL"
-```
-
-All CPU sockets, using `-d cpu` for node-local tensor parallel CPU execution:
-
-```bash
-docker run "${COMMON_RUN[@]}" \
-  "$LLAMINAR_CPU_IMAGE" \
-  benchmark -d cpu -m "$MODEL_CPU_DENSE"
-
-docker run "${COMMON_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CPU_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 -d cpu -m "$MODEL_SMALL"
-```
-
-#### CUDA image
-
-Single CUDA device:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" \
-  "$LLAMINAR_CUDA_IMAGE" \
-  benchmark -d cuda:0 -m "$MODEL_SMALL"
-
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CUDA_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 -d cuda:0 -m "$MODEL_SMALL"
-```
-
-Pipeline parallel across two CUDA devices. This uses the same 64-layer
-`Qwen3.5-27B-Q4_K_M.gguf` split that is tested in the CUDA+ROCm pipeline E2E
-case, with both stages placed on CUDA devices:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" \
-  "$LLAMINAR_CUDA_IMAGE" \
-  benchmark \
-  --define-domain cuda_pp0=cuda:0 \
-  --define-domain cuda_pp1=cuda:1 \
-  --pp-stage 0=cuda_pp0:0-31 \
-  --pp-stage 1=cuda_pp1:32-63 \
-  -m "$MODEL_PP_DENSE"
-
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CUDA_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --define-domain cuda_pp0=cuda:0 \
-  --define-domain cuda_pp1=cuda:1 \
-  --pp-stage 0=cuda_pp0:0-31 \
-  --pp-stage 1=cuda_pp1:32-63 \
-  -m "$MODEL_PP_DENSE"
-```
-
-Tensor parallel across two CUDA devices. The two entries in `--tp-devices`
-select TP=2. This model and TP2 CUDA shape are in the release E2E matrix:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" \
-  "$LLAMINAR_CUDA_IMAGE" \
-  benchmark --tp-devices cuda:0,cuda:1 -m "$MODEL_TP_MOE"
-
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CUDA_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --tp-devices cuda:0,cuda:1 \
-  -m "$MODEL_TP_MOE"
-```
-
-Tensor parallel across four CUDA devices. The four entries in `--tp-devices`
-select TP=4, using the same tested MoE model and TP command shape extended to
-four CUDA devices:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" \
-  "$LLAMINAR_CUDA_IMAGE" \
-  benchmark --tp-devices cuda:0,cuda:1,cuda:2,cuda:3 -m "$MODEL_TP_MOE"
-
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_CUDA_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --tp-devices cuda:0,cuda:1,cuda:2,cuda:3 \
-  -m "$MODEL_TP_MOE"
-```
-
-#### ROCm image
-
-Define the ROCm device arguments on hosts with AMD GPUs:
-
-```bash
-export AMD_KFD_GID="$(stat -c '%g' /dev/kfd)"
-export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' | head -n1)")"
-ROCM_RUN=(
-  --device /dev/kfd
-  --device /dev/dri
-  --group-add "$AMD_KFD_GID"
-  --group-add "$AMD_RENDER_GID"
-)
-```
-
-Single ROCm device. The ROCm E2E run also sets `NCCL_DEBUG=INFO` and
-`RCCL_LOG_LEVEL=INFO`; they are included here for the same diagnostics:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  benchmark -d rocm:0 -m "$MODEL_SMALL"
-
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 -d rocm:0 -m "$MODEL_SMALL"
-```
-
-Pipeline parallel across two ROCm devices. This uses the same 64-layer
-`Qwen3.5-27B-Q4_K_M.gguf` split that is tested in the CUDA+ROCm pipeline E2E
-case, with both stages placed on ROCm devices:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  benchmark \
-  --define-domain rocm_pp0=rocm:0 \
-  --define-domain rocm_pp1=rocm:1 \
-  --pp-stage 0=rocm_pp0:0-31 \
-  --pp-stage 1=rocm_pp1:32-63 \
-  -m "$MODEL_PP_DENSE"
-
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --define-domain rocm_pp0=rocm:0 \
-  --define-domain rocm_pp1=rocm:1 \
-  --pp-stage 0=rocm_pp0:0-31 \
-  --pp-stage 1=rocm_pp1:32-63 \
-  -m "$MODEL_PP_DENSE"
-```
-
-Tensor parallel across two ROCm devices. The two entries in `--tp-devices`
-select TP=2. This model and TP2 ROCm shape are in the release E2E matrix:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  benchmark --tp-devices rocm:0,rocm:1 -m "$MODEL_TP_MOE"
-
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --tp-devices rocm:0,rocm:1 \
-  -m "$MODEL_TP_MOE"
-```
-
-Tensor parallel across four ROCm devices. The four entries in `--tp-devices`
-select TP=4. This model and TP4 ROCm shape are in the release E2E matrix:
-
-```bash
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  benchmark --tp-devices rocm:0,rocm:1,rocm:2,rocm:3 -m "$MODEL_TP_MOE"
-
-docker run "${COMMON_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
-  -e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO \
-  "$LLAMINAR_ROCM_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --tp-devices rocm:0,rocm:1,rocm:2,rocm:3 \
-  -m "$MODEL_TP_MOE"
-```
-
-#### CUDA+ROCm image
-
-Pipeline parallel across one CUDA GPU and one ROCm GPU. Define `ROCM_RUN` as in
-the ROCm section above first. This is the exact hybrid release E2E topology:
-`Qwen3.5-27B-Q4_K_M.gguf`, layers `0-31` on `cuda:0`, and layers `32-63` on
-`rocm:0`.
-
-```bash
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" \
-  "$LLAMINAR_FULL_IMAGE" \
-  benchmark \
-  --define-domain cuda_pp=cuda:0 \
-  --define-domain rocm_pp=rocm:0 \
-  --pp-stage 0=cuda_pp:0-31 \
-  --pp-stage 1=rocm_pp:32-63 \
-  -m "$MODEL_PP_DENSE"
-
-docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 \
-  "$LLAMINAR_FULL_IMAGE" \
-  serve --host 0.0.0.0 --port 8080 \
-  --define-domain cuda_pp=cuda:0 \
-  --define-domain rocm_pp=rocm:0 \
-  --pp-stage 0=cuda_pp:0-31 \
-  --pp-stage 1=rocm_pp:32-63 \
-  -m "$MODEL_PP_DENSE"
-```
-
-Examples above demonstrate CLI topology syntax; they are not an inventory of
-current E2E certificates. Eligibility lives in the canonical typed model-parity
-definitions. List it with:
-
-```bash
-cmake --build build_v2_integration --parallel --target v2_model_parity_matrices
-python3 scripts/ci/run_model_parity_e2e.py --build-dir build_v2_integration --list
-```
-
-Run without `--list` to certify tagged cells through the Release HTTP server,
-including the full needle, long-generation, prefix/reset and context-boundary
-checks. Both local and container runners consume the same definitions. See the
-[parity workflow](tests/v2/integration/parity/README.md#tagged-http--long-context-certification)
-for selection, persistent tmpfs staging and evidence requirements.
-
-Reference docs:
-- NVIDIA CUDA release notes: https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-- Docker Engine install guide: https://docs.docker.com/engine/install/ubuntu/
-- NVIDIA Container Toolkit install guide: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
-- AMD ROCm Docker container guide: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/docker.html
 
 ## The Llaminar Philosophy
 

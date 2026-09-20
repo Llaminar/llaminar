@@ -1,0 +1,59 @@
+name: Published images — Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      e2e_run:
+        description: Successful HTTP E2E run ID (blank selects the latest on this branch)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+  actions: read
+
+concurrency:
+  group: llaminar-develop-image-gate
+  cancel-in-progress: false
+
+jobs:
+  benchmarks:
+    runs-on: [llaminar-bench]
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Benchmark the E2E-proven image pair and publish chart plus JSON
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          E2E_RUN: ${{ inputs.e2e_run }}
+        run: |
+          python3 scripts/ci/run_published_image_suite.py benchmarks \
+            --e2e-run "$E2E_RUN" --output parity-results/published-benchmarks \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --publish
+      - name: Retain complete benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-benchmarks-${{ github.run_id }}
+          path: parity-results/published-benchmarks/
+          if-no-files-found: error
+          retention-days: 30

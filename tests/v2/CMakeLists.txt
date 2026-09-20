@@ -2799,6 +2799,23 @@ set_tests_properties(V2_Unit_DevelopImageGate PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_PublishedImageSuites
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_published_image_suite.py
+)
+set_tests_properties(V2_Unit_PublishedImageSuites PROPERTIES
+    LABELS "V2;Unit;BuildSystem;Container;E2E;Benchmark;Publication;Regression"
+    TIMEOUT 30
+)
+add_test(NAME V2_Integration_PublishedImageSuites
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_published_image_suite.py
+)
+set_tests_properties(V2_Integration_PublishedImageSuites PROPERTIES
+    LABELS "V2;Integration;ProductionParityPreflight;BuildSystem;Container;E2E;Benchmark;Publication;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_AzureCrossHostResources
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_azure_cross_host_resources.py

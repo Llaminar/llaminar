@@ -18,7 +18,7 @@ sudo -n env OMP_NUM_THREADS=1 OMP_PROC_BIND=true \
   --cuda-graph-trace=node --force-overwrite=true --output=/tmp/comparison-llaminar \
   ./build_v2_release/llaminar2 benchmark --no-mpi-bootstrap \
   -m "$COMPARISON_MODEL" -d cuda:0 -c 4096 \
-  --prompt-file "$COMPARISON_PROMPT" -n 256 --deterministic \
+  --prompt-file "$COMPARISON_PROMPT" -n 256 --temperature 0 --seed 42 \
   --benchmark-json-output /tmp/comparison-llaminar.json
 ```
 

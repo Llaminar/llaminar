@@ -51,9 +51,16 @@ paths chosen for this run. Keep ordinary MPI bootstrap for canonical timing:
 env LLAMINAR_BENCHMARK_ITERATIONS=5 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
   ./build_v2_release/llaminar2 benchmark \
   -m "$COMPARISON_MODEL" -d cuda:0 -c 4096 \
-  --prompt-file "$COMPARISON_PROMPT" -n 256 --deterministic \
+  --prompt-file "$COMPARISON_PROMPT" -n 256 --temperature 0 --seed 42 \
   --benchmark-json-output "$COMPARISON_OUTPUT"
 ```
+
+Greedy sampling is distinct from diagnostic kernel determinism. For production
+comparisons use `--temperature 0 --seed 42`: `--deterministic` also publishes
+`LLAMINAR_DETERMINISTIC=1`, which can disable optimized dispatch and projection
+concurrency. If that diagnostic policy is explicitly requested, preserve it
+and report its results separately; never silently switch it to obtain a win.
+Compare generated token IDs when reproducing an earlier production run.
 
 Do not inherit profiling/debug overrides accidentally. Inspect `LLAMINAR_*`,
 profiler injection variables, `CUDA_VISIBLE_DEVICES`/HIP device masks and CPU
@@ -67,6 +74,14 @@ denominator: a 256-output request usually has 255 after-prefill serial steps.
 Inspect counts and timing definitions in `BenchmarkRunner` and the pinned
 llama.cpp implementation instead of comparing similarly named fields blindly.
 Retain individual iteration rates and all generated IDs, not just one mean.
+
+When evaluating automatic selection, start with only the requested backend
+constraint and workload/sampling arguments. Do not add a strategy filter or
+workload-cost hint unless the user requested it. Inspect the resolved domains:
+a homogeneous single-domain MoE proposal is currently labeled `tp` by the
+planner even when it executes through ExpertOverlay. An `expert-overlay`-only
+filter excludes that proposal; it does not simply require the overlay runtime.
+Keep any explicit tuning overrides in a separately identified experiment.
 
 ## llama.cpp server example
 
