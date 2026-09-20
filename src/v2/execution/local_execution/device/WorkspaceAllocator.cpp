@@ -5,6 +5,8 @@
  * Concrete consumers declare participant-local requirements. Serial graph
  * families merge those descriptors while concurrent members retain exclusive
  * storage; PhysicalMemoryAuthority remains the sole physical allocation ledger.
+ * Sealed backing inventories preserve each manager's physical device identity,
+ * including CPU scratch owned by a GPU execution participant.
  * @author David Sanftenberg
  * @date March 2026
  */
@@ -1507,19 +1509,15 @@ namespace llaminar2
         return (it != device_workspaces_.end()) ? it->second->used() : 0;
     }
 
-    size_t WorkspaceAllocator::retainedPrimaryBytes() const noexcept
+    size_t WorkspaceAllocator::retainedPrimaryBytes(DeviceId device) const noexcept
     {
-        size_t total = 0;
-        for (const auto &[_, manager] : device_workspaces_)
-        {
-            if (!manager || !manager->hasReusablePrimaryBlock())
-                continue;
-            const size_t bytes = manager->primaryBlockSize();
-            if (bytes > std::numeric_limits<size_t>::max() - total)
-                return std::numeric_limits<size_t>::max();
-            total += bytes;
-        }
-        return total;
+        // The graph owner's device does not describe all of its backing.
+        // Select the actual manager so host scratch cannot be billed as VRAM.
+        const auto found = device_workspaces_.find(device);
+        if (found == device_workspaces_.end() || !found->second ||
+            !found->second->hasReusablePrimaryBlock())
+            return 0u;
+        return found->second->primaryBlockSize();
     }
 
     void WorkspaceAllocator::bumpDeviceGeneration(DeviceId device)

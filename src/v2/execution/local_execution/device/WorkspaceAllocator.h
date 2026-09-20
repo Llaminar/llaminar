@@ -8,6 +8,8 @@
  * explicit non-graph heterogeneous consumers, bind the same per-device named
  * workspace contract. Serial graph families share stable storage; concurrent
  * participants have separate owners.
+ * Retention inventories name an exact physical device independently of the
+ * execution participant: heterogeneous graph families can also own CPU scratch.
  *
  * @author David Sanftenberg
  * @date March 2026
@@ -472,8 +474,15 @@ namespace llaminar2
          */
         size_t deviceAllocated(DeviceId device) const;
 
-        /** @return Primary bytes retained for a future exclusive runner. */
-        size_t retainedPrimaryBytes() const noexcept;
+        /**
+         * @brief Read sealed primary backing on one exact physical device.
+         * @param device Allocation device, not the graph's continuation device.
+         * @return Retained block size, or zero when that device has no sealed block.
+         *
+         * A heterogeneous graph family can bind several device managers. Its
+         * host scratch must never enter a GPU retirement or reuse-capacity BOM.
+         */
+        size_t retainedPrimaryBytes(DeviceId device) const noexcept;
 
         /**
          * @brief Number of devices with workspace allocated

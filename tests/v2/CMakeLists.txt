@@ -1961,6 +1961,33 @@ add_v2_test(V2_Unit_WorkspaceAllocator
     LABELS "V2;Unit;Execution;WorkspaceAllocator;Memory;Allocation;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_WorkspaceRetentionPhysicalIdentity
+    COMMAND $<TARGET_FILE:v2_unit_workspace_allocator>
+            --gtest_filter=Test__WorkspaceAllocator.RetentionUsesPhysicalDeviceAcrossStructuralOwners
+    LABELS "V2;Integration;ProductionParityPreflight;Memory;Workspace;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MPI NO_MODELS
+)
+if(HAVE_CUDA OR HAVE_ROCM)
+    add_executable(v2_integration_workspace_retention
+        integration/planning/Test__WorkspaceRetention.cpp)
+    target_link_libraries(v2_integration_workspace_retention
+        llaminar2_core GTest::gtest_main)
+    foreach(V2_RETENTION_BACKEND IN ITEMS CUDA ROCm)
+        if((V2_RETENTION_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (V2_RETENTION_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_WorkspaceRetention_${V2_RETENTION_BACKEND}
+                COMMAND $<TARGET_FILE:v2_integration_workspace_retention>
+                        --gtest_filter=Test__WorkspaceRetention.${V2_RETENTION_BACKEND}
+                LABELS "V2;Integration;ProductionParityPreflight;${V2_RETENTION_BACKEND};Memory;Workspace;Regression"
+                MPI_PROCS 1
+                TIMEOUT 60
+                NO_MPI NO_MODELS
+            )
+        endif()
+    endforeach()
+endif()
 
 # Test: IWorkspaceConsumerStage - Mixin for stages that delegate workspace to kernels
 add_executable(v2_unit_workspace_consumer_stage unit/execution/compute_stages/Test__IWorkspaceConsumerStage.cpp)

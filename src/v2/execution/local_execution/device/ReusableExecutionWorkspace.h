@@ -14,6 +14,8 @@
  * graph, then seal the allocator into backing-only state before the lease can
  * become reusable. A missing transition permanently invalidates that slot; a
  * later runner cannot allocate around the lifecycle defect.
+ * Structural execution keys identify independent lifetimes, not allocation
+ * domains. Retention queries select actual physical devices across sealed slots.
  */
 
 #pragma once
@@ -267,24 +269,27 @@ namespace llaminar2
         }
 
         /**
-         * @brief Sum sealed primary blocks for one physical device.
-         * @param device GPU whose reusable bytes should be credited.
+         * @brief Sum sealed primary blocks for one physical device across all owners.
+         * @param device CPU/GPU allocation device whose backing is requested.
          * @return Checked sum; max size_t denotes arithmetic saturation.
+         *
+         * A GPU-keyed execution slot may include CPU workspaces at a declared
+         * heterogeneous boundary. The allocator's physical manager identifies
+         * those bytes; the slot key must not reclassify or hide them.
          */
         [[nodiscard]] std::size_t retainedPrimaryBytes(
             DeviceId device) const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
             std::size_t total = 0;
-            for (const auto &[key, slot] : slots_)
+            for (const auto &[_, slot] : slots_)
             {
-                if (key.device != device ||
-                    slot.state != SlotState::Reusable || !slot.allocator)
+                if (slot.state != SlotState::Reusable || !slot.allocator)
                 {
                     continue;
                 }
                 const std::size_t bytes =
-                    slot.allocator->retainedPrimaryBytes();
+                    slot.allocator->retainedPrimaryBytes(device);
                 if (bytes > std::numeric_limits<std::size_t>::max() - total)
                     return std::numeric_limits<std::size_t>::max();
                 total += bytes;

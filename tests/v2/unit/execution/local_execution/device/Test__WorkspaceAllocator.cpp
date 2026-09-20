@@ -6,6 +6,8 @@
  * graph family publishes raw addresses. CPU executable stages, CUDA graphs,
  * and ROCm graphs share the same typed allocation contract; tests that need an
  * accelerator say so explicitly, while CPU coverage remains in the unit gate.
+ * Retention queries use physical allocation devices, not graph-owner keys:
+ * a GPU participant may also own CPU scratch at a heterogeneous boundary.
  */
 
 #include <gtest/gtest.h>
@@ -628,6 +630,68 @@ TEST(Test__WorkspaceAllocator,
             PhysicalMemoryMaterializationKind::NewAllocation),
         kCompleteFamilyBytes)
         << "Binding a later serial graph must not mint a second physical claim";
+}
+
+/**
+ * @brief CPU backing in GPU-keyed slots remains CPU-owned after sealing.
+ *
+ * CUDA and ROCm are structural keys only; all allocations are real CPU
+ * allocations admitted by PhysicalMemoryAuthority, so this stays device-free.
+ * Reacquisition removes only that slot from the reusable inventory without
+ * releasing or duplicating its canonical physical claim.
+ */
+TEST(Test__WorkspaceAllocator, RetentionUsesPhysicalDeviceAcrossStructuralOwners)
+{
+    if (!hasCPUBackend())
+        initCPUBackend(-1);
+    auto authority = makeWorkspaceAuthority(DeviceId::cpu(), 16384u);
+    {
+        auto registry = std::make_shared<ReusableExecutionWorkspaceRegistry>();
+        std::vector<ReusableExecutionWorkspaceKey> keys;
+        size_t expected_cpu_bytes = 0u;
+        for (const DeviceId graph_owner : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            const ReusableExecutionWorkspaceKey key{
+                .device = graph_owner,
+                .first_layer = 0,
+                .last_layer = 0,
+            };
+            keys.push_back(key);
+            std::string error;
+            auto lease = registry->acquire(key, authority, &error);
+            ASSERT_NE(lease, nullptr) << error;
+            const size_t bytes = expected_cpu_bytes == 0u ? 4096u : 8192u;
+            {
+                ComputeGraph graph;
+                MockWorkspaceConsumer cpu_consumer({
+                    {"heterogeneous_cpu_scratch", bytes, 256, true},
+                });
+                ASSERT_TRUE(lease->allocator()->allocateForGraph(
+                    graph, tinyHints(),
+                    {requestFor(cpu_consumer, DeviceId::cpu())},
+                    unitBudgetConfig()));
+            }
+            EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::cpu()), expected_cpu_bytes)
+                << "A live graph lease is not a reusable backing inventory";
+            ASSERT_TRUE(lease->publishReusable(&error)) << error;
+            expected_cpu_bytes += bytes;
+            EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::cpu()), expected_cpu_bytes);
+            EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::cuda(0)), 0u);
+            EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::rocm(0)), 0u);
+            EXPECT_EQ(authority->claimedBytes(
+                DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                PhysicalMemoryMaterializationKind::NewAllocation), expected_cpu_bytes);
+        }
+        std::string error;
+        auto next = registry->acquire(keys.front(), authority, &error);
+        ASSERT_NE(next, nullptr) << error;
+        EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::cpu()), 8192u);
+        ASSERT_TRUE(next->publishReusable(&error)) << error;
+        EXPECT_EQ(registry->retainedPrimaryBytes(DeviceId::cpu()), 12288u);
+    }
+    EXPECT_EQ(authority->claimedBytes(
+        DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
 }
 
 TEST(Test__WorkspaceAllocator, ExtendsExistingWorkspaceWithoutInvalidatingCapturedAddresses)
