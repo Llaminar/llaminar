@@ -6,8 +6,9 @@
  * routed weights. Logical kernels alias those pools, and Dynamic ExpertOverlay
  * may additionally create runner-owned shadow pools that disappear at teardown.
  * This ledger records each model preparation allocation once without extending
- * its lifetime. A reusable-context seal can therefore sum only owners that are
- * still live after runner teardown, independent of allocator telemetry.
+ * its lifetime.  Entries use the pool's physical-allocation lifetime token,
+ * rather than the broader LoadOrchestrator lifetime, so a reusable-context
+ * seal can sum only bytes whose matching backend allocation is still live.
  */
 
 #pragma once
@@ -28,7 +29,8 @@ namespace llaminar2
      * Registration identity is the shared-pointer control block, not the raw
      * address. This remains collision-free if an allocator later reuses an
      * object's address. Weak entries never keep abandoned or runner-only pools
-     * alive, while every prepared kernel retains the true allocation owner.
+     * alive, and a pool release expires the token even when a transaction
+     * temporarily retains its orchestrator object.
      */
     class PreparedDeviceAllocationLedger final
     {

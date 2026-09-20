@@ -2,6 +2,8 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "../mocks/MockBackend.h"
 
+#include <memory>
+
 /**
  * @file Test__WeightVRAMPool.cpp
  * @brief Unit tests for planning, allocation, and staging cleanup in WeightVRAMPool.
@@ -245,6 +247,31 @@ namespace llaminar2
         auto after = pool.getSlot("w1");
         ASSERT_TRUE(after.has_value());
         EXPECT_EQ(after->d_native_vnni_payload, payload_before);
+    }
+
+    /**
+     * @brief Prepared accounting follows the physical pool, not its owner.
+     *
+     * A maintenance transaction may retain a LoadOrchestrator after releasing
+     * its pool.  The weak token must therefore expire at the pool's persistent
+     * backend free, otherwise final model retirement overstates live bytes.
+     */
+    TEST(Test__WeightVRAMPool, PersistentAllocationLifetimeEndsWithPoolRelease)
+    {
+        test::MockBackend backend(DeviceType::ROCm);
+        WeightVRAMPool pool;
+        pool.planRawWeight("raw", 16, 16, 16u * 16u * sizeof(float));
+
+        ASSERT_TRUE(pool.allocate(&backend, 0, 0));
+        ASSERT_EQ(backend.getAllocationCount(), 1u);
+        const std::weak_ptr<void> lifetime =
+            pool.persistentAllocationLifetime();
+        EXPECT_FALSE(lifetime.expired());
+
+        pool.release();
+
+        EXPECT_TRUE(lifetime.expired());
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
     }
 
 } // namespace llaminar2

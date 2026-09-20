@@ -57,6 +57,8 @@ namespace llaminar2
           backend_(other.backend_),
           device_id_(other.device_id_),
           allocated_(other.allocated_),
+          persistent_allocation_lifetime_(
+              std::move(other.persistent_allocation_lifetime_)),
           current_offset_(other.current_offset_),
           plans_(std::move(other.plans_)),
           weight_order_(std::move(other.weight_order_))
@@ -89,6 +91,8 @@ namespace llaminar2
             backend_ = other.backend_;
             device_id_ = other.device_id_;
             allocated_ = other.allocated_;
+            persistent_allocation_lifetime_ =
+                std::move(other.persistent_allocation_lifetime_);
             current_offset_ = other.current_offset_;
             plans_ = std::move(other.plans_);
             weight_order_ = std::move(other.weight_order_);
@@ -308,6 +312,14 @@ namespace llaminar2
                     staging_slot_stride_bytes_ = 0;
                     return false;
                 }
+                /*
+                 * This token is the physical allocation identity consumed by
+                 * the prepared-device ledger.  It must be created only after
+                 * the backend has accepted the persistent allocation and is
+                 * reset only after the matching free in release().
+                 */
+                persistent_allocation_lifetime_ =
+                    std::make_shared<std::uint8_t>(0u);
                 logVramTrace(backend_, device_id_, "weight_pool.after_persistent_allocate", weight_region_bytes_);
             }
 
@@ -323,6 +335,7 @@ namespace llaminar2
                         backend_->free(d_base_, device_id_);
                         d_base_ = nullptr;
                     }
+                    persistent_allocation_lifetime_.reset();
                     total_bytes_ = 0;
                     weight_region_bytes_ = 0;
                     staging_region_bytes_ = 0;
@@ -430,6 +443,11 @@ namespace llaminar2
         return current_offset_;
     }
 
+    std::shared_ptr<void> WeightVRAMPool::persistentAllocationLifetime() const noexcept
+    {
+        return persistent_allocation_lifetime_;
+    }
+
     size_t WeightVRAMPool::maximumPlannedStagingBytes() const
     {
         size_t maximum = 0;
@@ -460,6 +478,8 @@ namespace llaminar2
             }
             d_base_ = nullptr;
         }
+        /* The weak ledger owner expires only after the physical free. */
+        persistent_allocation_lifetime_.reset();
         allocated_ = false;
         total_bytes_ = 0;
         weight_region_bytes_ = 0;

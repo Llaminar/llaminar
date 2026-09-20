@@ -6932,9 +6932,16 @@ namespace llaminar2
             throw std::runtime_error(
                 "WeightManager GPU pipeline finalized without a persistent prepared-weight pool");
         }
+        const auto allocation_lifetime =
+            finalized_pool->persistentAllocationLifetime();
+        if (!allocation_lifetime)
+        {
+            throw std::logic_error(
+                "WeightManager GPU pipeline finalized without a persistent allocation lifetime token");
+        }
         prepared_device_allocations_.registerAllocation(
             target_device,
-            std::shared_ptr<void>(orchestrator),
+            allocation_lifetime,
             finalized_pool->totalPlannedBytes());
 
         {

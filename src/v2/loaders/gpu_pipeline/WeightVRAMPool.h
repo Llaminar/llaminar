@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -90,6 +91,20 @@ namespace llaminar2
         std::optional<WeightSlot> getSlot(const std::string &name) const;
 
         size_t totalPlannedBytes() const;
+        /**
+         * @brief Return the exact lifetime token for the persistent allocation.
+         *
+         * The token is non-owning from the ledger's point of view: callers
+         * retain only a weak reference to it.  It remains live while this
+         * pool's persistent device allocation exists and expires immediately
+         * after @ref release() frees that allocation.  This is deliberately
+         * distinct from the LoadOrchestrator lifetime because a maintenance
+         * transaction may retain an orchestrator while retiring its pool.
+         *
+         * @return Shared token, or an empty handle before allocation.
+         */
+        [[nodiscard]] std::shared_ptr<void>
+        persistentAllocationLifetime() const noexcept;
         /** @return Largest logical raw source transaction in the plan. */
         size_t maximumPlannedStagingBytes() const;
         size_t numPlannedWeights() const;
@@ -155,6 +170,16 @@ namespace llaminar2
         IBackend *backend_ = nullptr;
         int device_id_ = -1;
         bool allocated_ = false;
+
+        /**
+         * @brief Identity of the currently materialized persistent allocation.
+         *
+         * Prepared-device accounting stores this identity as a weak owner.
+         * Reset it only after the matching backend free so the canonical
+         * retirement BOM cannot count a released pool merely because its
+         * orchestrator object is still retained by a kernel or transaction.
+         */
+        std::shared_ptr<void> persistent_allocation_lifetime_;
 
         size_t current_offset_ = 0;
 
