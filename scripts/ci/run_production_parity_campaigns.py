@@ -19,7 +19,9 @@ overlaps only campaigns whose backend sets are disjoint. Every production child
 then consumes the exact immutable staged paths declared by the typed campaign.
 Staging is private and run-scoped by default. An explicit persistent-cache
 directory instead retains atomically published, source-identity-bound read-only
-GGUFs for rapid iteration; the driver never removes that cache. Model-byte
+GGUFs for rapid iteration; the driver never removes that cache. Capacity follows
+the peak of sequential atomic replacements, not the sum of temporary copies,
+and is rechecked before each copy against actual filesystem availability. Model-byte
 hashing is deliberately absent: the copy transaction proves its exact byte
 count and stable source/destination identities, while the numerical checkpoints
 are the authoritative proof that those weights match the reference.
@@ -1853,6 +1855,61 @@ def _stage_one_model(
     )
 
 
+def _check_model_staging_capacity(
+    sources: tuple[Path, ...],
+    staging_directory: Path,
+    reserve_bytes: int,
+) -> int:
+    """Admit the peak additional allocation of ordered, atomic model copies.
+
+    The persistent workspace lock excludes cooperating inference readers and
+    other cache writers. A copy temporarily owns its entire new payload; only
+    its completed rename can release the previous inode before the next copy.
+    Charge retained growth between copies, and credit only allocated blocks of
+    single-link regular files on this filesystem (never sparse holes, symlink
+    targets, or hardlinked payloads).
+
+    Call once for the complete sequence and again with each individual source
+    immediately before copying. The latter checks actual free space: an
+    unrelated consumer or a reader outside the cache lease may retain bytes
+    that the initial projection expected to reclaim. Failure leaves published
+    cache files intact. The return value is peak extra bytes, not copy traffic.
+    """
+
+    filesystem = os.statvfs(staging_directory)
+    block_bytes = filesystem.f_frsize
+    if block_bytes <= 0:
+        raise ModelStagingError(f"invalid ramdisk allocation unit: {block_bytes}")
+    staging_device = staging_directory.stat().st_dev
+    retained_growth = 0
+    peak_bytes = 0
+    for source in sources:
+        new_bytes = ((source.stat().st_size + block_bytes - 1)
+                     // block_bytes * block_bytes)
+        # The old file remains fully live while the new file is being written.
+        peak_bytes = max(peak_bytes, retained_growth + new_bytes)
+        released_bytes = 0
+        try:
+            previous = (staging_directory / source.name).stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if (stat.S_ISREG(previous.st_mode) and previous.st_nlink == 1
+                    and previous.st_dev == staging_device):
+                # st_blocks is expressed in 512-byte units, not f_frsize units.
+                released_bytes = previous.st_blocks * 512
+        retained_growth += new_bytes - released_bytes
+
+    available_bytes = filesystem.f_bavail * block_bytes
+    if sources and peak_bytes + reserve_bytes > available_bytes:
+        raise ModelStagingError(
+            "insufficient ramdisk capacity for selected GGUF corpus: "
+            f"required_peak={peak_bytes} reserve={reserve_bytes} "
+            f"available={available_bytes} next_model={sources[0]}"
+        )
+    return peak_bytes
+
+
 def stage_models_in_ramdisk(
     cells: Iterable[CampaignCell],
     staging_directory: Path,
@@ -1866,8 +1923,9 @@ def stage_models_in_ramdisk(
     staging instead owns a versioned manifest and keeps immutable model files
     across invocations. A persistent hit requires unchanged source and read-only
     cached-file identities; misses are copied and published atomically without
-    exposing partial weights. Exact byte counts and mutation checks protect the
-    copy, while numerical parity proves the loaded weight contents.
+    exposing partial weights. Capacity follows the ordered replacement peak
+    and is revalidated before each transaction. Exact byte counts and mutation
+    checks protect the copy, while numerical parity proves the loaded weights.
     """
 
     sources = selected_model_files(cells)
@@ -1896,7 +1954,7 @@ def stage_models_in_ramdisk(
                 reusable[source] = reusable_record
 
     sources_to_copy = tuple(source for source in sources if source not in reusable)
-    required_bytes = sum(source.stat().st_size for source in sources_to_copy)
+    copy_bytes = sum(source.stat().st_size for source in sources_to_copy)
     reserve_bytes = max(
         MODEL_RAMDISK_MINIMUM_RESERVE_BYTES,
         math.ceil(
@@ -1904,18 +1962,13 @@ def stage_models_in_ramdisk(
             * MODEL_RAMDISK_RESERVE_FRACTION
         ),
     )
-    filesystem = os.statvfs(staging_directory)
-    available_bytes = filesystem.f_bavail * filesystem.f_frsize
-    if required_bytes > 0 and required_bytes + reserve_bytes > available_bytes:
-        raise ModelStagingError(
-            "insufficient ramdisk capacity for selected GGUF corpus: "
-            f"required={required_bytes} reserve={reserve_bytes} "
-            f"available={available_bytes}"
-        )
+    peak_bytes = _check_model_staging_capacity(
+        sources_to_copy, staging_directory, reserve_bytes)
 
     print(
         f"[production-parity] staging_models={len(sources)} "
-        f"cache_hits={len(reusable)} copy_bytes={required_bytes} "
+        f"cache_hits={len(reusable)} copy_bytes={copy_bytes} "
+        f"required_peak_bytes={peak_bytes} "
         f"mode={'persistent' if persistent else 'run_scoped'} "
         f"filesystem={filesystem_type} "
         f"destination={staging_directory}",
@@ -1945,6 +1998,7 @@ def stage_models_in_ramdisk(
                 flush=True,
             )
             continue
+        _check_model_staging_capacity((source,), staging_directory, reserve_bytes)
         print(
             f"[production-parity] staging_model={index}/{len(sources)} "
             f"source={source} bytes={source.stat().st_size}",

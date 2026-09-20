@@ -3170,5 +3170,153 @@ time.sleep(30)
             campaigns.discover_campaigns(Path("build"))
 
 
+class ModelStagingCapacityTests(unittest.TestCase):
+    """Exercise atomic cache replacement with a deliberately small tmpfs budget."""
+
+    def setUp(self) -> None:
+        """Keep real file transactions while controlling only available capacity."""
+        temporary = tempfile.TemporaryDirectory(prefix="llaminar-staging-capacity-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.models = self.root / "cache" / "models"
+        self.models.mkdir(parents=True)
+        self.page = 4096
+        for name, value in (
+            ("_filesystem_type", "tmpfs"),
+            ("MODEL_RAMDISK_MINIMUM_RESERVE_BYTES", 0),
+            ("MODEL_RAMDISK_RESERVE_FRACTION", 0.0),
+        ):
+            patch = (mock.patch.object(campaigns, name, return_value=value)
+                     if name == "_filesystem_type"
+                     else mock.patch.object(campaigns, name, value))
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def prepare(self, new_pages: tuple[int, ...], old_pages: tuple[int | None, ...]) -> None:
+        """Declare source models and stale, fully published cache files."""
+        self.sources = []
+        for index, (new, old) in enumerate(zip(new_pages, old_pages, strict=True)):
+            source = self.root / f"model-{index}.gguf"
+            source.write_bytes(b"N" * (new * self.page))
+            self.sources.append(source)
+            if old is not None:
+                cached = self.models / source.name
+                cached.write_bytes(b"O" * (old * self.page))
+                cached.chmod(0o400)
+
+    def filesystem(self, free_bytes: int) -> os.statvfs_result:
+        """Describe page-granular tmpfs space without allocating a real ramdisk."""
+        return os.statvfs_result((self.page, self.page, 1000,
+                                 free_bytes // self.page, free_bytes // self.page,
+                                 1000, 1000, 1000, 0, 255))
+
+    def capacity(self, free_pages: int) -> mock.Mock:
+        """Charge actual file blocks, including the atomically published manifest."""
+        def used_bytes() -> int:
+            return sum(path.stat().st_blocks * 512
+                       for path in self.models.parent.rglob("*") if path.is_file())
+        initial = used_bytes()
+        patch = mock.patch.object(
+            campaigns.os, "statvfs",
+            side_effect=lambda _: self.filesystem(
+                free_pages * self.page - (used_bytes() - initial)),
+        )
+        result = patch.start()
+        self.addCleanup(patch.stop)
+        return result
+
+    def stage(self) -> tuple[tuple[campaigns.StagedModelEvidence, ...], str]:
+        """Run the same staging transaction used by HTTP and mathematical suites."""
+        cell = campaigns.CampaignCell(
+            "capacity", campaigns.CampaignGroup("CPU", "ALL"),
+            model_files=tuple(str(source) for source in self.sources),
+        )
+        return campaigns.stage_models_in_ramdisk(
+            [cell], self.models, None, persistent=True)
+
+    def test_replacements_require_one_temporary_copy_not_their_sum(self) -> None:
+        """Each rename retires its old inode before the next copy begins."""
+        self.prepare((16, 16), (16, 16))
+        capacity = self.capacity(24)
+        records, _ = self.stage()
+        self.assertEqual(len(records), 2)
+        self.assertEqual(capacity.call_count, 3)
+        for source in self.sources:
+            self.assertEqual((self.models / source.name).read_bytes(), source.read_bytes())
+
+    def test_replacement_growth_is_retained_between_copies(self) -> None:
+        """The second copy pays for the first replacement's increased size."""
+        self.prepare((24, 24), (16, 16))
+        self.capacity(30)
+        with mock.patch.object(campaigns, "_stage_one_model") as copy:
+            with self.assertRaisesRegex(campaigns.ModelStagingError, "insufficient ramdisk"):
+                self.stage()
+        copy.assert_not_called()
+
+    def test_shrinking_replacements_release_capacity(self) -> None:
+        """A smaller first replacement can make a larger next transaction fit."""
+        self.prepare((16, 24), (32, 24))
+        self.capacity(20)
+        records, _ = self.stage()
+        self.assertEqual(len(records), 2)
+
+    def test_new_models_still_require_their_combined_capacity(self) -> None:
+        """There is no old allocation to credit on first admission."""
+        self.prepare((16, 16), (None, None))
+        self.capacity(24)
+        with mock.patch.object(campaigns, "_stage_one_model") as copy:
+            with self.assertRaisesRegex(campaigns.ModelStagingError, "insufficient ramdisk"):
+                self.stage()
+        copy.assert_not_called()
+
+    def test_sparse_old_files_credit_allocated_blocks_not_logical_size(self) -> None:
+        """Unallocated holes cannot pay for the next real weight copy."""
+        self.prepare((16, 16), (None, None))
+        for source in self.sources:
+            with (self.models / source.name).open("wb") as cached:
+                cached.seek(16 * self.page - 1)
+                cached.write(b"O")
+        self.capacity(24)
+        with mock.patch.object(campaigns, "_stage_one_model") as copy:
+            with self.assertRaisesRegex(campaigns.ModelStagingError, "insufficient ramdisk"):
+                self.stage()
+        copy.assert_not_called()
+
+    def test_hardlinked_old_files_cannot_be_reclaimed_by_replacement(self) -> None:
+        """Another directory entry retains the old payload after rename."""
+        self.prepare((16, 16), (16, 16))
+        for source in self.sources:
+            os.link(self.models / source.name, self.root / f"retained-{source.name}")
+        self.capacity(24)
+        with mock.patch.object(campaigns, "_stage_one_model") as copy:
+            with self.assertRaisesRegex(campaigns.ModelStagingError, "insufficient ramdisk"):
+                self.stage()
+        copy.assert_not_called()
+
+    def test_capacity_is_rechecked_before_each_copy(self) -> None:
+        """External consumers or uncooperative readers must fail before more writes."""
+        self.prepare((16, 16), (16, 16))
+        with mock.patch.object(campaigns.os, "statvfs", side_effect=[
+            self.filesystem(24 * self.page),
+            self.filesystem(24 * self.page),
+            self.filesystem(8 * self.page),
+        ]):
+            with self.assertRaisesRegex(campaigns.ModelStagingError, "insufficient ramdisk"):
+                self.stage()
+        self.assertEqual((self.models / self.sources[0].name).read_bytes(), b"N" * (16 * self.page))
+        self.assertEqual((self.models / self.sources[1].name).read_bytes(), b"O" * (16 * self.page))
+        self.assertEqual(list(self.models.glob(".*.copying-*")), [])
+
+    def test_failed_copy_preserves_the_old_published_file(self) -> None:
+        """Admission never deletes old weights to manufacture free space."""
+        self.prepare((16,), (16,))
+        self.capacity(24)
+        with mock.patch.object(campaigns.os, "fsync", side_effect=OSError("injected copy failure")):
+            with self.assertRaisesRegex(OSError, "injected copy failure"):
+                self.stage()
+        self.assertEqual((self.models / self.sources[0].name).read_bytes(), b"O" * (16 * self.page))
+        self.assertEqual(list(self.models.glob(".*.copying-*")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
