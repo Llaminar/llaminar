@@ -329,10 +329,21 @@ namespace llaminar2
          * @param address Exact stable GPU source or inactive destination.
          * @param bytes Positive authenticated chunk size.
          * @param error Receives publication/progression failures.
-         * @return True after command acceptance, never before copy completion.
+         * @return True after acceptance; the exact receipt still owns completion.
          */
         bool publishBlobLocked(OperationKind kind, void *address,
                                std::size_t bytes, std::string *error) noexcept;
+
+        /**
+         * @brief Bind one accepted service command to this lane's lifecycle.
+         * @param kind Exact copy/conversion operation covered by its receipt.
+         * @param bytes Complete CPU-format or raw-byte extent being transferred.
+         * @param error Receives a progress-submission failure without releasing storage.
+         * @return True when the command is pending under its retained owner.
+         * @pre The matching service slot has already accepted its generation.
+         */
+        bool acceptServiceCommandLocked(OperationKind kind, std::size_t bytes,
+                                        std::string *error) noexcept;
 
         /** @return The exact service receipt, or null for a native operation. */
         [[nodiscard]] MappedTransferProgressSlot *serviceCommandLocked() noexcept;

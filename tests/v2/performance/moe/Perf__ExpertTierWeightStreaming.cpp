@@ -6,6 +6,9 @@
  * executable prepares real quantized tensors through the production
  * NativeVNNI packer, proves both conversion directions byte-for-byte, and then
  * measures the exact explicit-stream kernels with and without pinned-host DMA.
+ * CUDA additionally measures service-finite/service-captured public background
+ * transactions. Those report complete wall time, not native kernel duration,
+ * and retain the same independent endpoint-byte checks.
  * The default matrix covers every loader-supported quantized format and the
  * two projection geometries used by Qwen3.5/Qwen3.6 MoE experts.
  *
@@ -22,6 +25,10 @@
 
 #if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 #include <cuda_runtime.h>
 #elif defined(LLAMINAR_EXPERT_TIER_PERF_ROCM)
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
@@ -32,8 +39,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
@@ -50,6 +59,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -93,6 +103,8 @@ namespace llaminar2
         {
             Kernel,
             Streaming,
+            ServiceFinite, ///< Public generation/receipt transaction, no active inference graph.
+            ServiceCaptured, ///< Same transaction through the co-resident captured worker.
         };
 
         /** One production expert projection geometry. */
@@ -921,6 +933,8 @@ namespace llaminar2
                     economy_floor_gbps < 0.0)
                     throw std::invalid_argument("invalid timing iteration count");
 
+                const bool service = mode == MeasurementMode::ServiceFinite ||
+                    mode == MeasurementMode::ServiceCaptured;
                 // The kernel-only promotion sample excludes staging DMA.  Put
                 // its first CPU chunk on device before either warmup or the
                 // start event so a zero-warmup measurement is still honest.
@@ -945,28 +959,32 @@ namespace llaminar2
                     }
                 };
 
-                for (int iteration = 0; iteration < warmup; ++iteration)
-                    enqueue();
-                stream_.synchronize();
-
                 // Each batch uses independent events, but all events and
                 // storage exist outside their measured intervals. Taking the
                 // median rejects one power-state or copy-engine scheduling
                 // outlier without selecting the unrealistically fastest run.
                 std::vector<double> sample_mean_ms;
                 sample_mean_ms.reserve(static_cast<std::size_t>(samples));
-                for (int sample = 0; sample < samples; ++sample)
+                if (service)
+                    sample_mean_ms = measureService(direction, mode, warmup, iterations, samples);
+                else
                 {
-                    BenchmarkEvent begin;
-                    BenchmarkEvent end;
-                    begin.record(stream_);
-                    for (int iteration = 0; iteration < iterations; ++iteration)
+                    for (int iteration = 0; iteration < warmup; ++iteration)
                         enqueue();
-                    end.record(stream_);
-                    end.synchronize();
-                    sample_mean_ms.push_back(
-                        BenchmarkEvent::elapsed(begin, end) /
-                        static_cast<double>(iterations));
+                    stream_.synchronize();
+                    for (int sample = 0; sample < samples; ++sample)
+                    {
+                        BenchmarkEvent begin;
+                        BenchmarkEvent end;
+                        begin.record(stream_);
+                        for (int iteration = 0; iteration < iterations; ++iteration)
+                            enqueue();
+                        end.record(stream_);
+                        end.synchronize();
+                        sample_mean_ms.push_back(
+                            BenchmarkEvent::elapsed(begin, end) /
+                            static_cast<double>(iterations));
+                    }
                 }
                 std::sort(sample_mean_ms.begin(), sample_mean_ms.end());
                 const double mean_ms = sample_mean_ms[
@@ -1018,8 +1036,15 @@ namespace llaminar2
             }
 
             /** Launch exactly one selected kernel for an isolated profiler run. */
-            void singleLaunch(Direction direction)
+            void singleLaunch(Direction direction, MeasurementMode mode = MeasurementMode::Kernel)
             {
+                if (mode == MeasurementMode::ServiceFinite)
+                {
+                    if (demotion_layout_.maximum_units_per_chunk != demotion_layout_.unit_count)
+                        throw std::invalid_argument("Single service launch requires a whole-projection chunk");
+                    (void)measureService(direction, mode, 0, 1, 1);
+                    return;
+                }
                 if (direction == Direction::CpuToGpu &&
                     !promotion_input_prepared_)
                     preparePromotionKernelInput();
@@ -1028,6 +1053,147 @@ namespace llaminar2
             }
 
         private:
+            /**
+             * @brief Time complete public packed transactions without a native repack producer.
+             * @param direction Fixed source/destination role for this measurement.
+             * @param mode Finite worker or co-resident captured worker; never an automatic retry.
+             * @param warmup Complete unmeasured projections after setup.
+             * @param iterations Complete projections in each measured batch.
+             * @param samples Independent batches; their median is selected by the caller.
+             * @return Wall milliseconds per projection, including publication, polling and CPU copies.
+             *
+             * The captured graph holds a diagnostic primary branch, not a model.
+             * It measures background progress/throughput, not interference with
+             * inference. All graph/storage setup precedes timing and the exact
+             * receipt is required before reusing staging. Both endpoint bytes
+             * are checked with the same CPU oracles used by the native benchmark.
+             */
+            std::vector<double> measureService(Direction direction, MeasurementMode mode,
+                int warmup, int iterations, int samples)
+            {
+#if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
+                int ordinal = 0;
+                if (cudaGetDevice(&ordinal) != cudaSuccess)
+                    throw std::runtime_error("Cannot resolve selected CUDA service device");
+                const auto device = DeviceId::cuda(ordinal);
+                auto &context = GPUDeviceContextPool::instance().getContext(device);
+                TransferEngine engine;
+                const DeviceId devices[] = {device};
+                auto staging = engine.allocateMappedHostTransferSlices(
+                    device_chunk_.bytes(), 1u, device).front();
+                auto epoch = MappedTransferProgressEpoch::create({
+                    .device = device, .slot_capacity = 1u, .execution_lane_capacity = 1u,
+                    .execution_streams = engine.allocatePersistentTransferExecutionLanes(
+                        1u, device, "packed_service_economy"),
+                    .maximum_bytes = device_chunk_.bytes(), .name = "packed_service_economy"});
+                auto command = epoch->reserveSlot(direction == Direction::GpuToCpu
+                    ? MappedTransferDirection::DeviceToHost : MappedTransferDirection::HostToDevice,
+                    staging);
+                const auto &layout = direction == Direction::GpuToCpu ? demotion_layout_ : promotion_layout_;
+                auto control = engine.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
+                auto *release = static_cast<std::uint64_t *>(control->mutableHostData());
+                std::atomic_ref<std::uint64_t>(*release).store(0u, std::memory_order_release);
+                auto branch = epoch->graphBranchFactory().create();
+                std::unique_ptr<IGPUGraphCapture> graph;
+                void *primary = nullptr;
+                void *terminal = nullptr;
+                auto retire = [&](void *) {
+                    std::atomic_ref<std::uint64_t>(*release).store(1u, std::memory_order_release);
+                    context.submitAndWait([&] {
+                        if (terminal && !context.synchronizeEventChecked(terminal))
+                            std::terminate();
+                        graph.reset();
+                        if (terminal) context.destroyEvent(terminal);
+                    });
+                };
+                std::unique_ptr<void, decltype(retire)> retirement(&context, retire);
+                if (mode == MeasurementMode::ServiceCaptured)
+                    context.submitAndWait([&] {
+                        primary = context.getOrCreateAuxiliaryStream("packed_service_economy_primary");
+                        terminal = context.createEvent();
+                        if (!primary || !terminal)
+                            throw std::runtime_error("Packed service graph setup failed");
+                        graph = context.createGraphCapture(primary);
+                        if (!graph) throw std::runtime_error("Packed service graph allocation failed");
+                        ScopedBackendGraphCapture capture(context, *graph, "packed service economy");
+                        if (!capture.begin() || !getBackendFor(device)->streamWaitTimelineSignal64(
+                                primary, control->deviceAlias(device), 1u, ordinal))
+                            throw std::runtime_error("Packed service graph recording failed");
+                        capture.finish();
+                        if (!branch->attach(*graph) || !graph->instantiate() || !graph->launch() ||
+                            !context.recordEventChecked(terminal, primary))
+                            throw std::runtime_error("Packed service graph admission failed");
+                    });
+
+                const auto transaction = [&] {
+                    for (std::uint32_t first = 0u; first < layout.unit_count;)
+                    {
+                        const auto units = std::min(layout.maximum_units_per_chunk, layout.unit_count - first);
+                        const auto bytes = layout.chunkBytes(units);
+                        if (direction == Direction::GpuToCpu)
+                            command.publishPackedDeviceToMappedHost(sourceView(), layout, first, units,
+                                device_chunk_.data(), device_chunk_.bytes());
+                        else
+                        {
+                            std::memcpy(staging->mutableHostData(),
+                                cpu_host_.native_interleaved.data() + layout.chunkBytes(first), bytes);
+                            command.publishPackedMappedHostToDevice(destinationView(), layout, first, units,
+                                device_chunk_.data(), device_chunk_.bytes());
+                        }
+                        if (!epoch->submitOutstandingProgress())
+                            throw std::runtime_error("Packed service submission failed");
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                        for (;;)
+                        {
+                            std::string error;
+                            const auto progress = command.poll(&error);
+                            if (progress == MappedTransferProgress::Ready) break;
+                            if (progress == MappedTransferProgress::Failed)
+                                throw std::runtime_error(error);
+                            if (std::chrono::steady_clock::now() >= deadline)
+                                throw std::runtime_error("Packed service receipt deadline exceeded");
+                            if (!epoch->submitOutstandingProgress())
+                                throw std::runtime_error("Packed service progress submission failed");
+                            std::this_thread::yield();
+                        }
+                        if (direction == Direction::GpuToCpu)
+                            std::memcpy(pinned_cpu_.data() + layout.chunkBytes(first),
+                                staging->mutableHostData(), bytes);
+                        first += units;
+                    }
+                };
+                for (int iteration = 0; iteration < warmup; ++iteration) transaction();
+                std::vector<double> result;
+                for (int sample = 0; sample < samples; ++sample)
+                {
+                    const auto started = std::chrono::steady_clock::now();
+                    for (int iteration = 0; iteration < iterations; ++iteration) transaction();
+                    result.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started).count() / iterations);
+                }
+                // Release the deliberate primary hold before diagnostic native
+                // readback, never to unblock any measured transfer transaction.
+                retirement.reset();
+                if (direction == Direction::GpuToCpu)
+                    requireEqual<std::uint8_t>({pinned_cpu_.data(), pinned_cpu_.size()},
+                        cpu_host_.native_interleaved, "service CPU bytes");
+                else
+                {
+                    requireEqual<std::uint8_t>(downloadVector(destination_payload_, stream_),
+                        destination_host_.payload, "service GPU payload");
+                    requireEqual<std::uint16_t>(downloadVector(destination_scales_, stream_),
+                        destination_host_.scales, "service GPU scales");
+                    requireEqual<std::uint16_t>(downloadVector(destination_mins_, stream_),
+                        destination_host_.mins, "service GPU minima");
+                    requireEqual<std::uint32_t>(downloadVector(destination_emins_, stream_),
+                        destination_host_.emins, "service GPU effective minima");
+                }
+                return result;
+#else
+                throw std::invalid_argument("The co-resident packed service benchmark is CUDA-specific");
+#endif
+            }
+
             /** Validate the newly created tensor before member initialization proceeds. */
             [[nodiscard]] HostGpuExpertPackedProjection requireAndPackTensor() const
             {
@@ -1299,6 +1465,7 @@ namespace llaminar2
                 << "  --shape gate_up|down|all   Real expert projection shape\n"
                 << "  --direction gpu-to-cpu|cpu-to-gpu|both\n"
                 << "  --mode kernel|streaming|both\n"
+                << "         service-finite|service-captured  CUDA public transaction wall timing\n"
                 << "  --units-per-chunk N        Complete 64-column CPU units (default 512)\n"
                 << "  --warmup N                 Unmeasured iterations (default 5)\n"
                 << "  --iterations N             Iterations per sample (default 20)\n"
@@ -1494,6 +1661,10 @@ namespace llaminar2
                 result.push_back(MeasurementMode::Kernel);
             if (options.mode == "both" || options.mode == "streaming")
                 result.push_back(MeasurementMode::Streaming);
+#if defined(LLAMINAR_EXPERT_TIER_PERF_CUDA)
+            if (options.mode == "service-finite") result.push_back(MeasurementMode::ServiceFinite);
+            if (options.mode == "service-captured") result.push_back(MeasurementMode::ServiceCaptured);
+#endif
             if (result.empty())
                 throw std::invalid_argument(
                     "unknown measurement mode: " + options.mode);
@@ -1511,7 +1682,14 @@ namespace llaminar2
         /** Stable textual scope for CSV evidence. */
         [[nodiscard]] std::string_view modeName(MeasurementMode mode)
         {
-            return mode == MeasurementMode::Kernel ? "kernel" : "streaming";
+            switch (mode)
+            {
+            case MeasurementMode::Kernel: return "kernel";
+            case MeasurementMode::Streaming: return "streaming";
+            case MeasurementMode::ServiceFinite: return "service_finite";
+            case MeasurementMode::ServiceCaptured: return "service_captured";
+            }
+            throw std::invalid_argument("Unknown measurement mode");
         }
 
         /** Emit the canonical header shared by stdout and optional artifacts. */
@@ -1600,12 +1778,15 @@ namespace llaminar2
 
             if (options.single_launch)
             {
+                if (options.mode == "service-captured")
+                    throw std::invalid_argument("Profile service-finite; an indefinitely held graph is not replayable");
                 Fixture fixture(
                     *formats.front(),
                     shapes.front(),
                     options.units_per_chunk,
                     numa_node);
-                fixture.singleLaunch(directions.front());
+                fixture.singleLaunch(directions.front(), options.mode == "service-finite"
+                    ? MeasurementMode::ServiceFinite : MeasurementMode::Kernel);
                 std::cout << "single_launch_backend=" << kBackendName
                           << " numa_node=" << numa_node
                           << " format=" << formats.front()->label

@@ -4,6 +4,9 @@
  *
  * Keep this in a separate translation unit from CUDA tests: cuda_runtime.h and
  * hip_runtime.h expose overlapping vector types and are intentionally not mixed.
+ * Retained-parent coverage includes both ordinary native graphs and the same
+ * graphs with the per-step event instrumentation used by HTTP certification.
+ * Diagnostic event nodes must preserve collective and mapped-ticket progress.
  */
 
 #include <gtest/gtest.h>
@@ -4056,6 +4059,9 @@ TEST(Test__LocalTPRCCLGraphCapture,
  * self-contained residency transaction. Participant zero's mapped ticket is
  * serviced concurrently by the CPU exactly between the dense and rooted
  * collective families.
+ * Alternate parent families retain per-step GPU timing events: the HTTP gate
+ * enables that instrumentation, so an uninstrumented-only proof would omit its
+ * actual native graph topology. Both forms import the same immutable children.
  */
 TEST(Test__LocalTPRCCLGraphCapture,
      RCCLCanonicalRankOrderReduction_TP4CapturedEpochTransactionParentCompletes)
@@ -4088,6 +4094,14 @@ TEST(Test__LocalTPRCCLGraphCapture,
     constexpr int kParticipants = 4;
     constexpr int kFragments = 49;
     constexpr int kRetainedFamilies = 4;
+    // Replay below selects both the ordinary first family and instrumented
+    // last family. This adds no second fixture or duplicated layer inventory.
+    constexpr std::array<GPUOrderedTimelineInstrumentation, kRetainedFamilies>
+        kFamilyInstrumentation{
+            GPUOrderedTimelineInstrumentation::Disabled,
+            GPUOrderedTimelineInstrumentation::PerStepEvents,
+            GPUOrderedTimelineInstrumentation::Disabled,
+            GPUOrderedTimelineInstrumentation::PerStepEvents};
     constexpr std::size_t kDenseElements = 3072u;
     constexpr std::size_t kRouteElements = 8u * kDenseElements;
     constexpr std::size_t kProductionMemcpyBytes = 993280u;
@@ -4604,7 +4618,8 @@ TEST(Test__LocalTPRCCLGraphCapture,
                         }
                         build_ok[participant] =
                             parents[family][participant]
-                                ->buildOrderedTimelineTransaction(steps);
+                                ->buildOrderedTimelineTransaction(
+                                    steps, kFamilyInstrumentation[family]);
                     }
 
                     ready_to_instantiate.arriveAndWait();
@@ -4622,9 +4637,14 @@ TEST(Test__LocalTPRCCLGraphCapture,
                 << "family=" << family << " participant=" << participant;
             ASSERT_TRUE(instantiate_ok[participant])
                 << "family=" << family << " participant=" << participant;
+            const std::size_t timing_nodes =
+                kFamilyInstrumentation[family] ==
+                        GPUOrderedTimelineInstrumentation::PerStepEvents
+                    ? 2u * kFragments
+                    : 0u;
             ASSERT_EQ(
                 parents[family][participant]->nodeCount(),
-                expected_parent_nodes[participant])
+                expected_parent_nodes[participant] + timing_nodes)
                 << "retained parent lost one or more immutable child nodes, "
                    "family="
                 << family << " participant=" << participant;
@@ -4795,6 +4815,27 @@ TEST(Test__LocalTPRCCLGraphCapture,
                 continue;
 
             ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            const auto timing =
+                parents[family][participant]->consumeOrderedTimelineTiming();
+            if (kFamilyInstrumentation[family] ==
+                GPUOrderedTimelineInstrumentation::PerStepEvents)
+            {
+                ASSERT_EQ(timing.state, GPUOrderedTimelineTimingState::Complete)
+                    << "family=" << family << " participant=" << participant
+                    << " error=" << timing.error;
+                ASSERT_EQ(timing.samples.size(), kFragments);
+                for (const auto &sample : timing.samples)
+                {
+                    EXPECT_EQ(sample.kind,
+                              GPUOrderedTimelineStepKind::CapturedFragment);
+                    EXPECT_GE(sample.elapsed_ms, 0.0);
+                }
+            }
+            else
+            {
+                EXPECT_EQ(timing.state, GPUOrderedTimelineTimingState::Disabled);
+                EXPECT_TRUE(timing.samples.empty());
+            }
             DeviceMoEOverlayEpochControl control{};
             DeviceMoEOverlayEpochTicket ticket{};
             DeviceMoEOverlayEpochStatus status{};
@@ -4844,6 +4885,11 @@ TEST(Test__LocalTPRCCLGraphCapture,
         }
         report_phase("replay_family_complete", -1, family);
     };
+    ASSERT_NO_FATAL_FAILURE(replay_family(0));
+    ASSERT_NO_FATAL_FAILURE(replay_family(kRetainedFamilies - 1));
+    // A second submission reuses the exact event and captured-plan identities.
+    // First-launch-only coverage cannot expose a stale prior timing generation
+    // or a collective plan lifetime error after another family has executed.
     ASSERT_NO_FATAL_FAILURE(replay_family(0));
     ASSERT_NO_FATAL_FAILURE(replay_family(kRetainedFamilies - 1));
 

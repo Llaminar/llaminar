@@ -27,6 +27,7 @@
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "tensors/TensorKernels.h"
 #include "transfer/MappedTransferProgressEpoch.h"
+#include "transfer/MappedTransferPackedWork.h"
 #include "transfer/TransferEngine.h"
 
 #include <algorithm>
@@ -1483,6 +1484,81 @@ namespace
     }
 
 #if defined(HAVE_CUDA)
+    /**
+     * @brief Reject malformed conversion work before following any payload address.
+     *
+     * These are deliberate infrastructure-level wire injections, not the
+     * ordinary publication API, which already rejects invalid layouts. Every
+     * bad generation must produce its exact error and leave the destination
+     * untouched. A well-formed header cannot authenticate a corrupt work body.
+     */
+    TEST(MappedTransferProgressEpochIntegration, CUDAPackedServiceRejectsMalformedWork)
+    {
+        const auto device = DeviceId::cuda(0);
+        if (!getBackendFor(device)->deviceCount()) GTEST_SKIP();
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        context.submitAndWait([&] {
+            TransferEngine engine;
+            const DeviceId devices[] = {device};
+            auto inbox = engine.allocateMappedHostRegion(
+                sizeof(MappedTransferProgressCommand) + sizeof(MappedTransferProgressCompletion), devices);
+            auto output = engine.allocateMappedHostRegion(4096u, devices);
+            auto storage = engine.allocateDeviceTransferBuffer(8192u, device);
+            auto *command = static_cast<MappedTransferProgressCommand *>(inbox->mutableHostData());
+            auto *receipt = reinterpret_cast<MappedTransferProgressCompletion *>(command + 1);
+            *command = {};
+            *receipt = {};
+            void *stream = context.getOrCreateAuxiliaryStream("invalid_packed_service");
+            ASSERT_NE(stream, nullptr);
+            auto cursors = engine.allocateMappedTransferServiceCursors(1u, device, stream);
+            void *terminal = context.createEvent();
+            ASSERT_NE(terminal, nullptr);
+            auto retire = [&](void *) { context.destroyEvent(terminal); };
+            std::unique_ptr<void, decltype(retire)> event_owner(&context, retire);
+            for (std::uint64_t generation = 1u; generation <= 3u; ++generation)
+            {
+                SCOPED_TRACE(generation);
+                std::memset(output->mutableHostData(), 0x5a, output->sizeBytes());
+                MappedTransferPackedWork description{};
+                description.kind = MappedTransferWorkKind::PackedGpuToCpu;
+                description.layout = makeGpuToCpuExpertTierWeightStreamManifest(
+                    native_vnni_formats::Q8_0, 64, 32, 1, 0, 0,
+                    ExpertTierWeightProjection::Gate, 1).deviceLayout();
+                description.scales = reinterpret_cast<std::uintptr_t>(storage->deviceData()) + 4096u;
+                description.device_staging = description.scales + 128u;
+                if (generation == 1u)
+                    description.kind = static_cast<MappedTransferWorkKind>(99u);
+                else if (generation == 2u)
+                    description.layout.gpu_codebook_id = 255u;
+                command->generation_magic = mappedTransferProgressGenerationMagic(generation);
+                command->generation_version = mappedTransferProgressGenerationVersion(generation);
+                command->source_address = reinterpret_cast<std::uintptr_t>(storage->deviceData());
+                command->destination_address = reinterpret_cast<std::uintptr_t>(output->deviceAlias(device));
+                command->bytes = description.layout.chunkBytes(1u);
+                command->source_complement = ~command->source_address;
+                command->destination_complement = ~command->destination_address;
+                command->bytes_complement = ~command->bytes;
+                std::memcpy(command->work, &description, sizeof(description));
+                for (std::size_t word = 0u; word < kMappedTransferWorkWords; ++word)
+                    command->work_complements[word] = ~command->work[word];
+                if (generation == 3u) command->work_complements[2] ^= 1u;
+                std::atomic_ref<std::uint64_t>(command->generation).store(generation, std::memory_order_release);
+                engine.enqueueMappedTransferService(*inbox, *cursors, 4096u, nullptr,
+                    MappedTransferServiceRun::FinitePass, stream);
+                ASSERT_TRUE(context.recordEventChecked(terminal, stream));
+                ASSERT_TRUE(context.synchronizeEventChecked(terminal));
+                EXPECT_EQ(std::atomic_ref<std::uint64_t>(receipt->completed_generation)
+                    .load(std::memory_order_acquire), generation);
+                EXPECT_EQ(receipt->error, static_cast<unsigned>(generation == 3u
+                    ? MappedTransferProgressError::InvalidIdentity : MappedTransferProgressError::InvalidWork));
+                EXPECT_EQ(receipt->completed_bytes, 0u);
+                const auto *bytes = static_cast<const unsigned char *>(output->mutableHostData());
+                EXPECT_TRUE(std::all_of(bytes, bytes + output->sizeBytes(),
+                    [](unsigned char byte) { return byte == 0x5a; }));
+            }
+        });
+    }
+
     /** Production TP recording must not be mistaken for GPU resource management. */
     TEST(MappedTransferProgressEpochIntegration, CUDATopologyWorkerRecordsAndReplaysProgressBranch)
     {
@@ -1512,13 +1588,15 @@ namespace
         const DeviceId devices[] = {device};
         constexpr size_t capacity = 4u;
         constexpr size_t bytes = 4u * 1024u * 1024u;
-        auto inbox = transfers.allocateMappedHostRegion(capacity * 128u, devices);
+        auto inbox = transfers.allocateMappedHostRegion(capacity *
+            (sizeof(MappedTransferProgressCommand) + sizeof(MappedTransferProgressCompletion)), devices);
         std::shared_ptr<DeviceTransferBuffer> cursors;
         auto controls = transfers.allocateMappedHostRegion(4096u, devices);
         auto wake = transfers.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
         auto source = transfers.allocateDeviceTransferBuffer(bytes + 16u, device);
         auto *control = static_cast<std::uint64_t *>(controls->mutableHostData());
         auto *commands = static_cast<MappedTransferProgressCommand *>(inbox->mutableHostData());
+        std::fill_n(commands, capacity, MappedTransferProgressCommand{});
         auto *receipts = reinterpret_cast<MappedTransferProgressCompletion *>(commands + capacity);
         std::vector<std::shared_ptr<MappedHostTransferRegion>> mapped;
         std::vector<std::shared_ptr<DeviceTransferBuffer>> destinations;

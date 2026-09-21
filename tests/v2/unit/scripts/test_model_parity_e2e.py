@@ -108,6 +108,65 @@ def inventory(records):
 
 
 class E2EDiscoveryTests(unittest.TestCase):
+    def test_cell_timeout_is_explicit_positive_metadata_not_name_inference(self):
+        """Only the typed profile grants an extended allowance."""
+        profile = {"cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200}}
+        self.assertEqual(e2e.cell_timeout_seconds(profile, e2e.CPUISA.AVX512), 900)
+        self.assertEqual(e2e.cell_timeout_seconds(profile, e2e.CPUISA.AVX2), 1200)
+        for budgets in (None, 900, {}, {"AVX2": 1200},
+                        {"AVX512": 900, "AVX2": 1200, "SSE2": 1800}):
+            with self.subTest(budgets=budgets), self.assertRaises(ValueError):
+                e2e.cell_timeout_seconds({"cell_timeout_seconds": budgets}, e2e.CPUISA.AVX2)
+        for isa in e2e.CPUISA:
+            for seconds in (None, 0, -1, True, "1200", 1200.5):
+                invalid = {**profile["cell_timeout_seconds"], isa.value: seconds}
+                with self.subTest(isa=isa, seconds=seconds), self.assertRaises(ValueError):
+                    e2e.cell_timeout_seconds({"cell_timeout_seconds": invalid}, e2e.CPUISA.AVX2)
+        with self.assertRaises(ValueError):
+            e2e.cell_timeout_seconds({"id": "AVX2_CPU_only"}, e2e.CPUISA.AVX2)
+        with self.assertRaises(ValueError):
+            e2e.cell_timeout_seconds(profile, "AVX2")
+
+    def test_runtime_isa_comes_from_the_tested_build_or_image(self):
+        """One inventory companion cannot impose its own ISA on either runtime."""
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "llaminar2"
+            cache = binary.parent / "CMakeCache.txt"
+            for isa in e2e.CPUISA:
+                cache.write_text(f"CMAKE_BUILD_TYPE:STRING=Release\nLLAMINAR_CPU_ISA:STRING={isa.value}\n")
+                self.assertEqual(e2e.release_binary_cpu_isa(binary), isa)
+                cache.write_text(f"CMAKE_BUILD_TYPE:STRING=Release\nLLAMINAR_CPU_ISA:STRING={isa.value.lower()}\n")
+                self.assertEqual(e2e.release_binary_cpu_isa(binary), isa)
+                identity = {"labels": {"org.llaminar.cpu_isa": isa.value}}
+                self.assertEqual(e2e.image_cpu_isa(identity), isa)
+            for contents in ("", "CMAKE_BUILD_TYPE:STRING=Integration\nLLAMINAR_CPU_ISA:STRING=AVX2\n",
+                             "CMAKE_BUILD_TYPE:STRING=Release\n",
+                             "CMAKE_BUILD_TYPE:STRING=Release\nLLAMINAR_CPU_ISA:STRING=native\n"):
+                cache.write_text(contents)
+                with self.assertRaises(ValueError):
+                    e2e.release_binary_cpu_isa(binary)
+        for identity in ({}, {"labels": None}, {"labels": {}},
+                         {"labels": {"org.llaminar.cpu_isa": "SSE2"}}):
+            with self.assertRaises(ValueError):
+                e2e.image_cpu_isa(identity)
+
+    def test_extended_cell_still_has_one_process_group_deadline(self):
+        """Plan, process creation and HTTP all spend the approved twenty minutes."""
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.wait.side_effect = [0, e2e.subprocess.TimeoutExpired("http", 1155)]
+        with patch.object(e2e.time, "monotonic", side_effect=[100, 100, 100, 140, 145]), \
+             patch.object(e2e.subprocess, "Popen", return_value=process), \
+             patch.object(e2e.parity, "_terminate_process_group") as retire:
+            budget = e2e.E2ECellBudget(1200)
+            self.assertEqual(e2e.run_e2e_process(["plan"], {}, None, budget=budget), 0)
+            self.assertEqual(e2e.run_e2e_process(["http"], {}, None, budget=budget), 124)
+        self.assertEqual([call.kwargs["timeout"] for call in process.wait.call_args_list], [1200, 1155])
+        retire.assert_called_once_with(process)
+        for invalid in (0, -1, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                e2e.E2ECellBudget(invalid)
+
     def test_cpu_node_tp_uses_cpu_evidence_without_adding_device_placement(self):
         self.assertEqual(e2e.harness_backend("CPU"), "cpu:0")
         for signature in ("CUDA", "ROCm", "CPU+CUDA", "CPU+ROCm", "CUDA+ROCm"):
@@ -191,7 +250,8 @@ class E2EDiscoveryTests(unittest.TestCase):
     def test_inherited_lite_or_small_context_cannot_weaken_profile(self):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
                    "generation_tokens": 2048, "request_timeout_seconds": 600,
-                   "readiness_timeout_seconds": 180, "thinking_modes": "both", "movement_evidence": "required"}
+                   "readiness_timeout_seconds": 180, "cell_timeout_seconds": {"AVX512": 900, "AVX2": 900},
+                   "thinking_modes": "both", "movement_evidence": "required"}
         with patch.dict(e2e.os.environ, {"LLAMINAR_E2E_LONG_CONTEXT_TIER": "lite",
                                         "LLAMINAR_E2E_CONTEXT_LENGTH": "128",
                                         "LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS": "9999",
@@ -208,7 +268,9 @@ class E2EDiscoveryTests(unittest.TestCase):
 
     def test_readiness_is_per_cell_and_cannot_extend_the_exact_cell_watchdog(self):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
-                   "generation_tokens": 2048, "request_timeout_seconds": 600, "thinking_modes": "both", "movement_evidence": "not_applicable"}
+                   "generation_tokens": 2048, "request_timeout_seconds": 600,
+                   "cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200},
+                   "thinking_modes": "both", "movement_evidence": "not_applicable"}
         for seconds in (60, 180, 900):
             env = e2e.certification_environment(profile | {"readiness_timeout_seconds": seconds}, Path("/tmp/e2e"))
             self.assertEqual(env["LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS"], str(seconds))

@@ -322,6 +322,15 @@ second runtime search. Select the compatible library explicitly when configuring
 a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
 
+ROCm graph execution also requires the canonical HIP runtime built by
+`scripts/docker/install-hip-graph-runtime.sh`. Development and release builders
+install its race-free graph-identity repair; Release images copy that exact DSO
+from the builder. Outside those images, install the matching `rocm-llvm-dev`
+package and run this installer before ROCm gates. Do not disable packet capture
+or serialize independent graph builders to hide an unfixed system HIP runtime.
+`V2_Integration_HIPConcurrentGraphIdentity` is the focused preflight proof that
+every operation survives concurrent construction and replay.
+
 Full-backend binaries also run on CPU-only cluster members. Keep CUDA Driver
 API binding in `CUDADriverApi`, prepared before CUDA graph recording; do not
 restore a public `CUDA::cuda_driver` dependency or inject toolkit stubs into

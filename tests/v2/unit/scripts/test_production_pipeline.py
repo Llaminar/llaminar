@@ -2226,6 +2226,7 @@ class CrossHostRunnerTests(unittest.TestCase):
                 public.write_text(PUBLIC_KEY)
                 profile = {"context_length": 4096, "minimum_prompt_tokens": 900,
                     "generation_tokens": 384, "readiness_timeout_seconds": 60,
+                    "cell_timeout_seconds": {"AVX512": 900, "AVX2": 900},
                     "request_timeout_seconds": 60, "thinking_modes": "non-thinking",
                     "movement_evidence": "required"}
                 parent = cell()
@@ -3660,6 +3661,45 @@ class InfrastructureTests(unittest.TestCase):
         self.assertLess(rccl_start, patch_copy)
         self.assertLess(patch_copy, patch_consumer)
         self.assertLess(patch_consumer, patch_cleanup)
+
+    def test_hip_runtime_repair_is_shared_by_builder_and_shipping_image(self):
+        """A green builder cannot ship the uncorrected distribution HIP DSO.
+
+        The native preflight proves execution, while this packaging contract
+        keeps that same standard-SONAME library in both shipping ISA lanes.
+        Runtime images do not need the compiler or a second source build.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        toolchain = dockerfile.split("FROM toolchain AS builder", 1)[0]
+        installer = (ROOT / "scripts/docker/install-rocm.sh").read_text(encoding="utf-8")
+        self.assertIn("scripts/docker/install-hip-graph-runtime.sh", toolchain)
+        self.assertIn("patches/rocm-hip-graph-node-identity.patch", toolchain)
+        self.assertIn('if [[ "${MODE}" != runtime ]]; then', installer)
+        self.assertIn('bash "$(dirname -- "${BASH_SOURCE[0]}")/install-hip-graph-runtime.sh"', installer)
+        self.assertIn("cp -L /opt/rocm/lib/libamdhip64.so.7 /src/runtime-libs/libamdhip64.so.7", dockerfile)
+        self.assertIn("/opt/rocm/share/licenses/llaminar-hip", dockerfile)
+        runtime = dockerfile.split("FROM ubuntu:24.04 AS runtime", 1)[1].split(
+            "FROM runtime AS test-runner", 1)[0]
+        self.assertIn("COPY --from=builder /src/runtime-libs/ /usr/local/lib/", runtime)
+        self.assertIn("LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib", runtime)
+
+    def test_hip_runtime_installer_rejects_an_unreviewed_sdk_before_building(self):
+        """An SDK override must not silently mix a pinned HIP runtime ABI."""
+        with tempfile.TemporaryDirectory() as directory:
+            sdk = Path(directory) / "sdk"
+            (sdk / ".info").mkdir(parents=True)
+            for version in (None, "7.2.3", "7.3.0"):
+                with self.subTest(version=version):
+                    if version is not None:
+                        (sdk / ".info/version").write_text(version + "\n")
+                    result = subprocess.run(
+                        ["bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                        env={**os.environ, "ROCM_PATH": str(sdk),
+                             "HIP_RUNTIME_INSTALL_PREFIX": str(Path(directory) / "output")},
+                        text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("requires the pinned ROCm 7.2.4 SDK", result.stderr)
+                    self.assertFalse((Path(directory) / "output").exists())
 
     def test_build_planning_never_probes_docker(self):
         with tempfile.TemporaryDirectory() as directory:

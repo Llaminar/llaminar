@@ -247,16 +247,17 @@ namespace llaminar2
         bool enqueueNextChunk(std::string *error) noexcept;
 
         /**
-         * @brief Publish an FP16/BF16/FP32 byte chunk to the shared graph service.
+         * @brief Publish a byte or packed-conversion chunk to the shared graph service.
          * @param byte_offset First byte of the retained source/inactive destination.
+         * @param unit_count Whole CPU units, or zero for a contiguous floating chunk.
          * @param bytes Exact positive chunk size within the persistent slice.
          * @param error Receives the precise publication failure.
          * @return True only after acceptance; the GPU receipt still owns completion.
          */
-        bool publishContiguousChunk(std::size_t byte_offset, std::size_t bytes,
-                                    std::string *error) noexcept;
+        bool publishServiceChunk(std::size_t byte_offset, std::uint32_t unit_count,
+                                 std::size_t bytes, std::string *error) noexcept;
 
-        /** @return Exact service command, or null for a native conversion/copy. */
+        /** @return Exact service command, or null for the backend's native mechanism. */
         [[nodiscard]] MappedTransferProgressSlot *serviceCommand() noexcept;
 
         /** @brief Dispatch the backend-specific GPU-to-CPU conversion kernel. */

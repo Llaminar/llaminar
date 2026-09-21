@@ -9,10 +9,30 @@ source control. No model bytes are hashed by this module.
 from __future__ import annotations
 
 import hashlib
+from enum import Enum
 import json
 import math
 from pathlib import Path
 import subprocess
+
+
+class CPUISA(str, Enum):
+    """The explicit whole-runtime ISA contracts of the two shippable images.
+
+    Test inventory and physical host capabilities do not identify a tested
+    binary's ISA. Consumers use its build declaration or immutable OCI label.
+    """
+
+    AVX2 = "AVX2"
+    AVX512 = "AVX512"
+
+
+def image_cpu_isa(identity: dict) -> CPUISA:
+    """Read the admitted runtime's ISA, rejecting missing or unknown labels."""
+    try:
+        return CPUISA(identity["labels"]["org.llaminar.cpu_isa"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("runtime image has no supported explicit CPU ISA") from error
 
 
 def model_identities(manifest: dict) -> dict:

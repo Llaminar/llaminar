@@ -414,7 +414,8 @@ TEST_F(Test__MappedHostTransferRegion, ResumableServiceUsesExactBindingsWithoutB
         auto &spy = device.is_cuda() ? *cuda_ : *rocm_;
         constexpr size_t capacity = 7u;
         const DeviceId devices[] = {device};
-        auto inbox = engine_.allocateMappedHostRegion(capacity * 128u, devices);
+        auto inbox = engine_.allocateMappedHostRegion(capacity *
+            (sizeof(MappedTransferProgressCommand) + sizeof(MappedTransferProgressCompletion)), devices);
         auto wake = engine_.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
         auto *stream = reinterpret_cast<void *>(0x12340u);
         auto cursors = engine_.allocateMappedTransferServiceCursors(capacity, device, stream);
@@ -452,7 +453,9 @@ TEST_F(Test__MappedHostTransferRegion, ResumableServiceRejectsIncompleteOrContra
     auto cursors = engine_.allocateDeviceTransferBuffer(sizeof(MappedTransferServiceCursor), device);
     auto odd = engine_.allocateDeviceTransferBuffer(sizeof(MappedTransferServiceCursor) + 1u, device);
     auto oversized = engine_.allocateDeviceTransferBuffer(
-        (inbox->sizeBytes() / 128u + 1u) * sizeof(MappedTransferServiceCursor), device);
+        (inbox->sizeBytes() /
+            (sizeof(MappedTransferProgressCommand) + sizeof(MappedTransferProgressCompletion)) + 1u) *
+            sizeof(MappedTransferServiceCursor), device);
     auto wake = engine_.allocateMappedHostRegion(sizeof(std::uint64_t), devices);
     const DeviceId foreign_devices[] = {DeviceId::rocm(0)};
     auto foreign = engine_.allocateMappedHostRegion(

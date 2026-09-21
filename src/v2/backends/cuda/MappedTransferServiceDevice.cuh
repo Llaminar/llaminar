@@ -1,6 +1,6 @@
 /**
  * @file MappedTransferServiceDevice.cuh
- * @brief Graph-bounded CUDA copy service with device-owned claims.
+ * @brief Graph-bounded CUDA transfer service with device-owned claims.
  *
  * Native future-event consumers can occupy all queues used by independent copy
  * submissions. A root branch of the inference graph is already admitted and
@@ -25,7 +25,7 @@ namespace llaminar2
     }
 
     /** System-visible lifecycle publication ordered in the captured branch. */
-    __global__ void mappedTransferWakeStateKernel(
+    static __global__ void mappedTransferWakeStateKernel(
         std::uint64_t *wake, MappedTransferWakeState value)
     {
         auto word = ::cuda::atomic_ref<std::uint64_t,
@@ -40,6 +40,7 @@ namespace llaminar2
 
     /**
      * @brief Progress independent inboxes under an explicit bounded lifetime.
+     * @tparam Payload Allocation-free operation sharing this claim/completion protocol.
      * @param commands Immutable host publications, one per physical inbox.
      * @param completions GPU release receipts acquired by the maintenance owner.
      * @param cursors Device-only locks and partial byte positions shared by workers.
@@ -53,6 +54,7 @@ namespace llaminar2
      * mapped writes. While retaining a claim, successive 64 KiB copy quanta need
      * no system fence or PCIe cursor writes: only retirement/completion publishes.
      */
+    template <typename Payload>
     __global__ void mappedTransferServiceKernel(
         const MappedTransferProgressCommand *commands,
         MappedTransferProgressCompletion *completions,
@@ -115,6 +117,11 @@ namespace llaminar2
                                     error = static_cast<unsigned>(MappedTransferProgressError::InvalidAddress);
                                 else if (!command.bytes || command.bytes > maximum_bytes)
                                     error = static_cast<unsigned>(MappedTransferProgressError::InvalidByteCount);
+                                for (unsigned word = 0u; word < kMappedTransferWorkWords; ++word)
+                                    if (command.work_complements[word] != ~command.work[word])
+                                        error = static_cast<unsigned>(MappedTransferProgressError::InvalidIdentity);
+                                if (!error && !Payload::valid(command))
+                                    error = static_cast<unsigned>(MappedTransferProgressError::InvalidWork);
                                 if (cursor.generation != generation)
                                 {
                                     cursor.generation = generation;
@@ -140,23 +147,9 @@ namespace llaminar2
 
                 while (position < command.bytes && !error)
                 {
-                    const auto remaining = command.bytes - position;
-                    const auto count = remaining < quantum ? remaining : quantum;
-                    auto *dst = reinterpret_cast<unsigned char *>(command.destination_address) + position;
-                    const auto *src = reinterpret_cast<const unsigned char *>(command.source_address) + position;
-                    if (((command.destination_address | command.source_address) & 15u) == 0u)
-                    {
-                        const auto vectors = count / sizeof(uint4);
-                        for (std::uint64_t i = threadIdx.x; i < vectors; i += blockDim.x)
-                            reinterpret_cast<uint4 *>(dst)[i] = reinterpret_cast<const uint4 *>(src)[i];
-                        for (std::uint64_t i = vectors * sizeof(uint4) + threadIdx.x; i < count; i += blockDim.x)
-                            dst[i] = src[i];
-                    }
-                    else
-                    {
-                        for (std::uint64_t i = threadIdx.x; i < count; i += blockDim.x)
-                            dst[i] = src[i];
-                    }
+                    // Reformatting and transport own one quantum. Neither may
+                    // enqueue a future native kernel outside this admitted CTA.
+                    const auto count = Payload::advance(command, position, quantum);
                     __syncthreads();
                     if (threadIdx.x == 0u)
                     {

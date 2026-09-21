@@ -13,6 +13,7 @@
  */
 
 #include "MappedTransferProgressEpoch.h"
+#include "MappedTransferPackedWork.h"
 
 #include "TransferEngine.h"
 #include "backends/BackendManager.h"
@@ -26,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -174,6 +176,8 @@ namespace llaminar2
                 return "invalid source or destination address";
             case MappedTransferProgressError::InvalidByteCount:
                 return "invalid byte count";
+            case MappedTransferProgressError::InvalidWork:
+                return "invalid transfer work description";
             }
             return "unknown transfer error";
         }
@@ -208,6 +212,9 @@ namespace llaminar2
             std::uint64_t generation,
             std::size_t maximum_bytes) noexcept
         {
+            for (std::size_t word = 0; word < kMappedTransferWorkWords; ++word)
+                if (command.work_complements[word] != ~command.work[word])
+                    return false;
             return generation != 0u &&
                    command.generation_magic ==
                        mappedTransferProgressGenerationMagic(generation) &&
@@ -325,6 +332,74 @@ namespace llaminar2
         pending_generation_ = epoch_->publish(
             index_, generation, MappedTransferDirection::HostToDevice,
             destination, destination_capacity, destination_offset, bytes);
+        pending_ = true;
+        return pending_generation_;
+    }
+
+    std::uint64_t MappedTransferProgressSlot::publishPackedDeviceToMappedHost(
+        const ExpertTierGpuConstProjectionView &source,
+        const ExpertTierWeightDeviceLayout &layout,
+        std::uint32_t first_unit, std::uint32_t unit_count,
+        void *device_staging, std::size_t staging_capacity,
+        TransferProducerDependency dependency)
+    {
+        if (!valid() || pending_ || !epoch_->device().is_cuda())
+            throw std::logic_error("Packed transfer requires an idle CUDA service slot");
+        if (!source.validFor(layout) ||
+            layout.direction != ExpertTierWeightConversionDirection::GpuToCpu ||
+            !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
+            unit_count > layout.unit_count - first_unit ||
+            unit_count > layout.maximum_units_per_chunk ||
+            staging_capacity < layout.chunkBytes(unit_count))
+            throw std::invalid_argument("Packed download exceeds its authenticated geometry or staging");
+        if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Packed transfer slot generation overflowed");
+
+        MappedTransferPackedWork work{};
+        work.kind = MappedTransferWorkKind::PackedGpuToCpu;
+        work.first_unit = first_unit;
+        work.layout = layout;
+        work.scales = reinterpret_cast<std::uintptr_t>(source.scales);
+        work.mins = reinterpret_cast<std::uintptr_t>(source.mins);
+        work.emins = reinterpret_cast<std::uintptr_t>(source.emins);
+        work.device_staging = reinterpret_cast<std::uintptr_t>(device_staging);
+        pending_generation_ = epoch_->publish(index_, ++next_generation_,
+            MappedTransferDirection::DeviceToHost, source.payload,
+            source.payload_bytes, 0u, layout.chunkBytes(unit_count), dependency, &work);
+        pending_ = true;
+        return pending_generation_;
+    }
+
+    std::uint64_t MappedTransferProgressSlot::publishPackedMappedHostToDevice(
+        const ExpertTierGpuMutableProjectionView &destination,
+        const ExpertTierWeightDeviceLayout &layout,
+        std::uint32_t first_unit, std::uint32_t unit_count,
+        void *device_staging, std::size_t staging_capacity)
+    {
+        if (!valid() || pending_ || !epoch_->device().is_cuda())
+            throw std::logic_error("Packed transfer requires an idle CUDA service slot");
+        if (!destination.validFor(layout) ||
+            layout.direction != ExpertTierWeightConversionDirection::CpuToGpu ||
+            !device_staging || unit_count == 0u || first_unit >= layout.unit_count ||
+            unit_count > layout.unit_count - first_unit ||
+            unit_count > layout.maximum_units_per_chunk ||
+            staging_capacity < layout.chunkBytes(unit_count))
+            throw std::invalid_argument("Packed upload exceeds its authenticated geometry or staging");
+        if (next_generation_ == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("Packed transfer slot generation overflowed");
+
+        MappedTransferPackedWork work{};
+        work.kind = MappedTransferWorkKind::PackedCpuToGpu;
+        work.first_unit = first_unit;
+        work.layout = layout;
+        work.scales = reinterpret_cast<std::uintptr_t>(destination.scales);
+        work.mins = reinterpret_cast<std::uintptr_t>(destination.mins);
+        work.emins = reinterpret_cast<std::uintptr_t>(destination.emins);
+        work.device_staging = reinterpret_cast<std::uintptr_t>(device_staging);
+        pending_generation_ = epoch_->publish(index_, ++next_generation_,
+            MappedTransferDirection::HostToDevice, destination.payload,
+            destination.payload_bytes, 0u, layout.chunkBytes(unit_count),
+            TransferProducerDependency::published(), &work);
         pending_ = true;
         return pending_generation_;
     }
@@ -693,12 +768,13 @@ namespace llaminar2
         std::size_t device_capacity,
         std::size_t device_offset,
         std::size_t bytes,
-        TransferProducerDependency dependency)
+        TransferProducerDependency dependency,
+        const MappedTransferPackedWork *packed_work)
     {
         if (generation == 0u || !device_region || bytes == 0u ||
             bytes > config_.maximum_bytes ||
             device_offset > device_capacity ||
-            bytes > device_capacity - device_offset)
+            (!packed_work && bytes > device_capacity - device_offset))
         {
             throw std::invalid_argument(
                 "Mapped transfer-progress command has invalid slot, device bounds, generation, or bytes");
@@ -707,7 +783,7 @@ namespace llaminar2
         std::size_t previous_outstanding = 0u;
         {
             /* Publication and device-worker lane assignment share this lock.
-             * The immutable command cache line is still release-published so
+             * The immutable command extent is still release-published so
              * observation remains correct if submission later moves to a
              * retained device-side dispatcher. */
             std::lock_guard<std::mutex> lock(reservation_mutex_);
@@ -769,6 +845,11 @@ namespace llaminar2
             entry.source_complement = ~source_address;
             entry.destination_complement = ~destination_address;
             entry.bytes_complement = ~byte_count;
+            std::fill(std::begin(entry.work), std::end(entry.work), 0u);
+            if (packed_work)
+                std::memcpy(entry.work, packed_work, sizeof(*packed_work));
+            for (std::size_t word = 0; word < kMappedTransferWorkWords; ++word)
+                entry.work_complements[word] = ~entry.work[word];
             std::atomic_ref<std::uint64_t>(entry.generation).store(
                 generation, std::memory_order_release);
 
@@ -1243,6 +1324,9 @@ namespace llaminar2
                     inbox.source_complement = ~inbox.source_address;
                     inbox.destination_complement = ~inbox.destination_address;
                     inbox.bytes_complement = ~inbox.bytes;
+                    std::copy(std::begin(entry.work), std::end(entry.work), std::begin(inbox.work));
+                    std::copy(std::begin(entry.work_complements), std::end(entry.work_complements),
+                              std::begin(inbox.work_complements));
                     // The GPU claims execution. CPU publication reserves only
                     // immutable physical IO storage, never a queued-worker lock.
                     std::atomic_ref<std::uint64_t>(inbox.generation)

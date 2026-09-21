@@ -173,7 +173,9 @@ What is 2+2?<|im_end|>
             // Never authenticate the fine-tune against its parent's reference pack.
             variant.model.reference_directory =
                 "pytorch_ornith15_moe_" + source.topology.test_id + "_snapshots";
-            if (overlay)
+            // Preserve already-authored CPU certification budgets and coverage;
+            // only previously untagged overlay topologies need a new selector.
+            if (overlay && variant.e2e_certifiable.empty())
                 variant.e2e_certifiable = {{
                     .mtp = ModelParityMTP::DynamicDepth,
                     .owner_order = RoutedExpertOwnerOrder::Ordinal,

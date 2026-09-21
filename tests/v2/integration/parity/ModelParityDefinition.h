@@ -546,6 +546,21 @@ namespace llaminar2::test::parity
         throw std::invalid_argument("invalid E2E thinking coverage policy");
     }
 
+    /**
+     * @brief Complete HTTP deadlines for both shipped CPU ISAs.
+     *
+     * Inventory is exported once and shared by both runtime images. Keep both
+     * budgets in that declaration: the inventory helper's compiled ISA must
+     * never determine the deadline for the separately tested runtime.
+     */
+    struct ModelParityE2ECellTimeouts
+    {
+        int avx512 = 900;
+        int avx2 = 900;
+        friend bool operator==(const ModelParityE2ECellTimeouts &,
+                               const ModelParityE2ECellTimeouts &) = default;
+    };
+
     /** Full HTTP needle/long-context workload, independent of numerical prompt size. */
     struct ModelParityE2EProfile
     {
@@ -555,6 +570,8 @@ namespace llaminar2::test::parity
         int request_timeout_seconds = 600;
         /** Startup readiness budget; independent of the request and exact-cell watchdogs. */
         int readiness_timeout_seconds = 60;
+        /** Complete HTTP cell, including startup, all checks and shutdown; never reset per phase. */
+        ModelParityE2ECellTimeouts cell_timeout_seconds;
         /** Test both reasoning modes by default, including renamed fine-tunes. */
         ModelParityE2EThinkingModes thinking_modes = ModelParityE2EThinkingModes::ThinkingAndNonThinking;
         friend bool operator==(const ModelParityE2EProfile &,
@@ -2083,6 +2100,9 @@ namespace llaminar2::test::parity
                 profile.context_length <= 0 || profile.minimum_prompt_tokens <= 0 ||
                 profile.generation_tokens <= 0 || profile.request_timeout_seconds <= 0 ||
                 profile.readiness_timeout_seconds <= 0 ||
+                profile.cell_timeout_seconds.avx512 <= 0 || profile.cell_timeout_seconds.avx2 <= 0 ||
+                profile.readiness_timeout_seconds > profile.cell_timeout_seconds.avx512 ||
+                profile.readiness_timeout_seconds > profile.cell_timeout_seconds.avx2 ||
                 static_cast<std::int64_t>(profile.minimum_prompt_tokens) + profile.generation_tokens >=
                     profile.context_length)
                 throw std::invalid_argument("invalid E2E certification selection/profile");

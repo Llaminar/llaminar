@@ -1878,9 +1878,11 @@ namespace llaminar2::test::parity
                 EXPECT_EQ(after[i].expert_overlay->movement, ModelParityExpertMovement::Dynamic);
                 EXPECT_EQ(after[i].expert_overlay->owner_order, RoutedExpertOwnerOrder::Random);
                 EXPECT_EQ(after[i].e2e_certification->readiness_timeout_seconds, 180);
+                EXPECT_EQ(after[i].e2e_certification->cell_timeout_seconds, ModelParityE2ECellTimeouts{});
                 std::ostringstream exported;
                 PrintTo(after[i], &exported);
                 EXPECT_NE(exported.str().find("\"readiness_timeout_seconds\":180"), std::string::npos);
+                EXPECT_NE(exported.str().find("\"cell_timeout_seconds\":{\"AVX512\":900,\"AVX2\":900}"), std::string::npos);
             }
         }
         EXPECT_EQ(tags, 1);
@@ -1939,7 +1941,13 @@ namespace llaminar2::test::parity
         {
             definition.e2e_certifiable = {{.profile = {.readiness_timeout_seconds = timeout}}};
             EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+            definition.e2e_certifiable = {{.profile = {.cell_timeout_seconds = {.avx512 = timeout}}}};
+            EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
+            definition.e2e_certifiable = {{.profile = {.cell_timeout_seconds = {.avx2 = timeout}}}};
+            EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
         }
+        definition.e2e_certifiable = {{.profile = {.readiness_timeout_seconds = 901}}};
+        EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
         definition.e2e_certifiable = {{}};
         const auto cells = expandModelParityDefinition(definition);
         ASSERT_TRUE(cells.front().e2e_certification);
@@ -2393,7 +2401,7 @@ namespace llaminar2::test::parity
             EXPECT_NE(variant.model.reference_directory, source->model.reference_directory);
             EXPECT_TRUE(references.insert(variant.model.reference_directory).second);
             auto expected_definition = *source;
-            if (source->topology.expert_overlay_plan)
+            if (source->topology.expert_overlay_plan && expected_definition.e2e_certifiable.empty())
                 expected_definition.e2e_certifiable = {{
                     .mtp = ModelParityMTP::DynamicDepth,
                     .owner_order = RoutedExpertOwnerOrder::Ordinal,
@@ -2416,6 +2424,8 @@ namespace llaminar2::test::parity
                 EXPECT_EQ(expected, modelParityServerArguments(after[j]));
                 EXPECT_EQ(after[j].e2e_certification->readiness_timeout_seconds,
                           before[j].e2e_certification->readiness_timeout_seconds);
+                EXPECT_EQ(after[j].e2e_certification->cell_timeout_seconds,
+                          before[j].e2e_certification->cell_timeout_seconds);
                 EXPECT_EQ(after[j].e2e_certification->thinking_modes,
                           ModelParityE2EThinkingModes::ThinkingAndNonThinking);
                 const auto config = parseE2EArguments(after[j]);
@@ -2481,6 +2491,42 @@ namespace llaminar2::test::parity
             EXPECT_FALSE(cell.e2e_certification);
             EXPECT_EQ(cell.model.decode_steps, 89);
         }
+    }
+
+    /** Only the two CPU-only AVX2 certificates receive the approved longer deadline. */
+    TEST(ModelParityDefinition, E2ECellTimeoutIsScopedToCPUOnlyAVX2Definitions)
+    {
+        std::vector<ModelParityDefinition> originals{
+            qwen36::qwen36MoECPU2NodeTPParityDefinition()};
+        for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                    qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+            originals.push_back(qwen36::qwen36MoEParityDefinition(
+                topology, "/references/qwen36", qwen36::qwen36MoEExpertOverlayThresholds()));
+        std::size_t cpu_tags = 0u, gpu_tags = 0u;
+        for (const auto &definition : qwen36::withOrnith15CertificationModels(originals))
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                const bool cpu_only = std::all_of(cell.topology.participants.begin(),
+                    cell.topology.participants.end(), [](const auto &participant) {
+                        return participant.address.isCPU();
+                    });
+                cpu_only ? ++cpu_tags : ++gpu_tags;
+                // Inventory is ISA-independent, including when exported by
+                // the AVX2 companion for an AVX512 Release image.
+                const int expected_avx2 = cpu_only ? 1200 : 900;
+                EXPECT_EQ(cell.e2e_certification->cell_timeout_seconds.avx512, 900);
+                EXPECT_EQ(cell.e2e_certification->cell_timeout_seconds.avx2, expected_avx2);
+                std::ostringstream exported;
+                PrintTo(cell, &exported);
+                const auto budgets = nlohmann::json::parse(exported.str()).at("e2e").at("cell_timeout_seconds");
+                EXPECT_EQ(budgets.at("AVX512"), 900);
+                EXPECT_EQ(budgets.at("AVX2"), expected_avx2);
+                EXPECT_EQ(cell.e2e_certification->generation_tokens, 2048);
+                EXPECT_EQ(cell.e2e_certification->minimum_prompt_tokens, 4096);
+            }
+        EXPECT_EQ(cpu_tags, 2u);
+        EXPECT_EQ(gpu_tags, 2u);
     }
 
     TEST(ModelParityDefinition, CPUNodeCertificationRetainsFullMatrixAndOneAuthority)

@@ -334,8 +334,14 @@ recall, multi-needle JSON recall, structured long generation, cache reset,
 near-limit admission and oversized-context rejection. It additionally retains
 the harness's chat, streaming, prefix, error-response, graph/PerfStats, memory,
 and shutdown checks. There is no model-size skip for a tagged cell. Each HTTP
-cell has the canonical fifteen-minute watchdog, including startup and shutdown;
-expiry retires its full server/MPI process group and records a timeout.
+cell has one profile-owned `cell_timeout_seconds` watchdog (default fifteen
+minutes), including startup and shutdown. The profile exports budgets for both
+ISAs; the runner selects the tested image's OCI ISA label or the local Release
+binary's CMake ISA, never the inventory companion's ISA. The two AVX2 CPU-only Qwen3.6/Ornith
+MoE selectors explicitly allow twenty minutes; their AVX512 counterparts and
+all GPU cells retain fifteen. Expiry retires the full server/MPI process group
+and records a timeout. Changing this HTTP allowance does not change the
+diagnostic mathematical-cell watchdog or shorten any accuracy check.
 
 Remote MPI certification has a distinct typed declaration on the same E2E
 selection: `remote_cpu_overlays`. It adds one-GPU/remote-CPU topology intents,
@@ -439,7 +445,7 @@ an exact certification selector's `.profile` when model loading and graph setup
 need a larger budget; the initial 122B tags use 180 seconds. Discovery exports
 this value and the driver passes it to the HTTP harness, overriding inherited
 startup-timeout environment settings. It is independent of the request timeout
-and cannot extend the fifteen-minute exact-cell watchdog. Neither the runner nor
+and cannot extend the profile's whole-cell watchdog. Neither the runner nor
 the harness infers a timeout from model size or a cell name. Rebuild and export
 the manifest after changing a profile.
 

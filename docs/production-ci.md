@@ -225,7 +225,9 @@ Runtime images do not contain model-parity executables. Discovery therefore
 builds a full-matrix **test companion from the tested image's exact committed
 source**, using the existing installed-inventory exporter. One full-backend
 AVX2 companion describes the ISA-independent matrix; it performs metadata
-discovery only. All model inference uses the pulled runtime image IDs. No
+discovery only. Its typed HTTP profiles carry both ISA deadlines; the tested
+runtime's immutable ISA label selects the applicable budget, not the companion's
+compile options. All model inference uses the pulled runtime image IDs. No
 model/topology list is copied into workflow YAML or the new driver.
 
 The ARC pod's model/cache mounts remain read-only. Canonical HTTP and benchmark
@@ -251,7 +253,9 @@ python3 scripts/ci/run_published_image_suite.py benchmarks \
 Use a new output directory for each attempt; partial evidence is retained, not
 silently promoted or overwritten. `--models` and `--model-ramdisk-root` use the
 same model staging authority as the full pipeline. There is no reduced-suite,
-timeout extension or diagnostic bypass in these publishing workflows. For a
+CLI timeout override or diagnostic bypass in these publishing workflows. Whole-cell
+deadlines come from the canonical typed profiles, including explicitly approved
+ISA-specific budgets. For a
 failing cell, use the existing E2E/benchmark runner's explicit diagnostic
 selection, then rerun the complete suite on the corrected published pair.
 Unit/preflight are not rerun per model cell: published develop images already
@@ -575,7 +579,8 @@ SSH compression; all original JSON records and collision checks are preserved.
 Plan/apply first runs the public `plan` command and distributes its completed
 document, then starts `serve --config`. Only serving spends the cell's
 server-readiness window; planning and the complete HTTP phase share one
-immutable fifteen-minute frontend budget. Planning failure or cancellation never
+immutable profile-owned frontend budget (fifteen minutes by default), selected
+by the controller runtime ISA. Planning failure or cancellation never
 starts the server, and changing phases cannot reset that budget. Direct
 auto-serve keeps its ordinary in-process planning inside server readiness.
 

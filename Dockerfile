@@ -89,11 +89,14 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cuda.sh \
      scripts/docker/install-nccl.sh \
      scripts/docker/install-rocm.sh \
+     scripts/docker/install-hip-graph-runtime.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
 # CUDA's NCCL installer consumes this patch during early toolchain setup.
 COPY scripts/docker/patches/nccl-capture-reentry.patch \
      /tmp/install-scripts/patches/nccl-capture-reentry.patch
+COPY scripts/docker/patches/rocm-hip-graph-node-identity.patch \
+     /tmp/install-scripts/patches/rocm-hip-graph-node-identity.patch
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
@@ -438,6 +441,10 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
+ && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+        cp -L /opt/rocm/lib/libamdhip64.so.7 /src/runtime-libs/libamdhip64.so.7; \
+        cp -r /opt/rocm/share/licenses/llaminar-hip /src/runtime-licenses/; \
+    fi \
  && cp "external/onednn/build-$(printf '%s' "${LLAMINAR_CPU_ISA}" | tr '[:upper:]' '[:lower:]')/lib/libdnnl.so.3.11" /src/runtime-libs/ \
  && if [ -e external/rccl/build/librccl.so.1.0 ]; then cp external/rccl/build/librccl.so.1.0 /src/runtime-libs/; fi \
  && echo "==> [release] done; elapsed_seconds=$(( $(date +%s) - release_started_epoch )); final size: $(du -sh build_v2_release | cut -f1)"

@@ -433,6 +433,8 @@ namespace llaminar2::test::parity
              << ",\"generation_tokens\":" << profile.generation_tokens
              << ",\"request_timeout_seconds\":" << profile.request_timeout_seconds
              << ",\"readiness_timeout_seconds\":" << profile.readiness_timeout_seconds
+             << ",\"cell_timeout_seconds\":{\"AVX512\":" << profile.cell_timeout_seconds.avx512
+             << ",\"AVX2\":" << profile.cell_timeout_seconds.avx2 << "}"
              << ",\"thinking_modes\":" << modelParityJsonString(modelParityE2EThinkingModesName(profile.thinking_modes))
              << ",\"movement_evidence\":" << modelParityJsonString(modelParityE2EMovementEvidenceName(cell.movementEvidence()))
              << ",\"server_args\":[";

@@ -131,6 +131,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
             profile = {"server_args": ["--device", "cpu:0"], "context_length": 8192,
                        "minimum_prompt_tokens": 4096, "generation_tokens": 2048,
                        "request_timeout_seconds": 600, "readiness_timeout_seconds": 180,
+                       "cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200},
                        "thinking_modes": "both", "movement_evidence": "not_applicable"}
             campaign = SimpleNamespace(group=SimpleNamespace(backends="CPU"))
             selected = [(campaign, f"Suite.Cell/{index}",
@@ -142,7 +143,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
             report_path = root / "e2e.json"
             image = "sha256:" + "a" * 64
             with patch.object(e2e, "discover", return_value=selected), \
-                 patch.object(e2e, "image_identity", return_value={"id": image}), \
+                 patch.object(e2e, "image_identity", return_value={"id": image,
+                              "labels": {"org.llaminar.cpu_isa": "AVX2"}}), \
                  patch.object(e2e, "validate_attached_execution"), \
                  patch.object(e2e.parity, "model_staging_workspace",
                               return_value=nullcontext(workspace)), \
@@ -157,9 +159,13 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(stage.call_count, 1)
             self.assertEqual(run.call_count, 3)
+            self.assertEqual([call.kwargs["budget"].timeout_seconds for call in run.call_args_list],
+                             [1200, 1200, 1200])
             checks.assert_called_once()
             report = json.loads(report_path.read_text())
             self.assertEqual(report["selected"], 3)
+            self.assertEqual(report["cpu_isa"], "AVX2")
+            self.assertEqual([row["timeout_seconds"] for row in report["cells"]], [1200, 1200, 1200])
             self.assertEqual([row["outcome"] for row in report["cells"]],
                              ["failed", "cell_timeout", "passed"])
             self.assertEqual(report["failed_cells"], ["Suite.Cell/0", "Suite.Cell/1"])

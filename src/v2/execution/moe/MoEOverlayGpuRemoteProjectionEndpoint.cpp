@@ -612,6 +612,21 @@ namespace llaminar2
                 *error = "Remote GPU-to-CPU repack chunk is outside its authenticated layout";
             return false;
         }
+        if (config_.progress.epoch())
+        {
+            try
+            {
+                service_read_.publishPackedDeviceToMappedHost(source, layout,
+                    first_unit, unit_count, device_chunk_, config_.staging.sizeBytes(),
+                    source_dependency_);
+                return acceptServiceCommandLocked(OperationKind::GpuToCpuRepack, bytes, error);
+            }
+            catch (const std::exception &exception)
+            {
+                setGpuRemoteError(error, exception.what());
+                return false;
+            }
+        }
         bool fenced = false;
         if (!submitOnOwningWorkerLocked(
                 [this, &layout, &source, first_unit, unit_count, bytes,
@@ -715,6 +730,20 @@ namespace llaminar2
 
         /* The MPI buffer is persistent but not necessarily GPU-DMA pinned. */
         std::memcpy(pinned_chunk_, payload.data(), bytes);
+        if (config_.progress.epoch())
+        {
+            try
+            {
+                service_write_.publishPackedMappedHostToDevice(destination, layout,
+                    first_unit, unit_count, device_chunk_, config_.staging.sizeBytes());
+                return acceptServiceCommandLocked(OperationKind::CpuToGpuRepack, bytes, error);
+            }
+            catch (const std::exception &exception)
+            {
+                setGpuRemoteError(error, exception.what());
+                return false;
+            }
+        }
         bool fenced = false;
         if (!submitOnOwningWorkerLocked(
                 [this, &layout, &destination, first_unit, unit_count, bytes,
@@ -798,9 +827,11 @@ namespace llaminar2
     {
         if (!config_.progress.epoch())
             return nullptr;
-        if (operation_kind_ == OperationKind::GpuBlobRead)
+        if (operation_kind_ == OperationKind::GpuBlobRead ||
+            operation_kind_ == OperationKind::GpuToCpuRepack)
             return &service_read_;
-        if (operation_kind_ == OperationKind::GpuBlobWrite)
+        if (operation_kind_ == OperationKind::GpuBlobWrite ||
+            operation_kind_ == OperationKind::CpuToGpuRepack)
             return &service_write_;
         return nullptr;
     }
@@ -816,9 +847,23 @@ namespace llaminar2
                 service_write_.publishMappedHostToDevice(address, bytes, 0u, bytes);
             else
                 throw std::logic_error("Raw graph-service publication requires a blob operation");
+            return acceptServiceCommandLocked(kind, bytes, error);
+        }
+        catch (const std::exception &exception)
+        {
+            setGpuRemoteError(error, exception.what());
+            return false;
+        }
+    }
 
-            // Acceptance retains the owner and staging even if a later runtime
-            // submission fails. No native event may certify these copied bytes.
+    bool MoEOverlayGpuRemoteProjectionLane::acceptServiceCommandLocked(
+        OperationKind kind, std::size_t bytes, std::string *error) noexcept
+    {
+        try
+        {
+            // Retain staging even if a later submission fails. One receipt
+            // covers the complete operation; no native event certifies a
+            // separately queued conversion or a merely accepted copy.
             operation_kind_ = kind;
             operation_bytes_ = bytes;
             progress_ = MoEOverlayGpuRemoteLaneProgress::Pending;
@@ -928,13 +973,15 @@ namespace llaminar2
             progress_watch_.observedIncompleteEvent(now);
             if (const auto age = progress_watch_.pending(now))
             {
-                LOG_WARN("[MoEOverlayGpuRemoteProjectionLane] chunk event remains pending"
+                LOG_WARN("[MoEOverlayGpuRemoteProjectionLane] chunk completion remains pending"
                          << " device=" << config_.device.toString()
                          << " lane=" << config_.lane_name
                          << " operation=" << operationName(operation_kind_)
                          << " bytes=" << operation_bytes_
                          << " command_pending_ns=" << *age
-                         << " native_not_ready_queries=" << progress_watch_.incompleteEventQueries()
+                         << " completion_authority="
+                         << (serviceCommandLocked() ? "graph-service-receipt" : "native-event")
+                         << " not_ready_queries=" << progress_watch_.incompleteEventQueries()
                          << " chunks_submitted=" << stats_.chunks_submitted
                          << " chunks_completed=" << stats_.chunks_completed
                          << " stream=" << stream_);

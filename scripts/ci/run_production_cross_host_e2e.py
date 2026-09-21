@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
-from enum import Enum
 import json
 import os
 from pathlib import Path
@@ -38,9 +37,9 @@ from cross_host_network import private_mpi_connection, validate_local_network
 from cross_host_artifacts import distribute
 from docker_paths import validate_attached_execution
 from model_parity_inventory import InventoryScope, cross_host_scenarios
-from production_artifacts import digest, image_identity, runtime_image_content, write_json
+from production_artifacts import CPUISA, digest, image_cpu_isa, image_identity, runtime_image_content, write_json
 from run_model_parity_e2e import (
-    E2ECellBudget, certification_environment, run_e2e_process, validate_long_context_evidence,
+    E2ECellBudget, cell_timeout_seconds, certification_environment, run_e2e_process, validate_long_context_evidence,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,20 +52,6 @@ CROSS_HOST_CONTAINER_SCRATCH = ROOT / "parity-results" / ".cross-host-container-
 # Ubuntu clears /tmp across VM restarts. Keep the incremental transfer basis
 # on the explicitly retained user disk, separate from mounted model inputs.
 REMOTE_IMAGE_ARCHIVE = "/home/llaminar/.cache/llaminar-cross-host/runtime-image.tar"
-
-
-class CPUISA(str, Enum):
-    """One installed x86 runtime ISA contract.
-
-    The Docker images deliberately compile the whole CPU execution surface to
-    either AVX2 or AVX-512.  A remote rank cannot safely discover that fact by
-    attempting to start an MPI daemon: an illegal instruction then looks like
-    an unrelated MPI failure.  Keep the two shippable contracts typed at the
-    transport boundary and admit the peer image before staging its bytes.
-    """
-
-    AVX2 = "AVX2"
-    AVX512 = "AVX512"
 
 
 @dataclass(frozen=True)
@@ -168,10 +153,7 @@ def admit_runtime_image(reference: str, source_revision: str) -> RuntimeImage:
     labels = identity.get("labels")
     if not isinstance(labels, dict):
         raise ValueError("runtime image omitted OCI labels")
-    try:
-        cpu_isa = CPUISA(labels["org.llaminar.cpu_isa"])
-    except (KeyError, ValueError) as error:
-        raise ValueError("runtime image has no supported explicit CPU ISA") from error
+    cpu_isa = image_cpu_isa(identity)
     required = {
         "org.opencontainers.image.revision": source_revision,
         "org.llaminar.image_role": "runtime",
@@ -551,7 +533,7 @@ def stage_models(parents: list[dict], hosts: list[dict], key: Path, directory: P
     return model_dir
 
 
-def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: list[dict],
+def run_case(parent: dict, scenario: dict, image: RuntimeImage, model_dir: Path, hosts: list[dict],
              args: argparse.Namespace, directory: Path, *, planning_only: bool = False) -> dict:
     """Run one public frontend, or its explicit non-certifying plan probe.
 
@@ -605,7 +587,7 @@ def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: l
         # container sees this explicitly mirrored immutable launch contract.
         # Do not let a private bind mount inherit incidental parent files.
         write_json(mounted_artifact / "server-args.json", policy)
-        with container_fleet(image=image, hosts=hosts, key=args.ssh_private_key,
+        with container_fleet(image=image.identity["id"], hosts=hosts, key=args.ssh_private_key,
                 workspace=workspace, artifact=mounted_artifact, model_dir=model_dir, model_name=model.name,
                 frontend_mode=scenario["frontend"], plan_args=plan_args,
                 backend=scenario["topology"]["continuation_backend"],
@@ -613,7 +595,7 @@ def run_case(parent: dict, scenario: dict, image: str, model_dir: Path, hosts: l
                 controller_address=args.controller_address) as launcher:
             # The two public commands are separate lifecycle phases, not a plan
             # job hidden inside server startup. Both still spend one cell deadline.
-            budget = E2ECellBudget()
+            budget = E2ECellBudget(cell_timeout_seconds(profile, image.cpu_isa))
             return_code = 0
             if scenario["frontend"] == "plan-apply":
                 with (artifact / "plan.log").open("w") as log:
@@ -817,7 +799,7 @@ def main(argv: list[str] | None = None) -> int:
                     for case_index, (parent, scenario) in enumerate(selected, start=1):
                         print(f"[production-cross-host] START {case_index}/{len(selected)} {scenario['id']}", flush=True)
                         peers = hosts[:scenario["topology"]["remote_cpu_hosts"]]
-                        result = run_case(parent, scenario, image, model_dir, peers, args, directory,
+                        result = run_case(parent, scenario, controller_runtime, model_dir, peers, args, directory,
                                           planning_only=args.planning_only)
                         report["scenarios"].append(result)
                         write_json(args.report, report)

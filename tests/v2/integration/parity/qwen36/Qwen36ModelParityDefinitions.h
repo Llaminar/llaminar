@@ -322,6 +322,11 @@ namespace llaminar2::test::parity::qwen36
             .owner_order = RoutedExpertOwnerOrder::Ordinal,
             .movement = ModelParityExpertMovement::Dynamic,
         }};
+        // The complete AVX2 CPU workload needs twenty minutes, including the
+        // final near-limit prefill after 2,048-token generation. This is a
+        // model/topology declaration, not a timeout inferred by either runner.
+        // AVX512 and every other topology retain the standard fifteen minutes.
+        definition.e2e_certifiable.front().profile.cell_timeout_seconds.avx2 = 1200;
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen36

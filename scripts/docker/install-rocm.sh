@@ -108,6 +108,7 @@ case "${MODE}" in
         # --no-dkms: the kernel driver comes from the host; don't rebuild it
         # inside the container.
         amdgpu-install --usecase=rocm --no-dkms -y
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages rocm-llvm-dev
         ;;
     build)
         # Direct package closure needed by CMake:
@@ -118,6 +119,7 @@ case "${MODE}" in
         apt-get "${APT_OPTS[@]}" update
         apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
             rocm-llvm \
+            rocm-llvm-dev \
             rocm-cmake \
             rocm-device-libs \
             hipcc \
@@ -155,6 +157,12 @@ if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/nu
        /opt/rocm/lib/rocblas/library/
 fi
 rm -rf /tmp/rocblas-arch /tmp/rocblas-arch.pkg.tar.zst
+
+# Keep parallel graph construction and native packet replay, with the same
+# repaired HIP runtime in development, release builds, and exported images.
+if [[ "${MODE}" != runtime ]]; then
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-hip-graph-runtime.sh"
+fi
 
 # Do not run autoremove here.  The caller owns the surrounding image and may
 # intentionally have build tools marked as automatically installed; a ROCm

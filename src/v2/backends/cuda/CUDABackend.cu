@@ -34,6 +34,7 @@
 #include <mutex>
 #include <unordered_map>
 #include "MappedTransferServiceDevice.cuh"
+#include "MappedTransferServiceCUDA.h"
 
 namespace llaminar2
 {
@@ -44,11 +45,6 @@ namespace llaminar2
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
         constexpr unsigned int kMappedHostCopyThreads = 256u;
-        // The graph-bounded service is normally idle beside inference. One
-        // warp supplies enough outstanding mapped-memory operations for an
-        // admitted 64-KiB quantum without reserving eight warps for polling.
-        // Finite transfer passes retain the wider copy geometry above.
-        constexpr unsigned int kCapturedMappedTransferServiceThreads = 32u;
         // Small link-saturating grid: excess blocks consume inference resources
         // without increasing PCIe throughput. Both backend economy sweeps cover
         // 192 KiB through 4 MiB plus odd tails and both transfer directions.
@@ -5728,7 +5724,7 @@ namespace llaminar2
         // Resolve both functions while setup may allocate/load modules. There
         // must be no lazy module operation when a held graph is already live.
         cudaFuncAttributes attributes{};
-        if (cudaFuncGetAttributes(&attributes, mappedTransferServiceKernel) != cudaSuccess ||
+        if (!prepareMappedTransferServiceCUDA() ||
             cudaFuncGetAttributes(&attributes, mappedTransferWakeStateKernel) != cudaSuccess)
             return false;
         return cudaMemsetAsync(cursors, 0, capacity * sizeof(*cursors), native) == cudaSuccess;
@@ -5763,16 +5759,8 @@ namespace llaminar2
              (wake != nullptr)) ||
             !setDevice(device_id))
             return false;
-        // A captured interval deliberately owns one co-resident block rather
-        // than one block per physical lane. Independent finite passes may use
-        // four CTAs because they do not remain resident beside inference.
-        const auto blocks = run == MappedTransferServiceRun::CapturedInterval
-            ? 1u : static_cast<unsigned>(std::min<size_t>(capacity, 4u));
-        const auto threads = run == MappedTransferServiceRun::CapturedInterval
-            ? kCapturedMappedTransferServiceThreads : kMappedHostCopyThreads;
-        mappedTransferServiceKernel<<<blocks, threads, 0u, native>>>(
-            commands, completions, cursors, capacity, maximum_bytes, wake, run);
-        return cudaGetLastError() == cudaSuccess;
+        return launchMappedTransferServiceCUDA(commands, completions, cursors,
+            capacity, maximum_bytes, wake, run, reinterpret_cast<void *>(native));
     }
 
     bool CUDABackend::enqueueMappedTransferProgressClaims(

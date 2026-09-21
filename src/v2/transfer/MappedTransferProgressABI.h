@@ -2,7 +2,7 @@
  * @file MappedTransferProgressABI.h
  * @brief Fixed-width node-local command ABI for retained GPU transfer epochs.
  *
- * ExpertOverlay maintenance publishes bounded copy commands into host pages
+ * ExpertOverlay maintenance publishes bounded copy/conversion commands into host pages
  * that are mapped into one local GPU. A retained graph checks those commands
  * at entry and after a host-authored work notification, copies every active
  * physical lane in parallel, and release-publishes one completion record per
@@ -30,7 +30,18 @@ namespace llaminar2
         0x5250544du;
 
     /** Version shared by commands, device claims, and completions. */
-    inline constexpr std::uint32_t kMappedTransferProgressVersion = 2u;
+    inline constexpr std::uint32_t kMappedTransferProgressVersion = 3u;
+
+    /** Work executed under the same immutable command and GPU completion lease. */
+    enum class MappedTransferWorkKind : std::uint32_t
+    {
+        Bytes = 0u, ///< Move already-prepared bytes without a compute producer.
+        PackedGpuToCpu = 1u, ///< Reformat GPU weights, then publish CPU bytes.
+        PackedCpuToGpu = 2u, ///< Consume received CPU bytes into inactive GPU weights.
+    };
+
+    /** Fixed node-local parameter envelope; physical concurrency bounds its BOM. */
+    inline constexpr std::size_t kMappedTransferWorkWords = 16u;
 
     /** @return Generation-bound low identity word for a command snapshot. */
     constexpr std::uint32_t mappedTransferProgressGenerationMagic(
@@ -55,6 +66,7 @@ namespace llaminar2
         InvalidIdentity = 1u,
         InvalidAddress = 2u,
         InvalidByteCount = 3u,
+        InvalidWork = 4u,
     };
 
     /** Device-owned lifetime of one graph-bounded CUDA transfer service. */
@@ -103,7 +115,7 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<MappedTransferServiceCursor>);
 
     /**
-     * @brief Host-authored immutable copy request for one permanent lane slot.
+     * @brief Host-authored immutable transfer request for one permanent lane slot.
      *
      * The owner writes every field except @ref generation, then release-stores
      * a positive generation. The GPU system-acquires that word before reading
@@ -112,8 +124,9 @@ namespace llaminar2
      * broken platform-coherence observation is rejected before dereferencing a
      * process-local address. A slot cannot be reused until its matching
      * completion has been acquired by the owner. Keeping this record on its own
-     * cache line prevents device completion traffic from contending with the
-     * next host publication.
+     * cache-line-aligned extent prevents device completion traffic from
+     * contending with the next host publication. The larger parameter envelope
+     * authenticates conversion metadata under the same generation as the copy.
      */
     struct alignas(64) MappedTransferProgressCommand
     {
@@ -137,6 +150,17 @@ namespace llaminar2
         std::uint64_t destination_complement = ~std::uint64_t{0u};
         /** Exact complement checked before the byte count can be consumed. */
         std::uint64_t bytes_complement = ~std::uint64_t{0u};
+        /**
+         * Immutable transform parameters. Word zero starts with the typed work
+         * kind; zero-filled parameters denote an ordinary byte copy. Integer
+         * words preserve the complete object representation across host/device
+         * snapshots, including any padding in the typed parameter structure.
+         */
+        std::uint64_t work[kMappedTransferWorkWords] = {};
+        /** Exact complements authenticate every parameter before a GPU dereference. */
+        std::uint64_t work_complements[kMappedTransferWorkWords] = {
+            ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull,
+            ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
     };
 
     /**
@@ -181,7 +205,7 @@ namespace llaminar2
         std::uint64_t reserved[4] = {};
     };
 
-    static_assert(sizeof(MappedTransferProgressCommand) == 64u);
+    static_assert(sizeof(MappedTransferProgressCommand) == 320u);
     static_assert(sizeof(MappedTransferProgressClaim) == 64u);
     static_assert(sizeof(MappedTransferProgressCompletion) == 64u);
     static_assert(alignof(MappedTransferProgressCommand) == 64u);

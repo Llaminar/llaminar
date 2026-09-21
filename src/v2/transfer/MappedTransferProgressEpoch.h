@@ -33,6 +33,10 @@ namespace llaminar2
     class IBackend;
     class IWorkerGPUContext;
     class MappedHostTransferRegion;
+    struct ExpertTierWeightDeviceLayout;
+    struct ExpertTierGpuConstProjectionView;
+    struct ExpertTierGpuMutableProjectionView;
+    struct MappedTransferPackedWork;
 
     /** Result of one non-blocking permanent-slot completion observation. */
     enum class MappedTransferProgress : std::uint8_t
@@ -122,6 +126,40 @@ namespace llaminar2
             std::size_t destination_capacity,
             std::size_t destination_offset,
             std::size_t bytes);
+
+        /**
+         * @brief Publish one indivisible GPU reformat-and-download command.
+         * @param source Published separated projection, retained through completion.
+         * @param layout Canonical authenticated conversion geometry.
+         * @param first_unit First complete CPU unit in the projection.
+         * @param unit_count Complete units covered by this command.
+         * @param device_staging This lane's exclusive, already-owned scratch region.
+         * @param staging_capacity Exact capacity of that scratch region.
+         * @param dependency Exact source producer, or an already-published bank.
+         * @return The generation whose receipt covers both conversion and copying.
+         */
+        std::uint64_t publishPackedDeviceToMappedHost(
+            const ExpertTierGpuConstProjectionView &source,
+            const ExpertTierWeightDeviceLayout &layout,
+            std::uint32_t first_unit, std::uint32_t unit_count,
+            void *device_staging, std::size_t staging_capacity,
+            TransferProducerDependency dependency = TransferProducerDependency::published());
+
+        /**
+         * @brief Publish one indivisible upload-and-GPU-reformat command.
+         * @param destination Inactive separated projection retained through completion.
+         * @param layout Canonical authenticated conversion geometry.
+         * @param first_unit First complete CPU unit in the projection.
+         * @param unit_count Complete received units covered by this command.
+         * @param device_staging This lane's exclusive, already-owned scratch region.
+         * @param staging_capacity Exact capacity of that scratch region.
+         * @return The generation whose receipt covers both copying and conversion.
+         */
+        std::uint64_t publishPackedMappedHostToDevice(
+            const ExpertTierGpuMutableProjectionView &destination,
+            const ExpertTierWeightDeviceLayout &layout,
+            std::uint32_t first_unit, std::uint32_t unit_count,
+            void *device_staging, std::size_t staging_capacity);
 
         /**
          * @brief Acquire the device completion without waiting.
@@ -352,7 +390,8 @@ namespace llaminar2
             std::size_t device_capacity,
             std::size_t device_offset,
             std::size_t bytes,
-            TransferProducerDependency dependency = TransferProducerDependency::published());
+            TransferProducerDependency dependency = TransferProducerDependency::published(),
+            const MappedTransferPackedWork *packed_work = nullptr);
 
         /** Acquire one matching completion and retire its outstanding count. */
         MappedTransferProgress poll(
@@ -361,7 +400,7 @@ namespace llaminar2
             std::size_t expected_bytes,
             std::string *error) noexcept;
 
-        /** @return Host-owned command cache line. */
+        /** @return Host-owned cache-line-aligned command extent. */
         [[nodiscard]] MappedTransferProgressCommand &command(
             std::size_t index) noexcept;
 

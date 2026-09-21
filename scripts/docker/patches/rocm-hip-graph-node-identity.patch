@@ -1,0 +1,127 @@
+ROCm 7.2.4: preserve graph identity under concurrent construction.
+
+GraphNode::nextID was incremented without synchronization before nodeSetLock_
+was acquired. Independent TP graph builders can therefore allocate duplicate
+IDs, including duplicates within one graph after a lost counter update.
+The packet scheduler used that diagnostic ID for its visited set, silently
+omitting nodes and dependent paths while graph launch still returned success.
+
+Use object identity for scheduling and relaxed atomic counters for labels.
+No graph capture, packet batching, concurrency, or inference policy is disabled.
+Covered by V2_Integration_HIPConcurrentGraphIdentity in ProductionParityPreflight.
+
+diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
+--- a/hipamd/src/hip_graph_internal.cpp
++++ b/hipamd/src/hip_graph_internal.cpp
+@@ -51,8 +51,8 @@ const char* GetGraphNodeTypeString(uint32_t op) {
+ 
+ namespace hip {
+ 
+-int GraphNode::nextID = 0;
+-int Graph::nextID = 0;
++std::atomic<int> GraphNode::nextID{0};
++std::atomic<int> Graph::nextID{0};
+ std::unordered_set<GraphNode*> GraphNode::nodeSet_;
+ // Guards global node set
+ amd::Monitor GraphNode::nodeSetLock_{};
+@@ -461,7 +461,7 @@ hip::Graph::GraphExecutionPaths Graph::FindExecutionPathsHierarchical() {
+   // Find all root nodes (nodes with no dependencies)
+   const auto& root_nodes = GetRootNodes();
+ 
+-  std::unordered_set<unsigned int> visited;
++  std::unordered_set<Node> visited;
+   for (const auto& root : root_nodes) {
+     // For each root, find all possible paths starting from it
+     std::vector<Node> current_path;
+@@ -473,7 +473,7 @@ hip::Graph::GraphExecutionPaths Graph::FindExecutionPathsHierarchical() {
+ // ================================================================================================
+ void Graph::FindPathsRecursiveHierarchical(Node node,
+                                            std::vector<Node>& current_path,
+-                                           std::unordered_set<unsigned int>& visited,
++                                           std::unordered_set<Node>& visited,
+                                            hip::Graph::GraphExecutionPaths& graph_paths) {
+   // Lambda to save current path as a HierarchicalPath
+   auto savePath = [&graph_paths](const std::vector<Node>& path, int device_id,
+@@ -487,12 +487,14 @@ void Graph::FindPathsRecursiveHierarchical(Node node,
+   };
+ 
+   // Check if already visited
+-  if (visited.find(node->GetID()) != visited.end()) {
++  // A cloned node can preserve its diagnostic label. Only object identity
++  // determines whether this exact operation has already been scheduled.
++  if (visited.find(node) != visited.end()) {
+     return;
+   }
+ 
+   // Mark regular nodes as visited
+-  visited.insert(node->GetID());
++  visited.insert(node);
+ 
+   // Check if device ID changed from previous node in path
+   bool device_changed = false;
+@@ -526,7 +528,7 @@ void Graph::FindPathsRecursiveHierarchical(Node node,
+ 
+       // Find all root nodes in the child graph
+       const auto& child_root_nodes = childGraph->GetRootNodes();
+-      std::unordered_set<unsigned int> child_visited;
++      std::unordered_set<Node> child_visited;
+ 
+       for (const auto& child_root : child_root_nodes) {
+         std::vector<Node> child_current_path;
+diff --git a/hipamd/src/hip_graph_internal.hpp b/hipamd/src/hip_graph_internal.hpp
+--- a/hipamd/src/hip_graph_internal.hpp
++++ b/hipamd/src/hip_graph_internal.hpp
+@@ -20,6 +20,7 @@
+ 
+ #pragma once
+ #include <algorithm>
++#include <atomic>
+ #include <queue>
+ #include <stack>
+ #include <iostream>
+@@ -194,7 +195,7 @@ class GraphNode : public hipGraphNodeDOTAttribute {
+         visited_(false),
+         inDegree_(0),
+         outDegree_(0),
+-        id_(nextID++),
++        id_(nextID.fetch_add(1, std::memory_order_relaxed)),
+         parentGraph_(nullptr),
+         isEnabled_(1),
+         dev_id_(ihipGetDevice()),
+@@ -473,7 +474,8 @@ class GraphNode : public hipGraphNodeDOTAttribute {
+   int32_t stream_id_ = -1;  //! Stream ID on which this node will be executed
+   int32_t segment_id_ = -1;  //! Segment ID on which this node will be executed
+   int32_t launch_id_ = -1;  //! Launch ID of this node in the entire graph execution sequence
+-  static int nextID;
++  // Labels must remain race-free while independent graphs are built in parallel.
++  static std::atomic<int> nextID;
+   Graph* parentGraph_;
+   static std::unordered_set<GraphNode*> nodeSet_;
+   static amd::Monitor nodeSetLock_;
+@@ -543,7 +545,7 @@ class Graph {
+   static std::unordered_set<Graph*> graphSet_;
+   static amd::Monitor graphSetLock_;
+   Graph(hip::Device* device, const Graph* original = nullptr)
+-      : pOriginalGraph_(original), id_(nextID++), device_(device) {
++      : pOriginalGraph_(original), id_(nextID.fetch_add(1, std::memory_order_relaxed)), device_(device) {
+     amd::ScopedLock lock(graphSetLock_);
+     graphSet_.insert(this);
+     mem_pool_ = device->GetGraphMemoryPool();
+@@ -697,7 +699,7 @@ class Graph {
+   //! Recursively find all paths from a node with hierarchical child graph handling
+   void FindPathsRecursiveHierarchical(Node node,
+                                       std::vector<Node>& current_path,
+-                                      std::unordered_set<unsigned int>& visited,
++                                      std::unordered_set<Node>& visited,
+                                       GraphExecutionPaths& graph_paths);
+ 
+   //! Create segments from hierarchical execution paths
+@@ -847,7 +849,7 @@ class Graph {
+   //!< graphUserObj_.second stores refcount owned by this graph for user object,
+   std::unordered_map<UserObject*, int> graphUserObj_;
+   unsigned int id_;
+-  static int nextID;
++  static std::atomic<int> nextID;
+   uint32_t memalloc_nodes_ = 0;  //!< Count of unreleased Memalloc nodes
+   std::vector<Node> roots_;      //!< Root nodes, used in parallel launches
+   std::vector<Node> leafs_;      //!< The list of leaf nodes on every parallel stream

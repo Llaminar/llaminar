@@ -2845,6 +2845,17 @@ set_tests_properties(V2_Unit_ModelParityE2E PROPERTIES
     TIMEOUT 30
 )
 
+# Exercise the actual Python process-group deadline consumer before HTTP cells.
+add_v2_test(V2_Integration_HTTPCellDeadline
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_parity_e2e.py
+            E2EDiscoveryTests
+    LABELS "V2;Integration;E2E;Server;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_ProductionPipeline
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
@@ -7457,6 +7468,14 @@ target_link_libraries(v2_integration_cuda_expert_tier_weight_kernels
 add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels
     COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
     LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;Repack;ByteExact;ExplicitStream"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_v2_test(V2_Integration_CUDA_CapturedExpertTierPackedTransferProgress
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+            --gtest_filter=CUDAExpertTierWeightKernelsTest.CapturedLocalPackedTransfersProgressAllFormats:CUDAExpertTierWeightKernelsTest.CapturedRemotePackedTransfersProgressAllFormats
+    LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;GraphCapture;Async;ByteExact;AllFormats;Regression"
     MPI_PROCS 1
     NO_MODELS
     TIMEOUT 30
@@ -15530,6 +15549,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
     set(V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
         unit/moe/Test__GPUExpertTransfer.cpp
         integration/transfer/Test__MappedTransferProgressEpoch.cpp
+        integration/transfer/Test__CapturedCollectiveMaintenanceProgress.cpp
         integration/moe/Test__ExpertTierGpuBlobTransferIntegration.cpp
         integration/moe/Test__MoEOverlayThreeTierMigrationIntegration.cpp
     )
@@ -15599,6 +15619,15 @@ if(HAVE_CUDA OR HAVE_ROCM)
         # bidirectional progress across peer-held captured inference. Its
         # internal event deadlines remain 5/10 seconds; the outer aggregate
         # allowance must also cover cold CUDA/HIP context and graph teardown.
+        TIMEOUT 60
+        NO_MODELS
+    )
+    add_v2_test(V2_Integration_CapturedCollectiveMaintenanceProgress
+        COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=CapturedCollectiveMaintenanceProgress.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;ROCm;CUDA2;ROCm4;TransferEngine;MoE;ExpertOverlay;GraphCapture;Parallel;ByteExact;NoBlocking"
+        MPI_PROCS 1
         TIMEOUT 60
         NO_MODELS
     )
@@ -17018,6 +17047,18 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;Backends;GraphCapture;ROCm;HIP;MultiStream;Lifecycle;Regression"
         MPI_PROCS 1
         NO_MODELS
+    )
+    add_executable(v2_integration_hip_concurrent_graph_identity
+        integration/backends/Test__HIPConcurrentGraphIdentity.cpp)
+    target_compile_features(v2_integration_hip_concurrent_graph_identity PRIVATE cxx_std_20)
+    target_link_libraries(v2_integration_hip_concurrent_graph_identity
+        PRIVATE hip::host GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_HIPConcurrentGraphIdentity
+        COMMAND $<TARGET_FILE:v2_integration_hip_concurrent_graph_identity>
+        LABELS "V2;Integration;ProductionParityPreflight;Backends;GraphCapture;ROCm;HIP;Concurrency;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 120
     )
     message(STATUS "V2 Tests: Added HIP Graph Capture integration tests (ROCm)")
 endif()
@@ -19075,6 +19116,7 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
+    V2_Integration_HTTPCellDeadline
     V2_Integration_ServerGpuMemoryTelemetry
     V2_Integration_ExpertOverlayRetirementProgress
     V2_Integration_ExpertOverlayRetirementProgress_MPI
@@ -19187,7 +19229,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
     # The mapped transfer epoch fixture is intentionally device-backed and is
     # not registered by a CPU-only configuration.
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
-        V2_Integration_MappedTransferProgressEpoch)
+        V2_Integration_MappedTransferProgressEpoch
+        V2_Integration_CapturedCollectiveMaintenanceProgress)
 endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
@@ -19206,6 +19249,7 @@ if(HAVE_CUDA)
     V2_Integration_GroupedVerifierRows_CUDA_GDNRequestBatch
     V2_Integration_GPUDeviceContext_CUDA
     V2_Integration_CUDA_ExpertTierWeightKernels
+    V2_Integration_CUDA_CapturedExpertTierPackedTransferProgress
     V2_Integration_CUDA_MoEOverlayEpoch
     V2_Integration_CUDAEventSynchronization
     V2_Integration_CUDAGraphCapture

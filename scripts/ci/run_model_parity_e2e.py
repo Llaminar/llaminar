@@ -19,7 +19,7 @@ import sys
 import time
 
 import run_production_parity_campaigns as parity
-from production_artifacts import digest, image_identity
+from production_artifacts import CPUISA, digest, image_cpu_isa, image_identity
 from docker_paths import validate_attached_execution
 from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision
 
@@ -31,11 +31,36 @@ def discover(args: argparse.Namespace) -> list[tuple[parity.CampaignCell, str, d
     return discover_inventory(args, InventoryScope.E2E)
 
 
+def cell_timeout_seconds(profile: dict, cpu_isa: CPUISA) -> int:
+    """Resolve shared inventory policy against the tested runtime, not its exporter."""
+    budgets = profile.get("cell_timeout_seconds")
+    if (not isinstance(cpu_isa, CPUISA) or not isinstance(budgets, dict)
+            or set(budgets) != {isa.value for isa in CPUISA}
+            or any(type(value) is not int or value <= 0 for value in budgets.values())):
+        raise ValueError("E2E cell timeouts must explicitly declare both runtime ISAs with positive integers; rebuild/export stale manifests")
+    return budgets[cpu_isa.value]
+
+
+def release_binary_cpu_isa(binary: Path) -> CPUISA:
+    """Authenticate a local Release build and its configured ISA before staging."""
+    cache = binary.resolve().parent / "CMakeCache.txt"
+    contents = cache.read_text() if cache.is_file() else ""
+    if not re.search(r"^CMAKE_BUILD_TYPE:STRING=Release$", contents, re.M):
+        raise ValueError("E2E certification requires a Release binary and its CMakeCache.txt")
+    match = re.search(r"^LLAMINAR_CPU_ISA:STRING=(\S+)$", contents, re.M)
+    try:
+        # CMake accepts the two spellings case-insensitively and normalizes
+        # compile flags; retain that contract when reading its cache entry.
+        return CPUISA(match.group(1).upper() if match else None)
+    except ValueError as error:
+        raise ValueError("Release binary has no supported explicit CPU ISA") from error
+
+
 def readiness_timeout_seconds(profile: dict) -> int:
     """Validate exported readiness policy before staging or starting a server."""
     readiness = profile.get("readiness_timeout_seconds")
     if (type(readiness) is not int or readiness <= 0
-            or readiness > parity.EXACT_CELL_TIMEOUT_SECONDS):
+            or any(readiness > cell_timeout_seconds(profile, isa) for isa in CPUISA)):
         raise ValueError("E2E readiness timeout must be a positive integer within the exact-cell watchdog; rebuild/export stale manifests")
     return readiness
 
@@ -96,8 +121,14 @@ class E2ECellBudget:
     Infrastructure staging precedes this budget; all frontend phases share it.
     """
 
-    _deadline: float = field(init=False, default_factory=lambda:
-                            time.monotonic() + parity.EXACT_CELL_TIMEOUT_SECONDS)
+    timeout_seconds: int = int(parity.EXACT_CELL_TIMEOUT_SECONDS)
+    _deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Freeze one validated allowance before any frontend process starts."""
+        if type(self.timeout_seconds) is not int or self.timeout_seconds <= 0:
+            raise ValueError("E2E deadline requires a positive integer allowance")
+        object.__setattr__(self, "_deadline", time.monotonic() + self.timeout_seconds)
 
     def remaining_seconds(self) -> float:
         """Return the unspent canonical budget; an expired phase cannot launch."""
@@ -174,19 +205,20 @@ def main(argv: list[str] | None = None) -> int:
         readiness = readiness_timeout_seconds(record["e2e"])
         thinking_modes(record["e2e"])
         movement_evidence(record["e2e"])
-        print(f"[model-parity-e2e] selected {exact} context={record['e2e']['context_length']} readiness={readiness}s", flush=True)
+        print(f"[model-parity-e2e] selected {exact} context={record['e2e']['context_length']} "
+              f"readiness={readiness}s cell_timeouts={record['e2e']['cell_timeout_seconds']}", flush=True)
     if args.list:
         return 0
     if args.container_image:
         # Pin tags once so every server and its report describe identical bytes.
-        args.container_image = image_identity(args.container_image)["id"]
+        identity = image_identity(args.container_image)
+        cpu_isa = image_cpu_isa(identity)
+        args.container_image = identity["id"]
         validate_attached_execution(args.container_image)
     if not args.container_image:
-        cache = args.binary.resolve().parent / "CMakeCache.txt"
-        if not cache.is_file() or not re.search(r"^CMAKE_BUILD_TYPE:STRING=Release$", cache.read_text(), re.M):
-            raise ValueError("E2E certification requires a Release binary and its CMakeCache.txt")
+        cpu_isa = release_binary_cpu_isa(args.binary)
     report = {"schema": 1, "selected": len(selected), "correctness_passed": False, "cells": [],
-              "image": args.container_image,
+              "image": args.container_image, "cpu_isa": cpu_isa.value,
               "source_revision": args.source_revision or subprocess.check_output(
                   ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
               "manifest_digest": digest(json.loads(args.manifest.read_text())) if args.manifest else None}
@@ -224,9 +256,10 @@ def main(argv: list[str] | None = None) -> int:
                     command += ["--container-image", args.container_image]
                 print(f"[model-parity-e2e] {index}/{len(selected)} RUN {exact}", flush=True)
                 cell_started = time.monotonic()
+                budget = E2ECellBudget(cell_timeout_seconds(record["e2e"], cpu_isa))
                 with (artifact_dir / "harness.log").open("w") as log:
                     return_code = run_e2e_process(command,
-                        certification_environment(record["e2e"], artifact_dir), log)
+                        certification_environment(record["e2e"], artifact_dir), log, budget=budget)
                 evidence_error = None
                 if return_code == 0:
                     try:
@@ -236,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                         evidence_error = str(error)
                 report["cells"].append({"case": exact, "configuration": record,
                     "return_code": return_code, "artifacts": str(artifact_dir),
+                    "timeout_seconds": budget.timeout_seconds,
                     "evidence_error": evidence_error,
                     "outcome": "cell_timeout" if return_code == 124 else
                                "passed" if return_code == 0 else "failed",

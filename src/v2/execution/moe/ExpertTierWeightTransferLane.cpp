@@ -3,13 +3,11 @@
  * @brief Event-polled implementation of background ExpertOverlay CPU edges.
  *
  * The implementation intentionally owns no inference stream. Each chunk is
- * ordered on a context-owned auxiliary stream, followed by one reusable event.
- * The maintenance worker queries that event and either commits a completed D2H
- * chunk to final CPU storage or submits the next H2D/conversion chunk.
- * All physical copies use TransferEngine's backend-native background mechanism;
- * an unrelated captured DMA node must not strand a CPU edge and the GPU relays
- * sharing its stream. Repack arithmetic and the terminal-event lifecycle do not
- * depend on the physical copy mechanism.
+ * ordered through the configured TransferEngine mechanism. A native lane owns
+ * its exact terminal event; a CUDA captured service owns one generation receipt
+ * spanning both repacking and copying. Maintenance acquires that receipt before
+ * committing CPU bytes or advancing the next chunk. Conversion never waits for
+ * a future inference reader to release an unrelated native hardware queue.
  */
 
 #include "ExpertTierWeightTransferLane.h"
@@ -566,7 +564,7 @@ namespace llaminar2
         }
 
         if (serviceCommand())
-            return publishContiguousChunk(byte_offset, bytes, error);
+            return publishServiceChunk(byte_offset, unit_count, bytes, error);
 
         bool timing_started = true;
         if (config_.collect_timing_measurements)
@@ -683,32 +681,44 @@ namespace llaminar2
 
     MappedTransferProgressSlot *ExpertTierWeightTransferLane::serviceCommand() noexcept
     {
-        if (!config_.progress.epoch() || !isContiguousDirection())
+        if (!config_.progress.epoch())
             return nullptr;
         return isGpuToCpuDirection() ? &service_read_ : &service_write_;
     }
 
-    bool ExpertTierWeightTransferLane::publishContiguousChunk(
-        std::size_t byte_offset, std::size_t bytes, std::string *error) noexcept
+    bool ExpertTierWeightTransferLane::publishServiceChunk(
+        std::size_t byte_offset, std::uint32_t unit_count,
+        std::size_t bytes, std::string *error) noexcept
     {
         try
         {
             if (isGpuToCpuDirection())
-                service_read_.publishDeviceToMappedHost(gpu_contiguous_source_,
-                    contiguous_total_bytes_, byte_offset, bytes, source_dependency_);
+            {
+                if (isContiguousDirection())
+                    service_read_.publishDeviceToMappedHost(gpu_contiguous_source_,
+                        contiguous_total_bytes_, byte_offset, bytes, source_dependency_);
+                else
+                    service_read_.publishPackedDeviceToMappedHost(gpu_source_, layout_,
+                        completed_units_, unit_count, device_chunk_, config_.staging.sizeBytes(),
+                        source_dependency_);
+            }
             else
             {
                 const auto started = std::chrono::steady_clock::now();
                 std::memcpy(pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
                 recordHostCopyDuration(std::chrono::steady_clock::now() - started);
-                service_write_.publishMappedHostToDevice(gpu_contiguous_destination_,
-                    contiguous_total_bytes_, byte_offset, bytes);
+                if (isContiguousDirection())
+                    service_write_.publishMappedHostToDevice(gpu_contiguous_destination_,
+                        contiguous_total_bytes_, byte_offset, bytes);
+                else
+                    service_write_.publishPackedMappedHostToDevice(gpu_destination_, layout_,
+                        completed_units_, unit_count, device_chunk_, config_.staging.sizeBytes());
             }
             // Once published, staging cannot be reclaimed on an enqueue error.
             // Only this generation's GPU receipt can retire its ownership.
             work_may_be_in_flight_ = true;
             in_flight_bytes_ = bytes;
-            in_flight_units_ = 0u;
+            in_flight_units_ = unit_count;
             in_flight_timing_valid_ = false;
             fail_after_in_flight_event_ = false;
             recordSubmittedChunk(bytes);
