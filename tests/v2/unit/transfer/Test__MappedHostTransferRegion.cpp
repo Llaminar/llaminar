@@ -108,6 +108,31 @@ namespace
             return allocation;
         }
 
+        /** @brief Advertise and record the native family-portable allocation path. */
+        [[nodiscard]] bool supportsPortableMappedAllocation() const noexcept override
+        {
+            return portable_mapped_supported;
+        }
+
+        /**
+         * @brief Allocate a shared family mapping without external registration.
+         *
+         * The mock uses the ordinary mapped allocator for storage, but keeps a
+         * separate counter so the test proves TransferEngine selected the
+         * native portable contract rather than the anonymous-register path.
+         */
+        void *allocatePortableMapped(
+            size_t bytes,
+            int device_id,
+            void **device_ptr) override
+        {
+            ++portable_allocate_count;
+            void *const allocation = allocateMapped(bytes, device_id, device_ptr);
+            portable_allocation_host = allocation;
+            portable_allocation_alias = device_ptr ? *device_ptr : nullptr;
+            return allocation;
+        }
+
         /** @brief Record native mapped retirement before delegating to the mock. */
         void freeMapped(void *host_ptr, int device_id) override
         {
@@ -124,11 +149,17 @@ namespace
             void **device_ptr) override
         {
             ++alias_count;
-            if (!device_ptr || host_ptr != registered_host ||
-                !registration_succeeds)
+            if (!device_ptr || !registration_succeeds)
             {
                 return false;
             }
+            if (portable_allocation_host && host_ptr == portable_allocation_host)
+            {
+                *device_ptr = aliasFor(host_ptr, device_id);
+                return true;
+            }
+            if (host_ptr != registered_host)
+                return false;
             *device_ptr = aliasFor(host_ptr, device_id);
             return true;
         }
@@ -254,6 +285,7 @@ namespace
             MappedTransferWakeState::InferenceComplete;
         MappedTransferServiceRun service_run = MappedTransferServiceRun::FinitePass;
         bool registration_succeeds = true;
+        bool portable_mapped_supported = false;
         bool timeline_calls_succeed = true;
         bool progress_calls_succeed = true;
         size_t register_count = 0u;
@@ -275,6 +307,9 @@ namespace
         int mapped_allocation_ordinal = -1;
         void *mapped_free_host = nullptr;
         int mapped_free_ordinal = -1;
+        size_t portable_allocate_count = 0u;
+        void *portable_allocation_host = nullptr;
+        void *portable_allocation_alias = nullptr;
         std::vector<TimelineCall> timeline_calls;
         std::vector<MappedProgressCall> progress_calls;
 
@@ -475,6 +510,36 @@ TEST_F(
     EXPECT_EQ(rocm_->mapped_free_count, 1u);
     EXPECT_EQ(rocm_->mapped_free_host, allocation);
     EXPECT_EQ(rocm_->mapped_free_ordinal, 1);
+    EXPECT_EQ(rocm_->unregister_count, 0u);
+}
+
+TEST_F(
+    Test__MappedHostTransferRegion,
+    SameFamilyEndpointsUseOnePortableAllocationAndPerDeviceAliases)
+{
+    rocm_->portable_mapped_supported = true;
+    const std::array devices{DeviceId::rocm(0), DeviceId::rocm(1)};
+
+    auto region = engine_.allocateMappedHostRegion(4097u, devices);
+
+    ASSERT_NE(region, nullptr);
+    ASSERT_TRUE(region->isBound());
+    EXPECT_EQ(rocm_->portable_allocate_count, 1u);
+    EXPECT_EQ(rocm_->mapped_allocate_count, 1u);
+    EXPECT_EQ(rocm_->register_count, 0u);
+    EXPECT_EQ(rocm_->alias_count, 1u);
+    EXPECT_EQ(region->mutableHostData(), rocm_->portable_allocation_host);
+    EXPECT_EQ(
+        region->deviceAlias(DeviceId::rocm(0)),
+        rocm_->portable_allocation_alias);
+    EXPECT_EQ(
+        region->deviceAlias(DeviceId::rocm(1)),
+        rocm_->aliasFor(rocm_->portable_allocation_host, 1));
+    EXPECT_EQ(rocm_->getSyncCount(), 0u);
+    EXPECT_EQ(rocm_->getStreamSyncCount(), 0u);
+
+    region.reset();
+    EXPECT_EQ(rocm_->mapped_free_count, 1u);
     EXPECT_EQ(rocm_->unregister_count, 0u);
 }
 

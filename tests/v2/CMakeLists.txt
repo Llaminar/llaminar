@@ -909,6 +909,18 @@ add_v2_test(V2_Unit_MoEForbiddenDependencyScan
     MPI_PROCS 1
 )
 
+# Greedy Dynamic-MTP has a distinct accepted-state cadence edge. Keep the
+# source-graph ownership proof in preflight beside the CUDA/ROCm captured
+# commit-boundary kernels: either half alone cannot prove the production graph
+# actually advances after its bootstrap maintenance boundary.
+add_v2_test(V2_Integration_GreedyDynamicMTPMoECadencePublication
+    COMMAND $<TARGET_FILE:v2_unit_moe_forbidden_dependency_scan>
+        --gtest_filter=Test__MoEGraphNative_ForbiddenDependencyScan.GreedyDynamicMTPPublishesCadenceAfterAcceptedState
+    LABELS "V2;Integration;ProductionParityPreflight;MTP;ExpertOverlay;Dynamic;GraphCapture;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Prefix lookup must reuse the already-published identity until the sole MoE
 # movement authority advances its epoch. Rebuilding the full 122B placement
 # description for every HTTP request caused avoidable allocator growth.
@@ -2748,6 +2760,20 @@ set_tests_properties(V2_Unit_ServerGraphCapturePerfPolicy PROPERTIES
     TIMEOUT 30
 )
 
+# Successful cold graph setup is diagnostic telemetry, not a fabricated
+# warning/error. Keep both native backends and the strict HTTP log scanner
+# covered without a model or a wall-clock-dependent regression.
+add_test(NAME V2_Integration_GraphInstantiationDiagnostics
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_graph_capture_perf_policy.py
+            TestServerGraphCapturePerfPolicy.test_native_graph_setup_timing_is_diagnostic_not_runtime_failure
+            TestServerGraphCapturePerfPolicy.test_log_scan_preserves_failures_without_broken_pipe
+)
+set_tests_properties(V2_Integration_GraphInstantiationDiagnostics PROPERTIES
+    LABELS "V2;Integration;ProductionParityPreflight;GraphCapture;Logging;SourcePolicy;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_ServerExecutionContract
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_execution_contract.py
@@ -2825,6 +2851,15 @@ add_test(NAME V2_Unit_ProductionPipeline
 )
 set_tests_properties(V2_Unit_ProductionPipeline PROPERTIES
     LABELS "V2;Unit;BuildSystem;Parity;E2E;Benchmark;Certification;Regression"
+    TIMEOUT 30
+)
+add_test(NAME V2_Integration_DockerBindMountIdentity
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+            InfrastructureTests.test_docker_mount_mapping_preserves_symlinked_socket_identity
+)
+set_tests_properties(V2_Integration_DockerBindMountIdentity PROPERTIES
+    LABELS "V2;Integration;ProductionParityPreflight;BuildSystem;Container;Topology;Regression"
     TIMEOUT 30
 )
 
@@ -7498,6 +7533,15 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA2_MoEReplicatedMTP
     MPI_PROCS 1
     TIMEOUT 60
 )
+add_v2_test(V2_Integration_CUDA_MoEGroupedPrefillQ4KM39SerialParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSerialRowsAndCaptures
+            --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;CUDA;MoE;ExpertOverlay;Q4_K;NativeVNNI;Prefill;GroupedPrefill;GraphCapture;TensorCore;IMMA;SerialRowOracle;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120
+)
 message(STATUS "V2 Tests: Added CUDA MoE kernel integration tests")
 endif()
 
@@ -9837,6 +9881,41 @@ add_v2_test(V2_Unit_BackendStartupConfig
     NO_MODELS
 )
 
+add_executable(v2_unit_rocm_runtime_startup unit/backends/Test__ROCmRuntimeStartup.cpp)
+target_link_libraries(v2_unit_rocm_runtime_startup llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_ROCmRuntimeStartup
+    COMMAND $<TARGET_FILE:v2_unit_rocm_runtime_startup>
+    LABELS "V2;Unit;Backends;StartupPolicy;Memory;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS
+)
+add_v2_test(V2_Integration_ROCmRuntimeStartupPolicy
+    COMMAND $<TARGET_FILE:v2_unit_rocm_runtime_startup>
+    LABELS "V2;Integration;ProductionParityPreflight;StartupPolicy;Memory;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MPI NO_MODELS
+)
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_host_memory_backing
+        integration/backends/Test__ROCmHostMemoryBacking.cpp)
+    target_link_libraries(v2_integration_rocm_host_memory_backing
+        llaminar2_core GTest::gtest_main)
+    add_v2_test(V2_Integration_ROCmHostMemoryBacking
+        COMMAND $<TARGET_FILE:v2_integration_rocm_host_memory_backing>
+        LABELS "V2;Integration;ProductionParityPreflight;ROCm;Transfer;Memory;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MPI NO_MODELS
+    )
+    # Exercise the production default in a fresh process, not an inherited
+    # diagnostic override from a developer's shell or CI environment.
+    if(TEST V2_Integration_ROCmHostMemoryBacking)
+        set_property(TEST V2_Integration_ROCmHostMemoryBacking APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:")
+    endif()
+endif()
+
 # Test: GPUDeviceContext - GPU device context infrastructure (pool, worker threads, streams/events)
 # Tests IGPUDeviceContext interface, NvidiaDeviceContext, AMDDeviceContext, GPUDeviceContextPool singleton
 add_v2_gpu_backend_test(
@@ -10281,6 +10360,28 @@ add_v2_test(V2_Integration_MTPSidecarWorkspaceRows
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
         --gtest_filter=Test__MTPGraphConstruction.SidecarWorkspaceUsesInvocationRowsNotContextCapacity
     LABELS "V2;Integration;ProductionParityPreflight;CPU;MTP;ExpertOverlay;Workspace;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+# A retained MTP graph envelope is valid for an MTP-off request, but that
+# request must execute ordinary prefill rather than demand a shifted sidecar
+# publication. Keep this capacity-vs-runtime lifecycle boundary in preflight.
+add_v2_test(V2_Integration_MTPDisabledRetainedCapacityPrefillLifecycle
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=Test__MTPGraphConstruction.RetainedMTPCapacityDoesNotAuthorizeRuntimeShiftedPrefill
+    LABELS "V2;Integration;ProductionParityPreflight;MTP;GraphCapture;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+# A compact MTP outcome is only safe to route when its producer authenticates
+# the exact greedy or stochastic graph family. Exercise both rank-owned greedy
+# reduction and mirrored stochastic child publication before a parity campaign
+# can admit real model weights.
+add_v2_test(V2_Integration_MTPCompactOutcomeSamplingTopology
+    COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
+        --gtest_filter=Test__RankOrchestrator.LocalTPResidentCompactGreedyOutcomeResolvesDeferredRankSlots:Test__RankOrchestrator.LocalTPMirroredStochasticOutcomePublishesEveryParticipantWithoutRankCorrection
+        --gtest_brief=1
+    LABELS "V2;Integration;ProductionParityPreflight;MTP;LocalTP;GraphCapture;Lifecycle;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -16225,6 +16326,13 @@ add_v2_test(V2_Integration_OrdinaryForcedResidentContinuation
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_OrdinaryForcedResidentScalarKVGeometry
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.OrdinaryForcedResidentContinuationUsesCanonicalScalarKVGeometry
+    LABELS "V2;Integration;ProductionParityPreflight;Generation;GraphCapture;CUDA;ROCm;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_CPUSeededSamplingPositionIdentity
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
         --gtest_filter=Test__PrefillDecodeTransition.CPUSeededScalarSamplingUsesLogicalPosition:Test__PrefillDecodeTransition.CPUSeededBatchedSamplingUsesLogicalPosition:Test__PrefillDecodeTransition.CPUStochasticPenaltyOwnership
@@ -18983,6 +19091,7 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_HTTPToolChoicePolicy
     V2_Integration_HTTPStreamingProtocolRegression
     V2_Integration_OrdinaryForcedResidentContinuation
+    V2_Integration_OrdinaryForcedResidentScalarKVGeometry
     V2_Integration_GroupedVerifierRows_CPU_RoPE
     V2_Integration_GroupedVerifierRows_CPU_AllFormats
     V2_Integration_CPUAttentionCacheSource
@@ -19001,6 +19110,9 @@ set(V2_PRODUCTION_PARITY_PREFLIGHT_TESTS
     V2_Integration_ParityCellLifecycle_MPI2
     V2_Integration_ParityMTPCheckpointNamespaceLifecycle
     V2_Integration_MTPConditionCommitGraphIdentity
+    V2_Integration_GreedyDynamicMTPMoECadencePublication
+    V2_Integration_MTPDisabledRetainedCapacityPrefillLifecycle
+    V2_Integration_MTPCompactOutcomeSamplingTopology
     V2_Integration_HeterogeneousTicketLifecycleEvidence
     V2_Integration_MTPScalarCommitOwnership
     V2_Integration_MTPStochasticVerificationOwner
@@ -19121,6 +19233,7 @@ if(HAVE_CUDA)
     V2_Integration_CUDA_MoECompactTransferAllFormats
     V2_Integration_CUDA_MoEDeviceResidentGroupedVerifierPublication
     V2_Integration_CUDA_MoEAsyncHistogramBorrowedStreamRetirement
+    V2_Integration_CUDA_MoEGroupedPrefillQ4KM39SerialParity
     ${V2_CUDA_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_CUDA
     V2_Integration_DeviceGenerationController_CUDA
@@ -19162,6 +19275,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_MoEDeviceResidentGroupedVerifierPublication
     V2_Integration_ROCm_MoEAsyncHistogramBorrowedStreamRetirement
     V2_Integration_ROCmFloatingExpertRetirement
+    V2_Integration_ROCmHostMemoryBacking
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_ROCm
     V2_Integration_DeviceGenerationController_ROCm

@@ -248,6 +248,7 @@ namespace llaminar2
                 params_.generation_control_device || params_.generation_control_stride ||
                 params_.verifier_input_tokens_device || params_.verifier_input_token_stride ||
                 params_.committed_verifier_identity_device || params_.publish_shifted_kv ||
+                params_.dynamic_moe_commit_boundary ||
                 !params_.shifted_kv_caches.empty() || params_.shifted_target_cached_tokens_device ||
                 params_.shifted_accepted_state_counts_device || params_.penalty_policy_device ||
                 params_.generated_token_counts_device || params_.vocab_size)
@@ -299,6 +300,14 @@ namespace llaminar2
              !params_.next_sidecar_position_ids_device))
         {
             LOG_ERROR("[MTPSpeculativeStatePublicationStage] Controller-owned publication has no persistent response ledger or next-sidecar mailbox");
+            return false;
+        }
+        if (params_.dynamic_moe_commit_boundary &&
+            (params_.authority != Authority::BoundedGeneration ||
+             !params_.dynamic_moe_commit_boundary->valid()))
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Dynamic MoE cadence must be a complete controller-owned publication transition");
             return false;
         }
         if (params_.publish_shifted_kv &&
@@ -547,6 +556,32 @@ namespace llaminar2
         return true;
     }
 
+    bool MTPSpeculativeStatePublicationStage::publishDynamicMoECommitBoundary(
+        void *stream) const
+    {
+        if (!params_.dynamic_moe_commit_boundary)
+            return true;
+
+        const DynamicMoECommitBoundaryBinding &boundary =
+            *params_.dynamic_moe_commit_boundary;
+        if (!params_.backend->enqueueAdvanceSpeculativeCommitBoundary(
+                params_.outcome_meta_device,
+                params_.request_count,
+                params_.outcome_meta_stride,
+                boundary.decode_rounds_committed_device,
+                boundary.decode_rounds_until_maintenance_device,
+                boundary.maintenance_due_device,
+                boundary.decode_boundary_advanced_device,
+                params_.device_id.gpu_ordinal(),
+                stream))
+        {
+            LOG_ERROR(
+                "[MTPSpeculativeStatePublicationStage] Dynamic MoE maintenance-boundary advancement failed");
+            return false;
+        }
+        return true;
+    }
+
     bool MTPSpeculativeStatePublicationStage::publishAcceptanceMetadata(void *stream) const
     {
         // The enclosing native collective is the follower's producer edge.
@@ -632,7 +667,8 @@ namespace llaminar2
             !publishMainKV(stream) ||
             (params_.authority != Authority::PipelineFollower &&
                 (!publishShiftedKV(stream) || !publishPenaltyHistory(stream))) ||
-            !publishVerifierState(stream))
+            !publishVerifierState(stream) ||
+            !publishDynamicMoECommitBoundary(stream))
         {
             return false;
         }
@@ -652,6 +688,8 @@ namespace llaminar2
               std::to_string(params_.moe_histogram_publishers.size())},
              {"controller_owned",
               params_.authority == Authority::BoundedGeneration ? "true" : "false"},
+             {"dynamic_moe_commit_boundary",
+              params_.dynamic_moe_commit_boundary ? "true" : "false"},
              {"publication_authority", std::to_string(static_cast<int>(params_.authority))}});
         return true;
     }
@@ -699,6 +737,9 @@ namespace llaminar2
         info.addScalarBool(
             "publish_shifted_kv",
             params_.publish_shifted_kv);
+        info.addScalarBool(
+            "dynamic_moe_commit_boundary",
+            params_.dynamic_moe_commit_boundary.has_value());
         return info;
     }
 
@@ -800,6 +841,8 @@ namespace llaminar2
                    other.verifier_input_token_stride &&
                self.committed_verifier_identity_device ==
                    other.committed_verifier_identity_device &&
+               self.dynamic_moe_commit_boundary ==
+                   other.dynamic_moe_commit_boundary &&
                self.request_count == other.request_count &&
                self.verifier_rows_per_request ==
                    other.verifier_rows_per_request &&

@@ -2574,6 +2574,9 @@ namespace llaminar2
         bool skip_cuda = false;
         /// Skip ROCm discovery and context-factory registration when non-zero.
         bool skip_rocm = false;
+        /// Exact vendor backing request; absence lets early ROCr startup install
+        /// driver-owned host pages. This is not a hot-path or diagnostic switch.
+        std::optional<std::string> rocm_userptr_for_paged_mem;
 
         /**
          * @brief Capture the process environment when the configuration is constructed.
@@ -2596,6 +2599,9 @@ namespace llaminar2
             force_cpu_only = readNonZeroInteger("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
             skip_cuda = readNonZeroInteger("LLAMINAR_SKIP_CUDA_STARTUP");
             skip_rocm = readNonZeroInteger("LLAMINAR_SKIP_ROCM_STARTUP");
+            const char *rocm_backing = std::getenv("HSA_USERPTR_FOR_PAGED_MEM");
+            rocm_userptr_for_paged_mem = rocm_backing
+                ? std::optional<std::string>{rocm_backing} : std::nullopt;
         }
 
         /**

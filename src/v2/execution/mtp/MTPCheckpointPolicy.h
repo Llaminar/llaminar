@@ -41,6 +41,45 @@ namespace llaminar2
     }
 
     /**
+     * @brief Runtime ownership of an MTP transaction on one graph participant.
+     *
+     * This is deliberately distinct from @ref MTPStateRole.  A service may
+     * retain an MTP-capable graph, weight, and KV envelope while an individual
+     * request executes ordinary decode.  In that capacity-only state the
+     * terminal participant remains the physical owner of the retained
+     * sidecar, but it must not append a shifted-KV transaction or publish an
+     * MTP terminal-hidden handoff during ordinary prefill.
+     */
+    enum class MTPRuntimeTransactionRole
+    {
+        Disabled,          ///< The request executes no speculative transaction.
+        MainModelFollower, ///< The request executes MTP but this participant lacks the terminal predictor.
+        PredictorOwner,    ///< The request executes MTP and this participant owns its shifted sidecar transaction.
+    };
+
+    /**
+     * @brief Resolve transaction ownership without conflating it with retained capacity.
+     * @param execution_enabled Whether this request's graph is allowed to execute MTP.
+     * @param owns_terminal_head Whether this participant executes the terminal head.
+     * @return The only runtime transaction role permitted for this participant.
+     *
+     * Capacity-only setup uses @ref resolveMTPStateRole instead.  Keeping the
+     * two projections separate makes it impossible for a retained MTP envelope
+     * to accidentally require a shifted-prefill transaction on an MTP-off
+     * request.
+     */
+    [[nodiscard]] constexpr MTPRuntimeTransactionRole
+    resolveMTPRuntimeTransactionRole(
+        bool execution_enabled, bool owns_terminal_head) noexcept
+    {
+        return !execution_enabled
+                   ? MTPRuntimeTransactionRole::Disabled
+                   : owns_terminal_head
+                         ? MTPRuntimeTransactionRole::PredictorOwner
+                         : MTPRuntimeTransactionRole::MainModelFollower;
+    }
+
+    /**
      * @brief Maximum complete live-state checkpoints retained concurrently.
      *
      * The scheduler may retain rollback, verifier-base, committed, and

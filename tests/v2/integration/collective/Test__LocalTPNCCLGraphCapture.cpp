@@ -41,6 +41,7 @@
 #include "kernels/common/TPRankOrderedReductionKernels.h"
 #include "kernels/cuda/moe/CUDAMoEKernel.h"
 #include "tensors/TensorClasses.h"
+#include "transfer/TransferEngine.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -1393,7 +1394,8 @@ TEST(Test__LocalTPNCCLGraphCapture, NCCLGroupedP2PMaintenanceGraph_AuxiliaryStre
  * only on that root, and broadcasts only the compact output. A separate launch
  * of the same production reducer over the complete serial slot bank supplies
  * the byte oracle. Sweeping every verifier row count through depth fifteen,
- * plus M=31, catches count-dependent collective and launch-geometry holes.
+ * plus M=31 and the 39-token Ornith chat-prefill boundary, catches
+ * count-dependent collective and launch-geometry holes.
  */
 TEST(Test__LocalTPNCCLGraphCapture,
      NCCLCanonicalRouteRootedPublication_GraphCaptured_MTotal_ByteExact)
@@ -1418,7 +1420,11 @@ TEST(Test__LocalTPNCCLGraphCapture,
     constexpr int kTopK = 8;
     constexpr int kDModel = 257;
     constexpr int kRoot = 0;
-    constexpr int kMaximumM = 31;
+    // Keep the retained allocation envelope in lockstep with the largest
+    // exercised production prefill geometry below.  The 39-token Ornith chat
+    // prompt is not a verifier depth, so it must not inherit the old M=31
+    // verifier-only capacity by accident.
+    constexpr int kMaximumM = 39;
 
     std::array<std::unique_ptr<FP32Tensor>, 2> route_slots;
     std::array<std::unique_ptr<FP32Tensor>, 2> compact_outputs;
@@ -1483,6 +1489,7 @@ TEST(Test__LocalTPNCCLGraphCapture,
     for (int m = 1; m <= 16; ++m)
         verifier_rows.push_back(m);
     verifier_rows.push_back(31);
+    verifier_rows.push_back(39);
 
     for (const int m : verifier_rows)
     {
@@ -1539,6 +1546,18 @@ TEST(Test__LocalTPNCCLGraphCapture,
                 participant_host[static_cast<size_t>(participant)].end(),
                 route_tensor->mutable_data());
             ASSERT_TRUE(route_tensor->ensureOnDevice(
+                DeviceId::cuda(participant),
+                stream));
+            /*
+             * The H2D upload publishes an exact producer event.  Captured
+             * collective/reducer work is not allowed to import that external
+             * event after beginCapture(), so establish the same-stream input
+             * edge while this is still setup.  A stream synchronization proves
+             * completion for the host fixture; it is not a replacement for the
+             * event provenance recorded below.
+             */
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                route_tensor,
                 DeviceId::cuda(participant),
                 stream));
             ASSERT_EQ(

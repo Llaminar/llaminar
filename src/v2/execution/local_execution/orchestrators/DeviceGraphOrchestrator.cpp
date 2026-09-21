@@ -17620,22 +17620,26 @@ namespace llaminar2
 
         const int32_t *condition_token_device =
             logical_state.nextConditionTokenDeviceForRequest(request_index);
-        const int32_t *condition_position_device =
-            logical_state.targetPositionDeviceForRequest(request_index);
-        const int32_t *condition_sequence_length_device =
-            logical_state.targetSequenceLengthDeviceForRequest(request_index);
-        if (!condition_token_device || !condition_position_device ||
-            !condition_sequence_length_device)
+        if (!condition_token_device)
         {
-            return fail("mailbox does not expose one complete token/position/length row");
+            return fail("mailbox does not expose its request-zero token row");
         }
 
         /*
-         * MainInference plus ExplicitDecode selects ordinary decode arithmetic,
-         * while the three device pointers make token and logical position one
-         * event-published transaction.  This is a retained graph replay through
-         * the same ForwardExecutionEngine used by serving, including sparse
-         * ExpertOverlay collectives; it is not an eager row implementation.
+         * The mailbox owns the condition token, but it does not own scalar
+         * decode geometry. Its target-length row describes the already-resident
+         * sequence (for example 39), whereas KV append interprets a device
+         * sequence-length binding as the number of rows to append. Passing that
+         * row through an ordinary one-token decode consequently makes the graph
+         * try to append the whole existing sequence instead of its single row.
+         *
+         * Leave position and length overrides absent so forwardImpl() selects
+         * the canonical scalar device-decode binding: the captured root
+         * snapshots the live KV count into REQUEST_POSITION_IDS and every KV
+         * append stage uses its exact captured width of one. The token still
+         * comes directly from the immutable mailbox, and the graph prelude
+         * retains its event-backed reader edge; no host token, position, or
+         * synchronization enters this path.
          */
         const bool ok =
             forwardImpl(
@@ -17645,8 +17649,8 @@ namespace llaminar2
                 /*batch_size=*/1,
                 ForwardExecutionRole::MainInference,
                 ForwardInvocationKind::ExplicitDecode,
-                condition_position_device,
-                condition_sequence_length_device) != nullptr;
+                /*position_ids_device_override=*/nullptr,
+                /*sequence_lengths_device_override=*/nullptr) != nullptr;
         if (!ok)
             return fail("captured ordinary condition graph execution failed");
 
@@ -17658,7 +17662,8 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"request_index", std::to_string(request_index)},
              {"token_owner", "device_logical_state_mailbox"},
-             {"position_owner", "device_logical_state_mailbox"}});
+             {"position_owner", "canonical_device_kv_count"},
+             {"append_rows", "captured_scalar_one"}});
         return true;
     }
 
@@ -20055,27 +20060,27 @@ namespace llaminar2
         /*
          * A PP follower participates in the main captured prefill graph but
          * does not own the learned predictor, shifted KV family, or terminal
-         * hidden archive.  MTP enablement is therefore not sufficient to
-         * decide whether this particular participant must carry a shifted
-         * prefill transaction.  Reuse the same typed ownership projection as
-         * cache construction and graph-family materialization so a follower
-         * cannot be mistaken for a broken predictor owner merely because the
-         * request enables MTP globally.
+         * hidden archive.  Separately, an MTP-off request may retain the same
+         * maximum-capacity graph family as a later MTP request.  Physical
+         * sidecar ownership therefore cannot decide whether this *runtime*
+         * prefill must carry a shifted transaction: only the typed runtime
+         * role can.  Using the capacity role here previously made a retained
+         * MTP-off graph demand a binding which bindShiftedMTPPrefillTransaction
+         * correctly omitted.
          */
-        const bool retains_mtp_capacity =
-            graph_builder_ &&
-            retainsMTPGraphCapacity(graph_builder_->config().mtp);
-        const MTPStateRole mtp_state_role = resolveMTPStateRole(
-            retains_mtp_capacity,
-            !pp_stage_config_ || pp_stage_config_->has_lm_head);
-        const bool mtp_predictor_owner =
-            mtp_state_role == MTPStateRole::PredictorOwner;
-        if (mtp_predictor_owner && !input.shifted_mtp_prefill.has_value())
+        const MTPRuntimeTransactionRole mtp_runtime_role =
+            resolveMTPRuntimeTransactionRole(
+                graph_builder_ && graph_builder_->config().mtp.enabled,
+                !pp_stage_config_ || pp_stage_config_->has_lm_head);
+        const bool executes_shifted_mtp_transaction =
+            mtp_runtime_role == MTPRuntimeTransactionRole::PredictorOwner;
+        if (executes_shifted_mtp_transaction &&
+            !input.shifted_mtp_prefill.has_value())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] GPU chunked prefill completed without its graph-integrated shifted-MTP transaction");
             return false;
         }
-        if (mtp_predictor_owner)
+        if (executes_shifted_mtp_transaction)
             state_.mtp_terminal_hidden_publication.publishMainForward();
         else
             state_.mtp_terminal_hidden_publication.invalidate();
@@ -20090,7 +20095,7 @@ namespace llaminar2
              {"request_admissions", "1"},
              {"source_cursor", "canonical_kv_count"},
              {"host_chunk_slices", "0"}});
-        if (mtp_predictor_owner)
+        if (executes_shifted_mtp_transaction)
         {
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -20115,7 +20120,7 @@ namespace llaminar2
             terminal_seq_len,
             1,
             {},
-            mtp_predictor_owner &&
+            executes_shifted_mtp_transaction &&
                     state_.mtp_terminal_hidden_publication.current()
                 ? MTPTerminalHiddenPublication::Source::MainForward
                 : MTPTerminalHiddenPublication::Source::Unavailable);
@@ -43614,6 +43619,7 @@ namespace llaminar2
         out_handle->mtp_transaction =
             currentDeviceResidentMTPTransactionLease();
         out_handle->device_generation_controller_owned = true;
+        out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
         out_handle->mirrored_local_tp_locally_complete =
             usesMirroredMTPHeadForVerifier() &&
             graph_builder_ &&
@@ -58116,6 +58122,7 @@ namespace llaminar2
         out_handle->mtp_transaction =
             currentDeviceResidentMTPTransactionLease();
         out_handle->device_generation_controller_owned = true;
+        out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
         out_handle->mirrored_local_tp_locally_complete =
             usesMirroredMTPHeadForVerifier() &&
             graph_builder_ &&

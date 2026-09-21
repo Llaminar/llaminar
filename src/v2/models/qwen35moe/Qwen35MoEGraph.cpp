@@ -7703,11 +7703,70 @@ namespace llaminar2
                     local_participant,
                     expert_params,
                     "Qwen35 MoE LocalTP fast path");
-                const bool least_loaded_prefill_runtime_grouping =
-                    moe_runtime_table &&
-                    total_tokens > 1 &&
-                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
-                if (least_loaded_prefill_runtime_grouping)
+
+                /**
+                 * @brief Select the one producer for the per-route participant ledger.
+                 *
+                 * The mapped-sparse rooted reducer consumes a participant id for
+                 * every original `[token, top-k]` router slot.  A Static
+                 * placement is just as much a runtime fact as a LeastLoaded
+                 * placement: its ids are read from the request-pinned durable
+                 * bank, whereas LeastLoaded may select a resident participant
+                 * from that same bank.  Leaving Static on the fixed-mask-only
+                 * grouped path computed the local expert rows correctly but
+                 * left the reducer's route ledger at its zero-initialized
+                 * scratch value.  The root then silently treated every slot as
+                 * root-owned and omitted its LocalTP sibling's contributions.
+                 *
+                 * Keep this as one typed graph-construction decision.  It
+                 * names an existing device-owned producer rather than adding a
+                 * host mirror or a second placement authority.
+                 */
+                enum class LocalTPPrefillRouteLedgerProducer : std::uint8_t
+                {
+                    FixedTopologyMask,
+                    DurableStaticOwnerBank,
+                    LeastLoadedResidentBank,
+                };
+                const auto prefill_route_ledger_producer = [&]()
+                {
+                    if (!moe_runtime_table || total_tokens <= 1)
+                    {
+                        return LocalTPPrefillRouteLedgerProducer::
+                            FixedTopologyMask;
+                    }
+                    if (prefill_routed_expert_assignment_policy ==
+                        RoutedExpertAssignmentPolicy::LeastLoadedResident)
+                    {
+                        return LocalTPPrefillRouteLedgerProducer::
+                            LeastLoadedResidentBank;
+                    }
+
+                    const bool static_mapped_sparse_rooted_publication =
+                        device.is_gpu() &&
+                        ordinary_prefill_graph &&
+                        local_tp_ctx &&
+                        routed_row_execution_policy ==
+                            RoutedExpertRowExecutionPolicy::
+                                ParticipantAssigned &&
+                        prefill_routed_expert_assignment_policy ==
+                            RoutedExpertAssignmentPolicy::StaticOwner &&
+                        needsMoEParticipantAllreduce() &&
+                        shared_expert_requires_tp_allreduce &&
+                        has_shared_expert_branch &&
+                        layer.shared_expert_gate_inp &&
+                        planned_shared_device == device &&
+                        node_local_route_transport ==
+                            MoEOverlayNodeLocalRouteTransport::MappedSparse &&
+                        config_.moe.node_local_route_exchange;
+                    return static_mapped_sparse_rooted_publication
+                               ? LocalTPPrefillRouteLedgerProducer::
+                                     DurableStaticOwnerBank
+                               : LocalTPPrefillRouteLedgerProducer::
+                                     FixedTopologyMask;
+                }();
+                if (prefill_route_ledger_producer !=
+                    LocalTPPrefillRouteLedgerProducer::FixedTopologyMask)
                 {
                     const int participant_count = expert_params.participant_count;
                     const auto owner_participants =
@@ -7731,11 +7790,17 @@ namespace llaminar2
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
                             device_state_publication_stream,
-                            prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident,
-                            "LocalTP expert-ID-apportioned LLEP grouped prefill runtime bank"))
+                            prefill_route_ledger_producer ==
+                                LocalTPPrefillRouteLedgerProducer::
+                                    LeastLoadedResidentBank,
+                            prefill_route_ledger_producer ==
+                                    LocalTPPrefillRouteLedgerProducer::
+                                        DurableStaticOwnerBank
+                                ? "LocalTP mapped-sparse Static grouped prefill runtime bank"
+                                : "LocalTP expert-ID-apportioned LLEP grouped prefill runtime bank"))
                     {
                         throw std::runtime_error(
-                            "Qwen35 MoE graph failed to initialize masked LocalTP LLEP prefill runtime table for layer " +
+                            "Qwen35 MoE graph failed to initialize LocalTP grouped prefill runtime table for layer " +
                             std::to_string(layer_idx) + " on " + device.to_string());
                     }
                     expert_params.use_runtime_row_grouping = true;

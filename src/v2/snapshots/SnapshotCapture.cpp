@@ -197,20 +197,26 @@ namespace llaminar2
         /**
          * @brief Resolve the model-layer prefix for a pinned route producer.
          *
-         * A LocalTP continuation publishes this evidence at its ordered route
-         * reducer. A single-participant continuation publishes the identical
-         * views at its final mapped return join, after grouped planning has
-         * finalized the invocation-local domain assignment ledger. Both are
-         * observations of the same runtime-table authority.
+         * A LocalTP continuation can publish this evidence through either its
+         * overlay-return ordered reducer or the mapped-sparse local reducer.
+         * A single-participant continuation publishes the identical views at
+         * its final mapped return join, after grouped planning has finalized
+         * the invocation-local domain assignment ledger. All three nodes are
+         * observations of the same runtime-table authority: their root-only
+         * `output` is the complete routed value in original route order.
          */
         std::string pinnedRouteEvidencePrefix(
             const std::string &stage_name)
         {
             constexpr std::string_view kOrderedReduce =
                 "_moe_overlay_continuation_routes_ordered_reduce";
+            constexpr std::string_view kMappedSparseLocalTPReduce =
+                "_moe_mapped_routes_ordered_reduce";
             constexpr std::string_view kMappedReturn =
                 "_moe_overlay_activation_return_consume";
             size_t marker = stage_name.find(kOrderedReduce);
+            if (marker == std::string::npos)
+                marker = stage_name.find(kMappedSparseLocalTPReduce);
             if (marker == std::string::npos)
                 marker = stage_name.find(kMappedReturn);
             return marker == std::string::npos

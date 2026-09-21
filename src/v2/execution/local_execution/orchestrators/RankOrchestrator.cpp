@@ -9555,6 +9555,14 @@ namespace llaminar2
             std::shared_ptr<void>(
                 &rank_compact_outcome_ready_event_token_,
                 [](void *) {});
+        /*
+         * This is the rank-owned fallback only for non-GPU LocalTP.  It reduces
+         * the greedy outcome directly into the rank's compact mailbox, so the
+         * handoff must explicitly identify the greedy graph family just as a
+         * device-owned producer does.  Leaving the tag unspecified would make
+         * an otherwise complete mailbox intentionally invalid.
+         */
+        out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
 
         rank_compact_outcome_valid_ = out_handle->valid();
         if (rank_compact_outcome_valid_)
@@ -9623,10 +9631,12 @@ namespace llaminar2
                     stop_tokens,
                     stop_token_count,
                     &child_outcomes[i]) ||
-                !child_outcomes[i].valid())
+                !child_outcomes[i].valid() ||
+                child_outcomes[i].sampling_mode !=
+                    DeviceGenerationSamplingMode::Greedy)
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy MTP child "
-                          << i << " failed resident verifier reduction");
+                          << i << " failed resident greedy verifier reduction");
                 return false;
             }
         }
@@ -9735,10 +9745,12 @@ namespace llaminar2
                     requests,
                     request_count,
                     &child_outcomes[i]) ||
-                !child_outcomes[i].valid())
+                !child_outcomes[i].valid() ||
+                child_outcomes[i].sampling_mode !=
+                    DeviceGenerationSamplingMode::Greedy)
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP greedy request-batch MTP child "
-                          << i << " failed resident verifier reduction");
+                          << i << " failed resident greedy verifier reduction");
                 return false;
             }
         }
@@ -9816,10 +9828,12 @@ namespace llaminar2
                     requests,
                     request_count,
                     &child_outcomes[i]) ||
-                !child_outcomes[i].valid())
+                !child_outcomes[i].valid() ||
+                child_outcomes[i].sampling_mode !=
+                    DeviceGenerationSamplingMode::Stochastic)
             {
                 LOG_ERROR("[RankOrchestrator] Mirrored LocalTP stochastic MTP child "
-                          << i << " failed resident verifier reduction");
+                          << i << " failed resident stochastic verifier reduction");
                 return false;
             }
         }
@@ -9909,6 +9923,12 @@ namespace llaminar2
             {
                 return fail(
                     "mirrored child outcome shape mismatch for participant " +
+                    std::to_string(i));
+            }
+            if (child.sampling_mode != primary.sampling_mode)
+            {
+                return fail(
+                    "mirrored child outcome sampling-mode mismatch for participant " +
                     std::to_string(i));
             }
             if (child.device != runner->primaryDeviceId())
@@ -13879,6 +13899,8 @@ namespace llaminar2
             outcome.device_generation_controller_owned ==
                 rank_mirrored_primary_outcome_
                     .device_generation_controller_owned &&
+            outcome.sampling_mode ==
+                rank_mirrored_primary_outcome_.sampling_mode &&
             outcome.mirrored_local_tp_locally_complete ==
                 rank_mirrored_primary_outcome_.mirrored_local_tp_locally_complete;
 

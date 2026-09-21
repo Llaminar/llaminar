@@ -10823,6 +10823,11 @@ namespace llaminar2::test::parity
                 "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
                 // MoE sub-stages (skipped for dense FFN layers)
                 "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
+                // One weighted expert row per original router slot.  This is
+                // the pre-fold sparse-collective boundary, so it exposes a
+                // lost/duplicated participant contribution before the
+                // aggregated MOE_EXPERT_OUTPUT can mask its source.
+                "MOE_ROUTE_CONTRIBUTIONS",
                 "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
                 "FFN_RESIDUAL"};
             auto snapshot_keys = activeSnapshotKeys();

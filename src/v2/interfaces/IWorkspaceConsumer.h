@@ -99,9 +99,9 @@ namespace llaminar2
          * @param k Number of input features (may be 0 if kernel-specific)
          * @return WorkspaceRequirements describing all needed buffers
          *
-         * @note Dimensions are typically the MAXIMUM expected values to avoid
-         *       re-allocation during inference. For variable-length sequences,
-         *       pass the maximum sequence length used in KV cache.
+         * @note Family setup queries every retained geometry before publishing
+         *       storage. M is this operation's row count, never KV context
+         *       capacity; live rebinding must not grow published scratch.
          *
          * @note If n and k are 0, kernel uses its internal N_ and K_ dimensions.
          */

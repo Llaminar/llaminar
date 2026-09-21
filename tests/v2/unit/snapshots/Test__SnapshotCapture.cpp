@@ -357,6 +357,24 @@ TEST(Test__SnapshotCapture_KeyConversion,
             "layer7_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
             "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
 
+    /* Ordinary multi-row LocalTP prefill takes the mapped-sparse reducer,
+     * rather than the overlay-return reducer above.  Its root-owned output is
+     * the same completed canonical route fold and must expose the exact same
+     * parity evidence before the shared-expert merge overwrites its scratch. */
+    EXPECT_EQ(
+        SnapshotCapture::possibleKeysForStage(
+            "layer7_moe_mapped_routes_ordered_reduce", dump),
+        (std::vector<std::string>{
+            "layer7_MOE_EXPERT_OUTPUT",
+            "layer7_MOE_ROUTE_CONTRIBUTIONS",
+            "layer7_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "layer7_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer7_MOE_OVERLAY_ROUTE_BANK0_EPOCH",
+            "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer7_MOE_OVERLAY_ROUTE_BANK1_EPOCH",
+            "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
+
     SnapshotCapture capture;
     StageDumpInfo local_expert_dump;
     local_expert_dump.outputs.push_back(makeFP32Output(

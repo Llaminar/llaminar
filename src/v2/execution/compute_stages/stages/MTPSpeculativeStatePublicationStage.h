@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -92,6 +93,36 @@ namespace llaminar2
         };
 
         /**
+         * @brief One complete Dynamic ExpertOverlay cadence boundary on device.
+         *
+         * These four fields are one state-machine transition, not independent
+         * optional controls. A greedy grouped MTP transaction advances the
+         * boundary only after every accepted-state mutation has been queued on
+         * the publication stream. The binding is absent for Static placement,
+         * stochastic reducers (which already own this transition), and
+         * non-controller publication authorities.
+         */
+        struct DynamicMoECommitBoundaryBinding
+        {
+            uint32_t *decode_rounds_committed_device = nullptr;
+            uint32_t *decode_rounds_until_maintenance_device = nullptr;
+            uint32_t *maintenance_due_device = nullptr;
+            uint32_t *decode_boundary_advanced_device = nullptr;
+
+            /** @return Whether all fields of the indivisible cadence transition are bound. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return decode_rounds_committed_device != nullptr &&
+                       decode_rounds_until_maintenance_device != nullptr &&
+                       maintenance_due_device != nullptr &&
+                       decode_boundary_advanced_device != nullptr;
+            }
+
+            bool operator==(const DynamicMoECommitBoundaryBinding &) const =
+                default;
+        };
+
+        /**
          * @brief Immutable bindings and launch geometry captured by the stage.
          *
          * All pointer members name model- or arena-lifetime device storage.  No
@@ -140,6 +171,17 @@ namespace llaminar2
             /** Durable identity written atomically with controller/response commit. */
             sampling_math::MTPCommittedVerifierIdentityRecord *
                 committed_verifier_identity_device = nullptr;
+
+            /**
+             * Optional, complete Dynamic ExpertOverlay cadence transition.
+             *
+             * Only a greedy controller-owned outcome may bind this field. The
+             * stage then advances the device clock after accepted response, KV,
+             * recurrent-state, histogram, and penalty publication, making the
+             * ensuing maintenance tail observe one coherent transaction.
+             */
+            std::optional<DynamicMoECommitBoundaryBinding>
+                dynamic_moe_commit_boundary;
 
             int request_count = 0;
             int verifier_rows_per_request = 0;
@@ -290,6 +332,12 @@ namespace llaminar2
         [[nodiscard]] bool publishPenaltyHistory(void *stream) const;
         /** @brief Select local recurrent-state rows using the committed device indices. */
         [[nodiscard]] bool publishVerifierState(void *stream) const;
+        /**
+         * @brief Advance Dynamic ExpertOverlay exactly once after accepted-state publication.
+         * @param stream Exact non-null publication stream.
+         * @return Whether the optional cadence transition was enqueued successfully.
+         */
+        [[nodiscard]] bool publishDynamicMoECommitBoundary(void *stream) const;
 
         Params params_;
     };

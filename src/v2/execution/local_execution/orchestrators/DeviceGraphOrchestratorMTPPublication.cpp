@@ -17,6 +17,8 @@
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 
+#include <cstddef>
+
 namespace llaminar2
 {
     bool DeviceGraphOrchestrator::materializeMTPSpeculativeStatePublicationGraph(
@@ -127,6 +129,63 @@ namespace llaminar2
             verifier_rows_per_request;
         params.committed_verifier_identity_device =
             mtp_committed_verifier_identity_dev_;
+
+        /*
+         * Greedy compact outcomes leave their accepted count in the verifier
+         * graph; publication is therefore the sole point at which the Dynamic
+         * ExpertOverlay cadence can observe a fully committed transaction.
+         * Stochastic reducers already advance this exact device boundary in
+         * their fused outcome graph, so binding them here would be a double
+         * transition. The producer-owned typed sampling mode makes that split
+         * explicit rather than inferring it from a mutable runner flag.
+         */
+        const bool owns_greedy_dynamic_moe_boundary =
+            request.outcome.device_generation_controller_owned &&
+            request.outcome.sampling_mode ==
+                DeviceGenerationSamplingMode::Greedy &&
+            usesParticipantLocalDeviceMoERebalanceController();
+        if (owns_greedy_dynamic_moe_boundary)
+        {
+            std::string controller_error;
+            DeviceMoERebalanceGraphControllerState *const controller =
+                deviceMoERebalanceControllerStateDevice(&controller_error);
+            if (!controller)
+            {
+                return fail(
+                    "MTP speculative publication cannot bind the Dynamic MoE cadence controller: " +
+                    controller_error);
+            }
+            auto *const controller_bytes =
+                reinterpret_cast<std::byte *>(controller);
+            params.dynamic_moe_commit_boundary =
+                MTPSpeculativeStatePublicationStage::
+                    DynamicMoECommitBoundaryBinding{
+                        .decode_rounds_committed_device =
+                            reinterpret_cast<uint32_t *>(
+                                controller_bytes +
+                                offsetof(
+                                    DeviceMoERebalanceGraphControllerState,
+                                    decode_rounds_committed)),
+                        .decode_rounds_until_maintenance_device =
+                            reinterpret_cast<uint32_t *>(
+                                controller_bytes +
+                                offsetof(
+                                    DeviceMoERebalanceGraphControllerState,
+                                    decode_rounds_until_maintenance)),
+                        .maintenance_due_device =
+                            reinterpret_cast<uint32_t *>(
+                                controller_bytes +
+                                offsetof(
+                                    DeviceMoERebalanceGraphControllerState,
+                                    maintenance_due)),
+                        .decode_boundary_advanced_device =
+                            reinterpret_cast<uint32_t *>(
+                                controller_bytes +
+                                offsetof(
+                                    DeviceMoERebalanceGraphControllerState,
+                                    decode_boundary_advanced)),
+                    };
+        }
 
         params.request_count = request.requestCount();
         params.verifier_rows_per_request = verifier_rows_per_request;

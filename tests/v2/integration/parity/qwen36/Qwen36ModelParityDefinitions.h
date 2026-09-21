@@ -120,7 +120,11 @@ namespace llaminar2::test::parity::qwen36
     /** @return Shard-aware Qwen3.6 MoE ExpertOverlay numerical contract. */
     inline BackendThresholds qwen36MoEExpertOverlayThresholds()
     {
-        auto thresholds = qwen35moe::qwen35MoEMultiDeviceThresholds();
+        // ExpertOverlay has root-owned routed and shared-gate publication
+        // checkpoints. Do not inherit the generic TP contract, which excludes
+        // those branch-local names before the overlay graph republishes their
+        // completed semantic values.
+        auto thresholds = qwen35moe::qwen35MoEExpertOverlayThresholds();
         thresholds.min_top5_accuracy = 60.0f;
         return thresholds;
     }

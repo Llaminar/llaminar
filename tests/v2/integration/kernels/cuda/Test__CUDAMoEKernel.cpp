@@ -25055,6 +25055,588 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
 #endif
 }
 
+/**
+ * @brief Prove the Q4_K tensor-core prefill engine matches serial rows at the
+ *        production 39-token Ornith/Qwen prompt geometry.
+ *
+ * The normal grouped-verifier inventory stops at 31 rows because it certifies
+ * MTP's maximum fifteen-draft transaction plus its target row.  A 39-token
+ * chat prefill therefore takes a different production branch:
+ * @ref CUDAMoEBatchInvariantPolicy selects the compact-directory IMMA engine
+ * instead of the ordered DP4A verifier.  Fused-versus-split checks are not an
+ * oracle for that branch because both paths share the same IMMA projections.
+ *
+ * This regression uses the actual Qwen routed-FFN geometry and codebook-5
+ * Q4_K descriptors, captures the production grouped transaction, and compares
+ * every replayed FP32 row to independently dispatched M=1 decode operations.
+ * It then repeats the proof through the real double-buffered runtime placement
+ * table with a StaticOwner half-expert mask.  That second phase is the exact
+ * local half of a two-participant ExpertOverlay transaction: remote route
+ * slots preserve their canonical owner identity but contribute no local bytes
+ * until the node-local exchange folds the peer bank.  Eight distinct
+ * descriptor triplets are deliberately repeated through the 256 logical
+ * expert table: that keeps the test economical while still proving
+ * descriptor-table indexing, asymmetric-minimum handling, and the full
+ * 256-expert work-directory schedule.
+ */
+TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ4KM39MatchesSerialRowsAndCaptures)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using GroupedProjectionEngine =
+        llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine;
+    constexpr int seq_len = 39;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 256;
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
+    constexpr int q4k_codebook = 5;
+    constexpr int expert_variants = 8;
+    static_assert(
+        llaminar2::CUDAMoEBatchInvariantPolicy::groupedProjectionEngine(
+            seq_len) == GroupedProjectionEngine::TensorCoreImmaPrefill,
+        "the regression must cover the production tensor-core prefill branch");
+
+    const auto device = llaminar2::DeviceId::cuda(0);
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    llaminar2::PerfStatsCollector::reset();
+
+    std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+    std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+    owned_weights.reserve(static_cast<size_t>(expert_variants * 3));
+    prepared_weights.reserve(static_cast<size_t>(expert_variants * 3));
+
+    auto add_prepared_q4k_descriptor =
+        [&](int rows,
+            int cols,
+            uint32_t seed,
+            const char *role) -> llaminar2::DeviceNativeVNNIMatrixDesc
+    {
+        auto weight = llaminar2::test::TestTensorFactory::createQ4_KRandom(
+            {static_cast<size_t>(rows), static_cast<size_t>(cols)}, seed);
+        auto *weight_ptr = weight.get();
+        owned_weights.push_back(std::move(weight));
+        prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+            weight_ptr,
+            device,
+            std::string("test.cuda_moe.q4k_m39.") + role + "." +
+                std::to_string(seed),
+            llaminar2::ModelContextId{940000u + static_cast<uint64_t>(seed)}));
+
+        auto *tensor_kernel = dynamic_cast<llaminar2::ITensorKernel *>(
+            prepared_weights.back().kernel);
+        if (!tensor_kernel)
+        {
+            throw std::runtime_error(
+                "prepared CUDA Q4_K GEMM must expose an explicit stream contract");
+        }
+        tensor_kernel->setGPUStream(stream_);
+
+        llaminar2::DeviceNativeVNNIMatrixDesc descriptor{};
+        if (!prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(
+                descriptor))
+        {
+            throw std::runtime_error(
+                std::string("failed to export Q4_K native descriptor for ") + role);
+        }
+        EXPECT_EQ(descriptor.n, rows);
+        EXPECT_EQ(descriptor.k, cols);
+        EXPECT_EQ(descriptor.codebook_id, q4k_codebook);
+        return descriptor;
+    };
+
+    struct ExpertTriplet
+    {
+        llaminar2::DeviceNativeVNNIMatrixDesc gate{};
+        llaminar2::DeviceNativeVNNIMatrixDesc up{};
+        llaminar2::DeviceNativeVNNIMatrixDesc down{};
+    };
+
+    std::array<ExpertTriplet, expert_variants> variants{};
+    for (int variant = 0; variant < expert_variants; ++variant)
+    {
+        variants[static_cast<size_t>(variant)].gate =
+            add_prepared_q4k_descriptor(
+                intermediate, d_model, 940100u + static_cast<uint32_t>(variant), "gate");
+        variants[static_cast<size_t>(variant)].up =
+            add_prepared_q4k_descriptor(
+                intermediate, d_model, 940200u + static_cast<uint32_t>(variant), "up");
+        variants[static_cast<size_t>(variant)].down =
+            add_prepared_q4k_descriptor(
+                d_model, intermediate, 940300u + static_cast<uint32_t>(variant), "down");
+    }
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descriptors;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descriptors;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descriptors;
+    gate_descriptors.reserve(num_experts);
+    up_descriptors.reserve(num_experts);
+    down_descriptors.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const auto &variant = variants[static_cast<size_t>(expert % expert_variants)];
+        gate_descriptors.push_back(variant.gate);
+        up_descriptors.push_back(variant.up);
+        down_descriptors.push_back(variant.down);
+    }
+
+    const int gateup_table =
+        cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+            gate_descriptors.data(),
+            up_descriptors.data(),
+            num_experts,
+            d_model,
+            intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descriptors.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    /*
+     * Model the participant-zero half of a static two-device owner map.  The
+     * sparse descriptor tables intentionally have no payload for remote
+     * experts: a route filter alone would not prove that the runtime plan
+     * avoids dereferencing a peer-owned descriptor.
+     */
+    std::vector<uint8_t> local_owner_mask(static_cast<size_t>(num_experts));
+    auto local_gate_descriptors = gate_descriptors;
+    auto local_up_descriptors = up_descriptors;
+    auto local_down_descriptors = down_descriptors;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const bool local_owner = (expert & 1) == 0;
+        local_owner_mask[static_cast<size_t>(expert)] =
+            local_owner ? 1u : 0u;
+        if (!local_owner)
+        {
+            local_gate_descriptors[static_cast<size_t>(expert)] = {};
+            local_up_descriptors[static_cast<size_t>(expert)] = {};
+            local_down_descriptors[static_cast<size_t>(expert)] = {};
+        }
+    }
+    const int local_gateup_table =
+        cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+            local_gate_descriptors.data(),
+            local_up_descriptors.data(),
+            num_experts,
+            d_model,
+            intermediate);
+    ASSERT_GE(local_gateup_table, 0);
+    const int local_down_table =
+        cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+            local_down_descriptors.data(),
+            num_experts,
+            d_model,
+            intermediate);
+    ASSERT_GE(local_down_table, 0);
+
+    std::vector<float> hidden_values(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+    for (size_t index = 0; index < hidden_values.size(); ++index)
+    {
+        hidden_values[index] =
+            0.019f * static_cast<float>(
+                         static_cast<int>((index * 17u + 3u) % 47u) - 23) +
+            0.004f * static_cast<float>(
+                         static_cast<int>(((index / 19u) * 11u + 7u) % 29u) - 14);
+    }
+
+    std::vector<float> routing_indices(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(top_k));
+    std::vector<float> routing_weights(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(top_k));
+    for (int row = 0; row < seq_len; ++row)
+    {
+        float sum = 0.0f;
+        for (int route = 0; route < top_k; ++route)
+        {
+            const int slot = row * top_k + route;
+            /*
+             * Cover all 256 logical descriptors, then revisit the first 56.
+             * This creates the compact one/two-row directory distribution a
+             * real sparse route table sees without baking in a host-side plan.
+             */
+            routing_indices[static_cast<size_t>(slot)] =
+                static_cast<float>(slot % num_experts);
+            const float weight = 0.07f + 0.011f *
+                static_cast<float>((row * 5 + route * 3 + 1) % 11);
+            routing_weights[static_cast<size_t>(slot)] = weight;
+            sum += weight;
+        }
+        for (int route = 0; route < top_k; ++route)
+        {
+            routing_weights[static_cast<size_t>(row * top_k + route)] /= sum;
+        }
+    }
+
+    /*
+     * Build the independent M=1 reference before recording the graph.  These
+     * calls are a diagnostic oracle only; the system under test below remains
+     * the retained, graph-captured grouped production transaction.
+     */
+    std::vector<float> serial_rows(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+    std::vector<float> serial_local_owner_rows(
+        static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
+    for (int row = 0; row < seq_len; ++row)
+    {
+        const size_t hidden_offset = static_cast<size_t>(row) * d_model;
+        const size_t route_offset = static_cast<size_t>(row) * top_k;
+        auto hidden_row = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        std::copy_n(
+            hidden_values.data() + hidden_offset,
+            d_model,
+            hidden_row->mutable_data());
+        auto row_indices = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(top_k)});
+        auto row_weights = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(top_k)});
+        std::copy_n(
+            routing_indices.data() + route_offset,
+            top_k,
+            row_indices->mutable_data());
+        std::copy_n(
+            routing_weights.data() + route_offset,
+            top_k,
+            row_weights->mutable_data());
+
+        std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_storage;
+        std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_storage;
+        std::array<llaminar2::ITensor *, top_k> gate_outputs{};
+        std::array<llaminar2::ITensor *, top_k> up_outputs{};
+        for (int route = 0; route < top_k; ++route)
+        {
+            gate_storage[static_cast<size_t>(route)] =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(intermediate)});
+            up_storage[static_cast<size_t>(route)] =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(intermediate)});
+            ASSERT_TRUE(gate_storage[static_cast<size_t>(route)]->ensureOnDevice(
+                device, stream_));
+            ASSERT_TRUE(up_storage[static_cast<size_t>(route)]->ensureOnDevice(
+                device, stream_));
+            gate_outputs[static_cast<size_t>(route)] =
+                gate_storage[static_cast<size_t>(route)].get();
+            up_outputs[static_cast<size_t>(route)] =
+                up_storage[static_cast<size_t>(route)].get();
+        }
+        auto row_output = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        auto local_row_output = llaminar2::test::TestTensorFactory::createFP32(
+            {1u, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_indices->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_weights->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(row_output->ensureOnDevice(device, stream_));
+        ASSERT_TRUE(local_row_output->ensureOnDevice(device, stream_));
+
+        ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRouting(
+            hidden_row.get(),
+            row_indices.get(),
+            gateup_table,
+            top_k,
+            gate_outputs.data(),
+            up_outputs.data(),
+            d_model,
+            intermediate))
+            << "serial Q4_K gate/up row=" << row;
+        ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRouting(
+            gate_outputs.data(),
+            up_outputs.data(),
+            row_indices.get(),
+            row_weights.get(),
+            down_table,
+            top_k,
+            row_output.get(),
+            d_model,
+            intermediate))
+            << "serial Q4_K down row=" << row;
+        ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRouting(
+            hidden_row.get(),
+            row_indices.get(),
+            local_gateup_table,
+            top_k,
+            gate_outputs.data(),
+            up_outputs.data(),
+            d_model,
+            intermediate,
+            local_owner_mask.data()))
+            << "serial StaticOwner Q4_K gate/up row=" << row;
+        ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRouting(
+            gate_outputs.data(),
+            up_outputs.data(),
+            row_indices.get(),
+            row_weights.get(),
+            local_down_table,
+            top_k,
+            local_row_output.get(),
+            d_model,
+            intermediate,
+            local_owner_mask.data()))
+            << "serial StaticOwner Q4_K down row=" << row;
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_TRUE(row_output->ensureOnHost(stream_));
+        ASSERT_TRUE(local_row_output->ensureOnHost(stream_));
+        std::copy_n(
+            row_output->data(),
+            d_model,
+            serial_rows.data() + hidden_offset);
+        std::copy_n(
+            local_row_output->data(),
+            d_model,
+            serial_local_owner_rows.data() + hidden_offset);
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto route_indices = makeTensor({seq_len, top_k}, routing_indices);
+    auto route_weights = makeTensor({seq_len, top_k}, routing_weights);
+    auto grouped_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(route_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(route_weights->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
+
+    /* Bind all workspace slices before capture; production graphs do this once. */
+    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+        route_indices.get(), route_weights.get(), seq_len, num_experts, top_k));
+    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(),
+        grouped_output.get(),
+        gateup_table,
+        down_table,
+        seq_len,
+        d_model,
+        intermediate,
+        num_experts,
+        top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ScopedCudaTestGraph graph(
+        stream_, "Q4_K M=39 grouped tensor-core prefill capture");
+    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+        route_indices.get(), route_weights.get(), seq_len, num_experts, top_k));
+    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(),
+        grouped_output.get(),
+        gateup_table,
+        down_table,
+        seq_len,
+        d_model,
+        intermediate,
+        num_experts,
+        top_k));
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launchAndPublishOutputs({grouped_output.get()}));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const auto grouped_rows = copyCudaFP32TensorToHost(grouped_output, stream_);
+    ASSERT_GT(l2Norm(serial_rows.data(), serial_rows.size()), 1.0e-7)
+        << "serial Q4_K oracle unexpectedly produced only zero rows";
+    ASSERT_GT(l2Norm(grouped_rows.data(), grouped_rows.size()), 1.0e-7)
+        << "captured Q4_K grouped prefill unexpectedly produced only zero rows";
+    expectBitwiseFP32RowsEqual(
+        "captured Q4_K grouped IMMA prefill M=39 versus serial decode rows",
+        grouped_rows.data(),
+        serial_rows.data(),
+        grouped_rows.size(),
+        static_cast<size_t>(d_model));
+    expectPrefillSwiGLUPathRecord(
+        "fused",
+        seq_len,
+        top_k,
+        num_experts,
+        /*expected_tile_m=*/0,
+        /*expected_gateup_route=*/nullptr,
+        /*expected_down_route=*/nullptr,
+        /*expected_down_accumulation=*/nullptr,
+        /*expected_active_expert_slots=*/num_experts);
+
+    /*
+     * The direct grouped probe above proves the Q4_K IMMA arithmetic, but it
+     * does not consume the double-buffered runtime placement bank used by
+     * Static ExpertOverlay.  Exercise that real publication path with only the
+     * even experts resident on this participant.  Remote routes intentionally
+     * retain participant one in the canonical ledger while their local
+     * execution weight is zero; that is the contract consumed by the mapped
+     * node-local route exchange after this stage.
+     */
+    llaminar2::DeviceMoERuntimeTable::Config runtime_config;
+    runtime_config.device_id = device;
+    runtime_config.num_layers = 1;
+    runtime_config.num_experts = num_experts;
+    runtime_config.top_k = top_k;
+    runtime_config.mirror_to_device = true;
+    runtime_config.prefill_token_capacity = seq_len;
+    llaminar2::DeviceMoERuntimeTable static_owner_runtime(runtime_config);
+
+    llaminar2::MoEPlacementUpdate static_owner_update;
+    static_owner_update.epoch = 1;
+    static_owner_update.expert_count = num_experts;
+    static_owner_update.participant_id = 0;
+    static_owner_update.participant_count = 2;
+    static_owner_update.experts.resize(static_cast<size_t>(num_experts));
+    static_owner_update.local_compute_mask = local_owner_mask;
+    static_owner_update.replica_role.resize(static_cast<size_t>(num_experts));
+    static_owner_update.resident_participant_mask.resize(
+        static_cast<size_t>(num_experts));
+    static_owner_update.overlay_route_participant.resize(
+        static_cast<size_t>(num_experts));
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const bool local_owner =
+            local_owner_mask[static_cast<size_t>(expert)] != 0u;
+        auto &descriptor =
+            static_owner_update.experts[static_cast<size_t>(expert)];
+        descriptor.logical_expert_id = expert;
+        descriptor.owner_participant = local_owner ? 0 : 1;
+        descriptor.local_slot = local_owner ? expert / 2 : -1;
+        if (local_owner)
+        {
+            descriptor.flags = llaminar2::toMoEExpertFlags(
+                llaminar2::DeviceMoEExpertFlags::Valid |
+                llaminar2::DeviceMoEExpertFlags::Resident |
+                llaminar2::DeviceMoEExpertFlags::PreferredOwner |
+                llaminar2::DeviceMoEExpertFlags::LocalCompute);
+            descriptor.gate =
+                gate_descriptors[static_cast<size_t>(expert)];
+            descriptor.up = up_descriptors[static_cast<size_t>(expert)];
+            descriptor.down = down_descriptors[static_cast<size_t>(expert)];
+            static_owner_update.replica_role[static_cast<size_t>(expert)] =
+                static_cast<uint8_t>(
+                    llaminar2::DeviceMoEReplicaRole::Primary);
+        }
+        else
+        {
+            /* A peer owner has no local weight pointer or residency claim. */
+            static_owner_update.replica_role[static_cast<size_t>(expert)] =
+                static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::None);
+        }
+        static_owner_update.resident_participant_mask[
+            static_cast<size_t>(expert)] = local_owner ? 0x1u : 0x2u;
+        static_owner_update.overlay_route_participant[
+            static_cast<size_t>(expert)] = descriptor.owner_participant;
+    }
+    ASSERT_TRUE(static_owner_runtime.prepareInactiveBank(
+        /*layer_idx=*/0,
+        static_owner_update));
+    ASSERT_TRUE(static_owner_runtime.flipActiveBank(
+        /*layer_idx=*/0,
+        static_owner_update.epoch,
+        stream_));
+
+    auto static_owner_hidden = makeTensor(
+        {seq_len, d_model},
+        hidden_values);
+    auto static_owner_route_indices = makeTensor(
+        {seq_len, top_k},
+        routing_indices);
+    auto static_owner_route_weights = makeTensor(
+        {seq_len, top_k},
+        routing_weights);
+    auto static_owner_output = makeZeros({seq_len, d_model});
+    auto static_owner_canonical =
+        llaminar2::test::TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len),
+             static_cast<size_t>(top_k),
+             static_cast<size_t>(d_model)});
+    std::fill_n(
+        static_owner_canonical->mutable_data(),
+        static_owner_canonical->numel(),
+        std::numeric_limits<float>::quiet_NaN());
+    ASSERT_TRUE(static_owner_hidden->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(static_owner_route_indices->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(static_owner_route_weights->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(static_owner_canonical->ensureOnDevice(device, stream_));
+    ASSERT_EQ(static_owner_output->gpu_data_ptr(), nullptr)
+        << "the local producer must not allocate the later root reducer output";
+
+    auto run_static_owner_runtime_plan = [&]()
+    {
+        return cuda_kernel_->publishCompleteGroupedPrefillPlanFromRouter(
+                   static_owner_runtime.deviceLayerState(0),
+                   static_owner_route_indices.get(),
+                   static_owner_route_weights.get(),
+                   seq_len,
+                   seq_len,
+                   num_experts,
+                   top_k,
+                   local_gateup_table,
+                   local_down_table,
+                   /*filter_to_local_runtime_experts=*/true) &&
+               cuda_kernel_->executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+                   static_owner_runtime.deviceLayerState(0),
+                   static_owner_runtime.hostLayerState(0),
+                   static_owner_hidden.get(),
+                   static_owner_output.get(),
+                   local_gateup_table,
+                   local_down_table,
+                   seq_len,
+                   d_model,
+                   intermediate,
+                   num_experts,
+                   top_k,
+                   static_owner_canonical.get());
+    };
+
+    /* Warmup owns allocation and joins all setup producer events before capture. */
+    ASSERT_TRUE(run_static_owner_runtime_plan());
+    ASSERT_EQ(static_owner_output->gpu_data_ptr(), nullptr);
+    ASSERT_TRUE(static_owner_output->ensureOnDevice(device, stream_));
+    ASSERT_TRUE(cuda_kernel_->reduceCanonicalRouteContributions(
+        static_owner_canonical.get(),
+        static_owner_output.get(),
+        seq_len,
+        top_k,
+        d_model));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_TRUE(static_owner_output->ensureOnHost(stream_));
+    expectBitwiseFP32RowsEqual(
+        "Q4_K M=39 StaticOwner runtime-plan warmup versus serial local rows",
+        static_owner_output->data(),
+        serial_local_owner_rows.data(),
+        static_owner_output->numel(),
+        static_cast<size_t>(d_model));
+
+    ScopedCudaTestGraph static_owner_graph(
+        stream_,
+        "Q4_K M=39 StaticOwner runtime-plan capture");
+    ASSERT_TRUE(run_static_owner_runtime_plan());
+    ASSERT_TRUE(cuda_kernel_->reduceCanonicalRouteContributions(
+        static_owner_canonical.get(),
+        static_owner_output.get(),
+        seq_len,
+        top_k,
+        d_model));
+    ASSERT_TRUE(static_owner_graph.finishAndInstantiate());
+    ASSERT_TRUE(static_owner_graph.launchAndPublishOutputs(
+        {static_owner_output.get()}));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const auto static_owner_rows = copyCudaFP32TensorToHost(
+        static_owner_output,
+        stream_);
+    ASSERT_GT(
+        l2Norm(serial_local_owner_rows.data(), serial_local_owner_rows.size()),
+        1.0e-7)
+        << "serial StaticOwner Q4_K oracle unexpectedly produced only zero rows";
+    expectBitwiseFP32RowsEqual(
+        "captured Q4_K M=39 StaticOwner runtime plan versus serial local rows",
+        static_owner_rows.data(),
+        serial_local_owner_rows.data(),
+        static_owner_rows.size(),
+        static_cast<size_t>(d_model));
+    llaminar2::PerfStatsCollector::reset();
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillQ8FusedMatchesSplitUnderGraphReplay)
 {
 #ifndef HAVE_CUDA

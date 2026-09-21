@@ -1404,6 +1404,7 @@ public:
             std::shared_ptr<void>(
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
+        out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
         out_handle->mirrored_local_tp_locally_complete =
             uses_mirrored_localtp_mtp_head_for_verifier_;
         attachMockResidentMTPTransaction(out_handle, /*request_count=*/1);
@@ -1888,6 +1889,7 @@ public:
             std::shared_ptr<void>(
                 &resident_outcome_ready_event_token_,
                 [](void *) {});
+        out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
         out_handle->mirrored_local_tp_locally_complete =
             uses_mirrored_localtp_mtp_head_for_verifier_;
         attachMockResidentMTPTransaction(out_handle, request_count);

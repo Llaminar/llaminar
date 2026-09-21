@@ -20,6 +20,7 @@
 #include "ComputeBackend.h"
 #include "GPUEnumeration.h"
 #include "DeviceUUID.h"
+#include "rocm/ROCmRuntimeStartup.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -30,6 +31,7 @@ namespace llaminar2
         /** @return Observed devices with immutable UUIDs and current capacities. */
         std::vector<ComputeDevice> enumerate_rocm_devices()
         {
+            requireROCmRuntimeStartup();
             std::vector<ComputeDevice> devices;
 
             LOG_DEBUG("[ROCm] enumerate_rocm_devices() called");

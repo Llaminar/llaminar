@@ -15,6 +15,7 @@
 #include "AMDDeviceContext.h"
 #include "HIPGraphCapture.h"
 #include "ROCmBackend.h"
+#include "ROCmRuntimeStartup.h"
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -83,6 +84,7 @@ namespace llaminar2
     AMDDeviceContext::AMDDeviceContext(int device_ordinal)
         : device_ordinal_(device_ordinal)
     {
+        requireROCmRuntimeStartup();
         LOG_DEBUG("[AMDDeviceContext] Creating context for ROCm device " << device_ordinal);
 
         // Validate device ordinal before starting worker

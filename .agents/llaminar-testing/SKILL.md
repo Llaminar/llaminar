@@ -290,6 +290,27 @@ real campaign with the driver's `--campaign`, `--backend`, and `--precision`
 selectors so staging, identity locking, artifacts, and the global timing
 authority remain intact.
 
+For one already identified red, use the driver's exact registered-cell route,
+not a hand-written `mpirun` command. It validates the requested fully qualified
+GTest identity against CTest discovery, retains the exact registered process
+contract, runs the normal fixture/staging path and CSV validator, and records a
+non-certifying focused report. It is the shortest valid feedback loop for an
+HF checkpoint diagnosis; it does not update the green ledger or replace a
+later unfiltered campaign. After a current prerequisite receipt exists, add
+`--reuse-passed-preflight-report PATH` only when its build/CTest identity
+validator accepts it.
+
+```bash
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --backend 'CUDA' --precision 'ALL' \
+  --campaign 'V2_Integration_Parity_Qwen36MoE_ExpertOverlay_ProductionCampaign_CUDA_ALL_PRECISIONS' \
+  --exact-cell 'Suite/Fixture.ProductionParity/Registered_Model_Topology_Static_Ordinal_ActFP32_KVFP16_MTPOff' \
+  --model-ramdisk-root /mnt/llaminar-production-parity \
+  --persistent-model-cache-dir cache \
+  --report parity-results/focused-exact-cell.json
+```
+
 For an explicitly requested full mathematical diagnostic, run the unfiltered
 matrix. The 75-minute requirement is one wall-clock
 performance target for all campaigns, backends, precision types, and fixtures

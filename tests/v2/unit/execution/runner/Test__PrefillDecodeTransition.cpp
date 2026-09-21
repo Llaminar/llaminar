@@ -2498,6 +2498,7 @@ namespace
             out_handle->mtp_transaction =
                 makeMockMTPTransactionLease(/*request_count=*/1);
             out_handle->device_generation_controller_owned = true;
+            out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
             out_handle->mirrored_local_tp_locally_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             const bool valid = out_handle->valid();
@@ -2702,6 +2703,7 @@ namespace
             out_handle->device_generation_controller_owned =
                 device_generation_admitted_ ||
                 device_generation_controller_owned_outcomes_;
+            out_handle->sampling_mode = DeviceGenerationSamplingMode::Greedy;
             out_handle->mirrored_local_tp_locally_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             return out_handle->valid();
@@ -4751,6 +4753,7 @@ namespace
             out_handle->device_generation_controller_owned =
                 device_generation_admitted_ ||
                 device_generation_controller_owned_outcomes_;
+            out_handle->sampling_mode = DeviceGenerationSamplingMode::Stochastic;
             out_handle->mirrored_local_tp_locally_complete =
                 mirrors_localtp_mtp_head_for_verifier_;
             return out_handle->valid();
@@ -8082,6 +8085,10 @@ namespace
         handle.stream = &stream_token;
         handle.response_ready_event =
             std::shared_ptr<void>(&response_ready_event_token, [](void *) {});
+        EXPECT_FALSE(handle.valid())
+            << "A compact outcome must identify its greedy or stochastic "
+               "producer before a consumer can accept it.";
+        handle.sampling_mode = DeviceGenerationSamplingMode::Greedy;
         EXPECT_TRUE(handle.valid());
 
         handle.response_ready_event.reset();

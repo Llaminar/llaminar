@@ -123,6 +123,28 @@ def device_generation_ticket_tags() -> dict[str, str]:
 class TestServerGraphCapturePerfPolicy(unittest.TestCase):
     """Prove topology and PerfStats jointly control production certification."""
 
+    def test_native_graph_setup_timing_is_diagnostic_not_runtime_failure(self) -> None:
+        """Cold driver setup duration must not fabricate a failed HTTP certificate.
+
+        This is a logging-policy invariant, not a timing benchmark. Check both
+        backend implementations without making the test depend on whether the
+        host happens to cross a wall-clock threshold. Actual native failures
+        must retain their ERROR diagnostic, and the HTTP scanner remains strict.
+        """
+        for path in ("rocm/HIPGraphCapture.cpp", "cuda/CUDAGraphCapture.cu"):
+            with self.subTest(backend=path):
+                source = (REPO_ROOT / "src/v2/backends" / path).read_text()
+                success_levels = re.findall(
+                    r'LOG_(\w+)\(\s*"\[(?:HIP|CUDA)GraphCapture\] '
+                    r'(?:Slow (?:hip|cuda)GraphInstantiate|Instantiated graph executable)',
+                    source)
+                self.assertTrue(success_levels, "retain successful setup diagnostics")
+                self.assertTrue(all(level in {"DEBUG", "TRACE"} for level in success_levels),
+                                f"successful setup must not warn: {success_levels}")
+                self.assertRegex(source,
+                    r'LOG_ERROR\(\s*"\[(?:HIP|CUDA)GraphCapture\] '
+                    r'(?:hip|cuda)GraphInstantiate failed: ')
+
     def test_log_scan_preserves_failures_without_broken_pipe(self) -> None:
         """Large diagnostics stay bounded without aborting the final certificate."""
         script = (SERVER_E2E_DIR / "test_server_e2e.sh").read_text()

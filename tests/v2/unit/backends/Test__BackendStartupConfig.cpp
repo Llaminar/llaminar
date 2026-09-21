@@ -68,10 +68,11 @@ namespace
         }
 
     private:
-        static constexpr std::array<const char *, 3> names_ = {
+        static constexpr std::array<const char *, 4> names_ = {
             "LLAMINAR_FORCE_CPU_ONLY_STARTUP",
             "LLAMINAR_SKIP_CUDA_STARTUP",
             "LLAMINAR_SKIP_ROCM_STARTUP",
+            "HSA_USERPTR_FOR_PAGED_MEM",
         };
         std::array<std::optional<std::string>, names_.size()> saved_{};
     };
@@ -128,6 +129,17 @@ TEST(Test__BackendStartupConfig, ParsingPreservesHistoricalIntegerSemantics)
     // accepted startup syntax must be an explicit CLI/configuration decision.
     EXPECT_TRUE(debugEnv().backend_startup.cudaEnabled());
     EXPECT_FALSE(debugEnv().backend_startup.rocmEnabled());
+}
+
+TEST(Test__BackendStartupConfig, VendorHostBackingRequestPreservesExactStartupIntent)
+{
+    ScopedBackendStartupEnvironment environment;
+    EXPECT_FALSE(debugEnv().backend_startup.rocm_userptr_for_paged_mem.has_value());
+    for (const char *value : {"0", "1", "", "00"})
+    {
+        environment.set("HSA_USERPTR_FOR_PAGED_MEM", value);
+        EXPECT_EQ(debugEnv().backend_startup.rocm_userptr_for_paged_mem, value);
+    }
 }
 
 TEST(Test__BackendStartupConfig, CpuOnlyInventoryNeverPublishesGpuDevices)

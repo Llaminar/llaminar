@@ -3047,6 +3047,30 @@ time.sleep(30)
                 ]
             )
 
+    def test_focused_exact_cell_requires_one_registered_identity(self) -> None:
+        """Keep focused diagnosis on CTest-owned exact matrix cases."""
+        exact_case = "Suite.ProductionParity/Model_CUDA_Static"
+        args = campaigns.parse_args(["--exact-cell", exact_case])
+        self.assertEqual(args.exact_cell, exact_case)
+
+        owner = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CUDA_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CUDA", "ALL"),
+            gtest_cases=(exact_case,),
+        )
+        self.assertIs(
+            campaigns.select_focused_exact_cell((owner,), exact_case),
+            owner,
+        )
+        with self.assertRaisesRegex(ValueError, "not registered"):
+            campaigns.select_focused_exact_cell((owner,), "Suite.ProductionParity/Missing")
+        with self.assertRaisesRegex(ValueError, "multiple campaign owners"):
+            campaigns.select_focused_exact_cell((owner, owner), exact_case)
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(["--exact-cell", "Suite.ProductionParity/*"])
+        with self.assertRaises(SystemExit):
+            campaigns.parse_args(["--exact-cell", exact_case, "--list"])
+
     @mock.patch.object(campaigns, "_filesystem_type", return_value="tmpfs")
     def test_persistent_workspace_rejects_session_ipc_tmpfs(
         self, _: mock.Mock

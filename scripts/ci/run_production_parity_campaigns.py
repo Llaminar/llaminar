@@ -272,6 +272,7 @@ REQUIRED_CAMPAIGN_ENV = {
 }
 INDIVIDUAL_GREEN_LEDGER_SCHEMA_VERSION = 1
 INDIVIDUAL_PROGRESS_REPORT_SCHEMA_VERSION = 2
+FOCUSED_EXACT_CELL_REPORT_SCHEMA_VERSION = 1
 INDIVIDUAL_GREEN_PROVENANCE = frozenset(
     {
         "exact_process_exit_zero_and_fresh_artifact_contract",
@@ -616,6 +617,31 @@ class IndividualProgressReport:
     artifact_root: str
     green_ledger: str
     results: tuple[CampaignResult, ...]
+
+
+@dataclass(frozen=True)
+class FocusedExactCellReport:
+    """Non-certifying evidence for one registered production matrix cell.
+
+    A focused run is a diagnosis aid, not a replacement for an unfiltered
+    campaign: it preserves the CTest-owned MPI command, production staging,
+    graph-capture requirements, prerequisite gate, per-cell watchdog, and CSV
+    contract while avoiding unrelated exact cells during a repair loop.
+    """
+
+    schema_version: int
+    mode: str
+    certification_eligible: bool
+    campaign: str
+    gtest_case: str
+    preflight_return_code: int
+    preflight_test_count: int
+    preflight_tests: tuple[str, ...]
+    fixture_return_code: int
+    model_staging_return_code: int
+    model_staging_root: str
+    artifact_root: str
+    result: CampaignResult | None
 
 
 def _property_map(test: dict[str, Any]) -> dict[str, Any]:
@@ -2128,6 +2154,50 @@ def _single_exact_cell(
         environment=cell.environment,
         working_directory=cell.working_directory,
     )
+
+
+def select_focused_exact_cell(
+    cells: Iterable[CampaignCell],
+    gtest_case: str,
+) -> CampaignCell:
+    """Resolve one registered exact case without inventing another matrix.
+
+    The command line may narrow a discovered aggregate only after CTest has
+    supplied its complete, wildcard-free case inventory.  This keeps focused
+    diagnosis on the identical production topology and launch contract rather
+    than accepting a caller-authored test/configuration string.
+
+    Args:
+        cells: CTest-discovered production campaign aggregates.
+        gtest_case: One fully qualified registered ``ProductionParity`` case.
+
+    Returns:
+        The unique aggregate that owns ``gtest_case``.
+
+    Raises:
+        ValueError: If the requested case is absent or ambiguously registered.
+    """
+
+    if not gtest_case or "*" in gtest_case or "?" in gtest_case:
+        raise ValueError(
+            "focused exact-cell execution requires one nonempty wildcard-free GTest case"
+        )
+    matches = [
+        cell
+        for cell in cells
+        if gtest_case in cell.gtest_cases
+    ]
+    if len(matches) != 1:
+        if not matches:
+            raise ValueError(
+                "focused exact-cell request is not registered by the selected campaigns: "
+                + gtest_case
+            )
+        raise ValueError(
+            "focused exact-cell request has multiple campaign owners: "
+            + gtest_case
+        )
+    return matches[0]
 
 
 def _current_git_short_hash() -> str:
@@ -4390,6 +4460,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "certifies the complete campaign"
         ),
     )
+    operation.add_argument(
+        "--exact-cell",
+        default=None,
+        metavar="GTEST_CASE",
+        help=(
+            "run one registered ProductionParity GTest case through the "
+            "full fixture/staging/preflight lifecycle; diagnostic only and "
+            "never a substitute for an unfiltered campaign"
+        ),
+    )
     parser.add_argument(
         "--max-unseen-cells",
         type=_positive_integer,
@@ -4460,6 +4540,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         arguments.declared_first_reds
     ):
         parser.error("--declare-first-red campaign identities must be unique")
+    if arguments.exact_cell is not None and (
+        not arguments.exact_cell
+        or "*" in arguments.exact_cell
+        or "?" in arguments.exact_cell
+    ):
+        parser.error("--exact-cell requires one nonempty wildcard-free GTest identity")
     arguments.prior_artifact_roots = tuple(
         dict.fromkeys(arguments.prior_artifact_roots)
     )
@@ -4799,6 +4885,148 @@ def run_unseen_cells_individually(
     return exit_code if exit_code != 0 else 3
 
 
+def run_focused_exact_cell(
+    args: argparse.Namespace,
+    selected: tuple[CampaignCell, ...],
+) -> int:
+    """Run one CTest-registered production cell through the full lifecycle.
+
+    Unlike a direct GTest invocation, this route owns real-model fixture
+    preparation, identity-bound tmpfs staging, the complete unit/preflight
+    prerequisite, production environment exports, fresh artifact validation,
+    and the fixed fifteen-minute exact-cell watchdog.  It deliberately does
+    not update the green ledger or claim campaign certification.
+
+    Args:
+        args: Parsed driver arguments containing one exact GTest identity.
+        selected: CTest-discovered campaign aggregates after ordinary filters.
+
+    Returns:
+        The focused cell's process/artifact result, or its prerequisite error.
+    """
+
+    if args.exact_cell is None:
+        raise ValueError("focused exact-cell execution requires an exact GTest case")
+    owner = select_focused_exact_cell(selected, args.exact_cell)
+    artifact_root = create_campaign_artifact_root(args.report)
+    started = time.monotonic()
+    completion_deadline = started + args.completion_timeout_seconds
+    preflight_return_code = 125
+    preflight_tests: tuple[str, ...] = ()
+    fixture_return_code = 125
+    model_staging_return_code = 125
+    model_staging_root = ""
+    result: CampaignResult | None = None
+    exit_code = 0
+
+    print(
+        "[production-parity] focused_exact_cell_status=RUNNING "
+        f"campaign={owner.name} gtest_case={args.exact_cell} "
+        "certification_eligible=false",
+        flush=True,
+    )
+    if args.reuse_passed_preflight_report is None:
+        (
+            preflight_return_code,
+            _,
+            preflight_tests,
+        ) = run_production_parity_preflight(
+            args.build_dir,
+            max(completion_deadline - time.monotonic(), 0.001),
+        )
+    else:
+        (
+            preflight_return_code,
+            _,
+            preflight_tests,
+        ) = reuse_unchanged_production_parity_preflight(
+            args.build_dir,
+            args.reuse_passed_preflight_report,
+        )
+    if preflight_return_code != 0:
+        exit_code = preflight_return_code
+    else:
+        fixture_return_code, _ = prepare_model_fixture(
+            args.build_dir,
+            max(completion_deadline - time.monotonic(), 0.001),
+        )
+        if fixture_return_code != 0:
+            exit_code = fixture_return_code
+
+    if exit_code == 0:
+        try:
+            with model_staging_workspace(
+                args.model_ramdisk_root,
+                args.persistent_model_cache_dir,
+                completion_deadline,
+            ) as workspace:
+                model_staging_root = str(workspace.root)
+                staged_directory = workspace.models
+                stage_models_in_ramdisk(
+                    (owner,),
+                    staged_directory,
+                    completion_deadline,
+                    persistent=workspace.persistent,
+                )
+                workspace.protect_published_models()
+                model_staging_return_code = 0
+                result = run_individual_cell(
+                    owner,
+                    args.exact_cell,
+                    None,
+                    exact_cell_timeout_seconds=EXACT_CELL_TIMEOUT_SECONDS,
+                    global_started_at=started,
+                    target_seconds=args.target_seconds,
+                    environment_overrides={
+                        MODEL_RAMDISK_ENV: str(staged_directory),
+                        ARTIFACT_ROOT_ENV: str(artifact_root),
+                    },
+                    artifact_results_root=artifact_root,
+                )
+                exit_code = result.return_code
+        except TimeoutError as error:
+            model_staging_return_code = 124
+            exit_code = 124
+            print(
+                f"[production-parity] focused_exact_cell_staging_error={error}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except (OSError, ModelStagingError) as error:
+            model_staging_return_code = 2
+            exit_code = 2
+            print(
+                f"[production-parity] focused_exact_cell_staging_error={error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    report = FocusedExactCellReport(
+        schema_version=FOCUSED_EXACT_CELL_REPORT_SCHEMA_VERSION,
+        mode="focused_exact_registered_cell",
+        certification_eligible=False,
+        campaign=owner.name,
+        gtest_case=args.exact_cell,
+        preflight_return_code=preflight_return_code,
+        preflight_test_count=len(preflight_tests),
+        preflight_tests=preflight_tests,
+        fixture_return_code=fixture_return_code,
+        model_staging_return_code=model_staging_return_code,
+        model_staging_root=model_staging_root,
+        artifact_root=str(artifact_root),
+        result=result,
+    )
+    write_report(args.report, report)
+    print(
+        "[production-parity] focused_exact_cell_status="
+        f"{'PASS' if exit_code == 0 else 'FAIL'} "
+        f"gtest_case={args.exact_cell} return_code={exit_code} "
+        "certification_eligible=false",
+        flush=True,
+    )
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
@@ -4809,6 +5037,8 @@ def main(argv: list[str] | None = None) -> int:
             args.campaign,
             args.exclude_campaign,
         )
+        if args.exact_cell is not None:
+            selected = [select_focused_exact_cell(selected, args.exact_cell)]
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"production parity campaign error: {error}", file=sys.stderr)
         return 2
@@ -4855,6 +5085,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.stage_models_only:
         return stage_selected_models_only(args, tuple(selected))
+
+    if args.exact_cell is not None:
+        try:
+            return run_focused_exact_cell(args, tuple(selected))
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+            print(
+                f"production parity focused exact-cell error: {error}",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.run_unseen_cells_individually:
         try:

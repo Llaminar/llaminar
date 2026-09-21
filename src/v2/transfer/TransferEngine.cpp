@@ -1760,6 +1760,126 @@ namespace llaminar2
             throw std::invalid_argument("TransferEngine::allocateMappedHostRegion requires local GPU endpoints");
         const size_t mapping_bytes = mappedHostRegionAllocationBytes(bytes);
 
+        const DeviceId allocation_device = devices.front();
+        IBackend *const allocation_backend = resolveBackend(allocation_device);
+        const bool same_backend_family =
+            allocation_backend != nullptr &&
+            std::all_of(
+                devices.begin(),
+                devices.end(),
+                [&](DeviceId device)
+                {
+                    return device.type == allocation_device.type &&
+                           resolveBackend(device) == allocation_backend;
+                });
+
+        if (devices.size() > 1u && same_backend_family &&
+            allocation_backend->supportsPortableMappedAllocation())
+        {
+            /*
+             * A node-local TP/ExpertOverlay route bank is read and written by
+             * every GPU in one backend family. Anonymous mmap followed by
+             * hipHostRegisterPortable/cudaHostRegisterPortable forces the
+             * driver to retrofit every already-touched page into each GPU
+             * page table; on Vega20 that can overflow the fixed IH2 ring while
+             * the retained graph is already live. Native portable ownership
+             * establishes the aliases as one setup transaction and leaves the
+             * captured host address immutable.
+             */
+            void *allocation_alias = nullptr;
+            void *const allocation = allocation_backend->allocatePortableMapped(
+                mapping_bytes,
+                allocation_device.gpu_ordinal(),
+                &allocation_alias);
+            if (!allocation || !allocation_alias)
+            {
+                if (allocation)
+                    allocation_backend->freeMapped(
+                        allocation,
+                        allocation_device.gpu_ordinal());
+                throw std::runtime_error(
+                    "TransferEngine backend could not allocate a portable mapped region for the complete same-family endpoint set");
+            }
+            auto lifetime = std::shared_ptr<void>(
+                allocation,
+                [allocation_backend,
+                 ordinal = allocation_device.gpu_ordinal()](void *address)
+                {
+                    allocation_backend->freeMapped(address, ordinal);
+                });
+
+            auto region = std::shared_ptr<MappedHostTransferRegion>(
+                new MappedHostTransferRegion(
+                    allocation,
+                    mapping_bytes,
+                    devices,
+                    std::move(lifetime),
+                    MappedHostTransferRegion::BackingKind::BackendAllocation));
+            region->aliases_.reserve(devices.size());
+            for (const DeviceId device : devices)
+            {
+                void *alias = nullptr;
+                if (device == allocation_device)
+                    alias = allocation_alias;
+                else if (!allocation_backend->externalMappedHostDevicePointer(
+                             allocation,
+                             device.gpu_ordinal(),
+                             &alias))
+                {
+                    throw std::runtime_error(
+                        "TransferEngine could not resolve a portable mapped alias for " +
+                        device.toString());
+                }
+                if (!alias)
+                    throw std::runtime_error(
+                        "TransferEngine resolved a null portable mapped alias for " +
+                        device.toString());
+                region->aliases_.push_back({
+                    .device = device,
+                    .address = alias,
+                    .backend = allocation_backend,
+                });
+            }
+            region->bound_ = true;
+            std::memset(allocation, 0, mapping_bytes);
+
+            if (PerfStatsCollector::isDomainEnabled(
+                    "moe_overlay_activation_epoch"))
+            {
+                const PerfStatsCollector::Tags tags{
+                    {"scope", "node_local"},
+                    {"mapping", "backend_owned_portable_mapped_host_pages"},
+                    {"backend", allocation_device.type == DeviceType::CUDA
+                                    ? "cuda"
+                                    : "rocm"},
+                    {"endpoint_count", std::to_string(devices.size())},
+                    {"blocking", "false"},
+                };
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_regions_allocated",
+                    1.0,
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_endpoint_aliases",
+                    static_cast<double>(devices.size()),
+                    "setup",
+                    "heterogeneous",
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_activation_epoch",
+                    "mapped_region_bytes",
+                    static_cast<double>(mapping_bytes),
+                    "setup",
+                    "heterogeneous",
+                    tags);
+            }
+            return region;
+        }
+
         if (devices.size() == 1u)
         {
             const DeviceId device = devices.front();

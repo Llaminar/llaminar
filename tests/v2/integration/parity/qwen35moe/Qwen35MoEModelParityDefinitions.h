@@ -340,23 +340,37 @@ namespace llaminar2::test::parity::qwen35moe
     }
 
     /**
-     * @return Numerical contract for ExpertOverlay's completed sparse return.
+     * @return Numerical contract for ExpertOverlay's completed MoE publication.
      *
-     * Generic tensor-parallel graphs expose `MOE_EXPERT_OUTPUT` before their
-     * cross-participant reduction, so the ordinary multi-device contract must
-     * exclude that branch-local value.  ExpertOverlay deliberately republishes
-     * the same semantic key from the final sparse-return consume stage.  That
-     * value is the canonical routed sum and therefore remains a required
-     * checkpoint in both the numerical comparison and its CSV evidence.
+     * Generic tensor-parallel graphs expose the routed and gated-shared values
+     * before their cross-participant reductions, so the ordinary multi-device
+     * contract must exclude those branch-local values. ExpertOverlay instead
+     * republishes both values from its root-owned sparse-return and shared-gate
+     * stages. They are complete semantic checkpoints, not aliases for one
+     * participant's partial, and must therefore be compared and written to
+     * CSV evidence. The raw shared-expert branch remains excluded because it
+     * deliberately precedes gating and its rooted completion.
      */
     inline BackendThresholds qwen35MoEExpertOverlayThresholds()
     {
         auto thresholds = qwen35MoEMultiDeviceThresholds();
+        static constexpr std::array<std::string_view, 2>
+            kCompletedExpertOverlayPublications{
+                "MOE_EXPERT_OUTPUT",
+                "MOE_SHARED_GATE_OUTPUT",
+            };
         thresholds.excluded_stages.erase(
-            std::remove(
+            std::remove_if(
                 thresholds.excluded_stages.begin(),
                 thresholds.excluded_stages.end(),
-                "MOE_EXPERT_OUTPUT"),
+                [](const std::string &stage)
+                {
+                    return std::find(
+                               kCompletedExpertOverlayPublications.begin(),
+                               kCompletedExpertOverlayPublications.end(),
+                               stage) !=
+                           kCompletedExpertOverlayPublications.end();
+                }),
             thresholds.excluded_stages.end());
         return thresholds;
     }

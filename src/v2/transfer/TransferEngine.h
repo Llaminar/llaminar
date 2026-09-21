@@ -698,11 +698,12 @@ namespace llaminar2
     /**
      * @brief One stable shared-page region mapped into explicit local endpoints.
      *
-     * Exact-one-GPU regions use the backend's native mapped allocation. This is
-     * materially different from allocating pageable memory and registering it:
-     * on ROCm, native KFD allocation avoids a page-table invalidation interrupt
-     * per host page. Genuinely shared or mixed-backend external pages are still
-     * registered once per backend family and resolved to every declared alias.
+     * Exact-one-GPU regions use the backend's native mapped allocation. Shared
+     * same-family regions use the backend's portable native allocation, rather
+     * than allocating pageable memory and registering it after first touch. On
+     * ROCm both native forms avoid a page-table invalidation interrupt per host
+     * page. Genuinely mixed-backend external pages are still registered once per
+     * backend family and resolved to every declared alias.
      * Slices retain their parent region without acquiring another native map.
      *
      * Device ordering is topology data, never a hard-coded backend role. All

@@ -682,6 +682,39 @@ namespace llaminar2
         virtual void *allocateMapped(size_t bytes, int device_id, void **device_ptr) = 0;
 
         /**
+         * @brief Allocate one backend-owned mapped region portable to all devices in its family.
+         *
+         * Shared node-local ExpertOverlay control pages must not be created by
+         * registering an anonymous mapping after it has been faulted in. On
+         * ROCm that path emits per-page invalidation work and can overflow the
+         * Vega20 IH2 retry ring while several devices establish aliases. This
+         * setup-only operation asks the native backend to allocate the pages
+         * with its portable ownership flag from the outset.
+         *
+         * @param bytes Positive mapped region extent.
+         * @param device_id Backend-local device that owns the allocation.
+         * @param[out] device_ptr Alias for @p device_id.
+         * @return Host address on success, nullptr when unsupported or failed.
+         */
+        virtual void *allocatePortableMapped(
+            size_t bytes,
+            int device_id,
+            void **device_ptr)
+        {
+            (void)bytes;
+            (void)device_id;
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return nullptr;
+        }
+
+        /** @return Whether this backend implements native portable mapped ownership. */
+        [[nodiscard]] virtual bool supportsPortableMappedAllocation() const noexcept
+        {
+            return false;
+        }
+
+        /**
          * @brief Free zero-copy mapped memory allocated by allocateMapped()
          *
          * @param host_ptr Host pointer returned by allocateMapped() (may be nullptr)

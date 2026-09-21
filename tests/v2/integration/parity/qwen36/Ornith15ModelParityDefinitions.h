@@ -17,9 +17,90 @@
 #include "Qwen36ModelParityDefinitions.h"
 #include "Ornith15AccuracyWorkload.h"
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace llaminar2::test::parity::qwen36
 {
+    /**
+     * @brief Return the exact no-thinking chat prefix that exposes Ornith's
+     *        CUDA two-device forward-path divergence.
+     *
+     * This is deliberately the fully rendered tokenizer input rather than a
+     * message-level approximation.  The server trace and the CPU/FP32 Hugging
+     * Face oracle authenticate the resulting 39 tokens byte-for-byte.  Keeping
+     * it with the typed model definition makes a failure in chat-template,
+     * tokenization, graph prefill, or first-token decode independently visible
+     * in the standard CSV checkpoint evidence.
+     *
+     * @return Exact raw prompt submitted to the model tokenizer.
+     */
+    inline constexpr std::string_view kOrnith15ChatNoThinkingForwardPrompt =
+        R"ORNITH(<|im_start|>system
+You are a calculator. Reply with only the numeric answer, no explanation.<|im_end|>
+<|im_start|>user
+What is 2+2?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+)ORNITH";
+
+    /**
+     * @brief Return the server-authenticated tokenization of the exact chat prompt.
+     *
+     * The terminal blank lines are semantic: removing them changes the Qwen
+     * chat prefix and would diagnose a different request than the production
+     * HTTP failure.
+     *
+     * @return Exact 39-token tokenizer result owned by the test declaration.
+     */
+    inline std::vector<int> ornith15ChatNoThinkingForwardTokenIds()
+    {
+        return {
+            248045, 8678, 198, 2523, 513, 264, 28974, 13, 17308, 440,
+            1132, 279, 23311, 4087, 11, 874, 15673, 13, 248046, 198,
+            248045, 846, 198, 3710, 369, 220, 17, 10, 17, 30, 248046,
+            198, 248045, 74455, 198, 248068, 271, 248069, 271,
+        };
+    }
+
+    /**
+     * @brief Declare the minimal checkpoint oracle for the observed HTTP bug.
+     *
+     * The declaration remains an ordinary typed ExpertOverlay definition: the
+     * central expander supplies its Static/Dynamic and Ordinal/Random policy
+     * points, while this model identity intentionally disables MTP so the
+     * first native forward can be localized without speculative sidecars.
+     * The focused CUDA/Static/Ordinal cell is the immediate regression target;
+     * the sibling cells remain available to determine whether the defect is
+     * placement- or movement-specific after the first divergent stage is known.
+     *
+     * @param topology Exact production CUDA ExpertOverlay topology.
+     * @param reference_directory Isolated CPU/FP32 Hugging Face checkpoint pack.
+     * @return Declarative one-token forward-parity matrix definition.
+     */
+    inline ModelParityDefinition ornith15MoEQ4ChatNoThinkingForwardParityDefinition(
+        ModelParityTopologyDefinition topology,
+        std::string reference_directory)
+    {
+        auto definition = qwen36MoEParityDefinition(
+            std::move(topology), std::move(reference_directory),
+            qwen36MoEExpertOverlayThresholds());
+        definition.model.test_id = "Ornith15MoE_35B_Q4KM_ChatNoThinkingForward";
+        definition.model.model_path =
+            "/opt/llaminar-models/Ornith-1.5-35B-Q4_K_M.gguf";
+        definition.model.prompt =
+            std::string(kOrnith15ChatNoThinkingForwardPrompt);
+        definition.model.token_ids = ornith15ChatNoThinkingForwardTokenIds();
+        definition.model.decode_steps = 1;
+        definition.features.mtp = ModelParityAxisProfile::Disabled;
+        definition.e2e_certifiable.clear();
+        return definition;
+    }
+
     /**
      * @brief Declare exact-weight, long-decode Ornith Q8 mathematical coverage.
      * @param topology Production participant and collective identity.

@@ -2,13 +2,15 @@
  * @file ROCmBackend.cpp
  * @brief ROCm/HIP backend implementation with hip_runtime.h
  *
- * **Purpose**: Implements IBackend for AMD GPUs. This .cpp file is the ONLY
- * compilation unit that includes hip_runtime.h, preventing header conflicts.
+ * Implements IBackend for AMD GPUs and isolates HIP kernels from CUDA translation
+ * units. Resource ownership, explicit streams and runtime generations are
+ * checked here before entering the vendor API.
  *
  * @author David Sanftenberg
  */
 
 #include "ROCmBackend.h"
+#include "ROCmRuntimeStartup.h"
 #include "HipDeviceGuard.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
@@ -418,6 +420,7 @@ namespace llaminar2
     ROCmBackend::ROCmBackend()
         : device_count_(0)
     {
+        requireROCmRuntimeStartup();
         hipError_t err = hipGetDeviceCount(&device_count_);
         if (err != hipSuccess)
         {
@@ -4490,6 +4493,10 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Startup selects KFD/GTT-owned host pages before HSA initializes.
+        // Otherwise this same native API uses anonymous USERPTR plus huge-page
+        // faulting, which can stall for minutes in Linux memory compaction.
+        // The allocation/free and coherence contracts remain native HIP.
         // Allocate mapped host memory (GPU can write directly to this via PCIe)
         // NOTE: Do NOT use hipHostMallocWriteCombined here. WC memory makes CPU
         // reads ~1000x slower (each load bypasses all CPU caches). Logits are
@@ -4525,6 +4532,66 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
             rocmPinnedAllocations()[host_ptr] = device_id;
         }
+        return host_ptr;
+    }
+
+    void *ROCmBackend::allocatePortableMapped(
+        size_t bytes,
+        int device_id,
+        void **device_ptr)
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            rocmRuntimeResourceLifecycleMutex());
+        if (device_ptr)
+            *device_ptr = nullptr;
+        if (bytes == 0u || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend] Invalid portable mapped allocation device="
+                      << device_id << " bytes=" << bytes);
+            return nullptr;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return nullptr;
+
+        /* Native KFD/GTT ownership avoids retrofitting already-touched pages
+         * with hipHostRegisterPortable, which can flood Vega20's IH2 ring. */
+        void *host_ptr = nullptr;
+        const hipError_t allocation_error = hipHostMalloc(
+            &host_ptr,
+            bytes,
+            hipHostMallocPortable | hipHostMallocMapped);
+        if (allocation_error != hipSuccess || !host_ptr)
+        {
+            LOG_ERROR("[ROCmBackend] hipHostMalloc(Portable|Mapped) failed for "
+                      << bytes << " bytes on device " << device_id << ": "
+                      << hipGetErrorString(allocation_error));
+            return nullptr;
+        }
+
+        void *alias = nullptr;
+        const hipError_t alias_error = hipHostGetDevicePointer(
+            &alias, host_ptr, 0u);
+        if (alias_error != hipSuccess || !alias)
+        {
+            LOG_ERROR("[ROCmBackend] hipHostGetDevicePointer failed for portable "
+                      << "mapped allocation: " << hipGetErrorString(alias_error));
+            HIP_WARN_IF_FAIL(hipHostFree(host_ptr));
+            return nullptr;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[host_ptr] = device_id;
+        }
+        if (device_ptr)
+            *device_ptr = alias;
+        LOG_TRACE("[ROCmBackend] allocatePortableMapped: " << bytes
+                                                            << " bytes, host_ptr="
+                                                            << host_ptr
+                                                            << ", device_ptr="
+                                                            << alias);
         return host_ptr;
     }
 

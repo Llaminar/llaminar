@@ -1017,6 +1017,64 @@ namespace llaminar2
         return host_ptr;
     }
 
+    void *CUDABackend::allocatePortableMapped(
+        size_t bytes,
+        int device_id,
+        void **device_ptr)
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(
+            cudaRuntimeResourceLifecycleMutex());
+        if (device_ptr)
+            *device_ptr = nullptr;
+        if (bytes == 0u || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[CUDABackend] Invalid portable mapped allocation device="
+                      << device_id << " bytes=" << bytes);
+            return nullptr;
+        }
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            return nullptr;
+
+        void *host_ptr = nullptr;
+        const cudaError_t allocation_error = cudaHostAlloc(
+            &host_ptr,
+            bytes,
+            cudaHostAllocPortable | cudaHostAllocMapped);
+        if (allocation_error != cudaSuccess || !host_ptr)
+        {
+            LOG_ERROR("[CUDABackend] cudaHostAlloc(Portable|Mapped) failed for "
+                      << bytes << " bytes on device " << device_id << ": "
+                      << cudaGetErrorString(allocation_error));
+            return nullptr;
+        }
+
+        void *alias = nullptr;
+        const cudaError_t alias_error = cudaHostGetDevicePointer(
+            &alias, host_ptr, 0u);
+        if (alias_error != cudaSuccess || !alias)
+        {
+            LOG_ERROR("[CUDABackend] cudaHostGetDevicePointer failed for portable "
+                      << "mapped allocation: " << cudaGetErrorString(alias_error));
+            CUDA_WARN_IF_FAIL(cudaFreeHost(host_ptr));
+            return nullptr;
+        }
+
+        cudaTrackedHostRegistrations().emplace(
+            host_ptr,
+            CUDAHostRegistrationRecord{
+                .bytes = bytes,
+                .device_id = device_id,
+            });
+        if (device_ptr)
+            *device_ptr = alias;
+        LOG_TRACE("[CUDABackend] allocatePortableMapped: " << bytes
+                                                            << " bytes, host_ptr="
+                                                            << host_ptr
+                                                            << ", device_ptr="
+                                                            << alias);
+        return host_ptr;
+    }
+
     void CUDABackend::freeMapped(void *host_ptr, int device_id)
     {
         std::lock_guard<std::mutex> lifecycle_lock(

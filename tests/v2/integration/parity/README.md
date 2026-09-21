@@ -628,6 +628,12 @@ entry only when its source
 device, inode, size, nanosecond mtime, nanosecond ctime, and read-only cached-file
 identity are unchanged. Changed entries are replaced atomically; a changed or
 incomplete cached identity is a miss rather than a reason to scan the payload.
+Capacity admission follows the peak of these sequential replacements: retain
+the old file while writing its replacement, then credit only blocks actually
+released by its completed rename. New files and replacement growth remain
+charged between copies. Free space is rechecked before every copy; sparse
+holes and hardlinked old payloads cannot count as reclaimable capacity. A
+failed admission or interrupted copy preserves the previously published file.
 One exclusive cache lock spans staging and every child inference process, so a
 concurrent run cannot replace weights still in use. After acquiring that lock,
 the driver reclaims only unpublished copy/manifest transaction files left by an

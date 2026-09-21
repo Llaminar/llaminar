@@ -7,7 +7,8 @@
  * exact native node count. Capacity planning consumes the same graph-family
  * model as CUDA, while these observations prove that the backend-specific
  * driver remains inside the admitted envelope. No memory query occurs during
- * graph replay or inference.
+ * graph replay or inference. Successful cold setup timings are diagnostics;
+ * native failures and invalid accounting remain errors regardless of duration.
  */
 
 #ifdef HAVE_ROCM
@@ -956,25 +957,17 @@ namespace llaminar2
         }
         const double instantiate_ms =
             static_cast<double>(instantiate_elapsed.count()) / 1000.0;
-        if (instantiate_ms >= 1000.0)
-        {
-            LOG_WARN(
-                "[HIPGraphCapture] Slow hipGraphInstantiate"
-                << " device=ROCm:" << device_ordinal_
-                << " nodes=" << node_count_
-                << " elapsed_ms=" << instantiate_ms
-                << " resident_delta_bytes=" << resident_delta_bytes);
-        }
-        else
-        {
-            LOG_TRACE(
-                "[HIPGraphCapture] Instantiated graph executable"
-                << " device=ROCm:" << device_ordinal_
-                << " nodes=" << node_count_
-                << " elapsed_ms=" << instantiate_ms
-                << " resident_delta_bytes=" << resident_delta_bytes
-                << " free_bytes_after=" << free_bytes_after);
-        }
+        // Cold native setup varies with graph size and driver initialization.
+        // A successful call is diagnostic evidence, as on CUDA, not an
+        // actionable warning at an arbitrary duration. Readiness/economy gates
+        // own their explicit budgets; native failures above remain errors.
+        LOG_DEBUG(
+            "[HIPGraphCapture] Instantiated graph executable"
+            << " device=ROCm:" << device_ordinal_
+            << " nodes=" << node_count_
+            << " elapsed_ms=" << instantiate_ms
+            << " resident_delta_bytes=" << resident_delta_bytes
+            << " free_bytes_after=" << free_bytes_after);
         return true;
     }
 

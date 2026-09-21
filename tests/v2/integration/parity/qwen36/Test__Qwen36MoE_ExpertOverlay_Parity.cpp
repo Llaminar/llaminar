@@ -56,6 +56,14 @@ namespace
             };
 
             auto all_definitions = withOrnith15CertificationModels(definitions);
+            // Keep the observed HTTP wrong-answer case in the same typed
+            // expander as every other real-weight diagnostic.  Its standard
+            // Static/Ordinal MTP-off cell gives checkpoint CSV evidence for
+            // the native graph forward before changing any numerical gate.
+            all_definitions.push_back(
+                ornith15MoEQ4ChatNoThinkingForwardParityDefinition(
+                    qwen36MoECuda2ExpertOverlayTopology(),
+                    "pytorch_ornith15_q4_chat_nonthinking_cuda2_snapshots"));
             all_definitions.push_back(ornith15MoEQ8AccuracyParityDefinition(
                 ornith15MoERocm4ExpertOverlayTopology(),
                 "pytorch_ornith15_q8_natural_decode_rocm4_snapshots"));
@@ -89,27 +97,82 @@ protected:
      * @brief Require final routed/shared publication for every MoE layer.
      *
      * Branch-local tensors are intentionally excluded because they are
-     * sharded. MOE_COMBINED_OUTPUT is the semantic post-collective boundary
-     * and must remain visible on every captured layer.
+     * sharded. The root-owned routed fold, gated shared contribution, and
+     * final combine are all complete semantic values. Requiring each boundary
+     * lets a real graph-captured failure distinguish sparse exchange/folding
+     * from the subsequent shared-expert merge without an eager replay.
      */
     ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
         ParityForwardPhase phase) const override
     {
         auto policy = Base::parityGraphSnapshotPolicy(phase);
+
+        /*
+         * The routed-output checkpoint alone cannot prove that the captured
+         * mapped-sparse prefill fold consumed the request-pinned ownership
+         * schedule produced by grouped routing. Retain that typed route
+         * evidence before graph construction, and make a missing prefill
+         * ledger a precise failure instead of silently weakening the
+         * ExpertOverlay proof.
+         *
+         * Ordinary LocalTP decode has a different rooted route-slot lowering:
+         * it consumes the immutable static ownership contract directly and
+         * does not materialize the grouped-prefill assignment scratch. Asking
+         * that graph to publish the prefill-only scratch would test a stale
+         * buffer, not live production state. Decode remains rigorously checked
+         * at its actual expert/output checkpoints; this additional route
+         * evidence is scoped to the one graph that consumes it.
+         */
+        const int declared_main_layer_count =
+            this->modelParityCase().model.transformer_layers;
+        const auto route_snapshot_inventory =
+            modelParityExpertOverlayRouteSnapshotInventory(
+                declared_main_layer_count,
+                this->modelParityCase().mtp);
+        if (phase == ParityForwardPhase::Prefill)
+        {
+            auto &required_route_keys =
+                policy.required_prefill_snapshot_keys;
+            for (const std::string &key : route_snapshot_inventory.main_model)
+            {
+                if (std::find(
+                        required_route_keys.begin(),
+                        required_route_keys.end(),
+                        key) == required_route_keys.end())
+                {
+                    required_route_keys.push_back(key);
+                }
+            }
+        }
+
         if (phase != ParityForwardPhase::Prefill)
             return policy;
 
-        for (int layer = 0; layer < parityLayerCount(); ++layer)
+        constexpr std::array<std::string_view, 3> kRequiredMoEOutputs = {
+            "MOE_EXPERT_OUTPUT",
+            "MOE_SHARED_GATE_OUTPUT",
+            "MOE_COMBINED_OUTPUT",
+        };
+        /*
+         * This policy becomes graph identity before ModelContext loading, so
+         * runtime metadata is unavailable at this point. The typed cell's
+         * declared main-layer count is immutable and is cross-checked against
+         * the GGUF before the production graph is admitted.
+        */
+        for (int layer = 0; layer < declared_main_layer_count; ++layer)
         {
-            const std::string key =
-                "layer" + std::to_string(layer) +
-                "_MOE_COMBINED_OUTPUT";
-            if (std::find(
-                    policy.required_prefill_snapshot_keys.begin(),
-                    policy.required_prefill_snapshot_keys.end(),
-                    key) == policy.required_prefill_snapshot_keys.end())
+            for (const std::string_view suffix : kRequiredMoEOutputs)
             {
-                policy.required_prefill_snapshot_keys.push_back(key);
+                const std::string key =
+                    "layer" + std::to_string(layer) + "_" +
+                    std::string(suffix);
+                if (std::find(
+                        policy.required_prefill_snapshot_keys.begin(),
+                        policy.required_prefill_snapshot_keys.end(),
+                        key) == policy.required_prefill_snapshot_keys.end())
+                {
+                    policy.required_prefill_snapshot_keys.push_back(key);
+                }
             }
         }
         return policy;

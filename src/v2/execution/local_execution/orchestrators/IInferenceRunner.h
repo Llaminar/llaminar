@@ -313,7 +313,56 @@ namespace llaminar2
     };
 
     /**
-     * @brief Device-resident compact outcome buffers for stochastic MTP.
+     * @brief Sampling topology embedded in a native device-generation parent.
+     *
+     * Greedy grouped verification reduces compact outcomes inside the retained
+     * all-position forward graph. Stochastic grouped verification instead owns
+     * separate target-distribution and serial-rejection child graphs. The two
+     * parent bodies are therefore different executables even when their request
+     * and verifier geometry match. Carrying this closed mode through the public
+     * runner contract prevents either topology from being guessed from ambient
+     * sampling parameters or reused under the other's cache identity.
+     */
+    enum class DeviceGenerationSamplingMode : uint8_t
+    {
+        /** No producer has authenticated a sampling topology yet. */
+        Unspecified = 0,
+        /** The compact outcome was produced by the greedy graph family. */
+        Greedy = 1,
+        /** The compact outcome was produced by the stochastic graph family. */
+        Stochastic = 2,
+    };
+
+    /**
+     * @brief Return the stable diagnostic name for a device-generation mode.
+     */
+    constexpr const char *deviceGenerationSamplingModeName(
+        DeviceGenerationSamplingMode mode) noexcept
+    {
+        switch (mode)
+        {
+        case DeviceGenerationSamplingMode::Unspecified:
+            return "unspecified";
+        case DeviceGenerationSamplingMode::Greedy:
+            return "greedy";
+        case DeviceGenerationSamplingMode::Stochastic:
+            return "stochastic";
+        }
+        return "invalid";
+    }
+
+    /**
+     * @brief Validate a possibly deserialized device-generation mode.
+     */
+    constexpr bool isValidDeviceGenerationSamplingMode(
+        DeviceGenerationSamplingMode mode) noexcept
+    {
+        return mode == DeviceGenerationSamplingMode::Greedy ||
+               mode == DeviceGenerationSamplingMode::Stochastic;
+    }
+
+    /**
+     * @brief Device-resident compact outcome buffers for MTP.
      *
      * This is the first-class handoff object for the vLLM-style path where the
      * verifier summary remains on GPU.  The pointed-to buffers are owned by the
@@ -400,6 +449,18 @@ namespace llaminar2
          */
         bool device_generation_controller_owned = false;
         /**
+         * @brief Immutable producer topology for this exact compact outcome.
+         *
+         * Dynamic MoE cadence is advanced by exactly one owner: stochastic
+         * outcomes publish it in their fused reducer, while greedy outcomes
+         * publish it in accepted-state publication after KV/recurrent state has
+         * committed. Recording the topology beside the producer-owned handle
+         * keeps that decision out of ambient runner flags and prevents either
+         * path from advancing the same boundary twice.
+         */
+        DeviceGenerationSamplingMode sampling_mode =
+            DeviceGenerationSamplingMode::Unspecified;
+        /**
          * @brief True when this child produced a complete mirrored LocalTP outcome.
          *
          * Every child in a mirrored domain must report this value. It proves
@@ -421,6 +482,7 @@ namespace llaminar2
                         logical_verifier_rows_per_request) &&
                    output_token_stride > 0 &&
                    meta_stride >= sampling_math::kSpeculativeBatchMetaCount &&
+                   isValidDeviceGenerationSamplingMode(sampling_mode) &&
                    stream != nullptr &&
                    response_ready_event != nullptr;
         }
@@ -480,49 +542,6 @@ namespace llaminar2
             return device.is_gpu() && !requests.empty();
         }
     };
-
-    /**
-     * @brief Sampling topology embedded in a native device-generation parent.
-     *
-     * Greedy grouped verification reduces compact outcomes inside the retained
-     * all-position forward graph. Stochastic grouped verification instead owns
-     * separate target-distribution and serial-rejection child graphs. The two
-     * parent bodies are therefore different executables even when their request
-     * and verifier geometry match. Carrying this closed mode through the public
-     * runner contract prevents either topology from being guessed from ambient
-     * sampling parameters or reused under the other's cache identity.
-     */
-    enum class DeviceGenerationSamplingMode : uint8_t
-    {
-        Greedy = 0,
-        Stochastic = 1,
-    };
-
-    /**
-     * @brief Return the stable diagnostic name for a device-generation mode.
-     */
-    constexpr const char *deviceGenerationSamplingModeName(
-        DeviceGenerationSamplingMode mode) noexcept
-    {
-        switch (mode)
-        {
-        case DeviceGenerationSamplingMode::Greedy:
-            return "greedy";
-        case DeviceGenerationSamplingMode::Stochastic:
-            return "stochastic";
-        }
-        return "invalid";
-    }
-
-    /**
-     * @brief Validate a possibly deserialized device-generation mode.
-     */
-    constexpr bool isValidDeviceGenerationSamplingMode(
-        DeviceGenerationSamplingMode mode) noexcept
-    {
-        return mode == DeviceGenerationSamplingMode::Greedy ||
-               mode == DeviceGenerationSamplingMode::Stochastic;
-    }
 
     /**
      * @brief Control topology required by one complete MTP generation loop.

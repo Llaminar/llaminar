@@ -10,6 +10,7 @@
  */
 
 #include "RCCLDynamicLoader.h"
+#include "backends/rocm/ROCmRuntimeStartup.h"
 #include "utils/Logger.h"
 
 #include <hip/hip_runtime.h>
@@ -29,14 +30,18 @@ namespace llaminar2
         // Device Management
         // =========================================================================
 
+        /** @brief Validate process startup policy before admitting a collective device. */
         bool hipSetDeviceOrdinal(int device_ordinal)
         {
+            requireROCmRuntimeStartup();
             hipError_t err = hipSetDevice(device_ordinal);
             return (err == hipSuccess);
         }
 
+        /** @brief Discover devices only after the immutable ROCr backing policy is ready. */
         bool hipGetDeviceCountWrapper(int *count)
         {
+            requireROCmRuntimeStartup();
             hipError_t err = hipGetDeviceCount(count);
             return (err == hipSuccess);
         }

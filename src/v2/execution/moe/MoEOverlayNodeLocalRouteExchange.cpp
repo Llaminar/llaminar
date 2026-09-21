@@ -14,8 +14,6 @@
 #include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
 
-#include <sys/mman.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -139,11 +137,10 @@ namespace llaminar2
         // The owning orchestrator drains retained graphs before destruction;
         // release graph-private root VRAM before unregistering shared pages.
         root_staging_.reset();
-        // MappedHostTransferRegion unregisters CUDA/HIP pages while the mmap
-        // lifetime is still retained. Reversing this order would leave backend
-        // registrations referring to unmapped virtual memory.
+        // MappedHostTransferRegion owns the backend mapping lifetime.  Reset it
+        // only after retained graph owners and root DMA scratch have gone away;
+        // this keeps every captured alias valid until the graph teardown edge.
         mapped_region_.reset();
-        mapping_lifetime_.reset();
     }
 
     void MoEOverlayNodeLocalRouteExchange::materialize(
@@ -304,40 +301,18 @@ namespace llaminar2
             cursor, dense_payload_bytes, "dense publication payload layout");
         const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
 
-        void *const mapping = ::mmap(
-            nullptr,
-            mapping_bytes,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS,
-            -1,
-            0);
-        if (mapping == MAP_FAILED)
-        {
-            throw std::runtime_error(
-                "node-local route exchange mmap failed for " +
-                std::to_string(mapping_bytes) + " bytes");
-        }
-        auto lifetime = std::shared_ptr<void>(
-            mapping,
-            [mapping_bytes](void *address)
-            {
-                if (address && address != MAP_FAILED)
-                    (void)::munmap(address, mapping_bytes);
-            });
-
-        // Transparent hugepage backing reduces IOMMU/page-walk pressure for
-        // route payloads while retaining ordinary mmap teardown semantics.
-#if defined(MADV_HUGEPAGE)
-        (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
-#endif
-        std::memset(mapping, 0, mapping_bytes);
-
+        /*
+         * TransferEngine is the sole mapped-memory authority.  In a
+         * same-family node-local topology it allocates one backend-owned
+         * portable region (hipHostMallocPortable/cudaHostAllocPortable) and
+         * resolves an alias for every endpoint.  Mixed-family topologies keep
+         * the explicit external-registration contract inside TransferEngine;
+         * this owner must not recreate either policy with a private mmap.
+         */
         TransferEngine transfer_engine;
-        auto region = transfer_engine.registerExternalMappedHostRegion(
-            mapping,
+        auto region = transfer_engine.allocateMappedHostRegion(
             mapping_bytes,
-            config_.devices,
-            lifetime);
+            config_.devices);
         if (!region || !region->isBound())
         {
             throw std::runtime_error(
@@ -399,7 +374,6 @@ namespace llaminar2
         dense_publication_peers_offset_ = dense_peers_offset;
         dense_publication_payload_offset_ = dense_payload_offset;
         dense_publication_element_capacity_ = dense_element_capacity;
-        mapping_lifetime_ = std::move(lifetime);
         mapped_region_ = std::move(region);
         root_staging_ = std::move(root_staging);
         materialized_ = true;

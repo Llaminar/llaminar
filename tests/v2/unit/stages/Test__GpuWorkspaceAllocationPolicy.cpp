@@ -11177,6 +11177,78 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUScalarMTPConditionRequiresPairedResi
            "token-only replay API.";
 }
 
+/**
+ * @brief Ordinary forced decode binds only the mailbox token and canonical KV geometry.
+ *
+ * A device-resident mailbox's target sequence-length row describes the logical
+ * length already present in KV.  It is therefore valid geometry for an MTP
+ * condition transaction, whose grouped append machinery consumes that row, but
+ * it is not an append-row count for an ordinary one-token main decode.  The
+ * latter must retain the mailbox token/event edge while taking its scalar
+ * position snapshot from canonical device KV and using the graph's captured
+ * one-row append width.  This structural regression protects CUDA and ROCm
+ * together because both backends consume the same ForwardInput contract.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     OrdinaryForcedResidentContinuationUsesCanonicalScalarKVGeometry)
+{
+    const auto orchestrator_source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto ordinary_advance = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            orchestrator_source,
+            "advanceOrdinaryMainConditionFromDeviceResidentLogicalState(",
+            "advanceMTPMainConditionFromDeviceResidentLogicalState(")));
+    const auto forward_impl = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            orchestrator_source,
+            "const float *DeviceGraphOrchestrator::forwardImpl(",
+            "bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(")));
+
+    EXPECT_NE(
+        ordinary_advance.find(
+            "logical_state.nextConditionTokenDeviceForRequest(request_index)"),
+        std::string::npos)
+        << "The forced continuation token must remain device-resident.";
+    EXPECT_EQ(
+        ordinary_advance.find(
+            "logical_state.targetPositionDeviceForRequest(request_index)"),
+        std::string::npos)
+        << "Ordinary scalar decode position comes from canonical device KV, not "
+           "the mailbox's already-resident logical length.";
+    EXPECT_EQ(
+        ordinary_advance.find(
+            "logical_state.targetSequenceLengthDeviceForRequest(request_index)"),
+        std::string::npos)
+        << "A mailbox logical length is not a scalar KV append-row count.";
+    EXPECT_NE(
+        ordinary_advance.find(
+            "forwardImpl(&token_shadow,condition_token_device,1,1,"
+            "ForwardExecutionRole::MainInference,"
+            "ForwardInvocationKind::ExplicitDecode,nullptr,nullptr)"),
+        std::string::npos)
+        << "Forced scalar decode must select the same no-geometry-override "
+           "contract as ordinary production decode.";
+
+    EXPECT_NE(
+        forward_impl.find(
+            "materialize_serial_decode_position_from_device_kv=true"),
+        std::string::npos)
+        << "The normal scalar graph path must snapshot the canonical device KV "
+           "count before it appends the captured row.";
+    EXPECT_NE(
+        forward_impl.find(
+            "input.device_decode_position=DeviceDecodePositionBinding{"),
+        std::string::npos);
+    EXPECT_NE(
+        forward_impl.find(
+            ".cached_tokens=state_.kv_cache->deviceSequenceCachedTokenCountPtr(0)"),
+        std::string::npos)
+        << "The graph-native scalar position binding must name the canonical "
+           "device KV count rather than a mutable mailbox length.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, DGOResidentPublicationDoesNotMutateKVBeforeLogicalStateIsResident)
 {
     const auto source =

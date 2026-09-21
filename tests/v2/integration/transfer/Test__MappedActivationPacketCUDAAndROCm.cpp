@@ -3310,19 +3310,30 @@ namespace
      * owning participant. Their cancellation-heavy values distinguish the
      * canonical original-slot fold from the obsolete participant-subtotal
      * arithmetic that made Dynamic placement numerically observable.
+     *
+     * @param root_device Continuation-root GPU that folds canonical slots.
+     * @param producer_device Non-root GPU that owns a sparse route subset.
+     * @param rows Live physical-row count for the retained route envelope.
+     * @param d_model Hidden width of every canonical route contribution.
+     * @param epochs Number of monotonic publications to retain and fold.
      */
     void runSparseCanonicalRouteExchange(
         DeviceId root_device,
-        DeviceId producer_device)
+        DeviceId producer_device,
+        std::uint32_t rows = 64u,
+        std::uint32_t d_model = 512u,
+        std::uint32_t epochs = 5u,
+        bool replay_through_retained_graphs = false)
     {
-        constexpr std::uint32_t rows = 64u;
         constexpr std::uint32_t top_k = 8u;
-        constexpr std::uint32_t d_model = 512u;
-        constexpr std::uint32_t route_slots = rows * top_k;
         constexpr std::int32_t root_participant = 11;
         constexpr std::int32_t producer_participant = 37;
-        constexpr std::uint32_t epochs = 5u;
-        constexpr std::uint32_t invariant_epoch_begin = 3u;
+        const std::uint32_t route_slots = rows * top_k;
+
+        ASSERT_GT(rows, 0u);
+        ASSERT_GT(d_model, 0u);
+        ASSERT_GE(epochs, 2u);
+        const std::uint32_t invariant_epoch_begin = epochs - 2u;
 
         SparseRouteExchangeResources resources(
             root_device, producer_device);
@@ -3377,11 +3388,11 @@ namespace
          * publication rather than a setup-time owner map. Distinct bytes on
          * both endpoints also expose a stale ledger or premature lane reuse.
          */
-        std::array<std::vector<std::int32_t>, epochs>
-            route_participant_epochs;
-        std::array<std::vector<float>, epochs> root_route_epochs;
-        std::array<std::vector<float>, epochs> producer_route_epochs;
-        std::array<std::vector<float>, epochs> expected_epochs;
+        std::vector<std::vector<std::int32_t>> route_participant_epochs(
+            epochs);
+        std::vector<std::vector<float>> root_route_epochs(epochs);
+        std::vector<std::vector<float>> producer_route_epochs(epochs);
+        std::vector<std::vector<float>> expected_epochs(epochs);
         for (std::uint32_t epoch = 0u; epoch < epochs; ++epoch)
         {
             route_participant_epochs[epoch].resize(route_slots);
@@ -3595,6 +3606,54 @@ namespace
         ASSERT_TRUE(consume.valid());
         ASSERT_TRUE(publish.valid());
 
+        /*
+         * The immediate-stream proof below validates the lane protocol, but
+         * production Ornith inference embeds the same producer and consumer
+         * sequence in independent retained graphs.  Capture both endpoint
+         * transactions before any epoch is published: a capture must record
+         * the device-owned wait kernels rather than accidentally observing a
+         * host-completed payload.  The persistent buffers and immutable launch
+         * descriptors are deliberately shared with the immediate path so this
+         * is a transport-lifecycle proof, not a synthetic alternate path.
+         */
+        std::unique_ptr<IGPUGraphCapture> root_capture;
+        std::unique_ptr<IGPUGraphCapture> producer_capture;
+        if (replay_through_retained_graphs)
+        {
+            auto &root_worker = GPUDeviceContextPool::instance().getContext(
+                root_device);
+            auto &producer_worker =
+                GPUDeviceContextPool::instance().getContext(producer_device);
+            root_worker.submitAndWait([&] {
+                root_capture = root_worker.createGraphCapture(
+                    resources.root_stream);
+                ASSERT_NE(root_capture, nullptr);
+                ASSERT_TRUE(root_capture->beginCapture());
+                ASSERT_TRUE(root_kernel->acquireNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+                ASSERT_TRUE(root_kernel->stageNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+                ASSERT_TRUE(root_kernel->foldNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+                ASSERT_TRUE(root_capture->endCapture());
+                ASSERT_TRUE(root_capture->instantiate());
+            });
+            producer_worker.submitAndWait([&] {
+                producer_capture = producer_worker.createGraphCapture(
+                    resources.producer_stream);
+                ASSERT_NE(producer_capture, nullptr);
+                ASSERT_TRUE(producer_capture->beginCapture());
+                ASSERT_TRUE(producer_kernel->publishNodeLocalCanonicalRoutes(
+                    producer_launch, publish));
+                ASSERT_TRUE(producer_capture->endCapture());
+                ASSERT_TRUE(producer_capture->instantiate());
+            });
+            ASSERT_NE(root_capture, nullptr);
+            ASSERT_NE(producer_capture, nullptr);
+            ASSERT_TRUE(root_capture->hasExecutable());
+            ASSERT_TRUE(producer_capture->hasExecutable());
+        }
+
         const auto submission_start = std::chrono::steady_clock::now();
         for (std::uint32_t epoch = 0u; epoch < epochs; ++epoch)
         {
@@ -3613,12 +3672,19 @@ namespace
             // Submit the waiter first to prove the root graph does not rely on
             // host ordering. Both endpoint streams then advance through their
             // monotonic SPSC epochs without an intervening host observation.
-            ASSERT_TRUE(root_kernel->acquireNodeLocalCanonicalRoutes(
-                root_launch, consume));
-            ASSERT_TRUE(root_kernel->stageNodeLocalCanonicalRoutes(
-                root_launch, consume));
-            ASSERT_TRUE(root_kernel->foldNodeLocalCanonicalRoutes(
-                root_launch, consume));
+            if (replay_through_retained_graphs)
+            {
+                ASSERT_TRUE(root_capture->launchOnStream(resources.root_stream));
+            }
+            else
+            {
+                ASSERT_TRUE(root_kernel->acquireNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+                ASSERT_TRUE(root_kernel->stageNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+                ASSERT_TRUE(root_kernel->foldNodeLocalCanonicalRoutes(
+                    root_launch, consume));
+            }
             ASSERT_TRUE(resources.root_backend->deviceCopyAsync(
                 static_cast<std::byte *>(output_epochs_device) +
                     static_cast<std::size_t>(epoch) * output_bytes,
@@ -3638,8 +3704,16 @@ namespace
                 participant_bytes,
                 producer_device.ordinal,
                 resources.producer_stream));
-            ASSERT_TRUE(producer_kernel->publishNodeLocalCanonicalRoutes(
-                producer_launch, publish));
+            if (replay_through_retained_graphs)
+            {
+                ASSERT_TRUE(
+                    producer_capture->launchOnStream(resources.producer_stream));
+            }
+            else
+            {
+                ASSERT_TRUE(producer_kernel->publishNodeLocalCanonicalRoutes(
+                    producer_launch, publish));
+            }
         }
         EXPECT_LT(
             std::chrono::steady_clock::now() - submission_start,
@@ -4065,6 +4139,72 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     if (cuda->deviceCount() < 2)
         GTEST_SKIP() << "Requires two CUDA devices";
     runSparseCanonicalRouteExchange(DeviceId::cuda(0), DeviceId::cuda(1));
+}
+
+/**
+ * @brief Prove the mapped lane at Ornith's actual 39-row Q4_K prefill geometry.
+ *
+ * The numerical model defect begins on a 39-token prefill with a 2,048-wide
+ * hidden state.  The generic 64-by-512 proof is deliberately retained because
+ * it covers a distinct lane shape, while this focused geometry closes the
+ * capacity/page-layout gap without pretending that synthetic payload values
+ * are a substitute for the real-weight HF checkpoint test.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     SparseCanonicalRoutesAcrossTwoCUDADevicesMatchOrnithQ4KPrefillGeometry)
+{
+    IBackend *const cuda = getCUDABackend();
+    ASSERT_NE(cuda, nullptr);
+    if (cuda->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    runSparseCanonicalRouteExchange(
+        DeviceId::cuda(0), DeviceId::cuda(1), 39u, 2048u);
+}
+
+/**
+ * @brief Retain one complete 40-layer mapped route epoch sequence on CUDA.
+ *
+ * A graph-recording warmup and its first retained replay can advance the same
+ * lane many times before the parity harness inspects layer zero.  This test
+ * therefore crosses more than Ornith's 40 main layers at the exact prefill
+ * geometry, ensuring that slot tags, acknowledgements, and root scratch reuse
+ * do not merely work for the five-epoch unit-sized probe.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     SparseCanonicalRoutesAcrossTwoCUDADevicesSurviveOrnithModelEpochCount)
+{
+    IBackend *const cuda = getCUDABackend();
+    ASSERT_NE(cuda, nullptr);
+    if (cuda->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    runSparseCanonicalRouteExchange(
+        DeviceId::cuda(0), DeviceId::cuda(1), 39u, 2048u, 48u);
+}
+
+/**
+ * @brief Prove Ornith-sized sparse route exchange under the retained CUDA graph.
+ *
+ * The production LocalTP ExpertOverlay path captures a distinct producer graph
+ * on CUDA:1 and root graph on CUDA:0.  This regression submits the root wait
+ * before every peer replay, changes route ownership and payload bytes for all
+ * 48 main-model epochs, and checks every completed FP32 fold byte-for-byte.
+ * It therefore catches a capture-only mapped-alias or system-fence regression
+ * that an immediate stream submission cannot expose.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     SparseCanonicalRoutesAcrossTwoCUDADevicesRemainExactUnderRetainedGraphsAtOrnithGeometry)
+{
+    IBackend *const cuda = getCUDABackend();
+    ASSERT_NE(cuda, nullptr);
+    if (cuda->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    runSparseCanonicalRouteExchange(
+        DeviceId::cuda(0),
+        DeviceId::cuda(1),
+        /*rows=*/39u,
+        /*d_model=*/2048u,
+        /*epochs=*/48u,
+        /*replay_through_retained_graphs=*/true);
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,

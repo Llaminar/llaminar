@@ -7862,3 +7862,90 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_LT(terminal_publication, release);
     EXPECT_LT(release, maintenance);
 }
+
+/**
+ * @brief Keep capacity-only MTP setup from becoming an executable sidecar transaction.
+ *
+ * A process may deliberately run an MTP-off control while retaining the
+ * depth-15 graph/KV/weight envelope used by later requests.  The physical
+ * predictor state is still present in that configuration, but ordinary
+ * prefill must neither require nor publish a shifted-MTP transaction.  This
+ * regression locks both the typed policy projection and the production
+ * chunked-prefill ownership check which previously conflated those two facts.
+ */
+TEST(Test__MTPGraphConstruction,
+     RetainedMTPCapacityDoesNotAuthorizeRuntimeShiftedPrefill)
+{
+    EXPECT_EQ(
+        resolveMTPStateRole(/*retains_capacity=*/true,
+                            /*owns_terminal_head=*/true),
+        MTPStateRole::PredictorOwner);
+    EXPECT_EQ(
+        resolveMTPRuntimeTransactionRole(/*execution_enabled=*/false,
+                                         /*owns_terminal_head=*/true),
+        MTPRuntimeTransactionRole::Disabled);
+    EXPECT_EQ(
+        resolveMTPRuntimeTransactionRole(/*execution_enabled=*/true,
+                                         /*owns_terminal_head=*/false),
+        MTPRuntimeTransactionRole::MainModelFollower);
+    EXPECT_EQ(
+        resolveMTPRuntimeTransactionRole(/*execution_enabled=*/true,
+                                         /*owns_terminal_head=*/true),
+        MTPRuntimeTransactionRole::PredictorOwner);
+
+    std::ifstream input(LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
+    ASSERT_TRUE(input.is_open())
+        << "Unable to open " << LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>());
+    const size_t chunked_prefill = source.find(
+        "Device-resident prefill requires one capacity-complete physical graph bucket");
+    const size_t publication = source.find(
+        "state_.mtp_terminal_hidden_publication.publishMainForward()",
+        chunked_prefill);
+    ASSERT_NE(chunked_prefill, std::string::npos);
+    ASSERT_NE(publication, std::string::npos);
+    const std::string runtime_ownership = source.substr(
+        chunked_prefill, publication - chunked_prefill);
+    EXPECT_NE(
+        runtime_ownership.find("resolveMTPRuntimeTransactionRole("),
+        std::string::npos);
+    EXPECT_NE(
+        runtime_ownership.find("graph_builder_ && graph_builder_->config().mtp.enabled"),
+        std::string::npos)
+        << "Only the logical request policy may require a runtime shifted-MTP transaction.";
+    EXPECT_NE(
+        runtime_ownership.find("executes_shifted_mtp_transaction"),
+        std::string::npos);
+    EXPECT_EQ(
+        runtime_ownership.find("retainsMTPGraphCapacity("),
+        std::string::npos)
+        << "Retained capacity is setup ownership, never a runtime transaction requirement.";
+}
+
+/**
+ * @brief Require every compact MTP outcome producer to authenticate its sampler graph.
+ *
+ * A greedy and a stochastic graph have different retained execution bodies.
+ * Treating an omitted producer tag as greedy allowed a stochastic test double
+ * to enter a greedy-only rank reduction.  The public handoff therefore starts
+ * invalid and requires the producer to state its exact graph family before a
+ * consumer can accept it.
+ */
+TEST(Test__MTPGraphConstruction,
+     DeviceSpeculativeOutcomeRequiresExplicitSamplingMode)
+{
+    const DeviceSpeculativeOutcomeHandle uninitialized;
+    EXPECT_EQ(uninitialized.sampling_mode,
+              DeviceGenerationSamplingMode::Unspecified);
+    EXPECT_FALSE(isValidDeviceGenerationSamplingMode(
+        uninitialized.sampling_mode));
+    EXPECT_EQ(deviceGenerationSamplingModeName(uninitialized.sampling_mode),
+              std::string("unspecified"));
+
+    EXPECT_TRUE(isValidDeviceGenerationSamplingMode(
+        DeviceGenerationSamplingMode::Greedy));
+    EXPECT_TRUE(isValidDeviceGenerationSamplingMode(
+        DeviceGenerationSamplingMode::Stochastic));
+}

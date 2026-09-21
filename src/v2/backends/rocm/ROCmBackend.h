@@ -827,6 +827,11 @@ namespace llaminar2
 
         // Zero-copy mapped memory operations
         void *allocateMapped(size_t bytes, int device_id, void **device_ptr) override;
+        void *allocatePortableMapped(size_t bytes, int device_id, void **device_ptr) override;
+        [[nodiscard]] bool supportsPortableMappedAllocation() const noexcept override
+        {
+            return true;
+        }
         void freeMapped(void *host_ptr, int device_id) override;
 
         // Device query operations

@@ -20932,13 +20932,7 @@ namespace llaminar2
                         return false;
                     }
                     if (progress.status ==
-                            MoEOverlayResidencyApplyStatus::Idle &&
-                        !moe_expert_overlay_residency_authority_
-                             ->hasActiveBackgroundWave() &&
-                        moe_expert_overlay_residency_authority_
-                                ->pendingRetirementCount() == 0u &&
-                        moe_expert_overlay_residency_authority_
-                                ->pendingAbortCount() == 0u)
+                            MoEOverlayResidencyApplyStatus::Idle)
                     {
                         return true;
                     }

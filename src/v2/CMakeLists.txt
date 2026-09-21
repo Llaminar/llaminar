@@ -662,6 +662,7 @@ if(HAVE_ROCM)
     # Note: AMDContextFactory.cpp registers the ROCm factory with GPUDeviceContextPool
     # Note: ROCmWorkerImpl.cpp provides rocm_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(rocm_backend STATIC 
+        backends/rocm/ROCmRuntimeStartup.cpp
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/rocm/AMDDeviceContext.cpp

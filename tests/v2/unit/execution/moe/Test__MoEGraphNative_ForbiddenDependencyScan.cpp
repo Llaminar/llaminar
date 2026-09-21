@@ -11760,8 +11760,11 @@ namespace llaminar2::test
      * mapped allocator. Registering an already first-touched anonymous tensor
      * generates an ATS invalidation per page on Vega20 and can overflow the
      * fixed IH2 retry ring when participants materialize concurrently. The
-     * three exceptions below own process/rank-shared mappings that cannot be
-     * replaced by one backend-private allocation.
+     * The two exceptions below own process/rank-shared mappings that cannot be
+     * replaced by one backend-private allocation. Node-local route exchange
+     * is intentionally absent: its same-family mapping is now allocated by
+     * TransferEngine, which gives each participating GPU a portable alias
+     * without late external registration.
      */
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
          ExternalMappedRegistrationIsRestrictedToTrueSharedPageOwners)
@@ -11778,7 +11781,7 @@ namespace llaminar2::test
                 1u},
             std::pair{
                 fs::path{"src/v2/execution/moe/MoEOverlayNodeLocalRouteExchange.cpp"},
-                1u},
+                0u},
         };
         constexpr std::string_view needle =
             "registerExternalMappedHostRegion(";
@@ -11918,6 +11921,94 @@ namespace llaminar2::test
                 "sizeof(DeviceMoEExpertDirectoryEntry) + 255u"),
             std::string::npos)
             << "Model wiring must not reproduce payload alignment arithmetic.";
+    }
+
+    /**
+     * @brief Keep greedy Dynamic-MTP cadence publication in the accepted-state graph.
+     *
+     * Dynamic ExpertOverlay starts with an initial maintenance boundary. Once
+     * that boundary leaves one serial round before the next wave, every greedy
+     * MTP transaction must decrement the same device clock from its compact
+     * accepted metadata. Omitting that edge clips every transaction to one row,
+     * which prevents dynamic-depth policy windows from ever receiving an
+     * unclipped observation. This source-level graph contract complements the
+     * CUDA/ROCm captured kernel regression: the kernel may be correct while a
+     * graph builder silently fails to include it.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GreedyDynamicMTPPublishesCadenceAfterAcceptedState)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path publication_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp";
+        const fs::path publication_builder_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp";
+        const fs::path outcome_handle_path =
+            root / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h";
+        const std::string publication_stage = readFile(publication_stage_path);
+        const std::string publication_builder = readFile(publication_builder_path);
+        const std::string outcome_handle = readFile(outcome_handle_path);
+        ASSERT_FALSE(publication_stage.empty()) << publication_stage_path;
+        ASSERT_FALSE(publication_builder.empty()) << publication_builder_path;
+        ASSERT_FALSE(outcome_handle.empty()) << outcome_handle_path;
+
+        const size_t execute = publication_stage.find(
+            "bool MTPSpeculativeStatePublicationStage::execute(");
+        const size_t accepted_metadata = publication_stage.find(
+            "!publishAcceptanceMetadata(stream)", execute);
+        const size_t histogram_publication = publication_stage.find(
+            "!publishMoEHistograms(stream)", accepted_metadata);
+        const size_t main_kv = publication_stage.find(
+            "!publishMainKV(stream)", histogram_publication);
+        const size_t shifted_kv = publication_stage.find(
+            "!publishShiftedKV(stream)", main_kv);
+        const size_t penalty_history = publication_stage.find(
+            "!publishPenaltyHistory(stream)", shifted_kv);
+        const size_t verifier_state = publication_stage.find(
+            "!publishVerifierState(stream)", penalty_history);
+        const size_t cadence_boundary = publication_stage.find(
+            "!publishDynamicMoECommitBoundary(stream)", verifier_state);
+        const size_t cadence_owner = publication_stage.find(
+            "bool MTPSpeculativeStatePublicationStage::publishDynamicMoECommitBoundary(");
+        ASSERT_NE(execute, std::string::npos);
+        ASSERT_NE(accepted_metadata, std::string::npos);
+        ASSERT_NE(histogram_publication, std::string::npos);
+        ASSERT_NE(main_kv, std::string::npos);
+        ASSERT_NE(shifted_kv, std::string::npos);
+        ASSERT_NE(penalty_history, std::string::npos);
+        ASSERT_NE(verifier_state, std::string::npos);
+        ASSERT_NE(cadence_boundary, std::string::npos);
+        ASSERT_NE(cadence_owner, std::string::npos);
+        EXPECT_LT(accepted_metadata, histogram_publication);
+        EXPECT_LT(histogram_publication, main_kv);
+        EXPECT_LT(main_kv, shifted_kv);
+        EXPECT_LT(shifted_kv, penalty_history);
+        EXPECT_LT(penalty_history, verifier_state);
+        EXPECT_LT(verifier_state, cadence_boundary)
+            << "Maintenance may see a transaction only after response, KV, recurrent, histogram, and penalty state are coherent.";
+        EXPECT_NE(
+            publication_stage.find(
+                "enqueueAdvanceSpeculativeCommitBoundary(", cadence_owner),
+            std::string::npos)
+            << "Greedy accepted-state publication must advance the exact device cadence.";
+
+        EXPECT_NE(
+            publication_builder.find("owns_greedy_dynamic_moe_boundary"),
+            std::string::npos);
+        EXPECT_NE(
+            publication_builder.find("request.outcome.sampling_mode"),
+            std::string::npos)
+            << "The cadence owner must come from the producer-owned outcome, not ambient flags.";
+        EXPECT_NE(
+            publication_builder.find("DeviceGenerationSamplingMode::Greedy"),
+            std::string::npos);
+        EXPECT_NE(
+            publication_builder.find("params.dynamic_moe_commit_boundary"),
+            std::string::npos);
+        EXPECT_NE(
+            outcome_handle.find("DeviceGenerationSamplingMode sampling_mode"),
+            std::string::npos)
+            << "Greedy/stochastic boundary ownership must remain a typed outcome property.";
     }
 
 } // namespace llaminar2::test

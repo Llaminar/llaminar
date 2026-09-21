@@ -2327,6 +2327,29 @@ namespace llaminar2::test::parity
         }
     }
 
+    TEST(ModelParityDefinition,
+         ExpertOverlayThresholdsRetainCompletedMoEPublicationCheckpoints)
+    {
+        const auto assert_complete_publications =
+            [](const BackendThresholds &thresholds)
+        {
+            const auto excluded = [&](std::string_view stage)
+            {
+                return std::find(
+                           thresholds.excluded_stages.begin(),
+                           thresholds.excluded_stages.end(),
+                           stage) != thresholds.excluded_stages.end();
+            };
+            EXPECT_FALSE(excluded("MOE_EXPERT_OUTPUT"));
+            EXPECT_FALSE(excluded("MOE_SHARED_GATE_OUTPUT"));
+            EXPECT_FALSE(excluded("MOE_COMBINED_OUTPUT"));
+            EXPECT_TRUE(excluded("MOE_SHARED_EXPERT_OUTPUT"));
+        };
+
+        assert_complete_publications(qwen35moe::qwen35MoEExpertOverlayThresholds());
+        assert_complete_publications(qwen36::qwen36MoEExpertOverlayThresholds());
+    }
+
     TEST(ModelParityDefinition, OrnithCertificationInheritsTopologyButNotReferenceIdentity)
     {
         std::vector<ModelParityDefinition> originals;

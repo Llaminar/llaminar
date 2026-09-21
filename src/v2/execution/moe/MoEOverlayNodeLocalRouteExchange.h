@@ -68,7 +68,7 @@ namespace llaminar2
          */
         explicit MoEOverlayNodeLocalRouteExchange(Config config);
 
-        /** Release page registrations before the retained mmap lifetime. */
+        /** Release the TransferEngine-owned mapping after captured users drain. */
         ~MoEOverlayNodeLocalRouteExchange();
 
         MoEOverlayNodeLocalRouteExchange(
@@ -215,7 +215,6 @@ namespace llaminar2
         std::size_t dense_publication_element_capacity_ = 0u;
         std::vector<MoENodeLocalRouteEndpoint> endpoints_;
         std::vector<LaneLayout> lanes_;
-        std::shared_ptr<void> mapping_lifetime_;
         std::shared_ptr<MappedHostTransferRegion> mapped_region_;
         std::shared_ptr<DeviceTransferBuffer> root_staging_;
     };
