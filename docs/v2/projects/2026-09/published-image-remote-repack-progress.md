@@ -540,3 +540,26 @@ The old branch is historical explanation, not a selectable runtime path.
 Fresh AVX512/AVX2 image builds and published-image aggregate E2E/benchmark
 results remain outstanding; the mounted-library diagnostic is not their
 certificate.
+
+### Minimal image-builder dependency closure
+
+Develop image run `35659664517` fails before Llaminar compilation: the pinned
+HIP source's `ROCclrHSA.cmake` unconditionally requires OpenGL, including for
+the HIP-only headless build. The full development SDK supplied those headers
+transitively; the minimal `MODE=build` installer did not. This is a packaging
+failure, not a new inference failure or evidence against the graph repair.
+
+Both source-building installer modes now explicitly install `libglvnd-dev`
+(the GL/GLX/X11 header closure), alongside `rocm-llvm-dev`. Runtime-only mode
+does not install development packages. The repaired DSO's `NEEDED` entries
+contain no GL/X11 libraries. The new executable installer-boundary regression
+fails on both old builder modes and passes after the fix; runtime-only mode
+remains minimal. It is registered as `V2_Integration_HIPRuntimePackaging` in
+production preflight, together with the existing shared-DSO/SDK-pin checks.
+All **209 pipeline tests pass**, and the registered focused packaging gate
+passes. In the canonical Dockerfile's isolated toolchain build, the repaired
+HIP library configures, compiles, links and installs successfully; its complete
+ROCm install/source-build layer takes **189.5 seconds**. The remaining shared
+toolchain layers continue populating the same host BuildKit cache. Full
+Unit/preflight gates will also run inside both freshly built ISA images; the
+packaging-only follow-up does not alter the already-gated engine or HIP patch.

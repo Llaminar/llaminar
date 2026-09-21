@@ -108,13 +108,17 @@ case "${MODE}" in
         # --no-dkms: the kernel driver comes from the host; don't rebuild it
         # inside the container.
         amdgpu-install --usecase=rocm --no-dkms -y
-        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages rocm-llvm-dev
+        # ROCclr includes GL interop in its HIP-only source build. Declare the
+        # GL/GLX headers explicitly instead of relying on full-SDK recommends.
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            rocm-llvm-dev libglvnd-dev
         ;;
     build)
         # Direct package closure needed by CMake:
         # - hipcc/amdclang + HIP headers/runtime
         # - hipBLAS/hipBLASLt headers and shared libraries
         # - ROCm CMake/device libs for HIP and RCCL source builds
+        # - GL/GLX development closure for the repaired HIP runtime's ROCclr
         # - RCCL dev package for headers/system fallback when source build is off
         apt-get "${APT_OPTS[@]}" update
         apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
@@ -127,6 +131,7 @@ case "${MODE}" in
             hip-dev \
             hsa-rocr-dev \
             libdrm-dev \
+            libglvnd-dev \
             hipblas-dev \
             hipblaslt-dev \
             rocblas-dev \

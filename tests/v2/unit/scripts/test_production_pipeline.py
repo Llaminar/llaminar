@@ -3701,6 +3701,47 @@ class InfrastructureTests(unittest.TestCase):
                     self.assertIn("requires the pinned ROCm 7.2.4 SDK", result.stderr)
                     self.assertFalse((Path(directory) / "output").exists())
 
+    def test_rocm_installer_declares_hip_source_build_dependencies(self):
+        """Exercise each install mode without installing packages or using GPUs.
+
+        HIP's ROCclr dependency compiles GL interop even for a headless HIP-only
+        build. The full SDK happened to supply these headers transitively, but
+        the minimal shipping-image builder did not. Intercept the actual apt
+        boundary so both build modes declare the closure and runtime stays slim.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            commands = Path(directory)
+            # Stop before the first mode-specific package transaction. Earlier
+            # installer/network/removal commands are inert, including the fixed
+            # /tmp installer pathname, so this test cannot mutate the machine.
+            for name in ("curl", "rm", "amdgpu-install"):
+                command = commands / name
+                command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                command.chmod(0o755)
+            apt = commands / "apt-get"
+            apt.write_text(
+                '#!/bin/sh\ncase " $* " in\n'
+                '  *" rocm-llvm-dev "*|*" hip-dev "*|*" hipblas "*)\n'
+                '    printf "%s\\n" "$@"\n    exit 77;;\n'
+                '  *) exit 0;;\nesac\n', encoding="utf-8")
+            apt.chmod(0o755)
+            for mode in ("full", "build", "runtime"):
+                with self.subTest(mode=mode):
+                    result = subprocess.run(
+                        ["/bin/bash", str(ROOT / "scripts/docker/install-rocm.sh")],
+                        # No real commands are reachable if the installer
+                        # unexpectedly advances beyond our package boundary.
+                        env={**os.environ, "MODE": mode, "PATH": directory},
+                        text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 77, result.stderr)
+                    packages = result.stdout.splitlines()
+                    if mode == "runtime":
+                        self.assertNotIn("rocm-llvm-dev", packages)
+                        self.assertNotIn("libglvnd-dev", packages)
+                    else:
+                        self.assertIn("rocm-llvm-dev", packages)
+                        self.assertIn("libglvnd-dev", packages)
+
     def test_build_planning_never_probes_docker(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "docker"

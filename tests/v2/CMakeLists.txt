@@ -2873,6 +2873,17 @@ set_tests_properties(V2_Integration_DockerBindMountIdentity PROPERTIES
     LABELS "V2;Integration;ProductionParityPreflight;BuildSystem;Container;Topology;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_HIPRuntimePackaging
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+            InfrastructureTests.test_rocm_installer_declares_hip_source_build_dependencies
+            InfrastructureTests.test_hip_runtime_repair_is_shared_by_builder_and_shipping_image
+            InfrastructureTests.test_hip_runtime_installer_rejects_an_unreviewed_sdk_before_building
+)
+set_tests_properties(V2_Integration_HIPRuntimePackaging PROPERTIES
+    LABELS "V2;Integration;ProductionParityPreflight;BuildSystem;Container;ROCm;Regression"
+    TIMEOUT 30
+)
 
 add_test(NAME V2_Unit_DevelopImageGate
     COMMAND ${Python3_EXECUTABLE}
