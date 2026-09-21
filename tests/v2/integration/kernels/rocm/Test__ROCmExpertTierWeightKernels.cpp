@@ -1303,14 +1303,17 @@ namespace llaminar2
         }
 
         /**
-         * @test A shared maintenance thread restores the lane's exact ROCm device.
+         * @test A shared maintenance caller preserves its device while the owning
+         *       ROCm worker performs the remote projection.
          *
          * The source arrays and auxiliary stream belong to device one, while
          * the calling thread is deliberately switched back to device zero
-         * immediately before submission.  This is the production shape when a
-         * rank progresses several GPU participants.  The remote projection
-         * lane must select its own device without synchronizing and emit the
-         * same final CPU bytes as the device-free packer.
+         * immediately before submission. This is the production shape when a
+         * rank progresses several GPU participants. The remote lane must submit
+         * all HIP work to its device-one worker: byte-exact output proves that
+         * the real repack used the source device, the worker probe proves that
+         * its HIP context remains device one, and the caller probe proves that
+         * maintenance cannot mutate unrelated thread-local HIP state.
          */
         TEST_F(
             ROCmExpertTierWeightKernelsTest,
@@ -1434,9 +1437,26 @@ namespace llaminar2
                     observed.end(),
                     expected_cpu.native_interleaved.begin()));
             }
-            int selected_device = -1;
-            ASSERT_EQ(hipGetDevice(&selected_device), hipSuccess);
-            EXPECT_EQ(selected_device, device_ordinal);
+            /* HIP device selection is thread-local. Device work now belongs to
+             * the lane's worker, so the maintenance caller must stay on device
+             * zero instead of being changed as an accidental side effect. */
+            int caller_device = -1;
+            ASSERT_EQ(hipGetDevice(&caller_device), hipSuccess);
+            EXPECT_EQ(caller_device, 0);
+
+            /* Query on the exact owner after the completed lane transaction.
+             * The byte comparison above makes this an end-to-end proof rather
+             * than merely checking a context constructor's initial device. */
+            int worker_device = -1;
+            hipError_t worker_status = hipSuccess;
+            auto &worker = GPUDeviceContextPool::instance().getContext(
+                DeviceId::rocm(device_ordinal));
+            worker.submitAndWait([&]
+            {
+                worker_status = hipGetDevice(&worker_device);
+            });
+            ASSERT_EQ(worker_status, hipSuccess);
+            EXPECT_EQ(worker_device, device_ordinal);
             EXPECT_TRUE(lane->release(&owner, &error)) << error;
 
             const auto stats = lane->stats();

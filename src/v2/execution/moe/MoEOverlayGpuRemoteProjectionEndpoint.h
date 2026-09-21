@@ -12,6 +12,10 @@
  * The setup-owned staging slice retains the host allocation's exact GPU alias.
  * TransferEngine alone selects backend-native background copies, consistently
  * with other users of the shared maintenance stream pool and for every format.
+ * A logical lane owns its staging and completion event, while compatible lanes
+ * can deliberately share one physical stream.  The owning GPU context is the
+ * single host-side submission authority for that stream, so independent
+ * maintenance threads cannot race CUDA/HIP API submission order.
  */
 
 #pragma once
@@ -73,8 +77,11 @@ namespace llaminar2
      * Endpoints acquire this lane for exactly one network chunk, then release it
      * after MPI or the destination event relinquishes staging ownership. The
      * physical fabric creates an admission-sized pool per GPU/projection/role
-     * and assigns different endpoints to different lanes, so acquisition never
-     * serializes independent operations within one admitted wave.
+     * and assigns different endpoints to different logical lanes.  Logical
+     * lane acquisition protects exclusive staging and completion ownership; it
+     * does not imply a private physical stream.  The exact GPU context orders
+     * every stream/event API sequence from compatible logical lanes, preserving
+     * asynchronous device execution without host-side submission races.
      */
     class MoEOverlayGpuRemoteProjectionLane final
     {
@@ -270,12 +277,51 @@ namespace llaminar2
             bool source_operation,
             std::string *error) noexcept;
 
-        /** @brief Record one fence even when an earlier submission failed. */
+        /**
+         * @brief Record one fence even when an earlier submission failed.
+         *
+         * The caller must already be executing on @ref context_.  Recording the
+         * event in the same worker callback as the copy/repack prevents another
+         * logical lane sharing @ref stream_ from being inserted between work and
+         * its completion frontier.
+         */
         bool fenceSubmissionLocked(
             bool submitted,
             OperationKind kind,
             std::size_t bytes,
             std::string *error) noexcept;
+
+        /**
+         * @brief Run one bounded GPU API sequence on the exact owning worker.
+         *
+         * The caller holds @ref mutex_.  @p work may enqueue stream operations,
+         * record/wait/query events, or create/destroy a setup resource, but it
+         * must never synchronize a stream or device.  `submitAndWait()` waits
+         * only for this short host callback to be serialized with all other
+         * users of the physical stream; the device work remains asynchronous.
+         * The inline-worker case is handled by @ref IWorkerGPUContext, avoiding
+         * a self-queue dependency when this lane is progressed by a larger GPU
+         * transaction.
+         *
+         * @param work Exact non-blocking GPU API sequence.
+         * @param error Receives a worker-handoff diagnostic on failure.
+         * @return True when the worker executed @p work.
+         */
+        bool submitOnOwningWorkerLocked(
+            std::function<void()> work,
+            std::string *error) noexcept;
+
+        /**
+         * @brief Fail a submission whose worker callback may have accepted work.
+         *
+         * A failed handoff after a callback began has no trustworthy completion
+         * frontier.  The lane therefore remains non-reusable and teardown fails
+         * loudly instead of guessing that the physical stream is idle.
+         *
+         * @param error Preserves the worker-handoff diagnostic for the caller.
+         * @return Always false for concise submission failure propagation.
+         */
+        bool failUnfencedWorkerSubmissionLocked(std::string *error) noexcept;
 
         /**
          * @brief Publish one raw-byte command to the graph-resident authority.
@@ -291,14 +337,20 @@ namespace llaminar2
         /** @return The exact service receipt, or null for a native operation. */
         [[nodiscard]] MappedTransferProgressSlot *serviceCommandLocked() noexcept;
 
-        /** @brief Launch backend-specific GPU-to-CPU repack on the lane stream. */
+        /**
+         * @brief Launch backend-specific GPU-to-CPU repack on the lane stream.
+         * @pre The caller is the exact owning GPU worker.
+         */
         bool launchGpuToCpuLocked(
             const ExpertTierWeightDeviceLayout &layout,
             const ExpertTierGpuConstProjectionView &source,
             std::uint32_t first_unit,
             std::uint32_t unit_count) noexcept;
 
-        /** @brief Launch backend-specific CPU-to-GPU repack on the lane stream. */
+        /**
+         * @brief Launch backend-specific CPU-to-GPU repack on the lane stream.
+         * @pre The caller is the exact owning GPU worker.
+         */
         bool launchCpuToGpuLocked(
             const ExpertTierWeightDeviceLayout &layout,
             const ExpertTierGpuMutableProjectionView &destination,

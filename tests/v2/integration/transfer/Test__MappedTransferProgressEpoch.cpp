@@ -1040,6 +1040,197 @@ namespace
     }
 
     /**
+     * @brief Prove remote CPU-edge and mapped-relay submissions share one worker.
+     *
+     * The four-ROCm/two-CPU ExpertOverlay topology can put a remote D2H edge and
+     * an incoming GPU relay on the same persistent maintenance stream.  They are
+     * owned by different host-side objects and are deliberately submitted from
+     * two concurrent maintenance threads here.  A stream/event API call issued
+     * outside the exact device worker can race the mapped relay's worker-owned
+     * submission, leaving a later relay generation permanently behind an
+     * unrelated command.  Twenty complete generations make that ordering bug a
+     * lifecycle proof rather than one fortunate enqueue ordering.
+     *
+     * The test uses raw floating-style blobs because the submission ownership
+     * invariant precedes codebook conversion and must protect every format.
+     * Device completion remains entirely asynchronous: the only synchronous
+     * waits are bounded host-worker handoffs and the test's terminal oracle.
+     */
+    void proveRemoteAndMappedRelayShareExactWorker(DeviceId device)
+    {
+        constexpr std::size_t bytes = 1024u * 1024u + 29u;
+        constexpr std::size_t generations = 20u;
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        if (backend->deviceCount() <= device.gpu_ordinal())
+            GTEST_SKIP() << device.toString() << " unavailable";
+
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        TransferEngine transfers;
+        const DeviceId devices[] = {device};
+        const auto expected = makePattern(bytes, 0xa9u);
+        auto source = transfers.allocateDeviceTransferBuffer(bytes, device);
+        auto relay_output = transfers.allocateMappedHostRegion(bytes, devices);
+        ASSERT_TRUE(source && relay_output);
+
+        void *setup_stream = nullptr;
+        context.submitAndWait(
+            [&]
+            {
+                setup_stream = context.getOrCreateAuxiliaryStream(
+                    "remote_mapped_shared_worker_setup:" + device.toString(),
+                    GPUAuxiliaryStreamSchedulingClass::Normal);
+                if (!setup_stream ||
+                    !backend->hostToDevice(
+                        source->mutableDeviceData(),
+                        expected.data(),
+                        bytes,
+                        device.gpu_ordinal(),
+                        setup_stream))
+                {
+                    throw std::runtime_error(
+                        "Could not initialize shared-worker remote source");
+                }
+                /* Initial bytes are a test oracle, never a maintenance wait. */
+                context.synchronizeStream(setup_stream);
+            });
+
+        /* One physical stream intentionally serves two logical authorities. */
+        const auto execution =
+            transfers.allocatePersistentTransferExecutionLanes(
+                1u,
+                device,
+                "remote_mapped_shared_worker");
+        auto staging = transfers.allocatePersistentTransferStagingSlices(
+            bytes, 1u, device);
+        ASSERT_EQ(staging.size(), 1u);
+        auto remote = std::make_unique<MoEOverlayGpuRemoteProjectionLane>(
+            MoEOverlayGpuRemoteProjectionLane::Config{
+                .device = device,
+                .staging = staging.front(),
+                .execution = execution.front(),
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "remote_mapped_shared_worker:" + device.toString(),
+                .perf_device = device.toString(),
+            });
+        std::string error;
+        ASSERT_TRUE(remote->materialize(&error)) << error;
+
+        auto epoch = MappedTransferProgressEpoch::create({
+            .device = device,
+            .slot_capacity = 1u,
+            .execution_lane_capacity = 1u,
+            .execution_streams = execution,
+            .maximum_bytes = bytes,
+            .name = "remote_mapped_shared_worker_relay:" + device.toString(),
+            .perf_device = device.toString(),
+        });
+        auto relay = epoch->reserveSlot(
+            MappedTransferDirection::DeviceToHost,
+            relay_output,
+            "remote_mapped_shared_worker_relay");
+
+        for (std::size_t generation = 1u;
+             generation <= generations;
+             ++generation)
+        {
+            SCOPED_TRACE("generation=" + std::to_string(generation));
+            std::memset(relay_output->mutableHostData(), 0, bytes);
+            ASSERT_TRUE(remote->tryAcquire(remote.get()));
+            ASSERT_TRUE(remote->bindSourceReadiness(
+                remote.get(),
+                ExpertTierSourceReadiness::publishedResidencyBank(generation),
+                &error)) << error;
+            ASSERT_EQ(
+                relay.publishDeviceToMappedHost(
+                    source->deviceData(), bytes, 0u, bytes),
+                generation);
+
+            std::atomic<unsigned int> entrants{0u};
+            std::atomic<bool> begin{false};
+            std::atomic<bool> remote_submitted{false};
+            std::atomic<bool> relay_submitted{false};
+            std::string remote_error;
+            std::thread remote_thread(
+                [&]
+                {
+                    entrants.fetch_add(1u, std::memory_order_release);
+                    while (!begin.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    remote_submitted.store(
+                        remote->submitGpuBlobRead(
+                            remote.get(),
+                            static_cast<const std::uint8_t *>(
+                                source->deviceData()),
+                            bytes,
+                            &remote_error),
+                        std::memory_order_release);
+                });
+            std::thread relay_thread(
+                [&]
+                {
+                    entrants.fetch_add(1u, std::memory_order_release);
+                    while (!begin.load(std::memory_order_acquire))
+                        std::this_thread::yield();
+                    relay_submitted.store(
+                        epoch->submitOutstandingProgress(),
+                        std::memory_order_release);
+                });
+            while (entrants.load(std::memory_order_acquire) != 2u)
+                std::this_thread::yield();
+            begin.store(true, std::memory_order_release);
+            remote_thread.join();
+            relay_thread.join();
+            ASSERT_TRUE(remote_submitted.load(std::memory_order_acquire))
+                << remote_error;
+            ASSERT_TRUE(relay_submitted.load(std::memory_order_acquire));
+
+            auto remote_progress = MoEOverlayGpuRemoteLaneProgress::Pending;
+            auto relay_progress = MappedTransferProgress::Pending;
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            bool progress_submitted = true;
+            while ((remote_progress == MoEOverlayGpuRemoteLaneProgress::Pending ||
+                    relay_progress == MappedTransferProgress::Pending) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress_submitted =
+                    epoch->submitOutstandingProgress() && progress_submitted;
+                if (remote_progress == MoEOverlayGpuRemoteLaneProgress::Pending)
+                    remote_progress = remote->poll(remote.get(), &error);
+                if (relay_progress == MappedTransferProgress::Pending)
+                    relay_progress = relay.poll(&error);
+                if (remote_progress == MoEOverlayGpuRemoteLaneProgress::Pending ||
+                    relay_progress == MappedTransferProgress::Pending)
+                {
+                    std::this_thread::yield();
+                }
+            }
+            ASSERT_TRUE(progress_submitted);
+            ASSERT_EQ(remote_progress, MoEOverlayGpuRemoteLaneProgress::Ready)
+                << error;
+            ASSERT_EQ(relay_progress, MappedTransferProgress::Ready) << error;
+            const auto remote_bytes = remote->pinnedOutput(remote.get(), bytes);
+            ASSERT_EQ(remote_bytes.size(), bytes);
+            EXPECT_EQ(std::memcmp(remote_bytes.data(), expected.data(), bytes), 0);
+            EXPECT_EQ(std::memcmp(
+                          relay_output->mutableHostData(), expected.data(), bytes),
+                      0);
+            ASSERT_TRUE(remote->release(remote.get(), &error)) << error;
+        }
+
+        const auto remote_stats = remote->stats();
+        const auto relay_stats = epoch->stats();
+        EXPECT_EQ(remote_stats.chunks_submitted, generations);
+        EXPECT_EQ(remote_stats.chunks_completed, generations);
+        EXPECT_EQ(remote_stats.failures, 0u);
+        EXPECT_EQ(remote_stats.blocking_synchronizations, 0u);
+        EXPECT_EQ(relay_stats.commands_published, generations);
+        EXPECT_EQ(relay_stats.commands_completed, generations);
+        EXPECT_EQ(relay_stats.command_failures, 0u);
+    }
+
+    /**
      * @brief A blocked producer gates only its own command, never unrelated work.
      *
      * The source's exact event is downstream of a captured graph held by a
@@ -1524,6 +1715,12 @@ namespace
     }
 
     TEST(MappedTransferProgressEpochIntegration,
+         CUDARemoteAndMappedRelayShareExactWorkerSubmissionAuthority)
+    {
+        proveRemoteAndMappedRelayShareExactWorker(DeviceId::cuda(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
          CUDAInferenceDoesNotJoinMaintenance)
     {
         proveInferenceDoesNotJoinMaintenance(DeviceId::cuda(0));
@@ -1587,6 +1784,12 @@ namespace
          ROCmRepeatedGenerationsAreByteExact)
     {
         proveRepeatedGenerations(DeviceId::rocm(0));
+    }
+
+    TEST(MappedTransferProgressEpochIntegration,
+         ROCmRemoteAndMappedRelayShareExactWorkerSubmissionAuthority)
+    {
+        proveRemoteAndMappedRelayShareExactWorker(DeviceId::rocm(0));
     }
 
     TEST(MappedTransferProgressEpochIntegration,

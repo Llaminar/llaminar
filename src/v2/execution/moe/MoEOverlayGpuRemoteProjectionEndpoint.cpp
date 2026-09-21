@@ -5,7 +5,11 @@
  * The maintenance worker calls every method in this file opportunistically.
  * Device ordering is expressed solely by one named auxiliary stream and exact
  * events; no method waits for a stream/device, allocates runtime storage, or
- * makes an inference stream depend on background migration.
+ * makes an inference stream depend on background migration.  Logical lanes can
+ * share that physical stream, so every CUDA/HIP API sequence is serialized by
+ * the exact IWorkerGPUContext before it reaches the backend.  The bounded host
+ * handoff never waits for device progress; events remain the only device-order
+ * and completion mechanism.
  * CPU repack and packed GPU blobs use the same TransferEngine background-copy
  * contract as node-local relay lanes. Exact mapped aliases belong to persistent
  * staging setup, never to a hot-path registration or assumed host-pointer cast.
@@ -207,7 +211,15 @@ namespace llaminar2
             context_ = &GPUDeviceContextPool::instance().getContext(
                 config_.device);
             stream_ = config_.execution.stream();
-            completion_event_ = backend_->createEvent(device_ordinal_);
+            /*
+             * The persistent stream can be shared by several logical remote
+             * lanes and the mapped-relay authority.  Event creation therefore
+             * belongs to the same exact GPU worker that owns every later stream
+             * operation; backend API calls from the fabric-maintenance thread
+             * would make that ownership merely advisory.
+             */
+            context_->submitAndWait(
+                [this] { completion_event_ = context_->createEvent(); });
             /* The pool-wide TransferEngine slab owns both stable addresses. */
             device_chunk_ = static_cast<std::uint8_t *>(
                 config_.staging.mutableDeviceData());
@@ -329,14 +341,23 @@ namespace llaminar2
         {
             if (readiness.requiresProducerWait())
             {
-                source_dependency_ = TransferProducerDependency::afterEvent(readiness.event());
-                if (!context_->waitEventChecked(readiness.event(), stream_))
+                bool waited = false;
+                if (!submitOnOwningWorkerLocked(
+                        [this, &readiness, &waited]
+                        { waited = context_->waitEventChecked(readiness.event(), stream_); },
+                        error))
+                {
+                    return false;
+                }
+                if (!waited)
                 {
                     setGpuRemoteError(
                         error,
                         "Remote ExpertOverlay GPU lane could not enqueue its producer event edge");
                     return false;
                 }
+                source_dependency_ =
+                    TransferProducerDependency::afterEvent(readiness.event());
                 ++stats_.producer_event_waits;
             }
             else
@@ -380,6 +401,60 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayGpuRemoteProjectionLane::submitOnOwningWorkerLocked(
+        std::function<void()> work,
+        std::string *error) noexcept
+    {
+        if (!context_ || !work)
+        {
+            setGpuRemoteError(
+                error,
+                "Remote ExpertOverlay GPU lane has no worker callback authority");
+            return false;
+        }
+
+        try
+        {
+            /*
+             * This is deliberately a host enqueue boundary, not a device wait.
+             * IWorkerGPUContext executes inline when its worker already owns the
+             * current transaction and otherwise serializes this callback with
+             * every other user of the same GPU's persistent stream pool.
+             */
+            context_->submitAndWait(std::move(work));
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            setGpuRemoteError(
+                error,
+                "Remote ExpertOverlay GPU lane worker submission failed: " +
+                    std::string(exception.what()));
+            return false;
+        }
+        catch (...)
+        {
+            setGpuRemoteError(
+                error,
+                "Remote ExpertOverlay GPU lane worker submission threw a non-standard exception");
+            return false;
+        }
+    }
+
+    bool MoEOverlayGpuRemoteProjectionLane::failUnfencedWorkerSubmissionLocked(
+        std::string *error) noexcept
+    {
+        failure_ = error && !error->empty()
+            ? *error
+            : "Remote ExpertOverlay GPU lane worker submission failed without a completion frontier";
+        progress_ = MoEOverlayGpuRemoteLaneProgress::Failed;
+        /* The callback may have begun a compound copy/repack before throwing. */
+        unfenced_work_ = true;
+        ++stats_.failures;
+        setGpuRemoteError(error, failure_);
+        return false;
+    }
+
     bool MoEOverlayGpuRemoteProjectionLane::launchGpuToCpuLocked(
         const ExpertTierWeightDeviceLayout &layout,
         const ExpertTierGpuConstProjectionView &source,
@@ -394,7 +469,8 @@ namespace llaminar2
          * while the thread still names device 0.  setDevice() is a context
          * selection operation; it does not synchronize either stream.
          */
-        if (!backend_ || !backend_->setDevice(device_ordinal_))
+        if (!context_ || !context_->ownsCurrentThread() ||
+            !backend_ || !backend_->setDevice(device_ordinal_))
             return false;
         if (config_.device.is_cuda())
         {
@@ -439,7 +515,8 @@ namespace llaminar2
         /* Keep repack dispatch device-exact even if the preceding H2D copy is
          * later replaced or reordered.  Kernel correctness must not depend on
          * an unrelated backend call incidentally selecting this device. */
-        if (!backend_ || !backend_->setDevice(device_ordinal_))
+        if (!context_ || !context_->ownsCurrentThread() ||
+            !backend_ || !backend_->setDevice(device_ordinal_))
             return false;
         if (config_.device.is_cuda())
         {
@@ -485,8 +562,8 @@ namespace llaminar2
          * kernel. Record the event unconditionally so staging ownership remains
          * explicit until the maintenance worker observes that exact stream point.
          */
-        if (!backend_->recordEvent(
-                completion_event_, device_ordinal_, stream_))
+        if (!context_ || !context_->ownsCurrentThread() ||
+            !context_->recordEventChecked(completion_event_, stream_))
         {
             failure_ =
                 "Remote ExpertOverlay GPU lane could not fence possibly submitted work";
@@ -535,17 +612,35 @@ namespace llaminar2
                 *error = "Remote GPU-to-CPU repack chunk is outside its authenticated layout";
             return false;
         }
-        const bool converted = launchGpuToCpuLocked(
-            layout, source, first_unit, unit_count);
-        const bool copied = converted && TransferEngine::instance().enqueueBackgroundStagingCopy(
-            config_.execution, MappedTransferDirection::DeviceToHost,
-            device_chunk_, config_.staging.sizeBytes(), 0u,
-            config_.staging, 0u, bytes, &failure_);
-        return fenceSubmissionLocked(
-            converted && copied,
-            OperationKind::GpuToCpuRepack,
-            bytes,
-            error);
+        bool fenced = false;
+        if (!submitOnOwningWorkerLocked(
+                [this, &layout, &source, first_unit, unit_count, bytes,
+                 &fenced, error]
+                {
+                    const bool converted = launchGpuToCpuLocked(
+                        layout, source, first_unit, unit_count);
+                    const bool copied = converted &&
+                        TransferEngine::instance().enqueueBackgroundStagingCopy(
+                            config_.execution,
+                            MappedTransferDirection::DeviceToHost,
+                            device_chunk_,
+                            config_.staging.sizeBytes(),
+                            0u,
+                            config_.staging,
+                            0u,
+                            bytes,
+                            &failure_);
+                    fenced = fenceSubmissionLocked(
+                        converted && copied,
+                        OperationKind::GpuToCpuRepack,
+                        bytes,
+                        error);
+                },
+                error))
+        {
+            return failUnfencedWorkerSubmissionLocked(error);
+        }
+        return fenced;
     }
 
     bool MoEOverlayGpuRemoteProjectionLane::submitGpuBlobRead(
@@ -565,15 +660,32 @@ namespace llaminar2
         if (config_.progress.epoch())
             return publishBlobLocked(OperationKind::GpuBlobRead,
                 const_cast<std::uint8_t *>(source), bytes, error);
-        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
-            config_.execution, MappedTransferDirection::DeviceToHost,
-            const_cast<std::uint8_t *>(source), bytes, 0u,
-            config_.staging, 0u, bytes, &failure_);
-        return fenceSubmissionLocked(
-            copied,
-            OperationKind::GpuBlobRead,
-            bytes,
-            error);
+        bool fenced = false;
+        if (!submitOnOwningWorkerLocked(
+                [this, source, bytes, &fenced, error]
+                {
+                    const bool copied =
+                        TransferEngine::instance().enqueueBackgroundStagingCopy(
+                            config_.execution,
+                            MappedTransferDirection::DeviceToHost,
+                            const_cast<std::uint8_t *>(source),
+                            bytes,
+                            0u,
+                            config_.staging,
+                            0u,
+                            bytes,
+                            &failure_);
+                    fenced = fenceSubmissionLocked(
+                        copied,
+                        OperationKind::GpuBlobRead,
+                        bytes,
+                        error);
+                },
+                error))
+        {
+            return failUnfencedWorkerSubmissionLocked(error);
+        }
+        return fenced;
     }
 
     bool MoEOverlayGpuRemoteProjectionLane::submitCpuToGpuRepack(
@@ -603,17 +715,35 @@ namespace llaminar2
 
         /* The MPI buffer is persistent but not necessarily GPU-DMA pinned. */
         std::memcpy(pinned_chunk_, payload.data(), bytes);
-        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
-            config_.execution, MappedTransferDirection::HostToDevice,
-            device_chunk_, config_.staging.sizeBytes(), 0u,
-            config_.staging, 0u, bytes, &failure_);
-        const bool converted = copied && launchCpuToGpuLocked(
-            layout, destination, first_unit, unit_count, bytes);
-        return fenceSubmissionLocked(
-            copied && converted,
-            OperationKind::CpuToGpuRepack,
-            bytes,
-            error);
+        bool fenced = false;
+        if (!submitOnOwningWorkerLocked(
+                [this, &layout, &destination, first_unit, unit_count, bytes,
+                 &fenced, error]
+                {
+                    const bool copied =
+                        TransferEngine::instance().enqueueBackgroundStagingCopy(
+                            config_.execution,
+                            MappedTransferDirection::HostToDevice,
+                            device_chunk_,
+                            config_.staging.sizeBytes(),
+                            0u,
+                            config_.staging,
+                            0u,
+                            bytes,
+                            &failure_);
+                    const bool converted = copied && launchCpuToGpuLocked(
+                        layout, destination, first_unit, unit_count, bytes);
+                    fenced = fenceSubmissionLocked(
+                        copied && converted,
+                        OperationKind::CpuToGpuRepack,
+                        bytes,
+                        error);
+                },
+                error))
+        {
+            return failUnfencedWorkerSubmissionLocked(error);
+        }
+        return fenced;
     }
 
     bool MoEOverlayGpuRemoteProjectionLane::submitGpuBlobWrite(
@@ -635,15 +765,33 @@ namespace llaminar2
         if (config_.progress.epoch())
             return publishBlobLocked(OperationKind::GpuBlobWrite,
                 destination, payload.size(), error);
-        const bool copied = TransferEngine::instance().enqueueBackgroundStagingCopy(
-            config_.execution, MappedTransferDirection::HostToDevice,
-            destination, payload.size(), 0u,
-            config_.staging, 0u, payload.size(), &failure_);
-        return fenceSubmissionLocked(
-            copied,
-            OperationKind::GpuBlobWrite,
-            payload.size(),
-            error);
+        const std::size_t bytes = payload.size();
+        bool fenced = false;
+        if (!submitOnOwningWorkerLocked(
+                [this, destination, bytes, &fenced, error]
+                {
+                    const bool copied =
+                        TransferEngine::instance().enqueueBackgroundStagingCopy(
+                            config_.execution,
+                            MappedTransferDirection::HostToDevice,
+                            destination,
+                            bytes,
+                            0u,
+                            config_.staging,
+                            0u,
+                            bytes,
+                            &failure_);
+                    fenced = fenceSubmissionLocked(
+                        copied,
+                        OperationKind::GpuBlobWrite,
+                        bytes,
+                        error);
+                },
+                error))
+        {
+            return failUnfencedWorkerSubmissionLocked(error);
+        }
+        return fenced;
     }
 
     MappedTransferProgressSlot *MoEOverlayGpuRemoteProjectionLane::serviceCommandLocked() noexcept
@@ -731,15 +879,24 @@ namespace llaminar2
                 }
                 ready = result == MappedTransferProgress::Ready;
             }
-            else if (!context_->queryEventChecked(completion_event_, ready))
+            else
             {
-                failure_ =
-                    "Remote ExpertOverlay GPU lane completion-event query failed";
-                progress_ = MoEOverlayGpuRemoteLaneProgress::Failed;
-                unfenced_work_ = true;
-                ++stats_.failures;
-                setGpuRemoteError(error, failure_);
-                return progress_;
+                bool queried = false;
+                if (!submitOnOwningWorkerLocked(
+                        [this, &ready, &queried]
+                        { queried = context_->queryEventChecked(completion_event_, ready); },
+                        error) ||
+                    !queried)
+                {
+                    failure_ = error && !error->empty()
+                        ? *error
+                        : "Remote ExpertOverlay GPU lane completion-event query failed";
+                    progress_ = MoEOverlayGpuRemoteLaneProgress::Failed;
+                    unfenced_work_ = true;
+                    ++stats_.failures;
+                    setGpuRemoteError(error, failure_);
+                    return progress_;
+                }
             }
         }
         catch (const std::exception &exception)
@@ -901,10 +1058,37 @@ namespace llaminar2
 
     void MoEOverlayGpuRemoteProjectionLane::releaseResources() noexcept
     {
-        if (backend_ && device_ordinal_ >= 0)
+        if (context_ && completion_event_)
         {
-            if (completion_event_)
-                backend_->destroyEvent(completion_event_, device_ordinal_);
+            try
+            {
+                auto *const context = context_;
+                auto *const completion_event = completion_event_;
+                /*
+                 * Destruction is model-time teardown, but still must use the
+                 * exact context that created the event.  The caller already
+                 * proved the event quiescent; this callback never drains a
+                 * stream or device.
+                 */
+                context->submitAndWait(
+                    [context, completion_event]
+                    { context->destroyEvent(completion_event); });
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(
+                    "[MoEOverlayGpuRemoteProjectionLane] event teardown failed"
+                    << " device=" << config_.device.to_string()
+                    << " lane=" << config_.lane_name
+                    << " error=" << exception.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(
+                    "[MoEOverlayGpuRemoteProjectionLane] event teardown threw a non-standard exception"
+                    << " device=" << config_.device.to_string()
+                    << " lane=" << config_.lane_name);
+            }
         }
         backend_ = nullptr;
         context_ = nullptr;
