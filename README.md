@@ -14,6 +14,10 @@ Llaminar is **experimental** and very much in an **alpha** stage of development.
 [Benchmarks](#benchmarks) · [Development](#development) ·
 [Architecture](#llaminar-architecture)
 
+**Discord:**
+
+https://discord.com/channels/1404857025854312528/1519609695793446979
+
 ## Supported Hardware
 
 Llaminar supports:
