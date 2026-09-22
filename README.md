@@ -414,10 +414,10 @@ kernel dispatch. Leave profiling/debug overrides off for timing runs.
 
 <!-- published-benchmarks:begin -->
 
-Published-image results will appear here after the manual HTTP E2E and
-benchmark workflows complete for both AVX512 and AVX2. No unmeasured rates are
-shown. See [manual image testing](docs/production-ci.md#manual-published-image-workflows)
-to run them.
+![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)
+
+Tested image source: [`6f823000cd06`](https://github.com/Llaminar/llaminar/commit/6f823000cd0654cf70b1187cae2128aff551ce95). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
+[Exact configurations, image digests and samples](benchmarks/production/published/results.json). This is E2E/benchmark evidence, not full production-image certification.
 
 <!-- published-benchmarks:end -->
 
