@@ -412,6 +412,11 @@ kernel dispatch. Leave profiling/debug overrides off for timing runs.
 
 ### Published benchmark results
 
+These scores use the exact canonical E2E configurations, including their
+explicit MTP and expert-movement settings—not an auto-planner/default-policy
+performance sweep. Context is the allocated capacity; each timing request uses
+the prompt and decode lengths shown in the chart.
+
 <!-- published-benchmarks:begin -->
 
 ![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)

@@ -7,11 +7,12 @@ now in the published images from `6f823000c`. Both complete image prerequisite
 gates pass: **661 Unit + 278 preflight on AVX512**, and **661 Unit + 266 preflight
 on AVX2**. The previously red AVX2 CUDA2/CPU2 HTTP cell also passes against the
 unchanged new image, including every long-context check and clean retirement.
-The full 26-cell published-image E2E run `35674792791` now has **26/26 green
-cells** and a complete same-image pair receipt. Benchmarks and README
-publication remain pending. This is HTTP E2E evidence, not a full production
-image certificate. The investigation below preserves which observations
-preceded each proof.
+The full 26-cell published-image E2E run `35674792791` has **26/26 green
+cells** and a complete same-image pair receipt. Benchmark run `35690342202`
+also passes **26/26 cells** and publishes the chart, compact JSON and README
+block to `develop` in `8ec8ef2f7`. Both Actions runs succeed. These are HTTP
+E2E/benchmark proofs, not a full production-image certificate. The
+investigation below preserves which observations preceded each proof.
 
 ## Initial observation, before root-cause isolation
 
@@ -688,3 +689,44 @@ block also succeeds inside the idle ARC pod on Ubuntu 24.04, installing the
 distribution GitHub CLI. The complete 209-test pipeline script passes. This
 harness-only repair will retry benchmarks against the unchanged E2E-proven
 images, without rebuilding images or rerunning E2E.
+
+### Benchmark publication verified (22 September, 06:12 UTC)
+
+The dependency repair is committed and pushed as `fc4b0720d` with `[skip ci]`,
+after the normal commit hook passes **661 Unit + 278 production-preflight
+tests**. The latter takes 868.82 seconds. The full published-image script suite
+includes 33 tests, including unchanged-image admission after a workflow-only
+commit. No runtime image or E2E policy changes for this retry.
+
+Manual benchmark run
+[`35690342202`](https://github.com/Llaminar/llaminar/actions/runs/35690342202)
+consumes the successful
+[E2E run `35674792791`](https://github.com/Llaminar/llaminar/actions/runs/35674792791)
+and succeeds. Both ISA reports have `complete: true`, `passed: true`, and
+`diagnostic: false`, each with all 13 canonical cells, 512 actual prompt tokens,
+one warmup and three measured samples per phase. AVX512 takes 1,234.473 seconds
+and AVX2 takes 1,267.296 seconds: 41.7 minutes of benchmark lanes combined,
+excluding shared setup and artifact publication.
+
+The workflow itself commits and pushes only `README.md`,
+`benchmarks/production/published/results.json` and `benchmarks.svg`, in
+[`8ec8ef2f7`](https://github.com/Llaminar/llaminar/commit/8ec8ef2f75f288a64ee7bab1d26dee235c5082ce).
+The result names the actual tested image source `6f823000c`, not the later
+workflow/publication commits. Exact samples and configuration are retained;
+these new measurement keys are recorded as new baselines, not improvements.
+No full-certification high-water mark is advanced.
+
+Final verification joins each benchmark report to its exact E2E report and
+canonical manifest, checks the published rows and digests against both complete
+reports, regenerates the SVG byte-for-byte, and confirms that the README block
+is the publisher's exact output. The GitHub chart blob matches the local Git
+blob; GitHub's rendered README contains its image reference. A rendered PNG
+review confirms all 13 paired rows, source SHA, topologies, context capacities,
+prompt/output lengths and phase rates are legible without clipping.
+
+The chart deliberately measures the same E2E configurations, including their
+explicit movement and dynamic-depth controls. It is not an auto-planner or
+default-policy performance claim. Local compact audit evidence and the visual
+preview live under `parity-results/published-image-benchmarks-20260922/`;
+complete raw evidence remains in the Actions artifacts. The unrelated
+`published-image-retirement-progress.md` worktree file is left untouched.
