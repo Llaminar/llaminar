@@ -337,6 +337,17 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(admitted, manifest)
             self.assertEqual(set(reports), set(suite.ISAS))
 
+    def test_workflow_only_commit_preserves_unchanged_image_evidence(self):
+        """Harness repairs do not invalidate E2E for the same exact runtime pair."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = write_e2e_bundle(root)
+            pair = image_pair()
+            pair["workflow_revision"] = "d" * 40
+            admitted, reports = suite.admit_e2e(root, pair)
+            self.assertEqual(admitted, manifest)
+            self.assertEqual(set(reports), set(suite.ISAS))
+
     def test_changed_latest_tag_rejects_earlier_e2e(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -575,6 +586,82 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(calls[0][calls[0].index("--target") + 1], "test-runner")
             admitted.assert_called_once()
             pair_admission.assert_not_called()
+
+
+class PublishedImageDependencyTests(unittest.TestCase):
+    """Stock ARC runners must acquire tools before downloading E2E evidence."""
+
+    def test_benchmark_workflow_installs_and_checks_github_cli(self):
+        """Execute the real setup block with inert tools, including failures."""
+        import yaml
+        workflow = yaml.load(
+            (ROOT / ".github/workflows/production-benchmarks.yml").read_text(),
+            Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["benchmarks"]["steps"]
+        setup = next(step for step in steps if step.get("name") == "Install GitHub CLI")
+        driver = next(step for step in steps
+                      if "run_published_image_suite.py" in step.get("run", ""))
+        self.assertLess(steps.index(setup), steps.index(driver))
+        self.assertEqual(setup["shell"], "bash")
+        expected = ["sudo apt-get update", "sudo apt-get install --yes --no-install-recommends gh"]
+        for install_exit, version_exit in ((0, 0), (23, 0), (0, 24)):
+            with self.subTest(install_exit=install_exit, version_exit=version_exit), \
+                 tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                log = root / "calls"
+                # The setup shell is real; only network/package operations are
+                # replaced. No test may mutate the machine's package database.
+                sudo = root / "sudo"
+                sudo.write_text('#!/bin/sh\nprintf "sudo %s\\n" "$*" >> "$INSTALL_LOG"\n'
+                                'if [ "$2" = "install" ]; then exit "$INSTALL_EXIT"; fi\n')
+                gh = root / "gh"
+                gh.write_text('#!/bin/sh\nprintf "gh %s\\n" "$*" >> "$INSTALL_LOG"\n'
+                              'exit "$VERSION_EXIT"\n')
+                sudo.chmod(0o755)
+                gh.chmod(0o755)
+                env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                       "INSTALL_LOG": str(log), "INSTALL_EXIT": str(install_exit),
+                       "VERSION_EXIT": str(version_exit)}
+                result = subprocess.run(["bash", "-c", setup["run"]], env=env,
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, install_exit or version_exit, result.stderr)
+                self.assertEqual(log.read_text().splitlines(),
+                                 expected + ([] if install_exit else ["gh --version"]))
+
+    def test_missing_github_cli_stops_remote_benchmarks_before_image_pull(self):
+        """Missing tooling must fail before Docker, cache ownership or GPU work."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(suite="benchmarks", e2e_bundle=None, publish=False,
+                                   output=root / "run", models=root, model_ramdisk_root=root)
+            with patch.object(suite, "parse_arguments", return_value=args), \
+                 patch("shutil.which", return_value=None), \
+                 patch.object(suite.pipeline, "device_lease", return_value=nullcontext()) as lease, \
+                 patch.object(suite, "pull_pair") as pull, \
+                 patch.object(suite.docker_paths, "publish_model_cache") as cache, \
+                 patch.object(suite, "run_benchmarks") as run:
+                with self.assertRaisesRegex(ValueError, r"GitHub CLI \(gh\).*required"):
+                    suite.main([])
+            lease.assert_not_called()
+            pull.assert_not_called()
+            cache.assert_not_called()
+            run.assert_not_called()
+            self.assertFalse(args.output.exists())
+
+    def test_explicit_local_e2e_bundle_does_not_require_github_cli(self):
+        """Offline same-image admission remains a first-class local workflow."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(suite="benchmarks", e2e_bundle=root, publish=False,
+                                   output=root / "run", models=root, model_ramdisk_root=root)
+            with patch.object(suite, "parse_arguments", return_value=args), \
+                 patch("shutil.which", return_value=None), \
+                 patch.object(suite.pipeline, "device_lease", return_value=nullcontext()), \
+                 patch.object(suite, "pull_pair", return_value=image_pair()), \
+                 patch.object(suite.docker_paths, "publish_model_cache"), \
+                 patch.object(suite, "run_benchmarks") as run:
+                self.assertEqual(suite.main([]), 0)
+            run.assert_called_once()
 
 
 if __name__ == "__main__":

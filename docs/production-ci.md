@@ -221,6 +221,13 @@ selected branch owns both the image tags and the published result commit.
 The workflows share the develop gate's accelerator concurrency group and use
 the same host Docker/BuildKit cache. No build cache is uploaded to GitHub.
 
+The stock ARC runner is not a GitHub-hosted tools image. The benchmark workflow
+explicitly installs and verifies GitHub CLI before downloading the authenticated
+E2E artifact; local remote-evidence runs also require `gh` on `PATH` and an
+appropriate login or `GH_TOKEN`. An explicitly supplied local `--e2e-bundle`
+does not require GitHub CLI. These control-plane tools are not dependencies of
+the tested inference image.
+
 Runtime images do not contain model-parity executables. Discovery therefore
 builds a full-matrix **test companion from the tested image's exact committed
 source**, using the existing installed-inventory exporter. One full-backend

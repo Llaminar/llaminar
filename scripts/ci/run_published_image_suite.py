@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -520,6 +521,13 @@ def parse_arguments(argv=None):
 def main(argv=None) -> int:
     """Own a single device lease and leave durable partial evidence on failure."""
     args = parse_arguments(argv)
+    # Remote evidence admission needs GitHub CLI on the control runner, not in
+    # the inference image. Diagnose its absence before pulling images, taking
+    # the accelerator lease or changing cache permissions. Local bundles do
+    # not contact GitHub and deliberately have no such dependency.
+    if args.suite == "benchmarks" and args.e2e_bundle is None and shutil.which("gh") is None:
+        raise ValueError("GitHub CLI (gh) is required to download E2E evidence; "
+                         "install it before starting the benchmark workflow")
     args.output = args.output.resolve()
     args.models = args.models.resolve(strict=True)
     args.model_ramdisk_root = args.model_ramdisk_root.resolve(strict=True)

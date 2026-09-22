@@ -2,13 +2,16 @@
 
 ## Current slice
 
-The ROCm stall now has an isolated native-runtime graph-identity defect and a
-tracked source repair: stock runtime red in 3.7 seconds, repaired regression
-20/20 green, and two complete repaired-runtime HTTP/long-context cells green.
-The final pre-commit gate is **661/661 Unit and 277/277 production preflight
-green**, using the repaired default workspace runtime. The published images are
-unchanged; diagnostic library overrides do not certify them. The investigation
-below preserves which observations preceded the root-cause proof.
+The native-runtime graph-identity repair and CUDA transfer-progress repair are
+now in the published images from `6f823000c`. Both complete image prerequisite
+gates pass: **661 Unit + 278 preflight on AVX512**, and **661 Unit + 266 preflight
+on AVX2**. The previously red AVX2 CUDA2/CPU2 HTTP cell also passes against the
+unchanged new image, including every long-context check and clean retirement.
+The full 26-cell published-image E2E run `35674792791` now has **26/26 green
+cells** and a complete same-image pair receipt. Benchmarks and README
+publication remain pending. This is HTTP E2E evidence, not a full production
+image certificate. The investigation below preserves which observations
+preceded each proof.
 
 ## Initial observation, before root-cause isolation
 
@@ -563,3 +566,125 @@ ROCm install/source-build layer takes **189.5 seconds**. The remaining shared
 toolchain layers continue populating the same host BuildKit cache. Full
 Unit/preflight gates will also run inside both freshly built ISA images; the
 packaging-only follow-up does not alter the already-gated engine or HIP patch.
+
+### Fresh published-image proof — 2026-09-22
+
+[Develop image run 35661953683](https://github.com/Llaminar/llaminar/actions/runs/35661953683)
+completes successfully and publishes both runtime tags from source
+`6f823000cd0654cf70b1187cae2128aff551ce95`. The image-bound prerequisite receipts
+cover the complete installed inventories, not a selected subset:
+
+| Runtime ISA | Unit | ProductionParityPreflight | Gate wall time |
+|---|---:|---:|---:|
+| AVX512 | 661/661 | 278/278 | 653.464 s |
+| AVX2 | 661/661 | 266/266 | 596.606 s |
+
+The inventory difference consists of explicit ISA/comparison registrations:
+six AVX512 CPU cases and six additional AVX2-override controls in the AVX512
+build. The native AVX2 inventory is complete. The HIP graph-identity regression
+passes inside both new images (3.27 s and 3.22 s respectively), and the new
+packaging regression passes in both. Runtime image identities are:
+
+- AVX512: `sha256:4c0d80a85a600ac35ca2181a2b43d4399e9d5a70b3a475b5017a677d3ac2ad5b`.
+- AVX2: `sha256:347d62f71498820d8fcd8d1488074531a994fd3354a3384d803240beac3fa31d`.
+
+The focused AVX2 Qwen3.5 122B CUDA2/CPU2 Dynamic/Ordinal, FP32-activation,
+FP16-KV, dynamic-depth MTP cell passes in **727.060 seconds**. It uses the new
+published runtime without library overrides, probes, reduced checks or changed
+deadlines. All four GGUF shards are tmpfs cache hits, with zero bytes copied.
+All **43 HTTP checks and eight long-context checks** pass, including 2,048
+structured completion tokens, exact needle recall, strict-JSON multi-needle
+recall, cache reset, 7,595/8,192-token boundary admission, and oversized-request
+rejection. Canonical production-path and movement evidence passes. There are
+zero server warnings/errors; the server exits cleanly and GPU usage returns
+from its model allocation to the same 2 MiB baseline. This is a targeted cell
+proof, not the full image-pair E2E or benchmark certificate.
+
+Local evidence is retained in
+`parity-results/published-image-gates-20260922/` and
+`parity-results/published-avx2-cuda2cpu2-20260922/e2e.json`.
+[Full E2E run 35674792791](https://github.com/Llaminar/llaminar/actions/runs/35674792791)
+then pins these exact published images and prepares the source-matched inventory
+companion. Both complete ISA suites must pass before the separate benchmark
+workflow can publish real results and the README chart.
+
+The first five AVX512 cells in that aggregate pass: both CPU-only MoE models,
+the 122B CUDA2/CPU2 topology, and the 122B ROCm2/CPU2 and ROCm4/CPU2 topologies.
+In particular, the previously stalling **ROCm4/CPU2** cell now passes all
+43 HTTP and eight long-context checks on the unchanged published image, without
+the mounted HIP-library diagnostic override. Its 2,048-token generation produces
+169 ordered lines with no resets or duplicates; the near-boundary request uses
+7,595 of 8,192 context tokens. Shutdown exits zero, GPU usage returns to the
+same 40 MiB baseline, and the full server log contains no warnings or errors.
+The run's evidence is under
+`avx512/e2e-1790042417841587099/5/`. This establishes the repaired runtime inside
+the published artifact, while the remaining aggregate cells and benchmark
+publication are still pending.
+
+The AVX512 lane subsequently completes **13/13 cells**, zero failures, in
+**4,748.575 seconds**. Its image-bound report has `correctness_passed: true`
+and is retained locally as
+`parity-results/published-image-e2e-20260922/avx512-e2e.json`. The original
+ROCm4/CPU2 stall cell takes 448.249 seconds, and the six-GPU CUDA2/ROCm4 cell
+takes 357.452 seconds. The final Qwen3.8 ROCm dense cell passes at 32K context
+in 827.285 seconds, including a 30,205/32,768-token near-boundary request.
+The outer receipt authenticates the complete AVX512 report and begins the
+AVX2 lane without rebuilding or rerunning Unit/preflight. The AVX2 lane and
+benchmark/README publication remain outstanding.
+
+The same aggregate also passes the original **ROCm4/CPU2 cell on AVX2**,
+using the unchanged published `347d62f71498...` image. It completes all 43
+HTTP checks and all eight long-context checks, including 2,048 generated
+tokens, 169 ordered lines, zero resets/duplicates, and the 7,595/8,192-token
+boundary. Shutdown exits zero, the complete server log is clean, and VRAM
+returns from 40 MiB to the same 40 MiB baseline. Evidence lives under
+`avx2/e2e-1790047169989288119/5/`. Both image variants now prove the original
+stall repair end to end; at this point 18/26 aggregate cells are green, with
+the remaining AVX2 cells and benchmark publication still pending.
+
+### Full published-image HTTP E2E pair is green (22 September, 04:51 UTC)
+
+Run `35674792791` completes **13/13 AVX512 + 13/13 AVX2 cells**, with no failed
+cells on either ISA. Both reports have `correctness_passed: true`; the outer
+receipt has `complete: true`, binds the original image pair and canonical
+manifest, and authenticates both complete report digests. The AVX2 lane takes
+**5,475.137 seconds**, compared with **4,748.575 seconds** for AVX512.
+
+The previously failing AVX2 CUDA2/CPU2 cell takes 702.335 seconds and
+ROCm4/CPU2 takes 494.180 seconds. The all-GPU CUDA2/ROCm4 case takes 350.142
+seconds. The final ROCm dense 32K-context case takes 823.169 seconds and proves
+30,205/32,768-token admission, oversized-request rejection, 2,048 generated
+tokens, a clean server log and zero post-shutdown VRAM delta. The two approved
+AVX2 CPU-only deadlines are respected: Qwen35B takes 970.985 seconds and
+Ornith35B takes 943.489 seconds, both below 1,200 seconds.
+
+The complete per-ISA reports, manifest, image identities and completed pair
+receipt are retained under
+`parity-results/published-image-e2e-20260922/`. At this checkpoint Actions is
+uploading the full E2E artifact; the separate benchmark workflow must consume
+that successful run and the same exact published images before publishing
+JSON, SVG and README results. No benchmark or full-image certificate is
+claimed from these HTTP passes.
+
+Actions subsequently marks E2E run `35674792791` **successful** and retains
+artifact `published-e2e-35674792791` (249,021,517 bytes). The independent manual
+benchmark workflow is dispatched as run `35688756377`, explicitly selecting
+that E2E run on `develop` at `6f823000c`. Its timing and branch publication
+results are pending; the runner must reject any changed image pair.
+
+That first benchmark dispatch fails before inference: the stock
+`ghcr.io/actions/actions-runner` container does not install GitHub CLI, but
+remote E2E artifact admission invokes `gh`. This is a control-plane dependency
+failure, not a new model failure or invalidation of the 26 green HTTP cells.
+The workflow now explicitly installs and verifies `gh`; the driver diagnoses
+a missing CLI before acquiring the device lease, pulling images or touching
+the model cache. Explicit local bundles remain usable without GitHub CLI.
+
+The focused tests first reproduce the missing setup and late failure, then
+verify the real workflow shell using inert package commands, including package
+and version-check failures. They are part of the already registered
+`V2_Integration_PublishedImageSuites` production preflight. The actual setup
+block also succeeds inside the idle ARC pod on Ubuntu 24.04, installing the
+distribution GitHub CLI. The complete 209-test pipeline script passes. This
+harness-only repair will retry benchmarks against the unchanged E2E-proven
+images, without rebuilding images or rerunning E2E.
