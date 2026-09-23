@@ -312,6 +312,19 @@ function(add_v2_test TEST_NAME)
         --mca btl_vader_single_copy_mechanism none
         --mca orte_allowed_exit_without_sync 1
     )
+
+    # Open MPI may remove the shared /tmp/ompi.<host>.<uid> parent as one
+    # independent launcher exits while another is creating its session. The
+    # Unit gate starts hundreds of one-rank launchers concurrently, so give
+    # each registered test an exclusive session root. Keep it in the build
+    # tree: the installed test-runner image retains that tree and owns it as
+    # the test UID, while local and node-local MPI ranks see the same path.
+    if(NOT ARG_NO_MPI)
+        set(TEST_MPI_SESSION_BASE
+            "${CMAKE_CURRENT_BINARY_DIR}/mpi-sessions/${TEST_NAME}")
+        file(MAKE_DIRECTORY "${TEST_MPI_SESSION_BASE}")
+        list(APPEND MPI_CMD --mca orte_tmpdir_base "${TEST_MPI_SESSION_BASE}")
+    endif()
     
     # Add --oversubscribe if we have fewer sockets than MPI ranks
     if(V2_TEST_SOCKETS LESS ARG_MPI_PROCS)
@@ -2951,6 +2964,15 @@ add_test(NAME V2_Integration_DockerBindMountIdentity
 set_tests_properties(V2_Integration_DockerBindMountIdentity PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;Topology;Regression"
     TIMEOUT 30
+)
+add_test(NAME V2_Integration_MPICTestSessionIsolation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_ctest_session_isolation.py
+            ${CMAKE_BINARY_DIR}
+)
+set_tests_properties(V2_Integration_MPICTestSessionIsolation PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;MPI;Lifecycle;Regression"
+    TIMEOUT 120
 )
 add_test(NAME V2_Integration_HIPRuntimePackaging
     COMMAND ${Python3_EXECUTABLE}
