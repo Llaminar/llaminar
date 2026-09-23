@@ -367,6 +367,9 @@ MemoryPlan MemoryPlanner::plan(
 
     for (const auto& cfg : device_configs)
     {
+        if (cfg.concurrent_workspace_owners == 0u)
+            throw std::invalid_argument(
+                "Memory planning requires a positive workspace-owner count");
         if (cfg.weight_load_staging.enabled() && !cfg.device.is_gpu())
         {
             throw std::invalid_argument(
@@ -403,6 +406,33 @@ MemoryPlan MemoryPlanner::plan(
         if (max_seq > 0)
             activation_seq = std::min(activation_seq, max_seq);
         activation_seq = std::max(1, activation_seq);
+        size_t pipeline_device_bytes = 0u;
+        size_t pipeline_host_bytes = 0u;
+        if (!cfg.captured_pipeline_boundaries.empty())
+        {
+            if (!cfg.device.is_gpu() || cfg.shard_index != 0 || cfg.local_pipeline_backend ||
+                cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph ||
+                cfg.captured_pipeline_boundaries.size() > 2 || profile.d_model <= 0)
+                throw std::invalid_argument("Captured pipeline channels require a GPU domain leader and no native PP boundary");
+            const auto geometry = PipelineTransferMemory::forRows(profile.d_model, activation_seq,
+                cfg.mtp_enabled ? std::max(1, cfg.mtp_target_query_rows) : 1);
+            for (size_t index = 0; index < cfg.captured_pipeline_boundaries.size(); ++index)
+            {
+                const auto side = cfg.captured_pipeline_boundaries[index];
+                if ((side != PipelineBoundarySide::EarlierDomain && side != PipelineBoundarySide::LaterDomain) ||
+                    std::find(cfg.captured_pipeline_boundaries.begin(),
+                        cfg.captured_pipeline_boundaries.begin() + index, side) !=
+                        cfg.captured_pipeline_boundaries.begin() + index)
+                    throw std::invalid_argument("Captured pipeline BOM repeats or invents an adjacent boundary");
+                pipeline_device_bytes = checkedAdd(pipeline_device_bytes,
+                    geometry.device_bytes_per_boundary, "pipeline channel device cursors");
+                // Both directional slots are charged once by the earlier
+                // layer domain. The later endpoint owns only its GPU cursors.
+                if (side == PipelineBoundarySide::EarlierDomain)
+                    pipeline_host_bytes = checkedAdd(pipeline_host_bytes,
+                        geometry.host_bytes_per_boundary, "pipeline channel host mappings");
+            }
+        }
         const bool replicated_dense_decode =
             std::find(
                 cfg.additional_weight_sets.begin(),
@@ -805,7 +835,13 @@ MemoryPlan MemoryPlanner::plan(
              * main-model GDN state, and (when eligible) a bounded device-hot
              * LRU. These allocations survive graph capture and must be priced
              * before routed experts consume the remaining capacity.
+             * An all-GDN pipeline slice archives a complete recurrent image,
+             * even though it has no attention block to stage. Do not confuse
+             * zero K/V layers with absence of restorable main-model state.
              */
+            const bool has_prefix_main_state =
+                persistent_state.main_full_attention_layers > 0 ||
+                persistent_state.main_gdn_layers > 0;
             const bool prefix_enabled =
                 cfg.device.is_gpu() &&
                 cfg.prefix_cache.enabled &&
@@ -813,7 +849,7 @@ MemoryPlan MemoryPlanner::plan(
                     PrefixCacheStorageMode::Disabled &&
                 cfg.prefix_cache.storage_mode !=
                     PrefixCacheStorageMode::Device &&
-                persistent_state.main_full_attention_layers > 0;
+                has_prefix_main_state;
             if (prefix_enabled)
             {
                 const int prefix_block_tokens =
@@ -844,7 +880,8 @@ MemoryPlan MemoryPlanner::plan(
                     "prefix shifted logical K/V layer");
 
                 prefix_cache_staging_bytes = checkedAdd(
-                    one_fa_layer_bytes,
+                    persistent_state.main_full_attention_layers > 0
+                        ? one_fa_layer_bytes : 0u,
                     persistent_state.prefix_hybrid_device_state_bytes,
                     "prefix main archive staging");
                 if (cfg.mtp_enabled &&
@@ -966,7 +1003,7 @@ MemoryPlan MemoryPlanner::plan(
                 cfg.device.is_cpu() && cfg.prefix_cache.enabled &&
                 cfg.prefix_cache.storage_mode !=
                     PrefixCacheStorageMode::Disabled &&
-                persistent_state.main_full_attention_layers > 0)
+                has_prefix_main_state)
             {
                 /*
                  * CPU inference archives directly into the same host
@@ -1150,9 +1187,6 @@ MemoryPlan MemoryPlanner::plan(
                             ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
                             : cfg.mtp_terminal_logits_layout,
                 });
-            retained_workspace_bytes = std::min(
-                workspace_bytes,
-                cfg.retained_workspace_bytes);
         }
         else
         {
@@ -1208,10 +1242,15 @@ MemoryPlan MemoryPlanner::plan(
                         .total_shards = cfg.total_shards,
                         .apportioned_routed_experts = true,
                     });
-            retained_workspace_bytes = std::min(
-                workspace_bytes,
-                cfg.retained_workspace_bytes);
         }
+
+        // Distinct graph owners can reuse one serial family across shapes,
+        // but cannot alias one physical block while they run concurrently.
+        workspace_bytes = checkedMultiply(
+            workspace_bytes, cfg.concurrent_workspace_owners,
+            "concurrent execution workspace owners");
+        retained_workspace_bytes = std::min(
+            workspace_bytes, cfg.retained_workspace_bytes);
 
         /*
          * The builder is the only place estimates become admission bytes.
@@ -1263,6 +1302,7 @@ MemoryPlan MemoryPlanner::plan(
                 PhysicalMemoryOwner::GraphSnapshotArena,
                 graph_snapshot_bytes)
             .add(PhysicalMemoryOwner::LocalCollective, collective_bytes)
+            .add(PhysicalMemoryOwner::ActivationTransportStaging, pipeline_device_bytes)
             .add(PhysicalMemoryOwner::ActivationArena, activation_bytes)
             .add(
                 PhysicalMemoryOwner::ExecutionWorkspace,
@@ -1281,7 +1321,7 @@ MemoryPlan MemoryPlanner::plan(
         if (cfg.device.is_gpu() &&
             (prefix_cache_host_tier_bytes != 0u ||
              prefix_cache_host_staging_bytes != 0u ||
-             cfg.weight_load_staging.host_bytes != 0u))
+             cfg.weight_load_staging.host_bytes != 0u || pipeline_host_bytes != 0u))
         {
             if (!cfg.associated_host_memory.has_value() ||
                 !cfg.associated_host_memory->valid() ||
@@ -1302,6 +1342,7 @@ MemoryPlan MemoryPlanner::plan(
             host_builder.add(
                 PhysicalMemoryOwner::WeightLoadStaging,
                 cfg.weight_load_staging.host_bytes);
+            host_builder.add(PhysicalMemoryOwner::ActivationTransportStaging, pipeline_host_bytes);
             appendPhysicalPlan(
                 result,
                 DeviceMemoryPlan(

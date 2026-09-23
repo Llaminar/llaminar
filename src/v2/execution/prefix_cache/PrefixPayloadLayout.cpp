@@ -1,3 +1,11 @@
+/**
+ * @file PrefixPayloadLayout.cpp
+ * @brief Derive prefix record geometry from canonical cache ownership.
+ *
+ * Recurrent-only pipeline shards deliberately have no attention payload. Their
+ * archive is a complete state image at a hash-authenticated token frontier;
+ * main or shifted attention instead requires a contiguous block sequence.
+ */
 #include "execution/prefix_cache/PrefixPayloadLayout.h"
 
 #include "kernels/IHybridKVCache.h"
@@ -5,31 +13,34 @@
 
 namespace llaminar2
 {
-    namespace
+    int prefixFALayerForIndex(const IKVCache &kv_cache, int fa_index)
     {
-        int firstFullAttentionLayerForLayout(const IKVCache &kv_cache,
-                                             const IHybridKVCache *hybrid)
-        {
-            if (!hybrid)
-            {
-                return kv_cache.first_layer_index();
-            }
-
-            for (int layer = 0; layer < kv_cache.n_layers(); ++layer)
-            {
-                if (hybrid->isFullAttentionLayer(layer))
-                {
-                    return kv_cache.first_layer_index() + layer;
-                }
-            }
+        if (fa_index < 0 || fa_index >= kv_cache.n_layers())
             return -1;
+        const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&kv_cache);
+        if (!hybrid)
+            return kv_cache.first_layer_index() + fa_index;
+
+        int seen = 0;
+        for (int offset = 0; offset < kv_cache.n_layers(); ++offset)
+        {
+            // The cache translates global identity into its compressed FA/GDN
+            // banks. Adding the offset after that query would classify a
+            // different layer when a pipeline slice starts inside the model.
+            const int global_layer = kv_cache.first_layer_index() + offset;
+            if (hybrid->isFullAttentionLayer(global_layer))
+            {
+                if (seen == fa_index)
+                    return global_layer;
+                ++seen;
+            }
         }
-    } // namespace
+        return -1;
+    }
 
     int firstRestorablePrefixLayer(const IKVCache &kv_cache)
     {
-        const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&kv_cache);
-        const int fa_layer = firstFullAttentionLayerForLayout(kv_cache, hybrid);
+        const int fa_layer = prefixFALayerForIndex(kv_cache, 0);
         return fa_layer >= 0 ? fa_layer : kv_cache.first_layer_index();
     }
 
@@ -46,6 +57,28 @@ namespace llaminar2
     size_t PrefixPayloadLayout::mtpKVBytes() const
     {
         return mtp_kv_bytes;
+    }
+
+    bool PrefixPayloadLayout::hasRestorableMainState() const
+    {
+        if (total_layers <= 0 || fa_layers < 0 || gdn_layers < 0 ||
+            fa_layers + gdn_layers != total_layers)
+            return false;
+        if (fa_layers > 0 &&
+            (bytes_per_fa_layer_k == 0 || bytes_per_fa_layer_v == 0))
+            return false;
+        // Missing attention is valid only when the complete recurrent owner
+        // supplies the state. Terminal logits alone cannot certify a cache.
+        return gdn_layers == 0 ||
+            (includes_hybrid_state && hybrid_state_bytes > 0 &&
+             hybrid_state_bytes == hybrid_host_state_bytes + hybrid_device_state_bytes);
+    }
+
+    PrefixPayloadOrganization PrefixPayloadLayout::organization() const
+    {
+        return fa_layers == 0 && gdn_layers > 0 && !includes_mtp_state
+            ? PrefixPayloadOrganization::RecurrentCheckpoint
+            : PrefixPayloadOrganization::AttentionBlocks;
     }
 
     size_t PrefixPayloadLayout::totalBytes() const

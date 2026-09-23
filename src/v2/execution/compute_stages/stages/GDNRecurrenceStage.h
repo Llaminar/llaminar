@@ -39,6 +39,7 @@ namespace llaminar2
 {
 
     class ITensorGatedDeltaNet;
+    class IKVCache;
 
     /**
      * @brief Delta rule recurrence for GDN linear attention
@@ -144,6 +145,10 @@ namespace llaminar2
 
             /// Kernel implementation (set during graph construction)
             ITensorGatedDeltaNet *kernel = nullptr;
+
+            /// Cache-owned sequence frontier; GPU recurrent-only slices advance
+            /// it on the same stream after their final recurrent layer.
+            IKVCache *sequence_state_cache = nullptr;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> qkv_buffer_id;   ///< Arena: merged QKV tensor

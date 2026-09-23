@@ -1549,7 +1549,10 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
     execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp
+    execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp
     execution/local_execution/orchestrators/PipelineForwardGraphEdges.cpp
+    execution/local_execution/orchestrators/PipelineActivationExchange.cpp
+    execution/local_execution/orchestrators/PipelineMetadataExchange.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
@@ -1562,6 +1565,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/CapturedTransferChannel.cpp
     transfer/MappedTransferProgressEpoch.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
@@ -1617,6 +1621,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/WorkspaceMemoryEstimator.cpp
     planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
+    planning/PipelineTransferMemory.cpp
     planning/RankMemoryPlanInputs.cpp
     planning/MoEOverlayPlanningInputs.cpp
     planning/MoEOverlayMemoryPlanInputs.cpp

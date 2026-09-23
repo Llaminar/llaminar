@@ -15,6 +15,7 @@
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
+#include "planning/PipelineTransferMemory.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "backends/DeviceId.h"
 #include "config/CollectiveBackendType.h"
@@ -252,6 +253,9 @@ struct DevicePlanConfig
     /** Native local PP lifecycle resources, independent of TP weight sharding. */
     std::optional<CollectiveBackendType> local_pipeline_backend;
 
+    /** Adjacent heterogeneous edges owned by this domain leader, never by TP nonleaders. */
+    std::vector<PipelineBoundarySide> captured_pipeline_boundaries;
+
     /**
      * Exact tensor-parallel slice installed by the production assignment authority.
      *
@@ -362,6 +366,16 @@ struct DevicePlanConfig
      * share one DeviceId while still requiring non-aliasing concurrent storage.
      */
     int serial_routed_expert_participant_count = 0;
+
+    /**
+     * @brief Independently runnable graph owners allocating this workspace.
+     *
+     * A rank-local GPU continuation gives each device runner its own CPU
+     * expert graph and WorkspaceAllocator, even when those graphs address one
+     * shared CPU physical resource. Admission must sum their non-aliasing
+     * workspace blocks. This count does not multiply weights or route packets.
+     */
+    std::size_t concurrent_workspace_owners = 1u;
 
     /**
      * @brief Flattened token-row capacity of one serial compact family.

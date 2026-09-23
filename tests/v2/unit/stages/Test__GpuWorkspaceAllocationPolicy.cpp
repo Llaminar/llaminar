@@ -2069,6 +2069,38 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceWaitHasNoResidencySideEff
 }
 
 /**
+ * @brief First grouped-MTP maintenance may not be inferred from diagnostic state.
+ *
+ * A prefill maintenance event can remain pending for diagnostic export when
+ * the first grouped verifier commits. That event is not a receipt for the
+ * verifier's boundary: the latter must submit its own device-owned cadence
+ * transaction before the retained parent admits a second verifier.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     FirstGroupedMTPBoundaryAlwaysSubmitsOwnMaintenance)
+{
+    const auto source = readFile(repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto first_boundary = stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(",
+        "bool DeviceGraphOrchestrator::\n"
+        "        enqueueDeviceGenerationDispatchTicketObservation()"));
+    ASSERT_FALSE(first_boundary.empty());
+    EXPECT_EQ(first_boundary.find("completion_event_in_flight"), std::string::npos)
+        << "Diagnostic event-export state cannot certify a committed transaction.";
+    EXPECT_NE(first_boundary.find(
+        "owns_dynamic_device_maintenance &&\n"
+        "            !maybeRunDeviceMoERebalanceMaintenanceGraph()"),
+        std::string::npos)
+        << "The first committed MTP transaction must submit its own cadence edge.";
+    expectNeedleBefore(first_boundary,
+        "!maybeRunDeviceMoERebalanceMaintenanceGraph()",
+        "!waitForPendingDeviceMoERebalanceMaintenance(",
+        "The parent must consume the first transaction's maintenance event before capture.");
+}
+
+/**
  * @brief Keep Static ExpertOverlay independent from Dynamic maintenance state.
  *
  * The device generation controller is authoritative in both policies, while
@@ -9924,6 +9956,70 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     EXPECT_LT(admission, retirement_open);
     EXPECT_LT(retirement_open, readiness);
     EXPECT_LT(readiness, readers_ready);
+}
+
+/**
+ * @brief Keep mixed-vendor retirement receipts off resident cross-rank waits.
+ *
+ * A fast follower tier may retire its old physical sources while a CUDA
+ * continuation is still finishing sparse inference. Its group root must
+ * acknowledge local retirement in a finite graph, then wait for the other
+ * group on the host phase scheduler. A captured AwaitTransactionComplete
+ * would occupy a ROCm graph until the CUDA rank catches up and can deadlock
+ * the very sparse inference needed to release CUDA's old bank.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     DynamicRetirementSplitsGroupReceiptFromLeaderCompletion)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+    const auto dynamic_capture = sliceBetween(
+        compact,
+        "capture(endpoint.dynamic_retire_graph,",
+        "boolMoEOverlayDeviceControllerGraphService::launchAll(");
+    ASSERT_FALSE(dynamic_capture.empty());
+    EXPECT_NE(
+        dynamic_capture.find("endpoint.dynamic_acknowledge_retired_graph"),
+        std::string::npos);
+    EXPECT_NE(
+        dynamic_capture.find("MoEOverlayDeviceControllerAction::AcknowledgeRetired"),
+        std::string::npos);
+    EXPECT_NE(
+        dynamic_capture.find("MoEOverlayDeviceControllerAction::CompleteDynamicRetirement"),
+        std::string::npos);
+    EXPECT_EQ(
+        dynamic_capture.find("MoEOverlayDeviceControllerAction::AwaitTransactionComplete"),
+        std::string::npos);
+
+    const auto run_one = sliceBetween(
+        compact,
+        "boolMoEOverlayDeviceControllerGraphService::DynamicWorker::runOne(",
+        "std::size_tMoEOverlayDeviceControllerGraphService::localGraphCount(");
+    ASSERT_FALSE(run_one.empty());
+    const auto physical_retired = run_one.find(
+        "protocol->groupRetirementReady(command)");
+    const auto acknowledge = run_one.find(
+        "run_epoch(DynamicGraphEpoch::AcknowledgeRetired,",
+        physical_retired);
+    const auto groups_retired = run_one.find(
+        "protocol->allGroupsRetired(command)", acknowledge);
+    const auto complete = run_one.find(
+        "run_epoch(DynamicGraphEpoch::Complete,", groups_retired);
+    const auto transaction_complete = run_one.find(
+        "protocol->transactionComplete(command)", complete);
+    constexpr std::size_t missing = std::string::npos;
+    ASSERT_NE(physical_retired, missing);
+    ASSERT_NE(acknowledge, missing);
+    ASSERT_NE(groups_retired, missing);
+    ASSERT_NE(complete, missing);
+    ASSERT_NE(transaction_complete, missing);
+    EXPECT_LT(physical_retired, acknowledge);
+    EXPECT_LT(acknowledge, groups_retired);
+    EXPECT_LT(groups_retired, complete);
+    EXPECT_LT(complete, transaction_complete);
 }
 
 /**

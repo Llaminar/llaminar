@@ -3180,5 +3180,104 @@ class TestRankedPerfArtifacts(unittest.TestCase):
             self.assertEqual(observed, [("/admin/shutdown", "0")])
 
 
+class TestNativeRetainedParentEvidence(unittest.TestCase):
+    """A composed GPU executable is not a host-segmented execution schedule.
+
+    Pipeline publication composes its captured local mutation and native wire
+    exchange into one executable. Its physical ownership tags must be present
+    at every lifecycle edge; neither child templates nor a neighboring owner
+    can manufacture proof of a complete parent.
+    """
+
+    @staticmethod
+    def records(device: str, context: str = "main_verifier") -> list[dict]:
+        """Project the executor's existing device-only parent publication ABI."""
+        boundary = {"context": context, "child_units": "1",
+                    "ticket_service_units": "0", "boundary_authority": "captured_device_units"}
+        rows = [
+            counter("full_graph_plan_graphs", device=device, tags={"context": context, "type": "capturable"}),
+            counter("decode_capture_policy", value=4, device=device, tags={
+                "context": context, "has_collectives": "true", "replay_plan_policy": "require_full_graph"}),
+            counter("decode_graph_phase", device=device, tags={"context": context, "phase": "capture"}),
+            counter("retained_parent_child_graph_nodes", value=5, device=device,
+                    tags={"context": context, "type": "captured_child_template", "source": "full_graph_capture"}),
+            counter("retained_parent_executable_nodes", value=6, device=device, tags=dict(boundary)),
+            counter("retained_parent_transaction_zero_launches", device=device, tags=dict(boundary)),
+            counter("retained_parent_replays", value=3, device=device, tags=dict(boundary)),
+        ]
+        return [dict(row, rank=1) for row in rows]
+
+    def test_complete_native_parent_passes_on_both_backends(self) -> None:
+        """Validate physical nodes/launches, not just a favorable policy string."""
+        for device in ("cuda:0", "rocm:0"):
+            for context in ("main_verifier", "mtp_speculative_state_publication"):
+                with self.subTest(device=device, context=context):
+                    result = validate_graph_capture_policy(self.records(device, context),
+                        frozenset({device.split(":")[0]}), decode_requirement=(
+                            DecodeGraphRequirement.REPLAY if context == "main_verifier" else DecodeGraphRequirement.OBSERVE))
+                    self.assertIsNone(result.error)
+                    self.assertFalse(result.has_segmented_execution)
+                    self.assertTrue(result.has_nonempty_full_graph_executable)
+
+    def test_native_parent_rejects_missing_or_foreign_lifecycle(self) -> None:
+        """All lifecycle evidence belongs to the same rank/device/context."""
+        for device in ("cuda:0", "rocm:0"):
+            for missing in ("retained_parent_executable_nodes", "retained_parent_transaction_zero_launches",
+                            "retained_parent_replays"):
+                with self.subTest(device=device, missing=missing):
+                    rows = [row for row in self.records(device) if row["name"] != missing]
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
+            for field, value in (("rank", 2), ("device", "cuda:7"), ("context", "unrelated")):
+                with self.subTest(device=device, field=field):
+                    rows = self.records(device)
+                    nodes = next(row for row in rows if row["name"] == "retained_parent_executable_nodes")
+                    (nodes["tags"] if field == "context" else nodes)[field] = value
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
+
+    def test_native_parent_rejects_host_service_or_incomplete_boundary(self) -> None:
+        """No missing/contradictory physical inventory can masquerade as native."""
+        for device in ("cuda:0", "rocm:0"):
+            for name in ("retained_parent_executable_nodes", "retained_parent_transaction_zero_launches",
+                         "retained_parent_replays"):
+                for field, value in (("boundary_authority", "concurrent_ticket_service"),
+                                     ("boundary_authority", None), ("ticket_service_units", "1"),
+                                     ("ticket_service_units", None), ("child_units", "0"),
+                                     ("child_units", "nan")):
+                    with self.subTest(device=device, name=name, field=field, value=value):
+                        rows = self.records(device)
+                        tags = next(row for row in rows if row["name"] == name)["tags"]
+                        if value is None:
+                            tags.pop(field)
+                        else:
+                            tags[field] = value
+                        self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
+
+    def test_native_parent_does_not_hide_segmentation_or_eager_work(self) -> None:
+        """A valid native helper cannot certify a different illegal main path."""
+        for device in ("cuda:0", "rocm:0"):
+            for extra in (counter("segmented_replay_segments", device=device),
+                          counter("decode_graph_phase", device=device, tags={"context": "main_verifier", "phase": "warmup"}),
+                          counter("decode_capture_policy", device=device, tags={"heterogeneous_segmented": "true"})):
+                with self.subTest(device=device, extra=extra["name"]):
+                    rows = self.records(device) + [dict(extra, rank=1)]
+                    self.assertIsNotNone(validate_graph_capture_policy(rows, frozenset({device.split(":")[0]})).error)
+
+    def test_native_setup_parent_requires_launch_after_runtime_admission(self) -> None:
+        """An unused setup variant is valid; admitting it creates a launch obligation."""
+        for device in ("cuda:0", "rocm:0"):
+            with self.subTest(device=device):
+                rows = [row for row in self.records(device) if row["name"] not in {
+                    "decode_capture_policy", "retained_parent_transaction_zero_launches", "retained_parent_replays"}]
+                materialized = copy.deepcopy(next(row for row in rows if row["name"] == "retained_parent_executable_nodes"))
+                materialized.update(name="retained_parent_materialized_without_launch", value=1)
+                rows.append(materialized)
+                kinds = frozenset({device.split(":")[0]})
+                self.assertIsNone(validate_graph_capture_policy(rows, kinds).error)
+                admission = copy.deepcopy(next(row for row in self.records(device) if row["name"] == "decode_capture_policy"))
+                admission["value"] = 1
+                rows.append(admission)
+                self.assertIsNotNone(validate_graph_capture_policy(rows, kinds).error)
+
+
 if __name__ == "__main__":
     unittest.main()

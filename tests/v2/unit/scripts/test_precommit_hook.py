@@ -96,12 +96,12 @@ class PreCommitHookTests(unittest.TestCase):
                 ])
                 self.assertEqual(calls[2]["args"], [
                     "--build", build, "--parallel", "--target",
-                    "v2_unit_gate", "v2_production_parity_preflight_gate",
+                    "v2_unit_gate", "v2_production_test_preflight_gate",
                 ])
                 common = ["--test-dir", build, "--output-on-failure",
                           "--parallel", "--no-tests=error"]
                 self.assertEqual(calls[3]["args"], common + ["-R", "^V2_Unit_"])
-                self.assertEqual(calls[4]["args"], common + ["-L", "^ProductionParityPreflight$"])
+                self.assertEqual(calls[4]["args"], common + ["-L", "^ProductionTestPreflight$"])
                 for call in calls[1:]:
                     self.assertEqual(call["cwd"], str(root))
 
@@ -112,7 +112,7 @@ class PreCommitHookTests(unittest.TestCase):
                 result, calls, _, _ = self.run_hook(fail=phase)
                 self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
                 self.assertEqual(len(calls), count)
-                self.assertNotIn("Unit and ProductionParityPreflight passed.", result.stdout)
+                self.assertNotIn("Unit and ProductionTestPreflight passed.", result.stdout)
 
 
 if __name__ == "__main__":

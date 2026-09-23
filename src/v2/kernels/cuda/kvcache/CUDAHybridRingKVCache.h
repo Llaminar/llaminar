@@ -122,6 +122,26 @@ namespace llaminar2
         int n_layers() const override { return total_layers_; }
         int first_layer_index() const override { return first_layer_index_; }
 
+        /**
+         * @brief Advance the recurrent-only frontier exactly once per forward.
+         *
+         * Attention-bearing slices already advance their compressed FA rows.
+         * The last layer of an all-GDN slice instead publishes its real request
+         * lengths through the common device-metadata owner.
+         */
+        bool advanceRecurrentSequenceState(
+            int layer, int request_count, const int32_t *rows_device,
+            int captured_rows, void *stream) override
+        {
+            const int local_layer = normalizeLayerIndex(layer);
+            if (local_layer < 0 || local_layer >= total_layers_)
+                return false;
+            if (layer_map_.kvLayerCount() != 0 || local_layer != total_layers_ - 1)
+                return true;
+            return Base::advanceSequenceOnlyState(
+                request_count, rows_device, captured_rows, stream);
+        }
+
         // =====================================================================
         // IKVCache Overrides — Layer-Indexed Methods
         // =====================================================================
@@ -816,6 +836,14 @@ namespace llaminar2
                 effective_stream,
                 false,
                 true);
+            // Prefix length is immutable archive metadata. Publish it beside
+            // the imported recurrent banks; no attention append exists to do
+            // that in an all-GDN slice. Live rollback additionally restores its
+            // opaque device checkpoint on the caller's ordered transaction.
+            if (ok && layer_map_.kvLayerCount() == 0 &&
+                !Base::importSequenceOnlyState(
+                    desc.seq_idx, desc.logical_token_count, effective_stream))
+                return false;
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getNvidiaContext(this->device_id())

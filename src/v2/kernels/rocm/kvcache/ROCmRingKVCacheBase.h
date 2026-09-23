@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../../IKVCache.h"
+#include "../../DeviceSequenceStateGeometry.h"
 #include <vector>
 
 namespace llaminar2
@@ -84,6 +85,8 @@ namespace llaminar2
             int captured_max_tokens,
             void *gpu_stream) override;
         const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override;
+        /** @brief Return the first canonical row, including recurrent-only caches. */
+        const int *deviceSequenceCachedTokenCountPtr(int seq_idx = 0) const override;
         const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override;
         size_t deviceSequenceStateCheckpointBytes() const override;
         bool captureDeviceSequenceStateCheckpoint(
@@ -125,6 +128,7 @@ namespace llaminar2
 
         // Core parameters
         int n_layers_;
+        const DeviceSequenceStateGeometry sequence_geometry_; ///< Metadata shape, separate from K/V layers.
         int batch_size_;
         int max_seq_len_;
         int n_kv_heads_;
@@ -133,7 +137,7 @@ namespace llaminar2
         int device_id_;
 
         // Canonical graph-captured device sequence state.
-        // Layout: [n_layers_ * batch_size_] ints
+        // Layout: [sequence_geometry_.rows() * batch_size_] ints.
         int *d_head_params_ = nullptr;  ///< Device-side head position buffer
         int *d_count_params_ = nullptr; ///< Device-side cached-token count buffer
         /** Stable arena-owned device count source per cache entry, or nullptr. */
@@ -158,6 +162,25 @@ namespace llaminar2
 
         void allocateDeviceParams();
         void freeDeviceParams();
+        /**
+         * @brief Advance a recurrent-only cache on its producer stream.
+         * @param request_count Independent banks starting at sequence zero.
+         * @param rows_device Optional resident real lengths for padded execution.
+         * @param captured_rows Exact width, or maximum width when lengths are bound.
+         * @param stream Non-null stream following the recurrent producer.
+         * @return false for malformed geometry or a cache that owns attention rows.
+         */
+        bool advanceSequenceOnlyState(
+            int request_count, const int32_t *rows_device,
+            int captured_rows, void *stream);
+        /**
+         * @brief Install the declared frontier of an imported recurrent prefix.
+         * @param seq_idx Independent request bank being replaced.
+         * @param tokens Immutable prefix length, not a host-observed live value.
+         * @param stream Exact stream after the recurrent payload import.
+         * @return Whether the recurrent-only cache accepted the replacement.
+         */
+        bool importSequenceOnlyState(int seq_idx, int tokens, void *stream);
         const int *deviceDynamicAppendCountPtr(int layer, int seq_idx) const;
         bool setDeviceSequenceState(
             int layer,

@@ -125,6 +125,9 @@ class PublishedImageSuiteTests(unittest.TestCase):
 
     def test_e2e_runner_collects_failed_timeout_and_passing_cells(self):
         """One red cell must not hide later independent HTTP configurations."""
+        from test_server_tool_calling import row_for, tools
+        from test_server_execution_contract import automatic_evidence
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_model = root / "model.gguf"
@@ -132,7 +135,10 @@ class PublishedImageSuiteTests(unittest.TestCase):
                        "minimum_prompt_tokens": 4096, "generation_tokens": 2048,
                        "request_timeout_seconds": 600, "readiness_timeout_seconds": 180,
                        "cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200},
-                       "thinking_modes": "both", "movement_evidence": "not_applicable"}
+                       "thinking_modes": "both", "movement_evidence": "not_applicable",
+                       "tool_calling": "required",
+                       "planning": {"mode": "auto", "strategy": "single", "mpi_ranks": 1,
+                                    "device_counts": {"cpu": 1}}}
             campaign = SimpleNamespace(group=SimpleNamespace(backends="CPU"))
             selected = [(campaign, f"Suite.Cell/{index}",
                          {"id": f"cell-{index}", "model": str(source_model),
@@ -142,6 +148,19 @@ class PublishedImageSuiteTests(unittest.TestCase):
             staged = [SimpleNamespace(source_path=str(source_model), filename="model.gguf")]
             report_path = root / "e2e.json"
             image = "sha256:" + "a" * 64
+            outcomes = iter((1, 124, 0))
+
+            def run_cell(_command, environment, _log, *, budget):
+                """Successful shell fixtures must retain the new tool evidence too."""
+                code = next(outcomes)
+                if code == 0:
+                    write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "tool_calling_results.json",
+                               {"schema": 1, "complete": True,
+                                "results": [row_for(probe) for probe in tools.PROBES]})
+                    write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "automatic_selection_results.json",
+                               automatic_evidence(["CPU"], strategy="single"))
+                return code
+
             with patch.object(e2e, "discover", return_value=selected), \
                  patch.object(e2e, "image_identity", return_value={"id": image,
                               "labels": {"org.llaminar.cpu_isa": "AVX2"}}), \
@@ -150,7 +169,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                               return_value=nullcontext(workspace)), \
                  patch.object(e2e.parity, "stage_models_in_ramdisk",
                               return_value=(staged, None)) as stage, \
-                 patch.object(e2e, "run_e2e_process", side_effect=[1, 124, 0]) as run, \
+                 patch.object(e2e, "run_e2e_process", side_effect=run_cell) as run, \
                  patch.object(e2e, "validate_long_context_evidence") as checks:
                 result = e2e.main(["--container-image", image,
                                    "--source-revision", "a" * 40,
@@ -507,6 +526,79 @@ class PublishedImageSuiteTests(unittest.TestCase):
         ET.fromstring(image)
         self.assertIn('unsafe&lt;&amp;&gt;', image)
 
+    def test_chart_scale_is_local_to_each_cell_and_phase(self):
+        """A much faster unrelated cell must not shrink either ISA's bars."""
+        result = benchmark_result()
+        for isa, prefill, decode in (("AVX512", 100, 40), ("AVX2", 80, 20)):
+            result["variants"][isa]["cells"][0]["tokens_per_second"] = {
+                "prefill": prefill, "decode": decode}
+
+        def widths(data):
+            """Inspect the semantic SVG row, independently of pixel positions."""
+            root = ET.fromstring(chart.render_chart(data))
+            cell = root.find(".//{*}g[@class='benchmark-cell']")
+            return {phase.attrib["data-phase"]: {
+                bar.attrib["data-isa"]: float(bar.attrib["width"])
+                for bar in phase.findall("{*}rect[@data-isa]")}
+                for phase in cell.findall("{*}g[@data-phase]")}
+
+        expected = {"prefill": {"AVX512": 205, "AVX2": 164},
+                    "decode": {"AVX512": 205, "AVX2": 102.5}}
+        self.assertEqual(widths(result), expected)
+        for variant in result["variants"].values():
+            unrelated = deepcopy(variant["cells"][0])
+            unrelated["case"] = "ZZZ/Unrelated"
+            unrelated["tokens_per_second"] = {"prefill": 1e6, "decode": 1e5}
+            variant["cells"].append(unrelated)
+        original = deepcopy(result)
+        self.assertEqual(widths(result), expected)
+        self.assertEqual(result, original, "rendering may not rewrite measured evidence")
+        image = chart.render_chart(result)
+        self.assertIn("80.0% of AVX512", image)
+        self.assertIn("50.0% of AVX512", image)
+
+    def test_chart_keeps_faster_avx2_visible_above_its_avx512_reference(self):
+        """A genuine AVX2 win extends the local axis instead of being clipped."""
+        result = benchmark_result()
+        for isa, prefill in (("AVX512", 100), ("AVX2", 125)):
+            result["variants"][isa]["cells"][0]["tokens_per_second"]["prefill"] = prefill
+        root = ET.fromstring(chart.render_chart(result))
+        phase = root.find(".//{*}g[@data-phase='prefill']")
+        bars = {bar.attrib["data-isa"]: bar for bar in phase.findall("{*}rect[@data-isa]")}
+        self.assertEqual(float(bars["AVX512"].attrib["width"]), 164)
+        self.assertEqual(float(bars["AVX2"].attrib["width"]), 205)
+        self.assertEqual(phase.attrib["data-reference"], "AVX512")
+        reference = phase.find("{*}line[@class='reference']")
+        self.assertEqual(float(reference.attrib["x1"]), float(bars["AVX512"].attrib["x"]) + 164)
+        self.assertIn("125.0% of AVX512", bars["AVX2"].find("{*}title").text)
+
+    def test_chart_groups_model_sizes_numerically_without_splitting_finetunes(self):
+        """27B, both 35B families and 122B are distinct, ordered sections."""
+        result = benchmark_result()
+        models = ("Qwen3.5-122B-A10B-Q8-00001-of-00004.gguf",
+                  "Ornith-1.5-35B-Q4_K_M.gguf", "Qwen3.8-27B-IQ4_XS.gguf",
+                  "Qwen3.6-35B-A3B-IQ3_S.gguf", "unknown.gguf")
+        for variant in result["variants"].values():
+            template = variant["cells"][0]
+            variant["cells"] = []
+            for model in models:
+                row = deepcopy(template)
+                row["case"] = f"Suite/{model}"
+                row["identity"]["configuration"]["model"] = model
+                variant["cells"].append(row)
+        root = ET.fromstring(chart.render_chart(result))
+        sections = root.findall("{*}g[@class='model-section']")
+        self.assertEqual([section.find("{*}title").text for section in sections],
+                         ["27B models", "35B models", "122B models", "Other models"])
+        self.assertEqual([section.findall("{*}text")[-1].text for section in sections],
+                         ["1 cell", "2 cells", "1 cell", "1 cell"])
+        rows = root.findall("{*}g[@class='benchmark-cell']")
+        self.assertEqual([row.attrib["data-case"] for row in rows],
+                         [f"Suite/{models[index]}" for index in (2, 1, 3, 0, 4)])
+        self.assertEqual(chart.model_section({"model": "Qwen-0.5B-Q8.gguf"}),
+                         (0.5, "0.5B models"))
+        self.assertEqual(chart.model_section({"model": "Qwen-A3B-Q8.gguf"})[1], "Other models")
+
     def test_chart_rejects_partial_duplicate_nonfinite_or_mismatched_rows(self):
         for mutation in (lambda data: data["variants"].pop("AVX2"),
                          lambda data: data["variants"]["AVX2"]["cells"].clear(),
@@ -525,6 +617,15 @@ class PublishedImageSuiteTests(unittest.TestCase):
             "--moe-routed-expert-tier", "slow@capacity;priority=20",
             "--moe-routed-expert-tier", "fast@continuation;priority=0"]}}
         self.assertEqual(chart.topology_label(config), "2×ROCm → 2×CPU · ExpertOverlay")
+
+    def test_automatic_labels_do_not_invent_stage_or_tier_order(self):
+        config = {"e2e": {"planning": {"mode": "auto", "strategy": "pp",
+                    "device_counts": {"rocm": 2, "cuda": 2}}, "server_args": ["--auto"]}}
+        self.assertEqual(chart.topology_label(config), "2×CUDA + 2×ROCm · auto PP")
+        config["e2e"]["planning"]["strategy"] = "expert-overlay"
+        self.assertEqual(chart.topology_label(config), "2×CUDA + 2×ROCm · auto ExpertOverlay")
+        config["e2e"]["planning"]["device_counts"]["rocm"] = 0
+        with self.assertRaises(ValueError): chart.topology_label(config)
 
     def test_readme_publication_changes_only_its_owned_block(self):
         original = f"prefix\n{suite.README_BEGIN}\nold\n{suite.README_END}\nsuffix\n"

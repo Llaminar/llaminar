@@ -3333,35 +3333,6 @@ namespace llaminar2
             return best.valid ? best.token : -1;
         }
 
-        int prefixFALayerForIndex(const IKVCache &cache, int fa_index)
-        {
-            if (fa_index < 0)
-            {
-                return -1;
-            }
-
-            const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
-            if (!hybrid)
-            {
-                return cache.first_layer_index() + fa_index;
-            }
-
-            int seen = 0;
-            for (int layer = 0; layer < cache.n_layers(); ++layer)
-            {
-                if (!hybrid->isFullAttentionLayer(layer))
-                {
-                    continue;
-                }
-                if (seen == fa_index)
-                {
-                    return cache.first_layer_index() + layer;
-                }
-                ++seen;
-            }
-            return -1;
-        }
-
         bool attachMTPPayloadLayout(PrefixPayloadLayout &layout, const IKVCache &mtp_cache)
         {
             if (layout.block_size <= 0)
@@ -3866,10 +3837,13 @@ namespace llaminar2
             {
                 return true;
             }
-            for (int layer = 0; layer < cache.n_layers(); ++layer)
+            for (int offset = 0; offset < cache.n_layers(); ++offset)
             {
-                if (hybrid->isGDNLayer(layer) &&
-                    !cache.resetLayerState(layer, context))
+                // Both classification and mutation address the same global
+                // layer; a local ordinal aliases another PP-owned layer.
+                const int global_layer = cache.first_layer_index() + offset;
+                if (hybrid->isGDNLayer(global_layer) &&
+                    !cache.resetLayerState(global_layer, context))
                 {
                     return false;
                 }
@@ -14776,6 +14750,8 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::hasHeterogeneousCollectiveExecutionDomain() const
     {
+        if (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary())
+            return true;
         const auto &graph_cfg = graph_builder_->config();
         std::optional<DeviceType> first_type;
         bool mixed_device_types = false;
@@ -14933,7 +14909,9 @@ namespace llaminar2
 
         const auto &graph_cfg = graph_builder_->config();
         const ITPContext *tp_ctx = pipeline_forward_edges_
-            ? &pipeline_forward_edges_->context() : graph_cfg.tp_ctx;
+            ? pipeline_forward_edges_->context() : graph_cfg.tp_ctx;
+        if (!tp_ctx && pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary())
+            return accept(); // A single member records only the explicit captured channel, not a host collective.
         if (!tp_ctx || !tp_ctx->isLocal() || tp_ctx->degree() <= 1)
         {
             return reject(
@@ -16631,8 +16609,12 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(
-        const ServingGraphFamilyMaterializationPlan &plan)
+        const ServingGraphFamilyMaterializationPlan &requested_plan)
     {
+        auto plan = requested_plan;
+        if (pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary())
+            plan.pipeline_hidden_input = pp_stage_config_ && !pp_stage_config_->has_embedding
+                ? state_.hidden.get() : nullptr;
         ScopedDeviceLog device_log(state_.device_id);
         LOG_INFO(
             "[ServingGraphMaterialization] participant begin device="
@@ -32358,6 +32340,14 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Publish one logical-state writer to both tensor and mailbox readers.
+     * @param request_count Number of initialized request rows in the arena bank.
+     * @param producer_stream Exact stream that enqueued the current writer.
+     * @param publication_kind Typed provenance of the new logical-state values.
+     * @param error Receives a diagnostic when admission or publication fails.
+     * @return Whether the event-backed mailbox now names the published arena rows.
+     */
     bool DeviceGraphOrchestrator::recordDeviceResidentLogicalSequenceStateMailbox(
         int request_count,
         void *producer_stream,
@@ -32428,6 +32418,20 @@ namespace llaminar2
             }
             return false;
         }
+        /*
+         * The mailbox is a typed view, not a second coherence authority. Its
+         * raw-pointer readers already join the mailbox event, but captured
+         * pipeline metadata reads the original arena tensor through
+         * TransferEngine. Publish that same writer there before making the
+         * mailbox visible. In particular, a first one-token request has no
+         * preceding verifier output that could have published this bank.
+         * Both events describe this exact producer stream; neither downloads
+         * state nor waits for the GPU on the host.
+         */
+        TransferEngine::publishDeviceWrite(
+            arena_->getTensor(BufferId::MTP_LOGICAL_SEQUENCE_STATE),
+            state_.device_id,
+            producer_stream);
         if (!backend->recordEvent(
                 device_resident_logical_sequence_state_ready_event_.get(),
                 state_.device_id.gpu_ordinal(),
@@ -41574,6 +41578,22 @@ namespace llaminar2
         {
             return false;
         }
+        // A pipeline follower has no sampler or logical-mailbox producer to
+        // join the previous main forward. Condition and verifier executables
+        // may use different capture streams, even when they share the same
+        // native communicator and hidden/KV storage. Acquire the durable local
+        // terminal before either their metadata collective or compute can run.
+        // This orders external submissions only: retained parent iterations
+        // already carry the same dependency inside their captured DAG.
+        if (pp_stage_config_ && !pp_stage_config_->has_lm_head &&
+            !waitForForwardGraphOutputReady(
+                execution_stream,
+                DeviceTimelineRole::MainForwardGraph,
+                ForwardGraphOutputKind::Any,
+                "pipeline_follower_previous_forward"))
+        {
+            return false;
+        }
         const bool has_accepted_publication =
             accepted_spec_publication_ready_.valid;
         const bool has_live_checkpoint =
@@ -46208,7 +46228,10 @@ namespace llaminar2
             terminal_hidden_bytes,
             terminal_logits_bytes);
 
-        if (config.mtp.enabled)
+        // Use the same participant role as cache construction. Pipeline
+        // followers verify/restore their main shard, but own no predictor.
+        if (resolveMTPRuntimeTransactionRole(config.mtp.enabled, owns_terminal_state) ==
+            MTPRuntimeTransactionRole::PredictorOwner)
         {
             if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
             {
@@ -46222,9 +46245,9 @@ namespace llaminar2
             }
         }
 
-        if (prefix_layout_.fa_layers <= 0 || prefix_layout_.faKVBytes() == 0)
+        if (!prefix_layout_.hasRestorableMainState())
         {
-            disablePrefixCacheForRunner("KV cache does not expose a dense logical payload layout");
+            disablePrefixCacheForRunner("main cache does not expose a complete attention/recurrent payload layout");
             return false;
         }
         if (!ensurePrefixArchiveDeviceStaging())
@@ -46408,9 +46431,9 @@ namespace llaminar2
         {
             return true;
         }
-        if (live_layout.fa_layers <= 0 || live_layout.faKVBytes() == 0)
+        if (!live_layout.hasRestorableMainState())
         {
-            disablePrefixCacheForRunner("live hybrid prefix layout does not expose restorable KV payloads");
+            disablePrefixCacheForRunner("live hybrid prefix layout does not expose complete restorable state");
             return false;
         }
 
@@ -46504,6 +46527,7 @@ namespace llaminar2
         const int complete_blocks =
             (static_cast<int>(tokens.size()) + prefix_layout_.block_size - 1) /
             prefix_layout_.block_size;
+        const auto organization = prefix_layout_.organization();
         uint64_t parent_hash = 0;
         for (int block = 0; block < complete_blocks; ++block)
         {
@@ -46552,6 +46576,14 @@ namespace llaminar2
                                                                   << (handle ? "present" : "absent")
                                                                   << " shape_compatible="
                                                                   << (handle && handle->layout.compatiblePayloadShape(prefix_layout_) ? "yes" : "no"));
+                }
+                if (organization == PrefixPayloadOrganization::RecurrentCheckpoint)
+                {
+                    // The prompt itself authenticates every ancestor hash.
+                    // No K/V payload is needed before a complete recurrent
+                    // checkpoint, so a missing earlier record is not a gap.
+                    parent_hash = requested_key.stableHash();
+                    continue;
                 }
                 break;
             }
@@ -46613,10 +46645,18 @@ namespace llaminar2
                                                                      : 0u));
             }
             result.blocks.push_back(*handle);
-            result.cached_tokens += handle->key.token_count;
+            result.cached_tokens = handle->key.token_start + handle->key.token_count;
             result.has_terminal_hidden = handle->has_terminal_hidden;
             result.has_terminal_logits = handle->has_terminal_logits;
-            parent_hash = key.stableHash();
+            parent_hash = organization == PrefixPayloadOrganization::RecurrentCheckpoint
+                ? requested_key.stableHash() : key.stableHash();
+            if (organization == PrefixPayloadOrganization::RecurrentCheckpoint)
+            {
+                // Retain complete candidate frontiers for coordinated clamp.
+                // A longer matching checkpoint may exist past this partial
+                // hash chunk; only attention requires a contiguous chain.
+                continue;
+            }
             if (terminal_prefix_match)
             {
                 /*
@@ -46903,10 +46943,10 @@ namespace llaminar2
             const bool device_hot =
                 handle.tier == PrefixStorageTier::DeviceHot;
             if (!handle.valid() || !handle.layout.compatiblePayloadShape(prefix_layout_) ||
-                (device_hot
+                (prefix_layout_.fa_layers > 0 && (device_hot
                      ? (!handle.deviceKVKData() ||
                         !handle.deviceKVVData())
-                     : (!handle.kvKData() || !handle.kvVData())))
+                     : (!handle.kvKData() || !handle.kvVData()))))
             {
                 return fail("prefix block handle is invalid or layout-incompatible");
             }
@@ -47764,6 +47804,15 @@ namespace llaminar2
             parent_hash = key.stableHash();
             const bool terminal_block =
                 (key.token_start + key.token_count) == prompt_token_count;
+            if (!terminal_block && prefix_layout_.organization() ==
+                    PrefixPayloadOrganization::RecurrentCheckpoint)
+            {
+                // Recurrent state summarizes the entire prompt, not each
+                // attention chunk. Store its one real checkpoint and keep
+                // ancestry in the authenticated key rather than allocating
+                // empty/fake K/V blocks or copying the same state repeatedly.
+                continue;
+            }
             const bool key_already_installed = prefix_cache_->contains(key);
             const bool reuse_admitted_terminal =
                 terminal_block && key_already_installed &&
@@ -47835,7 +47884,27 @@ namespace llaminar2
             const size_t total_block_bytes =
                 block_layout.totalBytes() + model_runtime_state_bytes;
 
-            if (!prefix_cache_->prepareInsert(key, total_block_bytes))
+            const PrefixRamInsertPreparation ram_preparation =
+                prefix_cache_->prepareInsert(key, total_block_bytes);
+            if (ram_preparation == PrefixRamInsertPreparation::Busy)
+            {
+                // A bounded optional archive can be full while the request's
+                // DMA/restore handles still own its admitted physical bytes.
+                // Preserve the successful inference result and record the
+                // missed cache admission; never overcommit PMA or block on a
+                // GPU stream merely to force an archive into RAM.
+                PerfStatsCollector::addCounter(
+                    "prefix_cache",
+                    "ram_harvest_busy_skips",
+                    1.0,
+                    "harvest",
+                    state_.device_id.toString(),
+                    {{"block", std::to_string(block)},
+                     {"bytes", std::to_string(total_block_bytes)},
+                     {"policy", "bounded_physical_lease"}});
+                continue;
+            }
+            if (ram_preparation != PrefixRamInsertPreparation::Prepared)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: "
                           "cache replacement/capacity preparation rejected key="
@@ -47844,12 +47913,15 @@ namespace llaminar2
                 return false;
             }
 
-            PrefixBlockHandle handle = prefix_ram_backend_->allocate(key, block_layout);
+            std::string archive_allocation_error;
+            PrefixBlockHandle handle = prefix_ram_backend_->allocateWithDiagnostics(
+                key, block_layout, &archive_allocation_error);
             if (!handle.valid())
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Prefix harvest failed: RAM allocate rejected key="
                           << key.toHex()
-                          << " block_bytes=" << block_layout.totalBytes());
+                          << " block_bytes=" << block_layout.totalBytes()
+                          << " reason=" << archive_allocation_error);
                 return false;
             }
             if (model_runtime_state &&
@@ -50765,14 +50837,9 @@ namespace llaminar2
             return false;
         }
 
-        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
-        {
-            if (hybrid->isGDNLayer(layer))
-            {
-                return true;
-            }
-        }
-        return false;
+        // The cache's compressed layer map already owns the local count. Do
+        // not reconstruct it by querying ambiguous local/global layer IDs.
+        return hybrid->gdnLayerCount() > 0;
     }
 
     bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
@@ -51647,20 +51714,19 @@ namespace llaminar2
          */
         const bool owns_dynamic_device_maintenance =
             usesParticipantLocalDeviceMoERebalanceController();
+        /*
+         * This is the first committed transaction's own boundary. The
+         * completion_event_in_flight flag tracks diagnostic export of the
+         * newest maintenance event; it can still describe prefill (or an
+         * earlier request) and cannot prove this transaction was serviced.
+         * Submit exactly once here. The device-owned cadence predicate makes
+         * a non-due boundary cheap, while a due edge must reset its countdown
+         * before the parent's next verifier admission.
+         */
         if (owns_dynamic_device_maintenance &&
-            !device_moe_rebalance_maintenance_graph_
-                 .completion_event_in_flight &&
             !maybeRunDeviceMoERebalanceMaintenanceGraph())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation could not launch the first committed MoE maintenance boundary"
-                      << " device=" << state_.device_id.toString());
-            return false;
-        }
-        if (owns_dynamic_device_maintenance &&
-            !device_moe_rebalance_maintenance_graph_
-                 .completion_event_in_flight)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation parent preparation requires the first committed MoE maintenance publication"
                       << " device=" << state_.device_id.toString());
             return false;
         }
@@ -51711,7 +51777,9 @@ namespace llaminar2
                     &error,
                     moe_overlay_epoch_execution_binding_
                         ? OrdinaryGenerationComposition::ExpertOverlay
-                        : OrdinaryGenerationComposition::CompleteLocal))
+                        : pipeline_forward_edges_ && pipeline_forward_edges_->hasHeterogeneousBoundary()
+                            ? OrdinaryGenerationComposition::PipelineDomainTail
+                            : OrdinaryGenerationComposition::CompleteLocal))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Ordinary generation preparation failed: " << error);
                 return false;

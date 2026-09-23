@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from run_production_parity_campaigns import run_production_parity_preflight
+from run_production_parity_campaigns import run_production_test_preflight
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
                  if args.installed_build_receipt is not None else None)
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
-    code, _, _ = run_production_parity_preflight(
+    code, _, _ = run_production_test_preflight(
         build, None, installed_build_receipt=installed, artifact_directory=output)
     return code
 

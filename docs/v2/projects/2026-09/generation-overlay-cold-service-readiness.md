@@ -88,7 +88,7 @@ participant while other participants continue real work. It must demonstrate
 that preparation/economics can become ready without routing to the cold expert,
 and that no fake histogram or placement change is recorded. Device integration
 must prove actual kernel measurement, immutable inference state, event ownership
-and capture compatibility, then join ProductionParityPreflight. Refresh the
+and capture compatibility, then join ProductionTestPreflight. Refresh the
 shared Unit/preflight receipt once after the implementation and required builds.
 Continue unseen-first acquisition without replaying the full expensive pipeline.
 
@@ -182,7 +182,7 @@ precision. Neither fixture correction changes the preserved model failure.
 CPU, CUDA and ROCm each passed 20 complete process repetitions (60 total) in
 91.62 seconds. The three registered tests together subsequently passed in
 5.03 seconds after rebuilding the certifier. They join
-`ProductionParityPreflight`; the AVX2 CPU dispatch has a separate registration
+`ProductionTestPreflight`; the AVX2 CPU dispatch has a separate registration
 using the same source, not a second format list. Ownership-only factory tests
 also pass on all three backends. The AVX2 registration also passed all 20
 repetitions in 12.32 seconds, bringing this slice to 80 passing stress processes.

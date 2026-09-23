@@ -42,14 +42,14 @@
  * 2. LOCAL TP (single-rank): One MPI rank with multiple devices
  *    - Configured via ILocalTPContext in InferenceRunnerConfig
  *    - Collectives via NCCL/RCCL/HOST
- *    - Use: llaminar2 --tp 2 --tp-scope rank_local --tp-devices cuda:0,rocm:0
+ *    - Use: llaminar2 serve -m model.gguf --tp-scope rank_local --tp-devices cuda:0,cuda:1
  *
  * @code
  * // GLOBAL TP: via MPI world_size
  * auto runner = createInferenceRunner(model_ctx, mpi_ctx, device, config);
  *
  * // LOCAL TP: via ILocalTPContext
- * auto tp_ctx = createLocalTPContext({DeviceId::cuda(0), DeviceId::rocm(0)}, ...);
+ * auto tp_ctx = createLocalTPContext({DeviceId::cuda(0), DeviceId::cuda(1)}, ...);
  * InferenceRunnerConfig config;
  * config.tp_ctx = tp_ctx.get();
  * auto runner = createInferenceRunner(model_ctx, nullptr, DeviceId::cuda(0), config);
@@ -63,6 +63,7 @@
 #include "../../loaders/PreparedWeightAdmission.h"
 #include "../../interfaces/IModelContext.h"
 #include "../config/RuntimeConfig.h"
+#include "../moe/MoEOverlayCpuPreparationGate.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../backends/DeviceId.h"
 #include "../../utils/MPIContext.h"
@@ -250,10 +251,16 @@ namespace llaminar2
         std::shared_ptr<DecodeExpertHistogram>
             moe_expert_overlay_decode_histogram;
 
-        /// True when a parent RankOrchestrator has already prepared overlay
-        /// expert weights for the whole LocalTP domain. Child device runners
-        /// still receive the overlay plan for graph routing, but skip the
-        /// expensive per-runner weight preparation side effect.
+        /**
+         * @brief Construction-only join for a colocated CPU expert bank.
+         *
+         * The continuation-root child publishes after its exact frozen CPU
+         * slices are prepared. Other GPU children may prepare their own
+         * weights concurrently, but must join this publication before graph
+         * stages read the shared CPU registry. No request path uses the gate.
+         */
+        std::optional<MoEOverlayCpuPreparationParticipation>
+            moe_overlay_cpu_preparation;
 
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;

@@ -649,8 +649,23 @@ namespace llaminar2
         }
         if (!chargesFit(all_shadow_charges, resource_index, resources))
         {
-            throw std::invalid_argument(
-                "ExpertOverlay endpoint shadow banks exceed the complete physical BOM");
+            std::ostringstream error;
+            error << "ExpertOverlay endpoint shadow banks exceed the complete physical BOM";
+            for (const auto &[resource_id, shadow_bytes] : all_shadow_charges)
+            {
+                const auto &resource = resources[resource_index.at(resource_id)];
+                const auto bom = resource.memory.build();
+                const auto used = bom.incrementalBytes();
+                const auto available = bom.resource().admission_available_bytes;
+                if (used <= available && shadow_bytes <= available - used)
+                    continue;
+                error << "; resource='" << resource_id << "' device="
+                      << bom.resource().device.toString()
+                      << " fixed_bytes=" << used
+                      << " shadow_bytes=" << shadow_bytes
+                      << " usable_bytes=" << available;
+            }
+            throw MoEOverlayCapacityExhausted(error.str());
         }
         commitCharges(
             all_shadow_charges, resource_index, resources, /*shadow=*/true);

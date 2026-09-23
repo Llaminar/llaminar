@@ -412,8 +412,14 @@ namespace llaminar2
 
     MPILaunchConfig MPIBootstrapPhase::discoveryLaunchConfig(const OrchestrationConfig &config)
     {
-        if (config.hostfile.empty() && !config.execution_rank_selection)
-            throw std::invalid_argument("Discovery launch requires a hostfile or saved execution selection");
+        const bool local_auto_world = config.hostfile.empty() &&
+            !config.execution_rank_selection && config.mpi_procs > 0 &&
+            std::holds_alternative<AutomaticOrchestrationRequest>(
+                resolveOrchestrationIntent(config));
+        if (config.hostfile.empty() && !config.execution_rank_selection &&
+            !local_auto_world)
+            throw std::invalid_argument(
+                "Discovery launch requires a hostfile, saved execution selection, or an automatic MPI world size");
         if (config.execution_rank_selection)
         {
             if (config.hostfile.empty() && config.mpi_procs <= 0)
@@ -494,6 +500,9 @@ namespace llaminar2
                                                int argc, char *argv[])
     {
         const auto device_intent = installDeviceStartupIntent(config);
+        const bool automatic_multi_rank_discovery =
+            device_intent == BootstrapDeviceIntent::Automatic &&
+            config.mpi_procs > 1;
         // Detect CPU topology (needed for both bootstrap and runtime config)
         CPUTopology cpu_topology = MPIBootstrap::detectCPUTopology();
 
@@ -503,12 +512,15 @@ namespace llaminar2
         // If already in MPI context or bootstrap disabled, continue to runtime init
         if (mpi_env.is_mpi_process || config.mpi_no_bootstrap)
         {
-            if (mpi_env.is_mpi_process && (!config.hostfile.empty() || config.execution_rank_selection))
+            if (mpi_env.is_mpi_process &&
+                (!config.hostfile.empty() || config.execution_rank_selection ||
+                 automatic_multi_rank_discovery))
                 configureClusterRankThreads(config);
             return {BootstrapResult::Action::CONTINUE, 0};
         }
 
-        if (!config.hostfile.empty() || config.execution_rank_selection)
+        if (!config.hostfile.empty() || config.execution_rank_selection ||
+            automatic_multi_rank_discovery)
         {
             const auto launch = discoveryLaunchConfig(config);
             if (config.mpi_dry_run)
@@ -519,8 +531,8 @@ namespace llaminar2
                 std::cout << '\n';
                 return {BootstrapResult::Action::EXIT, 0};
             }
-            // No inference endpoint can narrow the discovery namespace of a
-            // saved selection or remote cluster. MPI starts all requested ranks;
+            // No unresolved auto plan can narrow the discovery namespace to
+            // the launcher's NUMA-0 default. MPI starts the requested ranks;
             // their actual CPU/GPU inventory is gathered after initialization.
             const int result = MPIBootstrap::selfLaunchMPI(argc, argv, launch, cpu_topology);
             return {BootstrapResult::Action::EXIT, result < 0 ? 1 : result};

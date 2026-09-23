@@ -71,7 +71,7 @@ The focused pre-fix regression is red. The implementation adds nested/permuted
 epoch-span tests, preserves the negative after-later-admission test, and extends
 real two-rank coordination coverage. The MPI suite is reclassified from Unit
 to Integration, moved into the integration source tree, and included in the
-canonical ProductionParityPreflight label rather than maintaining a duplicate
+canonical ProductionTestPreflight label rather than maintaining a duplicate
 test path. Full Unit/preflight/matrix targets build successfully in
 `ci-local-prefix-admission-span-build-03.log` (757 tasks). The five focused
 coordinator, runner, device-orchestrator, and real-MPI suites pass. The
@@ -80,7 +80,7 @@ process invocations in 21.19 seconds total; the original device-free regression
 is now green without timing instrumentation.
 
 `ci-local-random-prefix-span-01` passes all 645 Unit tests and all 125
-ProductionParityPreflight tests (770 registrations, 540.257 seconds including
+ProductionTestPreflight tests (770 registrations, 540.257 seconds including
 prerequisite builds). Its exact uninstrumented model cell passes in 190.916
 seconds, validating all eight canonical CSVs after four persistent tmpfs cache
 hits and zero model copy bytes. Prefill LM-head cosine is 0.999041 with KL

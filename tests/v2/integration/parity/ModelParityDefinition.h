@@ -442,6 +442,8 @@ namespace llaminar2::test::parity
         Collective tensor_parallel_collective = Collective::None;
         std::shared_ptr<const MoERoutedExpertPlacementPlan>
             expert_overlay_plan; ///< Null for a non-overlay topology.
+        /** Per-stage TP collectives for mixed-vendor pipelines; empty uses the common scalar. */
+        std::vector<Collective> pipeline_tensor_parallel_collectives;
 
         /** @return Whether this topology enables ExpertOverlay matrix axes. */
         [[nodiscard]] bool isExpertOverlay() const noexcept
@@ -1213,7 +1215,9 @@ namespace llaminar2::test::parity
                     if (domain.devices.size() > 1u)
                     {
                         domain.backend = toCollectiveBackend(
-                            topology.tensor_parallel_collective);
+                            topology.pipeline_tensor_parallel_collectives.empty()
+                                ? topology.tensor_parallel_collective
+                                : topology.pipeline_tensor_parallel_collectives.at(stage));
                         domain.weights.assign(
                             domain.devices.size(),
                             1.0f / static_cast<float>(domain.devices.size()));
@@ -1926,6 +1930,11 @@ namespace llaminar2::test::parity
                     "pipeline stage sizes must cover every topology participant exactly once");
             }
         }
+        if (!topology.pipeline_tensor_parallel_collectives.empty() &&
+            (!pipeline || topology.pipeline_tensor_parallel_collectives.size() !=
+                (topology.pipeline_stage_sizes.empty() ? topology.participants.size()
+                                                       : topology.pipeline_stage_sizes.size())))
+            throw std::invalid_argument("per-stage TP collectives require one entry per pipeline stage");
         if (!topology.pipeline_weights.empty() &&
             topology.pipeline_weights.size() !=
                 (topology.pipeline_stage_sizes.empty()

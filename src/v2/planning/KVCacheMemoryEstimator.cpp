@@ -9,6 +9,7 @@
  */
 
 #include "planning/KVCacheMemoryEstimator.h"
+#include "kernels/DeviceSequenceStateGeometry.h"
 
 #include "tensors/BlockStructures.h"
 
@@ -488,7 +489,7 @@ namespace llaminar2
         const std::string &kv_precision,
         DeviceId device)
     {
-        if (n_layers <= 0 || batch_size <= 0 || max_seq_len <= 0 ||
+        if (n_layers < 0 || batch_size <= 0 || max_seq_len <= 0 ||
             n_kv_heads <= 0 || head_dim <= 0)
         {
             return 0;
@@ -498,6 +499,19 @@ namespace llaminar2
         if (family == KVCacheFamily::Hybrid &&
             (format == KVStorageFormat::TQ4 || format == KVStorageFormat::TQ8))
             throw std::invalid_argument("Hybrid KV caches do not implement TurboQuant storage");
+        if (n_layers == 0)
+        {
+            // The hybrid cache still owns a sequence frontier when its PP
+            // interval contains only recurrent layers. No payload or pointer
+            // tables exist; charge exactly the common metadata allocation.
+            if (format == KVStorageFormat::Q16_1 && device.is_gpu())
+                throw std::invalid_argument("Q16_1 KV-cache storage is supported only on CPU");
+            return family == KVCacheFamily::Hybrid && device.is_gpu()
+                       ? checkedMultiply(DeviceSequenceStateGeometry(0).checkpointBytes(),
+                                         static_cast<std::size_t>(batch_size),
+                                         "recurrent sequence metadata")
+                       : 0;
+        }
         const std::size_t layers = static_cast<std::size_t>(n_layers);
         const std::size_t batches = static_cast<std::size_t>(batch_size);
         const std::size_t sequence = static_cast<std::size_t>(max_seq_len);

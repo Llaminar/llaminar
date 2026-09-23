@@ -1393,6 +1393,7 @@ namespace llaminar2
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         rec_params.kernel = gdn_state->rec_kernel.get();
+        rec_params.sequence_state_cache = kv_cache;
 
         graph.addNode(prefix + "gdn_recurrence",
                       ComputeStageFactory::createGDNRecurrence(rec_params),

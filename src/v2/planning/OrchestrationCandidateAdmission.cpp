@@ -167,8 +167,19 @@ namespace llaminar2
                     ranks[index].runtime.resident_graph_rows = local[index].resident_graph_rows;
                     ranks[index].runtime.moe_routed_prefill.overlay_segment_rows = segments[index];
                 }
-                candidate.config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
-                    MoEOverlayCapacityResolver::installResolvedQuotas(overlay_plan, capacity));
+                /*
+                 * Auto's capacity result proves and ranks this topology at
+                 * discovery time; it is not a user-authored fixed quota.
+                 * Backend contexts and rank-local graph resources are created
+                 * after that observation. Persisting every last estimated
+                 * expert slot as FixedPerLayer would turn a small, legitimate
+                 * change in free VRAM into a startup failure even though the
+                 * same automatic policy fits with one fewer resident expert.
+                 * Preserve auto quota intent in the apply document. The live
+                 * runner resolves its complete BOM against its refreshed
+                 * PhysicalMemoryAuthority observation before allocating any
+                 * expert, without changing topology or movement policy.
+                 */
                 std::vector<DevicePlanConfig> devices;
                 for (auto &rank : local)
                     devices.insert(devices.end(), std::make_move_iterator(rank.device_inputs.begin()),

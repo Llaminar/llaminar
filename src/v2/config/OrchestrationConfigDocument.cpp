@@ -90,7 +90,10 @@ namespace
 #define MEMBERS(X) X(numa_node) X(device_type) X(device_ordinal)
     RECORD(GlobalDeviceAddress, hostname, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload)
+#define MEMBERS(X) X(count)
+    RECORD(AutomaticBackendDeviceCount, backend, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload) X(device_counts)
     RECORD(AutomaticOrchestrationOptions, only_backends, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(devices) X(weights) X(backend) X(routed_compute_policy) \

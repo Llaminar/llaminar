@@ -8,6 +8,7 @@
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <chrono>
@@ -63,7 +64,133 @@ namespace
             budget_bytes,
             kModelSha256);
     }
+
+    /** @brief Admit one production-style bounded host archive reservation. */
+    std::shared_ptr<PhysicalMemoryAuthority> prefixAuthority(
+        size_t prefix_bytes)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 4096u,
+                .admission_available_bytes = 4096u,
+            },
+            PhysicalMemoryOwner::PrefixHostTier,
+            prefix_bytes);
+        auto admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::move(admission), 0);
+    }
 } // namespace
+
+/**
+ * @test Cache pressure must follow the physical lease, not only LRU keys.
+ *
+ * The oldest key is still held by a request. Evicting it lowers logical
+ * occupancy but does not release PMA capacity; the next unaliased victim must
+ * retire before a new archive can be allocated.
+ */
+TEST(Test__PrefixStateCacheLRU,
+     PhysicalAliasPressureEvictsUntilTheArchiveCanBeLeased)
+{
+    auto authority = prefixAuthority(96u);
+    auto ram = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 96u, authority);
+    ASSERT_NE(ram, nullptr);
+    PrefixStateCache cache(96u, ram);
+
+    auto oldest = ram->allocate(keyFor(0), layoutBytes(32u));
+    auto middle = ram->allocate(keyFor(1), layoutBytes(32u));
+    auto newest = ram->allocate(keyFor(2), layoutBytes(32u));
+    ASSERT_TRUE(oldest.valid());
+    ASSERT_TRUE(middle.valid());
+    ASSERT_TRUE(newest.valid());
+    ASSERT_TRUE(cache.insert(oldest));
+    ASSERT_TRUE(cache.insert(middle));
+    ASSERT_TRUE(cache.insert(newest));
+    PrefixBlockHandle request_alias = oldest;
+    oldest = {};
+    middle = {};
+    newest = {};
+
+    EXPECT_EQ(cache.prepareInsert(keyFor(3), 32u),
+              PrefixRamInsertPreparation::Prepared);
+    EXPECT_FALSE(cache.isRamResident(keyFor(0)));
+    EXPECT_FALSE(cache.isRamResident(keyFor(1)));
+    EXPECT_TRUE(cache.isRamResident(keyFor(2)));
+    EXPECT_EQ(ram->usedBytes(), 32u);
+    auto incoming = ram->allocate(keyFor(3), layoutBytes(32u));
+    ASSERT_TRUE(incoming.valid());
+    EXPECT_TRUE(cache.insert(incoming));
+}
+
+/** @test All request-held aliases yield typed Busy instead of overcommit. */
+TEST(Test__PrefixStateCacheLRU,
+     PhysicalAliasPressureReportsBusyWhenEveryVictimIsRetained)
+{
+    auto authority = prefixAuthority(64u);
+    auto ram = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 64u, authority);
+    ASSERT_NE(ram, nullptr);
+    PrefixStateCache cache(64u, ram);
+
+    auto first = ram->allocate(keyFor(0), layoutBytes(32u));
+    auto second = ram->allocate(keyFor(1), layoutBytes(32u));
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(cache.insert(first));
+    ASSERT_TRUE(cache.insert(second));
+    PrefixBlockHandle retained_first = first;
+    PrefixBlockHandle retained_second = second;
+    first = {};
+    second = {};
+
+    EXPECT_EQ(cache.prepareInsert(keyFor(2), 32u),
+              PrefixRamInsertPreparation::Busy);
+    EXPECT_EQ(ram->usedBytes(), 0u);
+    EXPECT_FALSE(ram->canStore(32u));
+    retained_first = {};
+    EXPECT_EQ(cache.prepareInsert(keyFor(2), 32u),
+              PrefixRamInsertPreparation::Prepared);
+    EXPECT_TRUE(ram->allocate(keyFor(2), layoutBytes(32u)).valid());
+}
+
+/** @test A physically busy hydration keeps its valid durable disk record. */
+TEST(Test__PrefixStateCacheLRU,
+     PhysicalAliasPressureDoesNotDiscardVerifiedDiskEntry)
+{
+    const auto directory = tempDir();
+    auto authority = prefixAuthority(64u);
+    auto ram = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 64u, authority);
+    auto disk = makeDiskBackend(directory, 128u);
+    ASSERT_NE(ram, nullptr);
+    ASSERT_TRUE(disk->ready()) << disk->initializationError();
+    PrefixStateCache cache(32u, ram, disk);
+
+    auto first = ram->allocate(keyFor(0), layoutBytes(32u));
+    auto second = ram->allocate(keyFor(1), layoutBytes(32u));
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(cache.insert(first));
+    ASSERT_TRUE(cache.insert(second));
+    ASSERT_TRUE(cache.isDiskResident(keyFor(0)));
+
+    // Both evicted handles remain owned by the request. Hydration can retire
+    // logical keys but must not claim a third physical 32-byte allocation.
+    EXPECT_FALSE(cache.find(keyFor(0)).has_value());
+    EXPECT_TRUE(cache.isDiskResident(keyFor(0)));
+    first = {};
+    second = {};
+
+    auto hydrated = cache.find(keyFor(0));
+    ASSERT_TRUE(hydrated.has_value());
+    EXPECT_TRUE(hydrated->valid());
+    std::filesystem::remove_all(directory);
+}
 
 TEST(Test__PrefixStateCacheLRU, InsertFindAndTouchUpdatesRecency)
 {
@@ -282,7 +409,8 @@ TEST(Test__PrefixStateCacheLRU, PreparedReplacementCannotResurrectStaleDiskPaylo
     auto rich_layout = layoutBytes(32);
     rich_layout.includes_mtp_state = true;
     rich_layout.mtp_kv_bytes = 16;
-    ASSERT_TRUE(cache.prepareInsert(replaced_key, rich_layout.totalBytes()));
+    ASSERT_EQ(cache.prepareInsert(replaced_key, rich_layout.totalBytes()),
+              PrefixRamInsertPreparation::Prepared);
     EXPECT_FALSE(cache.contains(replaced_key));
 
     auto rich = ram->allocate(replaced_key, rich_layout);

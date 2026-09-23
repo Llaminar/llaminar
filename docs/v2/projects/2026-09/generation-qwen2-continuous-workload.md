@@ -190,7 +190,7 @@ flowchart TD
 The scalar `V2_Unit_AttentionKeyQ8` already contained a deterministic outlier
 fixture, but it never exercised the CPU cache. That same fixture is now shared
 with `CPUAttentionKeyQuality.Q8KeysPreserveScoreRelevantSmallCoordinates` in
-the existing `ProductionParityPreflight` executable. The live production
+the existing `ProductionTestPreflight` executable. The live production
 append/attention check fails in **8 ms**, with cosine **0.915217** against
 the existing scalar quality requirement **0.995**, relative-L2 **0.413630**
 against **0.06**. The earlier seven-format source-ownership cases remain green.

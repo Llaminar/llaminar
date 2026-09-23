@@ -10,6 +10,7 @@
 #include "config/OrchestrationPlanningPolicy.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/ConfigValidator.h"
+#include "config/OrchestrationConfigDocument.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
@@ -251,6 +252,49 @@ TEST(OrchestrationPlanningPolicy, HelpComesFromTheSameSharedSpecification)
 {
     const auto help = OrchestrationConfigParser::getHelpText();
     for (const auto option : {"--auto", "--planning-mode", "--only-backends", "--only-strategies",
-                              "--prefer-backend", "--prefer-strategy", "--plan-workload"})
+                              "--prefer-backend", "--prefer-strategy", "--plan-workload", "--auto-device-counts"})
         EXPECT_NE(help.find(option), std::string::npos);
+}
+
+TEST(OrchestrationPlanningPolicy, DeviceCountsSurviveCliYamlAndMPIDocument)
+{
+    const auto cli = parsePlanning({"--auto-device-counts", "cuda=2,rocm=4,cpu=2"});
+    const auto yaml = OrchestrationConfigParser{}.parseYamlString(
+        "planning:\n  device_counts: cuda=2,rocm=4,cpu=2\n");
+    ASSERT_EQ(cli.automatic_planning.device_counts, yaml.automatic_planning.device_counts);
+    const auto copy = deserializeOrchestrationConfig(serializeOrchestrationConfig(cli));
+    EXPECT_EQ(copy.automatic_planning.device_counts, cli.automatic_planning.device_counts);
+    const auto resolved = resolveOrchestrationIntent(copy);
+    ASSERT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(resolved));
+    const auto &policy = std::get<AutomaticOrchestrationRequest>(resolved);
+    const std::vector backends{DeviceType::CUDA, DeviceType::CUDA, DeviceType::ROCm,
+        DeviceType::ROCm, DeviceType::ROCm, DeviceType::ROCm, DeviceType::CPU, DeviceType::CPU};
+    EXPECT_TRUE(policy.allows(OrchestrationStrategy::ExpertOverlay, backends));
+    EXPECT_FALSE(policy.allows(OrchestrationStrategy::ExpertOverlay, std::span(backends).first(7)));
+    auto excess = backends;
+    excess.push_back(DeviceType::CUDA);
+    EXPECT_FALSE(policy.allows(OrchestrationStrategy::ExpertOverlay, excess));
+    auto applied = cli;
+    applied.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+    EXPECT_THROW((void)resolveOrchestrationIntent(applied), std::invalid_argument);
+}
+
+TEST(OrchestrationPlanningPolicy, DeviceCountsRejectInvalidAndConflictingIntent)
+{
+    for (const auto value : {"", "cuda", "cuda=", "=2", "cuda=0", "cpu=-1", "rocm=+2",
+                            "cuda=2.0", "cuda=2junk", "cuda=2147483648", "metal=1", "cuda=1,",
+                            "cuda=1,cuda=1", "cuda=1,cuda=2", "cuda=1=2"})
+    {
+        SCOPED_TRACE(value);
+        EXPECT_THROW((void)parseAutomaticDeviceCounts(value), std::invalid_argument);
+    }
+    auto config = parsePlanning({"--only-backends", "rocm", "--auto-device-counts", "cuda=2"});
+    EXPECT_THROW((void)resolveOrchestrationIntent(config), std::invalid_argument);
+    AutomaticOrchestrationOptions options;
+    options.device_counts = std::vector<AutomaticBackendDeviceCount>{};
+    EXPECT_THROW((void)AutomaticOrchestrationRequest(options), std::invalid_argument);
+    options.device_counts = {{DeviceType::CPU, 0}};
+    EXPECT_THROW((void)AutomaticOrchestrationRequest(options), std::invalid_argument);
+    EXPECT_EQ(parseAutomaticDeviceCounts(" cuda = 2 , cpu = 1 "),
+        (std::vector<AutomaticBackendDeviceCount>{{DeviceType::CUDA, 2}, {DeviceType::CPU, 1}}));
 }

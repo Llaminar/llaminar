@@ -4933,39 +4933,65 @@ namespace llaminar2
                     const auto parent_name = moeParentNameForRole(group.layer, role);
 
                     /*
-                     * A participant-only FrozenModelWeightSet is authoritative
-                     * when present.  Its tensor contains only the expert slots
-                     * named by slice.expert_ids; never replace that exact view
-                     * with the process-wide complete parent from cache_.
+                     * A frozen set may contain several CPU participant slices
+                     * with the same canonical parent name and generic CPU
+                     * DeviceId. The domain, participant, and MPI rank together
+                     * identify the sole authoritative slice for this group.
+                     * Its slot map is relative to that tensor, not to the
+                     * process-wide source parent in cache_.
                      */
                     if (frozen_weights)
                     {
+                        const WeightBinding *matched_binding = nullptr;
                         for (const auto &binding : frozen_weights->bindings())
                         {
                             if (binding.identity.canonical_name != parent_name ||
-                                !binding.tensor_owner ||
-                                binding.residency.home_device != group.device)
+                                binding.residency.home_device != group.device ||
+                                binding.identity.overlay_domain != group.domain_name ||
+                                binding.identity.overlay_participant_index != group.participant_index ||
+                                binding.identity.overlay_participant_world_rank != group.participant_world_rank)
                             {
                                 continue;
                             }
 
-                            CpuExpertParent result;
-                            result.tensor = binding.tensor_owner;
-                            result.logical_expert_ids = binding.slice.expert_ids;
-                            if (result.logical_expert_ids.empty())
+                            if (matched_binding)
                             {
-                                const auto &shape = result.tensor->shape();
-                                if (shape.size() == 3u)
-                                {
-                                    result.logical_expert_ids.resize(shape[2]);
-                                    std::iota(
-                                        result.logical_expert_ids.begin(),
-                                        result.logical_expert_ids.end(),
-                                        static_cast<int>(binding.slice.expert_start));
-                                }
+                                LOG_ERROR("[WeightManager] MoE overlay CPU fallback has ambiguous frozen parents for domain "
+                                          << group.domain_name << " rank="
+                                          << group.participant_world_rank << " participant="
+                                          << group.participant_index << " layer=" << group.layer
+                                          << " parent=" << parent_name);
+                                return {};
                             }
-                            return result;
+                            matched_binding = &binding;
                         }
+
+                        if (!matched_binding || !matched_binding->tensor_owner)
+                        {
+                            LOG_ERROR("[WeightManager] MoE overlay CPU fallback lacks its exact frozen parent for domain "
+                                      << group.domain_name << " rank="
+                                      << group.participant_world_rank << " participant="
+                                      << group.participant_index << " layer=" << group.layer
+                                      << " parent=" << parent_name);
+                            return {};
+                        }
+
+                        CpuExpertParent result;
+                        result.tensor = matched_binding->tensor_owner;
+                        result.logical_expert_ids = matched_binding->slice.expert_ids;
+                        if (result.logical_expert_ids.empty())
+                        {
+                            const auto &shape = result.tensor->shape();
+                            if (shape.size() == 3u)
+                            {
+                                result.logical_expert_ids.resize(shape[2]);
+                                std::iota(
+                                    result.logical_expert_ids.begin(),
+                                    result.logical_expert_ids.end(),
+                                    static_cast<int>(matched_binding->slice.expert_start));
+                            }
+                        }
+                        return result;
                     }
 
                     {

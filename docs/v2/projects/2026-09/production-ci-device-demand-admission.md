@@ -91,7 +91,7 @@ been relaxed. This document is not a passing receipt.
 ## Fresh prerequisites and the next exposed defect
 
 `ci-local-device-demand-01/report.json` records **645/645 Unit and 128/128
-ProductionParityPreflight passes**. The same exact six-GPU Dynamic cell now
+ProductionTestPreflight passes**. The same exact six-GPU Dynamic cell now
 passes movement admission/convergence and emits its six numerical CSVs. It
 fails after 163.831 seconds during the ordinary `shutdownMPIWorkers()` boundary
 at `NodeExpertOverlayParityRunner.cpp`, not exception unwinding from an earlier

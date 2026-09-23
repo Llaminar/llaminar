@@ -220,6 +220,32 @@ namespace llaminar2
                 std::adjacent_find(boundaries.begin(), boundaries.end()) != boundaries.end())
                 throw std::invalid_argument("Pipeline memory BOM requires one nonempty interval per stage");
 
+            // Cross-backend channels attach to domain leaders, not every TP
+            // member. Source order also assigns host mapping ownership, so the
+            // same physical slots cannot be charged once by each endpoint.
+            const auto bindCapturedBoundaries = [&](DevicePlanConfig &cfg, size_t stage) {
+                if (!cfg.device.is_gpu() || cfg.shard_index != 0) return;
+                const auto cross_backend = [&](size_t peer) {
+                    const auto device = pp_devices[peer].toLocalDeviceId();
+                    return device.is_gpu() && device.type != cfg.device.type;
+                };
+                if (stage && cross_backend(stage - 1))
+                    cfg.captured_pipeline_boundaries.push_back(PipelineBoundarySide::LaterDomain);
+                if (stage + 1 < pp_devices.size() && cross_backend(stage + 1))
+                {
+                    cfg.captured_pipeline_boundaries.push_back(PipelineBoundarySide::EarlierDomain);
+                    if (!cfg.associated_host_memory)
+                    {
+                        const auto host = inventoryForDevice(DeviceId::cpu());
+                        cfg.associated_host_memory = PhysicalMemoryResource{
+                            .world_rank = request.plan.rank, .device = DeviceId::cpu(),
+                            .total_bytes = host.total_bytes,
+                            .admission_available_bytes = PhysicalMemoryAuthority::admissionCapacity(
+                                host.free_bytes, request.max_cpu_memory_bytes)};
+                    }
+                }
+            };
+
             for (size_t stage = 0; stage < pp_devices.size(); ++stage)
             {
                 int stage_first = boundaries[stage];
@@ -252,6 +278,7 @@ namespace llaminar2
                         cfg.last_layer = stage_last;
                         cfg.owns_embedding =
                             request.plan.has_embedding && stage_first == 0;
+                        bindCapturedBoundaries(cfg, stage);
                         device_configs.push_back(cfg);
                     }
                 }
@@ -267,6 +294,7 @@ namespace llaminar2
                     if (native_pipeline)
                         cfg.local_pipeline_backend = cfg.device.is_cuda()
                             ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+                    bindCapturedBoundaries(cfg, stage);
                     device_configs.push_back(cfg);
                 }
             }

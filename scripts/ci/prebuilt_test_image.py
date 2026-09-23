@@ -3,7 +3,7 @@
 
 An installed test-runner image cannot incrementally rebuild: compiler-only
 objects are deliberately absent. This receipt changes only build preparation,
-not test execution. Every Unit and ProductionParityPreflight test still runs.
+not test execution. Every Unit and ProductionTestPreflight test still runs.
 The outer CI driver pins the immutable image ID and never overlays build/source
 files, while this receipt checks its installed CTest and executable inventory.
 """
@@ -16,9 +16,9 @@ import subprocess
 
 from production_artifacts import digest, write_json
 from run_production_parity_campaigns import (
-    PRODUCTION_CAMPAIGN_NAME, PRODUCTION_PARITY_PREFLIGHT_LABEL,
+    PRODUCTION_CAMPAIGN_NAME, PRODUCTION_TEST_PREFLIGHT_LABEL,
     PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX,
-    discover_production_parity_preflight_tests,
+    discover_production_test_preflight_tests,
     discover_production_parity_unit_tests,
     _as_string_list, _property_map,
 )
@@ -41,7 +41,7 @@ def inventory(build: Path) -> dict:
         labels = _as_string_list(_property_map(test).get("LABELS", []))
         required = (name.startswith(PRODUCTION_PARITY_UNIT_PREFIX)
                     or PRODUCTION_PARITY_UNIT_LABEL in labels
-                    or PRODUCTION_PARITY_PREFLIGHT_LABEL in labels
+                    or PRODUCTION_TEST_PREFLIGHT_LABEL in labels
                     or PRODUCTION_CAMPAIGN_NAME.search(name))
         if not required:
             continue
@@ -77,7 +77,7 @@ def seal(path: Path, build: Path) -> None:
     an image whose tests run manually may still be inadmissible to production.
     """
     discover_production_parity_unit_tests(build)
-    discover_production_parity_preflight_tests(build)
+    discover_production_test_preflight_tests(build)
     write_json(path, {"schema": 1, "inventory": inventory(build)})
 
 

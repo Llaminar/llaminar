@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
@@ -33,6 +34,23 @@ namespace llaminar2
         };
         using Pool = std::vector<Endpoint>;
 
+        /**
+         * @brief Apply cardinality to disjoint physical pools before compiling candidates.
+         * @param policy Validated public automatic filters.
+         * @param strategy Complete candidate family, not an individual domain's role.
+         * @param pools Disjoint pools; repeated discovery visibility is already deduplicated.
+         * @return Whether this membership satisfies every hard compute constraint.
+         */
+        bool permitsPools(const AutomaticOrchestrationRequest &policy,
+                          OrchestrationStrategy strategy, const std::vector<Pool> &pools)
+        {
+            std::vector<DeviceType> backends;
+            for (const auto &pool : pools)
+                for (const auto &endpoint : pool)
+                    backends.push_back(endpoint.address.device_type);
+            return policy.allows(strategy, backends);
+        }
+
         /** @return Whether two domains would execute on any same physical endpoint. */
         bool overlaps(const Pool &left, const Pool &right)
         {
@@ -41,6 +59,29 @@ namespace llaminar2
                     return a.node == b.node && a.physical_identity == b.physical_identity;
                 });
             });
+        }
+
+        /**
+         * @brief Require a real participant executor between distinct GPU tiers.
+         * @param domains Continuation pool followed by the expert-only pool.
+         * @return Whether the existing graph lowering can execute both pools.
+         *
+         * Two different GPU tiers on one MPI rank are not a distributed
+         * overlay: the continuation graph would try to lower a foreign GPU's
+         * expert work into its own device graph. Visibility of both vendors
+         * from one process is not proof of an executable graph boundary.
+         * Different ranks provide the participant executor and sparse edge.
+         * CPU expert tiers have their own host execution path on the same rank.
+         */
+        bool hasExecutableOverlayBoundary(const std::vector<Pool> &domains)
+        {
+            if (domains.size() != 2 || domains[0].empty() || domains[1].empty())
+                throw std::invalid_argument("Automatic overlay boundary requires two nonempty domains");
+            if (domains[1].front().address.isCPU()) return true;
+            std::set<int> continuation_ranks;
+            for (const auto &endpoint : domains[0]) continuation_ranks.insert(endpoint.rank);
+            return std::any_of(domains[1].begin(), domains[1].end(),
+                [&](const Endpoint &endpoint) { return !continuation_ranks.contains(endpoint.rank); });
         }
 
         /**
@@ -256,7 +297,8 @@ namespace llaminar2
          * @return Existing normalized overlay config, ready for model-aware compilation.
          */
         OrchestrationConfig overlayConfig(const OrchestrationConfig &request,
-            const std::vector<Pool> &pools, const ExecutionRankMembership &membership)
+            const std::vector<Pool> &pools, const ExecutionRankMembership &membership,
+            std::optional<DenseParallelPolicy> dense_policy = std::nullopt)
         {
             auto config = explicitRequest(request);
             auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
@@ -265,7 +307,11 @@ namespace llaminar2
             overlay->residency_policy =
                 defaultRoutedExpertResidencyPolicy(
                     request.moe_rebalance.mode);
-            overlay->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Automatic;
+            overlay->continuation_dense_policy_intent = dense_policy
+                ? MoEContinuationDensePolicyIntent::Resolved
+                : MoEContinuationDensePolicyIntent::Automatic;
+            if (dense_policy)
+                overlay->continuation_domain_spec.setDensePolicy(*dense_policy);
             for (size_t index = 0; index < pools.size(); ++index)
             {
                 const auto name = "domain_" + std::to_string(index);
@@ -317,11 +363,29 @@ namespace llaminar2
             }
             visit(std::move(proposal));
         };
+        const auto publishOverlay = [&](OrchestrationStrategy strategy,
+                                        const std::vector<Pool> &domains,
+                                        ExecutionRankMembership membership) {
+            auto default_config = overlayConfig(request, domains, membership);
+            const auto default_policy = default_config.moe_routed_expert_plan
+                ->continuation_domain_spec.effectiveDensePolicy();
+            publish({strategy, membership, std::move(default_config)});
+            if (default_policy == DenseParallelPolicy::PrefillTensorParallelDecodeReplicated)
+            {
+                // Full decode replicas are faster only when their complete
+                // physical BOM fits. Admit all-phase TP independently so the
+                // planner can choose it when replicas crowd out migration or
+                // expert residency; neither policy is a hidden runtime fallback.
+                auto tp_config = overlayConfig(request, domains, membership,
+                    DenseParallelPolicy::TensorParallel);
+                publish({strategy, std::move(membership), std::move(tp_config)});
+            }
+        };
         const auto pools = endpointPools(inventory, *policy);
         for (const auto &pool : pools)
         {
             const auto strategy = pool.size() == 1 ? OrchestrationStrategy::SingleDevice : OrchestrationStrategy::TensorParallel;
-            if (!policy->allows(strategy)) continue;
+            if (!permitsPools(*policy, strategy, {pool})) continue;
             if (strategy == OrchestrationStrategy::TensorParallel &&
                 !preservesGDNHeadOwnership(model.memoryProfile(), pool)) continue;
             auto membership = membershipFor({pool}, inventory);
@@ -345,9 +409,10 @@ namespace llaminar2
                      * tier. This lets the physical memory authority account
                      * phase-specific dense replicas instead of discovering
                      * them only after a simple-TP candidate was admitted. */
-                    config = overlayConfig(request, {pool}, membership);
+                    publishOverlay(strategy, {pool}, std::move(membership));
+                    continue;
                 }
-                else if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
+                if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
                 {
                     // A whole-model local TP proposal is not a one-stage
                     // pipeline. The shared compiler must be free to install
@@ -387,7 +452,7 @@ namespace llaminar2
             {
                 if (overlaps(first, second)) continue;
                 const std::vector<Pool> domains{first, second};
-                if (pipelines)
+                if (pipelines && permitsPools(*policy, OrchestrationStrategy::PipelineParallel, domains))
                 {
                     // Every legal split competes on complete BOM/cost evidence.
                     // Equal layer counts are not a proxy for equal physical bytes.
@@ -416,6 +481,10 @@ namespace llaminar2
                     if (std::any_of(cpu_pool.begin(), cpu_pool.end(), [&](const auto &cpu) { return cpu.node != continuation_node; }))
                         std::erase_if(cpu_pool, [&](const auto &cpu) { return cpu.node == continuation_node; });
                 }
+                // Apply counts after remote-only CPU projection. Counting the
+                // original pool would admit an idle local socket as remote work.
+                if (!permitsPools(*policy, OrchestrationStrategy::ExpertOverlay, overlay_domains)) continue;
+                if (!hasExecutableOverlayBoundary(overlay_domains)) continue;
                 // Removing the continuation node from a cluster CPU pool can
                 // produce a pool already visited as a node-only CPU choice.
                 // Publish that same topology once, not twice with different
@@ -430,8 +499,8 @@ namespace llaminar2
                 }
                 if (!emitted_overlays.insert(std::move(key)).second) continue;
                 auto membership = membershipFor(overlay_domains, inventory);
-                auto config = overlayConfig(request, overlay_domains, membership);
-                publish({OrchestrationStrategy::ExpertOverlay, std::move(membership), std::move(config)});
+                publishOverlay(OrchestrationStrategy::ExpertOverlay,
+                    overlay_domains, std::move(membership));
             }
     }
 }

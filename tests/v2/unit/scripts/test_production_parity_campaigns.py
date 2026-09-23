@@ -144,7 +144,7 @@ def preflight_ctest_document(*names: str) -> str:
                             "value": [
                                 "V2",
                                 "Integration",
-                                campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL,
+                                campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL,
                             ],
                         },
                         {"name": "TIMEOUT", "value": 30.0},
@@ -166,7 +166,7 @@ def preflight_registrations(
     return tuple(
         campaigns.PreflightRegistration(
             name=name,
-            labels=frozenset(("V2", "Integration", campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL)),
+            labels=frozenset(("V2", "Integration", campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL)),
             mpi_ranks=None,
             lane=lane,
         )
@@ -349,7 +349,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             stderr="",
         )
 
-        discovered = campaigns.discover_production_parity_preflight_tests(
+        discovered = campaigns.discover_production_test_preflight_tests(
             Path("build")
         )
 
@@ -363,7 +363,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--show-only=json-v1", command)
         self.assertIn(
-            f"^{campaigns.PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+            f"^{campaigns.PRODUCTION_TEST_PREFLIGHT_LABEL}$",
             command,
         )
 
@@ -383,7 +383,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "requires a fixture"):
-            campaigns.discover_production_parity_preflight_tests(Path("build"))
+            campaigns.discover_production_test_preflight_tests(Path("build"))
 
     def test_preflight_execution_plan_only_overlaps_single_rank_homogeneous_backends(self) -> None:
         """Mixed and multi-rank GPU tests retain exclusive package ownership."""
@@ -436,7 +436,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
         campaigns,
-        "discover_production_parity_preflight_registrations",
+        "discover_production_test_preflight_registrations",
         return_value=(
             campaigns.PreflightRegistration(
                 "V2_Integration_Host", frozenset(("Integration",)), 1,
@@ -471,7 +471,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns.PreflightExecutionLane.CUDA_SOCKET: 0,
             campaigns.PreflightExecutionLane.ROCM_SOCKET: 0,
         }
-        code, _, names = campaigns.run_production_parity_preflight(Path("build"), 60.0)
+        code, _, names = campaigns.run_production_test_preflight(Path("build"), 60.0)
         self.assertEqual(code, 0)
         self.assertEqual(names, (
             "V2_Unit_One", "V2_Integration_Host", "V2_Integration_CUDA",
@@ -494,7 +494,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
         campaigns,
-        "discover_production_parity_preflight_registrations",
+        "discover_production_test_preflight_registrations",
         return_value=preflight_registrations("V2_Integration_ParityCellLifecycle_MPI1"),
     )
     @mock.patch.object(
@@ -508,7 +508,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         discover: mock.Mock,
         run_process: mock.Mock,
     ) -> None:
-        return_code, _, tests = campaigns.run_production_parity_preflight(
+        return_code, _, tests = campaigns.run_production_test_preflight(
             Path("build"), 60.0
         )
 
@@ -529,7 +529,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         unit_command = run_process.call_args_list[1].args[0]
         command = run_process.call_args_list[2].args[0]
         self.assertIn(campaigns.PRODUCTION_PARITY_UNIT_BUILD_TARGET, build_command)
-        self.assertIn("v2_production_parity_preflight_gate", build_command)
+        self.assertIn("v2_production_test_preflight_gate", build_command)
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
@@ -542,13 +542,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
             campaigns, "discover_production_parity_unit_tests",
             side_effect=[("V2_Unit_Old",), ("V2_Unit_New", "V2_Unit_Added")],
         ), mock.patch.object(
-            campaigns, "discover_production_parity_preflight_registrations",
+            campaigns, "discover_production_test_preflight_registrations",
             side_effect=[
                 preflight_registrations("V2_Integration_Old"),
                 preflight_registrations("V2_Integration_New"),
             ],
         ), mock.patch.object(campaigns, "_run_process", return_value=0):
-            return_code, _, tests = campaigns.run_production_parity_preflight(
+            return_code, _, tests = campaigns.run_production_test_preflight(
                 Path("build"), 60.0
             )
         self.assertEqual(return_code, 0)
@@ -558,7 +558,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
 
     @mock.patch.object(
         campaigns,
-        "discover_production_parity_preflight_tests",
+        "discover_production_test_preflight_tests",
         return_value=("V2_Integration_ParityCellLifecycle_MPI1",),
     )
     @mock.patch.object(
@@ -608,7 +608,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
             os.utime(report, ns=(2_000_000_000, 2_000_000_000))
 
             return_code, elapsed, tests = (
-                campaigns.reuse_unchanged_production_parity_preflight(
+                campaigns.reuse_unchanged_production_test_preflight(
                     build,
                     report,
                 )
@@ -638,7 +638,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 receipt = {**generation, "mode": mode}
                 report.write_text(json.dumps(receipt))
                 os.utime(report, ns=(4_000_000_000, 4_000_000_000))
-                self.assertEqual(campaigns.reuse_unchanged_production_parity_preflight(build, report), (0, 0.0, tests))
+                self.assertEqual(campaigns.reuse_unchanged_production_test_preflight(build, report), (0, 0.0, tests))
                 for mutation in ({"preflight_completed_ns": None}, {"preflight_completed_ns": 5_000_000_000},
                                  {"preflight_build_directory": str(root)}, {"preflight_test_count": 1},
                                  {"preflight_tests": list(reversed(tests))},
@@ -646,7 +646,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     report.write_text(json.dumps({**receipt, **mutation}))
                     os.utime(report, ns=(4_000_000_000, 4_000_000_000))
                     with self.subTest(mode=mode, mutation=mutation), self.assertRaises(ValueError):
-                        campaigns.reuse_unchanged_production_parity_preflight(build, report)
+                        campaigns.reuse_unchanged_production_test_preflight(build, report)
             # A later model-progress report cannot hide a rebuild after the
             # actual gate, even though it is newer than the Ninja boundary.
             os.utime(
@@ -657,7 +657,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 report.write_text(json.dumps({**generation, "mode": mode}))
                 os.utime(report, ns=(4_000_000_000, 4_000_000_000))
                 with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "build or CTest"):
-                    campaigns.reuse_unchanged_production_parity_preflight(build, report)
+                    campaigns.reuse_unchanged_production_test_preflight(build, report)
 
     def test_standalone_gate_publishes_its_actual_result_without_a_model_run(self) -> None:
         """Every exit publishes its own result; a later failure cannot retain green."""
@@ -669,12 +669,12 @@ class ProductionParityCampaignTest(unittest.TestCase):
                     campaigns, "discover_production_parity_unit_tests", return_value=tests[:1]
                 ), mock.patch.object(
                     campaigns,
-                    "discover_production_parity_preflight_registrations",
+                    "discover_production_test_preflight_registrations",
                     return_value=preflight_registrations(*tests[1:]),
                 ), mock.patch.object(campaigns, "_run_process", side_effect=outcomes) as run, mock.patch.object(
                     campaigns.time, "time_ns", return_value=123456789
                 ):
-                    code, elapsed, inventory = campaigns.run_production_parity_preflight(
+                    code, elapsed, inventory = campaigns.run_production_test_preflight(
                         directory, None, artifact_directory=directory / "gate"
                     )
                     report = json.loads((directory / "gate/prerequisites.json").read_text())
@@ -694,7 +694,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
     def test_main_orders_preflight_before_model_fixture_and_staging(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         main = source[source.index("def main(") :]
-        preflight = main.index("run_production_parity_preflight(")
+        preflight = main.index("run_production_test_preflight(")
         fixture = main.index("prepare_model_fixture(")
         staging = main.index("stage_models_in_ramdisk(")
         self.assertLess(preflight, fixture)

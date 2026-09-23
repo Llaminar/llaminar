@@ -1964,6 +1964,112 @@ namespace llaminar2::test::parity
         return OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
     }
 
+    TEST(ModelParityDefinition, E2EAutomaticProjectionPreservesPoliciesWithoutAuthoredPlacement)
+    {
+        auto definitions = qwen38::qwen38DenseMultiDeviceDefinitions();
+        definitions.push_back(qwen36::qwen36MoECPU2NodeTPParityDefinition());
+        for (const auto address : {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+            definitions.push_back(qwen38::qwen38DenseParityDefinition(
+                qwen36::qwen36SingleDeviceTopology("single", address), "/references"));
+        int tags = 0;
+        for (const auto &definition : definitions)
+            for (const auto &cell : expandModelParityDefinition(definition))
+            {
+                if (!cell.e2e_certification) continue;
+                ++tags;
+                std::ostringstream output;
+                PrintTo(cell, &output);
+                const auto record = nlohmann::json::parse(output.str());
+                const auto &profile = record.at("e2e");
+                auto arguments = profile.at("server_args").get<std::vector<std::string>>();
+                EXPECT_EQ(profile.at("planning").at("mode"), "auto");
+                EXPECT_EQ(profile.at("planning").at("mpi_ranks"),
+                          cell.topology.mpi_ranks);
+                EXPECT_EQ(profile.at("tool_calling"), "required");
+                EXPECT_EQ(profile.at("planning").at("device_counts"), modelParityAutomaticDeviceCounts(cell));
+                if (cell.topology.mpi_ranks > 1)
+                {
+                    const auto rank_flag = std::find(arguments.begin(), arguments.end(),
+                                                     "--mpi-procs");
+                    ASSERT_NE(rank_flag, arguments.end());
+                    ASSERT_NE(std::next(rank_flag), arguments.end());
+                    EXPECT_EQ(*std::next(rank_flag),
+                              std::to_string(cell.topology.mpi_ranks));
+                }
+                if (cell.topology.kind == ModelParityTopologyKind::RankLocalPipelineParallel)
+                {
+                    const auto &domains = profile.at("planning").at("pipeline_domains");
+                    ASSERT_EQ(domains.size(), cell.topology.pipeline_stage_sizes.size());
+                    EXPECT_EQ(profile.at("planning").at("pipeline_layers"), cell.model.transformer_layers);
+                    size_t participant = 0;
+                    for (size_t stage = 0; stage < domains.size(); ++stage)
+                    {
+                        const auto &address = cell.topology.participants.at(participant).address;
+                        EXPECT_EQ(domains[stage].at("backend"), address.isCUDA() ? "cuda" : "rocm");
+                        EXPECT_EQ(domains[stage].at("devices"), cell.topology.pipeline_stage_sizes[stage]);
+                        participant += cell.topology.pipeline_stage_sizes[stage];
+                    }
+                }
+                else EXPECT_FALSE(profile.at("planning").contains("pipeline_domains"));
+                arguments.insert(arguments.begin(), "llaminar2");
+                std::vector<char *> argv;
+                for (auto &arg : arguments) argv.push_back(arg.data());
+                const auto config = OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
+                const auto intent = resolveOrchestrationIntent(config);
+                ASSERT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(intent));
+                const auto &policy = std::get<AutomaticOrchestrationRequest>(intent);
+                std::vector<DeviceType> devices;
+                for (const auto &participant : cell.topology.participants) devices.push_back(participant.address.device_type);
+                EXPECT_TRUE(policy.allows(modelParityAutomaticStrategy(cell), devices));
+                devices.pop_back();
+                EXPECT_FALSE(policy.allows(modelParityAutomaticStrategy(cell), devices));
+                EXPECT_FALSE(config.device_for_this_rank);
+                EXPECT_TRUE(config.tp_devices.empty());
+                EXPECT_TRUE(config.device_map.empty());
+                EXPECT_TRUE(config.domain_definitions.empty());
+                EXPECT_TRUE(config.pp_stage_definitions.empty());
+                EXPECT_FALSE(config.moe_routed_expert_plan);
+                EXPECT_TRUE(config.mtp.enabled);
+                EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+                EXPECT_TRUE(config.prefix_cache.enabled);
+                EXPECT_EQ(config.moe_rebalance.mode,
+                    cell.makeOrchestrationConfig(cell.model.model_path, 0).moe_rebalance.mode);
+                EXPECT_EQ(config.activation_precision, "fp32");
+                EXPECT_EQ(config.kv_cache_precision, "fp16");
+                // Exact-token regression stays on its original fixed topology;
+                // changing HTTP admission must not silently rebaseline controls.
+                EXPECT_EQ(record.at("runtime").at("server_args"), modelParityServerArguments(cell));
+            }
+        EXPECT_EQ(tags, 8);
+    }
+
+    TEST(ModelParityDefinition, DenseQwen38MultiDeviceMatrixHasFiveDistinctE2ETopologies)
+    {
+        const auto definitions = qwen38::qwen38DenseMultiDeviceDefinitions();
+        ASSERT_EQ(definitions.size(), 5u);
+        std::set<std::string> names;
+        for (const auto &definition : definitions)
+        {
+            EXPECT_TRUE(names.insert(definition.topology.test_id).second);
+            const auto cases = expandModelParityDefinition(definition);
+            EXPECT_EQ(cases.size(), 6u);
+            EXPECT_EQ(std::count_if(cases.begin(), cases.end(), [](const auto &cell) {
+                return cell.e2e_certification.has_value();
+            }), 1);
+            for (const auto &cell : cases)
+                if (cell.e2e_certification) EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+        }
+        const auto mixed = expandModelParityDefinition(definitions.back()).front()
+            .makeOrchestrationConfig("/models/qwen.gguf", 0);
+        ASSERT_EQ(mixed.domain_definitions.size(), 2u);
+        EXPECT_EQ(mixed.domain_definitions[0].backend, CollectiveBackendType::NCCL);
+        EXPECT_EQ(mixed.domain_definitions[1].backend, CollectiveBackendType::RCCL);
+        for (const auto &domain : mixed.domain_definitions) EXPECT_EQ(domain.devices.size(), 2u);
+        auto malformed = definitions.back();
+        malformed.topology.pipeline_tensor_parallel_collectives.pop_back();
+        EXPECT_THROW(expandModelParityDefinition(malformed), std::invalid_argument);
+    }
+
     TEST(ModelParityDefinition, E2EThinkingModesAreTypedAndExportedWithoutFilenameInference)
     {
         auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();

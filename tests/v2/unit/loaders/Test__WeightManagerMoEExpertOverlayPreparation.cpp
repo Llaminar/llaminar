@@ -12,17 +12,22 @@
 
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include "execution/moe/MoEOverlayCpuPreparationGate.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "loaders/WeightManager.h"
 #include "mocks/MockModelLoader.h"
 #include "tensors/Tensors.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
+#include <future>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace llaminar2::test
@@ -683,6 +688,140 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
         EXPECT_EQ(up[expert] != nullptr, owned_by_participant) << "expert=" << expert;
         EXPECT_EQ(down[expert] != nullptr, owned_by_participant) << "expert=" << expert;
     }
+}
+
+/**
+ * @brief Select the exact frozen parent for two colocated CPU expert endpoints.
+ *
+ * The auto planner can place both NUMA endpoints on one MPI rank. Their
+ * bindings then have the same canonical name and generic CPU DeviceId, but
+ * disjoint logical expert slices. Selecting the first name/device match for
+ * both endpoints drops the upper-half experts during server startup.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     SelectsFrozenParentByColocatedCpuParticipantIdentity)
+{
+    constexpr size_t kModel = 64;
+    constexpr size_t kIntermediate = 32;
+    constexpr size_t kExperts = 4;
+    auto plan = singleLayerCpuColdPlan(kExperts);
+    plan->domains[0].scope = ExecutionDomainScope::RANK_LOCAL;
+    plan->domains[0].world_ranks.clear();
+    const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+
+    auto loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(loader, kModel, kIntermediate, kExperts);
+    WeightManager manager(*loader);
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{8123};
+    strategy.devices = {DeviceId::cpu()};
+    ModelWeightSetBuilder builder(strategy);
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        for (const auto &[name, role, rows, cols] : {
+                 std::tuple{"blk.0.ffn_gate_exps.weight", WeightRole::MoEExpertGate, kModel, kIntermediate},
+                 std::tuple{"blk.0.ffn_up_exps.weight", WeightRole::MoEExpertUp, kModel, kIntermediate},
+                 std::tuple{"blk.0.ffn_down_exps.weight", WeightRole::MoEExpertDown, kIntermediate, kModel},
+             })
+        {
+            WeightBinding binding;
+            binding.identity.canonical_name = name;
+            binding.identity.role = role;
+            binding.identity.derivation = WeightDerivationKind::ExpertSlice;
+            binding.identity.layer = 0;
+            binding.identity.overlay_domain = "cpu_cold";
+            binding.identity.overlay_participant_index = participant;
+            binding.identity.overlay_participant_world_rank = 0;
+            binding.residency.home_device = DeviceId::cpu();
+            binding.residency.resident_device = DeviceId::cpu();
+            binding.slice.expert_start = static_cast<size_t>(participant) * 2u;
+            binding.slice.expert_count = 2u;
+            binding.slice.expert_ids = {participant * 2, participant * 2 + 1};
+            binding.tensor_owner = createQ4_0WithData(
+                {rows, cols, 2u},
+                static_cast<uint32_t>(101 + participant * 3 +
+                                      (role == WeightRole::MoEExpertUp ? 1 :
+                                       role == WeightRole::MoEExpertDown ? 2 : 0)));
+            binding.tensor = binding.tensor_owner.get();
+            builder.addBinding(std::move(binding));
+        }
+    }
+    FrozenModelWeightSet frozen(strategy, builder.freezeBindings());
+
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
+        *runtime_plan, DeviceId::cpu(), &frozen));
+    for (int participant = 0; participant < 2; ++participant)
+    {
+        for (int expert = participant * 2; expert < participant * 2 + 2; ++expert)
+        {
+            for (const auto role : {Role::GATE, Role::UP, Role::DOWN})
+            {
+                EXPECT_NE(
+                    manager.expertGemmRegistry().getEngineForParticipant(
+                        "cpu_cold", DeviceId::cpu(), 0, participant,
+                        0, expert, role),
+                    nullptr) << "participant=" << participant
+                             << " expert=" << expert;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Dependent graph construction joins only the CPU bank's startup edge.
+ */
+TEST(Test__MoEOverlayCpuPreparationGate,
+     WaitsForExactPublisherAndRejectsDuplicatePublication)
+{
+    auto gate = std::make_shared<MoEOverlayCpuPreparationGate>();
+    const auto publisher =
+        MoEOverlayCpuPreparationParticipation::publisher(gate);
+    const auto dependent =
+        MoEOverlayCpuPreparationParticipation::dependent(gate);
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    auto graph_builder = std::async(std::launch::async, [&]
+    {
+        entered.set_value();
+        dependent.afterLocalPreparation();
+        return true;
+    });
+    entered_future.wait();
+    EXPECT_EQ(graph_builder.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    publisher.afterLocalPreparation();
+    EXPECT_TRUE(graph_builder.get());
+    EXPECT_THROW(publisher.afterLocalPreparation(), std::logic_error);
+}
+
+/**
+ * @brief Producer failure releases dependents with the original setup error.
+ */
+TEST(Test__MoEOverlayCpuPreparationGate,
+     PropagatesProducerFailureWithoutASecondSetupPath)
+{
+    auto gate = std::make_shared<MoEOverlayCpuPreparationGate>();
+    const auto publisher =
+        MoEOverlayCpuPreparationParticipation::publisher(gate);
+    const auto dependent =
+        MoEOverlayCpuPreparationParticipation::dependent(gate);
+    publisher.publishFailureIfProducer("frozen CPU parent missing");
+    try
+    {
+        dependent.afterLocalPreparation();
+        FAIL() << "dependent graph ignored producer failure";
+    }
+    catch (const std::runtime_error &error)
+    {
+        EXPECT_NE(std::string(error.what()).find("frozen CPU parent missing"),
+                  std::string::npos);
+    }
+    EXPECT_THROW(publisher.afterLocalPreparation(), std::logic_error);
+    EXPECT_THROW(
+        MoEOverlayCpuPreparationParticipation::dependent(nullptr),
+        std::invalid_argument);
 }
 
 /**

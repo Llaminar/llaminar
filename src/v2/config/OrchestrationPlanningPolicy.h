@@ -100,6 +100,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Exact physical compute-endpoint count for one backend in an auto plan.
+     *
+     * This restricts cardinality, not device identities, rank ownership, layer
+     * boundaries or tier roles. CPU endpoints are observed NUMA participants,
+     * not control processes or worker threads. The request validates positivity
+     * and uniqueness before any inventory search or allocation.
+     */
+    struct AutomaticBackendDeviceCount
+    {
+        DeviceType backend;
+        int count;
+        bool operator==(const AutomaticBackendDeviceCount &) const = default;
+    };
+
+    /**
      * @brief Unresolved CLI/YAML options, validated once at the admission boundary.
      *
      * An omitted set permits all installed choices; an explicitly empty set is
@@ -114,6 +129,8 @@ namespace llaminar2
         std::optional<OrchestrationStrategy> prefer_strategy;
         std::optional<AutomaticHostParticipation> host_participation;
         std::optional<OrchestrationPlanningWorkload> workload;
+        /** Unlisted backends remain governed by only_backends, not implicitly excluded. */
+        std::optional<std::vector<AutomaticBackendDeviceCount>> device_counts;
 
         /** @return Whether any hard constraint or soft hint was explicitly supplied. */
         [[nodiscard]] bool specified() const noexcept;
@@ -137,8 +154,9 @@ namespace llaminar2
         /**
          * @brief Apply hard filters to every compute participant in a candidate.
          * @param strategy Candidate execution strategy.
-         * @param participants Compute backends only; excludes host control/BOM owners.
-         * @return False for empty membership or any forbidden backend/strategy.
+         * @param participants One entry per distinct physical compute endpoint;
+         *        excludes host control/BOM owners and repeated rank visibility.
+         * @return False for empty membership, forbidden choices or unmet counts.
          */
         [[nodiscard]] bool allows(
             OrchestrationStrategy strategy, std::span<const DeviceType> participants) const noexcept;
@@ -168,6 +186,8 @@ namespace llaminar2
     std::vector<DeviceType> parseOrchestrationBackendList(std::string_view value);
     /** @return Nonempty, duplicate-free comma-separated hard strategy restriction. */
     std::vector<OrchestrationStrategy> parseOrchestrationStrategyList(std::string_view value);
+    /** @return Exact positive backend=count pairs; duplicate backends are errors. */
+    std::vector<AutomaticBackendDeviceCount> parseAutomaticDeviceCounts(std::string_view value);
     /**
      * @brief Resolve search versus apply once from explicit configuration intent.
      * @param config Shared runtime configuration after CLI/YAML merge.

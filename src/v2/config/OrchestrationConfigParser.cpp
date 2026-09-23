@@ -120,6 +120,7 @@ namespace llaminar2
             if (key == "mode") config.planning_mode = parsePlanningMode(value);
             else if (key == "only_backends") config.automatic_planning.only_backends = parseOrchestrationBackendList(value);
             else if (key == "only_strategies") config.automatic_planning.only_strategies = parseOrchestrationStrategyList(value);
+            else if (key == "device_counts") config.automatic_planning.device_counts = parseAutomaticDeviceCounts(value);
             else if (key == "hosts") config.automatic_planning.host_participation = parseAutomaticHostParticipation(value);
             else if (key == "workload") config.automatic_planning.workload = parseOrchestrationPlanningWorkload(value);
             else if (key == "prefer_backend") config.automatic_planning.prefer_backend = parseOrchestrationComputeBackend(value);
@@ -1261,6 +1262,15 @@ namespace llaminar2
             .description = "Hard execution-strategy restriction for auto (comma-separated)",
             .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
                 c.automatic_planning.only_strategies = parseOrchestrationStrategyList(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--auto-device-counts",
+            .category = "Automatic Planning",
+            .value_label = "<backend=count,...>",
+            .description = "Require exact physical compute-device counts in auto selection (e.g. cuda=2,cpu=2); identities and placement remain automatic",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.device_counts = parseAutomaticDeviceCounts(v);
             }),
         });
         spec.add({

@@ -1,8 +1,12 @@
 /**
  * @file DeviceWorkspaceManager.cpp
- * @brief Per-device workspace buffer management implementation
+ * @brief Stable named workspaces with canonical physical-allocation ownership.
  *
- * (Formerly GpuWorkspaceManager.cpp)
+ * Names and serial-family layouts belong to the manager. Each backend block
+ * and its original PMA claim belong to one shared physical owner, retained by
+ * any captured buffer leases. Dropping names cannot free captured bytes, and
+ * a live retained region prevents whole-block semantic reuse. No live state
+ * is copied to another mailbox and no allocation enters graph replay.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -26,6 +30,58 @@
 
 namespace llaminar2
 {
+    namespace detail
+    {
+        /** @brief Sole physical owner of a workspace block and its accounting claim. */
+        struct WorkspaceAllocation final
+        {
+            /** @brief Adopt the existing claim before allocating the backend block.
+             * A failed native allocation leaves a null owner whose destruction
+             * rolls back the claim. No second live ledger is maintained here. */
+            WorkspaceAllocation(DeviceId device, IBackend *backend, size_t bytes,
+                size_t buffer_count, PhysicalMemoryAllocationLease claim)
+                : claim(std::move(claim)), device(device), backend(backend),
+                  bytes(bytes), buffer_count(buffer_count),
+                  base(backend->allocate(bytes, device.is_cpu() ? 0 : device.ordinal)) {}
+            WorkspaceAllocation(const WorkspaceAllocation &) = delete;
+            WorkspaceAllocation &operator=(const WorkspaceAllocation &) = delete;
+
+            /** @brief Free actual bytes before returning their canonical capacity.
+             * The graph owner joins submitted work before retiring its leases;
+             * this destructor adds neither a stream wait nor a synchronization. */
+            ~WorkspaceAllocation()
+            {
+                if (!base) return;
+                backend->free(base, device.is_cpu() ? 0 : device.ordinal);
+                PerfStatsCollector::addCounter("memory", "workspace_release_bytes",
+                    static_cast<double>(bytes), "release", device.to_string(),
+                    {{"buffer_count", std::to_string(buffer_count)},
+                     {"bytes", std::to_string(bytes)}});
+                // claim is the last field retired, after the physical free.
+            }
+            PhysicalMemoryAllocationLease claim;
+            const DeviceId device;
+            IBackend *const backend;
+            const size_t bytes;
+            const size_t buffer_count;
+            void *const base;
+        };
+    }
+
+    WorkspaceBufferLease::WorkspaceBufferLease(
+        std::shared_ptr<detail::WorkspaceAllocation> allocation, size_t offset, size_t bytes)
+        : allocation_(std::move(allocation)), offset_(offset), bytes_(bytes) {}
+    WorkspaceBufferLease::~WorkspaceBufferLease() = default;
+    DeviceId WorkspaceBufferLease::device() const noexcept { return allocation_->device; }
+    IBackend *WorkspaceBufferLease::backend() const noexcept { return allocation_->backend; }
+    bool WorkspaceBufferLease::contains(size_t offset, size_t bytes) const noexcept
+    { return bytes > 0 && offset <= bytes_ && bytes <= bytes_ - offset; }
+    void *WorkspaceBufferLease::data(size_t offset) const
+    {
+        if (offset > bytes_) throw std::out_of_range("Workspace lease offset exceeds its named region");
+        return static_cast<unsigned char *>(allocation_->base) + offset_ + offset;
+    }
+
     namespace
     {
         std::atomic<uint64_t> g_next_workspace_manager_id{1};
@@ -664,6 +720,14 @@ namespace llaminar2
 
         try
         {
+            // A consumer retaining even one word still owns its captured
+            // meaning. Reject before clearing names/publications, so failure
+            // leaves the current graph family completely unchanged.
+            if (primary_allocation_ && primary_allocation_.use_count() != 1)
+            {
+                if (error) *error = "workspace primary block still has retained buffer leases";
+                return false;
+            }
             if (!extension_blocks_.empty())
             {
                 if (error)
@@ -1182,7 +1246,9 @@ namespace llaminar2
 
         // Allocate single contiguous block
         int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
-        block_ = backend->allocate(total_size, device_ordinal);
+        auto allocation = std::make_shared<detail::WorkspaceAllocation>(
+            device_, backend, total_size, placements.size(), std::move(allocation_lease));
+        block_ = allocation->base;
         if (!block_)
         {
             LOG_ERROR("[DeviceWorkspaceManager] Failed to allocate " << total_size
@@ -1209,7 +1275,6 @@ namespace llaminar2
                                                                               << " returned block " << block_
                                                                               << " not aligned to " << max_alignment
                                                                               << " bytes");
-                backend->free(block_, device_ordinal);
                 block_ = nullptr;
                 block_size_ = 0;
                 return false;
@@ -1248,7 +1313,6 @@ namespace llaminar2
                 LOG_ERROR("[DeviceWorkspaceManager] Workspace placement for '"
                           << buffer.name << "' exceeds the primary block on "
                           << device_.to_string());
-                backend->free(block_, device_ordinal);
                 block_ = nullptr;
                 block_size_ = 0;
                 buffers_.clear();
@@ -1274,7 +1338,6 @@ namespace llaminar2
                                                                             << " is not aligned to " << buffer.alignment
                                                                             << " bytes (ptr=" << buf_ptr
                                                                             << ", offset=" << placement.offset << ")");
-                    backend->free(block_, device_ordinal);
                     block_ = nullptr;
                     block_size_ = 0;
                     buffers_.clear();
@@ -1311,7 +1374,7 @@ namespace llaminar2
 
         used_bytes_ = total_size;
         allocated_ = true;
-        primary_block_lease_ = std::move(allocation_lease);
+        primary_allocation_ = std::move(allocation);
 
         LOG_TRACE("[DeviceWorkspaceManager] Allocated " << buffers_.size() << " buffers, "
                                                         << used_bytes_ << "/" << budget_bytes_ << " bytes used");
@@ -1350,8 +1413,9 @@ namespace llaminar2
             return false;
         }
 
-        const int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
-        void *extension_base = backend->allocate(total_size, device_ordinal);
+        auto allocation = std::make_shared<detail::WorkspaceAllocation>(
+            device_, backend, total_size, buffers.size(), std::move(allocation_lease));
+        void *extension_base = allocation->base;
         if (!extension_base)
         {
             LOG_ERROR("[DeviceWorkspaceManager] Failed to allocate append-only workspace extension of "
@@ -1369,7 +1433,6 @@ namespace llaminar2
             LOG_ERROR("[DeviceWorkspaceManager] Append-only workspace extension on "
                       << device_.to_string() << " is not aligned to "
                       << max_alignment << " bytes");
-            backend->free(extension_base, device_ordinal);
             return false;
         }
 
@@ -1387,7 +1450,6 @@ namespace llaminar2
                           << buffer->name << "' on " << device_.to_string()
                           << " is not aligned to " << buffer->alignment
                           << " bytes");
-                backend->free(extension_base, device_ordinal);
                 return false;
             }
 
@@ -1417,7 +1479,7 @@ namespace llaminar2
         extension_blocks_.push_back(ExtensionBlock{
             .base = extension_base,
             .size = total_size,
-            .allocation_lease = std::move(allocation_lease),
+            .allocation = std::move(allocation),
         });
         used_bytes_ += total_size;
         PerfStatsCollector::addCounter(
@@ -1446,55 +1508,13 @@ namespace llaminar2
             return;
         }
 
-        if (block_)
-        {
-            const size_t release_bytes = block_size_;
-            const size_t release_buffer_count = buffers_.size();
-            IBackend *backend = getBackendFor(device_);
-            if (!backend)
-            {
-                LOG_ERROR("[DeviceWorkspaceManager] Lost backend while a primary workspace block remained live on "
-                          << device_.to_string());
-                std::terminate();
-            }
-            int device_ordinal = device_.is_cpu() ? 0 : device_.ordinal;
-            backend->free(block_, device_ordinal);
-            block_ = nullptr;
-            block_size_ = 0;
-            primary_block_lease_ = {};
-            LOG_DEBUG("[DeviceWorkspaceManager] Released " << release_bytes
-                                                           << " bytes on device " << device_.to_string());
-            PerfStatsCollector::addCounter(
-                "memory",
-                "workspace_release_bytes",
-                static_cast<double>(release_bytes),
-                "release",
-                device_.to_string(),
-                {{"buffer_count", std::to_string(release_buffer_count)},
-                 {"bytes", std::to_string(release_bytes)}});
-        }
-        if (!extension_blocks_.empty())
-        {
-            IBackend *backend = getBackendFor(device_);
-            if (!backend)
-            {
-                LOG_ERROR("[DeviceWorkspaceManager] Lost backend while append-only workspace blocks remained live on "
-                          << device_.to_string());
-                std::terminate();
-            }
-            const int device_ordinal =
-                device_.is_cpu() ? 0 : device_.ordinal;
-            for (const ExtensionBlock &extension : extension_blocks_)
-            {
-                if (extension.base)
-                    backend->free(extension.base, device_ordinal);
-            }
-            // Clearing happens only after every physical free; each block's
-            // accounting lease is the final field destroyed by this edge.
-            extension_blocks_.clear();
-        }
-
+        // Drop names before physical owners. A captured region keeps exactly
+        // its old block and claim, not this manager or a future name map.
         buffers_.clear();
+        block_ = nullptr;
+        block_size_ = 0;
+        primary_allocation_.reset();
+        extension_blocks_.clear();
         used_bytes_ = 0;
         allocated_ = false;
         reusable_primary_block_ = false;
@@ -1503,6 +1523,29 @@ namespace llaminar2
     // =========================================================================
     // Buffer Access
     // =========================================================================
+
+    std::shared_ptr<const WorkspaceBufferLease> DeviceWorkspaceManager::retainBuffer(
+        const std::string &name, size_t offset, size_t bytes) const
+    {
+        const auto found = buffers_.find(name);
+        if (found == buffers_.end() || !bytes)
+            throw std::invalid_argument("Workspace lease requires an existing name and positive extent");
+        const auto &region = found->second;
+        if (offset > region.size || bytes > region.size - offset)
+            throw std::out_of_range("Workspace lease exceeds named buffer '" + name + "'");
+        auto allocation = primary_allocation_;
+        if (!allocation || allocation->base != region.base)
+        {
+            allocation.reset();
+            for (const auto &extension : extension_blocks_)
+                if (extension.base == region.base) { allocation = extension.allocation; break; }
+        }
+        if (!allocation || region.offset > allocation->bytes ||
+            region.size > allocation->bytes - region.offset)
+            throw std::logic_error("Named workspace buffer lost its physical allocation owner");
+        return std::shared_ptr<const WorkspaceBufferLease>(
+            new WorkspaceBufferLease(std::move(allocation), region.offset + offset, bytes));
+    }
 
     void *DeviceWorkspaceManager::getBuffer(const std::string &name) const
     {

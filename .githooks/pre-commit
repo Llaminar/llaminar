@@ -21,14 +21,14 @@ cmake -B "$BUILD_DIR" -S "$REPO_ROOT/src/v2" -G Ninja \
 
 echo '[pre-commit] Building only Unit and production-preflight dependencies...'
 cmake --build "$BUILD_DIR" --parallel \
-    --target v2_unit_gate v2_production_parity_preflight_gate
+    --target v2_unit_gate v2_production_test_preflight_gate
 
 echo '[pre-commit] [1/2] Running the full Unit suite...'
 ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
     --no-tests=error -R '^V2_Unit_'
 
-echo '[pre-commit] [2/2] Running the full ProductionParityPreflight suite...'
+echo '[pre-commit] [2/2] Running the full ProductionTestPreflight suite...'
 ctest --test-dir "$BUILD_DIR" --output-on-failure --parallel \
-    --no-tests=error -L '^ProductionParityPreflight$'
+    --no-tests=error -L '^ProductionTestPreflight$'
 
-echo '[pre-commit] Unit and ProductionParityPreflight passed.'
+echo '[pre-commit] Unit and ProductionTestPreflight passed.'

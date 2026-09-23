@@ -2,8 +2,10 @@
  * @file NUMAAllocator.cpp
  * @brief NUMA-aware memory allocation implementation
  *
- * Uses an exact CPU-affinity scope, page revocation, first touch, and placement
- * certification so requested NUMA placement either succeeds or fails closed.
+ * Uses an exact thread-placement scope, page revocation, first touch, and
+ * placement certification so requested NUMA placement either succeeds or fails
+ * closed. Binding the memory policy during the fault prevents Linux from
+ * choosing a remote free node instead of reclaiming local file cache.
  * Batched page-table observations are resolved through a fault-capable lookup
  * when Linux reports a migration/non-present entry; unknown placement is never
  * treated as the requested node. Certification does not move application bytes.
@@ -25,6 +27,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <numa.h>
 #include <numaif.h>
@@ -59,29 +62,46 @@ namespace llaminar2
         }
 
         /**
-         * @brief Restore the calling thread's exact affinity after first touch.
+         * @brief Own exact CPU affinity and memory policy during first touch.
          *
-         * Acquisition may temporarily broaden a launcher's rank-local mask to
-         * other CPUs on the requested node; the kernel still intersects it with
-         * the process's cgroup/cpuset constraints. Destruction restores the
-         * exact incoming mask and retries if an explicit restore reported an
-         * error.
+         * CPU affinity alone does not guarantee locality: with local file cache
+         * and zone_reclaim_mode=0, Linux may fault onto a remote free node. A
+         * temporary MPOL_BIND constrains the fault to the target node, while
+         * the page write remains the actual placement operation. Both original
+         * thread settings are restored before certification or on scope exit.
          */
-        class ScopedThreadNodeAffinity final
+        class ScopedThreadNodePlacement final
         {
         public:
             /**
-             * @brief Bind the calling thread to permitted CPUs on one NUMA node.
+             * @brief Bind CPU execution and page faults to one NUMA node.
              * @param numa_node Exact target node.
-             * @return Armed scope, or `std::nullopt` without changing affinity.
+             * @return Armed scope, or `std::nullopt` after restoration on failure.
              */
-            static std::optional<ScopedThreadNodeAffinity> acquire(
+            static std::optional<ScopedThreadNodePlacement> acquire(
                 int numa_node)
             {
                 cpu_set_t original{};
                 if (sched_getaffinity(0, sizeof(original), &original) != 0)
                 {
                     LOG_ERROR("NUMAAllocator: sched_getaffinity failed before first touch: "
+                              << std::strerror(errno));
+                    return std::nullopt;
+                }
+
+                constexpr unsigned long word_bits =
+                    std::numeric_limits<unsigned long>::digits;
+                const unsigned long max_nodes = std::max(
+                    word_bits,
+                    static_cast<unsigned long>(
+                        std::max(numa_max_node(), numa_node) + 1));
+                std::vector<unsigned long> original_nodes(
+                    (max_nodes + word_bits - 1) / word_bits, 0);
+                int original_mode = MPOL_DEFAULT;
+                if (get_mempolicy(&original_mode, original_nodes.data(),
+                                  max_nodes, nullptr, 0) != 0)
+                {
+                    LOG_ERROR("NUMAAllocator: Could not observe first-touch thread memory policy: "
                               << std::strerror(errno));
                     return std::nullopt;
                 }
@@ -127,59 +147,93 @@ namespace llaminar2
                               << numa_node << ": " << std::strerror(errno));
                     return std::nullopt;
                 }
-                return ScopedThreadNodeAffinity(original);
+                std::vector<unsigned long> target_nodes(original_nodes.size(), 0);
+                target_nodes[static_cast<size_t>(numa_node) / word_bits] |=
+                    1ul << (static_cast<unsigned long>(numa_node) % word_bits);
+                if (set_mempolicy(MPOL_BIND, target_nodes.data(), max_nodes) != 0)
+                {
+                    LOG_ERROR("NUMAAllocator: Could not bind first-touch memory policy to NUMA node "
+                              << numa_node << ": " << std::strerror(errno));
+                    if (sched_setaffinity(0, sizeof(original), &original) != 0)
+                        LOG_ERROR("NUMAAllocator: Failed to restore affinity after memory-policy rejection: "
+                                  << std::strerror(errno));
+                    return std::nullopt;
+                }
+                return ScopedThreadNodePlacement(
+                    original, original_mode, std::move(original_nodes), max_nodes);
             }
 
-            ScopedThreadNodeAffinity(
-                const ScopedThreadNodeAffinity &) = delete;
-            ScopedThreadNodeAffinity &operator=(
-                const ScopedThreadNodeAffinity &) = delete;
+            ScopedThreadNodePlacement(
+                const ScopedThreadNodePlacement &) = delete;
+            ScopedThreadNodePlacement &operator=(
+                const ScopedThreadNodePlacement &) = delete;
 
             /** @brief Transfer restoration ownership into another scope. */
-            ScopedThreadNodeAffinity(
-                ScopedThreadNodeAffinity &&other) noexcept
-                : original_(other.original_),
+            ScopedThreadNodePlacement(
+                ScopedThreadNodePlacement &&other) noexcept
+                : original_affinity_(other.original_affinity_),
+                  original_mode_(other.original_mode_),
+                  original_nodes_(std::move(other.original_nodes_)),
+                  max_nodes_(other.max_nodes_),
                   armed_(std::exchange(other.armed_, false))
             {
             }
 
-            /** @brief Restore affinity if the owner has not done so explicitly. */
-            ~ScopedThreadNodeAffinity()
+            /** @brief Restore both incoming thread settings on scope exit. */
+            ~ScopedThreadNodePlacement()
             {
-                if (armed_ &&
-                    sched_setaffinity(0, sizeof(original_), &original_) != 0)
-                {
-                    LOG_ERROR("NUMAAllocator: Failed to restore first-touch thread affinity: "
-                              << std::strerror(errno));
-                }
+                (void)restore();
             }
 
             /**
-             * @brief Restore the incoming affinity now.
+             * @brief Restore the incoming memory policy and CPU affinity now.
              * @return `true` when restored or already disarmed.
              */
             bool restore() noexcept
             {
                 if (!armed_)
                     return true;
-                if (sched_setaffinity(0, sizeof(original_), &original_) != 0)
+                const bool has_nodes = std::any_of(
+                    original_nodes_.begin(), original_nodes_.end(),
+                    [](unsigned long word) { return word != 0; });
+                const bool policy_restored =
+                    set_mempolicy(
+                        original_mode_,
+                        has_nodes ? original_nodes_.data() : nullptr,
+                        has_nodes ? max_nodes_ : 0) == 0;
+                if (!policy_restored)
+                    LOG_ERROR("NUMAAllocator: Failed to restore first-touch thread memory policy: "
+                              << std::strerror(errno));
+                const bool affinity_restored =
+                    sched_setaffinity(0, sizeof(original_affinity_),
+                                      &original_affinity_) == 0;
+                if (!affinity_restored)
                 {
                     LOG_ERROR("NUMAAllocator: Failed to restore first-touch thread affinity: "
                               << std::strerror(errno));
-                    return false;
                 }
-                armed_ = false;
-                return true;
+                armed_ = !(policy_restored && affinity_restored);
+                return !armed_;
             }
 
         private:
-            /** @brief Arm a scope with the exact incoming affinity mask. */
-            explicit ScopedThreadNodeAffinity(const cpu_set_t &original)
-                : original_(original)
+            /** @brief Arm a scope with the exact incoming thread settings. */
+            explicit ScopedThreadNodePlacement(
+                const cpu_set_t &original_affinity,
+                int original_mode,
+                std::vector<unsigned long> original_nodes,
+                unsigned long max_nodes)
+                : original_affinity_(original_affinity),
+                  original_mode_(original_mode),
+                  original_nodes_(std::move(original_nodes)),
+                  max_nodes_(max_nodes)
             {
             }
 
-            cpu_set_t original_{};
+            cpu_set_t original_affinity_{};
+            int original_mode_ = MPOL_DEFAULT;
+            std::vector<unsigned long> original_nodes_;
+            unsigned long max_nodes_ = 0;
             bool armed_ = true;
         };
     } // anonymous namespace
@@ -412,8 +466,8 @@ namespace llaminar2
             return false;
         }
 
-        auto affinity = ScopedThreadNodeAffinity::acquire(numa_node);
-        if (!affinity)
+        auto placement = ScopedThreadNodePlacement::acquire(numa_node);
+        if (!placement)
             return false;
 
         volatile auto *pages = static_cast<volatile uint8_t *>(ptr);
@@ -423,7 +477,7 @@ namespace llaminar2
             // subsequent transport overwrites the complete logical range.
             pages[offset] = 0;
         }
-        if (!affinity->restore())
+        if (!placement->restore())
             return false;
 
         constexpr size_t kCertificationBatchPages = 1024;

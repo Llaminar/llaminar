@@ -106,7 +106,7 @@ flowchart TD
 
 The new model-free `GPUPrefixCacheAccounting.NativeLayoutMatchesAdmittedSlab`
 regression is compiled into both existing `GPUGraphCaptureExecution`
-ProductionParityPreflight registrations. Before the fix it reproduces the
+ProductionTestPreflight registrations. Before the fix it reproduces the
 hybrid Q8 mismatch at all six tested head geometries on both GPUs in under one
 second per backend. Floating-point hybrid controls and attention-only controls
 do not exhibit it. The expanded sweep also covers attention-only TQ4/TQ8;

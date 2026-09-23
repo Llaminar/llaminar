@@ -2135,7 +2135,7 @@ Current evidence:
   the completed cost model, validate asymmetric request/reply composition,
   reject incomplete/duplicate/foreign membership evidence, and retain existing
   all-format preparation/AVX2 regressions. These integration cases remain in the
-  existing `ProductionParityPreflight` registrations.
+  existing `ProductionTestPreflight` registrations.
 
 All build/test processes are terminal. The shared startup still installs
 `startupTopologyEvaluator`; this is **not** the completed measured auto-selector.
@@ -2259,7 +2259,7 @@ tests, including all 23 native source formats on CPU/CUDA/ROCm cost coordinates,
 ordinary and expert families, grouping, replication, endpoint aliases, missing
 formats and independent memory limits. CPU/two-rank, CPU/three-rank, CUDA and
 ROCm service-preparation integration cases are in the existing
-`ProductionParityPreflight` filters. The final r4 combined gate passed all five
+`ProductionTestPreflight` filters. The final r4 combined gate passed all five
 CTest groups in 18.50 seconds; evidence is
 `/tmp/planning-weight-service-focused-20260916-r4.xml`. An additional
 `LLAMINAR_ISA_LEVEL=avx2` two-rank CPU run passed in 2.27 seconds
@@ -2532,7 +2532,7 @@ flowchart LR
 The native probe's tests exercise both transport precisions, odd payload tails,
 reversed device order, repeated communicator/capture construction, and
 asymmetric exhaustion of workspace, native-graph and collective allocations.
-Its two functional groups are in `ProductionParityPreflight`, using the existing
+Its two functional groups are in `ProductionTestPreflight`, using the existing
 measurement executable. They contain no performance threshold. Each launch
 uses both available CUDA GPUs or all four available ROCm GPUs on this host;
 the implementation and tests derive degree from their supplied/visible devices.
@@ -2604,7 +2604,7 @@ nonzero-offset output-row shards with a 65-column tail, and block-aligned
 input-column shards. It repeats measurements against one immutable source,
 asserts allocation/reservation retirement, and exhausts prepared, workspace and
 native-graph admission separately. CPU uses one and three workers in both ISA
-lanes. The new functional tests join `ProductionParityPreflight`; no performance
+lanes. The new functional tests join `ProductionTestPreflight`; no performance
 threshold was added to that gate.
 
 - Combined focused build: `/tmp/planning-projection-build-20260916.log` (10 steps, exit 0).
@@ -3256,7 +3256,7 @@ Evidence so far:
   formats and all three captured phases. The CPU MPI cases additionally inject
   asymmetric admission errors, root-load failure, mismatched plans, then run
   20 successful publications with zero retained claims.
-- New GPU follower groups are registered in `ProductionParityPreflight`;
+- New GPU follower groups are registered in `ProductionTestPreflight`;
   two-/three-rank publication tests extend its existing MPI groups.
 - Logs: `/tmp/planning-distributed-sample-focused-20260915.log` and
   `/tmp/planning-distributed-sample-repeat20-20260915.log`. The full gate completed
@@ -3512,7 +3512,7 @@ The two- and three-rank integration groups each pass 20 successive batches,
 including reversed initiators, asymmetric packet sizes and uninvolved ranks.
 Asymmetric missing/invalid memory authority and occupied admission lines fail
 collectively and are followed by successful exchanges. Both groups join
-ProductionParityPreflight. All six focused groups passed in **3.35 seconds**:
+ProductionTestPreflight. All six focused groups passed in **3.35 seconds**:
 `/tmp/planning-mpi-cost-topology-final-focused-20260915.log`.
 This proves the local multi-rank implementation; no Azure VM was started and
 no new remote timing or container certificate is claimed. The complete native

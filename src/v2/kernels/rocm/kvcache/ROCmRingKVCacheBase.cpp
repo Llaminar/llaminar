@@ -106,7 +106,8 @@ namespace llaminar2
     ROCmRingKVCacheBase::ROCmRingKVCacheBase(
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, int kv_dim, int device_id)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
+        : n_layers_(n_layers), sequence_geometry_(n_layers),
+          batch_size_(batch_size), max_seq_len_(max_seq_len),
           n_kv_heads_(n_kv_heads), head_dim_(head_dim), kv_dim_(kv_dim),
           device_id_(device_id),
           append_count_sources_(static_cast<size_t>(std::max(0, n_layers)) *
@@ -154,12 +155,9 @@ namespace llaminar2
 
     void ROCmRingKVCacheBase::allocateDeviceParams()
     {
-        const int num_entries = n_layers_ * batch_size_;
-        if (num_entries == 0)
-        {
-            // All-GDN hybrid caches have no FA ring metadata to publish.
-            return;
-        }
+        // Recurrent-only slices still checkpoint one frontier per request;
+        // payload entry tables remain empty and no attention horizon is allocated.
+        const int num_entries = sequence_geometry_.rows() * batch_size_;
         if (!activateOwningDevice("device-parameter allocation"))
             return;
 
@@ -278,7 +276,7 @@ namespace llaminar2
         if (!hip_kv_sequence_state_truncate(
                 d_head_params_,
                 d_count_params_,
-                n_layers_,
+                sequence_geometry_.rows(),
                 batch_size_,
                 seq_idx,
                 cached_tokens,
@@ -371,7 +369,7 @@ namespace llaminar2
         }
 
         const size_t entry_count =
-            static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
+            static_cast<size_t>(sequence_geometry_.rows()) * static_cast<size_t>(batch_size_);
         const size_t metadata_bytes = entry_count * sizeof(int);
         auto stream = static_cast<hipStream_t>(context.execution_stream);
 
@@ -595,11 +593,53 @@ namespace llaminar2
         return &d_head_params_[idx];
     }
 
+    const int *ROCmRingKVCacheBase::deviceSequenceCachedTokenCountPtr(int seq_idx) const
+    {
+        return d_count_params_ && seq_idx >= 0 && seq_idx < batch_size_
+                   ? d_count_params_ + seq_idx : nullptr;
+    }
+
+    extern "C" void hip_kv_sequence_state_advance_dynamic(
+        int *head, int *count, const int *append_count,
+        int captured_rows, int max_seq_len, hipStream_t stream);
+
+    bool ROCmRingKVCacheBase::advanceSequenceOnlyState(
+        int request_count, const int32_t *rows_device,
+        int captured_rows, void *stream)
+    {
+        requireGPUExecutionStream(stream, "ROCmRingKVCacheBase::advanceSequenceOnlyState");
+        if (n_layers_ != 0 || request_count <= 0 || request_count > batch_size_ ||
+            captured_rows <= 0 || !d_head_params_ || !d_count_params_ ||
+            !activateOwningDevice("recurrent sequence advancement"))
+            return false;
+        // This is the same resident real-length kernel as an attention append.
+        // There is no payload copy, host count, allocation, or synchronization.
+        for (int request = 0; request < request_count; ++request)
+            hip_kv_sequence_state_advance_dynamic(
+                d_head_params_ + request, d_count_params_ + request,
+                rows_device ? rows_device + request : nullptr,
+                captured_rows, max_seq_len_, static_cast<hipStream_t>(stream));
+        return hipGetLastError() == hipSuccess;
+    }
+
+    bool ROCmRingKVCacheBase::importSequenceOnlyState(int seq_idx, int tokens, void *stream)
+    {
+        requireGPUExecutionStream(stream, "ROCmRingKVCacheBase::importSequenceOnlyState");
+        if (n_layers_ != 0 || seq_idx < 0 || seq_idx >= batch_size_ ||
+            tokens < 0 || tokens > max_seq_len_ || !d_head_params_ || !d_count_params_ ||
+            !activateOwningDevice("recurrent prefix frontier import"))
+            return false;
+        return hip_kv_sequence_state_set(
+            d_head_params_ + seq_idx, d_count_params_ + seq_idx,
+            tokens % max_seq_len_, tokens, max_seq_len_,
+            static_cast<hipStream_t>(stream));
+    }
+
     size_t ROCmRingKVCacheBase::deviceSequenceStateCheckpointBytes() const
     {
-        if (!d_head_params_ || !d_count_params_ || n_layers_ <= 0)
+        if (!d_head_params_ || !d_count_params_)
             return 0;
-        return sizeof(int32_t) * static_cast<size_t>(n_layers_) * 2u;
+        return sequence_geometry_.checkpointBytes();
     }
 
     bool ROCmRingKVCacheBase::captureDeviceSequenceStateCheckpoint(
@@ -635,7 +675,7 @@ namespace llaminar2
             d_head_params_,
             d_count_params_,
             static_cast<int *>(checkpoint_device),
-            n_layers_,
+            sequence_geometry_.rows(),
             batch_size_,
             seq_idx,
             static_cast<hipStream_t>(stream));
@@ -680,7 +720,7 @@ namespace llaminar2
             d_head_params_,
             d_count_params_,
             static_cast<const int *>(checkpoint_device),
-            n_layers_,
+            sequence_geometry_.rows(),
             batch_size_,
             seq_idx,
             static_cast<hipStream_t>(stream));
@@ -841,7 +881,7 @@ namespace llaminar2
                 ? static_cast<const int *>(
                       request.base_sequence_state_checkpoint_device)
                 : nullptr,
-            n_layers_,
+            sequence_geometry_.rows(),
             batch_size_,
             request.first_seq_idx,
             request.request_count,

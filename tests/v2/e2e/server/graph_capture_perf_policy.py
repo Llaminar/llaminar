@@ -23,6 +23,9 @@ retained parent, or independently instantiated heterogeneous segments. Segment
 proof joins each unit's capture and launch by rank/device/context, setup-issued
 executable-family ID and stage identity. Unused setup variants remain distinct;
 a neighboring executable or a graph-only child cannot satisfy live execution.
+A retained parent with only captured device units is itself one native GPU
+executable. Only a parent with an external service boundary requires the
+heterogeneous exception; the word "parent" does not imply host segmentation.
 """
 
 from __future__ import annotations
@@ -60,6 +63,35 @@ class DecodeGraphRequirement(Enum):
     OBSERVE = "observe"
     CAPTURE = "capture"
     REPLAY = "replay"
+
+
+_RETAINED_PARENT_METRICS = {
+    "retained_parent_executable_nodes": "nodes",
+    "retained_parent_materialized_without_launch": "materialized",
+    "retained_parent_transaction_zero_launches": "initial",
+    "retained_parent_replays": "replay",
+}
+
+
+def _is_captured_native_parent_record(record: Mapping[str, Any]) -> bool:
+    """Authenticate the executor's physical device-only composition inventory.
+
+    This is not a topology hint. Every lifecycle edge uses the common runtime
+    publisher, which derives these fields from the sealed parent. A missing
+    service count is not zero, and a graph-only child is not an executable.
+    Context-local nodes and launches are joined independently below.
+    """
+    tags = record.get("tags") or {}
+    children = tags.get("child_units")
+    value = _record_value(record)
+    return (record.get("domain") == "forward_graph"
+            and record.get("name") in _RETAINED_PARENT_METRICS
+            and bool(tags.get("context"))
+            and bool(re.fullmatch(r"(?:cuda|rocm):\d+", str(record.get("device", "")), re.IGNORECASE))
+            and tags.get("boundary_authority") == "captured_device_units"
+            and tags.get("ticket_service_units") == "0"
+            and isinstance(children, str) and children.isdecimal() and int(children) > 0
+            and math.isfinite(value) and value > 0)
 
 
 def _numeric(value: Any) -> float:
@@ -301,10 +333,12 @@ def _is_nonempty_full_graph_executable(record: Mapping[str, Any]) -> bool:
     Setup may instantiate without launching; the per-context lifecycle below
     separately requires a launch for runtime admissions. Both callers use this
     one predicate so an optimized setup cannot pass one check and fail another.
-    A retained graph-only child is not an executable and never qualifies.
+    A composed device-only parent is one physical executable too. A retained
+    graph-only child is not an executable and never qualifies.
     """
     tags = record.get("tags") or {}
-    return (
+    return (record.get("name") == "retained_parent_executable_nodes"
+            and _is_captured_native_parent_record(record)) or (
         record.get("domain") == "forward_graph"
         and record.get("name") == "full_graph_capture_executable_nodes"
         and tags.get("source") == "full_graph_capture"
@@ -326,7 +360,9 @@ def _has_segmented_execution(records: Iterable[Mapping[str, Any]]) -> bool:
     for record in records:
         name = str(record.get("name", ""))
         tags = record.get("tags") or {}
-        if name.startswith("retained_parent_"):
+        if (name.startswith("retained_parent_")
+                and name != "retained_parent_child_graph_nodes"
+                and not _is_captured_native_parent_record(record)):
             return True
         if tags.get("heterogeneous_segmented") == "true":
             return True
@@ -415,13 +451,8 @@ def _incomplete_graph_contexts(
     materialized_contexts: set[tuple[str, str]] = set()
     materialized_capture_counts: dict[tuple[str, str], float] = {}
     parent_counts: dict[tuple[str, str], dict[str, float]] = {}
+    native_parent_boundaries: dict[tuple[str, str], bool] = {}
     runtime_invocations: dict[tuple[str, str], float] = {}
-    parent_metrics = {
-        "retained_parent_executable_nodes": "nodes",
-        "retained_parent_materialized_without_launch": "materialized",
-        "retained_parent_transaction_zero_launches": "initial",
-        "retained_parent_replays": "replay",
-    }
 
     for record in records:
         name = str(record.get("name", ""))
@@ -434,13 +465,15 @@ def _incomplete_graph_contexts(
         key = (device, context)
         if name in {"decode_capture_policy", "sidecar_decode_capture_policy"}:
             runtime_invocations[key] = runtime_invocations.get(key, 0.0) + _record_value(record)
-        if name in parent_metrics and record.get("domain") == "forward_graph":
+        if name in _RETAINED_PARENT_METRICS and record.get("domain") == "forward_graph":
             counts = parent_counts.setdefault(key, {})
+            native_parent_boundaries[key] = (native_parent_boundaries.get(key, True)
+                                             and _is_captured_native_parent_record(record))
             # Graph-only compilation children are not executable evidence.
             # Every physical parent also declares its nonempty child inventory.
             value = _record_value(record)
             if _numeric(tags.get("child_units")) > 0.0 and value > 0.0:
-                metric = parent_metrics[name]
+                metric = _RETAINED_PARENT_METRICS[name]
                 counts[metric] = counts.get(metric, 0.0) + value
         if name == "decode_graph_phase":
             phase = str(tags.get("phase", ""))
@@ -474,8 +507,8 @@ def _incomplete_graph_contexts(
     )
     incomplete: list[str] = list(segment_errors)
     proven_parents: set[tuple[str, str]] = set()
-    if allow_heterogeneous_execution:
-        for key, counts in sorted(parent_counts.items()):
+    for key, counts in sorted(parent_counts.items()):
+        if allow_heterogeneous_execution or native_parent_boundaries[key]:
             reasons = []
             if counts.get("nodes", 0.0) <= 0.0:
                 reasons.append("retained parent has no context-matched executable nodes")
@@ -483,6 +516,9 @@ def _incomplete_graph_contexts(
                 reasons.append("retained parent has no materialization or transaction-zero launch")
             if counts.get("replay", 0.0) > 0.0 and counts.get("initial", 0.0) <= 0.0:
                 reasons.append("retained parent replay has no transaction-zero launch")
+            if (runtime_invocations.get(key, 0.0) > 0.0
+                    and counts.get("initial", 0.0) + counts.get("replay", 0.0) <= 0.0):
+                reasons.append("retained parent has no launch after runtime admission")
             # Capture counters aggregate several setup shapes. They are not
             # inference calls: an unused materialized family needs no replay.
             if (max(counts.get("initial", 0.0), runtime_invocations.get(key, 0.0)) > 1.0
@@ -492,6 +528,8 @@ def _incomplete_graph_contexts(
                 incomplete.append(f"{key[0]}:{key[1]} ({'; '.join(reasons)})")
             else:
                 proven_parents.add(key)
+        else:
+            incomplete.append(f"{key[0]}:{key[1]} (retained parent lacks a complete captured-device boundary)")
     for key, counts in sorted(phase_counts.items()):
         device, context = key
         total = sum(counts.values())
@@ -501,9 +539,11 @@ def _incomplete_graph_contexts(
         reasons: list[str] = []
         if warmup_count > 0.0:
             reasons.append("retired eager warmup phase was executed")
-        if allow_heterogeneous_execution and (key in parent_counts or key in segmented_contexts):
-            # Each heterogeneous family was validated independently against its
-            # actual physical executables. Eager execution is still forbidden.
+        if ((key in parent_counts and (allow_heterogeneous_execution or native_parent_boundaries[key]))
+                or key in segmented_contexts):
+            # Complete native parents and admitted heterogeneous families were
+            # validated against their actual physical executables above.
+            # Eager execution remains forbidden for either form.
             if warmup_count > 0.0:
                 incomplete.append(f"{device}:{context} ({'; '.join(reasons)})")
             continue
@@ -529,7 +569,7 @@ def _incomplete_graph_contexts(
         reasons = []
         if counts.get("retained_parent", 0.0) > 0.0:
             parent_key = (device, context)
-            if not allow_heterogeneous_execution or parent_key not in proven_parents:
+            if parent_key not in proven_parents:
                 reasons.append("sidecar has no matching certified retained parent")
             else:
                 replay_count += parent_counts[parent_key].get("replay", 0.0)
@@ -704,7 +744,8 @@ def validate_graph_capture_policy(
         and ((r.get("name") == "decode_graph_phase"
               and (r.get("tags") or {}).get("phase") == "replay")
              or (r.get("name") == "retained_parent_replays"
-                 and heterogeneous_device_mix and has_boundary_evidence))
+                 and ((heterogeneous_device_mix and has_boundary_evidence)
+                      or _is_captured_native_parent_record(r))))
         for r in records
     )
     has_decode_capture = any(

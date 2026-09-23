@@ -61,7 +61,7 @@ independent of model weight codebook. Native floating-point caches do not use
 this basis. Tests cover head dimensions 64/128/256, splits 1..16, 31, 64 and
 139 where the prefix fits, both ordinary and overflowing ring capacities,
 and replay after reset. Both backend entries are registered in
-`ProductionParityPreflight`, without model fixtures or performance gates.
+`ProductionTestPreflight`, without model fixtures or performance gates.
 
 ## Evidence and next gate
 

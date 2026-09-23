@@ -147,7 +147,7 @@ namespace llaminar2
 
     bool AutomaticOrchestrationOptions::specified() const noexcept
     {
-        return only_backends || only_strategies || prefer_backend || prefer_strategy || host_participation || workload;
+        return only_backends || only_strategies || prefer_backend || prefer_strategy || host_participation || workload || device_counts;
     }
 
     AutomaticOrchestrationRequest::AutomaticOrchestrationRequest(AutomaticOrchestrationOptions options)
@@ -155,6 +155,15 @@ namespace llaminar2
     {
         validateSet(options_.only_backends);
         validateSet(options_.only_strategies);
+        if (options_.device_counts)
+        {
+            if (options_.device_counts->empty())
+                throw std::invalid_argument("Automatic device counts cannot be empty");
+            std::set<DeviceType> seen;
+            for (const auto &entry : *options_.device_counts)
+                if (entry.count <= 0 || !allows(entry.backend) || !seen.insert(entry.backend).second)
+                    throw std::invalid_argument("Automatic device counts require positive counts, distinct permitted backends");
+        }
         if (options_.host_participation &&
             *options_.host_participation != AutomaticHostParticipation::BestSubset &&
             *options_.host_participation != AutomaticHostParticipation::AllDiscovered)
@@ -178,8 +187,38 @@ namespace llaminar2
     bool AutomaticOrchestrationRequest::allows(
         OrchestrationStrategy strategy, std::span<const DeviceType> participants) const noexcept
     {
-        return allows(strategy) && !participants.empty() &&
-            std::all_of(participants.begin(), participants.end(), [this](DeviceType backend) { return allows(backend); });
+        if (!allows(strategy) || participants.empty() ||
+            !std::all_of(participants.begin(), participants.end(), [this](DeviceType backend) { return allows(backend); }))
+            return false;
+        if (options_.device_counts)
+            for (const auto &entry : *options_.device_counts)
+                if (std::count(participants.begin(), participants.end(), entry.backend) != entry.count)
+                    return false;
+        return true;
+    }
+
+    std::vector<AutomaticBackendDeviceCount> parseAutomaticDeviceCounts(std::string_view value)
+    {
+        const auto counts = parseList<AutomaticBackendDeviceCount>(value, [](std::string_view token) {
+            const auto separator = token.find('=');
+            if (separator == std::string_view::npos)
+                throw std::invalid_argument("Automatic device counts use backend=count pairs");
+            const auto backend = parseOrchestrationComputeBackend(trimToken(token.substr(0, separator)));
+            const auto text = trimToken(token.substr(separator + 1));
+            if (text.empty())
+                throw std::invalid_argument("Automatic device counts require a positive integer");
+            int count = 0;
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), count);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || count <= 0)
+                throw std::invalid_argument("Automatic device counts require a positive integer");
+            return AutomaticBackendDeviceCount{backend, count};
+        });
+        // Use the same admission as programmatic callers; differing counts for
+        // one backend are still duplicates, not a range or last-writer-wins.
+        AutomaticOrchestrationOptions options;
+        options.device_counts = counts;
+        (void)AutomaticOrchestrationRequest(std::move(options));
+        return counts;
     }
 
     std::string_view orchestrationStrategyName(OrchestrationStrategy strategy)

@@ -61,6 +61,13 @@ def cross_host_scenarios(record: dict) -> list[dict]:
             raise ValueError("invalid cross-host E2E topology")
         frontend = scenario.get("frontend")
         arguments = scenario.get("server_policy_args")
+        planning = scenario.get("planning")
+        if (planning != {"mode": "auto", "strategy": "expert-overlay", "device_counts": {
+                topology["continuation_backend"]: topology["continuation_devices"],
+                "cpu": topology["remote_cpu_hosts"]},
+                "mpi_ranks": topology["execution_ranks"]}
+                or any(type(count) is not int for count in planning["device_counts"].values())):
+            raise ValueError("cross-host E2E automatic constraints differ from its typed topology")
         if (frontend not in ("plan-apply", "auto-serve")
                 or scenario.get("movement_evidence") != "required" or scenario.get("owner_order") != "ordinal"
                 or not isinstance(arguments, list) or not arguments
@@ -70,7 +77,7 @@ def cross_host_scenarios(record: dict) -> list[dict]:
         selected = routes.setdefault(key, {})
         if frontend in selected:
             raise ValueError("duplicate cross-host E2E frontend route")
-        selected[frontend] = arguments
+        selected[frontend] = (arguments, planning)
     for selected in routes.values():
         if set(selected) != {"plan-apply", "auto-serve"}:
             raise ValueError("cross-host E2E topology must prove both public frontend routes")

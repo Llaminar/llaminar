@@ -1,3 +1,13 @@
+/**
+ * @file RamPrefixStorageBackend.cpp
+ * @brief Implements bounded RAM prefix archives with exact physical leases.
+ *
+ * Cache indexing can retire a key while a request or in-flight copy still
+ * owns its payload. The production reservation therefore follows the backing
+ * allocation through the final shared handle, independently of logical LRU
+ * occupancy. Failed materialization reports which boundary rejected it.
+ */
+
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 
 #include "backends/BackendManager.h"
@@ -130,25 +140,53 @@ namespace llaminar2
 
     bool RamPrefixStorageBackend::canStore(size_t bytes) const
     {
-        return bytes <= budget_bytes_ && bytes <= budget_bytes_ - used_bytes_;
+        return used_bytes_ <= budget_bytes_ &&
+               bytes <= budget_bytes_ - used_bytes_ &&
+               (!reservation_.valid() || bytes <= reservation_.remainingBytes());
     }
 
     PrefixBlockHandle RamPrefixStorageBackend::allocate(
         const PrefixCacheKey &key,
         const PrefixPayloadLayout &layout)
     {
+        return allocateWithDiagnostics(key, layout, nullptr);
+    }
+
+    PrefixBlockHandle RamPrefixStorageBackend::allocateWithDiagnostics(
+        const PrefixCacheKey &key,
+        const PrefixPayloadLayout &layout,
+        std::string *error)
+    {
+        const auto fail = [&](std::string reason) -> PrefixBlockHandle
+        {
+            if (error)
+                *error = std::move(reason);
+            return {};
+        };
         PrefixBlockHandle handle;
         handle.key = key;
         handle.tier = PrefixStorageTier::Ram;
         handle.layout = layout;
         handle.total_bytes = layout.totalBytes();
 
-        if (!key.valid() || handle.total_bytes == 0 || !canStore(handle.total_bytes))
-        {
-            return {};
-        }
+        if (!key.valid() || handle.total_bytes == 0)
+            return fail("invalid prefix key or zero-byte payload layout");
+        if (used_bytes_ > budget_bytes_ ||
+            handle.total_bytes > budget_bytes_ - used_bytes_)
+            return fail("logical RAM prefix tier capacity exhausted: requested=" +
+                        std::to_string(handle.total_bytes) +
+                        " used=" + std::to_string(used_bytes_) +
+                        " budget=" + std::to_string(budget_bytes_));
+        if (reservation_.valid() &&
+            handle.total_bytes > reservation_.remainingBytes())
+            return fail("physical RAM prefix tier capacity busy: requested=" +
+                        std::to_string(handle.total_bytes) +
+                        " materialized=" +
+                        std::to_string(reservation_.materializedBytes()) +
+                        " reserved=" +
+                        std::to_string(reservation_.capacityBytes()));
         if (allocations_.find(key) != allocations_.end())
-            return {};
+            return fail("prefix key already owns a RAM archive allocation");
 
         try
         {
@@ -158,9 +196,14 @@ namespace llaminar2
             handle.ram_payload_memory_lease =
                 claimHostAllocation(handle.total_bytes);
         }
-        catch (const std::exception &)
+        catch (const std::exception &exception)
         {
-            return {};
+            return fail("physical RAM prefix lease rejected: " +
+                        std::string(exception.what()) +
+                        " materialized=" +
+                        std::to_string(reservation_.materializedBytes()) +
+                        " reserved=" +
+                        std::to_string(reservation_.capacityBytes()));
         }
 
         if (producer_device_.is_gpu())
@@ -198,7 +241,9 @@ namespace llaminar2
                 &handle.terminal_logits,
                 handle.payload_readiness))
         {
-            return {};
+            return fail("RAM prefix payload backing allocation failed for " +
+                        producer_device_.toString() +
+                        " requested=" + std::to_string(handle.total_bytes));
         }
 
         allocations_[key] = handle.total_bytes;

@@ -4,7 +4,7 @@
  *
  * Invalid dependency requests must fail without searching for a different DSO.
  * These tests never initialize HIP, create a communicator, or open a GPU. Real
- * communicator/reset/capture coverage remains in ProductionParityPreflight.
+ * communicator/reset/capture coverage remains in ProductionTestPreflight.
  */
 
 #include <gtest/gtest.h>

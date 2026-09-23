@@ -48,11 +48,11 @@ namespace llaminar2::test::parity::qwen38
         definition.precisions.activation = {ActivationPrecision::FP32};
         definition.precisions.kv_cache = {KVCachePrecision::FP16};
         definition.features.mtp = ModelParityAxisProfile::Standard;
-        // Initial HTTP certification covers adaptive MTP on each GPU vendor.
-        // CPU and fixed-depth cells retain their full mathematical obligations.
-        if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
-            definition.topology.participants.size() == 1 &&
-            !definition.topology.participants.front().address.isCPU())
+        // Each declared GPU topology certifies adaptive MTP through automatic
+        // frontend selection; fixed-depth cases remain mathematical diagnostics.
+        if (!definition.topology.participants.empty() &&
+            std::all_of(definition.topology.participants.begin(), definition.topology.participants.end(),
+                [](const auto &participant) { return !participant.address.isCPU(); }))
         {
             // Exercise the selected admitted single-device context for each
             // certification GPU. The 24-GiB CUDA configuration requires an
@@ -60,12 +60,8 @@ namespace llaminar2::test::parity::qwen38
             // captured physical BOM; the 32-GiB MI50 admits 32K. Keep this
             // capability fact in the typed profile, not in the HTTP runner.
             ModelParityE2EProfile profile;
-            if (definition.topology.participants.front().address.isCUDA())
-            {
-                profile.context_length = 8192;
-                profile.minimum_prompt_tokens = 4096;
-            }
-            else
+            if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
+                definition.topology.participants.front().address.isROCm())
             {
                 profile.context_length = 32768;
                 profile.minimum_prompt_tokens = 16384;
@@ -76,5 +72,47 @@ namespace llaminar2::test::parity::qwen38
             }};
         }
         return definition;
+    }
+
+    /**
+     * @return Dense homogeneous TP/PP and mixed-vendor TP-over-PP declarations.
+     *
+     * These are the canonical diagnostic topologies as well as the authority
+     * for HTTP cardinality/strategy constraints. E2E never prescribes these
+     * ordinal IDs or the mathematical fixture's equal layer partition to auto.
+     */
+    inline std::vector<ModelParityDefinition> qwen38DenseMultiDeviceDefinitions()
+    {
+        std::vector<ModelParityDefinition> definitions;
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            for (const bool pipeline : {false, true})
+            {
+                const bool cuda = backend == DeviceType::CUDA;
+                const std::string id = std::string(cuda ? "CUDA2" : "ROCm2") + (pipeline ? "_PP" : "_TP");
+                ModelParityTopologyDefinition topology{
+                    .test_id = id,
+                    .kind = pipeline ? ModelParityTopologyKind::RankLocalPipelineParallel
+                                     : ModelParityTopologyKind::RankLocalTensorParallel,
+                    .participants = {{cuda ? GlobalDeviceAddress::cuda(0) : GlobalDeviceAddress::rocm(0), 0},
+                                     {cuda ? GlobalDeviceAddress::cuda(1) : GlobalDeviceAddress::rocm(1), 0}},
+                    .collective = cuda ? Collective::NCCL : Collective::RCCL,
+                    .mpi_ranks = 1,
+                };
+                if (pipeline) topology.pipeline_stage_sizes = {1, 1};
+                definitions.push_back(qwen38DenseParityDefinition(std::move(topology),
+                    "pytorch_qwen38_dense_" + id + "_snapshots"));
+            }
+        definitions.push_back(qwen38DenseParityDefinition({
+            .test_id = "CUDA2_ROCm2_TPPP",
+            .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+            .participants = {{GlobalDeviceAddress::cuda(0), 0}, {GlobalDeviceAddress::cuda(1), 0},
+                             {GlobalDeviceAddress::rocm(0), 0}, {GlobalDeviceAddress::rocm(1), 0}},
+            .collective = Collective::HETEROGENEOUS,
+            .mpi_ranks = 1,
+            .pipeline_stage_sizes = {2, 2},
+            .tensor_parallel_collective = Collective::HETEROGENEOUS,
+            .pipeline_tensor_parallel_collectives = {Collective::NCCL, Collective::RCCL},
+        }, "pytorch_qwen38_dense_cuda2_rocm2_tppp_snapshots"));
+        return definitions;
     }
 } // namespace llaminar2::test::parity::qwen38

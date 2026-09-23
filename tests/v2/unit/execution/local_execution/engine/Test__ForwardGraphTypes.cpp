@@ -1338,7 +1338,9 @@ TEST(Test__PipelineForwardEdges, MTPForwardsEncloseEveryRootAndLeaf)
         transport.setDevices(devices);
         transport.setBackend(cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
         FP32Tensor hidden({16, 32});
-        int32_t identities[3]{};
+        // Verifier rows are real disjoint regions even in a topology-only
+        // fixture. Three adjacent scalar placeholders would overlap at M > 1.
+        int32_t identities[33]{};
         for (int participant = 0; participant < 3; ++participant)
             for (int rows = 1; rows <= 16; ++rows)
             {
@@ -1352,11 +1354,11 @@ TEST(Test__PipelineForwardEdges, MTPForwardsEncloseEveryRootAndLeaf)
                                                  : ForwardExecutionRole::GroupedMTPVerifier;
                 input.execution_phase = ForwardExecutionPhase::Decode;
                 input.token_ids_device = identities;
-                input.position_ids_device = identities + 1;
-                input.sequence_lengths_device = identities + 2;
+                input.position_ids_device = identities + 16;
+                input.sequence_lengths_device = identities + 32;
                 input.external_hidden_state = participant ? &hidden : nullptr;
                 input.kv_cache = participant < 2 ? pipelineFollowerIdentity(identities).checkpoint.cache : nullptr;
-                EXPECT_TRUE(PipelineForwardGraphEdges::encloses(input));
+                EXPECT_TRUE(edges.encloses(input));
                 ComputeGraph graph;
                 for (const auto *name : {"branch_a", "branch_b"})
                     graph.addNode(name, std::make_unique<llaminar2::testing::MockComputeStage>(), device);
@@ -1453,7 +1455,7 @@ TEST(Test__PipelineForwardEdges, RejectsContradictoryVerifierBindingsBeforeGraph
     input.position_ids_device = identities + 1;
     input.sequence_lengths_device = identities + 2;
     input.external_hidden_state = &hidden;
-    EXPECT_TRUE(PipelineForwardGraphEdges::encloses(input));
+    EXPECT_TRUE(edges.encloses(input));
     const auto reject = [&](auto mutate) {
         auto invalid = input;
         mutate(invalid);
@@ -1483,7 +1485,7 @@ TEST(Test__PipelineForwardEdges, RejectsContradictoryVerifierBindingsBeforeGraph
                             static_cast<ForwardExecutionRole>(255)})
     {
         input.execution_role = role;
-        EXPECT_FALSE(PipelineForwardGraphEdges::encloses(input))
+        EXPECT_FALSE(edges.encloses(input))
             << "Row count or resident pointers must not invent a grouped verifier role";
     }
 }

@@ -1014,6 +1014,67 @@ hidden state for transfer consumers, while terminal stages publish logits.
 Deferring completion never suppresses result publication; publication records
 an event without waiting or making host data visible.
 
+`CapturedTransferChannel` is TransferEngine's rank-local captured byte-message
+primitive. It owns one mapped payload slot and a private GPU cursor at each
+endpoint, all claimed through PMA. `memoryFor()` contributes allocation geometry;
+it performs no independent capacity admission. Setup joins the exact cursor
+initialization events before returning. Immutable bindings retain physical
+storage, endpoint, nonce, semantic message key and exact extent through capture
+retirement. The primitive cannot address another process or physical host.
+
+For workspace-backed metadata, `DeviceWorkspaceManager::retainBuffer` returns
+an immutable bounded `WorkspaceBufferLease`. It retains the original physical
+block and its original PMA claim, not a manager or a name that can later move.
+TransferEngine binds that region directly; it does not create a second mailbox
+or copy state to prolong its lifetime. Dropping a manager's names is distinct
+from releasing physical capacity: the last allocation lease frees the block
+and only then returns its claim. Whole-block reuse is rejected while any
+retained region survives. The enclosing graph still owns producer/consumer
+ordering and must retire submitted work before its last storage lease.
+
+The captured lifecycle is acquire → parallel payload copy → release. Each GPU
+owns its completion word; producer reuse requires consumer acknowledgement.
+Epochs continue across requests and retained graph families, without a host
+shadow or reset round. Wrong identity/extent/order or the bounded peer deadline
+aborts the channel and raises a native failure. A fixed-rate device timer keeps
+that deadline independent of shader DVFS. This byte primitive does not itself
+compose pipeline domains, choose MTP branches or certify a complete inference
+topology; those responsibilities remain with the existing graph/rank owners.
+
+Captured cross-vendor GPU pipelines preserve two distinct topology levels.
+`PipelineDeviceGeneration` owns the ordered layer domains, while each domain's
+existing runner owns its native TP members. `PipelineNativeDomain` freezes and
+validates that membership independently of physical GPU ordinals. Adjacent
+domain leaders exchange complete hidden rows forward and typed input/commit
+metadata backward; a receiving leader then broadcasts inside its own NCCL/RCCL
+domain. The final domain retains its existing sampler, mirrored MTP sidecars,
+ticket authentication and result authority. Earlier domains own only their
+local layer execution and accepted-state publication.
+
+`PipelineForwardGraphEdges::PublicationOrder` expresses that publication as
+one of three complete topologies: local commit only, commit then exchange, or
+exchange then commit. Terminal TP siblings need only their mirrored local
+commit; the leader alone publishes the committed words to earlier domains.
+Those domains receive/broadcast before restoring their own state. Readiness
+means a retained topology/storage lease with the exact bank identity, not
+necessarily a nonempty transport executable. Policy-specific commit parents
+compose the frozen transport; they never re-enter collective capture. Lease
+retirement makes preparation unavailable and cannot resurrect an old arena.
+
+`PipelineTransferMemory` supplies one shared geometry calculation to planning
+and materialization. Two opposite-direction channels belong to each physical
+boundary; TP width and the retained graph-family size do not multiply them.
+Only boundary leaders claim GPU cursor storage, and one endpoint's host resource
+claims the mapped backing. Arena activation storage is materialized before its
+immutable channel binding is frozen. Metadata bindings retain the original
+INT32 arena regions or workspace leases, never newly invented state mailboxes.
+
+Role-asymmetric participant graphs declare their shared logical forward through
+the existing `GraphCaptureWaveContract`; matching capture boundaries must not
+depend on a leader-only egress node's name. This is setup identity, not a new
+runtime rendezvous. Every native TP domain remains separate, and same-vendor
+domain-to-domain transport cannot silently use the cross-vendor mapped channel.
+
 Background mapped expert copies use prepared `PersistentTransferExecutionLane`
 leases and `TransferEngine::enqueueBackgroundMappedCopy`. Its progress contract
 is symmetric; native mechanisms differ: CUDA uses bounded byte-copy kernels,
@@ -1123,6 +1184,23 @@ embedding/LM-head ownership. Activation movement appears as local pipeline
 transfer stages. Local TP may be nested inside one PP stage through that
 stage's own rank-local runner.
 
+`PipelineGraphExecutionPlan` freezes the complete ordered local execution
+membership of each domain, not just its leader. Setup and replay validation
+compare every nested TP runner with the original collective membership without
+allocating or entering a collective. A domain's GPU members are unique and
+homogeneous; mixed backends belong in separate domains. Physical node/NUMA
+identity remains with the canonical rank plan and context. Preserving a wider
+domain in this declaration is not proof that its captured pipeline composition
+has been installed.
+
+PP construction is a two-phase setup transaction. Participant factories prepare
+weights and stable state banks but do not declare a PP workspace family: the
+pipeline composer must first bind the ingress owner and freeze its transport
+edges. It then invokes the same serving-family materializer on every stage,
+including CPU stages, before request admission. Whole-model factories retain
+their independent eager-family policy. Missing PP ingress remains a hard error;
+neither a dummy input nor first-request preparation substitutes for composition.
+
 The pipeline chunk distinguishes logical token rows from physical transfer
 capacity. GPU children retain captured bucket geometry and mask padding; CPU
 children execute only logical rows. A nonterminal CPU child zeroes unused
@@ -1165,6 +1243,16 @@ Prefix caching is integrated with live KV/GDN state. Lookup, restore, truncate,
 harvest, promotion/demotion, and device rehydration are explicit lifecycle
 operations. Cache fingerprints include model/graph policy needed to reject an
 incompatible state image.
+
+Prefix payload ownership follows the participant's actual cache role. A
+pipeline follower archives its main-model state, not the tail's shifted MTP
+cache. `PrefixPayloadLayout` distinguishes attention-block chains from complete
+recurrent checkpoints. An all-GDN slice hashes the full prompt ancestry but
+stores only genuine checkpoint records; it owns no dummy K/V payload or empty
+ancestor allocations. Coordination counts logical token coverage, not the
+number of physical records. `PhysicalMemoryAuthority` admission includes the
+recurrent archive staging and bounded RAM/device tiers even when the slice has
+zero full-attention layers.
 
 Coordinated prefix admission retains a typed placement-epoch span, not just
 the newest participant epoch. Local and MPI nesting preserve both endpoints;
@@ -1263,7 +1351,7 @@ pipeline shard or overlay boundary needs its explicit composed transfer and
 maintenance protocol, and is rejected until that composition is installed.
 
 `PipelineDeviceGeneration` supplies the rank-local captured composition for
-ordinary homogeneous GPU pipelines. It borrows each DGO's captured forward,
+ordinary and speculative homogeneous GPU pipelines. It borrows each DGO's captured forward,
 arena and request-event handoff. Only the tail admits a generation budget or
 records a sampler. Earlier stages receive exactly health, completion and the
 next condition token over the existing native collective; they do not initialize
@@ -1296,9 +1384,13 @@ own the explicit `HostedPipelineTransaction` executable kind, never ticket
 publishers or independent response controllers. Request reset and continuation
 reuse these retained executables and their existing graph memory inventory.
 
-This composition does not yet provide heterogeneous, nested-TP, or speculative pipeline programs:
-those require their own complete transaction/follower composition, not the
-mirrored TP admission helper or a host-token loop.
+Speculative followers retain their main-layer grouped verifier and local
+accepted-state publication. Only the tail owns the sidecar, outcome decision
+and depth selector. CUDA composes native continuation commands; HIP selects
+complete retained transactions using the tail's authenticated immutable ticket.
+This composition does not yet provide heterogeneous or nested-TP pipeline
+programs: those require complete domain-preserving transaction/follower
+composition, not treating a TP group as one DGO or introducing a host-token loop.
 
 Captured speculative state publication has an explicit immutable authority:
 `CompactOutcome` derives accepted metadata, `BoundedGeneration` also commits
@@ -1336,6 +1428,19 @@ The immutable edge owner is part of forward-cache identity and outlives its
 borrowed captures. Late installation is rejected rather than invalidating an
 already prepared graph family. No additional prefill executable or activation
 allocation is introduced by composition.
+
+`PipelineActivationExchange` is the explicit activation collective used by
+these native edges. Its separate `CapturedDomain` binding describes a
+rank-local heterogeneous TP-domain boundary: only member zero publishes or
+receives the TransferEngine channel, then destination members use their native
+NCCL/RCCL broadcast. Member zero is communicator order, not GPU ordinal zero.
+The frozen binding rejects membership drift, nonleader publication, wrong
+endpoint ownership and same-vendor channel substitution. Banks stay
+participant-local and the physical message extent excludes unused capacity.
+Captured receive-to-send dependencies use the normal graph dependency ledger,
+not an external event or a host assertion that recording produced live bytes.
+This activation primitive alone does not install mixed-domain MTP metadata
+transport, memory admission or complete generation composition.
 
 The same owner encloses a `GroupedMTPVerifier` forward using its explicit
 decode phase, resident token/position/length rows, and exact physical verifier

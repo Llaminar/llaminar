@@ -53,7 +53,7 @@ extra application readiness flag is introduced.
 ## Gate and evidence
 
 `V2_Integration_TransferEngine_CopyActivation` is explicitly model-free, has a
-120-second bound, and joins `ProductionParityPreflight`. Its fixture explicitly
+120-second bound, and joins `ProductionTestPreflight`. Its fixture explicitly
 retires its global collective owner before process-static registry teardown.
 The focused test must pass on both backends, then pass twenty repetitions,
 before a refreshed Unit/preflight receipt and the original generation retry.

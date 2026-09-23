@@ -7,7 +7,7 @@ controls after the thirteen Ornith controls completed. They run sequentially
 through the AVX-512 Release `llaminar2 serve` binary and public
 `/v1/chat/completions`; the first failure stops admission of later cells.
 
-The existing 649 Unit / 148 ProductionParityPreflight receipt is reused from
+The existing 649 Unit / 148 ProductionTestPreflight receipt is reused from
 `native-movement-evidence-prerequisites-01/prerequisites.json`. No source or
 build change was required before this run. All three required GGUFs are hits
 in the sealed persistent tmpfs cache, with zero copied bytes.
@@ -110,7 +110,7 @@ including the full MemoryPlanner executable, pass in
 `dense27b-workspace-bound-focused-02.log`.
 
 The corrected shared gate passes all 649 Unit registrations (74.35 s) and all
-148 ProductionParityPreflight registrations (532.76 s), 611.345 s including
+148 ProductionTestPreflight registrations (532.76 s), 611.345 s including
 driver overhead. The reusable receipt is
 `dense27b-workspace-prerequisites-02/prerequisites.json`. Both AVX512 Release
 and Integration gate/matrix builds pass. The exact failed CUDA cell passes in

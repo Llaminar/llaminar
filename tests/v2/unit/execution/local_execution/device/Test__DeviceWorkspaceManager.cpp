@@ -284,6 +284,118 @@ TEST_F(Test__DeviceWorkspaceManager,
         512u);
 }
 
+/** @test A tiny retained region keeps its complete original PMA charge live. */
+TEST_F(Test__DeviceWorkspaceManager, RetainedBufferSurvivesManagerWithoutDuplicatingItsClaim)
+{
+    constexpr size_t bytes = 4096;
+    auto authority = workspaceAuthority(bytes);
+    std::shared_ptr<const WorkspaceBufferLease> region;
+    {
+        DeviceWorkspaceManager manager(device, bytes, authority);
+        WorkspaceRequirements reqs;
+        reqs.buffers.push_back({"metadata", bytes, 1, true});
+        ASSERT_TRUE(manager.allocate(reqs));
+        region = manager.retainBuffer("metadata", 256, 17);
+        EXPECT_EQ(region->data(), static_cast<unsigned char *>(manager.getBuffer("metadata")) + 256);
+        EXPECT_EQ(region->device(), device);
+        EXPECT_EQ(region->backend(), getBackendFor(device));
+        EXPECT_EQ(region->sizeBytes(), 17u);
+        std::memset(region->data(), 0x5d, 17);
+        manager.release();
+        EXPECT_FALSE(manager.isAllocated());
+        EXPECT_EQ(manager.getBuffer("metadata"), nullptr);
+    }
+    const auto claimed = [&] { return authority->claimedBytes(device,
+        PhysicalMemoryOwner::ExecutionWorkspace, PhysicalMemoryMaterializationKind::NewAllocation); };
+    EXPECT_EQ(claimed(), bytes);
+    EXPECT_EQ(static_cast<unsigned char *>(region->data())[16], 0x5d);
+    DeviceWorkspaceManager next(device, bytes, authority);
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"new_layout", bytes, 1, true});
+    EXPECT_FALSE(next.allocate(reqs)) << "Retired names are not free physical capacity";
+    region.reset();
+    EXPECT_EQ(claimed(), 0u);
+    ASSERT_TRUE(next.allocate(reqs));
+    EXPECT_EQ(claimed(), bytes);
+}
+
+/** @test Reuse fails before mutating the current namespace while any region is live. */
+TEST_F(Test__DeviceWorkspaceManager, RetainedBufferRejectsReuseWithoutDamagingCurrentLayout)
+{
+    DeviceWorkspaceManager manager(device, budget);
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"metadata", 64, 1, true});
+    ASSERT_TRUE(manager.allocate(reqs));
+    auto region = manager.retainBuffer("metadata", 1, 4);
+    auto duplicate = manager.retainBuffer("metadata", 2, 4);
+    void *const original = manager.getBuffer("metadata");
+    std::string error;
+    EXPECT_FALSE(manager.sealPrimaryBlockForReuse(&error));
+    EXPECT_NE(error.find("retained buffer"), std::string::npos);
+    EXPECT_EQ(manager.getBuffer("metadata"), original);
+    EXPECT_EQ(manager.used(), 64u);
+    region.reset();
+    EXPECT_FALSE(manager.sealPrimaryBlockForReuse(&error));
+    duplicate.reset();
+    ASSERT_TRUE(manager.sealPrimaryBlockForReuse(&error)) << error;
+    EXPECT_EQ(manager.getBuffer("metadata"), nullptr);
+    EXPECT_THROW((void)manager.retainBuffer("metadata", 0, 1), std::invalid_argument);
+}
+
+/** @test Growth cannot redirect an older lease, including superseded extension blocks. */
+TEST_F(Test__DeviceWorkspaceManager, RetainedBufferPinsSupersededExtensionsUntilFinalConsumer)
+{
+    auto authority = workspaceAuthority(1024);
+    DeviceWorkspaceManager manager(device, 1024, authority);
+    const auto requirements = [](size_t bytes) {
+        WorkspaceRequirements reqs;
+        reqs.buffers.push_back({"metadata", bytes, 1, true});
+        return reqs;
+    };
+    ASSERT_TRUE(manager.allocate(requirements(128)));
+    ASSERT_TRUE(manager.extend(requirements(256)));
+    auto old = manager.retainBuffer("metadata", 2, 4);
+    std::memset(old->data(), 0x35, 4);
+    ASSERT_TRUE(manager.extend(requirements(512)));
+    auto current = manager.retainBuffer("metadata", 2, 4);
+    EXPECT_NE(old->data(), current->data());
+    std::memset(current->data(), 0x71, 4);
+    manager.release();
+    const auto claimed = [&] { return authority->claimedBytes(device,
+        PhysicalMemoryOwner::ExecutionWorkspace, PhysicalMemoryMaterializationKind::NewAllocation); };
+    EXPECT_EQ(claimed(), 256u + 512u);
+    EXPECT_EQ(static_cast<unsigned char *>(old->data())[3], 0x35);
+    EXPECT_EQ(static_cast<unsigned char *>(current->data())[3], 0x71);
+    old.reset();
+    EXPECT_EQ(claimed(), 512u);
+    current.reset();
+    EXPECT_EQ(claimed(), 0u);
+}
+
+/** @test Named and leased bounds reject overflow and access to adjacent workspace buffers. */
+TEST_F(Test__DeviceWorkspaceManager, RetainedBufferBoundsAreNamedRegionRelative)
+{
+    DeviceWorkspaceManager manager(device, budget);
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"metadata", 17, 1, true});
+    reqs.buffers.push_back({"neighbor", 1024, 1, true});
+    ASSERT_TRUE(manager.allocate(reqs));
+    EXPECT_THROW((void)manager.retainBuffer("missing", 0, 1), std::invalid_argument);
+    EXPECT_THROW((void)manager.retainBuffer("metadata", 0, 0), std::invalid_argument);
+    EXPECT_THROW((void)manager.retainBuffer("metadata", 17, 1), std::out_of_range);
+    EXPECT_THROW((void)manager.retainBuffer("metadata", SIZE_MAX, 1), std::out_of_range);
+    EXPECT_THROW((void)manager.retainBuffer("metadata", 1, SIZE_MAX), std::out_of_range);
+    auto region = manager.retainBuffer("metadata", 1, 16);
+    EXPECT_TRUE(region->contains(0, 16));
+    EXPECT_TRUE(region->contains(15, 1));
+    EXPECT_FALSE(region->contains(0, 0));
+    EXPECT_FALSE(region->contains(16, 1));
+    EXPECT_FALSE(region->contains(SIZE_MAX, 1));
+    EXPECT_FALSE(region->contains(1, SIZE_MAX));
+    EXPECT_EQ(region->data(16), static_cast<unsigned char *>(region->data()) + 16);
+    EXPECT_THROW((void)region->data(17), std::out_of_range);
+}
+
 TEST_F(Test__DeviceWorkspaceManager,
        StableArenaCanChargeItsExactNonWorkspaceOwner)
 {

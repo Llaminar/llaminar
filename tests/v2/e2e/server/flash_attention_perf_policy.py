@@ -14,8 +14,10 @@ tests or benchmark-only controls.
 
 Expert-only overlay domains own no attention: the resolved runtime plan's base
 model domain identifies the participants that must supply attention evidence.
-Ordinary TP/PP retains its all-participant requirement. No model/backend name
-or absence of evidence can grant the expert-only exception.
+Ordinary TP/PP observes each participant's actual layer interval and enabled
+predictor ownership: a recurrent-only pipeline domain still requires compute
+and graph evidence, but owns no FlashAttention work. No model/backend name or
+absence of evidence can grant either ownership distinction.
 
 The GPU check consumes only capture-time ``gpu_graph_inventory`` records. The
 CPU check consumes aggregate execution counters and never inspects tensor data

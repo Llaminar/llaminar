@@ -208,6 +208,7 @@ Use constraints only when they express a real requirement:
 | Intent | Option |
 |---|---|
 | Only ROCm compute | `--only-backends rocm` |
+| Exactly two ROCm devices, with automatic placement | `--only-backends rocm --auto-device-counts rocm=2` |
 | Only TP or PP candidates | `--only-strategies tp,pp` |
 | Prefer a backend when candidates otherwise tie | `--prefer-backend rocm` |
 | Rank for an expected request length | `--plan-workload 512,384` |
@@ -215,6 +216,9 @@ Use constraints only when they express a real requirement:
 
 `--plan-workload` is an optional costing horizon, not a prompt generator or
 output limit. Auto may choose fewer devices when that is predicted to be faster.
+Use `--auto-device-counts` only when a count is required: it preserves automatic
+device selection and placement but rejects candidates with a different count.
+CPU counts refer to NUMA compute endpoints, not threads or MPI processes.
 Benchmark the result; a cost estimate is not a measured throughput guarantee.
 
 Do not add an `expert-overlay` strategy filter merely because the model is MoE:
@@ -416,6 +420,10 @@ These scores use the exact canonical E2E configurations, including their
 explicit MTP and expert-movement settings—not an auto-planner/default-policy
 performance sweep. Context is the allocated capacity; each timing request uses
 the prompt and decode lengths shown in the chart.
+
+Results are grouped by model size (27B, 35B, 122B). Within each cell, prefill
+and decode each use that cell's AVX512 result as the 100% reference for AVX2.
+Compare absolute tok/s values across cells, not their normalized bar lengths.
 
 <!-- published-benchmarks:begin -->
 

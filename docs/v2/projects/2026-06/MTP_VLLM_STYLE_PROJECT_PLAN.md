@@ -665,7 +665,7 @@ refreshed after the attention change before any 90% certification.
   retained capture semantics; no fixed-depth substitution for dynamic mode.
 - Retain strict serial/grouped byte equivalence and real-model numerical/CSV
   proof, including reset, prefix restore, stochastic sampling and capacity
-  through depth 15. Run focused regressions, full Unit, ProductionParityPreflight
+  through depth 15. Run focused regressions, full Unit, ProductionTestPreflight
   and affected canonical model cells before accepting a change. Performance
   measurements remain outside the functional preflight gate.
 

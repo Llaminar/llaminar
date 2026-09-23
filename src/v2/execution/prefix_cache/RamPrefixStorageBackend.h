@@ -68,6 +68,25 @@ namespace llaminar2
                                    const PrefixPayloadLayout &layout) override;
 
         /**
+         * @brief Allocate a RAM archive with the exact rejection reason.
+         *
+         * Prefix harvest is a request-completion boundary. An allocation
+         * failure must identify whether its cause was logical capacity,
+         * an outstanding physical lease, or backing-memory admission rather
+         * than reporting all three as an indistinguishable invalid handle.
+         * The ordinary storage interface delegates to this same operation.
+         *
+         * @param key Immutable archive identity.
+         * @param layout Serialized payload geometry.
+         * @param error Receives the failure reason, if requested.
+         * @return A live archive handle or an invalid handle on rejection.
+         */
+        PrefixBlockHandle allocateWithDiagnostics(
+            const PrefixCacheKey &key,
+            const PrefixPayloadLayout &layout,
+            std::string *error);
+
+        /**
          * @brief Retire one cache key without invalidating outstanding handles.
          */
         bool release(const PrefixBlockHandle &handle) override;

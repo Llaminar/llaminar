@@ -48,7 +48,7 @@ precision is introduced. Greedy and unseeded calls retain their existing
 behavior. GPU state and sampling remain device-owned and unchanged.
 
 The focused registration `V2_Integration_CPUSeededSamplingPositionIdentity`
-is in `ProductionParityPreflight`. It exercises real orchestration and CPU
+is in `ProductionTestPreflight`. It exercises real orchestration and CPU
 sampling with model-free injected logits, both scalar and ragged-batch
 entrypoints, and multiple seeds/output positions. The same cases also belong
 to the complete Unit fixture. This is a sampling/wiring regression, not a claim

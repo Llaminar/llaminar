@@ -77,10 +77,21 @@ python3 scripts/ci/model_parity_inventory.py \
   --export-manifest parity-results/canonical-cells.json
 ```
 
-The runtime record and the E2E profile share one CLI argument projection.
-The profile additionally owns its HTTP workload/context budgets; it does not
-define a second topology. Rebuild the matrix executables after changing the
-typed export and regenerate manifests rather than editing their JSON by hand.
+The runtime record and E2E profile use two placement projections of the same
+typed definition and inference policy. Saved-token regression and mathematical
+diagnostics retain declared placement. HTTP E2E uses production auto selection:
+the exporter supplies backend/strategy filters and exact physical device counts,
+not device ordinals, MPI ownership, domains, expert tiers or layer boundaries.
+The profile owns its HTTP workload/context budgets and a `planning` contract;
+it does not define a second topology. Rebuild the matrix executables after
+changing the typed export and regenerate manifests rather than editing JSON.
+
+Rank-local PP cells also project the canonical topology's domain sizes/backends
+and the model's main-layer count into that observation contract. Startup
+evidence must prove those actual TP groups and contiguous layer coverage; four
+selected GPUs alone cannot certify two two-way TP domains. Domain order,
+physical ordinals and the layer split remain automatic choices, not authored
+placements in the HTTP runner.
 
 `ModelParityDefinition::generation_workload` owns the fast regression horizon.
 Every generated cell, including MTP off and fixed/adaptive MTP, inherits the
@@ -177,7 +188,7 @@ MTP options out of CLI strings to synthesize a control configuration.
 
 For unchanged local iteration, `--reuse-preflight-report PATH` accepts a passed
 canonical numerical, generation or standalone prerequisite receipt. A direct
-`run_production_parity_preflight(..., artifact_directory=...)` invocation writes
+`run_production_test_preflight(..., artifact_directory=...)` invocation writes
 `prerequisites.json` even when no model run follows. This model-free receipt
 cannot certify a model or image. The same admission
 authority verifies the complete Unit/integration inventory and build identity;
@@ -267,14 +278,18 @@ checks. Stale manifests without this field fail admission. Standalone harness
 diagnostics use `LLAMINAR_E2E_THINKING_MODES` explicitly (default `both`);
 there is no filename-based model capability table.
 
-The initial tags select dynamic-depth MTP for single-GPU Qwen3.8 dense 27B
-and Qwen3.6 MoE 35B on CUDA and ROCm. The Qwen3.5 MoE 122B topology declarations
+The tags select dynamic-depth MTP for single-GPU Qwen3.8 dense 27B and Qwen3.6
+MoE 35B on CUDA and ROCm. Dense 27B additionally declares two-GPU TP and PP
+on each vendor, plus a two-CUDA/two-ROCm hybrid TP/PP case. Auto chooses its
+homogeneous stage groups and layer boundary; CUDA and ROCm never form one
+vendor-native TP collective. The Qwen3.5 MoE 122B topology declarations
 also select Dynamic movement, ordinal initial placement, and dynamic-depth MTP
 for two CUDA GPUs plus two CPU sockets, two or four ROCm GPUs plus two CPU
-sockets, and two CUDA GPUs plus four ROCm GPUs. In each two-tier case the GPU
-continuation domain has priority zero; CPU, or ROCm in the mixed-vendor case,
-has the lower residency priority. GPU-to-socket placement remains inventory
-resolved. On the certification host these are the 3090 and MI50 devices, not
+sockets, and two CUDA GPUs plus four ROCm GPUs. Mathematical diagnostics retain
+their declared continuation and tier order. HTTP auto selection constrains
+backend counts and the ExpertOverlay family but chooses domain roles and
+capacity using measured topology costs. On the certification host the GPUs
+are the 3090 and MI50 devices, not
 hardcoded GPU product names in the topology. Use discovery below for the exact
 current inventory; adding a tag must not add a runner-side configuration.
 Qwen3.6 MoE 35B also tags a CPU-only, two-socket NodeTP cell with ordinal
@@ -328,12 +343,20 @@ python3 scripts/ci/run_model_parity_e2e.py \
 
 The runner reuses the parity driver's persistent tmpfs lease and staging
 authority. It starts one server per tagged cell, passes an argument vector
-exported from that cell's production configuration, and invokes the mature
+exported from that cell's automatic constraints and inference policy, and invokes the mature
 `test_server_e2e.sh` checks. The full helper proves beginning/middle/end needle
 recall, multi-needle JSON recall, structured long generation, cache reset,
 near-limit admission and oversized-context rejection. It additionally retains
 the harness's chat, streaming, prefix, error-response, graph/PerfStats, memory,
-and shutdown checks. There is no model-size skip for a tagged cell. Each HTTP
+and shutdown checks. Every cell also requires real streaming and non-streaming
+tool-call round trips (`required`, named-function and automatic selection),
+exact JSON arguments, call-ID preservation, and consumption of an independently
+supplied tool result. Raw requests/responses are retained and revalidated; a
+passed flag alone is insufficient. Runtime startup evidence joins selected
+participants to canonical physical-node and GPU UUID/CPU NUMA identity, then
+checks the declared strategy and counts. Repeated visibility of one GPU on two
+MPI ranks cannot satisfy a two-GPU obligation. There is no model-size skip for
+a tagged cell. Each HTTP
 cell has one profile-owned `cell_timeout_seconds` watchdog (default fifteen
 minutes), including startup and shutdown. The profile exports budgets for both
 ISAs; the runner selects the tested image's OCI ISA label or the local Release
@@ -342,6 +365,17 @@ MoE selectors explicitly allow twenty minutes; their AVX512 counterparts and
 all GPU cells retain fifteen. Expiry retires the full server/MPI process group
 and records a timeout. Changing this HTTP allowance does not change the
 diagnostic mathematical-cell watchdog or shorten any accuracy check.
+
+For a focused stability proof, add `--repeat 20 --fail-fast` to the selected
+HTTP command and choose a new report path. Every iteration starts and retires
+its own real server and runs the complete checks; only immutable tmpfs model
+staging is shared. The report records iteration numbers, independent artifact
+directories, and completed versus required run counts. A failure or missing
+behavioral proof stops the diagnostic cohort without certifying its earlier
+passes. After a runtime fix, begin a new cohort for the affected cells instead
+of combining passes from different implementations. Without `--fail-fast`,
+the normal aggregate continues through all selected cells to preserve its full
+failure map.
 
 Remote MPI certification has a distinct typed declaration on the same E2E
 selection: `remote_cpu_overlays`. It adds one-GPU/remote-CPU topology intents,
@@ -506,16 +540,16 @@ still skip when their optional prerequisite is absent.
 
 ## Model-free prerequisite gates
 
-Git pre-commit runs only the complete Unit and ProductionParityPreflight
+Git pre-commit runs only the complete Unit and ProductionTestPreflight
 prerequisites on every branch. It builds their CMake-owned executable targets,
 not every Integration/Release target, and never launches a model campaign,
 E2E server, container, or benchmark. Registration and manual invocation are in
 `.githooks/README.md`. Numerical and HTTP certification remain separate gates.
 
 Every aggregate campaign run first builds the CMake-owned `v2_unit_gate` and
-`v2_production_parity_preflight_gate` targets in one transaction, then runs the
+`v2_production_test_preflight_gate` targets in one transaction, then runs the
 complete `V2_Unit_*` CTest namespace. It then runs the registered
-`ProductionParityPreflight` CTest label. Both phases precede the model-download
+`ProductionTestPreflight` CTest label. Both phases precede the model-download
 fixture and GGUF staging, so a broken device-free invariant, rank lifecycle,
 graph/event contract, or ExpertOverlay epoch cannot consume model-loading time
 or contaminate a later parity process.
@@ -543,19 +577,19 @@ prefill graph buckets, heterogeneous captured-ticket dispatch, prepared
 ExpertOverlay weights, and asynchronous overlay epochs. When a campaign defect
 exposes a new model-free invariant, add a focused integration regression and
 add that existing test registration to
-`V2_PRODUCTION_PARITY_PREFLIGHT_TESTS`. Do not add a second list to the
+`V2_PRODUCTION_TEST_PREFLIGHT_TESTS`. Do not add a second list to the
 campaign driver.
 
 Run both phases independently with:
 
 ```bash
 cmake --build build_v2_integration --parallel \
-  --target v2_unit_gate v2_production_parity_preflight_gate
+  --target v2_unit_gate v2_production_test_preflight_gate
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error \
-  -L '^ProductionParityPreflight$'
+  -L '^ProductionTestPreflight$'
 ```
 
 A Unit build/test or Integration preflight failure prevents fixture setup,
@@ -954,7 +988,7 @@ The listing validates campaign labels, environment, timeout, declared GGUF
 manifest, forward-graph PerfStats, and exact GTest filters, then reports
 campaign count, exact matrix cell count, backend signatures, and precision
 tags. A non-list run additionally validates and executes the
-`ProductionParityPreflight` label before model admission.
+`ProductionTestPreflight` label before model admission.
 
 Run every configured campaign and write machine-readable timing evidence:
 
@@ -1028,7 +1062,7 @@ Use a substantive file header and keep configurations declarative.
 6. Add each new device-free regression as a `V2_Unit_*` test; it joins the
    prerequisite automatically. Add each model-free backend/integration
    production-path regression to the CMake-owned
-   `ProductionParityPreflight` inventory. Run both gates, then stage the real
+   `ProductionTestPreflight` inventory. Run both gates, then stage the real
    model files and run every affected backend campaign. A new defect needs a
    focused regression in addition to the full campaign cell.
 
@@ -1088,7 +1122,7 @@ identity. No whole-GGUF checksum or full-model reload is performed. Corrupt
 committed banks fail closed. The codebook-independent slice uses the canonical
 GGUF dequantizer; FP32, FP16, and BF16 follow the same equation as quantized
 experts. Device-free equation/cache/normalization regressions belong to both
-Unit and `ProductionParityPreflight`.
+Unit and `ProductionTestPreflight`.
 
 ### Commands
 

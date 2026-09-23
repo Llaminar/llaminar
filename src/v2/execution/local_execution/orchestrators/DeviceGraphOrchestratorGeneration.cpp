@@ -9,6 +9,7 @@
  * retains one complete transaction, never a host-submitted list of model stages.
  */
 #include "DeviceGraphOrchestrator.h"
+#include "PipelineForwardGraphEdges.h"
 #include "backends/BackendManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
@@ -126,7 +127,10 @@ bool DeviceGraphOrchestrator::materializeOrdinaryDeviceGenerationLoopGraph(
         !state_.kv_cache || !state_.logits || !request_position_ids_dev_ ||
         activeMainLogitsAreColumnParallel() ||
         (pp_stage_config_ && (!pp_stage_config_->has_lm_head ||
-            (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail))) ||
+            (!pp_stage_config_->has_embedding && composition != OrdinaryGenerationComposition::PipelineTail &&
+             composition != OrdinaryGenerationComposition::PipelineDomainTail))) ||
+        (composition == OrdinaryGenerationComposition::PipelineDomainTail &&
+            (!pipeline_forward_edges_ || !pipeline_forward_edges_->hasHeterogeneousBoundary())) ||
         (composition == OrdinaryGenerationComposition::ExpertOverlay) !=
             static_cast<bool>(moe_overlay_epoch_execution_binding_))
         return fail("Ordinary generation requires an admitted scalar sampler and an exact local, pipeline-tail, or ExpertOverlay composition");

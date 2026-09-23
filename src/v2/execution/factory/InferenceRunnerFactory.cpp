@@ -73,6 +73,42 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Declare independently owned workspace families before returning a runner.
+     * @param orchestrator Fully allocated participant with prepared weight bindings.
+     * @param config Typed placement and request-capacity policy for this participant.
+     * @param graph_config Resolved graph families that require stable workspace.
+     * @param architecture Registered model family owning CPU expert preparation.
+     * @return False if an independently owned family cannot be prepared.
+     *
+     * A pipeline stage is not an independently executable graph. Its composer
+     * must first bind the stable ingress and freeze transport edges, then call
+     * the ordinary serving-family materializer. Both concrete and injected
+     * factories use this boundary, including TP participants inside PP stages.
+     * Deferring to that setup owner does not defer preparation to inference.
+     */
+    static bool materializeIndependentFactoryGraphFamily(
+        DeviceGraphOrchestrator &orchestrator,
+        const InferenceRunnerConfig &config,
+        const GraphConfig &graph_config,
+        const std::string &architecture)
+    {
+        if (config.pp_stage_config)
+            return true;
+
+        const bool cpu_expert_family = graph_config.default_device.is_cpu() &&
+            architecture == "qwen35moe" && graph_config.moe.num_experts > 0;
+        if (!cpu_expert_family && !graph_config.requiresEagerWorkspaceFamilyManifest())
+            return true;
+
+        ScopedWeightLoadDetailTimer timer("graph.build.eager_graph_family_materialization");
+        if (orchestrator.materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
+            return true;
+        LOG_ERROR("[InferenceRunner] Failed eager graph-family materialization on "
+                  << graph_config.default_device.to_string());
+        return false;
+    }
+
     void FactoryPPStageConfig::requireValidForModel(IModelContext &model) const
     {
         const auto loader = model.loader();
@@ -3397,23 +3433,9 @@ namespace llaminar2
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
 
-        const bool eager_cpu_moe_materialization =
-            device.is_cpu() &&
-            architecture == "qwen35moe" &&
-            graph_config.moe.num_experts > 0;
-        const bool eager_shape_dependent_graph_family_materialization =
-            graph_config.requiresEagerWorkspaceFamilyManifest();
-        if (eager_cpu_moe_materialization ||
-            eager_shape_dependent_graph_family_materialization)
-        {
-            ScopedWeightLoadDetailTimer timer("graph.build.eager_graph_family_materialization");
-            if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
-            {
-                LOG_ERROR("[InferenceRunner] Failed eager graph-family materialization on "
-                          << device.to_string());
-                return nullptr;
-            }
-        }
+        if (!materializeIndependentFactoryGraphFamily(
+                *orchestrator, config, graph_config, architecture))
+            return nullptr;
 
         // DeviceGraphOrchestrator implements IInferenceRunner directly
         return orchestrator;
@@ -4521,6 +4543,19 @@ namespace llaminar2
                         }
                     }
 
+                    if (config.moe_overlay_cpu_preparation)
+                    {
+                        if (!graph_config.moe.expert_overlay_runtime_plan)
+                        {
+                            throw std::logic_error(
+                                "LocalTP CPU expert preparation dependency lacks an ExpertOverlay runtime plan");
+                        }
+                        // Own-GPU preparation may overlap on all children. A
+                        // dependent graph now joins the root's completed CPU
+                        // registry before any stage resolves CPU engines.
+                        config.moe_overlay_cpu_preparation->afterLocalPreparation();
+                    }
+
                     std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
                     const bool needs_mirrored_mtp_head =
                         needsMirroredMTPHeadWeights(graph_config);
@@ -4673,22 +4708,9 @@ namespace llaminar2
             }
         }
 
-        const bool eager_cpu_moe_materialization =
-            device.is_cpu() &&
-            architecture == "qwen35moe" &&
-            graph_config.moe.num_experts > 0;
-        const bool eager_shape_dependent_graph_family_materialization =
-            graph_config.requiresEagerWorkspaceFamilyManifest();
-        if (eager_cpu_moe_materialization ||
-            eager_shape_dependent_graph_family_materialization)
-        {
-            if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
-            {
-                LOG_ERROR("[InferenceRunner] Failed eager graph-family materialization on "
-                          << device.to_string());
-                return nullptr;
-            }
-        }
+        if (!materializeIndependentFactoryGraphFamily(
+                *orchestrator, config, graph_config, architecture))
+            return nullptr;
 
         LOG_DEBUG("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
 

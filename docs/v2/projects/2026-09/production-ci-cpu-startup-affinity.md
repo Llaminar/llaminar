@@ -40,7 +40,7 @@ The new model-free `V2_Integration_CPUStartupAffinity` drives the production
 parser and `MPIBootstrapPhase` self-launch. CTest must not wrap this test in MPI:
 that would bypass the failing path. It checks unresolved locality, short/full
 selectors on every detected NUMA node, all physical workers, and fatal rejection
-of an unavailable node. It is in `ProductionParityPreflight`.
+of an unavailable node. It is in `ProductionTestPreflight`.
 
 The pre-fix run reproduced the unresolved-node failure and passed both address
 spellings on both real sockets. Device-free tests reproduced false explicit

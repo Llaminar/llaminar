@@ -15,6 +15,7 @@
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "utils/NUMATopology.h"
 #include <gtest/gtest.h>
+#include <array>
 #include <set>
 
 using namespace llaminar2;
@@ -197,22 +198,59 @@ TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority
         auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
         config.moe_rebalance.mode = mode;
         const auto proposals = candidates(config, inventory, true);
-        ASSERT_EQ(proposals.size(), 1u);
-        EXPECT_TRUE(proposals.front().config.tp_devices.empty());
-        ASSERT_TRUE(proposals.front().config.moe_routed_expert_plan);
-        EXPECT_EQ(
-            proposals.front()
-                .config.moe_routed_expert_plan->continuation_domain_spec
-                .effectiveDensePolicy(),
-            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated);
-        compile(proposals.front(), true);
-        ExecutionPlanBuilder builder;
-        const auto resolved = ResolvedRankOrchestration::resolve(proposals.front().config, model(true),
-            proposals.front().membership.inventory(), builder, 0);
-        ASSERT_TRUE(resolved.overlayExecution());
-        ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
-        EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.size(), 1u);
-        EXPECT_EQ(resolved.config().moe_rebalance.mode, mode);
+        ASSERT_EQ(proposals.size(), 2u);
+        const std::array policies{
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+            DenseParallelPolicy::TensorParallel};
+        for (std::size_t index = 0; index < proposals.size(); ++index)
+        {
+            const auto &proposal = proposals[index];
+            EXPECT_TRUE(proposal.config.tp_devices.empty());
+            ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+            EXPECT_EQ(proposal.config.moe_routed_expert_plan
+                          ->continuation_domain_spec.effectiveDensePolicy(),
+                      policies[index]);
+            compile(proposal, true);
+            ExecutionPlanBuilder builder;
+            const auto resolved = ResolvedRankOrchestration::resolve(
+                proposal.config, model(true),
+                proposal.membership.inventory(), builder, 0);
+            ASSERT_TRUE(resolved.overlayExecution());
+            ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
+            EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.size(), 1u);
+            EXPECT_EQ(resolved.config().moe_rebalance.mode, mode);
+        }
+    }
+}
+
+TEST(AutomaticOrchestrationCandidates,
+     MultiTierLocalGpuContinuationOffersBothAdmittedDensePolicies)
+{
+    auto inventory = hosts(2);
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].local_rank = 1;
+    inventory.buildNodeAggregations();
+    cards(inventory, 0, DeviceType::CUDA, 2);
+    auto config = request({DeviceType::CUDA, DeviceType::CPU},
+                          {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts =
+        {{DeviceType::CUDA, 2}, {DeviceType::CPU, 2}};
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_EQ(proposals.size(), 2u);
+    const std::array policies{
+        DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+        DenseParallelPolicy::TensorParallel};
+    for (std::size_t index = 0; index < proposals.size(); ++index)
+    {
+        const auto &proposal = proposals[index];
+        ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+        EXPECT_EQ(proposal.config.moe_routed_expert_plan
+                      ->continuation_domain_spec.effectiveDensePolicy(),
+                  policies[index]);
+        EXPECT_EQ(proposal.membership.discoveryRanks(),
+                  (std::vector<int>{0, 1}));
+        compile(proposal, true);
     }
 }
 
@@ -265,6 +303,122 @@ TEST(AutomaticOrchestrationCandidates, PipelinesTryEveryRealMainLayerBoundaryInB
         EXPECT_TRUE(splits.emplace(proposal.membership.discoveryRanks().front(), last.first_layer).second);
         compile(proposal);
     }
+}
+
+TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsKeepAutomaticTPAndPPChoices)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = hosts(1);
+        cards(inventory, 0, backend, 4);
+        auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        config.automatic_planning.device_counts = {{backend, 2}};
+        const auto tp = candidates(config, inventory);
+        ASSERT_EQ(tp.size(), 6u); // All two-device subsets, not hard-coded ordinals.
+        for (const auto &proposal : tp)
+        {
+            EXPECT_EQ(proposal.config.tp_devices.size(), 2u);
+            compile(proposal);
+        }
+        config.automatic_planning.only_strategies = {OrchestrationStrategy::PipelineParallel};
+        const auto pp = candidates(config, inventory);
+        ASSERT_EQ(pp.size(), 36u); // Twelve ordered pairs, three legal layer splits.
+        for (const auto &proposal : pp)
+        {
+            ASSERT_EQ(proposal.config.domain_definitions.size(), 2u);
+            for (const auto &domain : proposal.config.domain_definitions) EXPECT_EQ(domain.devices.size(), 1u);
+            compile(proposal);
+        }
+        config.automatic_planning.device_counts = {{backend, 5}};
+        EXPECT_TRUE(candidates(config, inventory).empty());
+    }
+}
+
+TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsRequireBothVendorsInHybridTPPP)
+{
+    auto inventory = hosts(1);
+    cards(inventory, 0, DeviceType::CUDA, 2);
+    cards(inventory, 0, DeviceType::ROCm, 4);
+    auto config = request({DeviceType::CUDA, DeviceType::ROCm}, {OrchestrationStrategy::PipelineParallel});
+    config.automatic_planning.device_counts = {{DeviceType::CUDA, 2}, {DeviceType::ROCm, 2}};
+    const auto proposals = candidates(config, inventory);
+    ASSERT_EQ(proposals.size(), 36u); // Six ROCm subsets, both orders, three splits.
+    for (const auto &proposal : proposals)
+    {
+        ASSERT_EQ(proposal.config.domain_definitions.size(), 2u);
+        std::set<DeviceType> vendors;
+        for (const auto &domain : proposal.config.domain_definitions)
+        {
+            ASSERT_EQ(domain.devices.size(), 2u);
+            EXPECT_EQ(domain.devices[0].device_type, domain.devices[1].device_type);
+            vendors.insert(domain.devices[0].device_type);
+        }
+        EXPECT_EQ(vendors, (std::set{DeviceType::CUDA, DeviceType::ROCm}));
+        compile(proposal);
+    }
+}
+
+/**
+ * @brief Reproduce a two-socket host where both MPI ranks can enumerate all GPUs.
+ *
+ * An automatic 2xCUDA/4xROCm overlay previously selected both tiers on rank
+ * zero.  That passed inventory and memory admission, then failed while the
+ * CUDA graph tried to lower ROCm participant work without a rank executor.
+ */
+TEST(AutomaticOrchestrationCandidates,
+     ExactDeviceCountsMixedVendorOverlayRequiresRealRankBoundary)
+{
+    auto inventory = hosts(2);
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].local_rank = 1;
+    cards(inventory, 0, DeviceType::CUDA, 2);
+    cards(inventory, 0, DeviceType::ROCm, 4);
+    for (auto &gpu : inventory.ranks[0].gpus)
+        if (gpu.type == DeviceType::ROCm)
+            gpu.numa_node = inventory.ranks[1].cpu.numa_node;
+    inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    inventory.buildNodeAggregations();
+
+    auto config = request({DeviceType::CUDA, DeviceType::ROCm},
+        {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts =
+        {{DeviceType::CUDA, 2}, {DeviceType::ROCm, 4}};
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_EQ(proposals.size(), 8u); // Both continuation directions and dense policies.
+    for (const auto &proposal : proposals)
+    {
+        EXPECT_EQ(proposal.membership.discoveryRanks().size(), 2u);
+        const auto &domains = proposal.config.moe_routed_expert_plan->domains;
+        ASSERT_EQ(domains.size(), 2u);
+        EXPECT_NE(domains[0].owner_rank, domains[1].owner_rank);
+        compile(proposal, true);
+    }
+}
+
+TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsUsePhysicalNotRankCardinality)
+{
+    auto inventory = hosts(2);
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    cards(inventory, 0, DeviceType::ROCm, 1);
+    inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    inventory.buildNodeAggregations();
+    auto config = request({DeviceType::ROCm}, {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {{DeviceType::ROCm, 2}};
+    EXPECT_TRUE(candidates(config, inventory, true).empty());
+
+    // A three-host CPU pool loses the continuation host during remote offload
+    // construction. That removed socket cannot satisfy a requested CPU count.
+    inventory = hosts(3);
+    cards(inventory, 0, DeviceType::CUDA, 1);
+    config = request({DeviceType::CUDA, DeviceType::CPU}, {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {{DeviceType::CUDA, 1}, {DeviceType::CPU, 3}};
+    EXPECT_TRUE(candidates(config, inventory, true).empty());
+    config.automatic_planning.device_counts = {{DeviceType::CUDA, 1}, {DeviceType::CPU, 2}};
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_EQ(proposals.size(), 1u);
+    EXPECT_EQ(proposals.front().config.moe_routed_expert_plan->domains[1].participants.size(), 2u);
 }
 
 /**

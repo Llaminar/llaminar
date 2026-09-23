@@ -109,9 +109,9 @@ namespace llaminar2
 
         /**
          * @brief Launch discovery without narrowing it to selected inference endpoints.
-         * @param config Hostfile or saved membership, rank-count and diagnostic intent.
+         * @param config Hostfile, saved membership, or local automatic rank-count intent.
          * @return Slot-driven MPI launch; workers resolve affinity on each host.
-         * @throws std::invalid_argument without discovery intent or a saved local launch size.
+         * @throws std::invalid_argument without a complete discovery launch intent.
          */
         static MPILaunchConfig discoveryLaunchConfig(const OrchestrationConfig &config);
 

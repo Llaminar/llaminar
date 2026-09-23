@@ -302,7 +302,7 @@ not included in any canonical throughput result.
 Gate receipt: `/tmp/qwen38-empty-prefix-proof.{json,log}`; artifact root:
 `/tmp/production-campaign-artifacts/20260907T233213Z-671908-1788823933654173967`.
 The new functional registration is `V2_Integration_CUDAFlashDecodeEmptyPrefix`
-in `ProductionParityPreflight`. The separate performance fixture now uses
+in `ProductionTestPreflight`. The separate performance fixture now uses
 `CUDAGraphCapture` plus `ScopedBackendGraphCapture`, rather than a second raw
 capture owner. Its final six-point run passes exact output and 128-node shape
 checks (`/tmp/qwen38-decode-empty-branch-scoped-micro.log`). The final rebuilt
@@ -1357,7 +1357,7 @@ claim that the end-to-end goal has already passed.
 candidate, with native weight types and compile-time 2/4/8-row tiles. It does
 not select itself or change the installed production bridge. The permanent
 `V2_Integration_CUDATinyProjectionSharedOperands` registration joins
-`ProductionParityPreflight`; it covers **1,944 cases**, each with two weight
+`ProductionTestPreflight`; it covers **1,944 cases**, each with two weight
 batches and complete output checks after every one of 20 poisoned replays.
 All finite FP16/BF16 encodings and M/N/K arithmetic tails are included. It and
 the established production projection test pass together in **9.41 s**.
@@ -1490,7 +1490,7 @@ path. It covers KB=31/32/33/63/64 and explicitly exercises the 16-column
 1024-thread limit without pretending the 32-column geometry supports KB>32.
 All queried physical specializations have zero local storage and nonzero
 occupancy. Rejected bindings also leave a surrounding captured transaction
-valid. The test is a model-free `ProductionParityPreflight` member, while the
+valid. The test is a model-free `ProductionTestPreflight` member, while the
 header-only test belongs to the complete Unit inventory. Receipt:
 `/tmp/qwen38-fused-kpar-functional-fixed.log`.
 
@@ -1616,7 +1616,7 @@ inheritance for both fused widths. The 850 parameter cases still perform 20
 replays per admitted path. **182 focused Python tests pass**, including
 compiled/generated C++ family/KB selection, adapter tamper rejection, and
 analytical ownership features. The fresh complete gates pass **637/637 Unit**
-in **69.31 s** and **102/102 ProductionParityPreflight** in **345.04 s**.
+in **69.31 s** and **102/102 ProductionTestPreflight** in **345.04 s**.
 The first Unit pass found only the old registry-cardinality assertion; it now
 requires the exact additional 96 physical width/KB pairs, and the entire Unit
 gate was repeated successfully. No new real-model campaign or E2E performance

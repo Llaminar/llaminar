@@ -365,8 +365,8 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
      && case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}" in \
-            ON) integration_targets="v2_unit_gate v2_production_parity_preflight_gate v2_model_parity_matrices" ;; \
-            OFF) integration_targets="v2_unit_gate v2_production_parity_preflight_gate" ;; \
+            ON) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
+            OFF) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
             *) echo "Unsupported LLAMINAR_BUILD_MODEL_PARITY_MATRICES='${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}'. Use ON or OFF." >&2; exit 1 ;; \
         esac \
      && echo "==> [integration] cmake build (parallel; matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES})" \
@@ -677,7 +677,7 @@ ENTRYPOINT []
 CMD ["bash"]
 
 LABEL org.opencontainers.image.title="Llaminar test runner" \
-      org.opencontainers.image.description="Sealed Unit and ProductionParityPreflight runner" \
+      org.opencontainers.image.description="Sealed Unit and ProductionTestPreflight runner" \
       org.opencontainers.image.source="https://github.com/llaminar/llaminar" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}" \

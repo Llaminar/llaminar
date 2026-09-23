@@ -11503,7 +11503,7 @@ namespace llaminar2::test
      * double-buffer slots. That complete command directory is required, but it
      * must never become a stream/event-per-slot allocation. A typed execution
      * pool carries the configured physical cycle bound, and a real-device
-     * topology-sized regression belongs to production parity preflight.
+     * topology-sized regression belongs to production test preflight.
      */
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
          MappedTransferProgressUsesBoundedTypedExecutionLanes)
@@ -11632,7 +11632,7 @@ namespace llaminar2::test
             countOccurrences(
                 cmake, "V2_Integration_MappedTransferProgressEpoch"),
             2u)
-            << "The registered real-device regression must also be in the production parity preflight inventory";
+            << "The registered real-device regression must also be in the production test preflight inventory";
     }
 
     /**

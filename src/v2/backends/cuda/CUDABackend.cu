@@ -18,6 +18,7 @@
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
+#include "../../transfer/CapturedTransferChannelProtocol.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
@@ -158,6 +159,7 @@ namespace llaminar2
         }
 
 #include "../../kernels/common/MappedHostCopyDevice.inl"
+#include "../../kernels/common/CapturedTransferChannelDevice.inl"
 
         /**
          * @brief Snapshot every host-published transfer slot into device memory.
@@ -5656,6 +5658,43 @@ namespace llaminar2
             return false;
         }
         return true;
+    }
+
+    bool CUDABackend::prepareCapturedTransferChannelKernels(
+        int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
+    {
+        if (!timeout_ticks || timeout_ms <= 0 || device_id < 0 || device_id >= device_count_ || !setDevice(device_id))
+            return false;
+        *timeout_ticks = 0;
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, capturedTransferAcquireKernel) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferPublishKernel) != cudaSuccess)
+            return false;
+        // The graph wait uses %globaltimer nanoseconds, not a DVFS-dependent
+        // SM cycle count or a queried maximum shader frequency.
+        *timeout_ticks = 1'000'000ULL * static_cast<std::uint64_t>(timeout_ms);
+        return prepareMappedHostCopyKernels(device_id);
+    }
+
+    bool CUDABackend::enqueueCapturedTransferChannelBoundary(
+        const CapturedTransferChannelDeviceBinding &binding,
+        CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannelBoundary");
+        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        // One warp orders metadata only. Payload throughput belongs to the
+        // existing multi-block copy, not a serial copy inside a wait kernel.
+        switch (operation)
+        {
+        case CapturedTransferBoundaryOperation::Acquire:
+            capturedTransferAcquireKernel<<<1, 32, 0, native>>>(binding);
+            break;
+        case CapturedTransferBoundaryOperation::Publish:
+            capturedTransferPublishKernel<<<1, 32, 0, native>>>(binding);
+            break;
+        default: return false;
+        }
+        return cudaGetLastError() == cudaSuccess;
     }
 
     bool CUDABackend::copyDeviceVisibleRegionByKernelOnStream(

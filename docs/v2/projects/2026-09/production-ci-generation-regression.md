@@ -1469,7 +1469,7 @@ The runtime HTTP driver belongs on the host so it can launch the tested
 Release image, while Unit/preflight belongs inside the corresponding builder.
 `run_production_prerequisites.py` exposes that model-free transaction without
 copying the inventories or gate state machine. It calls the existing
-`run_production_parity_preflight()` authority, which owns build/installation
+`run_production_test_preflight()` authority, which owns build/installation
 authentication, both complete CTest phases, the receipt and XML/log evidence.
 No nested Docker socket, extra model staging, receipt synthesis or skip path
 is added. The eventual outer generation transition still needs to bind the
@@ -1991,7 +1991,7 @@ full Unit-plus-Integration prerequisite
 receipt, Release model run, image certificate or checkpoint is claimed.
 
 The previous complete publication/fixture gate passed **650/650 Unit** in
-74.42 seconds and **155/155 ProductionParityPreflight** in 592.10 seconds,
+74.42 seconds and **155/155 ProductionTestPreflight** in 592.10 seconds,
 with no failed or skipped CTest entries. Evidence is preserved in
 `native-publication-final-unit-01.log` and
 `native-publication-final-preflight-01.log`. Both complete epoch suites and
@@ -3199,7 +3199,7 @@ was treated as explicit, disabling normal MPI worker binding after CPU-set
 lookup failed. Parsed-address locality now replaces colon counting on all
 backend/configuration surfaces, and missing explicit physical placement fails
 before launch. The focused parser/bootstrap and real self-launch tests pass;
-the new model-free integration test belongs to `ProductionParityPreflight`.
+the new model-free integration test belongs to `ProductionTestPreflight`.
 Twenty repeats pass (100 MPI launches, 118.08 seconds), followed by fresh
 647/647 Unit and 129/129 preflight gates. The exact CPU Off control now passes
 all four 384-token requests with repeatability, real RAM full/partial hybrid

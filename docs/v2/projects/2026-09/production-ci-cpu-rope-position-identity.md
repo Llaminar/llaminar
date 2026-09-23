@@ -76,7 +76,7 @@ partially initialized before a different head partition reads it. The four
 focused tests now pass **20/20 complete repetitions**, approximately 57 ms
 per repetition. This explicitly includes the 139/19 split, ordinary serial
 rows, grouped verifier rows, and 1/3/7-worker outer teams. The RoPE CTest entry
-now explicitly declares `NO_MODELS` and joins `ProductionParityPreflight`.
+now explicitly declares `NO_MODELS` and joins `ProductionTestPreflight`.
 The registration guard caught the initially inherited model fixture before
 running tests. The corrected first gate passed all 780 tests in 662.180 s
 including its build. Its evidence predates the implicit-position change below.

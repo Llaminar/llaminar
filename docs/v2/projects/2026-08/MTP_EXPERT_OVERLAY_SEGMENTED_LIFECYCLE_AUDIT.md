@@ -1138,7 +1138,7 @@ exclusive publication graph. Only terminal model teardown may fence and
 destroy it. CUDA and ROCm integration tests now force the first rotation before
 capturing publication work, prove replay on the reserved stream, and prove
 that a genuinely late stream remains fatal. Those tests stay in the model-free
-`ProductionParityPreflight` gate so this lifecycle is certified before any
+`ProductionTestPreflight` gate so this lifecycle is certified before any
 real-weight campaign starts.
 
 ## Follow-up: static graphs falsely claimed deferred histogram ownership
@@ -1254,7 +1254,7 @@ shadow. The one blocking fence is permitted only after inference admission has
 stopped and covers the complete producer family. CUDA and ROCm model-free
 integration regressions deliberately retire the DAG, destroy the external
 producer stream, and only then destroy the runtime table. Both registrations
-are part of `ProductionParityPreflight`, and a unit source-policy assertion
+are part of `ProductionTestPreflight`, and a unit source-policy assertion
 locks the retirement call ahead of graph/context destruction.
 
 ## Follow-up: snapshot manifest construction observed device-owned KV state
@@ -1369,7 +1369,7 @@ hooks have been removed. MTP publication now has only two graph-node outcomes:
 a verifier-capturing state owner restores its selected row and detaches scratch,
 or a non-state stage is skipped. CPU-only protocol tests prove the layout and
 accounting through TP=8; captured CUDA and ROCm integration tests prove both
-state kinds byte-exact through TP=8 and run in `ProductionParityPreflight`.
+state kinds byte-exact through TP=8 and run in `ProductionTestPreflight`.
 
 ## Follow-up: device-owned restoration crossed split teardown authorities
 
@@ -1603,7 +1603,7 @@ comparisons; the remaining schedules happened to stay byte exact. The
 canonical four-cell CPU NodeTP campaign then passed Static/Dynamic and
 Ordinal/Random placement, validated all 32 CSV artifacts, and completed in
 168.3 seconds including its model-free preflight. A dedicated model-free
-CPU-hybrid integration regression now runs in `ProductionParityPreflight` so
+CPU-hybrid integration regression now runs in `ProductionTestPreflight` so
 the cross-epoch contract is checked before any model campaign starts.
 
 ## Follow-up: rank-local fail-fast crossed parity-cell identity

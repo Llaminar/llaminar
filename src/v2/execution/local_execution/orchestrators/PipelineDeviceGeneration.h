@@ -4,8 +4,10 @@
  *
  * The vocabulary stage alone admits a response budget and runs a sampler.
  * Earlier stages receive only a continuation command and token; their layer
- * caches remain independent owners. Native collectives connect local graphs,
- * never a nested multi-device graph or a host token loop.
+ * caches remain independent owners. Native collectives connect homogeneous
+ * participants. Cross-vendor domain leaders use captured TransferEngine channels,
+ * while the terminal domain's authenticated ticket selects complete local
+ * transactions. Neither case creates a nested multi-device graph or host sampler.
  */
 #pragma once
 #include "IInferenceRunner.h"
@@ -19,6 +21,8 @@ namespace llaminar2
 {
 class DeviceGraphOrchestrator;
 class LocalTPContext;
+class ILocalTPContext;
+class CapturedTransferChannel;
 class TPWorkerPool;
 class PipelineForwardGraphEdges;
 
@@ -26,13 +30,13 @@ class PipelineForwardGraphEdges;
 class PipelineDeviceGeneration final
 {
 public:
-    /** @return Whether the declared stage set is a homogeneous local GPU pipeline.
+    /** @return Whether every declared layer domain is GPU-resident.
      * This is topology classification only; construction still validates every
      * role and backend capability, with no alternative on admission failure. */
-    static bool isHomogeneousGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages);
-    /** @brief Freeze ordered stages and construct their native collective owner.
+    static bool isGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages);
+    /** @brief Freeze ordered domains and their exact native/cross-vendor edges.
      * @param stages Stable participant runners, in layer order, tail last.
-     * @throws std::invalid_argument for incomplete or non-native composition. */
+     * @throws std::invalid_argument for incomplete or unsupported composition. */
     explicit PipelineDeviceGeneration(std::span<const std::unique_ptr<IInferenceRunner>> stages);
     /** @brief Join workers; stage graphs must already be retired by their owners. */
     ~PipelineDeviceGeneration();
@@ -42,6 +46,8 @@ public:
     bool prepareServing(const ServingGraphFamilyMaterializationPlan &plan);
     /** @return Whether native prefill edge ownership has been frozen. */
     bool prefillPrepared() const noexcept { return forward_edges_.size() == stages_.size(); }
+    /** @return Whether the installed terminal and every local follower own publication. */
+    bool supportsMTPPublication() const;
     /** @brief Admit request inputs once per stage and submit captured chunk DAGs.
      * @param tokens Immutable unprocessed token span (the suffix after a prefix hit).
      * @param count Rows in that span, excluding restored tokens and bucket padding.
@@ -63,6 +69,11 @@ public:
      * @param terminal Exact tail verifier operation; followers receive its resident rows.
      * @return Whether all stages submitted the same retained physical geometry. */
     bool forwardMTPVerifier(int logical_rows, const std::function<bool(IInferenceRunner &)> &terminal);
+    /** @brief Publish one tail outcome into each participant's own KV/recurrent state.
+     * @param request Tail-owned immutable outcome handle and publication geometry.
+     * @param error Receives the first participant's publication diagnostic.
+     * @return Whether every captured commit was submitted, without host outcome reads. */
+    bool publishMTPOutcome(const DeviceSpeculativePublicationRequest &request, std::string *error);
     /** @brief Admit the tail's policy and each follower's local event handoff. */
     bool begin(const DeviceGenerationAdmissionRequest &request);
     /** @brief Compile or reuse all complete parents before submitting any work. */
@@ -76,6 +87,34 @@ public:
     bool active() const noexcept { return phase_ != Phase::Idle; }
 
 private:
+    /** @brief Frozen layer-domain role; its runner remains the TP authority. */
+    struct Domain
+    {
+        IInferenceRunner *runner;
+        ILocalTPContext *context;
+        size_t first;
+        size_t count;
+    };
+    /** @brief Two opposite directions, shared by every retained graph family. */
+    struct Boundary
+    {
+        std::shared_ptr<CapturedTransferChannel> activation;
+        std::shared_ptr<CapturedTransferChannel> metadata;
+    };
+    /** @brief Exact installed composition, not a runtime failure alternative. */
+    enum class Transport { NativePipeline, CapturedDomains };
+    /** @return Frozen domain containing one flattened participant. */
+    const Domain &domainFor(size_t participant) const;
+    /** @return First participant of the terminal domain (not the last physical GPU). */
+    size_t terminalIndex() const noexcept { return domains_.back().first; }
+    /** @return Whether a participant belongs to the one terminal authority. */
+    bool terminalParticipant(size_t index) const noexcept { return index >= terminalIndex(); }
+    /** @brief Abort every installed native communicator after a fatal partial submission. */
+    void abortParticipants();
+    /** @brief Materialize admitted channels, before any graph borrows their identities. */
+    void prepareDomainBoundaries();
+    /** @brief Submit complete ordinary follower transactions around terminal-domain tickets. */
+    bool launchHostedDomainTransactions();
     /** @brief Host submission lifecycle only; no mirrored device decision state. */
     enum class Phase { Idle, Admitted, Materialized, Submitted, Failed };
     /** @brief Persistent worker fanout for setup, never a per-token dispatch. */
@@ -88,11 +127,27 @@ private:
         const std::function<bool(IInferenceRunner &)> &terminal);
     /** @brief Record the exact native command and adjacent activation edges. */
     bool composeParticipants();
+    /** @brief Borrow the tail policy and the followers' exact verifier/commit captures.
+     * @param depth Fixed depth or dynamic policy's maximum captured depth.
+     * @param topology Must match the tail's admitted device controller.
+     * @param sampling Tail's greedy/stochastic outcome policy.
+     * @return Whether every participant has a complete current transaction. */
+    bool prepareSpeculativeParticipants(int depth, DeviceGenerationLoopTopology topology,
+        DeviceGenerationSamplingMode sampling);
+    /** @brief Compose complete follower transactions and native continuation commands.
+     * The tail retains the sole depth selector; followers execute a fixed physical
+     * verifier envelope whose logical row count arrives through captured edges. */
+    bool composeSpeculativeParticipants();
+    /** @brief Submit HIP follower transactions only from authenticated tail tickets. */
+    bool launchHostedSpeculativeTransactions();
     /** @brief Submit complete HIP transactions selected solely by tail tickets.
      * Every follower is submitted before the next ticket is observed. The host
      * neither samples tokens nor inspects mutable model/cache state. */
     bool launchHostedTransactions();
     std::vector<DeviceGraphOrchestrator *> stages_;
+    std::vector<Domain> domains_;
+    std::vector<Boundary> boundaries_;
+    Transport transport_ = Transport::NativePipeline;
     std::unique_ptr<LocalTPContext> collective_;
     std::unique_ptr<TPWorkerPool> workers_;
     /** Frozen edge owners outlive the stages' borrowed forward-cache identities. */

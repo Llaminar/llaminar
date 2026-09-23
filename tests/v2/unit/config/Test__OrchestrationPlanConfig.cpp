@@ -328,6 +328,23 @@ TEST(OrchestrationPlanConfig, HostfileLaunchDelegatesSlotsAndRemoteGeometryToMPI
     EXPECT_EQ(MPIBootstrapPhase::discoveryLaunchConfig(request).num_procs, 7);
 }
 
+/** @brief Auto discovery must not pin every requested rank to NUMA zero. */
+TEST(OrchestrationPlanConfig, AutomaticLocalMpiWorldRetainsSocketDiscovery)
+{
+    OrchestrationConfig request;
+    request.planning_mode = OrchestrationPlanningMode::Automatic;
+    request.mpi_procs = 2;
+    const auto launch = MPIBootstrapPhase::discoveryLaunchConfig(request);
+    EXPECT_EQ(launch.num_procs, 2);
+    EXPECT_TRUE(launch.cpu_set.empty());
+    EXPECT_TRUE(launch.bind_to_socket);
+    EXPECT_TRUE(launch.map_by_socket);
+    EXPECT_EQ(launch.omp_threads_per_rank, 0);
+    request.planning_mode = OrchestrationPlanningMode::Apply;
+    EXPECT_THROW(MPIBootstrapPhase::discoveryLaunchConfig(request),
+                 std::invalid_argument);
+}
+
 TEST(OrchestrationPlanConfig, SavedLocalSelectionCannotNarrowTheDiscoveryLaunchToItsCpuPin)
 {
     OrchestrationConfig request;

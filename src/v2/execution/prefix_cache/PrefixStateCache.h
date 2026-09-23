@@ -42,6 +42,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Outcome of preparing a bounded RAM archive publication.
+     *
+     * Busy means the cache has retired every reclaimable entry but an active
+     * request or DMA still owns physical archive bytes. It is ordinary cache
+     * admission pressure, not a failed inference or a broken storage edge.
+     * Error denotes an invalid key, unsafe replacement, or failed tier write.
+     */
+    enum class PrefixRamInsertPreparation
+    {
+        Prepared,
+        Busy,
+        Error,
+    };
+
+    /**
      * @brief Total state transition produced by a runtime fingerprint rebase.
      *
      * `InvalidateOnRebalance` creates a new request namespace when the sole
@@ -220,15 +235,15 @@ namespace llaminar2
          * required replacement boundary before the caller allocates storage.
          *
          * The operation rejects retained resident entries. On success no cache
-         * tier contains @p key and enough cache-managed RAM capacity is available
-         * for @p incoming_bytes. A later allocation or copy failure simply leaves
-         * the key absent; stale payloads are never restored as a fallback.
+         * tier contains @p key and both logical and physically leased RAM
+         * capacity are available for @p incoming_bytes. A later allocation or
+         * copy failure leaves the key absent; stale payloads never reappear.
          *
          * @param key Key that the new archive will publish.
          * @param incoming_bytes Total RAM bytes required by the new archive.
-         * @return true when replacement and capacity preparation both succeed.
+         * @return Prepared, temporary physical-capacity contention, or error.
          */
-        bool prepareInsert(
+        PrefixRamInsertPreparation prepareInsert(
             const PrefixCacheKey &key,
             size_t incoming_bytes);
 
@@ -256,6 +271,9 @@ namespace llaminar2
         bool insertResident(PrefixBlockHandle handle, bool count_store, bool preserve_disk_entry = false);
         bool evictResident(const PrefixCacheKey &key);
         bool evictUntilFits(size_t incoming_bytes);
+        /** @brief Reclaim cache-owned aliases until PMA can lease RAM bytes. */
+        PrefixRamInsertPreparation evictUntilPhysicallyFits(
+            size_t incoming_bytes);
         bool removeDeviceHotEntry(
             const PrefixCacheKey &key,
             bool capacity_eviction);

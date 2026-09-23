@@ -149,7 +149,7 @@ diagnostic only, never inputs to the independent HF generator.
 
 Every confirmed device defect exposed by this stronger gate must be reduced to
 a model-free integration regression, registered in the CMake-owned
-`V2_PRODUCTION_PARITY_PREFLIGHT_TESTS` inventory, and verified on every affected
+`V2_PRODUCTION_TEST_PREFLIGHT_TESTS` inventory, and verified on every affected
 backend/format before the broader campaign resumes. Race/lifetime fixes need
 the requested twenty-repeat stability proof as well. The device-free comparator
 tests alone cannot close an actual device-execution defect.

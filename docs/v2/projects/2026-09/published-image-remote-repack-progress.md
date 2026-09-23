@@ -483,7 +483,7 @@ replay. It does not contain RCCL, MPI, a model, or shared graph mutation:
 - Stock runtime: fails in **3.676 seconds**, with missing result words.
 - Repaired runtime: **20/20 repeated passes**, approximately 3–4 seconds each.
 - Canonical installer output, through registered CTest: passes in **3.49
-  seconds**; explicitly registered in `ProductionParityPreflight`.
+  seconds**; explicitly registered in `ProductionTestPreflight`.
 
 The repair makes scheduling use node object identity, not diagnostic labels,
 and gives graph/node labels relaxed atomic counters. It leaves parallel graph
@@ -575,7 +575,7 @@ completes successfully and publishes both runtime tags from source
 `6f823000cd0654cf70b1187cae2128aff551ce95`. The image-bound prerequisite receipts
 cover the complete installed inventories, not a selected subset:
 
-| Runtime ISA | Unit | ProductionParityPreflight | Gate wall time |
+| Runtime ISA | Unit | ProductionTestPreflight | Gate wall time |
 |---|---:|---:|---:|
 | AVX512 | 661/661 | 278/278 | 653.464 s |
 | AVX2 | 661/661 | 266/266 | 596.606 s |

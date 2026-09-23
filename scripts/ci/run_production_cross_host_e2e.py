@@ -39,7 +39,7 @@ from docker_paths import validate_attached_execution
 from model_parity_inventory import InventoryScope, cross_host_scenarios
 from production_artifacts import CPUISA, digest, image_cpu_isa, image_identity, runtime_image_content, write_json
 from run_model_parity_e2e import (
-    E2ECellBudget, cell_timeout_seconds, certification_environment, run_e2e_process, validate_long_context_evidence,
+    E2ECellBudget, cell_timeout_seconds, certification_environment, run_e2e_process, validate_http_cell_evidence,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -564,7 +564,8 @@ def run_case(parent: dict, scenario: dict, image: RuntimeImage, model_dir: Path,
     plan_policy = list(policy)
     if scenario["frontend"] == "plan-apply":
         policy = ["--config", str(CASE_ROOT / "plan.json")]
-    profile = {**configuration["e2e"], "movement_evidence": scenario["movement_evidence"]}
+    profile = {**configuration["e2e"], "movement_evidence": scenario["movement_evidence"],
+               "planning": scenario["planning"]}
     env = certification_environment(profile, artifact)
     plan_args = ["plan", "-m", f"/opt/llaminar-models/{model.name}",
                  *plan_policy, "--format", "json",
@@ -653,7 +654,7 @@ def validate_case_evidence(directory: Path, scenario: dict, profile: dict) -> No
     suite also writes that artifact. Use the ordinary HTTP validator so remote
     certification cannot silently acquire weaker behavioral gates.
     """
-    validate_long_context_evidence(directory, profile)
+    validate_http_cell_evidence(directory, profile)
     proof_files = list(directory.glob("*.cross-host.json"))
     if len(proof_files) != 1:
         raise ValueError("cross-host cell requires exactly one transport observer result")

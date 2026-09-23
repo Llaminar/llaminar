@@ -8,7 +8,7 @@ omitting nodes and dependent paths while graph launch still returned success.
 
 Use object identity for scheduling and relaxed atomic counters for labels.
 No graph capture, packet batching, concurrency, or inference policy is disabled.
-Covered by V2_Integration_HIPConcurrentGraphIdentity in ProductionParityPreflight.
+Covered by V2_Integration_HIPConcurrentGraphIdentity in ProductionTestPreflight.
 
 diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
 --- a/hipamd/src/hip_graph_internal.cpp

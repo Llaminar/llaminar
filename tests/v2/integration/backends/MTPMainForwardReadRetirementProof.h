@@ -102,6 +102,10 @@ namespace llaminar2
             return static_cast<bool>(runner.pipeline_publication_transport_);
         }
 
+        /** @return Opaque retained setup identity, without exposing native graph internals. */
+        static const PipelinePublicationTransport *publicationTransportIdentity(DeviceGraphOrchestrator &runner)
+        { return runner.pipeline_publication_transport_.get(); }
+
         /** @brief Test terminal native resource retirement without exposing arena storage. */
         static void retirePublicationTransport(DeviceGraphOrchestrator &runner)
         { runner.pipeline_publication_transport_.reset(); }
@@ -166,7 +170,8 @@ namespace llaminar2
         {
             runner.state_.device_id = device;
             return runner.initializeShiftedMTPKVReadyEvent() &&
-                   runner.initializeMTPPrefillTerminalArchiveReadyEvent();
+                   runner.initializeMTPPrefillTerminalArchiveReadyEvent() &&
+                   runner.initializeForwardGraphOutputReadyEvent();
         }
 
         /** @brief Publish the exact sidecar stream after its captured read. */
@@ -259,6 +264,7 @@ namespace llaminar2
         {
             MainForward, ///< A main graph borrows without taking the sidecar handoff.
             MetadataThenMailbox, ///< Metadata borrows; the actual mailbox writer consumes.
+            PipelineForwardPredecessor, ///< A headless participant has no sampler to join its last forward.
         };
         /**
          * @brief Forced publication must retire the preceding forward before reuse.
@@ -432,6 +438,9 @@ namespace llaminar2
             runner = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
             using Peer = DeviceGraphOrchestratorLiveStateTestAccess;
             ASSERT_TRUE(Peer::initialize(*runner, device));
+            if (boundary == MTPReadRetirementBoundary::PipelineForwardPredecessor)
+                runner->setPPStageConfig({.first_layer = 0, .last_layer = 1,
+                    .has_embedding = true, .has_lm_head = false});
             constexpr std::array roles{ForwardExecutionRole::MainInference,
                 ForwardExecutionRole::MTPCondition, ForwardExecutionRole::GroupedMTPVerifier};
             for (std::uint32_t round = 1; round <= 20; ++round)
@@ -443,7 +452,10 @@ namespace llaminar2
                 ASSERT_TRUE(backend.streamWaitTimelineSignal64(
                     streams[1], control->deviceAlias(device), round, ordinal));
                 ASSERT_TRUE(graphs[1]->launch());
-                ASSERT_TRUE(Peer::publishRead(*runner, streams[1]));
+                if (boundary == MTPReadRetirementBoundary::PipelineForwardPredecessor)
+                    ASSERT_TRUE(Peer::publishForward(*runner, device, streams[1], roles[(round - 1) % roles.size()]));
+                else
+                    ASSERT_TRUE(Peer::publishRead(*runner, streams[1]));
                 if (boundary == MTPReadRetirementBoundary::MetadataThenMailbox)
                 {
                     // Repeated metadata readers join a third stream. That wait
@@ -457,11 +469,12 @@ namespace llaminar2
                 }
                 else
                 {
-                    if (round == 1)
+                    if (round == 1 && boundary != MTPReadRetirementBoundary::PipelineForwardPredecessor)
                         EXPECT_THROW(Peer::prepareMain(*runner, nullptr, device, roles[0]),
                                      std::runtime_error);
                     ASSERT_TRUE(Peer::prepareMain(*runner, streams[0], device, roles[(round - 1) % roles.size()]));
-                    EXPECT_TRUE(Peer::publicationRetained(*runner));
+                    if (boundary != MTPReadRetirementBoundary::PipelineForwardPredecessor)
+                        EXPECT_TRUE(Peer::publicationRetained(*runner));
                 }
                 ASSERT_TRUE(graphs[2]->launch());
                 ASSERT_TRUE(context.recordEventChecked(events[1], streams[0]));

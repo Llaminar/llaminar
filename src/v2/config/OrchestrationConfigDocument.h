@@ -7,7 +7,8 @@
  * to fresh PhysicalMemoryAuthority admission, never transferable live grants.
  * Optional policy values remain optional instead of becoming today's defaults.
  * The current version carries ordered discovery-rank selection, explicit
- * host-participation intent and the optional planning workload. Older documents are rejected rather
+ * host-participation intent, optional planning workload and exact physical
+ * backend-device counts. Older documents are rejected rather
  * than silently assigning newly introduced policy defaults.
  */
 #pragma once
@@ -19,7 +20,7 @@
 namespace llaminar2
 {
     /** @brief Exact field schema shared by the writer and fail-closed reader. */
-    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 4;
+    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 5;
 
     /**
      * @brief Encode every supported configuration field without normalization.

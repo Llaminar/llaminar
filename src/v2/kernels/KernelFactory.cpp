@@ -3961,7 +3961,7 @@ namespace llaminar
                 const int effective_layers =
                     hybrid_config ? hybrid_config->countKVLayers()
                                   : num_layers;
-                if (effective_kv_heads <= 0 || effective_layers <= 0 || head_dim <= 0)
+                if (effective_kv_heads <= 0 || effective_layers < 0 || head_dim <= 0)
                     return 0;
 
                 std::string prec_str;

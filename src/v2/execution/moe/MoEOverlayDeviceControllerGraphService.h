@@ -537,6 +537,7 @@ namespace llaminar2
             PublishAdmission,
             PublishRetirementReadiness,
             Retire,
+            AcknowledgeRetired,
             Complete,
         };
 

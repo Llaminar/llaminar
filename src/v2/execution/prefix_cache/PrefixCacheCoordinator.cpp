@@ -143,9 +143,19 @@ namespace llaminar2
         participant.cache_enabled = hit.cache_enabled;
         participant.hit = hit.cached_tokens > 0;
         participant.matched_tokens = nonNegative(hit.cached_tokens);
-        participant.matched_blocks = !hit.blocks.empty()
-                                         ? static_cast<int>(hit.blocks.size())
-                                         : (hit.block_size > 0 ? participant.matched_tokens / hit.block_size : 0);
+        // Coordination compares logical coverage, not allocation count. One
+        // complete recurrent checkpoint can cover the same prefix as many
+        // attention blocks. A partial chunk needs an actual retained boundary
+        // witness; metadata alone only certifies complete block coverage.
+        const bool retained_terminal_boundary = !hit.blocks.empty() &&
+            hit.blocks.back().key.token_count > 0 &&
+            hit.blocks.back().key.token_start + hit.blocks.back().key.token_count ==
+                participant.matched_tokens;
+        participant.matched_blocks = hit.block_size > 0
+            ? participant.matched_tokens / hit.block_size +
+                (retained_terminal_boundary &&
+                 participant.matched_tokens % hit.block_size != 0 ? 1 : 0)
+            : 0;
         participant.requires_terminal_logits = hit.requires_terminal_logits;
         participant.requires_terminal_hidden = hit.requires_terminal_hidden;
         participant.has_terminal_logits = hit.has_terminal_logits;

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <iomanip>
+#include <map>
 #include <ostream>
 #include <sstream>
 
@@ -133,8 +134,42 @@ namespace llaminar2::test::parity
     enum class ModelParityRuntimePlacementProjection
     {
         DeclaredCell,
+        AutomaticCell,
         AutomaticRemoteCPUOverlay,
     };
+
+    /** @return The existing cell's strategy family, without fixed device/rank placement. */
+    inline OrchestrationStrategy modelParityAutomaticStrategy(const ModelParityCase &cell)
+    {
+        if (cell.topology.isExpertOverlay())
+            return cell.topology.expert_overlay_plan->domains.size() == 1
+                ? OrchestrationStrategy::TensorParallel : OrchestrationStrategy::ExpertOverlay;
+        switch (cell.topology.kind)
+        {
+        case ModelParityTopologyKind::SingleDevice: return OrchestrationStrategy::SingleDevice;
+        case ModelParityTopologyKind::RankLocalTensorParallel:
+        case ModelParityTopologyKind::NodeTensorParallel:
+        case ModelParityTopologyKind::GlobalTensorParallel: return OrchestrationStrategy::TensorParallel;
+        case ModelParityTopologyKind::RankLocalPipelineParallel:
+        case ModelParityTopologyKind::NodePipelineParallel: return OrchestrationStrategy::PipelineParallel;
+        default: throw std::invalid_argument("canonical E2E topology has no automatic strategy projection");
+        }
+    }
+
+    /** @return Exact compute cardinality from the sole typed topology declaration. */
+    inline std::map<std::string, int> modelParityAutomaticDeviceCounts(const ModelParityCase &cell)
+    {
+        std::map<std::string, int> counts;
+        for (const auto &participant : cell.topology.participants)
+        {
+            const auto &address = participant.address;
+            if (!address.isCPU() && !address.isCUDA() && !address.isROCm())
+                throw std::invalid_argument("canonical E2E has an unsupported compute backend");
+            ++counts[address.isCPU() ? "cpu" : address.isCUDA() ? "cuda" : "rocm"];
+        }
+        if (counts.empty()) throw std::invalid_argument("canonical E2E requires compute participants");
+        return counts;
+    }
 
     /**
      * @brief Project any canonical case onto the Release server's public CLI.
@@ -154,7 +189,8 @@ namespace llaminar2::test::parity
     {
         auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
         const bool automatic_remote = placement == ModelParityRuntimePlacementProjection::AutomaticRemoteCPUOverlay;
-        if (!automatic_remote && placement != ModelParityRuntimePlacementProjection::DeclaredCell)
+        const bool declared = placement == ModelParityRuntimePlacementProjection::DeclaredCell;
+        if (!automatic_remote && !declared && placement != ModelParityRuntimePlacementProjection::AutomaticCell)
             throw std::invalid_argument("invalid model parity placement projection");
         if (automatic_remote)
         {
@@ -174,10 +210,11 @@ namespace llaminar2::test::parity
             out << std::setprecision(9) << value;
             args.insert(args.end(), {flag, out.str()});
         };
-        if (!automatic_remote) add("--mpi-procs", cell.topology.mpi_ranks);
+        if (declared || cell.topology.mpi_ranks > 1)
+            add("--mpi-procs", cell.topology.mpi_ranks);
         add("--activation-precision", config.activation_precision);
         add("--kv-cache-precision", config.kv_cache_precision);
-        if (!automatic_remote) add("--backend", collectiveBackendTypeToString(config.default_backend));
+        if (declared) add("--backend", collectiveBackendTypeToString(config.default_backend));
         if (!config.tp_allreduce_precision_override.empty())
             add("--tp-allreduce-precision", config.tp_allreduce_precision_override);
         args.push_back("--prefix-cache");
@@ -193,6 +230,25 @@ namespace llaminar2::test::parity
             add("--only-backends", cell.topology.participants.front().address.isCUDA() ? "cuda,cpu" : "rocm,cpu");
             add("--only-strategies", "expert-overlay");
             add("--auto-hosts", "all");
+        }
+        else if (!declared)
+        {
+            // This is a search constraint, not a prebuilt apply document. Auto
+            // retains endpoint, rank, layer-split, domain and tier-role choices.
+            // Requiring counts prevents a two-device E2E cell silently passing
+            // as a faster single-device candidate on a larger machine.
+            args.push_back("--auto");
+            std::string backends, cardinality;
+            for (const auto &[backend, count] : modelParityAutomaticDeviceCounts(cell))
+            {
+                backends += (backends.empty() ? "" : ",") + backend;
+                cardinality += (cardinality.empty() ? "" : ",") + backend + "=" + std::to_string(count);
+            }
+            add("--only-backends", backends);
+            add("--auto-device-counts", cardinality);
+            add("--only-strategies", orchestrationStrategyName(modelParityAutomaticStrategy(cell)));
+            if (cell.expert_overlay)
+                add("--moe-routed-expert-owner-order", cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random");
         }
         else if (cell.topology.isExpertOverlay())
         {
@@ -340,6 +396,10 @@ namespace llaminar2::test::parity
                 for (const auto route : kModelParityCrossHostFrontends)
                 {
                     const auto route_name = std::string(modelParityCrossHostFrontendName(route));
+                    const std::string backend = cell.topology.participants.front().address.isCUDA() ? "cuda" : "rocm";
+                    auto route_args = args;
+                    route_args.insert(route_args.end(), {"--auto-device-counts",
+                        backend + "=1,cpu=" + std::to_string(remote.count())});
                     out << (first ? "" : ",") << "{\"schema\":1,\"id\":"
                         << modelParityJsonString(cell.testName() + "_RemoteCPU" + std::to_string(remote.count()) + "_" + route_name)
                         << ",\"frontend\":" << modelParityJsonString(route_name)
@@ -349,9 +409,11 @@ namespace llaminar2::test::parity
                         << ",\"cpu_ranks_per_host\":1,\"execution_ranks\":" << remote.executionRanks()
                         << ",\"continuation_priority\":0,\"remote_priority\":1}"
                         << ",\"movement_evidence\":\"required\",\"owner_order\":\"ordinal\""
+                        << ",\"planning\":{\"mode\":\"auto\",\"strategy\":\"expert-overlay\",\"device_counts\":{"
+                        << modelParityJsonString(backend) << ":1,\"cpu\":" << remote.count() << "}}"
                         << ",\"server_policy_args\":[";
-                    for (std::size_t i = 0; i < args.size(); ++i)
-                        out << (i ? "," : "") << modelParityJsonString(args[i]);
+                    for (std::size_t i = 0; i < route_args.size(); ++i)
+                        out << (i ? "," : "") << modelParityJsonString(route_args[i]);
                     out << "]}";
                     first = false;
                 }
@@ -437,9 +499,41 @@ namespace llaminar2::test::parity
              << ",\"AVX2\":" << profile.cell_timeout_seconds.avx2 << "}"
              << ",\"thinking_modes\":" << modelParityJsonString(modelParityE2EThinkingModesName(profile.thinking_modes))
              << ",\"movement_evidence\":" << modelParityJsonString(modelParityE2EMovementEvidenceName(cell.movementEvidence()))
-             << ",\"server_args\":[";
-        for (std::size_t i = 0; i < args.size(); ++i)
-            *out << (i ? "," : "") << modelParityJsonString(args[i]);
+             << ",\"planning\":{\"mode\":\"auto\",\"mpi_ranks\":"
+             << cell.topology.mpi_ranks << ",\"strategy\":"
+             << modelParityJsonString(std::string(orchestrationStrategyName(modelParityAutomaticStrategy(cell))))
+             << ",\"device_counts\":{";
+        bool first = true;
+        for (const auto &[backend, count] : modelParityAutomaticDeviceCounts(cell))
+        {
+            *out << (first ? "" : ",") << modelParityJsonString(backend) << ':' << count;
+            first = false;
+        }
+        *out << "}";
+        if (cell.topology.kind == ModelParityTopologyKind::RankLocalPipelineParallel)
+        {
+            // This is a shape obligation, not authored placement. Auto retains
+            // device ordinals, domain order and layer split as free choices.
+            *out << ",\"pipeline_layers\":" << cell.model.transformer_layers
+                 << ",\"pipeline_domains\":[";
+            const auto sizes = cell.topology.pipeline_stage_sizes.empty()
+                ? std::vector<int>(cell.topology.participants.size(), 1) : cell.topology.pipeline_stage_sizes;
+            size_t participant = 0;
+            for (size_t stage = 0; stage < sizes.size(); ++stage)
+            {
+                const auto size = sizes[stage];
+                const auto &address = cell.topology.participants.at(participant).address;
+                *out << (stage ? "," : "") << "{\"backend\":"
+                     << modelParityJsonString(address.isCUDA() ? "cuda" : address.isROCm() ? "rocm" : "cpu")
+                     << ",\"devices\":" << size << "}";
+                participant += size;
+            }
+            *out << "]";
+        }
+        *out << "},\"tool_calling\":\"required\",\"server_args\":[";
+        const auto automatic_args = modelParityServerArguments(cell, ModelParityRuntimePlacementProjection::AutomaticCell);
+        for (std::size_t i = 0; i < automatic_args.size(); ++i)
+            *out << (i ? "," : "") << modelParityJsonString(automatic_args[i]);
         *out << "]}}";
     }
 } // namespace llaminar2::test::parity

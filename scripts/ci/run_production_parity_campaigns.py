@@ -10,7 +10,7 @@ runner, arena, graph, stream, and KV state remain exact per cell.
 
 The performance target belongs to the whole selected matrix. Before model
 staging, the driver builds and runs the complete CMake-owned ``V2_Unit_*``
-suite, then runs the ``ProductionParityPreflight`` label: a model-free
+suite, then runs the ``ProductionTestPreflight`` label: a model-free
 integration gate for MPI lifecycle, orchestration, graph, stream/event,
 collective, and movement invariants. It then prepares the model
 fixture once, capacity-checks and atomically stages the complete selected GGUF
@@ -83,11 +83,11 @@ EXACT_CELL_TIMEOUT_SECONDS = 900.0
 REGISTERED_TIMEOUT_SECONDS = COMPLETION_TIMEOUT_SECONDS
 MODEL_FIXTURE_NAME = "V2_Models"
 MODEL_FIXTURE_TEST = "V2_FetchModelsFixture"
-PRODUCTION_PARITY_PREFLIGHT_LABEL = "ProductionParityPreflight"
+PRODUCTION_TEST_PREFLIGHT_LABEL = "ProductionTestPreflight"
 PRODUCTION_PARITY_UNIT_PREFIX = "V2_Unit_"
 PRODUCTION_PARITY_UNIT_LABEL = "Unit"
 PRODUCTION_PARITY_UNIT_BUILD_TARGET = "v2_unit_gate"
-PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET = "v2_production_parity_preflight_gate"
+PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET = "v2_production_test_preflight_gate"
 MODEL_RAMDISK_ROOT = Path("/dev/shm")
 SESSION_IPC_RAMDISK_ROOT = Path("/dev/shm")
 PERSISTENT_MODEL_CACHE_SCHEMA_VERSION = 2
@@ -746,19 +746,19 @@ def discover_production_parity_unit_tests(
     return tuple(names)
 
 
-def discover_production_parity_preflight_tests(
+def discover_production_test_preflight_tests(
     build_dir: Path,
 ) -> tuple[str, ...]:
     """Return the sorted model-free Integration names owned by CTest.
 
     Callers that must schedule the same validated inventory use
-    :func:`discover_production_parity_preflight_registrations`; ordinary
+    :func:`discover_production_test_preflight_registrations`; ordinary
     admission and report code deliberately consumes names only.
     """
 
     return tuple(
         registration.name
-        for registration in discover_production_parity_preflight_registrations(build_dir)
+        for registration in discover_production_test_preflight_registrations(build_dir)
     )
 
 
@@ -862,7 +862,7 @@ def _preflight_execution_lane(
     return ranks, PreflightExecutionLane.HOST
 
 
-def discover_production_parity_preflight_registrations(
+def discover_production_test_preflight_registrations(
     build_dir: Path,
 ) -> tuple[PreflightRegistration, ...]:
     """Discover and validate the model-free integration preflight from CTest.
@@ -881,7 +881,7 @@ def discover_production_parity_preflight_registrations(
             str(build_dir),
             "--show-only=json-v1",
             "-L",
-            f"^{PRODUCTION_PARITY_PREFLIGHT_LABEL}$",
+            f"^{PRODUCTION_TEST_PREFLIGHT_LABEL}$",
         ],
         check=False,
         capture_output=True,
@@ -889,7 +889,7 @@ def discover_production_parity_preflight_registrations(
     )
     if completed.returncode != 0:
         raise RuntimeError(
-            "CTest production parity preflight discovery failed:\n"
+            "CTest production test preflight discovery failed:\n"
             + (completed.stderr or completed.stdout)
         )
 
@@ -899,38 +899,38 @@ def discover_production_parity_preflight_registrations(
         name = str(test.get("name", ""))
         properties = _property_map(test)
         labels = frozenset(_as_string_list(properties.get("LABELS", [])))
-        if PRODUCTION_PARITY_PREFLIGHT_LABEL not in labels:
+        if PRODUCTION_TEST_PREFLIGHT_LABEL not in labels:
             continue
         if not name.startswith("V2_Integration_") or "Integration" not in labels:
             raise RuntimeError(
-                f"production parity preflight is not an Integration test: {name}"
+                f"production test preflight is not an Integration test: {name}"
             )
         if "Campaign" in labels or "FullModel" in labels:
             raise RuntimeError(
-                f"production parity preflight contains a model campaign: {name}"
+                f"production test preflight contains a model campaign: {name}"
             )
         if _as_string_list(properties.get("FIXTURES_REQUIRED", [])):
             raise RuntimeError(
-                f"production parity preflight requires a fixture: {name}"
+                f"production test preflight requires a fixture: {name}"
             )
         if _as_string_list(properties.get("REQUIRED_FILES", [])):
             raise RuntimeError(
-                f"production parity preflight requires model/files: {name}"
+                f"production test preflight requires model/files: {name}"
             )
         try:
             timeout = float(properties.get("TIMEOUT", 0.0))
         except (TypeError, ValueError) as error:
             raise RuntimeError(
-                f"production parity preflight timeout is not numeric: {name}"
+                f"production test preflight timeout is not numeric: {name}"
             ) from error
         if timeout <= 0.0 or timeout > 120.0:
             raise RuntimeError(
-                f"production parity preflight timeout must be in (0, 120] seconds: "
+                f"production test preflight timeout must be in (0, 120] seconds: "
                 f"{name} has {timeout}"
             )
         command = _as_string_list(test.get("command", []))
         if not command:
-            raise RuntimeError(f"production parity preflight has no command: {name}")
+            raise RuntimeError(f"production test preflight has no command: {name}")
         ranks, lane = _preflight_execution_lane(
             name,
             labels,
@@ -943,11 +943,11 @@ def discover_production_parity_preflight_registrations(
     names = tuple(registration.name for registration in registrations)
     if not registrations:
         raise RuntimeError(
-            "no model-free ProductionParityPreflight integration tests discovered"
+            "no model-free ProductionTestPreflight integration tests discovered"
         )
     if len(set(names)) != len(names):
         raise RuntimeError(
-            "CTest returned duplicate ProductionParityPreflight tests"
+            "CTest returned duplicate ProductionTestPreflight tests"
         )
     return tuple(registrations)
 
@@ -3318,7 +3318,7 @@ class PrerequisiteReport:
     certification_eligible: bool = False
 
 
-def run_production_parity_preflight(
+def run_production_test_preflight(
     build_dir: Path,
     timeout_seconds: float | None,
     installed_build_receipt: Path | None = None,
@@ -3333,7 +3333,7 @@ def run_production_parity_preflight(
     """
 
     unit_tests = discover_production_parity_unit_tests(build_dir)
-    integration_registrations = discover_production_parity_preflight_registrations(build_dir)
+    integration_registrations = discover_production_test_preflight_registrations(build_dir)
     integration_tests = tuple(registration.name for registration in integration_registrations)
     tests = unit_tests + integration_tests
     timeout_text = (
@@ -3380,13 +3380,13 @@ def run_production_parity_preflight(
         "--parallel",
         "--target",
         PRODUCTION_PARITY_UNIT_BUILD_TARGET,
-        PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET,
+        PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET,
     ]
     # Both CTest namespaces must consume current executables. An additive
     # Integration regression is not necessarily reachable from the Unit target.
     # Build their CMake-owned inventories together, once before either phase.
     build_targets = ",".join((PRODUCTION_PARITY_UNIT_BUILD_TARGET,
-                              PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET))
+                              PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET))
     print(
         "[production-parity] prerequisite_build_status=RUNNING "
         f"targets={build_targets}",
@@ -3420,7 +3420,7 @@ def run_production_parity_preflight(
     # registrations. CTest below consumes that regenerated inventory, so its
     # receipt must name those exact tests rather than the pre-build snapshot.
     unit_tests = discover_production_parity_unit_tests(build_dir)
-    integration_registrations = discover_production_parity_preflight_registrations(build_dir)
+    integration_registrations = discover_production_test_preflight_registrations(build_dir)
     integration_tests = tuple(registration.name for registration in integration_registrations)
     tests = unit_tests + integration_tests
 
@@ -3634,7 +3634,7 @@ def run_production_parity_preflight(
     return complete(return_code, elapsed)
 
 
-def reuse_unchanged_production_parity_preflight(
+def reuse_unchanged_production_test_preflight(
     build_dir: Path,
     report_path: Path,
 ) -> tuple[int, float, tuple[str, ...]]:
@@ -3710,7 +3710,7 @@ def reuse_unchanged_production_parity_preflight(
 
     tests = (
         discover_production_parity_unit_tests(resolved_build)
-        + discover_production_parity_preflight_tests(resolved_build)
+        + discover_production_test_preflight_tests(resolved_build)
     )
     reported_tests = tuple(document.get("preflight_tests", ()))
     if (
@@ -4723,7 +4723,7 @@ def run_unseen_cells_individually(
             preflight_return_code,
             _,
             preflight_tests,
-        ) = run_production_parity_preflight(
+        ) = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
@@ -4732,7 +4732,7 @@ def run_unseen_cells_individually(
             preflight_return_code,
             _,
             preflight_tests,
-        ) = reuse_unchanged_production_parity_preflight(
+        ) = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
@@ -4930,7 +4930,7 @@ def run_focused_exact_cell(
             preflight_return_code,
             _,
             preflight_tests,
-        ) = run_production_parity_preflight(
+        ) = run_production_test_preflight(
             args.build_dir,
             max(completion_deadline - time.monotonic(), 0.001),
         )
@@ -4939,7 +4939,7 @@ def run_focused_exact_cell(
             preflight_return_code,
             _,
             preflight_tests,
-        ) = reuse_unchanged_production_parity_preflight(
+        ) = reuse_unchanged_production_test_preflight(
             args.build_dir,
             args.reuse_passed_preflight_report,
         )
@@ -5132,9 +5132,9 @@ def main(argv: list[str] | None = None) -> int:
             preflight_return_code,
             preflight_elapsed,
             preflight_tests,
-        ) = (reuse_unchanged_production_parity_preflight(
+        ) = (reuse_unchanged_production_test_preflight(
             args.build_dir, args.reuse_passed_preflight_report,
-        ) if args.reuse_passed_preflight_report is not None else run_production_parity_preflight(
+        ) if args.reuse_passed_preflight_report is not None else run_production_test_preflight(
             args.build_dir,
             max(global_completion_deadline - time.monotonic(), 0.001),
             artifact_directory=args.report.resolve().parent / "prerequisites",
@@ -5143,7 +5143,7 @@ def main(argv: list[str] | None = None) -> int:
         ))
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(
-            f"production parity preflight error: {error}",
+            f"production test preflight error: {error}",
             file=sys.stderr,
             flush=True,
         )
@@ -5170,7 +5170,7 @@ def main(argv: list[str] | None = None) -> int:
     model_staging_error = (
         "not attempted because the model fixture failed"
         if preflight_return_code == 0
-        else "not attempted because production parity preflight failed"
+        else "not attempted because production test preflight failed"
     )
     staged_models: tuple[StagedModelEvidence, ...] = ()
     if fixture_return_code == 0:
@@ -5259,7 +5259,7 @@ def main(argv: list[str] | None = None) -> int:
             else fixture_return_code
         )
         prerequisite_outcome = (
-            "production_parity_preflight_failed"
+            "production_test_preflight_failed"
             if preflight_return_code != 0
             else "model_fixture_failed"
         )

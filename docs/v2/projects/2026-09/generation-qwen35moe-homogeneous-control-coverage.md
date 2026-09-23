@@ -72,7 +72,7 @@ clean shutdown.
 
 The entire batch reuses
 `hybrid-q8-prefix-prerequisites-01/prerequisites.json`: 647 Unit and 137
-ProductionParityPreflight registrations for the unchanged build. Recorded
+ProductionTestPreflight registrations for the unchanged build. Recorded
 repeated prerequisite cost is zero. The sealed persistent tmpfs entry is reused
 with zero copied model bytes. No production edit, rebuild, reconfiguration,
 prompt change, precision change or retry is needed for this slice.

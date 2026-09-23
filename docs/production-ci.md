@@ -14,7 +14,7 @@ routes local development checks, model diagnostics, and this full image gate.
 `.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
 `scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
 full-backend test-runner/runtime pairs, runs the complete Unit and
-`ProductionParityPreflight` transaction inside each test runner, then publishes
+`ProductionTestPreflight` transaction inside each test runner, then publishes
 only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
 `ghcr.io/llaminar/llaminar:develop-avx2`. It does not run model discovery,
 generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
@@ -169,7 +169,7 @@ untouched for manual retirement, but no live runner consumes it.
 flowchart TD
     S[One immutable source snapshot] --> B[AVX512 and AVX2 test-runner/runtime image pairs]
     B --> U[Complete Unit gate in each ISA image]
-    U --> P[Complete ProductionParityPreflight in each ISA image]
+    U --> P[Complete ProductionTestPreflight in each ISA image]
     P --> G[HTTP token regression: MTP off and dynamic, reviewed 384-token controls]
     G --> E[Both full canonical E2E HTTP needle suites]
     E --> X[Canonical cross-host MPI E2E; Azure lease retired]
@@ -200,6 +200,13 @@ build and do not extend the ordinary develop push gate:
   the same branch. A newer image tag invalidates the old E2E receipt. It commits
   compact JSON, an SVG chart and the owned README block only after every
   benchmark passes.
+
+HTTP profiles use automatic selection with canonical backend/strategy/count
+constraints. Every cell retains the resolved physical-participant proof and
+streaming/non-streaming tool-call round trips, in addition to all long-context
+checks. Auto still owns GPU ordinals, rank placement and PP layer boundaries.
+Mathematical/saved-token projections keep their declared placement; the HTTP
+constraint projection does not redefine their reviewed control streams.
 
 For `develop`, the images are `ghcr.io/llaminar/llaminar:develop` and
 `:develop-avx2`. Both must exist, be full-backend Release images, and name the
@@ -278,6 +285,12 @@ are the compact checked-in evidence. These workflows do **not** run saved-token
 or remote-MPI regression, mint a full production-image certificate, modify
 runtime layers/tags, or advance the full-certification high-water file. The
 benchmark runner still checks the existing high-water policy for regressions.
+
+The published chart groups cells by model size and normalizes each cell/phase
+to its own AVX512 median (100%). AVX2 bars and percentages use that same local
+reference, including values above 100% when AVX2 is faster. Exact tok/s labels
+remain comparable across cells; normalized bar lengths are not. The renderer
+only changes presentation and never alters samples or high-water marks.
 
 ## Run locally
 
@@ -816,5 +829,5 @@ The result commit points back to the tested source SHA; it does not pretend
 that the bookkeeping commit produced another tested binary. A failure leaves
 reports available and never force-pushes or merges untested source.
 
-The source pre-commit hook remains Unit + ProductionParityPreflight only.
+The source pre-commit hook remains Unit + ProductionTestPreflight only.
 Performance is never part of that model-free hook.

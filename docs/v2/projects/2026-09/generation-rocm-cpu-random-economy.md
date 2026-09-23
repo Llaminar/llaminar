@@ -352,7 +352,7 @@ shared-cost tests also pass twenty repetitions. Updated CUDA/HIP compile-only
 checks pass; these remain compilation evidence, not native execution proof.
 The complete rebuilt Unit gate passes **649/649 in 73.96 seconds**
 (`transaction-histogram-full-unit-01.log`).
-The complete rebuilt `ProductionParityPreflight` gate then passes **143/143 in
+The complete rebuilt `ProductionTestPreflight` gate then passes **143/143 in
 533.29 seconds** (`transaction-histogram-preflight-01.log`). CUDA and ROCm were
 idle before admission. Both builds and test processes are terminal; no model
 or benchmark process was started. These are fresh direct CTest gate results,
@@ -459,7 +459,7 @@ integration suite subsequently passed in **1.25 seconds**
 green model cell.
 
 The complete changed-build gate is now terminal and green: **649/649 Unit in
-72.41 seconds**, then **143/143 ProductionParityPreflight in 530.16 seconds**.
+72.41 seconds**, then **143/143 ProductionTestPreflight in 530.16 seconds**.
 The canonical driver reports **603.306 seconds** including its no-op build and
 discovery, and owns the reusable receipt at
 `parity-results/transaction-wire-prerequisites-01/prerequisites.json` with both
@@ -571,7 +571,7 @@ policy identity, not the follower's execution identity.
 
 All prerequisite targets were rebuilt after the shared evidence change. The
 canonical driver then passes **649/649 Unit in 75.56 seconds** and
-**143/143 ProductionParityPreflight in 527.17 seconds**. Its **603.465-second**
+**143/143 ProductionTestPreflight in 527.17 seconds**. Its **603.465-second**
 receipt includes the final no-op build and discovery, not the earlier rebuild:
 `parity-results/forecast-authority-prerequisites-01/prerequisites.json`.
 The adjacent Unit/integration logs and JUnit XML retain complete evidence.
@@ -654,7 +654,7 @@ All logs are ignored under `parity-results/`. Maintenance and MPI fixtures use
 BOMs; their existing mailbox and retained samples use that same PMA admission.
 The previous full prerequisite receipt is stale after these builds. The complete
 refresh passes **649/649 Unit in 73.78 seconds** and
-**143/143 ProductionParityPreflight in 528.93 seconds**. Its
+**143/143 ProductionTestPreflight in 528.93 seconds**. Its
 **951.569-second** elapsed time includes the 790-step prerequisite rebuild.
 The terminal receipt is
 `parity-results/observed-cost-prerequisites-01/prerequisites.json`; its adjacent
@@ -707,7 +707,7 @@ It retains an old snapshot while reusing the mailbox and verifies exact release.
 
 The new preflight registration is `V2_Integration_MoEOverlayHostDemandAdmission`.
 The full refreshed gate passes **649/649 Unit in 73.56 seconds** and
-**144/144 ProductionParityPreflight in 529.99 seconds**. Rebuild plus both gates
+**144/144 ProductionTestPreflight in 529.99 seconds**. Rebuild plus both gates
 took **628.653 seconds**. The new receipt is
 `parity-results/host-demand-bom-prerequisites-01/prerequisites.json`, with
 adjacent logs/JUnit and `host-demand-bom-prerequisites-driver-01.log` retaining

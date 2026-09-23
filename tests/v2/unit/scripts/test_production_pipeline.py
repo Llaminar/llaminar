@@ -52,6 +52,8 @@ import run_production_parity_campaigns as parity
 import run_production_prerequisites as prerequisites_runner
 from test_generation_movement_ledger import empty_ledger, ledger as movement_ledger
 from test_model_parity_inventory import remote_cases
+from test_server_tool_calling import row_for, tools as tool_fixtures
+from test_server_execution_contract import automatic_evidence
 
 
 def cell(name="cell"):
@@ -904,7 +906,7 @@ class GenerationHTTPTests(unittest.TestCase):
             output = root / "must-not-exist"
             with patch.object(generation_runner, "select_cells", return_value=[selected]), \
                     patch.object(generation_runner, "control_path", return_value=control_file), \
-                    patch.object(parity, "run_production_parity_preflight") as preflight, \
+                    patch.object(parity, "run_production_test_preflight") as preflight, \
                     patch.object(parity, "model_staging_workspace") as staging:
                 with self.assertRaisesRegex(ValueError, "current canonical control"):
                     generation_runner.main(["--mode", "compare-controls", "--controls", str(root),
@@ -1500,12 +1502,12 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                     argv += ["--installed-build-receipt", str(receipt)]
                 registration = parity.PreflightRegistration(
                     "V2_Integration_B",
-                    frozenset(("Integration", "ProductionParityPreflight")),
+                    frozenset(("Integration", "ProductionTestPreflight")),
                     None,
                     parity.PreflightExecutionLane.HOST,
                 )
                 with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-                     patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
+                     patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
                      patch.object(prebuilt_test_image, "validate") as validate, \
                      patch.object(parity, "_run_process", return_value=0) as execute:
                     self.assertEqual(prerequisites_runner.main(argv), 0)
@@ -1517,7 +1519,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
                     validate.assert_not_called()
                     self.assertEqual(commands[0], ["cmake", "--build", str(build), "--parallel", "--target",
                                                   parity.PRODUCTION_PARITY_UNIT_BUILD_TARGET,
-                                                  parity.PRODUCTION_PARITY_PREFLIGHT_BUILD_TARGET])
+                                                  parity.PRODUCTION_TEST_PREFLIGHT_BUILD_TARGET])
                 unit, preflight = commands[-2:]
                 self.assertEqual(unit[unit.index("-R") + 1], "^V2_Unit_")
                 self.assertEqual(preflight[preflight.index("-R") + 1], "^(V2_Integration_B)$")
@@ -1536,7 +1538,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
             output = root / "results"
             output.mkdir()
             artifacts.write_json(output / "prerequisites.json", {"prior": "evidence"})
-            with patch.object(prerequisites_runner, "run_production_parity_preflight") as execute:
+            with patch.object(prerequisites_runner, "run_production_test_preflight") as execute:
                 with self.assertRaises(FileExistsError):
                     prerequisites_runner.main(["--build-dir", str(root), "--output", str(output)])
                 execute.assert_not_called()
@@ -1547,7 +1549,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
             with self.subTest(code=code), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 output = root / "results"
-                with patch.object(prerequisites_runner, "run_production_parity_preflight",
+                with patch.object(prerequisites_runner, "run_production_test_preflight",
                                   return_value=(code, 1.0, ())) as execute:
                     self.assertEqual(prerequisites_runner.main([
                         "--build-dir", str(root), "--output", str(output)]), code)
@@ -1559,7 +1561,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             receipt = root / "installed.json"
-            with patch.object(prerequisites_runner, "run_production_parity_preflight") as authority:
+            with patch.object(prerequisites_runner, "run_production_test_preflight") as authority:
                 with self.assertRaises(FileNotFoundError):
                     prerequisites_runner.main(["--build-dir", str(root), "--output", str(root / "missing"),
                                                "--installed-build-receipt", str(receipt)])
@@ -1567,12 +1569,12 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
             artifacts.write_json(receipt, {"invalid": True})
             registration = parity.PreflightRegistration(
                 "V2_Integration_B",
-                frozenset(("Integration", "ProductionParityPreflight")),
+                frozenset(("Integration", "ProductionTestPreflight")),
                 None,
                 parity.PreflightExecutionLane.HOST,
             )
             with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-                 patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
+                 patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
                  patch.object(prebuilt_test_image, "validate", side_effect=ValueError("stale installation")), \
                  patch.object(parity, "_run_process") as execute:
                 with self.assertRaisesRegex(ValueError, "stale installation"):
@@ -1582,7 +1584,7 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
     def test_cli_has_no_inventory_selector_or_skip_switch(self):
         for flag in ("--cell", "--skip-preflight", "--backend", "--collect-controls"):
-            with self.subTest(flag=flag), patch.object(prerequisites_runner, "run_production_parity_preflight") as execute:
+            with self.subTest(flag=flag), patch.object(prerequisites_runner, "run_production_test_preflight") as execute:
                 with self.assertRaises(SystemExit) as error:
                     prerequisites_runner.main(["--build-dir", "unused", "--output", "unused", flag])
                 self.assertEqual(error.exception.code, 2)
@@ -2181,7 +2183,8 @@ class CrossHostRunnerTests(unittest.TestCase):
 
     def test_partial_long_context_and_wrong_remote_policy_never_pass(self):
         scenario = remote_cases()[0]
-        profile = {"context_length": 4096, "minimum_prompt_tokens": 900, "generation_tokens": 384}
+        profile = {"context_length": 4096, "minimum_prompt_tokens": 900, "generation_tokens": 384,
+                   "planning": scenario["planning"]}
         complete = {"schema": 1, "tier": "full", "complete": True, **profile,
                     "results": [{"passed": True} for _ in range(8)]}
         proof = {"case": scenario["id"], "scenario": scenario, "execution": {"observed": True}}
@@ -2189,6 +2192,10 @@ class CrossHostRunnerTests(unittest.TestCase):
             path = Path(directory)
             artifacts.write_json(path / "long_context_results.json", complete)
             artifacts.write_json(path / "runtime.cross-host.json", proof)
+            artifacts.write_json(path / "tool_calling_results.json", {"schema": 1, "complete": True,
+                "results": [row_for(probe) for probe in tool_fixtures.PROBES]})
+            artifacts.write_json(path / "automatic_selection_results.json",
+                automatic_evidence(["ROCm:0", "CPU"], strategy="expert-overlay", nodes=[0, 1]))
             remote_e2e.validate_case_evidence(path, scenario, profile)
             for mutate in (lambda long, proof: long.update(complete=False),
                            lambda long, proof: long["results"].pop(),
@@ -2228,7 +2235,7 @@ class CrossHostRunnerTests(unittest.TestCase):
                     "generation_tokens": 384, "readiness_timeout_seconds": 60,
                     "cell_timeout_seconds": {"AVX512": 900, "AVX2": 900},
                     "request_timeout_seconds": 60, "thinking_modes": "non-thinking",
-                    "movement_evidence": "required"}
+                    "movement_evidence": "required", "tool_calling": "required"}
                 parent = cell()
                 parent.update(model_files=[str(model)])
                 parent["configuration"].update(model=str(model), e2e=profile,
@@ -2257,6 +2264,12 @@ class CrossHostRunnerTests(unittest.TestCase):
                     artifacts.write_json(directory / "long_context_results.json", {
                         "schema": 1, "tier": "full", "complete": not failed,
                         **profile, "results": [{"passed": True} for _ in range(8)]})
+                    artifacts.write_json(directory / "tool_calling_results.json", {"schema": 1, "complete": True,
+                        "results": [row_for(probe) for probe in tool_fixtures.PROBES]})
+                    count = scenario["topology"]["remote_cpu_hosts"]
+                    artifacts.write_json(directory / "automatic_selection_results.json",
+                        automatic_evidence(["ROCm:0", *(["CPU"] * count)], strategy="expert-overlay",
+                                           nodes=list(range(count + 1))))
                     return 0
 
                 @contextmanager
@@ -3205,12 +3218,12 @@ class ImageIdentityTests(unittest.TestCase):
         test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
         self.assertIn("ON:full-matrix|OFF:model-free", builder)
         self.assertIn(
-            'ON) integration_targets="v2_unit_gate v2_production_parity_preflight_gate '
+            'ON) integration_targets="v2_unit_gate v2_production_test_preflight_gate '
             'v2_model_parity_matrices"',
             builder,
         )
         self.assertIn(
-            'OFF) integration_targets="v2_unit_gate v2_production_parity_preflight_gate"',
+            'OFF) integration_targets="v2_unit_gate v2_production_test_preflight_gate"',
             builder,
         )
         self.assertIn(
@@ -3892,7 +3905,7 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             receipt = Path(directory) / "receipt.json"
             with patch.object(prebuilt_test_image, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-                 patch.object(prebuilt_test_image, "discover_production_parity_preflight_tests", side_effect=RuntimeError("invalid timeout")), \
+                 patch.object(prebuilt_test_image, "discover_production_test_preflight_tests", side_effect=RuntimeError("invalid timeout")), \
                  patch.object(prebuilt_test_image, "inventory") as installed:
                 with self.assertRaisesRegex(RuntimeError, "invalid timeout"):
                     prebuilt_test_image.seal(receipt, Path(directory))
@@ -3922,7 +3935,7 @@ class InfrastructureTests(unittest.TestCase):
     def test_installed_seal_rejects_missing_ctest_command_for_each_gate(self):
         for name, labels in (
             ("V2_Unit_HostOnly", []),
-            ("V2_Integration_Device", ["ProductionParityPreflight"]),
+            ("V2_Integration_Device", ["ProductionTestPreflight"]),
             ("V2_Integration_Parity_ProductionCampaign_CPU", ["Campaign"]),
         ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
@@ -3959,16 +3972,16 @@ class InfrastructureTests(unittest.TestCase):
     def test_prebuilt_image_still_executes_both_complete_gates(self):
         registration = parity.PreflightRegistration(
             "V2_Integration_B",
-            frozenset(("Integration", "ProductionParityPreflight")),
+            frozenset(("Integration", "ProductionTestPreflight")),
             None,
             parity.PreflightExecutionLane.HOST,
         )
         with patch.object(parity, "discover_production_parity_unit_tests", return_value=("V2_Unit_A",)), \
-             patch.object(parity, "discover_production_parity_preflight_registrations", return_value=(registration,)), \
+             patch.object(parity, "discover_production_test_preflight_registrations", return_value=(registration,)), \
              patch.object(parity.os, "sched_getaffinity", return_value=set(range(8))), \
              patch.object(prebuilt_test_image, "validate") as validate, \
              patch.object(parity, "_run_process", return_value=0) as execute:
-            status, _, tests = parity.run_production_parity_preflight(Path("build"), None, Path("receipt"))
+            status, _, tests = parity.run_production_test_preflight(Path("build"), None, Path("receipt"))
         self.assertEqual(status, 0)
         self.assertEqual(len(tests), 2)
         validate.assert_called_once()

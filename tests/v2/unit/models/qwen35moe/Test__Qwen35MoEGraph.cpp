@@ -2868,6 +2868,8 @@ TEST(Test__Qwen35MoEGraph, MTPAllPositionVerifierUsesMirroredGDNStateWhenHandoff
     const auto *recurrence =
         dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
     ASSERT_NE(recurrence, nullptr);
+    EXPECT_EQ(recurrence->getParams().sequence_state_cache, &cache)
+        << "The graph must bind the same cache owner for recurrent-only PP frontier publication";
     EXPECT_EQ(recurrence->getParams().n_heads, 2);
     EXPECT_EQ(recurrence->getParams().n_k_heads, 2);
     EXPECT_EQ(

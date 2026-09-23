@@ -28,6 +28,8 @@
 namespace llaminar2
 {
     class TransferEngine;
+    struct CapturedTransferChannelDeviceBinding;
+    enum class CapturedTransferBoundaryOperation : std::uint32_t;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
@@ -4103,6 +4105,40 @@ namespace llaminar2
         virtual bool prepareMappedHostCopyKernels(int device_id)
         {
             (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Prepare the two retained-channel boundary kernels before capture.
+         * @param device_id Exact local GPU ordinal.
+         * @param timeout_ms Positive bounded peer-wait policy from TransferEngine.
+         * @param timeout_ticks Receives the immutable device-clock timeout bound.
+         * @return True only after function resolution and timer geometry succeed.
+         * Production callers use TransferEngine; no allocation or work is submitted.
+         */
+        virtual bool prepareCapturedTransferChannelKernels(
+            int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
+        {
+            (void)device_id; (void)timeout_ms; (void)timeout_ticks;
+            return false;
+        }
+
+        /**
+         * @brief Lower one TransferEngine-owned acquire/publication node on an exact stream.
+         * @param binding Validated mapped aliases, private cursor and exact message.
+         * @param operation Typed boundary; byte copying is the intervening parallel node.
+         * @param device_id Exact local GPU interpreting every pointer.
+         * @param stream Non-null stream supplied by the transfer authority.
+         * @return Whether the native kernel submission succeeded.
+         * This backend bridge never allocates, waits on the host or mutates a
+         * host shadow. Asynchronous semantic failures trap and surface through
+         * the ordinary fatal backend event/query path.
+         */
+        virtual bool enqueueCapturedTransferChannelBoundary(
+            const CapturedTransferChannelDeviceBinding &binding,
+            CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+        {
+            (void)binding; (void)operation; (void)device_id; (void)stream;
             return false;
         }
 

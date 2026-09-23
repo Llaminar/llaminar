@@ -60,7 +60,7 @@ and compare token identities and memory BOM as well as throughput. Retain a
 change only when its model-level benefit exceeds the measured noise and the
 applicable correctness gates pass. Use
 [Llaminar testing](../llaminar-testing/SKILL.md) for the full Unit gate,
-ProductionParityPreflight and affected canonical real-weight cells. Report
+ProductionTestPreflight and affected canonical real-weight cells. Report
 missing or still-running evidence explicitly; do not call a timing candidate
 certified.
 

@@ -180,6 +180,15 @@ namespace llaminar2::test
                 .validForConsumption());
     }
 
+    /** @test Headless pipeline graphs order their own state without a sampler. */
+    TEST(Test__DeviceExecutionTimeline, PipelineForwardConsumesItsLocalPredecessor)
+    {
+        EXPECT_TRUE(DeviceEventEdge::at(DeviceTimelinePoint::ForwardGraphOutputReady)
+            .from(DeviceTimelineRole::MainForwardGraph)
+            .to(DeviceTimelineRole::MainForwardGraph)
+            .validForConsumption());
+    }
+
     TEST(Test__DeviceExecutionTimeline, RequestResetMustPrecedeEveryGpuGraphFamily)
     {
         const auto reset =

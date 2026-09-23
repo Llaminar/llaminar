@@ -18,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef HAVE_CUDA
@@ -555,6 +556,126 @@ namespace
 } // namespace
 
 #ifdef HAVE_CUDA
+
+/**
+ * @brief Recurrent-only PP slices retain graph-captured sequence metadata.
+ *
+ * A GDN-only slice has no K/V payload, but still needs a device-owned frontier
+ * for speculative publication, rollback and request reset. Sweep every native
+ * hybrid GPU cache format; the metadata contract must not depend on its codec.
+ */
+TEST(Test__CUDAHybridKVCacheReset, RecurrentOnlySequenceCheckpointGraphReplay)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    for (const auto precision : {
+             llaminar2::ActivationPrecision::FP32,
+             llaminar2::ActivationPrecision::FP16,
+             llaminar2::ActivationPrecision::BF16,
+             llaminar2::ActivationPrecision::Q8_1})
+    {
+        SCOPED_TRACE(static_cast<int>(precision));
+        auto config = makeHybridConfig();
+        config.layer_types = {"gdn", "gdn"};
+        config.first_layer_index = 8;
+        auto cache = createHybridCacheWithShape(config, precision, 32, 1, 64);
+        ASSERT_EQ(cache.hybrid->kvLayerCount(), 0);
+        ASSERT_EQ(cache.owner->deviceCachedTokenCountPtr(8, 0), nullptr);
+        ASSERT_EQ(cache.owner->deviceSequenceStateCheckpointBytes(), 2 * sizeof(int32_t));
+        ASSERT_NE(cache.owner->deviceSequenceCachedTokenCountPtr(0), nullptr);
+        EXPECT_EQ(cache.memory_authority->claimedBytes(
+                      llaminar2::DeviceId::cuda(0),
+                      llaminar2::PhysicalMemoryOwner::KVCache,
+                      llaminar2::PhysicalMemoryMaterializationKind::NewAllocation),
+                  2 * sizeof(int32_t))
+            << "No context-sized K/V storage is permitted for recurrent-only slices";
+
+        CudaStream stream;
+        CudaFloatBuffer checkpoint(2), speculative(2), real_rows(1),
+            target(1), accepted(1), publication_ok(1);
+        const int32_t three = 3;
+        const int32_t one = 1;
+        checkCuda(cudaMemcpyAsync(target.ptr, &three, sizeof(three),
+                                  cudaMemcpyHostToDevice, stream.stream), "target upload");
+        checkCuda(cudaMemcpyAsync(accepted.ptr, &three, sizeof(three),
+                                  cudaMemcpyHostToDevice, stream.stream), "accepted upload");
+        checkCuda(cudaMemcpyAsync(publication_ok.ptr, &one, sizeof(one),
+                                  cudaMemcpyHostToDevice, stream.stream), "publication upload");
+        // Cache initialization owns another exact stream; finish setup before
+        // recording this test's independent transaction stream.
+        checkCuda(cudaDeviceSynchronize(), "initial cache publication");
+        cudaGraph_t graph = nullptr;
+        checkCuda(cudaStreamBeginCapture(stream.stream, cudaStreamCaptureModeThreadLocal),
+                  "begin sequence-state capture");
+        std::string error;
+        const bool captured = cache.owner->captureDeviceSequenceStateCheckpoint(
+            0, checkpoint.ptr, 2 * sizeof(int32_t), stream.opaque(), &error);
+        const bool first_layer = cache.owner->advanceRecurrentSequenceState(
+            8, 1, reinterpret_cast<int32_t *>(real_rows.ptr), 8, stream.opaque());
+        const bool final_layer = cache.owner->advanceRecurrentSequenceState(
+            9, 1, reinterpret_cast<int32_t *>(real_rows.ptr), 8, stream.opaque());
+        const bool speculative_captured = cache.owner->captureDeviceSequenceStateCheckpoint(
+            0, speculative.ptr, 2 * sizeof(int32_t), stream.opaque(), &error);
+        const bool published = cache.owner->publishSequenceStateFromDeviceMetadata({
+            .request_count = 1,
+            .target_cached_tokens_device = reinterpret_cast<int32_t *>(target.ptr),
+            .accepted_state_counts_device = reinterpret_cast<int32_t *>(accepted.ptr),
+            .publication_ok_flags_device = reinterpret_cast<int32_t *>(publication_ok.ptr),
+            .base_sequence_state_checkpoint_device = checkpoint.ptr,
+            .base_sequence_state_checkpoint_bytes = 2 * sizeof(int32_t),
+            .stream = stream.opaque(),
+        }, &error);
+        checkCuda(cudaStreamEndCapture(stream.stream, &graph), "end sequence-state capture");
+        const auto destroy_graph = [](cudaGraph_t value) {{ if (value) (void)cudaGraphDestroy(value); }};
+        std::unique_ptr<std::remove_pointer_t<cudaGraph_t>, decltype(destroy_graph)>
+            graph_owner(graph, destroy_graph);
+        ASSERT_TRUE(captured && first_layer && final_layer && speculative_captured && published) << error;
+        cudaGraphExec_t executable = nullptr;
+        checkCuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+                  "instantiate sequence-state graph");
+        const auto destroy_exec = [](cudaGraphExec_t value) {{ if (value) (void)cudaGraphExecDestroy(value); }};
+        std::unique_ptr<std::remove_pointer_t<cudaGraphExec_t>, decltype(destroy_exec)>
+            executable_owner(executable, destroy_exec);
+
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            const int32_t rows = 4 + replay;
+            checkCuda(cudaMemcpyAsync(real_rows.ptr, &rows, sizeof(rows),
+                                      cudaMemcpyHostToDevice, stream.stream), "resident real row count");
+            checkCuda(cudaGraphLaunch(executable, stream.stream), "sequence-state replay");
+            stream.synchronize("sequence publication observation");
+            EXPECT_EQ(copyDeviceInt(reinterpret_cast<int32_t *>(speculative.ptr) + 1,
+                                    "speculative real-row frontier"), rows)
+                << "Neither the first GDN layer nor padded rows may advance twice";
+            EXPECT_EQ(copyDeviceInt(cache.owner->deviceSequenceCachedTokenCountPtr(0),
+                                    "recurrent sequence frontier"), 3);
+            ASSERT_TRUE(cache.owner->truncateSequence(0, 1, stream.opaque()));
+            ASSERT_TRUE(cache.owner->restoreDeviceSequenceStateCheckpoint(
+                0, checkpoint.ptr, 2 * sizeof(int32_t), stream.opaque(), &error)) << error;
+            stream.synchronize("rollback observation");
+            EXPECT_EQ(copyDeviceInt(cache.owner->deviceSequenceCachedTokenCountPtr(0),
+                                    "recurrent rollback frontier"), 0);
+        }
+        checkCuda(cudaGraphLaunch(executable, stream.stream), "final sequence publication");
+        const auto prefix_metadata = cache.hybrid->hybridPrefixStateMetadata();
+        ASSERT_GT(prefix_metadata.device_bytes, 0u);
+        CudaFloatBuffer prefix(prefix_metadata.device_bytes / sizeof(float));
+        const llaminar2::HybridPrefixStateDescriptor prefix_desc{
+            .seq_idx = 0, .logical_token_count = 3, .stream = stream.opaque(),
+            .synchronize = false, .include_host_state = false, .include_device_state = true};
+        ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(prefix_desc, nullptr, prefix.ptr));
+        ASSERT_TRUE(cache.owner->resetRequestState(
+            llaminar2::IKVCache::StateResetContext::testReinitialization(stream.opaque())));
+        stream.synchronize("request reset observation");
+        EXPECT_EQ(copyDeviceInt(cache.owner->deviceSequenceCachedTokenCountPtr(0),
+                                "reset recurrent frontier"), 0);
+        ASSERT_TRUE(cache.hybrid->importHybridPrefixState(prefix_desc, nullptr, prefix.ptr));
+        stream.synchronize("prefix restore observation");
+        EXPECT_EQ(copyDeviceInt(cache.owner->deviceSequenceCachedTokenCountPtr(0),
+                                "restored recurrent prefix frontier"), 3);
+    }
+}
 
 TEST(Test__CUDAHybridKVCacheReset,
      GDNStateArenaClaimsTheRecurrentOwnerUntilDeviceFree)

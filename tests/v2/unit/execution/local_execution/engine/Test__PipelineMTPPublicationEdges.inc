@@ -70,7 +70,7 @@ TEST(Test__PipelineForwardEdges, PublicationOwnsOneAuthorityAcrossEveryParticipa
             EXPECT_FALSE(stage.isCollectiveStage());
             const auto wire = PipelineForwardGraphEdges::PublicationBanks::from(params);
             EXPECT_TRUE(wire.valid());
-            EXPECT_EQ(edges.publicationTransport(wire), nullptr) << "Unit admission must never capture GPU work";
+            EXPECT_FALSE(edges.preparedPublication(wire)) << "Unit admission must never capture GPU work";
             if (tail)
             {
                 auto clipped = params;

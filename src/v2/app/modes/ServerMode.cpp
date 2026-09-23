@@ -22,6 +22,7 @@
 #include "app/modes/ServerExecutionEvidence.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
+#include "loaders/ModelContext.h"
 #include "utils/Assertions.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -431,10 +432,27 @@ namespace llaminar2
                 "server", "rank_membership", 1.0, "startup", {},
                 serverRankMembershipTags(*inventory, mpi_ctx->rank(),
                                          runner->coordinatedRootRank()));
+            const auto participants = serverExecutionParticipants(
+                runner->executionPlan(), runner->config(), mpi_ctx->world_size());
+            // Reuse loaded metadata; observing attention ownership must not
+            // reopen the model or infer a layer family from missing timings.
+            const auto *model = dynamic_cast<const ModelContext *>(runner->modelContextForDiagnostics());
+            LLAMINAR_ASSERT_NOT_NULL(model, "server loaded model metadata");
             PerfStatsCollector::addCounter(
                 "server", "execution_topology", 1.0, "startup", {},
-                serverExecutionTopologyTags(serverExecutionParticipants(
-                    runner->executionPlan(), runner->config(), mpi_ctx->world_size())));
+                serverExecutionTopologyTags(participants, runner->executionPlan(),
+                    ModelMemoryProfile::fromGGUF(model->model())));
+            for (const auto &domain : serverPipelineDomainTags(runner->executionPlan()))
+                PerfStatsCollector::addCounter(
+                    "server", "execution_pipeline_domain", 1.0, "startup", {}, domain);
+            for (const auto &[device, role] : participants)
+            {
+                (void)role;
+                PerfStatsCollector::addCounter(
+                    "server", "execution_participant", 1.0, "startup", device.toString(),
+                    serverExecutionParticipantTags(device, inventory->ranks.at(mpi_ctx->rank()),
+                                                   runner->executionPlan().numa_node));
+            }
             // Only the service authority publishes request policy. Expert-only
             // followers do not own an independent MTP/prefix configuration.
             if (is_authority)

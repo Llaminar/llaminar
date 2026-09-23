@@ -14,6 +14,7 @@
 
 #include "../../../backends/DeviceId.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -37,24 +38,50 @@ namespace llaminar2
         Materialized, ///< Every declared native segment is resident and replay-ready.
     };
 
-    /** @brief One participant-local compute segment in pipeline order. */
+    /**
+     * @brief One execution domain in pipeline order, including every TP member.
+     *
+     * Membership preserves the compiled collective order: index zero is the
+     * domain leader, not the lowest physical ordinal. A domain contains one
+     * backend; heterogeneous movement is an edge between domains. This is a
+     * frozen projection of the rank plan, not another topology discoverer.
+     */
     struct PipelineGraphExecutionSegment
     {
         std::size_t stage_index = 0; ///< Contiguous LocalPP stage coordinate.
-        DeviceId primary_device; ///< Device whose runner owns this stage graph.
+        std::vector<DeviceId> participants; ///< Ordered execution identities; CPU NUMA ownership remains in the rank plan/context.
         PipelineGraphSegmentExecution execution =
             PipelineGraphSegmentExecution::HostDeclarative;
 
-        /** @return Whether this segment names a concrete production owner. */
+        /** @return Domain leader, or invalid for an incomplete declaration. */
+        [[nodiscard]] DeviceId primaryDevice() const noexcept
+        {
+            return participants.empty() ? DeviceId::invalid() : participants.front();
+        }
+
+        /** @return Whether members are concrete and same-backend, with no duplicate GPU. */
         [[nodiscard]] bool valid() const noexcept
         {
-            return primary_device.is_valid() &&
-                   ((execution ==
+            const auto primary = primaryDevice();
+            if (!((execution ==
                          PipelineGraphSegmentExecution::HostDeclarative &&
-                     primary_device.is_cpu()) ||
+                     primary.is_cpu()) ||
                     (execution == PipelineGraphSegmentExecution::
                                       NativeDeviceExecutable &&
-                     primary_device.is_gpu()));
+                     primary.is_gpu())))
+                return false;
+            for (std::size_t i = 0; i < participants.size(); ++i)
+            {
+                // DeviceId deliberately collapses CPU NUMA endpoints to the
+                // host execution kind. Their physical membership remains in
+                // the existing TP context/rank plan, not a new NUMA ledger here.
+                if (!participants[i].is_valid() || participants[i].type != primary.type ||
+                    (primary.is_gpu() &&
+                     std::find(participants.begin(), participants.begin() + i, participants[i]) !=
+                        participants.begin() + i))
+                    return false;
+            }
+            return true;
         }
     };
 
@@ -97,10 +124,19 @@ namespace llaminar2
             return segments_;
         }
 
-        /** @return Number of compute segments in one complete transaction. */
+        /** @return Number of ordered domains, not the number of native device graphs. */
         [[nodiscard]] std::size_t segmentCount() const noexcept
         {
             return segments_.size();
+        }
+
+        /** @return Number of participant-local graphs, retaining nested TP width. */
+        [[nodiscard]] std::size_t participantCount() const noexcept
+        {
+            std::size_t count = 0;
+            for (const auto &segment : segments_)
+                count += segment.participants.size();
+            return count;
         }
 
         /** @return Number of retained GPU executable segments. */
@@ -135,8 +171,8 @@ namespace llaminar2
         {
             for (std::size_t index = 1; index < segments_.size(); ++index)
             {
-                if (segments_[index - 1u].primary_device.type !=
-                    segments_[index].primary_device.type)
+                if (segments_[index - 1u].primaryDevice().type !=
+                    segments_[index].primaryDevice().type)
                 {
                     return true;
                 }

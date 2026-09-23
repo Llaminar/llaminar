@@ -15,7 +15,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
-#include "execution/local_execution/orchestrators/PipelineGraphExecutionPlan.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
@@ -28,6 +27,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
+#include "utils/TestTensorFactory.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3436,83 +3436,6 @@ private:
     mutable std::atomic<size_t> collective_sideband_broadcasts_{0};
 };
 
-TEST(PipelineGraphExecutionPlanTest,
-     HeterogeneousPlanRequiresExactMaterializationAndReplayTraversal)
-{
-    PipelineGraphExecutionPlan plan(
-        std::vector<PipelineGraphExecutionSegment>{
-            {.stage_index = 0u,
-             .primary_device = DeviceId::cuda(0),
-             .execution = PipelineGraphSegmentExecution::
-                 NativeDeviceExecutable},
-            {.stage_index = 1u,
-             .primary_device = DeviceId::cpu(),
-             .execution =
-                 PipelineGraphSegmentExecution::HostDeclarative},
-        });
-
-    EXPECT_TRUE(plan.hasHeterogeneousBoundary());
-    EXPECT_EQ(plan.segmentCount(), 2u);
-    EXPECT_EQ(plan.nativeSegmentCount(), 1u);
-    EXPECT_EQ(plan.hostSegmentCount(), 1u);
-
-    std::string error;
-    EXPECT_FALSE(plan.certifiesReplay(2u, &error));
-    EXPECT_THAT(error, ::testing::HasSubstr("preceded"));
-    EXPECT_FALSE(plan.markMaterialized(0u, &error));
-    EXPECT_THAT(error, ::testing::HasSubstr("requires 1"));
-    EXPECT_TRUE(plan.markMaterialized(1u, &error)) << error;
-    EXPECT_TRUE(plan.certifiesReplay(2u, &error)) << error;
-    EXPECT_FALSE(plan.certifiesReplay(1u, &error));
-    EXPECT_THAT(error, ::testing::HasSubstr("requires 2"));
-}
-
-TEST(PipelineGraphExecutionPlanTest,
-     SameBackendGpuOrdinalsDoNotClaimHeterogeneousSegmentation)
-{
-    PipelineGraphExecutionPlan plan(
-        std::vector<PipelineGraphExecutionSegment>{
-            {.stage_index = 0u,
-             .primary_device = DeviceId::cuda(0),
-             .execution = PipelineGraphSegmentExecution::
-                 NativeDeviceExecutable},
-            {.stage_index = 1u,
-             .primary_device = DeviceId::cuda(1),
-             .execution = PipelineGraphSegmentExecution::
-                 NativeDeviceExecutable},
-        });
-
-    EXPECT_FALSE(plan.hasHeterogeneousBoundary());
-    EXPECT_EQ(plan.nativeSegmentCount(), 2u);
-    std::string error;
-    EXPECT_TRUE(plan.markMaterialized(2u, &error)) << error;
-    EXPECT_TRUE(plan.certifiesReplay(2u, &error)) << error;
-}
-
-TEST(PipelineGraphExecutionPlanTest,
-     RejectsNonContiguousCoordinatesAndOwnerKindMismatch)
-{
-    EXPECT_THROW(
-        PipelineGraphExecutionPlan(
-            std::vector<PipelineGraphExecutionSegment>{
-                {.stage_index = 1u,
-                 .primary_device = DeviceId::cpu(),
-                 .execution =
-                     PipelineGraphSegmentExecution::HostDeclarative},
-            }),
-        std::invalid_argument);
-
-    EXPECT_THROW(
-        PipelineGraphExecutionPlan(
-            std::vector<PipelineGraphExecutionSegment>{
-                {.stage_index = 0u,
-                 .primary_device = DeviceId::cuda(0),
-                 .execution =
-                     PipelineGraphSegmentExecution::HostDeclarative},
-            }),
-        std::invalid_argument);
-}
-
 // =============================================================================
 // Test Fixture
 // =============================================================================
@@ -6782,6 +6705,95 @@ TEST_F(Test__RankOrchestrator, PrefixLookupPipelineStageMissClampsWholePipeline)
     ASSERT_TRUE(orchestrator->populatePrefix(hit));
     EXPECT_EQ(stage0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
     EXPECT_EQ(stage1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+}
+
+/** @test A stable leader cannot conceal drift in another TP member before graph setup. */
+TEST_F(Test__RankOrchestrator, PipelinePreparationAuthenticatesEveryTPMember)
+{
+    /** @brief Setup witness; no device work is permitted after membership changes. */
+    class Participant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @brief Record whether invalid membership reached a child materializer. */
+        bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan) override
+        {
+            ++calls;
+            return plan.valid();
+        }
+        int calls = 0;
+    };
+    std::vector<std::unique_ptr<IInferenceRunner>> members;
+    std::vector<Participant *> observed;
+    for (int index = 0; index < 2; ++index)
+    {
+        auto member = std::make_unique<Participant>();
+        observed.push_back(member.get());
+        members.push_back(std::move(member));
+    }
+    auto domain = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(members),
+        makeTPContextForRunnerCount(2), makeRankConfigForRunnerCount(2));
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(domain));
+    stages.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+    auto pipeline = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(), std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    // The frozen domain still has its original CPU leader. Replacing only its
+    // second execution identity must fail before visiting either materializer.
+    observed[1]->set_primary_device_id(DeviceId::rocm(7));
+    EXPECT_FALSE(pipeline->materializeServingGraphFamilyWithoutLaunch({
+        .prefill_bucket_rows = {32},
+        .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+    EXPECT_EQ(observed[0]->calls, 0);
+    EXPECT_EQ(observed[1]->calls, 0);
+    observed[1]->set_primary_device_id(DeviceId::cpu());
+}
+
+/** @test Every CPU PP stage receives its exact ingress before workspace declaration. */
+TEST_F(Test__RankOrchestrator, PipelinePreparationBindsAndSealsHostStages)
+{
+    /** @brief Passive setup witness with a stable participant-owned hidden bank. */
+    class Participant final : public MockDeviceGraphOrchestrator
+    {
+    public:
+        /** @return The bank borrowed by the next pipeline stage. */
+        TensorBase *getHiddenState() override { return hidden.get(); }
+        /** @brief Observe the real composer's input binding without executing inference. */
+        bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan) override
+        {
+            ++calls;
+            ingress = plan.pipeline_hidden_input;
+            return plan.valid();
+        }
+        std::shared_ptr<TensorBase> hidden =
+            llaminar2::test::TestTensorFactory::createFP32({32, 32});
+        TensorBase *ingress = nullptr;
+        int calls = 0;
+    };
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    std::vector<Participant *> participants;
+    for (int i = 0; i < 3; ++i)
+    {
+        auto stage = std::make_unique<Participant>();
+        participants.push_back(stage.get());
+        stages.push_back(std::move(stage));
+    }
+    auto pipeline = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages), makeRankConfigForRunnerCount(3));
+    ASSERT_TRUE(pipeline->materializeServingGraphFamilyWithoutLaunch({
+        .prefill_bucket_rows = {32},
+        .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial}));
+    for (size_t i = 0; i < participants.size(); ++i)
+    {
+        EXPECT_EQ(participants[i]->calls, 1);
+        EXPECT_EQ(participants[i]->ingress,
+            i == 0 ? nullptr : participants[i - 1]->hidden.get());
+    }
 }
 
 TEST_F(Test__RankOrchestrator, LocalPPSidecarMethodsDelegateOnlyToFinalStage)

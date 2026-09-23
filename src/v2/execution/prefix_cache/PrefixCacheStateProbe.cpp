@@ -576,21 +576,24 @@ namespace llaminar2
 
         std::vector<PrefixGDNLayerProbe> probes;
         probes.reserve(static_cast<size_t>(std::max(0, hybrid->gdnLayerCount())));
-        for (int layer = 0; layer < cache.n_layers(); ++layer)
+        for (int offset = 0; offset < cache.n_layers(); ++offset)
         {
-            if (!hybrid->isGDNLayer(layer))
+            // The serialization order is local, but every public state query
+            // names its global model layer. Keep those identities distinct.
+            const int global_layer = cache.first_layer_index() + offset;
+            if (!hybrid->isGDNLayer(global_layer))
             {
                 continue;
             }
 
-            const HybridGDNLayerState *state = hybrid->getGDNState(layer);
+            const HybridGDNLayerState *state = hybrid->getGDNState(global_layer);
             if (!state)
             {
                 continue;
             }
 
             PrefixGDNLayerProbe probe;
-            probe.global_layer = cache.first_layer_index() + layer;
+            probe.global_layer = global_layer;
             probe.recurrence_values = state->recurrence_state.size();
             probe.conv_values = state->conv_state.size();
             probe.recurrence_hash = hashFloatVector(state->recurrence_state);
@@ -644,11 +647,11 @@ namespace llaminar2
                 };
 
                 const bool has_conv =
-                    const_cast<IHybridKVCache *>(hybrid)->getConvKernel(layer) !=
+                    const_cast<IHybridKVCache *>(hybrid)->getConvKernel(global_layer) !=
                     nullptr;
                 const bool has_recurrence =
                     const_cast<IHybridKVCache *>(hybrid)
-                        ->getRecurrenceKernel(layer) != nullptr;
+                        ->getRecurrenceKernel(global_layer) != nullptr;
                 bool local_complete = true;
                 bool full_complete = true;
                 bool has_local_bank = false;

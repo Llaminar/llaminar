@@ -5,7 +5,7 @@
  * These tests are deliberately device-free. They lock down parsing and prove
  * that CPU-only inventory detection returns before any vendor enumeration is
  * reachable. Real-driver primary-context isolation is covered by the matching
- * production-parity preflight integration test.
+ * production-test preflight integration test.
  */
 
 #include <gtest/gtest.h>

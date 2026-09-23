@@ -11,6 +11,7 @@
 
 #include "execution/mtp/MTPCheckpointPolicy.h"
 #include "kernels/HybridGDNStateGeometry.h"
+#include "kernels/DeviceSequenceStateGeometry.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 
@@ -244,19 +245,17 @@ namespace llaminar2
 
             if (device.is_gpu())
             {
-                constexpr size_t kSequenceWordsPerLayer = 2;
-                constexpr size_t kSequenceWordBytes =
-                    sizeof(int32_t);
+                // Match each concrete cache's metadata shape, including the
+                // recurrent-only frontier. Absent predictor caches have no
+                // allocation and therefore contribute nothing.
                 const size_t main_metadata =
-                    static_cast<size_t>(
-                        result.main_full_attention_layers) *
-                    kSequenceWordsPerLayer *
-                    kSequenceWordBytes;
+                    DeviceSequenceStateGeometry(
+                        result.main_full_attention_layers).checkpointBytes();
                 const size_t shifted_metadata =
-                    static_cast<size_t>(
-                        result.mtp_full_attention_layers) *
-                    kSequenceWordsPerLayer *
-                    kSequenceWordBytes;
+                    result.mtp_full_attention_layers + result.mtp_gdn_layers > 0
+                        ? DeviceSequenceStateGeometry(
+                              result.mtp_full_attention_layers).checkpointBytes()
+                        : 0;
                 result.sequence_metadata_bytes =
                     kMTPConcurrentLiveCheckpointSets *
                         (main_metadata + shifted_metadata) +

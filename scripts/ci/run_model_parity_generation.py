@@ -223,9 +223,9 @@ def main(argv: list[str] | None = None) -> int:
             report["prerequisite_report_digest"] = digest(installed)
         prerequisites = ((installed["preflight_return_code"], installed["preflight_elapsed_seconds"],
                           installed["preflight_tests"]) if installed is not None else
-                         parity.reuse_unchanged_production_parity_preflight(args.build_dir, args.reuse_preflight_report)
+                         parity.reuse_unchanged_production_test_preflight(args.build_dir, args.reuse_preflight_report)
                          if args.reuse_preflight_report else
-                         parity.run_production_parity_preflight(args.build_dir, None,
+                         parity.run_production_test_preflight(args.build_dir, None,
                                                                artifact_directory=args.output / "preflight"))
         code, elapsed, tests = prerequisites
         report.update(preflight_return_code=code, preflight_elapsed_seconds=elapsed,

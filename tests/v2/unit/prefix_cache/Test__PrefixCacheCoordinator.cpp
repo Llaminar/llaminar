@@ -262,6 +262,52 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     EXPECT_FALSE(participant.has_terminal_hidden);
 }
 
+/** @test Metadata without an archive cannot certify a partial terminal chunk. */
+TEST(Test__PrefixCacheCoordinator, MetadataOnlyHitRequiresCompleteBlockCoverage)
+{
+    PrefixLookupResult hit;
+    hit.supported = hit.cache_enabled = true;
+    hit.cached_tokens = 3;
+    hit.block_size = 2;
+    const auto participant = makePrefixParticipantLookup(0, DeviceId::cpu(), hit);
+    EXPECT_EQ(participant.matched_blocks, 1);
+    const auto aggregate = makePrefixLookupResult(coordinatePrefixLookups({participant}), 2);
+    EXPECT_EQ(aggregate.cached_tokens, 2);
+    EXPECT_FALSE(aggregate.has_terminal_logits);
+    EXPECT_FALSE(aggregate.has_terminal_hidden);
+}
+
+/** @test One recurrent image covers the same token frontier as many KV records. */
+TEST(Test__PrefixCacheCoordinator, RecurrentCheckpointCountsLogicalCoverage)
+{
+    PrefixLookupResult hit;
+    hit.supported = hit.cache_enabled = true;
+    hit.cached_tokens = 9;
+    hit.block_size = 4;
+    hit.requires_terminal_hidden = hit.requires_terminal_logits = false;
+    PrefixBlockHandle terminal;
+    terminal.key = makePrefixCacheKey(0xfeed, 0x1234, 2, 8, {17});
+    terminal.layout.block_size = 4;
+    terminal.layout.total_layers = terminal.layout.gdn_layers = 1;
+    terminal.layout.hybrid_host_state_bytes = terminal.layout.hybrid_state_bytes = 8;
+    terminal.layout.includes_hybrid_state = terminal.has_hybrid_state = true;
+    terminal.total_bytes = terminal.layout.totalBytes();
+    hit.blocks.push_back(terminal);
+
+    auto recurrent = makePrefixParticipantLookup(0, DeviceId::cpu(), hit, {},
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally);
+    EXPECT_EQ(recurrent.matched_blocks, 3);
+    auto attention = recurrent;
+    attention.participant_id = 1;
+    attention.matched_blocks = 3;
+    const auto aggregate = makePrefixLookupResult(
+        coordinatePrefixLookups({recurrent, attention}), 4);
+    EXPECT_EQ(aggregate.cached_tokens, 9);
+    EXPECT_EQ(hit.clampedTo(aggregate.cached_tokens).cached_tokens, 9);
+    EXPECT_EQ(hit.clampedTo(8).cached_tokens, 0)
+        << "A recurrent image cannot be rewound to a frontier it never captured";
+}
+
 TEST(Test__PrefixCacheCoordinator, BuildsAggregateLookupResultForRunnerCode)
 {
     auto coordination = coordinatePrefixLookups({

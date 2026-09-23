@@ -14,7 +14,7 @@ Prepared weights and workspace remain 17,091,788,800 and 2,435,227,652 bytes.
 These are fixed-contract Release workloads, not the profiler measurements below.
 
 The shared ordinary/forward-only controller slice passes **636 Unit tests,
-96 ProductionParityPreflight integrations and all six selected CUDA Qwen3.8
+96 ProductionTestPreflight integrations and all six selected CUDA Qwen3.8
 cells** (MTP off, 1, 2, 3, 15 and dynamic depth), with **53 validated CSVs**.
 The aggregate took **384.866 s**; its model campaign took approximately 59 s.
 Receipt: `/tmp/qwen38-ordinary-shared-program-proof.{json,log}`. Artifact root:
@@ -303,7 +303,7 @@ must not be used as canonical-KPART evidence.
 The final source passes the canonical CUDA Qwen3.8 aggregate at 22:57 UTC:
 
 - Complete Unit gate: **633/633**, 69.96 seconds.
-- ProductionParityPreflight: **96/96**, 250.78 seconds. Its newly registered
+- ProductionTestPreflight: **96/96**, 250.78 seconds. Its newly registered
   captured all-format boundary test passes in 24.09 seconds, and the exact
   all-codebook compiler-resource inventory passes in 1.50 seconds.
 - Qwen3.8 CUDA model parity: **6/6 cells**, 59.22 seconds; **53 CSV artifacts**
@@ -464,7 +464,7 @@ Implementation boundaries and proof obligations:
 ### Final verification of the retained source
 
 At 00:19 UTC the complete Unit gate passes **634/634** in 69.49 seconds,
-ProductionParityPreflight passes **96/96** in 250.12 seconds, and the selected
+ProductionTestPreflight passes **96/96** in 250.12 seconds, and the selected
 Qwen3.8 CUDA campaign passes **6/6** in 59.53 seconds with **53 validated CSV
 artifacts**. Individual cells: MTP off 10.159 s, depth 1 9.345 s, depth 2
 9.182 s, depth 3 9.185 s, depth 15 9.344 s, dynamic depth 11.052 s. Prefix
@@ -524,7 +524,7 @@ MTP cases. The new fixture covers request counts 1, 2, 31, 32, 33, 63, 64, 65
 and 129, budgets 1, 2 and 17, both initial frontiers, independent EOS, padded
 strides, invalid sampler output and twenty replays per captured configuration.
 The selected canonical campaign passes its unchanged prerequisites:
-**635/635 Unit** in 71.57 seconds and **96/96 ProductionParityPreflight** in
+**635/635 Unit** in 71.57 seconds and **96/96 ProductionTestPreflight** in
 250.28 seconds. The six CUDA Qwen3.8 cells then pass in 59.58 seconds with
 **53 validated CSV artifacts** and prefix restore enabled. Cell times are:
 MTP off 9.919 s, depth 1 9.219 s, depth 2 9.385 s, depth 3 9.174 s, depth 15
@@ -668,7 +668,7 @@ does **not** subtract a separately observed first-sample latency. A complete
 ordinary parent can preserve that convention without a host-per-token bridge.
 
 The fresh canonical selected run passes **635/635 Unit** in 67.80 seconds,
-**96/96 ProductionParityPreflight** in 250.93 seconds, and **6/6 CUDA Qwen3.8
+**96/96 ProductionTestPreflight** in 250.93 seconds, and **6/6 CUDA Qwen3.8
 cells** in 59.67 seconds. It validates all **53 CSV artifacts**, including
 mandatory prefix restore. Individual GoogleTest cell times are MTP off
 9.956 s, depth 1 9.408 s, depth 2 9.167 s, depth 3 9.296 s, depth 15 9.312 s,
@@ -759,7 +759,7 @@ but those model/request bindings still need to be installed and proven before
 any new Release throughput claim.
 
 The retained-parent slice's canonical selected gate passes **635/635 Unit**
-and **96/96 ProductionParityPreflight**, followed by **6/6 Qwen3.8 CUDA cells**
+and **96/96 ProductionTestPreflight**, followed by **6/6 Qwen3.8 CUDA cells**
 and **53 validated CSV artifacts**. Individual times are off 10.061 s, depth 1
 9.215 s, depth 2 9.168 s, depth 3 9.260 s, depth 15 9.396 s, and dynamic depth
 11.132 s. Protected wall time is 382.804 s; persistent tmpfs staging copies

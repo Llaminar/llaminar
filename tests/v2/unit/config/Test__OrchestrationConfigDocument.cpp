@@ -270,7 +270,7 @@ TEST(OrchestrationConfigDocument, BadTypesEnumsOverflowAndDuplicateKeysFailAtInp
 {
     const Json base = Json::parse(serializeOrchestrationConfig(example(DeviceType::ROCm)));
     for (const auto &[path, value] : std::vector<std::pair<std::string, Json>>{
-             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 5}, {"/schema_version", 4.0}, {"/kind", "memory-report"},
+             {"/schema_version", 1}, {"/schema_version", 2}, {"/schema_version", 3}, {"/schema_version", 4}, {"/schema_version", 6}, {"/schema_version", 5.0}, {"/kind", "memory-report"},
              {"/configuration/mpi_procs", "3"}, {"/configuration/mpi_procs", 1ull << 32},
              {"/configuration/mtp/enabled", 1}, {"/configuration/mtp/draft_tokens", 1.5},
              {"/configuration/mtp/verify_mode", "invented"}, {"/configuration/mtp/verify_mode", 0},

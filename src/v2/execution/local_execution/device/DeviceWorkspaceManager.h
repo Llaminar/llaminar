@@ -22,6 +22,7 @@
 #pragma once
 
 #include "WorkspaceDescriptor.h"
+#include "WorkspaceBufferLease.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../planning/PhysicalMemoryAuthority.h"
 #include <cstdint>
@@ -469,8 +470,10 @@ namespace llaminar2
         /**
          * @brief Release all allocated buffers
          *
-         * Frees the underlying memory block and clears all buffer mappings.
-         * After release(), isAllocated() returns false.
+         * Clears the manager's names and ownership. A retained buffer lease
+         * keeps its original allocation and PMA claim alive until its last
+         * consumer retires. After release(), isAllocated() returns false;
+         * only PhysicalMemoryAuthority reports whether physical bytes remain.
          */
         void release();
 
@@ -484,6 +487,22 @@ namespace llaminar2
          * @return Pointer to buffer (nullptr if not found)
          */
         void *getBuffer(const std::string &name) const;
+
+        /** @brief Retain one exact named region for a captured consumer.
+         * @param name Existing buffer name in the current workspace layout.
+         * @param offset Region offset relative to that name, not the whole block.
+         * @param bytes Positive physical extent needed by the consumer.
+         * @return Lease on the original allocation and its original PMA claim.
+         * @throws std::invalid_argument for an absent/empty name or zero extent.
+         * @throws std::out_of_range for an extent outside the named buffer.
+         *
+         * Setup-only. No device allocation, copy, event or new claim occurs.
+         * Growth may publish a different address for a name; this lease keeps
+         * the old address alive and never follows that replacement. Reusing
+         * the whole primary allocation is forbidden while a lease survives.
+         */
+        [[nodiscard]] std::shared_ptr<const WorkspaceBufferLease> retainBuffer(
+            const std::string &name, size_t offset, size_t bytes) const;
 
         /**
          * @brief Get size of a named buffer
@@ -680,8 +699,8 @@ namespace llaminar2
         // Main allocation block
         void *block_ = nullptr;
         size_t block_size_ = 0;
-        /** Exact accounting claim retained for the primary backend block. */
-        PhysicalMemoryAllocationLease primary_block_lease_;
+        /** Original physical allocation and claim, shared only by bounded leases. */
+        std::shared_ptr<detail::WorkspaceAllocation> primary_allocation_;
 
         // Named buffer offsets within block
         struct BufferInfo
@@ -699,8 +718,8 @@ namespace llaminar2
         {
             void *base = nullptr;
             size_t size = 0;
-            /** Claim released only after `base` is returned to the backend. */
-            PhysicalMemoryAllocationLease allocation_lease;
+            /** Original physical allocation; leases may outlive the name map. */
+            std::shared_ptr<detail::WorkspaceAllocation> allocation;
         };
         std::vector<ExtensionBlock> extension_blocks_;
 

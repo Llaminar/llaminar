@@ -6,7 +6,7 @@
  * Tests the new AttentionComputeStage which uses KernelFactory for
  * type-safe attention kernel dispatch. CPU contracts run in Unit; the CUDA and
  * ROCm workspace cases use physical-device properties and are separately
- * registered in ProductionParityPreflight. No model weights are needed.
+ * registered in ProductionTestPreflight. No model weights are needed.
  */
 
 #include <gtest/gtest.h>

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Device-free regressions for typed E2E discovery and full-check admission."""
 import argparse
+from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
@@ -108,6 +110,94 @@ def inventory(records):
 
 
 class E2EDiscoveryTests(unittest.TestCase):
+    """Typed discovery, full-cell admission and repeat scheduling used by preflight."""
+
+    def run_driver(self, outcomes, options=(), evidence_error=None):
+        """Replace only discovery, staging and process I/O, retaining driver policy."""
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as mocks:
+            root = Path(directory)
+            model = root / "model.gguf"
+            profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
+                       "generation_tokens": 2048, "request_timeout_seconds": 600,
+                       "readiness_timeout_seconds": 180,
+                       "cell_timeout_seconds": {"AVX512": 900, "AVX2": 900},
+                       "thinking_modes": "both", "movement_evidence": "not_applicable",
+                       "tool_calling": "required", "server_args": ["--auto"],
+                       "planning": {"mode": "auto", "strategy": "tp", "mpi_ranks": 1,
+                                    "device_counts": {"cuda": 2}}}
+            campaign = SimpleNamespace(group=SimpleNamespace(backends="CUDA"))
+            selected = [(campaign, name, {"id": name, "model": str(model), "e2e": profile})
+                        for name in ("a", "b")]
+            mocks.enter_context(patch.object(e2e, "discover", return_value=selected))
+            mocks.enter_context(patch.object(e2e, "release_binary_cpu_isa", return_value=e2e.CPUISA.AVX512))
+            workspace = MagicMock(models=root, persistent=True)
+            lease = mocks.enter_context(patch.object(e2e.parity, "model_staging_workspace"))
+            lease.return_value.__enter__.return_value = workspace
+            staged = mocks.enter_context(patch.object(e2e.parity, "stage_models_in_ramdisk",
+                return_value=([SimpleNamespace(source_path=str(model), filename=model.name)], None)))
+            run = mocks.enter_context(patch.object(e2e, "run_e2e_process", side_effect=outcomes))
+            validate = mocks.enter_context(patch.object(e2e, "validate_http_cell_evidence",
+                                                        side_effect=evidence_error))
+            report = root / "report.json"
+            code = e2e.main(["--binary", str(root / "llaminar2"), "--source-revision", "test",
+                             "--report", str(report), *options])
+            result = json.loads(report.read_text())
+            self.assertEqual(staged.call_count, 1)
+            self.assertEqual(workspace.protect_published_models.call_count, 1)
+            self.assertEqual(len({row["artifacts"] for row in result["cells"]}), run.call_count)
+            # Every invocation receives a new complete-cell budget and the full
+            # public harness, never an in-process request-only fast path.
+            self.assertEqual(len({id(call.kwargs["budget"]) for call in run.call_args_list}), run.call_count)
+            for call in run.call_args_list:
+                self.assertIn("test_server_e2e.sh", call.args[0][1])
+                self.assertEqual(call.args[1]["LLAMINAR_E2E_LONG_CONTEXT_TIER"], "full")
+            self.assertEqual(validate.call_count, sum(value == 0 for value in outcomes[:run.call_count]))
+            return code, result
+
+    def test_complete_repetitions_keep_independent_evidence_and_one_staging_lease(self):
+        """Twenty iterations of both cells means forty distinct full server runs."""
+        code, result = self.run_driver([0] * 40, ["--repeat", "20", "--fail-fast"])
+        self.assertEqual(code, 0)
+        self.assertTrue(result["correctness_passed"])
+        self.assertEqual(result["selected"], 2)
+        self.assertEqual(result["planned_runs"], 40)
+        self.assertEqual(result["completed_runs"], 40)
+        self.assertEqual([(row["case"], row["iteration"]) for row in result["cells"]],
+                         [(name, iteration) for iteration in range(1, 21) for name in ("a", "b")])
+
+    def test_default_aggregate_still_visits_later_cells_after_failure(self):
+        """The diagnostic fail-fast option must not change the normal failure map."""
+        code, result = self.run_driver([1, 0])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["completed_runs"], 2)
+        self.assertEqual(result["failed_cells"], ["a"])
+        self.assertFalse(result["correctness_passed"])
+
+    def test_stability_failure_preserves_evidence_and_cannot_certify_unfinished_runs(self):
+        """A timeout retires this diagnostic cohort; earlier passes remain visible."""
+        code, result = self.run_driver([0, 124, 0], ["--repeat", "20", "--fail-fast"])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["completed_runs"], 2)
+        self.assertEqual(result["planned_runs"], 40)
+        self.assertEqual(result["cells"][-1]["outcome"], "cell_timeout")
+        self.assertFalse(result["correctness_passed"])
+
+    def test_missing_http_proof_is_also_a_failed_stability_iteration(self):
+        """A zero process status alone must never increment the clean count."""
+        code, result = self.run_driver([0], ["--repeat", "20", "--fail-fast"], ValueError("missing tool proof"))
+        self.assertEqual(code, 1)
+        self.assertEqual(result["completed_runs"], 1)
+        self.assertEqual(result["cells"][0]["evidence_error"], "missing tool proof")
+        self.assertFalse(result["correctness_passed"])
+
+    def test_invalid_count_rejected_before_any_discovery_or_staging(self):
+        """An empty or malformed repetition count cannot manufacture a green run."""
+        for count in ("0", "-1", "1.5"):
+            with self.subTest(count=count), patch.object(e2e, "discover") as discovery:
+                with self.assertRaises(SystemExit) as raised:
+                    e2e.main(["--repeat", count])
+                self.assertEqual(raised.exception.code, 2)
+                discovery.assert_not_called()
     def test_cell_timeout_is_explicit_positive_metadata_not_name_inference(self):
         """Only the typed profile grants an extended allowance."""
         profile = {"cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200}}
@@ -251,7 +341,9 @@ class E2EDiscoveryTests(unittest.TestCase):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
                    "generation_tokens": 2048, "request_timeout_seconds": 600,
                    "readiness_timeout_seconds": 180, "cell_timeout_seconds": {"AVX512": 900, "AVX2": 900},
-                   "thinking_modes": "both", "movement_evidence": "required"}
+                   "thinking_modes": "both", "movement_evidence": "required", "tool_calling": "required",
+                   "planning": {"mode": "auto", "strategy": "expert-overlay", "mpi_ranks": 2,
+                                "device_counts": {"cuda": 2, "cpu": 2}}}
         with patch.dict(e2e.os.environ, {"LLAMINAR_E2E_LONG_CONTEXT_TIER": "lite",
                                         "LLAMINAR_E2E_CONTEXT_LENGTH": "128",
                                         "LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS": "9999",
@@ -270,7 +362,9 @@ class E2EDiscoveryTests(unittest.TestCase):
         profile = {"context_length": 8192, "minimum_prompt_tokens": 4096,
                    "generation_tokens": 2048, "request_timeout_seconds": 600,
                    "cell_timeout_seconds": {"AVX512": 900, "AVX2": 1200},
-                   "thinking_modes": "both", "movement_evidence": "not_applicable"}
+                   "thinking_modes": "both", "movement_evidence": "not_applicable", "tool_calling": "required",
+                   "planning": {"mode": "auto", "strategy": "single", "mpi_ranks": 1,
+                                "device_counts": {"cuda": 1}}}
         for seconds in (60, 180, 900):
             env = e2e.certification_environment(profile | {"readiness_timeout_seconds": seconds}, Path("/tmp/e2e"))
             self.assertEqual(env["LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS"], str(seconds))
@@ -285,6 +379,13 @@ class E2EDiscoveryTests(unittest.TestCase):
         for evidence in (None, True, "dynamic", "auto", ""):
             with self.subTest(evidence=evidence), self.assertRaises(ValueError):
                 e2e.movement_evidence({"movement_evidence": evidence})
+
+    def test_tool_calling_is_required_for_every_cell(self):
+        """Stale or opted-out profiles cannot certify the complete HTTP surface."""
+        self.assertEqual(e2e.tool_calling({"tool_calling": "required"}), "required")
+        for evidence in (None, True, "optional", "off", ""):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                e2e.tool_calling({"tool_calling": evidence})
 
     def test_thinking_coverage_is_explicit_and_never_model_name_derived(self):
         for mode in ("both", "non-thinking"):

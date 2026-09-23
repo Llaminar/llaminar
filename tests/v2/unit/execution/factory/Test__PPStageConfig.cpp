@@ -13,6 +13,8 @@
 #include <gtest/gtest.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "backends/BackendManager.h"
 #include "mocks/MockModelContext.h"
 #include "utils/TestTensorFactory.h"
 
@@ -127,6 +129,56 @@ TEST(Test__FactoryPPStageConfig, InjectedFactoryRejectsInvalidScopeBeforeMateria
                  std::invalid_argument);
     EXPECT_EQ(model->getWeightCallCount(), 0u);
     EXPECT_EQ(model->loadTensorCallCount(), 0u);
+}
+
+/**
+ * @test PP construction cannot materialize a graph before its input is bound.
+ *
+ * CPU MoE normally requests an eager workspace family, so this device-free
+ * fixture exercises the same premature factory transition as GPU MTP. Only
+ * global weights are supplied deliberately: stage construction may allocate
+ * its admitted banks, but graph declaration belongs to the enclosing pipeline
+ * after every stage and transport edge exists. Neither a head, an interior
+ * stage nor the tail may enter graph declaration from the participant factory.
+ */
+TEST(Test__FactoryPPStageConfig, PipelineConstructionLeavesGraphDeclarationToComposer)
+{
+    initCPUBackend(-1);
+    auto model = MockModelContextBuilder()
+        .setArchitecture("qwen35moe").setBlockCount(3)
+        .setEmbeddingLength(32).setHeadCount(1).setHeadCountKV(1)
+        .setFeedForwardLength(64).setVocabSize(32).setContextLength(64)
+        .addTensor("token_embd.weight", TestTensorFactory::createFP32({32, 32}))
+        .addTensor("output_norm.weight", TestTensorFactory::createFP32({32}))
+        .addTensor("output.weight", TestTensorFactory::createFP32({32, 32}))
+        .build();
+    auto &loader = model->mockLoader();
+    loader.setIntParam("qwen35moe.expert_count", 4);
+    loader.setIntParam("qwen35moe.expert_used_count", 2);
+    loader.setIntParam("qwen35moe.expert_feed_forward_length", 64);
+    loader.setIntParam("qwen35moe.full_attention_interval", 1);
+    loader.setIntParam("qwen35moe.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35moe.ssm.state_size", 32);
+    loader.setIntParam("qwen35moe.ssm.inner_size", 32);
+    loader.setIntParam("qwen35moe.ssm.group_count", 1);
+    loader.setIntParam("qwen35moe.ssm.time_step_rank", 1);
+
+    for (int stage = 0; stage < 3; ++stage)
+    {
+        SCOPED_TRACE(stage);
+        InferenceRunnerConfig config;
+        config.max_seq_len = config.activation_seq_len = 64;
+        config.pp_stage_config = FactoryPPStageConfig{
+            stage, stage + 1, stage == 0, stage == 2};
+        auto runner = createTestableInferenceRunner(model, DeviceId::cpu(), config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_NE(runner->getHiddenState(), nullptr);
+        auto *device = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
+        ASSERT_NE(device, nullptr);
+        if (stage != 0)
+            EXPECT_FALSE(device->materializeForwardGraphForShape(1))
+                << "Deferring construction must not weaken the required input-owner check";
+    }
 }
 
 /** @test Missing metadata is an admission error, never permission to guess bounds. */

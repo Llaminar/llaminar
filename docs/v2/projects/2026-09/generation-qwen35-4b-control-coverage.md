@@ -43,7 +43,7 @@ Each root contains `report.json`, per-cell exact configuration, harness/server
 logs, terminal PerfStats and `generation/observations.json` with all responses.
 Both batches use the same unchanged Release build and the same authenticated
 `hybrid-q8-prefix-prerequisites-01/prerequisites.json` receipt: 647 Unit and 137
-ProductionParityPreflight registrations. Reused prerequisite time is zero in
+ProductionTestPreflight registrations. Reused prerequisite time is zero in
 both reports. The model remains in the sealed persistent tmpfs; both runs
 report cache hits and zero model-copy bytes. No build, reconfiguration, prompt
 change, precision change, or inference-policy override occurs between them.

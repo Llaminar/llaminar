@@ -55,7 +55,7 @@ the original error, including malformed subsequent budget admission.
   11), then passes on both rebuilt backends across twenty replays. All four
   new focused backend tests pass against the rebuilt Integration core.
 - The focused probe is included in both existing DeviceGenerationController
-  integration selections, already in ProductionParityPreflight.
+  integration selections, already in ProductionTestPreflight.
 - Both runtime builds complete. Canonical receipt
   `native-hosted-maintenance-prerequisites-03` passes 651 Units and 170
   production preflight tests in 699.684s, reused unchanged by the exact retry.

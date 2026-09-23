@@ -4,7 +4,7 @@
 This intentionally small gate is distinct from the full production
 certification pipeline.  It owns exactly the develop-branch promise: build the
 AVX512 and AVX2 full-backend image pairs, run the complete CMake-owned Unit and
-ProductionParityPreflight gates inside each installed test runner, then publish the
+ProductionTestPreflight gates inside each installed test runner, then publish the
 two already-tested runtime siblings.  It never discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.

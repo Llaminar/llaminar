@@ -126,11 +126,15 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                         ASSERT_TRUE(backend->hostToDevice(banks[field]->gpu_data_ptr(), setup_guard.data(),
                             sizeof(setup_guard), device.gpu_ordinal(), stream));
                     ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context));
-                    const auto *const retained_wire = edges.publicationTransport(wire);
+                    const auto *const retained_wire = Peer::publicationTransportIdentity(owner);
                     ASSERT_NE(retained_wire, nullptr);
+                    const auto expected_order = tail ? PipelineForwardGraphEdges::PublicationOrder::CommitThenExchange
+                                                     : PipelineForwardGraphEdges::PublicationOrder::ExchangeThenCommit;
+                    ASSERT_EQ(edges.preparedPublication(wire), expected_order);
                     // A second preparation is local reuse, not another collective wave.
                     ASSERT_TRUE(Peer::capturePublicationTransport(owner, edges, wire, *execution, context));
-                    EXPECT_EQ(edges.publicationTransport(wire), retained_wire);
+                    EXPECT_EQ(Peer::publicationTransportIdentity(owner), retained_wire);
+                    EXPECT_EQ(edges.preparedPublication(wire), expected_order);
                     for (size_t field = 0; field < 4; ++field)
                     {
                         std::array<int32_t, 3> observed{};
@@ -189,7 +193,8 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                         if (!tail && limit == width - 1)
                             EXPECT_EQ(publication, previous_publication) << "A tail-only limit must not recapture followers";
                         previous_publication = publication;
-                        EXPECT_EQ(edges.publicationTransport(wire), retained_wire);
+                        EXPECT_EQ(Peer::publicationTransportIdentity(owner), retained_wire);
+                        EXPECT_EQ(edges.preparedPublication(wire), expected_order);
                         // Record synthetic verifier writes, then compose the real
                         // production publication parent after them. The collective
                         // is never recorded inside these policy-specific captures.
@@ -264,7 +269,7 @@ TEST_P(PipelineMTPStateOwnership, CapturedAcceptanceCrossesNativeParticipants)
                     // Real DGO teardown owns both parents and the wire lease;
                     // the surviving rank topology must not retain arena borrowers.
                     owner_storage.reset();
-                    EXPECT_EQ(edges.publicationTransport(wire), nullptr);
+                    EXPECT_FALSE(edges.preparedPublication(wire));
                     DeviceGraphExecutor unused_executor;
                     EXPECT_THROW(edges.materializePublicationTransport(wire, unused_executor, *execution, context), std::logic_error)
                         << "A retired participant cannot resurrect capture against an old arena";

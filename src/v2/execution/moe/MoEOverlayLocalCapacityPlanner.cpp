@@ -395,6 +395,12 @@ namespace llaminar2
 
         const auto bound =
             MoEOverlayCapacityAdmission::boundParticipants(overlay_plan);
+        const auto continuation_shards =
+            continuationShards(rank_plan, input.rank_execution_kind);
+        const std::size_t local_gpu_graph_owners = static_cast<std::size_t>(
+            std::count_if(continuation_shards.begin(), continuation_shards.end(),
+                [](const MoEOverlayContinuationShard &shard)
+                { return shard.device.is_gpu(); }));
         /* Rank locality, not tier priority, determines whether the retained
          * graph needs a cross-rank activation channel. Keep this predicate in
          * the channel planner so capacity admission and runtime preflight
@@ -607,6 +613,15 @@ namespace llaminar2
                 participant_count == endpoint_participant_counts.end()
                     ? 0
                     : participant_count->second;
+            if (device.is_cpu() &&
+                role == DeviceExecutionMemoryRole::RoutedExpertParticipant)
+            {
+                // Every local GPU continuation runner materializes an
+                // independent CPU graph workspace. The physical CPU resource
+                // is shared, but those blocks may be live concurrently.
+                config.concurrent_workspace_owners =
+                    std::max<std::size_t>(1u, local_gpu_graph_owners);
+            }
             const int overlay_segment_rows = std::min(
                 std::max(1, config.activation_seq_len),
                 rank_plan.runtime.moe_routed_prefill
@@ -670,8 +685,7 @@ namespace llaminar2
                 assignments.forRank(config.shard_index));
         };
 
-        for (const auto &shard : continuationShards(
-                 rank_plan, input.rank_execution_kind))
+        for (const auto &shard : continuation_shards)
         {
             /*
              * A LocalTP context can be retained solely as the sparse expert

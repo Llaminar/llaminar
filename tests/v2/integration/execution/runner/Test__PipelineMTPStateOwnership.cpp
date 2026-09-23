@@ -9,82 +9,15 @@
  * native graphs. These focused proofs do not replace real-weight HTTP or
  * mathematical model certification.
  */
-#include <gtest/gtest.h>
-#include <algorithm>
-#include <array>
-#include <cstring>
-#include <limits>
-#include "backends/BackendManager.h"
-#include "backends/GPUDeviceContextPool.h"
-#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "execution/local_execution/orchestrators/RankOrchestrator.h"
-#include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
-#include "execution/local_execution/orchestrators/TPWorkerPool.h"
-#include "execution/runner/OrchestrationRunner.h"
-#include "execution/mtp/MTPCheckpointPolicy.h"
-#include "loaders/WeightPlan.h"
-#include "models/qwen35/Qwen35Graph.h"
-#include "execution/compute_stages/stages/EmbeddingStage.h"
-#include "execution/compute_stages/stages/KVCacheAppendStage.h"
-#include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
-#include "execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.h"
-#include "execution/compute_stages/stages/MTPVerifierPreparationStage.h"
-#include "execution/local_execution/graph/GraphCaptureGuard.h"
-#include "../../../utils/TestTensorFactory.h"
-#include "transfer/TransferEngine.h"
-#include "collective/BackendRouter.h"
-#include "collective/LocalTPContext.h"
-#include "planning/MemoryPlanner.h"
-#include "planning/PhysicalMemoryAuthority.h"
-#include "tensors/FP16Utils.h"
-#include "../../../mocks/MockModelContext.h"
-#include "../../backends/MTPMainForwardReadRetirementProof.h"
+#include "PipelineGenerationTestSupport.h"
 
 namespace llaminar2::test
 {
-/** @brief Explicit backend selection keeps CPU-only preflight device-free. */
-class PipelineMTPStateOwnership : public ::testing::TestWithParam<std::string>
-{
-protected:
-    /** @brief Small real Qwen schema; model weights are unnecessary for state admission. */
-    static GraphConfig stateConfig(DeviceId device)
-    {
-        GraphConfig config;
-        config.d_model = 32;
-        config.d_ff = config.d_ff_local = 64;
-        config.n_heads = config.local_n_heads = 1;
-        config.n_kv_heads = config.local_n_kv_heads = 1;
-        config.head_dim = 32;
-        config.n_layers = 3;
-        config.total_n_layers = 4;
-        config.vocab_size = config.vocab_local = 32;
-        config.max_seq_len = 64;
-        config.default_device = device;
-        config.layer_types.assign(4, "full_attention");
-        config.gdn.conv_kernel_size = 4;
-        config.gdn.state_size = config.head_dim;
-        config.gdn.inner_size = config.d_model;
-        config.gdn.group_count = config.n_kv_heads;
-        config.gdn.time_step_rank = config.n_heads;
-        // Match the production Qwen configuration builder.  A retained GPU
-        // MTP family owns the shifted-KV append inside the captured prefill
-        // transaction; the generic GraphConfig default is intentionally not
-        // a valid substitute for graph-native MTP execution.
-        config.mtp_request_terminal_hidden_publication =
-            MTPRequestTerminalHiddenPublicationPolicy::GraphCapturedDeviceGeometry;
-        config.mtp_shifted_prefill_hidden_publication =
-            MTPShiftedPrefillHiddenPublicationPolicy::GraphIntegratedKVTransaction;
-        return config;
-    }
-};
-
-#include "Test__OrdinaryDGOGeneration.inc"
 #include "Test__PipelineMTPPublication.inc"
 #include "Test__PipelineMTPPublicationTransport.inc"
 #include "Test__PipelineVerifierEdges.inc"
 #include "Test__PipelineMTPForwardInput.inc"
 #include "Test__PipelineMTPPublicationBindings.inc"
-#include "Test__PipelineMTPMainForward.inc"
 
 /**
  * @brief Retained MTP capacity is distinct from both request enablement and PP role.
@@ -509,6 +442,28 @@ TEST_P(PipelineMTPStateOwnership, OrdinaryAdmissionPublishesRequestSamplingPolic
                 ? InferenceStateResetRequest::requestBoundary("ordinary-policy-new-request")
                 : InferenceStateResetRequest::prefixRestoreBoundary("ordinary-policy-prefix", true));
         }
+    });
+}
+
+/**
+ * @test A headless stage joins the preceding forward before entering another graph.
+ *
+ * A native timeline gate holds the predecessor pending while the real DGO
+ * prelude submits its successor on another stream. No sampler or sidecar
+ * exists on this participant to provide an incidental ordering edge. Check
+ * both nonblocking submission and exact bytes for twenty role transitions.
+ */
+TEST_P(PipelineMTPStateOwnership, PipelineFollowerJoinsPriorForwardWithoutSampler)
+{
+    if (GetParam() == "CPU") return;
+    initCPUBackend(-1);
+    const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    auto *backend = device.is_cuda() ? getCUDABackend() : getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    auto &context = GPUDeviceContextPool::instance().getContext(device);
+    context.submitAndWait([&] {
+        proveMTPMainForwardReadRetirement(context, *backend, device,
+            MTPReadRetirementBoundary::PipelineForwardPredecessor);
     });
 }
 

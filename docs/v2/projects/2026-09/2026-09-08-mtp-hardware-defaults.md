@@ -64,7 +64,7 @@ plan-owned runtime rather than reparsing it independently.
 ## Verification
 
 Both Release and Integration are rebuilt. The fresh canonical affected gate
-passes **639 Unit registrations, 115 ProductionParityPreflight registrations,
+passes **639 Unit registrations, 115 ProductionTestPreflight registrations,
 and all twelve Qwen3.8 CUDA/ROCm numerical cells**, with **106 validated CSV
 artifacts** and no artifact errors. Wall time is **600.305 seconds**, including
 532.750 seconds for the shared Unit/preflight gate. Both backends cover MTP

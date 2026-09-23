@@ -69,7 +69,7 @@ installed.
 ## Correctness and profiling
 
 `V2_Integration_CUDATinyProjectionAllFloatingFormats` is added to
-`ProductionParityPreflight`. It invokes the production launch bridges inside
+`ProductionTestPreflight`. It invokes the production launch bridges inside
 retained graphs and compares bytes with an independent copy of the historical
 arithmetic, including the old software FP16 conversion. Coverage totals 1,076
 format/geometry cases, with twenty graph replays per case: M=1..65, neighboring

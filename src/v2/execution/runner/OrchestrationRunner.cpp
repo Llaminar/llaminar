@@ -22658,7 +22658,8 @@ namespace llaminar2
 
         const ServingGraphPreparationKind preparation_kind =
             runner_->servingGraphPreparationKind();
-        if (preparation_kind == ServingGraphPreparationKind::EagerHostGraph)
+        if (preparation_kind == ServingGraphPreparationKind::EagerHostGraph &&
+            !plan_.usesLocalPP())
             return true;
         if (preparation_kind == ServingGraphPreparationKind::Unresolved)
         {
@@ -22678,8 +22679,14 @@ namespace llaminar2
         // padded-bucket floor was 256, leaving an admitted input bank stranded
         // when preflight rejected execution. Exact verifier/decode geometries
         // remain independent of this raw-prompt coalescing policy.
-        const std::vector<int> buckets =
-            rawPrefillGraphBucketsForResidentCapacity(
+        // CPU-only pipelines also deferred workspace declaration until their
+        // ingress owners existed. They seal that host family at its admitted
+        // row capacity; no GPU bucket ladder or native executable is implied.
+        const bool host_pipeline =
+            preparation_kind == ServingGraphPreparationKind::EagerHostGraph;
+        const std::vector<int> buckets = host_pipeline
+            ? std::vector<int>{plan_.runtime.resident_graph_rows}
+            : rawPrefillGraphBucketsForResidentCapacity(
                 execution.prefill_graph_bucket_sizes,
                 plan_.runtime.resident_graph_rows,
                 execution.prefill_graph_min_seq);
@@ -22689,16 +22696,16 @@ namespace llaminar2
             .main_decode_graph =
                 ServingMainDecodeGraphKind::HistoryBearingSerial,
         };
-        if (!execution.gpu_graphs || !execution.prefill_graph_buckets ||
-            !family_plan.valid())
+        if (!family_plan.valid() ||
+            (!host_pipeline && (!execution.gpu_graphs || !execution.prefill_graph_buckets)))
         {
             return setError(
-                "Native GPU serving graph setup has no valid memory-admitted prefill bucket family");
+                "Serving graph setup has no valid memory-admitted prefill family");
         }
         if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
         {
             return setError(
-                "Ordinary GPU runner could not seal its admitted serving graph family");
+                "Ordinary runner could not seal its admitted serving graph family");
         }
 
         PerfStatsCollector::addCounter(
@@ -22711,7 +22718,7 @@ namespace llaminar2
              {"graph_row_capacity",
               std::to_string(plan_.runtime.resident_graph_rows)},
              {"main_decode", "history_bearing_serial"},
-             {"preparation_kind", "native_device_executable_family"},
+             {"preparation_kind", host_pipeline ? "eager_host_graph" : "native_device_executable_family"},
              {"request_state_mutations", "0"},
              {"executable_launches", "0"}});
         return true;

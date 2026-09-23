@@ -11,6 +11,7 @@
 #include "PipelineDeviceGeneration.h"
 #include "PipelineForwardGraphEdges.h"
 #include "DeviceGraphOrchestrator.h"
+#include "IRankOrchestrator.h"
 #include "TPWorkerPool.h"
 #include "backends/BackendManager.h"
 #include "collective/LocalTPContext.h"
@@ -18,6 +19,11 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
 #include "execution/mtp/MTPServingForwardCaptureGeometry.h"
+#include "execution/mtp/MTPSpecDecodeMetadata.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceAllocator.h"
+#include "planning/ActivationBufferSizing.h"
+#include "planning/PipelineTransferMemory.h"
 #include <barrier>
 #include <algorithm>
 #include <array>
@@ -56,38 +62,105 @@ PipelineDeviceGeneration::PipelineDeviceGeneration(
     std::set<DeviceId> unique;
     for (size_t i = 0; i < stages.size(); ++i)
     {
-        auto *stage = dynamic_cast<DeviceGraphOrchestrator *>(stages[i].get());
-        if (!stage || !stage->pp_stage_config_ ||
-            stage->pp_stage_config_->has_embedding != (i == 0) ||
-            stage->pp_stage_config_->has_lm_head != (i + 1 == stages.size()) ||
-            !stage->state_.hidden || !stage->state_.kv_cache ||
-            !stage->mtp_device_generation_loop_graph_.capture ||
-            stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth) ==
-                DeviceGenerationExecutionPolicy::Unsupported ||
-            !unique.insert(stage->state_.device_id).second ||
-            (!stages_.empty() && (stage->state_.device_id.type != stages_.front()->state_.device_id.type ||
-                stage->graph_builder_->config().d_model != stages_.front()->graph_builder_->config().d_model ||
-                stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth) != execution_policy_)))
-            throw std::invalid_argument("Pipeline generation requires distinct homogeneous captured stages with exact head/tail ownership; heterogeneous and nested TP composition is not installed");
-        execution_policy_ = stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth);
-        stages_.push_back(stage);
-        devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(stage->state_.device_id));
+        auto *rank = dynamic_cast<IRankOrchestrator *>(stages[i].get());
+        const int count = rank ? rank->device_count() : 1;
+        auto *context = rank ? rank->localTPContext() : nullptr;
+        if (!stages[i] || count < 1 || (count > 1 && (!context || context->degree() != count)))
+            throw std::invalid_argument("Pipeline generation requires exact native TP domain membership");
+        domains_.push_back({stages[i].get(), context, stages_.size(), size_t(count)});
+        for (int member = 0; member < count; ++member)
+        {
+            auto *stage = dynamic_cast<DeviceGraphOrchestrator *>(rank ? rank->deviceRunner(member) : stages[i].get());
+            if (!stage || !stage->pp_stage_config_ ||
+                stage->pp_stage_config_->has_embedding != (i == 0) ||
+                stage->pp_stage_config_->has_lm_head != (i + 1 == stages.size()) ||
+                !stage->state_.hidden || !stage->state_.kv_cache || !stage->arena_ ||
+                !stage->mtp_device_generation_loop_graph_.capture ||
+                stage->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth) ==
+                    DeviceGenerationExecutionPolicy::Unsupported ||
+                !unique.insert(stage->state_.device_id).second ||
+                (!stages_.empty() && stage->graph_builder_->config().d_model != stages_.front()->graph_builder_->config().d_model))
+                throw std::invalid_argument("Pipeline generation requires distinct captured GPU members with exact layer-domain ownership");
+            (void)PipelineNativeDomain(stage->state_.device_id, context, member);
+            stages_.push_back(stage);
+            devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(stage->state_.device_id));
+        }
     }
-    collective_ = std::make_unique<LocalTPContext>(std::move(devices), std::vector<float>{}, CollectiveBackendType::AUTO);
-    if (!collective_) throw std::runtime_error("Pipeline generation collective admission failed");
+    const bool one_native_pipeline = std::all_of(domains_.begin(), domains_.end(), [](const auto &domain) {
+        return domain.count == 1;
+    }) && std::all_of(stages_.begin(), stages_.end(), [&](const auto *stage) {
+        return stage->state_.device_id.type == stages_.front()->state_.device_id.type;
+    });
+    if (one_native_pipeline)
+    {
+        collective_ = std::make_unique<LocalTPContext>(std::move(devices), std::vector<float>{}, CollectiveBackendType::AUTO);
+        execution_policy_ = stages_.front()->deviceGenerationExecutionPolicy(DeviceGenerationLoopTopology::FixedDepth);
+    }
+    else
+    {
+        // A custom mapped channel is justified only at a genuine inter-vendor
+        // boundary. Homogeneous domain-to-domain P2P needs its own native
+        // composition; never silently substitute a host bounce for NCCL/RCCL.
+        for (size_t i = 1; i < domains_.size(); ++i)
+            if (stages_[domains_[i - 1].first]->state_.device_id.type == stages_[domains_[i].first]->state_.device_id.type)
+                throw std::invalid_argument("Nested homogeneous pipeline domains require native domain-to-domain composition, not a heterogeneous channel");
+        transport_ = Transport::CapturedDomains;
+        execution_policy_ = DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
+    }
     workers_ = std::make_unique<TPWorkerPool>(stages_.size());
-    workers_->setFailureCallback([this] { collective_->requestAbort(); });
+    workers_->setFailureCallback([this] { abortParticipants(); });
 }
 
 PipelineDeviceGeneration::~PipelineDeviceGeneration() = default;
 
-bool PipelineDeviceGeneration::isHomogeneousGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages)
+bool PipelineDeviceGeneration::isGPUStageSet(std::span<const std::unique_ptr<IInferenceRunner>> stages)
 {
-    if (stages.size() < 2 || !stages.front() || !stages.front()->primaryDeviceId().is_gpu()) return false;
-    const auto type = stages.front()->primaryDeviceId().type;
-    return std::all_of(stages.begin(), stages.end(), [type](const auto &stage) {
-        return stage && dynamic_cast<DeviceGraphOrchestrator *>(stage.get()) && stage->primaryDeviceId().type == type;
+    if (stages.size() < 2) return false;
+    return std::all_of(stages.begin(), stages.end(), [](const auto &stage) {
+        return stage && stage->primaryDeviceId().is_gpu();
     });
+}
+
+const PipelineDeviceGeneration::Domain &PipelineDeviceGeneration::domainFor(size_t participant) const
+{
+    for (const auto &domain : domains_)
+        if (participant >= domain.first && participant - domain.first < domain.count) return domain;
+    throw std::out_of_range("Pipeline participant is outside its frozen domains");
+}
+
+void PipelineDeviceGeneration::abortParticipants()
+{
+    if (collective_) collective_->requestAbort();
+    for (const auto &domain : domains_) if (domain.context) domain.context->requestAbort();
+}
+
+bool PipelineDeviceGeneration::supportsMTPPublication() const
+{
+    return prefillPrepared() && domains_.back().runner->supportsDeviceResidentMTPSpecStatePublication() &&
+        std::all_of(stages_.begin(), stages_.begin() + terminalIndex(), [](const auto *stage) {
+            return stage->supportsDeviceResidentMTPSpecStatePublication();
+        });
+}
+
+void PipelineDeviceGeneration::prepareDomainBoundaries()
+{
+    for (size_t i = 1; i < domains_.size(); ++i)
+    {
+        auto &earlier = *stages_[domains_[i - 1].first];
+        auto &later = *stages_[domains_[i].first];
+        const auto &config = earlier.graph_builder_->config();
+        const auto geometry = PipelineTransferMemory::forRows(config.d_model,
+            resolveActivationBufferSeqLen(earlier.state_.max_seq_len, earlier.state_.device_id),
+            std::max(1, resolveMTPRetainedTargetQueryRows(config.mtp)));
+        auto &transfer = TransferEngine::instance();
+        const auto create = [&](auto &source, auto &destination, size_t capacity) {
+            return transfer.createCapturedTransferChannel(*earlier.physical_memory_authority_, DeviceId::cpu(),
+                source.state_.device_id, source.mtp_device_generation_loop_graph_.stream.get(),
+                destination.state_.device_id, destination.mtp_device_generation_loop_graph_.stream.get(), capacity);
+        };
+        boundaries_.push_back({create(earlier, later, geometry.activation_capacity_bytes),
+            create(later, earlier, geometry.metadata_capacity_bytes)});
+    }
 }
 
 bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializationPlan &plan)
@@ -102,18 +175,32 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
         for (auto *stage : stages_)
             if (!memory || stage->physical_memory_authority_ != memory)
                 throw std::logic_error("Pipeline capture requires one shared physical-memory authority");
-        if (!collective_->reserveGraphCaptureBoundaryResources(memory)) return false;
+        if (collective_ && !collective_->reserveGraphCaptureBoundaryResources(memory)) return false;
         // A late edge install would change already captured topology. Reject
         // it before mutating any stage instead of invalidating/recapturing a
         // supposedly ready model. The owner is installed at serving setup.
         for (auto *stage : stages_)
             if (stage->forward_engine_ || stage->pipeline_forward_edges_)
                 throw std::logic_error("Pipeline prefill transport must be frozen before forward-engine construction");
+        if (transport_ == Transport::CapturedDomains)
+        {
+            // A cross-backend edge retains the arena's exact physical bank.
+            // Ordinary activations otherwise acquire storage at their first
+            // graph preparation; materialize this admitted bank now, before
+            // freezing any channel binding. This neither copies host data nor
+            // creates a second allocation owner or a mutable staging buffer.
+            for (auto *stage : stages_)
+                if (!stage->arena_->allocateDeviceStorage(BufferId::HIDDEN_STATE, stage->state_.device_id))
+                    throw std::runtime_error("Pipeline activation bank could not materialize its admitted device storage");
+            prepareDomainBoundaries();
+        }
         for (size_t index = 0; index < stages_.size(); ++index)
         {
             auto &stage = *stages_[index];
+            const auto &domain = domainFor(index);
+            const auto domain_index = size_t(&domain - domains_.data());
             std::optional<PipelineForwardGraphEdges::FollowerState> follower;
-            if (index + 1 < stages_.size() && stage.graph_builder_->config().mtp.enabled)
+            if (!terminalParticipant(index) && stage.graph_builder_->config().mtp.enabled)
             {
                 if (stage.mtp_publication_main_kv_base_checkpoints_.empty())
                     throw std::logic_error("Pipeline verifier lacks its admitted local KV checkpoint");
@@ -125,17 +212,30 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
                     .checkpoint = {.cache = stage.state_.kv_cache.get(), .sequence_index = 0,
                         .checkpoint_device = checkpoint.data(), .checkpoint_bytes = checkpoint.bytes}};
             }
-            forward_edges_.push_back(std::make_unique<PipelineForwardGraphEdges>(*collective_,
-                static_cast<int>(index), *stage.state_.hidden, stage.graph_builder_->config().d_model, follower));
+            if (transport_ == Transport::NativePipeline)
+                forward_edges_.push_back(std::make_unique<PipelineForwardGraphEdges>(*collective_,
+                    static_cast<int>(index), *stage.state_.hidden, stage.graph_builder_->config().d_model, follower));
+            else
+                forward_edges_.push_back(std::make_unique<PipelineForwardGraphEdges>(stage.state_.device_id,
+                    PipelineForwardGraphEdges::CapturedDomain{
+                        .stage_index = domain_index, .stage_count = domains_.size(), .context = domain.context,
+                        .participant = int(index - domain.first),
+                        .activation_in = domain_index ? boundaries_[domain_index - 1].activation : nullptr,
+                        .activation_out = domain_index < boundaries_.size() ? boundaries_[domain_index].activation : nullptr,
+                        .metadata_in = domain_index < boundaries_.size() ? boundaries_[domain_index].metadata : nullptr,
+                        .metadata_out = domain_index ? boundaries_[domain_index - 1].metadata : nullptr},
+                    *stage.arena_, stage.graph_builder_->config().d_model, follower));
             stage.pipeline_forward_edges_ = forward_edges_.back().get();
         }
     }
     workers_->dispatch([&, this](size_t index) {
+        const auto &domain = domainFor(index);
+        if (index != domain.first) return true; // The TP runner owns its own symmetric worker wave.
         auto local = plan;
         // The receive node fills the stage's own bank. No external tensor is
         // migrated or aliased into this participant's captured model graph.
         local.pipeline_hidden_input = index ? stages_[index]->state_.hidden.get() : nullptr;
-        return stages_[index]->materializeServingGraphFamilyWithoutLaunch(local);
+        return domain.runner->materializeServingGraphFamilyWithoutLaunch(local);
     });
     if (!collectPreparation(*workers_)) return false;
     workers_->dispatch([&, this](size_t index) {
@@ -147,9 +247,30 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
         auto &gpu = GPUDeviceContextPool::instance().getContext(stage.state_.device_id);
         auto *context = stage.getDeviceContext(stage.state_.device_id);
         if (!context) return false;
+        std::vector<PipelineMetadataBank> retained;
+        if (transport_ == Transport::CapturedDomains)
+        {
+            auto *workspace = stage.workspace_allocator_->getDeviceWorkspace(stage.state_.device_id);
+            if (!workspace) return false;
+            auto accepted = workspace->retainBuffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_STATE_SLOT_INDICES,
+                0, sizeof(int32_t));
+            if (accepted->data() != metadata.accepted_state_slot_indices)
+                throw std::logic_error("Pipeline publication restore bank lost its original workspace owner");
+            retained.emplace_back(std::move(accepted), 0, 1);
+            auto logical = stage.arena_->getSharedTensor(BufferId::MTP_LOGICAL_SEQUENCE_STATE);
+            if (!logical || !logical->gpu_data_ptr()) return false;
+            const auto base = reinterpret_cast<uintptr_t>(logical->gpu_data_ptr());
+            for (const auto *field : {metadata.target_cached_tokens, metadata.accepted_state_counts, metadata.publication_ok_flags})
+            {
+                const auto address = reinterpret_cast<uintptr_t>(field);
+                if (address < base) throw std::logic_error("Pipeline publication metadata precedes its logical-state arena");
+                retained.emplace_back(logical, BufferId::MTP_LOGICAL_SEQUENCE_STATE, address - base, 1);
+            }
+        }
         stage.pipeline_publication_transport_ = forward_edges_[index]->materializePublicationTransport(
             {metadata.accepted_state_slot_indices, metadata.target_cached_tokens,
-                metadata.accepted_state_counts, metadata.publication_ok_flags}, stage.executor_, *context, gpu);
+                metadata.accepted_state_counts, metadata.publication_ok_flags}, stage.executor_, *context, gpu,
+                std::move(retained));
         return static_cast<bool>(stage.pipeline_publication_transport_);
     });
     if (!collectPreparation(*workers_)) return false;
@@ -163,7 +284,8 @@ bool PipelineDeviceGeneration::prefill(const int *tokens, int count,
     if (phase_ != Phase::Idle || !prefillPrepared() || !tokens || count <= 0) return false;
     phase_ = Phase::Failed;
     workers_->dispatch([&, this](size_t index) {
-        return stages_[index]->forwardPrefillChunkSchedule(tokens, count, policy, pad_token, allow_padding);
+        const auto &domain = domainFor(index);
+        return index != domain.first || domain.runner->forwardPrefillChunkSchedule(tokens, count, policy, pad_token, allow_padding);
     });
     if (!collectPreparation(*workers_)) return false;
     phase_ = Phase::Idle;
@@ -179,7 +301,7 @@ bool PipelineDeviceGeneration::forwardMTPCondition(MTPConditionForwardPurpose pu
 bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
     const std::function<bool(IInferenceRunner &)> &terminal)
 {
-    auto &tail = *stages_.back();
+    auto &tail = *stages_[terminalIndex()];
     std::string error;
     const auto width_policy = tail.mtpVerifierPhysicalWidthPolicyForRequest(1, &error);
     const auto geometry = resolveMTPServingForwardCaptureGeometry(tail.graph_builder_->config().mtp,
@@ -191,7 +313,10 @@ bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
         LOG_ERROR("Pipeline verifier does not match its retained physical envelope: " << error);
         return false;
     }
-    return forwardMTP(tail.mtp_verifier_outcome_graph_mode_, terminal);
+    // The callback installs the tail's greedy/stochastic outcome policy.
+    // Followers only produce layer state and activations; asking them to arm
+    // an outcome transaction would invent a second sampler/head authority.
+    return forwardMTP(MTPVerifierOutcomeGraphMode::Disabled, terminal);
 }
 
 bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
@@ -203,11 +328,21 @@ bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
     phase_ = Phase::Failed;
     workers_->dispatch([&, this](size_t index) {
         auto &stage = *stages_[index];
-        if (index + 1 == stages_.size()) return terminal(stage);
+        if (terminalParticipant(index))
+            return index != terminalIndex() || terminal(*domains_.back().runner);
         std::string error;
+        void *const stream = stage.explicitGPUStreamForOperation("pipeline_mtp_main_forward");
+        // Admission hands the first speculative transaction to its verifier.
+        // The later commit closes that same borrow; no second controller or
+        // publication-time re-admission is created on a follower.
+        if (previous == Phase::Admitted &&
+            std::holds_alternative<MTPVerifierOutcomeGraphMode>(policy) &&
+            !stage.consumeDeviceGenerationStateReady(stream,
+                DeviceTimelineRole::AllPositionVerifier, 1, "pipeline_initial_mtp_verifier"))
+            return false;
         const bool ok = stage.executeMTPMainForward(policy,
-            index ? stage.state_.hidden.get() : nullptr,
-            stage.explicitGPUStreamForOperation("pipeline_mtp_main_forward"),
+            domainFor(index).first ? stage.state_.hidden.get() : nullptr,
+            stream,
             ForwardGraphSubmissionIntent::Execute, &error);
         if (!ok) LOG_ERROR("Pipeline follower main forward failed: " << error);
         if (!ok)
@@ -239,17 +374,18 @@ bool PipelineDeviceGeneration::forwardMTP(const MTPMainForwardPolicy &policy,
 
 bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &request)
 {
-    if (phase_ != Phase::Idle || !request.valid() || request.request_count != 1 ||
-        !request.depth_policy.isOrdinary())
+    if (phase_ != Phase::Idle || !request.valid() || request.request_count != 1)
         return false;
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         const auto &stage = *stages_[i];
+        const auto &domain = domainFor(i);
         if (!stage.pp_stage_config_ ||
-            stage.pp_stage_config_->has_embedding != (i == 0) ||
-            stage.pp_stage_config_->has_lm_head != (i + 1 == stages_.size()) ||
-            stage.state_.device_id != collective_->devices()[i].toLocalDeviceId())
+            stage.pp_stage_config_->has_embedding != (domain.first == 0) ||
+            stage.pp_stage_config_->has_lm_head != terminalParticipant(i) ||
+            (collective_ && stage.state_.device_id != collective_->devices()[i].toLocalDeviceId()))
             throw std::logic_error("Pipeline generation stage ownership changed after collective admission");
+        (void)PipelineNativeDomain(stage.state_.device_id, domain.context, int(i - domain.first));
     }
     // Partial admission must never re-enter an unrelated rank/TP path. Until
     // every participant succeeds, this owner remains in an absorbing failure
@@ -257,8 +393,8 @@ bool PipelineDeviceGeneration::begin(const DeviceGenerationAdmissionRequest &req
     phase_ = Phase::Failed;
     // The tail is the only owner permitted to initialize a sampler, response
     // budget or logical next-token authority. Followers admit local work only.
-    if (!stages_.back()->beginDeviceResidentGeneration(request)) return false;
-    for (size_t i = 0; i + 1 < stages_.size(); ++i)
+    if (!domains_.back().runner->beginDeviceResidentGeneration(request)) return false;
+    for (size_t i = 0; i < terminalIndex(); ++i)
     {
         auto &stage = *stages_[i];
         void *stream = stage.explicitGPUStreamForOperation("pipeline_follower_admission");
@@ -285,8 +421,12 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
     workers_->dispatch([this, sampling](size_t index) {
         auto &stage = *stages_[index];
         std::string error;
-        if (index + 1 == stages_.size())
+        if (terminalParticipant(index))
         {
+            if (index != terminalIndex()) return true;
+            if (transport_ == Transport::CapturedDomains)
+                return domains_.back().runner->materializeDeviceResidentGeneration(1, 0,
+                    DeviceGenerationLoopTopology::FixedDepth, sampling);
             const bool ready = stage.materializeOrdinaryDeviceGenerationLoopGraph(sampling, &error,
                 DeviceGraphOrchestrator::OrdinaryGenerationComposition::PipelineTail);
             if (!ready) LOG_ERROR("Pipeline tail preparation failed: " << error);
@@ -317,6 +457,21 @@ bool PipelineDeviceGeneration::prepareParticipants(DeviceGenerationSamplingMode 
 
 bool PipelineDeviceGeneration::composeParticipants()
 {
+    if (transport_ == Transport::CapturedDomains)
+    {
+        // Forward captures already contain their declared boundary. Compose
+        // only participant-local nodes; the terminal domain's existing compiler
+        // already owns its sampler and authenticated ticket publisher.
+        workers_->dispatch([this](size_t index) {
+            if (terminalParticipant(index)) return true;
+            auto &loop = stages_[index]->mtp_device_generation_loop_graph_;
+            loop.capture->reset();
+            const GPUOrderedTimelineStep forward{.name = "complete pipeline domain forward",
+                .capture = loop.source_fragments.front().capture};
+            return loop.capture->buildOrderedTimelineTransaction(std::span(&forward, 1)) && loop.capture->instantiate();
+        });
+        return collectPreparation(*workers_);
+    }
     using namespace sampling_math;
     constexpr size_t command = 0, receive = 1, send = 2;
     const bool hosted = execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
@@ -475,10 +630,24 @@ bool PipelineDeviceGeneration::composeParticipants()
 bool PipelineDeviceGeneration::materialize(int requests, int depth,
     DeviceGenerationLoopTopology topology, DeviceGenerationSamplingMode sampling)
 {
-    if (phase_ != Phase::Admitted || requests != 1 || depth != 0 ||
-        topology != DeviceGenerationLoopTopology::FixedDepth || !isValidDeviceGenerationSamplingMode(sampling))
+    if (phase_ != Phase::Admitted || requests != 1 || depth < 0 ||
+        !isValidDeviceGenerationSamplingMode(sampling))
         return false;
     phase_ = Phase::Failed;
+    if (depth > 0)
+    {
+        if (!prepareSpeculativeParticipants(depth, topology, sampling)) return false;
+        const bool reusable = std::all_of(stages_.begin(), stages_.end(), [this](auto *stage) {
+            const auto &loop = stage->mtp_device_generation_loop_graph_;
+            return loop.capture->hasExecutable() &&
+                (execution_policy_ != DeviceGenerationExecutionPolicy::NativeConditionalGraph ||
+                 loop.pipeline_children[0]);
+        });
+        if (!reusable && !composeSpeculativeParticipants()) return false;
+        phase_ = Phase::Materialized;
+        return true;
+    }
+    if (topology != DeviceGenerationLoopTopology::FixedDepth) return false;
     if (!prepareParticipants(sampling)) return false;
     const bool reusable = std::all_of(stages_.begin(), stages_.end(), [](auto *stage) {
         return stage->mtp_device_generation_loop_graph_.capture->hasExecutable(); });
@@ -493,9 +662,10 @@ bool PipelineDeviceGeneration::launch()
     phase_ = Phase::Failed;
     if (execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions)
     {
-        if (!launchHostedTransactions())
+        const bool speculative = stages_[terminalIndex()]->mtp_device_generation_loop_graph_.draft_depth > 0;
+        if (!(speculative ? launchHostedSpeculativeTransactions() : launchHostedTransactions()))
         {
-            collective_->requestAbort();
+            abortParticipants();
             throw std::runtime_error("Pipeline generation failed during ticket-selected distributed submission");
         }
         phase_ = Phase::Submitted;
@@ -504,7 +674,7 @@ bool PipelineDeviceGeneration::launch()
     for (auto *stage : stages_)
         if (!stage->launchDeviceResidentGeneration())
         {
-            collective_->requestAbort();
+            abortParticipants();
             throw std::runtime_error("Pipeline generation failed during distributed submission");
         }
     phase_ = Phase::Submitted;
@@ -513,6 +683,7 @@ bool PipelineDeviceGeneration::launch()
 
 bool PipelineDeviceGeneration::launchHostedTransactions()
 {
+    if (transport_ == Transport::CapturedDomains) return launchHostedDomainTransactions();
     auto &tail = *stages_.back();
     auto &tail_loop = tail.mtp_device_generation_loop_graph_;
     for (auto *stage : stages_)
@@ -569,18 +740,61 @@ bool PipelineDeviceGeneration::launchHostedTransactions()
     throw std::runtime_error("Pipeline generation exhausted its admitted response bound without a terminal ticket");
 }
 
+bool PipelineDeviceGeneration::launchHostedDomainTransactions()
+{
+    auto &tail = *stages_[terminalIndex()];
+    auto &owner = *domains_.back().runner;
+    for (size_t i = 0; i < terminalIndex(); ++i)
+    {
+        auto &stage = *stages_[i];
+        auto &loop = stage.mtp_device_generation_loop_graph_;
+        if (!loop.valid || loop.launched || !loop.capture->hasExecutable() ||
+            loop.workspace_generation != stage.workspaceGeneration(stage.state_.device_id) ||
+            !stage.consumeDeviceGenerationStateReady(loop.stream.get(),
+                DeviceTimelineRole::DeviceGenerationController, 1, "pipeline_domain_admission")) return false;
+        loop.launched = true;
+    }
+    const auto submit_followers = [&] {
+        // Every participant is enqueued before the terminal is allowed to wait
+        // for a ticket. Native broadcasts remain on their exact device streams.
+        for (size_t i = 0; i < terminalIndex(); ++i)
+        {
+            auto &loop = stages_[i]->mtp_device_generation_loop_graph_;
+            if (!loop.capture->launchOnStream(loop.stream.get())) return false;
+        }
+        return true;
+    };
+    if (tail.mtp_device_generation_loop_graph_.ordinary_leading ==
+            sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted && !submit_followers())
+        return false;
+    const int bound = tail.active_device_generation_admission_->max_new_tokens;
+    for (int observation = 0; observation < bound; ++observation)
+    {
+        sampling_math::DeviceGenerationDispatchTicket ticket;
+        if (!owner.observeDeviceGenerationDispatchTicket(&ticket) ||
+            (!ticket.complete && !submit_followers()) ||
+            !owner.submitHostScheduledDeviceGenerationAdvance(ticket)) return false;
+        if (!ticket.complete) continue;
+        for (size_t i = 0; i < terminalIndex(); ++i)
+            if (!stages_[i]->publishDeviceGenerationStateReady(stages_[i]->mtp_device_generation_loop_graph_.stream.get(),
+                    1, DeviceGenerationStatePublicationKind::Terminal)) return false;
+        return true;
+    }
+    throw std::runtime_error("Pipeline domains exhausted their admitted response bound without a terminal ticket");
+}
+
 bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
 {
     if (phase_ != Phase::Submitted || !result) return false;
     phase_ = Phase::Failed;
-    if (!stages_.back()->finishDeviceResidentGeneration(result)) return false;
+    if (!domains_.back().runner->finishDeviceResidentGeneration(result)) return false;
     std::vector<std::array<int, 3>> terminal(stages_.size());
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
         auto *backend = getBackendFor(stage.state_.device_id);
         void *stream = stage.mtp_device_generation_loop_graph_.stream.get();
-        const bool follower = i + 1 < stages_.size();
+        const bool follower = !terminalParticipant(i);
         if (follower && !stage.consumeDeviceGenerationStateReady(stream, DeviceTimelineRole::HostResultBridge,
                 1, "pipeline_follower_terminal")) return false;
         // One small terminal observation proves actual independent KV work.
@@ -600,12 +814,12 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
     for (size_t i = 0; i < stages_.size(); ++i)
     {
         auto &stage = *stages_[i];
-        const bool hosted_follower = i + 1 < stages_.size() &&
+        const bool hosted_follower = !terminalParticipant(i) &&
             execution_policy_ == DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions;
         if (!getBackendFor(stage.state_.device_id)->waitForEvent(stage.device_generation_terminal_host_ready_event_.get(),
                 stage.state_.device_id.gpu_ordinal()) || (!hosted_follower && (terminal[i][1] != 1 || terminal[i][2] != 1)))
             return false;
-        if (i + 1 < stages_.size())
+        if (!terminalParticipant(i))
         {
             if (!stage.mtp_device_generation_loop_graph_.retireCompletedLaunch() ||
                 !stage.device_generation_state_ready_.handoff.retireAfterHostCompletion(1)) return false;
@@ -618,8 +832,9 @@ bool PipelineDeviceGeneration::finish(DeviceGenerationTerminalResult *result)
     // The tail reported its own completed forwards through the ordinary DGO
     // terminal. Followers report only after the independent KV check above;
     // they borrow its authenticated count, never a mirrored response ledger.
-    for (size_t i = 0; i + 1 < stages_.size(); ++i)
-        if (!stages_[i]->observeOrdinaryGenerationForwardCompletion(
+    for (size_t i = 0; i < terminalIndex(); ++i)
+        if (stages_[i]->mtp_device_generation_loop_graph_.draft_depth == 0 &&
+            !stages_[i]->observeOrdinaryGenerationForwardCompletion(
                 result->requests.front().published_state_commit_count)) return false;
     PerfStatsCollector::addCounter("generation", "pipeline_terminal_responses", 1.0, "decode", "rank",
         {{"response_owner", "tail"}, {"validation", "independent_stage_kv_positions"}});

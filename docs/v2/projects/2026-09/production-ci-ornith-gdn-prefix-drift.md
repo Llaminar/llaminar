@@ -118,7 +118,7 @@ every two/three-participant ownership map and arrival ordering for a cancellatio
 witness, real CPU expert-stage raw publication after route filtering, transport
 layout round trips, and rejection of invalid/missing/duplicate records. A new
 real-MPI all-two-rank-placement regression is in the already registered
-`ProductionParityPreflight` sparse-transport suite. Its focused run passes all
+`ProductionTestPreflight` sparse-transport suite. Its focused run passes all
 six cases on both ranks in 0.97s, including the new placement sweep.
 
 The first full rebuilt Unit gate passes 644/646 registrations in 78.39s. Two

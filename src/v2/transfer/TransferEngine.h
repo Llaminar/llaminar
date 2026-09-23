@@ -31,6 +31,12 @@
 namespace llaminar2
 {
     class TransferEngine;
+    class PhysicalMemoryAuthority;
+    class CapturedTransferChannel;
+    class CapturedTransferBinding;
+    class WorkspaceBufferLease;
+    struct CapturedTransferMessage;
+    enum class CapturedTransferEndpoint : std::uint32_t;
 
     /**
      * @brief Ownership boundary certified by a device-memory reclaim request.
@@ -1328,6 +1334,82 @@ namespace llaminar2
          * it does not query free memory, admit capacity or maintain a ledger.
          */
         [[nodiscard]] static size_t mappedHostRegionAllocationBytes(size_t bytes);
+
+        /**
+         * @brief Materialize one PMA-admitted captured channel between two local GPUs.
+         * @param authority Canonical rank-local physical memory ledger, never a private budget.
+         * @param host_device CPU NUMA allocator charged for the mapped control/payload pages.
+         * @param producer Exact rank-local GPU writing the slot.
+         * @param producer_setup_stream Non-null stream initializing its private cursor.
+         * @param consumer Distinct rank-local GPU consuming the slot.
+         * @param consumer_setup_stream Non-null stream initializing its private cursor.
+         * @param capacity Maximum single message extent; use the shared channel BOM in planning.
+         * @return Complete owner or throw, rolling back every partial allocation/claim.
+         *
+         * This same-process API cannot express a remote rank. Initial cursor
+         * publication has one bounded setup event join before returning ready;
+         * no stream/device synchronization or inference-time host wait occurs.
+         * Caller establishes NUMA first-touch affinity before materialization.
+         */
+        [[nodiscard]] std::shared_ptr<CapturedTransferChannel> createCapturedTransferChannel(
+            PhysicalMemoryAuthority &authority, DeviceId host_device,
+            DeviceId producer, void *producer_setup_stream,
+            DeviceId consumer, void *consumer_setup_stream, size_t capacity) const;
+
+        /**
+         * @brief Freeze a captured message against retained graph-private device scratch.
+         * @param channel Admitted local channel kept alive by the returned binding.
+         * @param role Exact endpoint direction.
+         * @param message Nonzero semantic key and exact byte extent, not full capacity.
+         * @param storage Stable physical buffer belonging to the selected endpoint.
+         * @param offset First byte of the bounded payload within that buffer.
+         * @return Complete binding; invalid owner, role, device or bounds throw before enqueue.
+         */
+        [[nodiscard]] CapturedTransferBinding bindCapturedTransfer(
+            std::shared_ptr<CapturedTransferChannel> channel, CapturedTransferEndpoint role,
+            CapturedTransferMessage message, std::shared_ptr<DeviceTransferBuffer> storage,
+            size_t offset = 0) const;
+
+        /**
+         * @brief Freeze a captured message against an already-resident tensor's physical owner.
+         * @param channel Admitted channel retained until graph retirement.
+         * @param role Exact producer or consumer endpoint.
+         * @param message Exact captured role/geometry.
+         * @param tensor Stable tensor view; its canonical physical owner is retained.
+         * @param offset First physical payload byte, validated against owner storage.
+         * @return Binding which rejects later storage rebinding rather than reusing a stale graph.
+         */
+        [[nodiscard]] CapturedTransferBinding bindCapturedTransfer(
+            std::shared_ptr<CapturedTransferChannel> channel, CapturedTransferEndpoint role,
+            CapturedTransferMessage message, std::shared_ptr<ITensor> tensor, size_t offset = 0) const;
+
+        /** @brief Capture a message directly from an existing named workspace region.
+         * @param channel Admitted local channel retained until graph retirement.
+         * @param role Exact producer or consumer endpoint.
+         * @param message Exact semantic key and positive physical extent.
+         * @param storage Lease retaining the original workspace allocation and PMA claim.
+         * @param offset First byte within the leased region, never the whole workspace.
+         * @return Frozen binding; no raw unowned pointer or copied mailbox is accepted.
+         *
+         * The graph owns producer/consumer ordering. Keeping the allocation
+         * alive does not authorize concurrent scratch reuse or a host state mirror.
+         */
+        [[nodiscard]] CapturedTransferBinding bindCapturedTransfer(
+            std::shared_ptr<CapturedTransferChannel> channel, CapturedTransferEndpoint role,
+            CapturedTransferMessage message, std::shared_ptr<const WorkspaceBufferLease> storage,
+            size_t offset = 0) const;
+
+        /**
+         * @brief Record one complete acquire/copy/release DAG on an exact stream.
+         * @param binding Immutable endpoint, storage owner and message geometry.
+         * @param stream Exact non-null execution/capture stream for that GPU.
+         * @throws std::exception on stale storage, foreign backend or failed native submission.
+         *
+         * No host protocol observation, reset, allocation, DMA queue substitution
+         * or blocking synchronization is allowed. Tensor consumers receive the
+         * canonical write publication after the same-stream message completes.
+         */
+        void enqueueCapturedTransfer(const CapturedTransferBinding &binding, void *stream) const;
 
         /**
          * @brief Allocate one native mapped slab and partition exclusive slots.

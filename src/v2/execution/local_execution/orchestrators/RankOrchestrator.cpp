@@ -26,6 +26,7 @@
 #include "../../mtp/MTPSpecStateContract.h"
 #include "../../factory/InferenceRunnerFactory.h"
 #include "../../moe/MoEExpertOverlayRuntimePlan.h"
+#include "../../moe/MoEOverlayCpuPreparationGate.h"
 #include "../../moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
 #include "../../moe/MoEOverlayInferenceInterferenceProbe.h"
@@ -80,6 +81,42 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Authenticate all local graph owners against a frozen PP domain.
+         * @param runner The single-device runner or existing nested TP owner.
+         * @param segment Immutable projection of its setup membership.
+         * @return Whether ordered runner and collective membership still agree.
+         *
+         * This query allocates nothing and enters no collective. In particular,
+         * an unchanged leader cannot conceal a replaced/missing nonleader.
+         */
+        bool pipelineStageMatches(const IInferenceRunner &runner,
+            const PipelineGraphExecutionSegment &segment) noexcept
+        {
+            const auto expected = segment.execution == PipelineGraphSegmentExecution::HostDeclarative
+                ? ServingGraphPreparationKind::EagerHostGraph
+                : ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+            if (runner.primaryDeviceId() != segment.primaryDevice() ||
+                runner.servingGraphPreparationKind() != expected)
+                return false;
+            const auto *rank = dynamic_cast<const IRankOrchestrator *>(&runner);
+            if (!rank) return segment.participants.size() == 1;
+            if (rank->device_count() != static_cast<int>(segment.participants.size())) return false;
+            const auto *context = rank->localTPContext();
+            if (!context || context->degree() != rank->device_count() ||
+                context->devices().size() != segment.participants.size()) return false;
+            for (size_t index = 0; index < segment.participants.size(); ++index)
+            {
+                const auto *child = rank->deviceRunner(static_cast<int>(index));
+                if (!child || dynamic_cast<const IRankOrchestrator *>(child) ||
+                    child->primaryDeviceId() != segment.participants[index] ||
+                    child->servingGraphPreparationKind() != expected ||
+                    context->devices()[index].toLocalDeviceId() != segment.participants[index])
+                    return false;
+            }
+            return true;
+        }
+
         /**
          * @brief Resolve the exact packed LocalTP layout of one GDN checkpoint.
          *
@@ -1781,12 +1818,54 @@ namespace llaminar2
         // =====================================================================
         // Create device runners in parallel
         // =====================================================================
-        // After preloadForDevices(), each runner creation is independent:
-        //   - Different device_id, different device_idx
-        //   - WeightManager cache hits are mutex-protected
-        //   - Graph construction reads immutable model config
-        // Parallelizing this cuts ~50% off the MDO init time for 2+ devices.
+        // GPU weights remain independent. A colocated CPU expert tier is the
+        // one shared preparation dependency: the continuation root publishes
+        // its completed CPU bank before sibling graphs resolve those engines.
+        // No setup gate survives into request execution.
         // =====================================================================
+
+        std::shared_ptr<MoEOverlayCpuPreparationGate> cpu_preparation_gate;
+        DeviceId cpu_preparation_publisher = DeviceId::invalid();
+        if (config_.moe_routed_expert_plan &&
+            config_.moe_routed_expert_plan->usesExpertOverlayAuthority() &&
+            devices.size() > 1u)
+        {
+            const int world_rank = config_.moe_expert_overlay_mpi_ctx
+                                       ? config_.moe_expert_overlay_mpi_ctx->rank()
+                                       : 0;
+            const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+                config_.moe_routed_expert_plan,
+                MoEExpertOverlayRuntimeResolverOptions{
+                    .current_world_rank = world_rank,
+                });
+            bool has_colocated_cpu_bank = false;
+            for (size_t tier = 0; tier < runtime_plan->routedTiers().size(); ++tier)
+            {
+                const auto &domain = runtime_plan->domainForTier(tier);
+                has_colocated_cpu_bank = has_colocated_cpu_bank ||
+                    std::any_of(domain.participants.begin(), domain.participants.end(),
+                                [](const MoEOverlayDomainParticipant &participant)
+                                {
+                                    return participant.owned_by_current_rank &&
+                                           participant.local_device.is_cpu();
+                                });
+            }
+            if (has_colocated_cpu_bank && runtime_plan->continuationDevice().is_gpu())
+            {
+                cpu_preparation_publisher = runtime_plan->continuationDevice();
+                const size_t publishers = static_cast<size_t>(std::count_if(
+                    devices.begin(), devices.end(),
+                    [&](const GlobalDeviceAddress &address)
+                    { return address.toLocalDeviceId() == cpu_preparation_publisher; }));
+                if (publishers != 1u)
+                {
+                    throw std::runtime_error(
+                        "RankOrchestrator colocated CPU ExpertOverlay bank lacks exactly one continuation-root GPU publisher");
+                }
+                cpu_preparation_gate =
+                    std::make_shared<MoEOverlayCpuPreparationGate>();
+            }
+        }
 
         struct RunnerResult
         {
@@ -1804,11 +1883,26 @@ namespace llaminar2
             const auto &device_addr = devices[device_idx];
             DeviceId device_id = device_addr.toLocalDeviceId();
 
-            futures.push_back(std::async(std::launch::async,
-                                         [this, device_idx, device_id]() -> RunnerResult
+            try
+            {
+                futures.push_back(std::async(std::launch::async,
+                                         [this, device_idx, device_id,
+                                          cpu_preparation_gate,
+                                          cpu_preparation_publisher]() -> RunnerResult
                                          {
                                              RunnerResult result;
                                              result.device_idx = device_idx;
+                                             std::optional<MoEOverlayCpuPreparationParticipation>
+                                                 cpu_preparation;
+                                             if (cpu_preparation_gate)
+                                             {
+                                                 cpu_preparation =
+                                                     device_id == cpu_preparation_publisher
+                                                         ? MoEOverlayCpuPreparationParticipation::publisher(
+                                                               cpu_preparation_gate)
+                                                         : MoEOverlayCpuPreparationParticipation::dependent(
+                                                               cpu_preparation_gate);
+                                             }
                                              try
                                              {
                                                  LOG_DEBUG("RankOrchestrator: Creating runner for device " << device_idx
@@ -1836,6 +1930,8 @@ namespace llaminar2
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
                                                  runner_config.prepared_weight_admission =
                                                      config_.prepared_weight_admission;
+                                                 runner_config.moe_overlay_cpu_preparation =
+                                                     cpu_preparation;
                                                  runner_config.reusable_execution_workspaces =
                                                      config_.reusable_execution_workspaces;
                                                  runner_config.moe_routed_expert_plan = config_.moe_routed_expert_plan;
@@ -1883,15 +1979,31 @@ namespace llaminar2
                                                  {
                                                      result.error = "Failed to create inference runner for device " +
                                                                     std::to_string(device_idx);
+                                                     if (cpu_preparation)
+                                                         cpu_preparation->publishFailureIfProducer(
+                                                             result.error);
                                                  }
                                              }
                                              catch (const std::exception &e)
                                              {
                                                  result.error = std::string("Exception creating runner for device ") +
                                                                 std::to_string(device_idx) + ": " + e.what();
+                                                 if (cpu_preparation)
+                                                     cpu_preparation->publishFailureIfProducer(
+                                                         result.error);
                                              }
                                              return result;
                                          }));
+            }
+            catch (...)
+            {
+                // A failed async launch must wake any already launched
+                // dependent instead of leaving its future blocked forever.
+                if (cpu_preparation_gate)
+                    cpu_preparation_gate->publishFailure(
+                        "RankOrchestrator could not launch all device runner constructors");
+                throw;
+            }
         }
 
         // Collect results in device order
@@ -2382,11 +2494,22 @@ namespace llaminar2
                     std::to_string(stage));
             }
 
-            segments.push_back(PipelineGraphExecutionSegment{
-                .stage_index = stage,
-                .primary_device = runner->primaryDeviceId(),
-                .execution = execution,
-            });
+            PipelineGraphExecutionSegment segment{.stage_index = stage, .execution = execution};
+            if (const auto *rank = dynamic_cast<const IRankOrchestrator *>(runner.get()))
+            {
+                for (int index = 0; index < rank->device_count(); ++index)
+                {
+                    const auto *child = rank->deviceRunner(index);
+                    if (!child)
+                        throw std::runtime_error("Pipeline domain is missing a TP graph owner");
+                    segment.participants.push_back(child->primaryDeviceId());
+                }
+            }
+            else segment.participants.push_back(runner->primaryDeviceId());
+            if (!segment.valid() || !pipelineStageMatches(*runner, segment))
+                throw std::runtime_error("Pipeline domain runners do not match their ordered collective membership at stage " +
+                    std::to_string(stage));
+            segments.push_back(std::move(segment));
         }
 
         pp_graph_execution_plan_ =
@@ -2427,21 +2550,14 @@ namespace llaminar2
                 return false;
             }
             const auto &runner = pp_stage_runners_[segment.stage_index];
-            const ServingGraphPreparationKind expected_kind =
-                segment.execution ==
-                        PipelineGraphSegmentExecution::HostDeclarative
-                    ? ServingGraphPreparationKind::EagerHostGraph
-                    : ServingGraphPreparationKind::
-                          NativeDeviceExecutableFamily;
-            if (runner->primaryDeviceId() != segment.primary_device ||
-                runner->servingGraphPreparationKind() != expected_kind)
+            if (!pipelineStageMatches(*runner, segment))
             {
                 LOG_ERROR(
                     operation_name
                     << " detected pipeline graph identity drift at stage "
                     << segment.stage_index
                     << " planned_device="
-                    << segment.primary_device.toString()
+                    << segment.primaryDevice().toString()
                     << " live_device="
                     << runner->primaryDeviceId().toString());
                 return false;
@@ -2809,10 +2925,10 @@ namespace llaminar2
         {
             /*
              * PP stages are sequential, so a mixed CPU/GPU pipeline reports
-             * the strongest child transition. Materialization below skips
-             * already-built eager children and seals each native stage in
-             * pipeline order. Nested LocalTP stages remain responsible for
-             * their own symmetric participant capture.
+             * the strongest child transition. Materialization below binds and
+             * seals every stage in pipeline order, including CPU workspace
+             * families. Nested LocalTP stages remain responsible for their
+             * own symmetric participant capture.
              */
             return composite_kind(pp_stage_runners_);
         }
@@ -2847,76 +2963,58 @@ namespace llaminar2
                 return false;
             }
 
-            if (PipelineDeviceGeneration::isHomogeneousGPUStageSet(pp_stage_runners_))
+            std::size_t materialized_native_segments = 0u;
+            if (PipelineDeviceGeneration::isGPUStageSet(pp_stage_runners_))
             {
                 if (!pp_device_generation_)
                     pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
                 if (!pp_device_generation_->prepareServing(plan)) return false;
-                return pp_graph_execution_plan_->markMaterialized(pp_stage_runners_.size());
+                materialized_native_segments = pp_stage_runners_.size();
             }
-
-            std::size_t materialized_native_segments = 0u;
-            for (const auto &segment :
-                 pp_graph_execution_plan_->segments())
+            else
             {
-                const std::size_t stage = segment.stage_index;
-                auto &runner = pp_stage_runners_[stage];
-                if (!runner)
+                for (const auto &segment : pp_graph_execution_plan_->segments())
                 {
-                    LOG_ERROR(
-                        "RankOrchestrator PP serving graph setup found a missing stage at index "
-                        << stage);
-                    return false;
-                }
-                const auto child_kind =
-                    runner->servingGraphPreparationKind();
-                const ServingGraphPreparationKind planned_kind =
-                    segment.execution ==
-                            PipelineGraphSegmentExecution::HostDeclarative
-                        ? ServingGraphPreparationKind::EagerHostGraph
-                        : ServingGraphPreparationKind::
-                              NativeDeviceExecutableFamily;
-                if (child_kind != planned_kind ||
-                    runner->primaryDeviceId() != segment.primary_device)
-                {
-                    LOG_ERROR(
-                        "RankOrchestrator PP serving graph setup detected identity drift at stage "
-                        << stage << " planned_device="
-                        << segment.primary_device.toString()
-                        << " live_device="
-                        << runner->primaryDeviceId().toString());
-                    return false;
-                }
-                if (segment.execution ==
-                    PipelineGraphSegmentExecution::HostDeclarative)
-                {
-                    continue;
-                }
-
-                ServingGraphFamilyMaterializationPlan stage_plan = plan;
-                stage_plan.pipeline_hidden_input = nullptr;
-                if (stage > 0u)
-                {
-                    auto *previous = pp_stage_runners_[stage - 1u].get();
-                    stage_plan.pipeline_hidden_input =
-                        previous ? previous->getHiddenState() : nullptr;
-                    if (!stage_plan.pipeline_hidden_input)
+                    const std::size_t stage = segment.stage_index;
+                    auto &runner = pp_stage_runners_[stage];
+                    if (!runner)
                     {
                         LOG_ERROR(
-                            "RankOrchestrator PP serving graph setup could not bind the stable activation owner from stage "
-                            << (stage - 1u) << " to stage " << stage);
+                            "RankOrchestrator PP serving graph setup found a missing stage at index " << stage);
                         return false;
                     }
+                    if (!pipelineStageMatches(*runner, segment))
+                    {
+                        LOG_ERROR(
+                            "RankOrchestrator PP serving graph setup detected identity drift at stage "
+                            << stage << " planned_device=" << segment.primaryDevice().toString()
+                            << " live_device=" << runner->primaryDeviceId().toString());
+                        return false;
+                    }
+                    ServingGraphFamilyMaterializationPlan stage_plan = plan;
+                    stage_plan.pipeline_hidden_input = nullptr;
+                    if (stage > 0u)
+                    {
+                        auto *previous = pp_stage_runners_[stage - 1u].get();
+                        stage_plan.pipeline_hidden_input = previous ? previous->getHiddenState() : nullptr;
+                        if (!stage_plan.pipeline_hidden_input)
+                        {
+                            LOG_ERROR(
+                                "RankOrchestrator PP serving graph setup could not bind the stable activation owner from stage "
+                                << (stage - 1u) << " to stage " << stage);
+                            return false;
+                        }
+                    }
+                    if (!runner->materializeServingGraphFamilyWithoutLaunch(stage_plan))
+                    {
+                        LOG_ERROR("RankOrchestrator PP serving graph setup failed at stage " << stage);
+                        return false;
+                    }
+                    // CPU stages declare their workspace family, but do not
+                    // contribute a native executable to this inventory.
+                    if (segment.execution == PipelineGraphSegmentExecution::NativeDeviceExecutable)
+                        ++materialized_native_segments;
                 }
-                if (!runner->materializeServingGraphFamilyWithoutLaunch(
-                        stage_plan))
-                {
-                    LOG_ERROR(
-                        "RankOrchestrator PP serving graph setup failed at stage "
-                        << stage);
-                    return false;
-                }
-                ++materialized_native_segments;
             }
 
             std::string materialization_error;
@@ -6136,15 +6234,12 @@ namespace llaminar2
         int draft_sample_slot,
         int position_offset)
     {
-        /*
-         * LocalPP samples draft tokens in final-stage device memory, while the
-         * next verifier input starts at pipeline stage 0.  Until the pipeline
-         * has a first-stage-owned token slot or an explicit transfer contract,
-         * rank-level PP must not advertise device-token sidecar chaining.
-         */
-        if (finalPPSidecarRunner())
+        if (IInferenceRunner *tail = finalPPSidecarRunner())
         {
-            return false;
+            // Draft chaining stays on the tail. The captured main-verifier
+            // row exchange, not a borrowed tail pointer, later feeds the head.
+            return pp_device_generation_ && tail->forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(
+                draft_sample_slot, position_offset);
         }
         if (device_runners_.size() == 1 && device_runners_[0])
         {
@@ -6272,10 +6367,8 @@ namespace llaminar2
     bool RankOrchestrator::forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
         int target_sample_slot)
     {
-        if (finalPPSidecarRunner())
-        {
-            return false;
-        }
+        if (IInferenceRunner *tail = finalPPSidecarRunner())
+            return pp_device_generation_ && tail->forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(target_sample_slot);
         if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]
@@ -6398,10 +6491,9 @@ namespace llaminar2
         const DeviceResidentLogicalSequenceStateHandle &logical_state,
         int request_index)
     {
-        if (finalPPSidecarRunner())
-        {
-            return false;
-        }
+        if (IInferenceRunner *tail = finalPPSidecarRunner())
+            return pp_device_generation_ && tail->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+                logical_state, request_index);
         if (device_runners_.size() == 1 && device_runners_[0])
         {
             return device_runners_[0]->forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
@@ -12605,7 +12697,7 @@ namespace llaminar2
     bool RankOrchestrator::beginDeviceResidentGeneration(
         const DeviceGenerationAdmissionRequest &request)
     {
-        if (!pp_stage_runners_.empty() && request.depth_policy.isOrdinary())
+        if (!pp_stage_runners_.empty())
         {
             if (!pp_device_generation_)
                 pp_device_generation_ = std::make_unique<PipelineDeviceGeneration>(pp_stage_runners_);
@@ -13244,7 +13336,22 @@ namespace llaminar2
         DeviceGenerationTerminalResult *out_result)
     {
         if (pp_device_generation_ && pp_device_generation_->active())
-            return pp_device_generation_->finish(out_result);
+        {
+            if (!pp_device_generation_->finish(out_result)) return false;
+            // Observe completed domain traversal only at the authenticated
+            // terminal. Depth zero is the ordinary controller: its first
+            // sampled token can use existing prefill logits without another
+            // forward. Only its committed state rows traverse the pipeline.
+            // A speculative transaction traverses every domain once regardless
+            // of depth. These terminal fields are evidence, never a scheduler.
+            std::size_t transactions = 0;
+            for (const auto &request : out_result->requests)
+                transactions += request.final_draft_depth > 0 ? request.transaction_count
+                    : request.published_state_commit_count;
+            if (transactions)
+                recordCompletedPPGraphTransactions("decode", pp_stage_runners_.size(), transactions);
+            return true;
+        }
         if (out_result)
             *out_result = DeviceGenerationTerminalResult{};
         if (!out_result)
@@ -13838,13 +13945,11 @@ namespace llaminar2
             return device_runners_[0]->supportsDeviceResidentMTPSpecStatePublication();
         }
 
-        /*
-         * A PP sidecar can produce final-stage logits, but a rank-level
-         * resident publication must also mutate every earlier PP stage's KV and
-         * recurrent state.  Do not advertise this path for PP until there is a
-         * PP-wide compact metadata mailbox and grouped publication proof.
-         */
-        if (!pp_stage_runners_.empty() || device_runners_.size() < 2)
+        // A prepared native pipeline owns the captured acceptance exchange and
+        // each follower's local commit. It never mirrors the tail's controller.
+        if (!pp_stage_runners_.empty())
+            return pp_device_generation_ && pp_device_generation_->supportsMTPPublication();
+        if (device_runners_.size() < 2)
         {
             return false;
         }
@@ -14054,6 +14159,8 @@ namespace llaminar2
         const DeviceSpeculativePublicationRequest &request,
         std::string *error)
     {
+        if (pp_device_generation_)
+            return pp_device_generation_->publishMTPOutcome(request, error);
         auto fail = [&](const std::string &reason) -> bool
         {
             if (error)
@@ -15166,17 +15273,9 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsMTPSidecarLogitsStreamHandoff() const
     {
-        /*
-         * LocalPP is intentionally false for now: the sidecar logits are
-         * produced on the pipeline tail, but verifier token input belongs to
-         * the pipeline head.  Keeping this false prevents the vLLM-style
-         * stochastic path from assuming one stage's device token slot can be
-         * consumed by another stage without an explicit handoff contract.
-         */
-        if (finalPPSidecarRunner())
-        {
-            return false;
-        }
+        if (const IInferenceRunner *tail = finalPPSidecarRunner())
+            return pp_device_generation_ && pp_device_generation_->prefillPrepared() &&
+                tail->supportsMTPSidecarLogitsStreamHandoff();
         if (device_runners_.empty())
             return false;
         return std::all_of(
@@ -15191,10 +15290,9 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsMTPDeviceDraftTokenInput() const
     {
-        if (finalPPSidecarRunner())
-        {
-            return false;
-        }
+        if (const IInferenceRunner *tail = finalPPSidecarRunner())
+            return pp_device_generation_ && pp_device_generation_->prefillPrepared() &&
+                tail->supportsMTPDeviceDraftTokenInput();
         if (device_runners_.empty())
             return false;
         return std::all_of(

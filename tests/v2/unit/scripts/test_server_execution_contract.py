@@ -20,7 +20,8 @@ from unittest.mock import patch
 
 SERVER_DIR = Path(__file__).resolve().parents[2] / "e2e/server"
 sys.path.insert(0, str(SERVER_DIR))
-from server_execution_contract import RuntimeFeaturePolicy, validate_server_execution_contract
+from server_execution_contract import (RuntimeFeaturePolicy, validate_server_execution_contract,
+                                       automatic_selection_policy, validate_automatic_selection)
 from graph_capture_perf_policy import validate_graph_capture_policy
 from flash_attention_perf_policy import validate_flash_attention_plan_policy
 import test_server_graph_capture_perf_policy as graph_fixtures
@@ -43,6 +44,112 @@ def evidence(devices: list[tuple[str, str]], *, authority: int = 0,
     return {"world_size": len(devices), "authority_rank": authority, "records": rows}
 
 
+def automatic_evidence(devices: list[str], *, strategy: str, nodes: list[int] | None = None) -> dict:
+    """Add physical execution witnesses; visible GPU ordinals share UUIDs on one node."""
+    data = evidence([(devices, devices) for devices in devices])
+    data["records"][-1]["tags"]["execution_strategy"] = strategy
+    for rank, selected in enumerate(devices):
+        node = str(nodes[rank] if nodes is not None else 0)
+        data["records"].append({"domain": "server", "name": "rank_membership", "rank": rank,
+            "value": 1, "phase": "startup", "tags": {"rank": str(rank), "node_id": node,
+                "world_size": str(len(devices)), "authority_rank": "0",
+                "identity_source": "communicator_cluster_inventory"}})
+        for device in selected.split(",") if selected else []:
+            backend = device.partition(":")[0]
+            data["records"].append({"domain": "server", "name": "execution_participant", "rank": rank,
+                "value": 1, "phase": "startup", "device": device, "tags": {
+                    "schema": "1", "source": "resolved_execution_plan",
+                    "identity_source": "communicator_cluster_inventory", "node_id": node,
+                    "backend": backend, "physical_id": f"numa:{rank}" if backend == "CPU" else f"uuid-{device}"}})
+    return data
+
+
+class TestPipelineDomainEvidence(unittest.TestCase):
+    """A GPU count is not evidence of the requested TP-over-PP composition."""
+
+    @staticmethod
+    def selection():
+        """Expected domain shapes do not prescribe ordering, ordinals or splits."""
+        return {"mode": "auto", "strategy": "pp", "mpi_ranks": 1,
+                "device_counts": {"cuda": 2, "rocm": 2},
+                "pipeline_layers": 64,
+                "pipeline_domains": [{"backend": "cuda", "devices": 2}, {"backend": "rocm", "devices": 2}]}
+
+    @staticmethod
+    def observed(groups=("CUDA:1,CUDA:0", "ROCm:3,ROCm:2"), split=17):
+        """Construct observation from concrete stage membership, not its name."""
+        data = automatic_evidence([",".join(groups)], strategy="pp")
+        for index, group in enumerate(groups):
+            data["records"].append({"domain": "server", "name": "execution_pipeline_domain", "rank": 0,
+                "value": 1, "phase": "startup", "tags": {"schema": "1", "source": "resolved_execution_plan",
+                    "scope": "rank_local", "stage": str(index), "stages": str(len(groups)),
+                    "first_layer": str(0 if index == 0 else split),
+                    "end_layer": str(split if index == 0 else 64), "devices": group}})
+        return data
+
+    def test_accepts_either_vendor_order_and_nonuniform_layer_splits(self):
+        for groups in (("CUDA:1,CUDA:0", "ROCm:3,ROCm:2"), ("ROCm:3,ROCm:2", "CUDA:1,CUDA:0")):
+            for split in (1, 17, 63):
+                with self.subTest(groups=groups, split=split):
+                    observed = validate_automatic_selection(self.observed(groups, split), self.selection())
+                    self.assertEqual(observed["pipeline_layers"], 64)
+                    self.assertCountEqual(observed["pipeline_domains"], self.selection()["pipeline_domains"])
+
+    def test_recurrent_only_domain_retains_compute_and_capture_obligations(self):
+        """A one-layer GDN domain is compute, not missing FlashAttention work."""
+        for groups in (("CUDA:1,CUDA:0", "ROCm:3,ROCm:2"), ("ROCm:3,ROCm:2", "CUDA:1,CUDA:0")):
+            with self.subTest(groups=groups):
+                data = self.observed(groups, split=1)
+                data["records"][0]["tags"]["attention_devices"] = groups[1]
+                contract = validate_server_execution_contract(data)
+                self.assertEqual(contract.device_kinds, {"cuda", "rocm"})
+                backend = groups[1].partition(":")[0].lower()
+                self.assertEqual(contract.attention_device_kinds, {backend})
+                observed = validate_automatic_selection(data, self.selection())
+                self.assertEqual(observed["device_counts"], {"cuda": 2, "rocm": 2})
+                missing = validate_flash_attention_plan_policy([], contract.attention_device_kinds)
+                self.assertEqual(missing.expected_backends, {backend})
+                self.assertIsNotNone(missing.error)  # The actual FA owner is still mandatory.
+                self.assertIsNotNone(validate_graph_capture_policy([], contract.device_kinds).error)
+
+    def test_missing_false_and_partial_domain_proof_fails(self):
+        mutations = (
+            lambda d: d["records"].pop(),
+            lambda d: d["records"].append(copy.deepcopy(d["records"][-1])),
+            lambda d: d["records"][-1]["tags"].update(devices="ROCm:3"),
+            lambda d: d["records"][-1]["tags"].update(devices="CUDA:0,ROCm:3"),
+            lambda d: d["records"][-1]["tags"].update(devices="ROCm:7,ROCm:8"),
+            lambda d: d["records"][-1]["tags"].update(devices="CUDA:1,CUDA:0"),
+            lambda d: d["records"][-1]["tags"].update(first_layer="18"),
+            lambda d: d["records"][-1]["tags"].update(first_layer="16"),
+            lambda d: d["records"][-1]["tags"].update(end_layer="63"),
+            lambda d: d["records"][-1]["tags"].update(stage="2"),
+            lambda d: d["records"][-1]["tags"].update(stages="3"),
+            lambda d: d["records"][-1]["tags"].update(source="cli"),
+            lambda d: d["records"][-1].update(rank=True),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                data = self.observed()
+                mutate(data)
+                validate_automatic_selection(data, self.selection())
+
+    def test_four_singletons_do_not_prove_two_tensor_parallel_domains(self):
+        data = self.observed(("CUDA:1", "CUDA:0", "ROCm:3", "ROCm:2"))
+        with self.assertRaises(ValueError):
+            validate_automatic_selection(data, self.selection())
+
+    def test_contract_rejects_incomplete_and_contradictory_shapes(self):
+        selection = self.selection()
+        for change in ({"mpi_ranks": 0}, {"mpi_ranks": True}, {"pipeline_layers": 0},
+                       {"pipeline_layers": True}, {"pipeline_domains": []},
+                       {"pipeline_domains": [{"backend": "cuda", "devices": 1}]},
+                       {"pipeline_domains": [{"backend": "cuda", "devices": 2}, {"backend": "rocm", "devices": True}]},
+                       {"strategy": "tp"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                automatic_selection_policy({"planning": {**selection, **change}})
+
+
 class TestServerExecutionContract(unittest.TestCase):
     """Authenticate roles without conflating discoverable devices and execution."""
 
@@ -57,6 +164,66 @@ class TestServerExecutionContract(unittest.TestCase):
             [("CPU", ""), ("ROCm:1,ROCm:2", "ROCm:1,ROCm:2"), ("", "")], authority=1))
         self.assertEqual(contract.device_kinds, {"cpu", "rocm"})
         self.assertEqual(contract.attention_device_kinds, {"rocm"})
+
+    def test_automatic_selection_requires_real_backend_counts_and_execution_family(self):
+        for devices, strategy, counts in (
+                (["CPU", "CPU"], "tp", {"cpu": 2}),
+                (["CUDA:0,CUDA:1"], "tp", {"cuda": 2}),
+                (["ROCm:2,ROCm:3"], "pp", {"rocm": 2}),
+                (["CUDA:0,CUDA:1,ROCm:2,ROCm:3"], "pp", {"cuda": 2, "rocm": 2})):
+            with self.subTest(devices=devices, strategy=strategy):
+                selection = {"mode": "auto", "strategy": strategy,
+                             "device_counts": counts, "mpi_ranks": len(devices)}
+                data = automatic_evidence(devices, strategy=strategy)
+                self.assertEqual(validate_automatic_selection(data, selection),
+                                 {"strategy": strategy, "device_counts": counts,
+                                  "mpi_ranks": len(devices)})
+                with self.assertRaisesRegex(ValueError, "mismatch"):
+                    validate_automatic_selection(data, {**selection, "device_counts": {"cuda": 1}})
+                with self.assertRaisesRegex(ValueError, "mismatch"):
+                    validate_automatic_selection(data, {**selection, "strategy": "single"})
+
+    def test_automatic_selection_deduplicates_visibility_not_distinct_physical_hosts(self):
+        selection = {"mode": "auto", "strategy": "tp", "device_counts": {"cuda": 2},
+                     "mpi_ranks": 2}
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            validate_automatic_selection(automatic_evidence(["CUDA:0", "CUDA:0"], strategy="tp"), selection)
+        observed = validate_automatic_selection(
+            automatic_evidence(["CUDA:0", "CUDA:0"], strategy="tp", nodes=[0, 1]), selection)
+        self.assertEqual(observed["device_counts"], {"cuda": 2})
+
+    def test_two_rank_cell_rejects_single_rank_with_same_physical_device_count(self):
+        selection = {"mode": "auto", "strategy": "tp", "device_counts": {"cuda": 2},
+                     "mpi_ranks": 2}
+        with self.assertRaisesRegex(ValueError, "MPI rank mismatch"):
+            validate_automatic_selection(
+                automatic_evidence(["CUDA:0,CUDA:1"], strategy="tp"), selection)
+        observed = validate_automatic_selection(
+            automatic_evidence(["CUDA:0", "CUDA:1"], strategy="tp"), selection)
+        self.assertEqual(observed["mpi_ranks"], 2)
+
+    def test_automatic_selection_rejects_idle_missing_duplicate_and_forged_participants(self):
+        original = automatic_evidence(["CUDA:0,CUDA:1"], strategy="tp")
+        selection = {"mode": "auto", "strategy": "tp", "device_counts": {"cuda": 2},
+                     "mpi_ranks": 1}
+        for mutate in (
+                lambda d: d["records"].pop(),
+                lambda d: d["records"].append(copy.deepcopy(d["records"][-1])),
+                lambda d: d["records"][-1].update(device="CUDA:7"),
+                lambda d: d["records"][-1]["tags"].update(physical_id=""),
+                lambda d: d["records"][-1]["tags"].update(node_id="1"),
+                lambda d: d["records"][-1]["tags"].update(backend="ROCm"),
+                lambda d: d["records"][-1]["tags"].update(identity_source="measured_latency")):
+            with self.subTest(mutate=mutate), self.assertRaises(ValueError):
+                data = copy.deepcopy(original)
+                mutate(data)
+                validate_automatic_selection(data, selection)
+        for planning in (None, {}, {**selection, "mode": "apply"}, {**selection, "strategy": "future"},
+                         {key: value for key, value in selection.items() if key != "mpi_ranks"},
+                         {**selection, "device_counts": {}}, {**selection, "device_counts": {"cuda": True}},
+                         {**selection, "device_counts": {"cuda": 0}}, {**selection, "device_counts": {"cuda": "2"}}):
+            with self.subTest(planning=planning), self.assertRaises(ValueError):
+                automatic_selection_policy({"planning": planning})
 
     def test_missing_duplicate_foreign_and_future_records_fail(self):
         mutations = [

@@ -24,6 +24,7 @@
 
 #include "GDNRecurrenceStage.h"
 #include "GDNSpeculativeWorkspaceContract.h"
+#include "../../../kernels/IKVCache.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
@@ -1039,6 +1040,21 @@ namespace llaminar2
             if (!ok)
             {
                 LOG_ERROR("[GDNRecurrenceStage] GPU kernel failed");
+                return false;
+            }
+
+            // A pipeline slice can contain no attention append at all. Its
+            // cache elects the terminal recurrent layer to advance the same
+            // canonical metadata used by checkpoint/restore. Padded graphs
+            // consume resident lengths, never the padded physical row count.
+            if (params_.sequence_state_cache &&
+                !params_.sequence_state_cache->advanceRecurrentSequenceState(
+                    params_.layer_idx, params_.request_count,
+                    params_.seq_len == 1 ? nullptr : params_.request_seq_lens_device,
+                    params_.request_seq_len > 0 ? params_.request_seq_len : params_.seq_len,
+                    gpuStream()))
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Recurrent sequence frontier publication failed");
                 return false;
             }
 

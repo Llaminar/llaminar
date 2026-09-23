@@ -98,6 +98,36 @@ TEST(Test__RamPrefixStorageBackend, AllocatesHybridPayloadSegment)
     EXPECT_FALSE(handle.has_hybrid_state);
 }
 
+/** @test Recurrent checkpoints are real bounded payloads, not zero-byte KV placeholders. */
+TEST(Test__RamPrefixStorageBackend, RecurrentOnlyLayoutOwnsNoAttentionBytes)
+{
+    auto layout = makeLayout(0, 0);
+    layout.fa_layers = 0;
+    layout.gdn_layers = 1;
+    layout.hybrid_host_state_bytes = layout.hybrid_state_bytes = 32;
+    layout.includes_hybrid_state = true;
+    ASSERT_TRUE(layout.hasRestorableMainState());
+    EXPECT_EQ(layout.organization(), PrefixPayloadOrganization::RecurrentCheckpoint);
+    RamPrefixStorageBackend backend(32);
+    auto handle = backend.allocate(keyFor(0), layout);
+    ASSERT_TRUE(handle.valid());
+    EXPECT_EQ(handle.kvKData(), nullptr);
+    EXPECT_EQ(handle.kvVData(), nullptr);
+    ASSERT_NE(handle.hybrid_payload, nullptr);
+    EXPECT_EQ(backend.usedBytes(), 32u);
+    EXPECT_FALSE(backend.allocate(keyFor(1), layout).valid());
+
+    layout.includes_hybrid_state = false;
+    EXPECT_FALSE(layout.hasRestorableMainState());
+    layout.includes_hybrid_state = true;
+    layout.includes_mtp_state = true;
+    layout.mtp_kv_bytes = 16;
+    EXPECT_EQ(layout.organization(), PrefixPayloadOrganization::AttentionBlocks)
+        << "A terminal participant still needs its shifted attention block chain";
+    layout.hybrid_state_bytes = 31;
+    EXPECT_FALSE(layout.hasRestorableMainState()) << "Reject incomplete recurrent geometry";
+}
+
 TEST(Test__RamPrefixStorageBackend, RejectsBlocksThatDoNotFit)
 {
     RamPrefixStorageBackend backend(31);
@@ -159,6 +189,40 @@ TEST(Test__RamPrefixStorageBackend,
         authority->reservedBytes(
             DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier),
         0u);
+}
+
+/** @test Logical eviction cannot reissue bytes still leased by a request. */
+TEST(Test__RamPrefixStorageBackend,
+     RequestAliasKeepsPhysicalArchiveCapacityBusy)
+{
+    auto authority = makePrefixAuthority(64u);
+    auto backend = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 64u, authority);
+    ASSERT_NE(backend, nullptr);
+
+    auto first = backend->allocate(keyFor(0), makeLayout());
+    auto second = backend->allocate(keyFor(1), makeLayout());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    PrefixBlockHandle request_alias = first;
+    ASSERT_TRUE(backend->release(first));
+    first = {};
+
+    EXPECT_EQ(backend->usedBytes(), 32u);
+    EXPECT_FALSE(backend->canStore(32u));
+    std::string error;
+    EXPECT_FALSE(backend->allocateWithDiagnostics(
+        keyFor(2), makeLayout(), &error).valid());
+    EXPECT_NE(error.find("physical RAM prefix tier capacity busy"),
+              std::string::npos);
+    EXPECT_EQ(authority->claimedBytes(
+                  DeviceId::cpu(), PhysicalMemoryOwner::PrefixHostTier,
+                  PhysicalMemoryMaterializationKind::NewAllocation),
+              64u);
+
+    request_alias = {};
+    EXPECT_TRUE(backend->canStore(32u));
+    EXPECT_TRUE(backend->allocate(keyFor(2), makeLayout()).valid());
 }
 
 TEST(Test__RamPrefixStorageBackend,

@@ -236,6 +236,15 @@ namespace llaminar2
                 stats_.misses++;
                 return std::nullopt;
             }
+            if (evictUntilPhysicallyFits(hydration->totalBytes()) !=
+                PrefixRamInsertPreparation::Prepared)
+            {
+                // A request may still own an evicted RAM payload. Physical
+                // pressure is a cache miss, not evidence that the durable
+                // record is corrupt or should be removed from the disk index.
+                stats_.misses++;
+                return std::nullopt;
+            }
 
             auto concrete_ram =
                 std::dynamic_pointer_cast<RamPrefixStorageBackend>(
@@ -524,28 +533,76 @@ namespace llaminar2
         return transition;
     }
 
-    bool PrefixStateCache::prepareInsert(
+    PrefixRamInsertPreparation PrefixStateCache::prepareInsert(
         const PrefixCacheKey &key,
         size_t incoming_bytes)
     {
         if (!key.valid() || incoming_bytes == 0 ||
-            incoming_bytes > ram_budget_bytes_)
+            incoming_bytes > ram_budget_bytes_ || !ram_backend_)
         {
-            return false;
+            return PrefixRamInsertPreparation::Error;
         }
 
         const auto resident = entries_.find(key);
         if (resident != entries_.end() &&
             resident->second.block.ref_count > 0)
         {
-            return false;
+            return PrefixRamInsertPreparation::Error;
         }
 
         if (contains(key) && !erase(key))
         {
-            return false;
+            return PrefixRamInsertPreparation::Error;
         }
-        return evictUntilFits(incoming_bytes);
+        if (!evictUntilFits(incoming_bytes))
+            return PrefixRamInsertPreparation::Error;
+
+        return evictUntilPhysicallyFits(incoming_bytes);
+    }
+
+    PrefixRamInsertPreparation PrefixStateCache::evictUntilPhysicallyFits(
+        size_t incoming_bytes)
+    {
+        /*
+         * Logical LRU bytes can fall before physical bytes: a request-held
+         * handle or an in-flight DMA retains its admitted child lease after
+         * cache eviction. Continue pressure until the backend's physical
+         * authority can actually admit the new archive. Never let the caller
+         * discover that mismatch after it has started copying the payload.
+         */
+        while (!ram_backend_->canStore(incoming_bytes))
+        {
+            bool evicted = false;
+            for (auto it = lru_.rbegin(); it != lru_.rend(); ++it)
+            {
+                const auto entry = entries_.find(*it);
+                if (entry == entries_.end() || entry->second.block.ref_count > 0)
+                    continue;
+                if (!persistResidentToDisk(entry->second))
+                    return PrefixRamInsertPreparation::Error;
+                const PrefixCacheKey victim = *it;
+                if (!evictResident(victim))
+                    return PrefixRamInsertPreparation::Error;
+                ++stats_.evictions;
+                evicted = true;
+                break;
+            }
+            if (evicted)
+                continue;
+
+            // Device-hot copies may retain a host runtime-state lease even
+            // after their RAM key is gone. Retire only cache-owned hot copies;
+            // active request aliases remain leased until their event retires.
+            if (!device_hot_lru_.empty())
+            {
+                const PrefixCacheKey victim = device_hot_lru_.back();
+                if (!removeDeviceHotEntry(victim, /*capacity_eviction=*/true))
+                    return PrefixRamInsertPreparation::Error;
+                continue;
+            }
+            return PrefixRamInsertPreparation::Busy;
+        }
+        return PrefixRamInsertPreparation::Prepared;
     }
 
     PrefixDeviceHotLeaseResult PrefixStateCache::prepareDeviceHotCopy(

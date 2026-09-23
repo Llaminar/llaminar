@@ -19,6 +19,7 @@
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
+#include "../../transfer/CapturedTransferChannelProtocol.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
@@ -93,6 +94,7 @@ namespace llaminar2
         }
 
 #include "../../kernels/common/MappedHostCopyDevice.inl"
+#include "../../kernels/common/CapturedTransferChannelDevice.inl"
 
         /** @brief Snapshot one mapped command per block into ordinary VRAM. */
         __global__ void mappedTransferProgressClaimKernel(
@@ -5887,6 +5889,45 @@ namespace llaminar2
             return false;
         }
         return true;
+    }
+
+    bool ROCmBackend::prepareCapturedTransferChannelKernels(
+        int device_id, int timeout_ms, std::uint64_t *timeout_ticks)
+    {
+        if (!timeout_ticks || timeout_ms <= 0 || device_id < 0 || device_id >= device_count_ || !setDevice(device_id))
+            return false;
+        *timeout_ticks = 0;
+        hipFuncAttributes attributes{};
+        int clock_khz = 0;
+        if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferPublishKernel)) != hipSuccess ||
+            hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate, device_id) != hipSuccess || clock_khz <= 0)
+            return false;
+        // wall_clock64 uses this fixed-rate clock. Shader clockRate is a
+        // maximum and cannot define a wall deadline under power management.
+        *timeout_ticks = static_cast<std::uint64_t>(clock_khz) * static_cast<std::uint64_t>(timeout_ms);
+        return prepareMappedHostCopyKernels(device_id);
+    }
+
+    bool ROCmBackend::enqueueCapturedTransferChannelBoundary(
+        const CapturedTransferChannelDeviceBinding &binding,
+        CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+    {
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannelBoundary");
+        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
+        // Match CUDA's one-wave metadata ownership. The full payload uses the
+        // same separately tuned parallel copy implementation as other transfers.
+        switch (operation)
+        {
+        case CapturedTransferBoundaryOperation::Acquire:
+            hipLaunchKernelGGL(capturedTransferAcquireKernel, dim3(1), dim3(64), 0, native, binding);
+            break;
+        case CapturedTransferBoundaryOperation::Publish:
+            hipLaunchKernelGGL(capturedTransferPublishKernel, dim3(1), dim3(64), 0, native, binding);
+            break;
+        default: return false;
+        }
+        return hipGetLastError() == hipSuccess;
     }
 
     bool ROCmBackend::copyDeviceVisibleRegionByKernelOnStream(

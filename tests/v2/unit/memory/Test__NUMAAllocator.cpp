@@ -22,6 +22,7 @@
 #include "tensors/AlignedVector.h"
 
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <thread>
@@ -29,6 +30,7 @@
 #include <numeric>
 
 #include <sched.h>
+#include <numaif.h>
 #include <unistd.h>
 
 using namespace llaminar2;
@@ -277,6 +279,54 @@ TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
                 << " ignored certified first touch";
         }
     }
+}
+
+TEST(Test__NUMAAllocator, FirstTouchOverridesInheritedRemoteMemoryPolicy)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable() || allocator.numNUMANodes() < 2)
+        GTEST_SKIP() << "Two NUMA nodes are required for conflicting-policy proof";
+
+    constexpr size_t bytes = 3u * 4096u;
+    constexpr unsigned long max_nodes = sizeof(unsigned long) * 8u;
+    const unsigned long preferred_node_zero = 1ul;
+    int policy_error = 0;
+    bool allocated_on_requested_node = false;
+    int restored_mode = -1;
+    unsigned long restored_nodes = 0;
+
+    // A separate thread lets the kernel discard this deliberately conflicting
+    // policy at exit, even if an assertion later fails in the test process.
+    std::thread worker([&] {
+        if (set_mempolicy(MPOL_PREFERRED, &preferred_node_zero, max_nodes) != 0)
+        {
+            policy_error = errno;
+            return;
+        }
+
+        void *memory = allocator.allocateOnNode(bytes, 1, 4096);
+        if (memory)
+        {
+            allocated_on_requested_node =
+                allocator.getNUMANodeForAddress(memory) == 1;
+            allocator.free(memory, bytes);
+        }
+
+        if (get_mempolicy(&restored_mode, &restored_nodes, max_nodes,
+                          nullptr, 0) != 0)
+            policy_error = errno;
+    });
+    worker.join();
+
+    if (policy_error != 0)
+        GTEST_SKIP() << "This environment cannot set/query thread NUMA policy: "
+                     << std::strerror(policy_error);
+    EXPECT_TRUE(allocated_on_requested_node)
+        << "First touch must target the requested NUMA node despite an "
+           "inherited policy preferring a remote node";
+    EXPECT_EQ(restored_mode, MPOL_PREFERRED);
+    EXPECT_EQ(restored_nodes & preferred_node_zero, preferred_node_zero)
+        << "First-touch policy must be restored for subsequent allocations";
 }
 
 TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)

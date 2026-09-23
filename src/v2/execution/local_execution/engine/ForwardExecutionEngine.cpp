@@ -2076,7 +2076,7 @@ namespace llaminar2
                     effective_input.device_prefill_chunk
                         ? effective_input.device_prefill_chunk->capture_identity
                         : uint64_t{0},
-                .pipeline_forward_edges = PipelineForwardGraphEdges::encloses(effective_input)
+                .pipeline_forward_edges = config_.pipeline_forward_edges && config_.pipeline_forward_edges->encloses(effective_input)
                     ? config_.pipeline_forward_edges : nullptr,
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
@@ -5584,7 +5584,7 @@ namespace llaminar2
         // surrounding chunk/verifier prelude still owns local positions/real lengths;
         // graph capture never copies a previous stage's TensorBase or changes
         // its current-device authority.
-        if (config_.pipeline_forward_edges && PipelineForwardGraphEdges::encloses(effective_input))
+        if (config_.pipeline_forward_edges && config_.pipeline_forward_edges->encloses(effective_input))
             config_.pipeline_forward_edges->append(graph, effective_input);
 
         if (effective_input.device_decode_position)

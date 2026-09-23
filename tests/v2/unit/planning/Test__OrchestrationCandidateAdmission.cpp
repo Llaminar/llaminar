@@ -192,6 +192,43 @@ TEST(OrchestrationCandidateAdmission, RemoteOverlayAdmitsEveryRankAndRetainsDept
     }
 }
 
+/**
+ * @brief Discovery-time capacity evidence must not become a fixed live quota.
+ *
+ * GPU context creation happens after automatic search. A changed free-memory
+ * observation can alter the maximal resident expert count without changing
+ * the selected topology or automatic capacity policy.
+ */
+TEST(OrchestrationCandidateAdmission, AutomaticOverlayKeepsLiveExpertQuotaAdaptive)
+{
+    test::PlanningGGUFFixture file(true, true, GGUFTensorType::F16);
+    PlanningModelSource source(file.path());
+    auto proposal = candidate(source, DeviceType::ROCm, 1);
+    proposal.config.model_path = file.path();
+    const auto admitted = AdmittedOrchestrationCandidate::admit(
+        proposal, source, policy());
+    ASSERT_TRUE(admitted.overlayCapacity());
+    ASSERT_TRUE(admitted.config().moe_routed_expert_plan);
+    ASSERT_EQ(admitted.config().moe_routed_expert_plan->routed_tiers.size(), 2u);
+    for (const auto &tier : admitted.config().moe_routed_expert_plan->routed_tiers)
+        EXPECT_TRUE(tier.resolved_live_experts_per_layer.empty());
+
+    auto lower_free_inventory = proposal.membership.inventory();
+    lower_free_inventory.ranks[0].gpus[0].free_memory_bytes -= 1ull << 20;
+    lower_free_inventory.buildNodeAggregations();
+    proposal.membership = ExecutionRankMembership(
+        lower_free_inventory, proposal.membership.discoveryRanks());
+    const auto refreshed = AdmittedOrchestrationCandidate::admit(
+        std::move(proposal), source, policy());
+    ASSERT_TRUE(refreshed.overlayCapacity());
+    for (const auto &tier : refreshed.config().moe_routed_expert_plan->routed_tiers)
+        EXPECT_TRUE(tier.resolved_live_experts_per_layer.empty());
+    const auto restored = deserializeOrchestrationConfig(
+        serializeOrchestrationConfig(refreshed.config()));
+    for (const auto &tier : restored.moe_routed_expert_plan->routed_tiers)
+        EXPECT_TRUE(tier.resolved_live_experts_per_layer.empty());
+}
+
 TEST(OrchestrationCandidateAdmission, PipelineAdmissionIncludesTheNonRootPhysicalBOM)
 {
     test::PlanningGGUFFixture file;

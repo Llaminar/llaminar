@@ -73,7 +73,7 @@ memory-authority, attention and host-transfer policies. The original aggregate
 and failed report are not rewritten. This offline diagnosis is not a fresh
 green cell or an approved token baseline.
 
-The refreshed shared gate passes 647 Unit and 137 ProductionParityPreflight
+The refreshed shared gate passes 647 Unit and 137 ProductionTestPreflight
 registrations in 594.269 seconds (Unit 73.77 seconds, preflight 519.61 seconds).
 The reusable receipt is
 `parity-results/overlay-boundary-evidence-prerequisites-01/prerequisites.json`.

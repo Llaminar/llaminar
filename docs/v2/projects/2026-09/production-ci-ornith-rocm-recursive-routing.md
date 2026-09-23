@@ -134,7 +134,7 @@ of later recurrence or logits.
 The Python reference suite now passes 70 tests, including cache corruption,
 canonical normalization reconstruction and all-codebook dequantizer dispatch.
 The C++ gate adds corrupt-stage/dependency/geometry/nonfinite and row-local RMS
-regressions. Both are already registered in `ProductionParityPreflight`.
+regressions. Both are already registered in `ProductionTestPreflight`.
 Both focused suites pass **20/20 repetitions each** in 142.63 seconds total
 (`parity-results/route-suffix-focused-20.log`). The shared single-device, dense,
 35B overlay and 122B overlay fixtures build cleanly.

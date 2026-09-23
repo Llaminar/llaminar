@@ -616,6 +616,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish progress after a GPU recurrent layer without KV appends.
+         *
+         * Hybrid caches advance once, at their last recurrent layer, only when
+         * no attention layer already owns the sequence frontier. Other layers
+         * are explicit no-ops. GPU implementations consume resident real row
+         * counts; this interface never observes or mirrors device values.
+         *
+         * @param layer Global recurrent model layer that has just executed.
+         * @param request_count Number of independent request banks, starting at zero.
+         * @param rows_device Optional device-owned real lengths, one per request.
+         * @param captured_rows Maximum rows per request represented by this graph.
+         * @param stream Exact stream ordered after the recurrent-state producer.
+         * @return Whether the cache accepted this recurrent publication contract.
+         */
+        virtual bool advanceRecurrentSequenceState(
+            int layer, int request_count, const int32_t *rows_device,
+            int captured_rows, void *stream)
+        {
+            (void)layer;
+            (void)request_count;
+            (void)rows_device;
+            (void)captured_rows;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Capture one sequence's canonical metadata into device memory.
          *
          * Implementations enqueue device-to-device work on @p stream. They

@@ -37,6 +37,9 @@ def remote_cases():
                           "cpu_ranks_per_host": 1, "execution_ranks": count + 1,
                           "continuation_priority": -4, "remote_priority": 37},
              "movement_evidence": "required", "owner_order": "ordinal",
+             "planning": {"mode": "auto", "strategy": "expert-overlay",
+                          "device_counts": {"rocm": 1, "cpu": count},
+                          "mpi_ranks": count + 1},
              "server_policy_args": ["--only-strategies", "expert-overlay"]}
             for count in (1, 2) for route in ("plan-apply", "auto-serve")]
 
@@ -109,6 +112,10 @@ class InventoryTests(unittest.TestCase):
             lambda rows: rows[0].update(movement_evidence="not_applicable"),
             lambda rows: rows[0].update(server_policy_args="--mtp"),
             lambda rows: rows[0].update(server_policy_args=["--different-policy"]),
+            lambda rows: rows[0].pop("planning"),
+            lambda rows: rows[0]["planning"]["device_counts"].update(cpu=7),
+            lambda rows: rows[0]["planning"].pop("mpi_ranks"),
+            lambda rows: rows[0]["planning"].update(mpi_ranks=7),
             lambda rows: rows[0]["topology"].update(remote_cpu_hosts=0),
             lambda rows: rows[0]["topology"].update(remote_cpu_hosts=True),
             lambda rows: rows[0]["topology"].update(remote_cpu_hosts=2**31 - 1),

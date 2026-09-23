@@ -2583,6 +2583,117 @@ namespace llaminar2
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
+         ColocatedCpuWorkspaceCountsEveryConcurrentGpuGraphOwner)
+    {
+        auto profile = smallModelProfile();
+        addRoutedExpertMetadata(profile);
+        constexpr std::size_t kBudget = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+
+        for (const DeviceType backend :
+             {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            SCOPED_TRACE(backend == DeviceType::CUDA ? "CUDA" : "ROCm");
+            const auto address = [backend](int ordinal)
+            {
+                return backend == DeviceType::CUDA
+                    ? GlobalDeviceAddress::cuda(ordinal)
+                    : GlobalDeviceAddress::rocm(ordinal);
+            };
+            RankExecutionPlan rank_plan;
+            rank_plan.rank = 0;
+            rank_plan.first_layer = 0;
+            rank_plan.last_layer = profile.n_layers - 1;
+            rank_plan.primary_device = address(0);
+            rank_plan.local_tp_devices = {address(0), address(1)};
+            rank_plan.local_tp_backend = backend == DeviceType::CUDA
+                ? CollectiveBackendType::NCCL
+                : CollectiveBackendType::RCCL;
+            rank_plan.runtime.batch_size = 1;
+            rank_plan.runtime.max_seq_len = profile.max_seq_len;
+            rank_plan.runtime.kv_cache_precision = KVCachePrecision::FP16;
+            rank_plan.runtime.prefix_cache.enabled = false;
+            rank_plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+            rank_plan.runtime.moe_rebalance.mode =
+                MoERebalanceRuntimeMode::Off;
+
+            RankInventory inventory;
+            inventory.rank = 0;
+            inventory.cpu_cores = 8;
+            inventory.cpu_worker_threads = 8;
+            inventory.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+            inventory.cpu_memory_bytes = kBudget;
+            inventory.cpu.memory_bytes = kBudget;
+            inventory.cpu.free_memory_bytes = kBudget;
+            for (int ordinal = 0; ordinal < 2; ++ordinal)
+                inventory.gpus.push_back(DeviceInfo{
+                    .type = backend,
+                    .local_device_id = ordinal,
+                    .memory_bytes = kBudget,
+                    .free_memory_bytes = kBudget,
+                    .compute_units = 60,
+                });
+
+            MoERoutedExpertPlacementPlan overlay;
+            overlay.enabled = true;
+            overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            overlay.continuation_domain = "accelerators";
+            overlay.base_model_domain = "accelerators";
+            overlay.shared_expert_domain = "accelerators";
+            overlay.continuation_domain_spec.domain = "accelerators";
+            overlay.continuation_domain_spec.setDensePolicy(
+                DenseParallelPolicy::Replicated);
+            auto gpu_domain = boundDomain("accelerators", 0, address(0));
+            gpu_domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            gpu_domain.participants.push_back(address(1));
+            gpu_domain.world_ranks.push_back(0);
+            gpu_domain.backend = rank_plan.local_tp_backend;
+            overlay.domains = {
+                std::move(gpu_domain),
+                boundDomain("cpu-experts", 0, GlobalDeviceAddress::cpu(0)),
+            };
+            overlay.routed_tiers = {
+                RoutedExpertTier{.name = "first", .domain = "accelerators", .priority = 0},
+                RoutedExpertTier{.name = "second", .domain = "cpu-experts", .priority = 1,
+                                 .fallback = true},
+            };
+
+            const auto result = MoEOverlayLocalCapacityPlanner::plan({
+                .model_profile = &profile,
+                .rank_plan = &rank_plan,
+                .overlay_plan = &overlay,
+                .rank_inventory = &inventory,
+                .rank_execution_kind =
+                    OverlayRankExecutionKind::ContinuationAuthority,
+                .resident_graph_rows = 8,
+                .gpu_weight_load = testGPUWeightLoadCapacityInput(),
+            });
+            const auto cpu_input = std::find_if(
+                result.device_inputs.begin(), result.device_inputs.end(),
+                [](const DevicePlanConfig &config)
+                {
+                    return config.device.is_cpu() &&
+                        config.execution_role ==
+                            DeviceExecutionMemoryRole::RoutedExpertParticipant;
+                });
+            ASSERT_NE(cpu_input, result.device_inputs.end());
+            ASSERT_EQ(cpu_input->concurrent_workspace_owners, 2u);
+            auto one_owner = *cpu_input;
+            one_owner.concurrent_workspace_owners = 1u;
+            const auto one_plan = MemoryPlanner::plan(profile, {one_owner});
+            ASSERT_EQ(one_plan.devices.size(), 1u);
+            const auto cpu_plan = std::find_if(
+                result.fixed_memory_plan.devices.begin(),
+                result.fixed_memory_plan.devices.end(),
+                [](const DeviceMemoryPlan &device)
+                { return device.device().is_cpu(); });
+            ASSERT_NE(cpu_plan, result.fixed_memory_plan.devices.end());
+            EXPECT_EQ(cpu_plan->workspace_bytes(),
+                      2u * one_plan.devices.front().workspace_bytes());
+        }
+    }
+
+    TEST(MoEOverlayLocalCapacityPlanner,
          RelayHostAuthorityDoesNotInventAnExpertGraphWorkspace)
     {
         const auto profile = smallModelProfile();
@@ -3141,7 +3252,7 @@ namespace llaminar2
                 input.physical_budgets.back().usableBudgetBytes() - 1u);
         EXPECT_THROW(
             (void)MoEOverlayCapacityResolver::resolve(input),
-            std::invalid_argument);
+            MoEOverlayCapacityExhausted);
     }
 
     TEST(MoEOverlayCapacityResolver, FallbackCoverageFailsClosedWhenOneExpertDoesNotFit)

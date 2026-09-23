@@ -27,7 +27,7 @@ immutable persistent tmpfs staging, and independent authenticated HF snapshots.
 | Check | Result |
 |---|---|
 | Complete Unit gate | 658/658 passed |
-| Complete ProductionParityPreflight gate | 243/243 passed |
+| Complete ProductionTestPreflight gate | 243/243 passed |
 | CPU0, FP32 activation / FP16 KV, MTP off | Passed existing numerical and prefix gates; 58.995 s |
 | Four ROCm, Dynamic/Ordinal, FP32 activation / FP16 KV, MTP depth 1 | Passed existing numerical, MTP, and prefix gates; 338.015 s |
 

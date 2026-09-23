@@ -1,6 +1,10 @@
 /**
  * @file DeviceExecutionTimeline.cpp
  * @brief Runtime validation and backend lowering for declarative event edges.
+ *
+ * Each dependency has one named producer and an explicit consumer set. Local
+ * pipeline forwards consume their predecessor directly: a headless participant
+ * must not depend on an absent sampler to order reuse of its model state.
  */
 
 #include "DeviceExecutionTimeline.h"
@@ -233,6 +237,7 @@ namespace llaminar2
                     .name = "forward_graph_output_ready",
                     .producer = DeviceTimelineRole::MainForwardGraph,
                     .consumers = roles({
+                        DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::DeviceGenerationController,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::TargetSampler,

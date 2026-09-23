@@ -48,6 +48,24 @@ TEST(Test__KVCacheMemoryEstimator, CPUFP16OwnsOnlyKeyAndValueHorizons)
         expected);
 }
 
+/** @brief Recurrent-only GPU slices own metadata, never context-sized dummy KV. */
+TEST(Test__KVCacheMemoryEstimator, RecurrentOnlyGPUPricesOnlySequenceFrontiers)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const char *format : {"fp32", "fp16", "bf16", "q8_1"})
+            for (const int batch : {1, 3})
+                for (const int context : {32, 32768})
+                {
+                    EXPECT_EQ(KVCacheMemoryEstimator::estimate(
+                        KVCacheFamily::Hybrid, 0, batch, context, 1, 64, format, device),
+                        static_cast<size_t>(batch) * 2u * sizeof(int32_t));
+                    EXPECT_EQ(KVCacheMemoryEstimator::estimate(
+                        KVCacheFamily::AttentionOnly, 0, batch, context, 1, 64, format, device), 0u);
+                }
+    EXPECT_EQ(KVCacheMemoryEstimator::estimate(
+        KVCacheFamily::Hybrid, 0, 1, 32, 1, 64, "fp32", DeviceId::cpu()), 0u);
+}
+
 TEST(Test__KVCacheMemoryEstimator, CUDAFP16IncludesPermanentLinearizationHorizons)
 {
     const std::size_t expected =

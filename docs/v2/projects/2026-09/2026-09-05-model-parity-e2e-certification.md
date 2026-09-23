@@ -1583,7 +1583,7 @@ are being rerun; no GPU/model correctness failure is inferred from this unit
 fixture's synthetic timing failure.
 
 **Final shared gate is green (02:32 UTC):** complete Unit **633/633, 68.94 s**,
-and model-free ProductionParityPreflight **92/92, 196.66 s**, including the
+and model-free ProductionTestPreflight **92/92, 196.66 s**, including the
 expanded mapped-progress fixture. Receipts are
 `/tmp/e2e-native-progress-copy-certified-{unit,preflight}.log`. The remaining
 CUDA2/CPU2 122B cell is next, with unchanged context, generation, MTP, placement,
@@ -1669,7 +1669,7 @@ format (1.66 seconds). The complete regression passed **20/20 repetitions**:
 `/tmp/e2e-merged-workspace-repeat20.log`. Two device-free tests sweep alignment,
 fan-out 1–8, non-divisible envelopes, bounds, and overflow extremes:
 `/tmp/e2e-aligned-workspace-unit.log`. The focused Integration test is registered
-in `ProductionParityPreflight`; Unit coverage joins its existing gate binary.
+in `ProductionTestPreflight`; Unit coverage joins its existing gate binary.
 Release rebuilt successfully. Compute Sanitizer reports **zero errors** for the
 all-format regression (`/tmp/e2e-merged-workspace-sanitizer.log`), and the full
 Unit refresh passes **633/633 in 67.14 seconds**
@@ -1824,7 +1824,7 @@ groups each pass twenty repeated runs
 (`/tmp/e2e-context-blas-retirement-repeat20.log`): retirement of FP16/BF16/FP32
 adapters while unrelated work is blocked, exact-stream isolation, and twenty
 poisoned-output replays of a two-stream native graph with independent scratch.
-These two model-free registrations join `ProductionParityPreflight` (92 tests).
+These two model-free registrations join `ProductionTestPreflight` (92 tests).
 The source sanitizer additionally forbids all eight BLAS/Lt create/destroy
 variants outside the exact device-context initialization/shutdown functions.
 
@@ -3549,7 +3549,7 @@ the above comparison. Full Unit/preflight are being refreshed after the CUDA
 production change.
 
 Both refreshed shared gates are green: Unit 632/632 in 69.13 s
-(`/tmp/e2e-cuda-wait-progress-unit-gate.log`) and ProductionParityPreflight
+(`/tmp/e2e-cuda-wait-progress-unit-gate.log`) and ProductionTestPreflight
 88/88 in 185.89 s (`/tmp/e2e-cuda-wait-progress-preflight-gate.log`). The
 unchanged mixed122B Release cell is now running with report destination
 `/tmp/e2e-mixed-system-acquire-waits.json`. This retry, rather than the
@@ -3651,7 +3651,7 @@ are unchanged. No sequence is tied to a graph-cache object or token position.
 The real-MPI asynchronous ring regression now mixes repeated depth-zero
 sidecars with verifier depths 1/2/3/15, wraps its two physical send slots over
 36 operations, and rejects exact return-key reuse on every round. Its existing
-CTest registration joins ProductionParityPreflight with a model-free 60-second
+CTest registration joins ProductionTestPreflight with a model-free 60-second
 timeout. Release and focused Integration targets are rebuilding; green gates
 and a fresh CPU2 E2E receipt are still required.
 
@@ -3666,7 +3666,7 @@ is in progress; discovery confirms 89 preflight entries including the new
 model-free sparse transport gate. These focused passes are not an E2E certificate.
 
 Shared validation then passed: **632/632 Unit (68.40 s)** and **89/89
-ProductionParityPreflight (185.97 s)**. Receipts are
+ProductionTestPreflight (185.97 s)**. Receipts are
 `/tmp/e2e-cpu-sparse-identity-unit-gate.log` and
 `/tmp/e2e-cpu-sparse-identity-preflight-gate.log`. The unchanged canonical CPU2
 E2E retry is running with report target

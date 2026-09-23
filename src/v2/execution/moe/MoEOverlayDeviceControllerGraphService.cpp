@@ -390,7 +390,9 @@ namespace llaminar2
             dynamic_retirement_readiness_graph;
         /** Reader-ticket-selected participant-local bank reclamation. */
         std::unique_ptr<IGPUGraphCapture> dynamic_retire_graph;
-        /** Physical-retirement-selected topology terminal publication. */
+        /** Group-root receipt after local physical source retirement. */
+        std::unique_ptr<IGPUGraphCapture> dynamic_acknowledge_retired_graph;
+        /** Sole-leader terminal after every group receipt is visible. */
         std::unique_ptr<IGPUGraphCapture> dynamic_complete_graph;
         void *stream = nullptr;
         void *terminal_event = nullptr;
@@ -1805,32 +1807,30 @@ namespace llaminar2
                     },
                     "Dynamic bounded local-retirement epoch");
 
-                capture(
-                    endpoint.dynamic_complete_graph,
-                    [&]
-                    {
-                        bool captured = true;
-                        if (endpoint.binding.group_root)
+                if (endpoint.binding.group_root)
+                {
+                    capture(
+                        endpoint.dynamic_acknowledge_retired_graph,
+                        [&]
                         {
-                            captured = enqueue(
+                            return enqueue(
                                 MoEOverlayDeviceControllerAction::
                                     AcknowledgeRetired);
-                        }
-                        if (endpoint.binding.authority_leader)
+                        },
+                        "Dynamic group retirement-receipt phase");
+                }
+                if (endpoint.binding.authority_leader)
+                {
+                    capture(
+                        endpoint.dynamic_complete_graph,
+                        [&]
                         {
-                            captured = captured && enqueue(
+                            return enqueue(
                                 MoEOverlayDeviceControllerAction::
                                     CompleteDynamicRetirement);
-                        }
-                        else
-                        {
-                            captured = captured && enqueue(
-                                MoEOverlayDeviceControllerAction::
-                                    AwaitTransactionComplete);
-                        }
-                        return captured;
-                    },
-                    "Dynamic bounded completion epoch");
+                        },
+                        "Dynamic topology completion phase");
+                }
             });
     }
 
@@ -2555,6 +2555,8 @@ namespace llaminar2
                 return "publish-retirement-readiness";
             case DynamicGraphEpoch::Retire:
                 return "retire";
+            case DynamicGraphEpoch::AcknowledgeRetired:
+                return "acknowledge-retired";
             case DynamicGraphEpoch::Complete:
                 return "complete";
             }
@@ -2636,6 +2638,9 @@ namespace llaminar2
             case DynamicGraphEpoch::Retire:
                 graph = endpoint.dynamic_retire_graph.get();
                 break;
+            case DynamicGraphEpoch::AcknowledgeRetired:
+                graph = endpoint.dynamic_acknowledge_retired_graph.get();
+                break;
             case DynamicGraphEpoch::Complete:
                 graph = endpoint.dynamic_complete_graph.get();
                 break;
@@ -2651,7 +2656,9 @@ namespace llaminar2
                 epoch == DynamicGraphEpoch::AcknowledgePrepared ||
                 epoch == DynamicGraphEpoch::BeginCommit ||
                 epoch == DynamicGraphEpoch::AcknowledgePublished ||
-                epoch == DynamicGraphEpoch::PublishAdmission;
+                epoch == DynamicGraphEpoch::PublishAdmission ||
+                epoch == DynamicGraphEpoch::AcknowledgeRetired ||
+                epoch == DynamicGraphEpoch::Complete;
             if (!graph && role_specific_epoch)
                 continue;
             if (!graph)
@@ -3804,7 +3811,9 @@ namespace llaminar2
                  {"inference_phase", inference_phase},
                  {"blocking_inference", "false"},
                  {"policy_owner", "device"}});
+            const auto wait_started = std::chrono::steady_clock::now();
             const auto deadline = protocolDeadline();
+            bool slow_phase_reported = false;
             while (std::chrono::steady_clock::now() < deadline)
             {
                 bool ready = false;
@@ -3818,6 +3827,34 @@ namespace llaminar2
                 }
                 if (ready)
                     return true;
+                if (!slow_phase_reported &&
+                    std::chrono::steady_clock::now() - wait_started >=
+                        std::chrono::seconds(3))
+                {
+                    /* A retained phase should normally terminate quickly.
+                     * Name the exact queued endpoints before a separate
+                     * inference graph reaches its own fatal deadline. This
+                     * warning is emitted once, off the inference path. */
+                    std::ostringstream diagnostic;
+                    diagnostic << "[ExpertOverlay][Controller] Slow retained "
+                                  "epoch rank="
+                               << owner->config_.mpi_ctx->rank()
+                               << " phase=" << phase << " pending=[";
+                    bool first = true;
+                    for (const auto &endpoint : owner->endpoints_)
+                    {
+                        if (!endpoint->in_flight ||
+                            endpoint->terminal_ready)
+                            continue;
+                        if (!first)
+                            diagnostic << ',';
+                        diagnostic << endpoint->binding.device.to_string();
+                        first = false;
+                    }
+                    diagnostic << ']';
+                    LOG_WARN(diagnostic.str());
+                    slow_phase_reported = true;
+                }
                 pollPause();
             }
             if (error)
@@ -4768,6 +4805,35 @@ namespace llaminar2
             return unwind(
                 "device physical retirement omitted a local lifecycle edge");
         }
+        /* A remote group can finish its physical retirement before a busy
+         * continuation GPU finishes its inference graph. Keep the group-root
+         * acknowledgement finite and release its stream immediately. In
+         * particular, no ROCm follower may run a resident wait for the CUDA
+         * leader's later completion while it still owes sparse inference. */
+        if (!run_epoch(
+                DynamicGraphEpoch::AcknowledgeRetired,
+                "Dynamic bounded group retirement-receipt epoch"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "device group retirement receipt did not terminate");
+        }
+        if (!wait_protocol(
+                [&]
+                {
+                    return std::all_of(
+                        protocols.begin(), protocols.end(),
+                        [&](const auto &protocol)
+                        {
+                            return protocol->allGroupsRetired(command);
+                        });
+                },
+                "device controller timed out awaiting all group retirement receipts"))
+        {
+            return unwind(error && !error->empty()
+                              ? *error
+                              : "group retirement receipts were not published");
+        }
         if (!run_epoch(
                 DynamicGraphEpoch::Complete,
                 "Dynamic bounded completion epoch"))
@@ -5358,6 +5424,7 @@ namespace llaminar2
                     endpoint.dynamic_publish_admission_graph.reset();
                     endpoint.dynamic_retirement_readiness_graph.reset();
                     endpoint.dynamic_retire_graph.reset();
+                    endpoint.dynamic_acknowledge_retired_graph.reset();
                     endpoint.dynamic_complete_graph.reset();
                     endpoint.arrival_inbox.reset();
                     endpoint.kernel.reset();

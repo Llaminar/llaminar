@@ -2005,6 +2005,7 @@ validate_perf_stats() {
     local validation
     validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" "$SCRIPT_DIR" "$GENERATION_CONFIG_FILE" "$LOG_DIR/generation/observations.json" "$REPO_ROOT/scripts/ci" "$CROSS_HOST_CONFIG_FILE" "$CROSS_HOST_CASE" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -2029,7 +2030,7 @@ from request_input_lifetime_perf_policy import (
 from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validate_memory_authority
 from moe_route_scratch_perf_policy import validate_moe_route_scratch_policy
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
-from server_execution_contract import validate_server_execution_contract
+from server_execution_contract import validate_server_execution_contract, validate_automatic_selection
 
 suite_option_set = {
     option.strip()
@@ -2080,6 +2081,16 @@ except ValueError as error:
 
 try:
     execution = validate_server_execution_contract(data)
+    selection = os.environ.get("LLAMINAR_E2E_PLANNING_POLICY")
+    if selection:
+        # Retain only the bounded startup projection for the outer driver.
+        # The complete rank files remain beside it; avoid reparsing their large
+        # per-request graphs just to authenticate this one selection.
+        selected = {"world_size": data["world_size"], "authority_rank": data["authority_rank"],
+                    "records": [row for row in records if row.get("domain") == "server"
+                                and row.get("phase") == "startup"]}
+        validate_automatic_selection(selected, json.loads(selection))
+        Path(path).with_name("automatic_selection_results.json").write_text(json.dumps(selected, indent=2) + "\n")
 except ValueError as error:
     print(f"FAIL: {error}")
     sys.exit(0)
@@ -3600,6 +3611,18 @@ run_backend_tests() {
     # ─── Test 6/7: SSE streaming ─────────────────────────────────────
     stream_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer."},{"role":"user","content":"What is 1+1?"}]'
     run_streaming_checks "$tag" "$port" "$max_tokens" "$thinking_model" "2" "$stream_messages"
+
+    # Tool calling is a real generated, two-turn protocol proof for every HTTP
+    # cell, including SSE and receipt consumption. It is not a parser smoke
+    # test and has no model/backend opt-out. Persist bytes for outer admission.
+    if python3 "$SCRIPT_DIR/tool_calling_checks.py" \
+        --base-url "$(server_base_url "$port")" \
+        --output "$LOG_DIR/tool_calling_results.json" \
+        --request-timeout "$REQUEST_TIMEOUT"; then
+        pass "[${tag}] HTTP tool calling: JSON/SSE round trips and tool-result consumption"
+    else
+        fail "[${tag}] HTTP tool calling (see tool_calling_results.json)"
+    fi
 
     # ─── Test 8: Error handling — invalid JSON ────────────────────────
     local error_response error_msg

@@ -24,6 +24,9 @@ from docker_paths import validate_attached_execution
 from model_parity_inventory import InventoryScope, discover as discover_inventory, export_manifest, source_revision
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
+from tool_calling_checks import validate_evidence as validate_tool_calling_evidence
+from server_execution_contract import automatic_selection_policy, validate_automatic_selection
 
 
 def discover(args: argparse.Namespace) -> list[tuple[parity.CampaignCell, str, dict]]:
@@ -81,10 +84,19 @@ def movement_evidence(profile: dict) -> str:
     return evidence
 
 
+def tool_calling(profile: dict) -> str:
+    """Every canonical HTTP cell must exercise the live tool protocol; omission is stale inventory."""
+    if profile.get("tool_calling") != "required":
+        raise ValueError("E2E tool_calling must be required; rebuild/export stale manifests")
+    return "required"
+
+
 def certification_environment(profile: dict, artifact_dir: Path) -> dict[str, str]:
     """Pin full checks and geometry to the typed profile, not inherited knobs."""
     readiness = readiness_timeout_seconds(profile)
+    tool_calling(profile)
     return {**os.environ,
+            "LLAMINAR_E2E_PLANNING_POLICY": json.dumps(automatic_selection_policy(profile)),
             "LLAMINAR_E2E_THINKING_MODES": thinking_modes(profile),
             "LLAMINAR_E2E_MOVEMENT_EVIDENCE": movement_evidence(profile),
             "LLAMINAR_E2E_STARTUP_TIMEOUT_SECONDS": str(readiness),
@@ -110,6 +122,14 @@ def validate_long_context_evidence(directory: Path, profile: dict) -> None:
     for field in ("context_length", "minimum_prompt_tokens", "generation_tokens"):
         if evidence.get(field) != profile[field]:
             raise ValueError(f"long-context evidence has wrong {field}")
+
+
+def validate_http_cell_evidence(directory: Path, profile: dict) -> None:
+    """Revalidate the full needle, tool and automatic-placement proof after shell success."""
+    validate_long_context_evidence(directory, profile)
+    validate_tool_calling_evidence(json.loads((directory / "tool_calling_results.json").read_text()))
+    selection = json.loads((directory / "automatic_selection_results.json").read_text())
+    validate_automatic_selection(selection, automatic_selection_policy(profile))
 
 
 @dataclass(frozen=True)
@@ -175,7 +195,12 @@ def harness_backend(backend_signature: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run tagged cases sequentially, retaining independent evidence per cell."""
+    """Run tagged cases sequentially, retaining every complete server lifecycle.
+
+    Repetition is a diagnostic scheduling policy, never a new model axis. Each
+    iteration starts the real harness afresh, owns its watchdog/artifacts, and
+    validates the complete HTTP proof. Immutable staged models alone are reused.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build_v2_integration")
     parser.add_argument("--binary", type=Path, default=ROOT / "build_v2_release/llaminar2")
@@ -189,12 +214,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backend", default=".*")
     parser.add_argument("--campaign", default=".*")
     parser.add_argument("--cell", default=".*")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Run every selected full HTTP cell this many times; reuse only immutable model staging")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="Stop on the first failed iteration for focused stability diagnosis; default collects all cells")
     parser.add_argument("--port", type=int, default=19080)
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--model-ramdisk-root", type=Path, default=Path("/mnt/llaminar-production-parity"))
     parser.add_argument("--persistent-model-cache-dir", type=Path, default=Path("cache"))
     parser.add_argument("--report", type=Path, default=ROOT / "parity-results/e2e-certification.json")
     args = parser.parse_args(argv)
+    if args.repeat <= 0:
+        parser.error("--repeat must be a positive integer")
     selected = discover(args)
     if args.export_manifest:
         args.export_manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         readiness = readiness_timeout_seconds(record["e2e"])
         thinking_modes(record["e2e"])
         movement_evidence(record["e2e"])
+        tool_calling(record["e2e"])
+        automatic_selection_policy(record["e2e"])
         print(f"[model-parity-e2e] selected {exact} context={record['e2e']['context_length']} "
               f"readiness={readiness}s cell_timeouts={record['e2e']['cell_timeout_seconds']}", flush=True)
     if args.list:
@@ -217,7 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         validate_attached_execution(args.container_image)
     if not args.container_image:
         cpu_isa = release_binary_cpu_isa(args.binary)
+    planned_runs = len(selected) * args.repeat
     report = {"schema": 1, "selected": len(selected), "correctness_passed": False, "cells": [],
+              "repetitions": args.repeat, "planned_runs": planned_runs, "completed_runs": 0,
               "image": args.container_image, "cpu_isa": cpu_isa.value,
               "source_revision": args.source_revision or subprocess.check_output(
                   ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -239,7 +274,11 @@ def main(argv: list[str] | None = None) -> int:
                 staging_cells, workspace.models, None, persistent=workspace.persistent)
             workspace.protect_published_models()
             staged_paths = {Path(item.source_path).resolve(): str(workspace.models / item.filename) for item in staged}
-            for index, (campaign, exact, record) in enumerate(selected, 1):
+            # Visit the entire selected inventory before its next repetition so
+            # unseen cells get feedback first. Nothing resumes from old passes.
+            schedule = ((iteration, cell) for iteration in range(1, args.repeat + 1)
+                        for cell in selected)
+            for index, (iteration, (campaign, exact, record)) in enumerate(schedule, 1):
                 artifact_dir = run_root / str(index)
                 artifact_dir.mkdir()
                 config_file = artifact_dir / "server-args.json"
@@ -254,7 +293,8 @@ def main(argv: list[str] | None = None) -> int:
                 command += ["--port", str(args.port)]
                 if args.container_image:
                     command += ["--container-image", args.container_image]
-                print(f"[model-parity-e2e] {index}/{len(selected)} RUN {exact}", flush=True)
+                print(f"[model-parity-e2e] {index}/{planned_runs} RUN {exact} "
+                      f"iteration={iteration}/{args.repeat}", flush=True)
                 cell_started = time.monotonic()
                 budget = E2ECellBudget(cell_timeout_seconds(record["e2e"], cpu_isa))
                 with (artifact_dir / "harness.log").open("w") as log:
@@ -263,30 +303,36 @@ def main(argv: list[str] | None = None) -> int:
                 evidence_error = None
                 if return_code == 0:
                     try:
-                        validate_long_context_evidence(artifact_dir, record["e2e"])
+                        validate_http_cell_evidence(artifact_dir, record["e2e"])
                     except (ValueError, OSError) as error:
                         return_code = 1
                         evidence_error = str(error)
                 report["cells"].append({"case": exact, "configuration": record,
+                    "iteration": iteration,
                     "return_code": return_code, "artifacts": str(artifact_dir),
                     "timeout_seconds": budget.timeout_seconds,
                     "evidence_error": evidence_error,
                     "outcome": "cell_timeout" if return_code == 124 else
                                "passed" if return_code == 0 else "failed",
                     "elapsed_seconds": time.monotonic() - cell_started})
-                print(f"[model-parity-e2e] {index}/{len(selected)} "
-                      f"{'PASS' if return_code == 0 else 'FAIL'} {exact}", flush=True)
+                report["completed_runs"] = len(report["cells"])
+                print(f"[model-parity-e2e] {index}/{planned_runs} "
+                      f"{'PASS' if return_code == 0 else 'FAIL'} {exact} "
+                      f"iteration={iteration}/{args.repeat}", flush=True)
                 args.report.write_text(json.dumps(report, indent=2) + "\n")
+                if return_code != 0 and args.fail_fast:
+                    break
                 # A retired cell owns no live server or MPI process. Preserve
                 # its evidence and continue with the next independent cell so
                 # one CI run yields the complete failure map, not just a high
                 # water mark at the first red configuration.
         failures = [row for row in report["cells"] if row["return_code"] != 0]
-        report["correctness_passed"] = not failures
-        report["failed_cells"] = [row["case"] for row in failures]
+        report["correctness_passed"] = not failures and len(report["cells"]) == planned_runs
+        report["failed_cells"] = list(dict.fromkeys(row["case"] for row in failures))
         print(f"[model-parity-e2e] SUMMARY passed={len(report['cells']) - len(failures)} "
-              f"failed={len(failures)} selected={len(selected)}", flush=True)
-        return 1 if failures else 0
+              f"failed={len(failures)} completed={len(report['cells'])}/{planned_runs} "
+              f"selected={len(selected)} repetitions={args.repeat}", flush=True)
+        return 0 if report["correctness_passed"] else 1
     finally:
         report["elapsed_seconds"] = time.monotonic() - started
         args.report.write_text(json.dumps(report, indent=2) + "\n")

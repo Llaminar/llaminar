@@ -1677,6 +1677,60 @@ TEST(Test__MemoryPlanner, NativePipelineFenceAccountingIsBackendSymmetric)
     EXPECT_THROW((void)CollectiveMemoryEstimator::nativePipelineBoundaryBytes(CollectiveBackendType::HOST), std::invalid_argument);
 }
 
+/** @test Channel admission charges each physical owner once, independent of GPU family. */
+TEST(Test__MemoryPlanner, CapturedPipelineChannelAccountingIsExactAndBackendSymmetric)
+{
+    const auto profile = createTestProfile();
+    constexpr auto owner = PhysicalMemoryOwner::ActivationTransportStaging;
+    for (const auto device : {DeviceId::cuda(1), DeviceId::rocm(3)})
+    for (const int verifier_rows : {1, 2, 4, 16})
+    for (const auto sides : {std::vector{PipelineBoundarySide::EarlierDomain},
+             std::vector{PipelineBoundarySide::LaterDomain},
+             std::vector{PipelineBoundarySide::LaterDomain, PipelineBoundarySide::EarlierDomain}})
+    {
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+        cfg.device_compute_units = 128;
+        cfg.max_seq_len = 256;
+        cfg.activation_seq_len = 8; // A deeper verifier, not prefill, can set the slot capacity.
+        cfg.mtp_enabled = verifier_rows > 1;
+        cfg.mtp_target_query_rows = verifier_rows;
+        cfg.associated_host_memory = PhysicalMemoryResource{.world_rank = -1, .device = DeviceId::cpu(),
+            .total_bytes = 64ull << 30, .admission_available_bytes = 64ull << 30};
+        const auto before = MemoryPlanner::plan(profile, {cfg}).physicalPlan().totalBytes();
+        cfg.captured_pipeline_boundaries = sides;
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        const auto geometry = PipelineTransferMemory::forRows(profile.d_model, 8, verifier_rows);
+        const bool owns_host = std::find(sides.begin(), sides.end(), PipelineBoundarySide::EarlierDomain) != sides.end();
+        size_t host_bytes = 0, device_bytes = 0;
+        for (const auto &row : plan.devices)
+            (row.device().is_cpu() ? host_bytes : device_bytes) += row.bom().bytes(owner);
+        EXPECT_EQ(device_bytes, geometry.device_bytes_per_boundary * sides.size());
+        EXPECT_EQ(host_bytes, owns_host ? geometry.host_bytes_per_boundary : 0);
+        EXPECT_EQ(plan.physicalPlan().totalBytes() - before, device_bytes + host_bytes);
+        EXPECT_EQ(geometry.activation_capacity_bytes, size_t(profile.d_model) * std::max(8, verifier_rows) * sizeof(float));
+        EXPECT_EQ(geometry.metadata_capacity_bytes, size_t(verifier_rows) * sizeof(int32_t));
+
+        auto invalid = cfg;
+        invalid.captured_pipeline_boundaries.push_back(sides.front());
+        EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::invalid_argument);
+        invalid = cfg; invalid.shard_index = 1;
+        EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::invalid_argument);
+        invalid = cfg; invalid.local_pipeline_backend = device.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+        EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::invalid_argument);
+        if (owns_host)
+        {
+            invalid = cfg; invalid.associated_host_memory.reset();
+            EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::invalid_argument);
+        }
+    }
+    EXPECT_THROW(PipelineTransferMemory::forRows(0, 1, 1), std::invalid_argument);
+    EXPECT_THROW(PipelineTransferMemory::forRows(1, 0, 1), std::invalid_argument);
+    EXPECT_THROW(PipelineTransferMemory::forRows(1, 1, 0), std::invalid_argument);
+    EXPECT_THROW(PipelineTransferMemory::forRows(std::numeric_limits<size_t>::max(), 2, 1), std::overflow_error);
+}
+
 TEST(Test__MemoryPlanner,
      MirroredTerminalHeadIsPricedForSerialOracleWhenMTPIsOff)
 {
@@ -2069,6 +2123,96 @@ TEST(Test__MemoryPlanner, PipelineWeightBOMPartitionsEndpointsAndMirrors)
             }
             EXPECT_EQ(stages, full) << "A three-stage pipeline must not clone vocabulary weights or mirrors";
         }
+}
+
+/** @brief All-GDN PP followers price live and rollback metadata without dummy attention. */
+TEST(Test__MemoryPlanner, RecurrentOnlyPipelineFollowerOwnsSequenceMetadata)
+{
+    const auto profile = createQwen36HybridMTPStateProfile();
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const std::string precision : {"fp32", "fp16", "bf16", "q8_1"})
+        {
+            DevicePlanConfig cfg;
+            cfg.device = device;
+            cfg.device_compute_units = 60;
+            cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+            cfg.max_seq_len = 64;
+            cfg.kv_precision = precision;
+            cfg.first_layer = 0;
+            cfg.last_layer = 1;
+            cfg.owns_embedding = true;
+            cfg.mtp_enabled = true;
+            const auto plan = MemoryPlanner::plan(profile, {cfg}).devices.front();
+            EXPECT_EQ(plan.kv_cache_bytes(), 2u * sizeof(int32_t));
+            // Four live rollback slots plus one accepted-verifier publication.
+            EXPECT_EQ(plan.sequence_metadata_bytes(), 5u * 2u * sizeof(int32_t));
+            EXPECT_GT(plan.checkpoint_state_bytes(), 0u);
+        }
+}
+
+/**
+ * @brief Recurrent-only prefix archives retain their exact admitted physical owners.
+ *
+ * A PP head with no attention layers still exports a real recurrent snapshot.
+ * Its GPU staging and hot slots contain that image alone; the RAM owner exists
+ * on every backend. Neither MTP enablement nor KV precision may erase this BOM
+ * or introduce a fictitious attention block.
+ */
+TEST(Test__MemoryPlanner, RecurrentOnlyPipelinePrefixAdmission)
+{
+    const auto profile = createQwen36HybridMTPStateProfile();
+    const auto gdn = HybridGDNStateGeometry::resolve(profile.n_heads, 0,
+        profile.n_heads, profile.gdn_group_count, profile.gdn_time_step_rank,
+        profile.gdn_state_size, profile.gdn_inner_size, profile.gdn_conv_kernel_size);
+    const auto recurrent_bytes = gdn.deviceSerializedPayloadBytes(2);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const std::string precision : {"fp32", "fp16", "bf16", "q8_1"})
+    for (const bool mtp_enabled : {false, true})
+    for (const auto mode : {PrefixCacheStorageMode::Disabled,
+                           PrefixCacheStorageMode::Ram, PrefixCacheStorageMode::Tiered})
+    {
+        SCOPED_TRACE(device.toString() + ":" + precision + ":mtp=" +
+            std::to_string(mtp_enabled) + ":mode=" + std::to_string(static_cast<int>(mode)));
+        DevicePlanConfig cfg;
+        cfg.device = device;
+        cfg.cpu_execution = device.is_cpu()
+            ? test::kSyntheticCPUExecutionGeometry : CPUExecutionGeometry{};
+        cfg.device_compute_units = 60;
+        cfg.device_total_bytes = cfg.device_free_bytes = 64ull << 30;
+        cfg.max_seq_len = 64;
+        cfg.kv_precision = precision;
+        cfg.first_layer = 0;
+        cfg.last_layer = 1;
+        cfg.owns_embedding = true;
+        cfg.mtp_enabled = mtp_enabled;
+        cfg.prefix_cache.enabled = true;
+        cfg.prefix_cache.storage_mode = mode;
+        cfg.prefix_cache.ram_budget_bytes = 64u << 20;
+        cfg.prefix_cache.device_budget_bytes = 32u << 20;
+        cfg.prefix_cache.disk_budget_bytes = 0;
+        cfg.associated_host_memory = PhysicalMemoryResource{
+            .world_rank = -1, .device = DeviceId::cpu(),
+            .total_bytes = 64ull << 30, .admission_available_bytes = 64ull << 30};
+        const auto plan = MemoryPlanner::plan(profile, {cfg});
+        const auto entry = std::find_if(plan.devices.begin(), plan.devices.end(),
+            [&](const auto &candidate) { return candidate.device() == device; });
+        ASSERT_NE(entry, plan.devices.end());
+        const bool enabled = mode != PrefixCacheStorageMode::Disabled;
+        EXPECT_EQ(entry->prefix_cache_staging_bytes(),
+            enabled && device.is_gpu() ? recurrent_bytes : 0u);
+        EXPECT_EQ(entry->prefix_cache_device_hot_bytes(),
+            mode == PrefixCacheStorageMode::Tiered && device.is_gpu()
+                ? prefixCacheWholeBlockReservationBytes(
+                    cfg.prefix_cache.device_budget_bytes, recurrent_bytes) : 0u);
+        const auto host = std::find_if(plan.devices.begin(), plan.devices.end(),
+            [](const auto &candidate) { return candidate.device().is_cpu(); });
+        if (enabled || device.is_cpu())
+        {
+            ASSERT_NE(host, plan.devices.end());
+            EXPECT_EQ(host->bom().bytes(PhysicalMemoryOwner::PrefixHostTier),
+                enabled ? cfg.prefix_cache.ram_budget_bytes : 0u);
+        }
+    }
 }
 
 /**
@@ -2525,6 +2669,42 @@ TEST(Test__MemoryPlanner, RoutedExpertParticipantOwnsNoDensePersistentState)
     EXPECT_GT(participant_plan.activation_bytes(), 0u);
     EXPECT_GT(participant_plan.workspace_bytes(), 0u);
     EXPECT_LT(participant_plan.weight_bytes(), continuation_plan.weight_bytes());
+}
+
+/**
+ * @brief Two graph owners on one physical CPU resource need two scratch blocks.
+ *
+ * Serial prefill/decode graph families may alias within one owner, but local
+ * GPU children can execute their CPU expert graphs concurrently. The PMA BOM
+ * must reserve each owner's block before expert quota filling begins.
+ */
+TEST(Test__MemoryPlanner, RoutedExpertConcurrentWorkspaceOwnersAreAdditive)
+{
+    const auto profile = createMoEOverlayProfile();
+    auto participant = overlayDeviceConfig(DeviceId::cpu());
+    participant.execution_role =
+        DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    participant.weight_residency =
+        DeviceWeightResidency::selectedRoutedExpertsOnly(
+            profile.expert_count, {2, 2});
+
+    const auto one = MemoryPlanner::plan(profile, {participant});
+    ASSERT_EQ(one.devices.size(), 1u);
+    ASSERT_GT(one.devices.front().workspace_bytes(), 0u);
+
+    participant.concurrent_workspace_owners = 2u;
+    const auto two = MemoryPlanner::plan(profile, {participant});
+    ASSERT_EQ(two.devices.size(), 1u);
+    EXPECT_EQ(two.devices.front().workspace_bytes(),
+              2u * one.devices.front().workspace_bytes());
+    EXPECT_EQ(two.devices.front().activation_bytes(),
+              one.devices.front().activation_bytes());
+    EXPECT_EQ(two.devices.front().weight_bytes(),
+              one.devices.front().weight_bytes());
+
+    participant.concurrent_workspace_owners = 0u;
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {participant}),
+                 std::invalid_argument);
 }
 
 TEST(Test__MemoryPlanner, OverlayContinuationReservesItsOwnCompactRouteBuffers)

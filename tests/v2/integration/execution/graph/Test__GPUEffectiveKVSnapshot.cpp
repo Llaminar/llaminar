@@ -6,7 +6,7 @@
  * Real production stages must retain that complete output manifest through
  * capture and request reset. No eager attention warmup may discover missing
  * descriptors. Backend-specialized graph integration binaries include this
- * translation unit in their existing ProductionParityPreflight registrations.
+ * translation unit in their existing ProductionTestPreflight registrations.
  */
 
 #include <gtest/gtest.h>

@@ -35,7 +35,7 @@ MTP activity, movement obligations and captured production-path evidence.
 The enabled `develop` GitHub workflow is intentionally narrower than that
 routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
 build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
-Unit and ProductionParityPreflight transaction inside each builder, and publish
+Unit and ProductionTestPreflight transaction inside each builder, and publish
 the two tested `develop` runtime tags. It does not run model discovery,
 generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
 certificate. Use it for fast shippable developer images; use the full pipeline
@@ -232,7 +232,7 @@ selection. Record campaign and exact-cell counts when changing coverage.
 
 The first non-list run for a build first builds the CMake-owned `v2_unit_gate`
 target and runs the complete `V2_Unit_*` namespace. It then runs the
-`ProductionParityPreflight` integration label, all before the model fixture or
+`ProductionTestPreflight` integration label, all before the model fixture or
 RAM staging. Unit tests prove device-free policy and state-machine invariants;
 preflight proves MPI/rank lifecycle, orchestration, explicit-stream event
 ordering, graph capture/replay, retained heterogeneous tickets, prepared
@@ -257,12 +257,12 @@ Run the same prerequisite phases directly when developing their infrastructure:
 
 ```bash
 cmake --build build_v2_integration --parallel \
-  --target v2_unit_gate v2_production_parity_preflight_gate
+  --target v2_unit_gate v2_production_test_preflight_gate
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error -R '^V2_Unit_'
 ctest --test-dir build_v2_integration \
   --output-on-failure --parallel --no-tests=error \
-  -L '^ProductionParityPreflight$'
+  -L '^ProductionTestPreflight$'
 ```
 
 Git pre-commit runs only these two complete model-free suites on every branch.
@@ -498,7 +498,7 @@ proof. MoE MTP inherits the same policy and placement movement contract.
 root invariant. Every `V2_Unit_*` test joins the prerequisite automatically. If
 an Integration test is model-free and guards campaign infrastructure or a
 production mechanism used by parity, add its existing CTest registration to
-`V2_PRODUCTION_PARITY_PREFLIGHT_TESTS`; do not copy either inventory into the
+`V2_PRODUCTION_TEST_PREFLIGHT_TESTS`; do not copy either inventory into the
 Python driver. Then rerun both prerequisite phases and the affected diagnostic
 cell before resuming routine generation regression. Run the full mathematical
 matrix only when explicitly requested.

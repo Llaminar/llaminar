@@ -103,7 +103,7 @@ graph evidence, clean shutdown and released VRAM. Both runtime builds and all
 605 shared-gate build actions completed before the new prerequisite run began.
 
 The refreshed shared gate now passes **647/647 Unit** (73.72 seconds) and
-**137/137 ProductionParityPreflight** (513.85 seconds), **588.245 seconds**
+**137/137 ProductionTestPreflight** (513.85 seconds), **588.245 seconds**
 combined. Receipt: `cpu-pp-logical-rows-prerequisites-01/prerequisites.json`.
 The canonical two-cell CUDA→CPU/CUDA→ROCm admission reuses this receipt and the
 fresh 510-cell typed inventory; no further prerequisite run is charged per cell.

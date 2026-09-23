@@ -390,3 +390,44 @@ TEST(RankMemoryPlanInputs, ImpossibleGQAShardCannotBecomeAnAdmissibleCandidate)
     fixture.model.n_heads = 8; // Replicated two-head GQA needs at least two Q heads per shard.
     EXPECT_THROW(buildRankMemoryPlanInputs(fixture.request()), std::invalid_argument);
 }
+
+/** @test Reverse vendor order and uneven TP domains assign channels only to actual leaders. */
+TEST(RankMemoryPlanInputs, CapturedPipelineChannelsFollowDomainsNotDeviceOrdinals)
+{
+    for (const bool reverse : {false, true})
+    for (const int width : {1, 2, 4, 8})
+    {
+        const auto first = reverse ? DeviceType::ROCm : DeviceType::CUDA;
+        const auto second = reverse ? DeviceType::CUDA : DeviceType::ROCm;
+        Fixture fixture(first, width);
+        Fixture other(second, width);
+        fixture.inventory.gpus.insert(fixture.inventory.gpus.end(), other.inventory.gpus.begin(), other.inventory.gpus.end());
+        fixture.plan.runtime.prefix_cache.enabled = false;
+        fixture.plan.local_tp_devices.clear();
+        std::vector<GlobalDeviceAddress> earlier, later;
+        for (int i = 0; i < width; ++i)
+        {
+            const int ordinal = (i + 1) % width; // Domain leader is not sorted by ordinal.
+            earlier.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(first, ordinal), "node", 0));
+            later.push_back(GlobalDeviceAddress::fromLocalDeviceId(DeviceId(second, ordinal), "node", 0));
+        }
+        fixture.plan.local_pp_devices = {earlier.front(), later.front()};
+        fixture.plan.local_pp_layer_boundaries = {0, 2, 4};
+        fixture.plan.local_pp_stage_tp_info = {{.devices = earlier}, {.devices = later}};
+        auto request = fixture.request();
+        request.weight_load_geometry.reset(); // Host ownership below must come from the channel itself.
+        const auto configs = buildRankMemoryPlanInputs(request);
+        ASSERT_EQ(configs.size(), size_t(width * 2));
+        for (int i = 0; i < width * 2; ++i)
+        {
+            const bool leader = i % width == 0;
+            const bool source = i < width;
+            const auto &cfg = configs[i];
+            EXPECT_FALSE(cfg.local_pipeline_backend);
+            if (!leader) EXPECT_TRUE(cfg.captured_pipeline_boundaries.empty());
+            else EXPECT_EQ(cfg.captured_pipeline_boundaries, std::vector{source
+                ? PipelineBoundarySide::EarlierDomain : PipelineBoundarySide::LaterDomain});
+            EXPECT_EQ(cfg.associated_host_memory.has_value(), source && leader);
+        }
+    }
+}

@@ -8085,6 +8085,7 @@ namespace llaminar2
         {
             CompleteLocal = 0,
             PipelineTail,
+            PipelineDomainTail, ///< Boundary already enclosed in this complete local forward.
             ExpertOverlay,
         };
 
@@ -8129,6 +8130,8 @@ namespace llaminar2
             std::optional<OrdinaryGenerationSamplingStage::Params> ordinary_sampling_identity;
             /** Complete forward identity, not a last-executed diagnostic handle. */
             std::optional<ForwardGraphSignature> ordinary_forward_identity;
+            /** Exact grouped verifier owned by a pipeline follower, never a sampler. */
+            std::optional<ForwardGraphSignature> pipeline_verifier_identity;
             /** Exact ordinary ownership/lifecycle topology embedded in this parent. */
             std::optional<OrdinaryGenerationComposition> ordinary_composition;
             /** Exact maintenance executable borrowed by an ordinary parent, if any. */
@@ -8208,6 +8211,7 @@ namespace llaminar2
                     child.reset();
                 ordinary_sampling_identity.reset();
                 ordinary_forward_identity.reset();
+                pipeline_verifier_identity.reset();
                 ordinary_composition.reset();
                 ordinary_maintenance_capture = nullptr;
                 ordinary_maintenance_due = nullptr;

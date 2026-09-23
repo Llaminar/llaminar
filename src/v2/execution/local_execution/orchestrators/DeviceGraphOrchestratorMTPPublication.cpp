@@ -468,12 +468,9 @@ namespace llaminar2
         // The communicator records this immutable exchange once at serving
         // setup. Local policies (for example clipping the tail's final commit)
         // may change independently without making peers re-enter capture.
-        const auto *transport = cache.pipeline_edges
-            ? cache.pipeline_edges->publicationTransport(
-                PipelineForwardGraphEdges::PublicationBanks::from(cache.stage->getParams()))
-            : nullptr;
-        if (cache.pipeline_edges && !transport)
-            return fail("Pipeline MTP publication requires its frozen serving-time transport capture");
+        if (cache.pipeline_edges && !cache.pipeline_edges->preparedPublication(
+                PipelineForwardGraphEdges::PublicationBanks::from(cache.stage->getParams())))
+            return fail("Pipeline MTP publication requires its frozen serving-time publication topology");
         if (submission == DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch &&
             cache.segment_cache.initialized)
             return cache.segment_cache.deviceLoopGraphTemplate(*cache.graph, error).has_value();

@@ -1020,7 +1020,7 @@ TEST_F(GPUGraphCaptureExecutionTest,
  * name. The existing collective suites prove transport; this test proves the
  * production executor captures the selected producer and publishes complete,
  * byte-exact semantic/diagnostic aliases without a second D2D snapshot allocation.
- * Both backend-specialized binaries belong to ProductionParityPreflight.
+ * Both backend-specialized binaries belong to ProductionTestPreflight.
  */
 TEST_F(GPUGraphCaptureExecutionTest, CanonicalEmbeddingFilterPublishesOneCapturedPayload)
 {
