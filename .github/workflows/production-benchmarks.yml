@@ -65,7 +65,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           E2E_RUN: ${{ inputs.e2e_run }}
         run: |
-          python3 scripts/ci/run_published_image_suite.py benchmarks \
+          exec python3 scripts/ci/run_published_image_suite.py benchmarks \
             --e2e-run "$E2E_RUN" --output "$RUNNER_TEMP/llaminar-published-benchmarks-$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --publish

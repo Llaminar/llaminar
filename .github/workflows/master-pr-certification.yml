@@ -91,7 +91,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/ci/run_published_image_suite.py e2e \
+          exec python3 scripts/ci/run_published_image_suite.py e2e \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
@@ -167,7 +167,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/ci/run_published_image_suite.py benchmarks \
+          exec python3 scripts/ci/run_published_image_suite.py benchmarks \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \

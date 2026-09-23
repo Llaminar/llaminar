@@ -51,7 +51,7 @@ jobs:
           cache-binary: false
       - name: Test both published runtime images with the full canonical HTTP suite
         run: |
-          python3 scripts/ci/run_published_image_suite.py e2e \
+          exec python3 scripts/ci/run_published_image_suite.py e2e \
             --output "$RUNNER_TEMP/llaminar-published-e2e-$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - name: Retain image-bound E2E evidence

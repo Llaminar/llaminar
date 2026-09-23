@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -148,6 +152,53 @@ class DevelopImageGateTests(unittest.TestCase):
                 "args": ["docker"]})()):
             with self.assertRaises(gate.subprocess.CalledProcessError):
                 gate.remote_image_id("example:failed")
+
+    def test_canceled_build_retires_exact_child_group(self):
+        """SIGTERM of the Actions driver cannot orphan its Buildx-style child."""
+        driver_source = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from run_production_pipeline import run\n"
+            "child = 'import os,sys,time;from pathlib import Path;"
+            "Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(30)'\n"
+            "run([sys.executable, '-c', child, sys.argv[2]], Path(sys.argv[3]))\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file, log = root / "child.pid", root / "build.log"
+            driver = subprocess.Popen([sys.executable, "-c", driver_source,
+                                       str(ROOT / "scripts/ci"), str(pid_file), str(log)],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      start_new_session=True)
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while not pid_file.exists() and driver.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(pid_file.exists(), "build child never reached its ready edge")
+                child_pid = int(pid_file.read_text())
+                os.kill(driver.pid, signal.SIGTERM)
+                os.kill(driver.pid, signal.SIGTERM)
+                self.assertNotEqual(driver.wait(timeout=5), 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if driver.poll() is None:
+                    driver.terminate()
+                    driver.wait(timeout=5)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        os.killpg(child_pid, signal.SIGKILL)
+
+    def test_ci_replaces_the_step_shell_with_the_cancellable_driver(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
+        self.assertIn("if: ${{ !cancelled() }}", workflow)
 
 
 if __name__ == "__main__":

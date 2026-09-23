@@ -3011,6 +3011,16 @@ set_tests_properties(V2_Unit_DevelopImageGate PROPERTIES
     LABELS "V2;Unit;BuildSystem;Container;Preflight;Publication;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_DevelopImageGateCancellation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
+            DevelopImageGateTests.test_canceled_build_retires_exact_child_group
+            DevelopImageGateTests.test_ci_replaces_the_step_shell_with_the_cancellable_driver
+)
+set_tests_properties(V2_Integration_DevelopImageGateCancellation PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;Cancellation;Regression"
+    TIMEOUT 15
+)
 
 add_test(NAME V2_Unit_PublishedImageSuites
     COMMAND ${Python3_EXECUTABLE}

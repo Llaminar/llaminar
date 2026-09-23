@@ -1138,6 +1138,9 @@ class PublishedImageSuiteTests(unittest.TestCase):
                                 text.index("Retire legacy checkout evidence"))
                 self.assertLess(text.index("Retire legacy checkout evidence"),
                                 text.index("actions/checkout@v6"))
+                self.assertIn("exec python3 scripts/ci/run_published_image_suite.py", text)
+        pr = (ROOT / ".github/workflows/master-pr-certification.yml").read_text()
+        self.assertEqual(pr.count("exec python3 scripts/ci/run_published_image_suite.py"), 2)
 
     def test_metadata_companion_does_not_build_a_replacement_runtime(self):
         from types import SimpleNamespace

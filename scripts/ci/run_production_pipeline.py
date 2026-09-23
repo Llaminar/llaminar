@@ -29,10 +29,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 
@@ -102,26 +104,45 @@ class TestRunnerInventory(str, Enum):
 
 
 def run(command: list[str], log: Path, **kwargs) -> None:
-    """Retain full logs and surface cell progress without compiler-output noise."""
+    """Retain logs and retire the exact child group on Actions cancellation.
+
+    GitHub cancels the top-level step process, not every descendant of a
+    Buildx/MPI launcher. Translate main-thread SIGTERM into an exception so
+    the existing process-group retirement edge runs before the driver exits.
+    """
     print(f"[production-ci] log={log}", flush=True)
-    with log.open("a") as stream:
-        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, start_new_session=True, **kwargs) as process:
-            try:
-                for line in process.stdout:
-                    stream.write(line)
-                    stream.flush()
-                    if line.startswith(("[production-", "[model-parity-")):
-                        print(line, end="", flush=True)
-                code = process.wait()
-                if code:
-                    raise subprocess.CalledProcessError(code, command)
-            finally:
-                if process.poll() is None:
-                    # Retire the whole launcher/MPI family on interruption.
-                    # The numerical driver owns this process-group protocol.
-                    from run_production_parity_campaigns import _terminate_process_group
-                    _terminate_process_group(process)
+    def interrupt_for_cancellation(_signum, _frame) -> None:
+        # Actions may escalate SIGINT to SIGTERM while the child group is
+        # retiring. Ignore repeat TERM so it cannot interrupt that cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise InterruptedError("production CI command canceled by SIGTERM")
+
+    handle_signals = threading.current_thread() is threading.main_thread()
+    previous_handler = signal.getsignal(signal.SIGTERM) if handle_signals else None
+    if handle_signals:
+        signal.signal(signal.SIGTERM, interrupt_for_cancellation)
+    try:
+        with log.open("a") as stream:
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, start_new_session=True, **kwargs) as process:
+                try:
+                    for line in process.stdout:
+                        stream.write(line)
+                        stream.flush()
+                        if line.startswith(("[production-", "[model-parity-")):
+                            print(line, end="", flush=True)
+                    code = process.wait()
+                    if code:
+                        raise subprocess.CalledProcessError(code, command)
+                finally:
+                    if process.poll() is None:
+                        # Retire the whole launcher/MPI family on interruption.
+                        # The numerical driver owns this process-group protocol.
+                        from run_production_parity_campaigns import _terminate_process_group
+                        _terminate_process_group(process)
+    finally:
+        if handle_signals:
+            signal.signal(signal.SIGTERM, previous_handler)
 
 
 def append_build_timeline_event(path: Path, event: str, target: ImageRole, log: Path,

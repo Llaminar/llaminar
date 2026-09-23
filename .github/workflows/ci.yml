@@ -53,12 +53,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/ci/run_develop_image_gate.py \
+          exec python3 scripts/ci/run_develop_image_gate.py \
             --output parity-results/develop-image-gate \
             --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
             --publish
       - name: Bound node-local BuildKit cache
-        if: always()
+        # A canceled build is still retiring its Buildx child. Pruning that
+        # same worker during cancellation can wait on its active build lock.
+        if: ${{ !cancelled() }}
         shell: bash
         run: bash scripts/ci/prune_docker_build_cache.sh
       - name: Retain develop-image build evidence
