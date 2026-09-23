@@ -997,6 +997,14 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertIn("scripts/ci/publish_pr_high_water.py", text)
         self.assertNotIn("release-please", text)
 
+    def test_pr_workflow_run_title_pins_number_and_exact_source(self):
+        import yaml
+        workflow = yaml.load((ROOT / ".github/workflows/master-pr-certification.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["run-name"],
+                         "master PR #${{ github.event.pull_request.number }} — "
+                         "${{ github.event.pull_request.head.sha }}")
+
     def test_post_merge_high_water_combines_both_isas_and_uses_skip_ci(self):
         pair = image_pair()
         baseline = {"schema": 1, "regression_threshold_pct": 10, "entries": {}}

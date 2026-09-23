@@ -1,5 +1,5 @@
 name: Master PR — published-image certification
-run-name: master PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}
+run-name: "master PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}"
 
 # Required PR checks are emitted by this pull_request workflow itself. A
 # workflow_dispatch/workflow_run check is not attached to the PR merge ref and
