@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark only canonical E2E candidates on an immutable Release image.
+"""Benchmark canonical E2E candidates on an image or local Release diagnostic.
 
 The typed E2E argument vector owns model execution policy. This runner owns
 only a versioned workload, timing validation and the high-water comparison.
@@ -7,14 +7,18 @@ It never commits results, lowers a baseline, or mints a production certificate;
 the full pipeline owns those operations after all correctness gates pass.
 Full same-image E2E evidence is required unless --diagnostic explicitly selects
 a one-off experiment that cannot certify an image.
+``--diagnostic-binary`` checks the exact canonical matrix before a new image is
+published; it cannot produce or consume an image E2E receipt.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -95,27 +99,53 @@ def validate_measurement(data: dict, workload: dict) -> dict:
             "samples": samples, "prefill_tokens": int(token_counts.pop())}
 
 
-def run_cell(image: str, backends: str, directory: Path, model: Path,
-             record: dict, workload: dict) -> dict:
-    """Run one isolated container and always retire it on timeout/interruption."""
+def run_cell(image: str | None, backends: str, directory: Path, model: Path,
+             record: dict, workload: dict, *, diagnostic_binary: Path | None = None) -> dict:
+    """Run one exact workload, isolating a certified image or a local diagnostic.
+
+    The binary route is explicitly non-certifying. Its process group includes
+    self-launched MPI followers so a timeout retires the entire local cell.
+    """
     name = "llaminar-benchmark-" + uuid.uuid4().hex
     output = directory / "benchmark.json"
-    command = ["docker", "run", "--rm", "--name", name,
-               *docker_paths.device_args(image, backends),
-               *docker_paths.mounts([(model.parent, str(model.parent), True),
-                                     (directory, "/benchmark-output", False)]),
-               "-e", f"LLAMINAR_BENCHMARK_ITERATIONS={workload['measurement_iterations']}",
-               "-e", f"LLAMINAR_BENCHMARK_WARMUP_ITERATIONS={workload['warmup_iterations']}",
-               image, *benchmark_arguments(record, str(model), "/benchmark-output/benchmark.json", workload)]
+    if diagnostic_binary is not None:
+        command = [str(diagnostic_binary), *benchmark_arguments(
+            record, str(model), str(output), workload)]
+    else:
+        if image is None:
+            raise ValueError("certifying benchmark cell requires an immutable image")
+        command = ["docker", "run", "--rm", "--name", name,
+                   *docker_paths.device_args(image, backends),
+                   *docker_paths.mounts([(model.parent, str(model.parent), True),
+                                         (directory, "/benchmark-output", False)]),
+                   "-e", f"LLAMINAR_BENCHMARK_ITERATIONS={workload['measurement_iterations']}",
+                   "-e", f"LLAMINAR_BENCHMARK_WARMUP_ITERATIONS={workload['warmup_iterations']}",
+                   image, *benchmark_arguments(record, str(model), "/benchmark-output/benchmark.json", workload)]
     write_json(directory / "invocation.json", {"argv": command})
-    try:
+    if diagnostic_binary is not None:
+        environment = os.environ.copy()
+        environment["LLAMINAR_BENCHMARK_ITERATIONS"] = str(workload["measurement_iterations"])
+        environment["LLAMINAR_BENCHMARK_WARMUP_ITERATIONS"] = str(workload["warmup_iterations"])
         with (directory / "benchmark.log").open("w") as log:
-            subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
-                           timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
-    finally:
-        # A dead docker client does not necessarily retire server/MPI children.
-        subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=30, check=False)
+            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                       env=environment, start_new_session=True)
+            try:
+                return_code = process.wait(timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                raise
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
+    else:
+        try:
+            with (directory / "benchmark.log").open("w") as log:
+                subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
+                               timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
+        finally:
+            # A dead docker client does not necessarily retire server/MPI children.
+            subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30, check=False)
     return json.loads(output.read_text())
 
 
@@ -124,7 +154,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--image", required=True)
+    execution = parser.add_mutually_exclusive_group(required=True)
+    execution.add_argument("--image", help="immutable candidate image for certification")
+    execution.add_argument("--diagnostic-binary", type=Path,
+                           help="local Release executable; diagnostic only, never an image certificate")
     admission = parser.add_mutually_exclusive_group()
     admission.add_argument("--e2e-report", type=Path,
                            help="passing full E2E report for this exact image and manifest")
@@ -137,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workload", type=Path, default=ROOT / "benchmarks/production/workload.json")
     parser.add_argument("--model-ramdisk-root", type=Path, default=Path("/mnt/llaminar-production-parity"))
     args = parser.parse_args(argv)
+    if args.diagnostic_binary is not None and not args.diagnostic:
+        parser.error("--diagnostic-binary requires --diagnostic")
     manifest = json.loads(args.manifest.read_text())
     all_cells = validate_manifest(manifest, args.source_revision)
     cells = [row for row in all_cells if re.fullmatch(args.cell, row["case"])]
@@ -149,9 +184,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.diagnostic and args.e2e_report is None:
         parser.error("benchmarks require --e2e-report from the full server suite; "
                      "use --diagnostic only for an explicit one-off experiment")
-    runtime = image_identity(args.image)
-    if runtime["labels"].get("org.opencontainers.image.revision") != args.source_revision:
-        raise ValueError("benchmark image has the wrong source revision")
+    if args.diagnostic_binary is not None:
+        binary = args.diagnostic_binary.resolve(strict=True)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError("diagnostic binary must be an executable file")
+        runtime = {"id": f"local-release:{binary}",
+                   "labels": {"org.llaminar.cpu_isa": "local-diagnostic"}}
+    else:
+        binary = None
+        runtime = image_identity(args.image)
+        if runtime["labels"].get("org.opencontainers.image.revision") != args.source_revision:
+            raise ValueError("benchmark image has the wrong source revision")
     e2e_digest = None
     if args.e2e_report is not None:
         evidence = json.loads(args.e2e_report.read_text())
@@ -183,7 +226,9 @@ def main(argv: list[str] | None = None) -> int:
                 directory.mkdir()
                 config = row["configuration"]
                 model = paths[Path(config["model"]).resolve()]
-                data = run_cell(runtime["id"], row["backends"], directory, model, config, workload)
+                data = run_cell(runtime["id"] if binary is None else None,
+                                row["backends"], directory, model, config, workload,
+                                diagnostic_binary=binary)
                 measured = validate_measurement(data, workload)
                 # Preserve the model filename/size, not machine-specific mount text.
                 identity = {"case": row["case"], "configuration": {**config, "model": model.name},

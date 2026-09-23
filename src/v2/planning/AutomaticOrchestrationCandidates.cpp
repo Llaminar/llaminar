@@ -62,26 +62,130 @@ namespace llaminar2
         }
 
         /**
-         * @brief Require a real participant executor between distinct GPU tiers.
-         * @param domains Continuation pool followed by the expert-only pool.
-         * @return Whether the existing graph lowering can execute both pools.
+         * @brief Require a real participant executor for every foreign GPU tier.
+         * @param domains Continuation pool followed by any number of expert tiers.
+         * @return Whether graph lowering can execute every declared GPU pool.
          *
-         * Two different GPU tiers on one MPI rank are not a distributed
-         * overlay: the continuation graph would try to lower a foreign GPU's
-         * expert work into its own device graph. Visibility of both vendors
-         * from one process is not proof of an executable graph boundary.
-         * Different ranks provide the participant executor and sparse edge.
-         * CPU expert tiers have their own host execution path on the same rank.
+         * A foreign GPU visible only from continuation ranks has no separate
+         * participant executor: the continuation graph would try to lower its
+         * expert work into its own device graph. Each GPU tier therefore needs
+         * a rank outside the continuation domain. CPU tiers have their own
+         * host execution path and may share those ranks.
          */
         bool hasExecutableOverlayBoundary(const std::vector<Pool> &domains)
         {
-            if (domains.size() != 2 || domains[0].empty() || domains[1].empty())
-                throw std::invalid_argument("Automatic overlay boundary requires two nonempty domains");
-            if (domains[1].front().address.isCPU()) return true;
+            if (domains.size() < 2 ||
+                std::any_of(domains.begin(), domains.end(),
+                    [](const Pool &pool) { return pool.empty(); }))
+                throw std::invalid_argument("Automatic overlay boundary requires at least two nonempty domains");
             std::set<int> continuation_ranks;
             for (const auto &endpoint : domains[0]) continuation_ranks.insert(endpoint.rank);
-            return std::any_of(domains[1].begin(), domains[1].end(),
-                [&](const Endpoint &endpoint) { return !continuation_ranks.contains(endpoint.rank); });
+            for (std::size_t index = 1; index < domains.size(); ++index)
+            {
+                if (domains[index].front().address.isCPU()) continue;
+                if (std::none_of(domains[index].begin(), domains[index].end(),
+                    [&](const Endpoint &endpoint)
+                    { return !continuation_ranks.contains(endpoint.rank); }))
+                    return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Keep only maximal ownership pools for unconstrained deep search.
+         *
+         * Pair search still considers every GPU subset. Deeper search needs a
+         * finite representative for each rank/backend group; otherwise every
+         * subset partition of a rank's GPUs becomes a redundant tier sequence.
+         * Exact device-count requests retain smaller pools that may be needed
+         * to satisfy the user's physical cardinality.
+         */
+        std::vector<Pool> deeperOverlayPools(const std::vector<Pool> &pools,
+            const AutomaticOrchestrationRequest &policy)
+        {
+            std::vector<Pool> selected;
+            for (const auto &pool : pools)
+            {
+                const DeviceType backend = pool.front().address.device_type;
+                const auto &counts = policy.options().device_counts;
+                std::optional<int> required_count;
+                if (counts)
+                    for (const auto &entry : *counts)
+                        if (entry.backend == backend)
+                            required_count = entry.count;
+                if (required_count && backend != DeviceType::CPU &&
+                    pool.size() > static_cast<std::size_t>(*required_count))
+                    continue;
+                const bool needs_maximal_pool = !required_count ||
+                    (backend == DeviceType::CPU &&
+                     pool.size() != static_cast<std::size_t>(*required_count));
+                if (needs_maximal_pool && std::any_of(pools.begin(), pools.end(),
+                    [&](const Pool &other)
+                    {
+                        return other.size() > pool.size() &&
+                               other.front().address.device_type == backend &&
+                               std::all_of(pool.begin(), pool.end(),
+                                   [&](const Endpoint &endpoint)
+                                   {
+                                       return std::any_of(other.begin(), other.end(),
+                                           [&](const Endpoint &candidate)
+                                           {
+                                               return candidate.rank == endpoint.rank &&
+                                                      candidate.node == endpoint.node &&
+                                                      candidate.physical_identity == endpoint.physical_identity;
+                                           });
+                                   });
+                    }))
+                    continue;
+                selected.push_back(pool);
+            }
+            return selected;
+        }
+
+        /**
+         * @brief Reject extra tiers that merely repartition one observed domain.
+         * @param domains Current disjoint tier prefix.
+         * @param observed_pools Every physical pool available to auto search.
+         * @return Whether repeated-backend tiers have an equivalent one-domain pool.
+         *
+         * A rank-local homogeneous pool is already an executable TP domain.
+         * Splitting exactly those physical GPUs across ranks cannot add memory
+         * or backend coverage, but multiplies graph/collective candidates.
+         * Truly separate ownership groups remain eligible at any depth.
+         */
+        bool repartitionsOneObservedDomain(const std::vector<Pool> &domains,
+            const std::vector<Pool> &observed_pools)
+        {
+            using PhysicalKey = std::pair<int, std::string>;
+            std::map<DeviceType, std::set<PhysicalKey>> identities;
+            std::map<DeviceType, std::size_t> domain_counts;
+            for (const auto &domain : domains)
+            {
+                const DeviceType backend = domain.front().address.device_type;
+                ++domain_counts[backend];
+                for (const auto &endpoint : domain)
+                    identities[backend].emplace(endpoint.node,
+                                                endpoint.physical_identity);
+            }
+            for (const auto &[backend, count] : domain_counts)
+            {
+                if (count < 2u) continue;
+                const auto &physical = identities.at(backend);
+                if (std::any_of(observed_pools.begin(), observed_pools.end(),
+                    [&](const Pool &pool)
+                    {
+                        return pool.front().address.device_type == backend &&
+                               pool.size() == physical.size() &&
+                               std::all_of(pool.begin(), pool.end(),
+                                   [&](const Endpoint &endpoint)
+                                   {
+                                       return physical.contains({endpoint.node,
+                                                                 endpoint.physical_identity});
+                                   });
+                    }))
+                    return true;
+            }
+            return false;
         }
 
         /**
@@ -447,6 +551,42 @@ namespace llaminar2
         if (!pipelines && !overlays) return;
         using PoolKey = std::vector<std::pair<int, std::string>>;
         std::set<std::vector<PoolKey>> emitted_overlays;
+        const auto projectRemoteCPU = [](std::vector<Pool> &domains)
+        {
+            const int continuation_node = domains.front().front().node;
+            for (std::size_t index = 1; index < domains.size(); ++index)
+            {
+                auto &cpu_pool = domains[index];
+                if (cpu_pool.empty() || !cpu_pool.front().address.isCPU()) continue;
+                if (std::any_of(cpu_pool.begin(), cpu_pool.end(),
+                    [&](const Endpoint &cpu) { return cpu.node != continuation_node; }))
+                    std::erase_if(cpu_pool,
+                        [&](const Endpoint &cpu) { return cpu.node == continuation_node; });
+            }
+        };
+        const auto emitOverlay = [&](std::vector<Pool> domains)
+        {
+            projectRemoteCPU(domains);
+            if (std::any_of(domains.begin(), domains.end(),
+                    [](const Pool &pool) { return pool.empty(); }) ||
+                !permitsPools(*policy, OrchestrationStrategy::ExpertOverlay, domains) ||
+                !hasExecutableOverlayBoundary(domains))
+                return;
+            // Rank visibility aliases and the remote-CPU projection can lead
+            // to the same physical topology through different search paths.
+            std::vector<PoolKey> key;
+            for (const auto &pool : domains)
+            {
+                PoolKey participants;
+                for (const auto &endpoint : pool)
+                    participants.emplace_back(endpoint.rank, endpoint.physical_identity);
+                key.push_back(std::move(participants));
+            }
+            if (!emitted_overlays.insert(std::move(key)).second) return;
+            auto membership = membershipFor(domains, inventory);
+            publishOverlay(OrchestrationStrategy::ExpertOverlay,
+                domains, std::move(membership));
+        };
         for (const auto &first : pools)
             for (const auto &second : pools)
             {
@@ -473,34 +613,76 @@ namespace llaminar2
                 if (!overlays ||
                     first.front().address.device_type == DeviceType::CPU) continue;
                 if (!preservesGDNHeadOwnership(model.memoryProfile(), first)) continue;
-                auto overlay_domains = domains;
-                if (second.front().address.device_type == DeviceType::CPU)
-                {
-                    auto &cpu_pool = overlay_domains[1];
-                    const int continuation_node = first.front().node;
-                    if (std::any_of(cpu_pool.begin(), cpu_pool.end(), [&](const auto &cpu) { return cpu.node != continuation_node; }))
-                        std::erase_if(cpu_pool, [&](const auto &cpu) { return cpu.node == continuation_node; });
-                }
-                // Apply counts after remote-only CPU projection. Counting the
-                // original pool would admit an idle local socket as remote work.
-                if (!permitsPools(*policy, OrchestrationStrategy::ExpertOverlay, overlay_domains)) continue;
-                if (!hasExecutableOverlayBoundary(overlay_domains)) continue;
-                // Removing the continuation node from a cluster CPU pool can
-                // produce a pool already visited as a node-only CPU choice.
-                // Publish that same topology once, not twice with different
-                // enumeration provenance or duplicated admission/probe work.
-                std::vector<PoolKey> key;
-                for (const auto &pool : overlay_domains)
-                {
-                    PoolKey participants;
-                    for (const auto &endpoint : pool)
-                        participants.emplace_back(endpoint.rank, endpoint.physical_identity);
-                    key.push_back(std::move(participants));
-                }
-                if (!emitted_overlays.insert(std::move(key)).second) continue;
-                auto membership = membershipFor(overlay_domains, inventory);
-                publishOverlay(OrchestrationStrategy::ExpertOverlay,
-                    overlay_domains, std::move(membership));
+                emitOverlay(domains);
             }
+        if (!overlays) return;
+
+        // Two-domain search above retains every existing subset and ordering.
+        // For deeper overlays, extend disjoint observed pools recursively. The
+        // depth is bounded only by actual physical ownership, not by a tier
+        // constant. Maximal unconstrained pools avoid exploring every partition
+        // of GPUs within one rank; exact counts retain needed smaller pools.
+        const auto deep_pools = deeperOverlayPools(pools, *policy);
+        std::vector<Pool> selected;
+        const auto visitDeeper = [&](const auto &self) -> void
+        {
+            if (selected.size() > 2)
+                emitOverlay(selected);
+            for (const auto &next : deep_pools)
+            {
+                if (selected.empty())
+                {
+                    if (next.front().address.isCPU() ||
+                        !preservesGDNHeadOwnership(model.memoryProfile(), next))
+                        continue;
+                }
+                else if (std::any_of(selected.begin(), selected.end(),
+                    [&](const Pool &existing)
+                    {
+                        if (overlaps(existing, next)) return true;
+                        // A homogeneous rank already has one TP-capable pool.
+                        // Splitting it into several same-backend tiers adds
+                        // equivalent partitions and factorial search paths.
+                        if (existing.front().address.device_type !=
+                            next.front().address.device_type)
+                            return false;
+                        return std::any_of(existing.begin(), existing.end(),
+                            [&](const Endpoint &left)
+                            {
+                                return std::any_of(next.begin(), next.end(),
+                                    [&](const Endpoint &right)
+                                    { return left.rank == right.rank; });
+                            });
+                    }))
+                    continue;
+                selected.push_back(next);
+                auto projected = selected;
+                projectRemoteCPU(projected);
+                bool exceeds_requested_count = false;
+                if (policy->options().device_counts)
+                {
+                    for (const auto &required : *policy->options().device_counts)
+                    {
+                        std::size_t count = 0;
+                        for (const auto &pool : projected)
+                            count += std::count_if(pool.begin(), pool.end(),
+                                [&](const Endpoint &endpoint)
+                                { return endpoint.address.device_type == required.backend; });
+                        if (count > static_cast<std::size_t>(required.count))
+                        {
+                            exceeds_requested_count = true;
+                            break;
+                        }
+                    }
+                }
+                if (!exceeds_requested_count &&
+                    !repartitionsOneObservedDomain(selected, pools) &&
+                    (projected.size() < 2 ||
+                     hasExecutableOverlayBoundary(projected)))
+                    self(self);
+                selected.pop_back();
+            }
+        };
+        visitDeeper(visitDeeper);
     }
 }

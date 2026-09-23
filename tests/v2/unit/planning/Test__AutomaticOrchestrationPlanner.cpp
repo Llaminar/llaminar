@@ -572,3 +572,70 @@ TEST(AutomaticOrchestrationPlanner, RemoteOverlaySelectionPreservesDynamicMTPAnd
         EXPECT_TRUE(applied.moe_routed_expert_plan->usesExpertOverlayAuthority());
     }
 }
+
+/**
+ * @brief Full auto selection admits three physical tiers before ranking them.
+ *
+ * Candidate enumeration alone cannot prove that model-aware compilation,
+ * PhysicalMemoryAuthority and the final apply document accept a deeper plan.
+ * The synthetic cost oracle selects the CUDA-continuation ordering; it makes
+ * no claim about the relative speed of these fixture devices.
+ */
+TEST(AutomaticOrchestrationPlanner, MultiTierOverlayAdmissionAndSelection)
+{
+    test::PlanningGGUFFixture file(true);
+    PlanningModelSource source(file.path());
+    auto observed = inventory(DeviceType::CUDA);
+    observed.ranks.front().node_id = 0;
+    observed.ranks.front().hostname = "shared-host";
+    auto rocm_rank = observed.ranks.front();
+    rocm_rank.rank = 1;
+    rocm_rank.local_rank = 1;
+    rocm_rank.cpu.numa_node = 4;
+    for (auto &gpu : rocm_rank.gpus)
+    {
+        gpu.type = DeviceType::ROCm;
+        gpu.uuid = "rocm-" + gpu.uuid;
+        gpu.numa_node = 4;
+    }
+    observed.ranks.push_back(std::move(rocm_rank));
+    observed.world_size = 2;
+    observed.buildNodeAggregations();
+
+    auto config = request(source, DeviceType::CUDA);
+    config.automatic_planning.only_backends =
+        std::vector{DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm};
+    config.automatic_planning.only_strategies =
+        std::vector{OrchestrationStrategy::ExpertOverlay};
+    config.automatic_planning.device_counts = {
+        {DeviceType::CPU, 2}, {DeviceType::CUDA, 2}, {DeviceType::ROCm, 2}};
+    // The fixture's small head geometry is outside TurboQuant admission.
+    config.kv_cache_precision = "fp32";
+    config.prefill_max_bucket_size = 64;
+    bool priced_desired = false;
+    const auto selected = AutomaticOrchestrationPlanner::select(
+        config, source, observed, memory(), {64, 128},
+        [&](const AdmittedOrchestrationCandidate &candidate,
+            const OrchestrationPlanningWorkload &work)
+        {
+            EXPECT_TRUE(candidate.physicalAdmission().plan().fits());
+            EXPECT_TRUE(candidate.overlayCapacity());
+            const auto &domains = candidate.config().moe_routed_expert_plan->domains;
+            const bool desired = domains.size() == 3u &&
+                domains[0].participants.front().isCUDA() &&
+                domains[1].participants.front().isROCm() &&
+                domains[2].participants.front().isCPU();
+            priced_desired |= desired;
+            return OrchestrationCostEstimate(work, desired ? 0.1 : 1.0,
+                0.01, "synthetic three-tier decision oracle");
+        });
+    EXPECT_TRUE(priced_desired);
+    EXPECT_GE(selected.counts().evaluated, 1u);
+    const auto &plan = *selected.candidate().config().moe_routed_expert_plan;
+    ASSERT_EQ(plan.domains.size(), 3u);
+    EXPECT_TRUE(plan.domains[0].participants.front().isCUDA());
+    EXPECT_TRUE(plan.domains[1].participants.front().isROCm());
+    EXPECT_TRUE(plan.domains[2].participants.front().isCPU());
+    const auto saved = serializeOrchestrationConfig(selected.candidate().config());
+    EXPECT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(saved)), saved);
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run manual HTTP E2E or benchmarks against a branch's published image pair.
+"""Run manual or PR HTTP E2E/benchmarks against a published image pair.
 
 This is a consumer of the production pipeline, not another test matrix or an
 image builder/publisher. A same-source installed test companion exports the
@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import uuid
 
 import docker_paths
-from production_artifacts import (digest, image_identity, positive, validate_image_e2e,
+from production_artifacts import (digest, image_identity, positive, ratchet, validate_image_e2e,
                                   validate_image_e2e_coverage,
                                   validate_manifest, write_json)
 import run_production_pipeline as pipeline
@@ -70,7 +70,11 @@ def validate_pair(pair: dict) -> None:
 
 
 def pull_pair(args, directory: Path) -> dict:
-    """Pull the latest tags once, then authenticate their committed source tree."""
+    """Pull both tags once and authenticate the exact requested source tree.
+
+    PR gates use source-pinned develop tags and reject a mutable tag that
+    advances to a newer commit while certification is starting.
+    """
     base = args.image or branch_image(args.repository, args.branch)
     if not base.startswith("ghcr.io/") or "@" in base:
         raise ValueError("--image must name the branch's mutable AVX512 GHCR tag")
@@ -94,6 +98,9 @@ def pull_pair(args, directory: Path) -> dict:
             "source": source, "images": images,
             "workflow_revision": git("rev-parse", "HEAD")}
     validate_pair(pair)
+    expected = getattr(args, "expected_source_revision", None)
+    if expected is not None and source["revision"] != expected:
+        raise ValueError("published image source differs from the PR head revision")
     # A tag can legitimately lag this workflow's commit, but cannot name an
     # unrelated branch or a dirty local snapshot masquerading as that commit.
     if git("rev-parse", source["revision"] + "^{tree}") != source["tree"]:
@@ -380,11 +387,17 @@ def download_e2e(args, destination: Path) -> tuple[Path, str]:
     return destination, run["html_url"]
 
 
-def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict, isa: str) -> None:
-    """Reject partial, duplicate, diagnostic, wrong-image or regressed results."""
+def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict,
+                       isa: str, *, allow_regressions: bool = False) -> None:
+    """Authenticate every measurement and recompute its high-water comparison.
+
+    PR reporting admits a complete red report so the second ISA still runs and
+    the reviewer sees the full failure map. Release proof retains the default
+    all-green requirement; a red report can never certify an image pair.
+    """
     expected = {row["case"]: row for row in validate_manifest(manifest, pair["source"]["revision"])}
     rows = report.get("cells", [])
-    if (report.get("complete") is not True or report.get("passed") is not True
+    if (report.get("complete") is not True
             or report.get("diagnostic") is not False
             or report.get("source_revision") != pair["source"]["revision"]
             or report.get("image") != pair["images"][isa]["id"]
@@ -400,10 +413,19 @@ def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict, isa:
             raise ValueError("benchmark policy differs from its canonical cell")
         for phase in ("prefill", "decode"):
             positive(row["tokens_per_second"][phase])
+    baseline = json.loads((ROOT / "benchmarks/production/high_water.json").read_text())
+    proposed, comparisons = ratchet(baseline, rows)
+    if (report.get("baseline_digest") != digest(baseline)
+            or report.get("proposed_high_water") != proposed
+            or report.get("comparisons") != comparisons
+            or report.get("passed") is not all(item["passed"] for item in comparisons)):
+        raise ValueError(f"{isa} benchmark comparison differs from canonical high water")
+    if not allow_regressions and report["passed"] is not True:
+        raise ValueError(f"{isa} benchmark regressed below canonical high water")
 
 
 def run_benchmarks(args, pair: dict, directory: Path) -> dict:
-    """Consume the full E2E pair, then use the unchanged production benchmark runner."""
+    """Consume the full E2E pair and collect both ISA results before judgement."""
     if args.e2e_bundle:
         bundle, evidence_url = args.e2e_bundle.resolve(strict=True), "local"
     else:
@@ -417,24 +439,35 @@ def run_benchmarks(args, pair: dict, directory: Path) -> dict:
         lane.mkdir()
         report = lane / "benchmarks.json"
         print(f"[published-images] BENCHMARK {isa}: {len(manifest['cells'])} canonical cells", flush=True)
-        run_in_driver(args, driver, [sys.executable, str(ROOT / "scripts/ci/run_model_parity_benchmarks.py"),
-            "--manifest", str(bundle / "manifest.json"),
-            "--source-revision", pair["source"]["revision"],
-            "--image", pair["images"][isa]["id"],
-            "--e2e-report", str(bundle / isa.lower() / "e2e.json"),
-            "--model-ramdisk-root", str(args.model_ramdisk_root),
-            "--report", str(report)], lane, "benchmarks.log")
+        regression_failure = None
+        try:
+            run_in_driver(args, driver, [sys.executable, str(ROOT / "scripts/ci/run_model_parity_benchmarks.py"),
+                "--manifest", str(bundle / "manifest.json"),
+                "--source-revision", pair["source"]["revision"],
+                "--image", pair["images"][isa]["id"],
+                "--e2e-report", str(bundle / isa.lower() / "e2e.json"),
+                "--model-ramdisk-root", str(args.model_ramdisk_root),
+                "--report", str(report)], lane, "benchmarks.log")
+        except subprocess.CalledProcessError as error:
+            regression_failure = error
         reports[isa] = json.loads(report.read_text())
-        validate_benchmark(reports[isa], pair, manifest, e2e[isa], isa)
+        validate_benchmark(reports[isa], pair, manifest, e2e[isa], isa,
+                           allow_regressions=True)
+        if (regression_failure is None) != reports[isa]["passed"]:
+            raise ValueError(f"benchmark {isa} exit status disagrees with complete ratchet evidence")
     # Publish compact phase evidence, not raw logs or a full-image certificate.
+    baseline = json.loads((ROOT / "benchmarks/production/high_water.json").read_text())
     result = {"schema": 1, "source": pair["source"], "branch": pair["branch"],
               "repository": pair["repository"],
               "images": pair["images"], "e2e_run": evidence_url,
               "workflow_run": args.run_url,
               "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+              "passed": all(report["passed"] for report in reports.values()),
+              "regression_threshold_pct": baseline["regression_threshold_pct"],
               "scope": "full-http-e2e-and-benchmarks", "full_image_certification": False,
               "variants": {isa: {"hardware": report["hardware"], "workload": report["workload"],
                   "report_digest": digest(report), "e2e_report_digest": digest(e2e[isa]),
+                  "comparisons": report["comparisons"],
                   "cells": [{key: value for key, value in row.items() if key != "artifacts"}
                             for row in report["cells"]]} for isa, report in reports.items()}}
     write_json(directory / "results.json", result)
@@ -489,7 +522,7 @@ def publish_results(args, directory: Path, result: dict) -> None:
                            cwd=ROOT, env=env, check=True)
         tree = subprocess.check_output(["git", "write-tree"], cwd=ROOT, env=env, text=True).strip()
         commit = subprocess.check_output(["git", "commit-tree", tree, "-p", parent,
-            "-m", f"benchmarks: published images {result['source']['revision'][:12]} [skip ci]"],
+            "-m", f"benchmarks: published images {result['source']['revision'][:12]}"],
             cwd=ROOT, env=env, text=True).strip()
     subprocess.run(["git", "push", "origin", f"{commit}:refs/heads/{args.branch}"], cwd=ROOT, check=True)
     write_json(directory / "publication.json", {"commit": commit, "parent": parent,
@@ -503,6 +536,8 @@ def parse_arguments(argv=None):
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "Llaminar/llaminar"))
     parser.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME") or git("branch", "--show-current"))
     parser.add_argument("--image", help="AVX512 branch tag; AVX2 uses the canonical -avx2 suffix")
+    parser.add_argument("--expected-source-revision",
+                        help="require the exact 40-character PR head revision")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--models", type=Path, default=Path("/opt/llaminar-models"))
     parser.add_argument("--model-ramdisk-root", type=Path, default=Path("/mnt/llaminar-production-parity"))
@@ -512,6 +547,9 @@ def parse_arguments(argv=None):
     parser.add_argument("--run-url", default="local")
     parser.add_argument("--publish", action="store_true", help="commit only successful complete benchmark results")
     args = parser.parse_args(argv)
+    if args.expected_source_revision is not None and not re.fullmatch(
+            r"[0-9a-f]{40}", args.expected_source_revision):
+        parser.error("--expected-source-revision requires a full Git SHA")
     if args.suite != "benchmarks" and (args.publish or args.e2e_run or args.e2e_bundle):
         parser.error("E2E evidence inputs and publication apply only to benchmarks")
     subprocess.run(["git", "check-ref-format", f"refs/heads/{args.branch}"], check=True)
@@ -540,8 +578,10 @@ def main(argv=None) -> int:
             run_e2e(args, pair, manifest, args.output)
         else:
             result = run_benchmarks(args, pair, args.output)
-            if args.publish:
+            if args.publish and result["passed"]:
                 publish_results(args, args.output, result)
+            if not result["passed"]:
+                raise ValueError("one or more published-image benchmark phases regressed")
     return 0
 
 

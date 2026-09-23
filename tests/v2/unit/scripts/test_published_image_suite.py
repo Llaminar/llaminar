@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Device-free contracts for manual, immutable-image E2E/benchmark publication.
+"""Device-free contracts for immutable-image E2E, PR, and release publication.
 
 Fixtures model metadata only. Real HTTP/math evidence remains the canonical
 runners' responsibility; these tests exercise pair admission, full-suite joins,
@@ -23,9 +23,14 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import run_published_image_suite as suite
+import wait_for_develop_image_gate as image_wait
+import publish_master_release as master_release
+import apply_master_ruleset as master_ruleset
+import post_pr_benchmark_rag as benchmark_rag
+import publish_pr_high_water as high_water
 import run_model_parity_e2e as e2e
 import published_benchmark_chart as chart
-from production_artifacts import digest, write_json
+from production_artifacts import digest, ratchet, write_json
 
 
 def image_pair():
@@ -115,9 +120,13 @@ def benchmark_report(pair, manifest, e2e, isa):
         rows.append({"case": cell["case"], "identity": {"cpu_isa": isa,
             "configuration": {**config, "model": Path(config["model"]).name}},
             "tokens_per_second": {"prefill": 1000.0, "decode": 60.0}})
+    baseline = json.loads((ROOT / "benchmarks/production/high_water.json").read_text())
+    proposed, comparisons = ratchet(baseline, rows)
     return {"complete": True, "passed": True, "diagnostic": False,
             "source_revision": pair["source"]["revision"], "image": pair["images"][isa]["id"],
-            "manifest_digest": digest(manifest), "e2e_report_digest": digest(e2e), "cells": rows}
+            "manifest_digest": digest(manifest), "e2e_report_digest": digest(e2e), "cells": rows,
+            "baseline_digest": digest(baseline), "proposed_high_water": proposed,
+            "comparisons": comparisons}
 
 
 class PublishedImageSuiteTests(unittest.TestCase):
@@ -329,6 +338,24 @@ class PublishedImageSuiteTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             suite.branch_image("Llaminar/llaminar", "feature/ambiguous")
 
+    def test_pr_pair_rejects_a_different_published_source_revision(self):
+        pair = image_pair()
+        base = "ghcr.io/llaminar/llaminar:develop-" + pair["source"]["revision"]
+        identities = {suite.runtime_tag(base, isa): pair["images"][isa]
+                      for isa in suite.ISAS}
+        args = SimpleNamespace(image=base, branch="develop",
+                               repository="Llaminar/llaminar",
+                               expected_source_revision="f" * 40)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(suite.pipeline, "run"), \
+                 patch.object(suite, "image_identity", side_effect=lambda tag: identities[tag]), \
+                 patch.object(suite.subprocess, "check_output", side_effect=lambda command, **_: json.dumps([
+                     {"RepoDigests": [identities[next(tag for tag in identities if
+                         identities[tag]["id"] == command[-1])]["registry_ref"]]}])), \
+                 patch.object(suite, "git", return_value="c" * 40):
+                with self.assertRaisesRegex(ValueError, "PR head revision"):
+                    suite.pull_pair(args, Path(temporary))
+
     def test_pair_admission_checks_every_isa_and_source_label(self):
         suite.validate_pair(image_pair())
         for label in ("org.llaminar.cpu_isa", "org.opencontainers.image.revision",
@@ -427,6 +454,125 @@ class PublishedImageSuiteTests(unittest.TestCase):
                     changed = deepcopy(report)
                     mutation(changed)
                     suite.validate_benchmark(changed, pair, manifest, evidence["AVX2"], "AVX2")
+
+    def test_complete_red_benchmark_can_be_reported_but_never_certified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = write_e2e_bundle(root)
+            pair = image_pair()
+            _, evidence = suite.admit_e2e(root, pair)
+            report = benchmark_report(pair, manifest, evidence["AVX2"], "AVX2")
+            row = report["cells"][0]
+            baseline = {"schema": 1, "regression_threshold_pct": 10, "entries": {
+                digest(row["identity"]): {"identity": row["identity"],
+                                          "tokens_per_second": {"prefill": 2000.0,
+                                                                "decode": 120.0}}}}
+            (root / "benchmarks/production").mkdir(parents=True)
+            write_json(root / "benchmarks/production/high_water.json", baseline)
+            proposed, comparisons = ratchet(baseline, report["cells"])
+            report.update(baseline_digest=digest(baseline), proposed_high_water=proposed,
+                          comparisons=comparisons, passed=False)
+            with patch.object(suite, "ROOT", root):
+                suite.validate_benchmark(report, pair, manifest, evidence["AVX2"], "AVX2",
+                                         allow_regressions=True)
+                with self.assertRaisesRegex(ValueError, "regressed"):
+                    suite.validate_benchmark(report, pair, manifest, evidence["AVX2"], "AVX2")
+                report["comparisons"][0]["passed"] = True
+                with self.assertRaisesRegex(ValueError, "canonical high water"):
+                    suite.validate_benchmark(report, pair, manifest, evidence["AVX2"], "AVX2",
+                                             allow_regressions=True)
+
+    def test_pr_rag_exposes_every_phase_and_blocks_red(self):
+        revision = "a" * 40
+        rows = [
+            {"case": "Model/CellA", "phase": "prefill", "current": 120.0,
+             "high_water": 100.0, "passed": True},
+            {"case": "Model/CellA", "phase": "decode", "current": 95.0,
+             "high_water": 100.0, "passed": True},
+            {"case": "Model/CellB", "phase": "prefill", "current": 70.0,
+             "high_water": 100.0, "passed": False},
+            {"case": "Model/CellB", "phase": "decode", "current": 60.0,
+             "high_water": None, "passed": True},
+        ]
+        result = {"source": {"revision": revision},
+                  "scope": "full-http-e2e-and-benchmarks", "passed": False,
+                  "regression_threshold_pct": 10,
+                  "variants": {"AVX512": {"comparisons": rows},
+                               "AVX2": {"comparisons": rows}}}
+        body = benchmark_rag.render(result, revision, "https://example.test/run")
+        self.assertIn("🔴 BLOCKED", body)
+        self.assertIn("4 green / 2 amber / 2 red", body)
+        self.assertIn("AVX512: 2 cells", body)
+        self.assertIn("AVX2: 2 cells", body)
+        self.assertIn("-30.0%", body)
+        with self.assertRaisesRegex(ValueError, "exact PR image pair"):
+            benchmark_rag.render(result, "b" * 40, "https://example.test/run")
+        result["passed"] = True
+        with self.assertRaisesRegex(ValueError, "canonical benchmark evidence"):
+            benchmark_rag.render(result, revision, "https://example.test/run")
+
+    def test_pr_rag_updates_owned_comment_instead_of_spamming(self):
+        marker = benchmark_rag.MARKER
+        comments = [{"id": 9, "body": marker, "user": {"login": "github-actions[bot]"}}]
+        with patch.object(benchmark_rag, "github_json", side_effect=[comments, {}]) as api:
+            benchmark_rag.publish("Llaminar/llaminar", 42, marker + " green")
+        self.assertEqual(api.call_args_list[1].args[0],
+                         "repos/Llaminar/llaminar/issues/comments/9")
+        self.assertEqual(api.call_args_list[1].kwargs["method"], "PATCH")
+        later = [{"id": 91, "body": marker, "user": {"login": "github-actions[bot]"}}]
+        with patch.object(benchmark_rag, "github_json",
+                          side_effect=[[{"id": i} for i in range(100)], later, {}]) as api:
+            benchmark_rag.publish("Llaminar/llaminar", 42, marker + " updated")
+        self.assertIn("page=2", api.call_args_list[1].args[0])
+        self.assertEqual(api.call_args_list[2].args[0],
+                         "repos/Llaminar/llaminar/issues/comments/91")
+
+    def test_red_first_isa_does_not_hide_second_isa_benchmark_numbers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "e2e"
+            bundle.mkdir()
+            manifest = write_e2e_bundle(bundle)
+            pair = image_pair()
+            _, e2e_reports = suite.admit_e2e(bundle, pair)
+            reports = {isa: benchmark_report(pair, manifest, e2e_reports[isa], isa)
+                       for isa in suite.ISAS}
+            row = reports["AVX512"]["cells"][0]
+            baseline = {"schema": 1, "regression_threshold_pct": 10, "entries": {
+                digest(row["identity"]): {"identity": row["identity"],
+                                          "tokens_per_second": {"prefill": 2000.0,
+                                                                "decode": 120.0}}}}
+            (root / "benchmarks/production").mkdir(parents=True)
+            write_json(root / "benchmarks/production/high_water.json", baseline)
+            for isa, report in reports.items():
+                proposed, comparisons = ratchet(baseline, report["cells"])
+                report.update(baseline_digest=digest(baseline), proposed_high_water=proposed,
+                              comparisons=comparisons,
+                              passed=all(item["passed"] for item in comparisons),
+                              hardware={}, workload={})
+            calls = []
+
+            def run_lane(_args, _driver, command, lane, _log):
+                isa = lane.name.upper()
+                calls.append(isa)
+                write_json(Path(command[command.index("--report") + 1]), reports[isa])
+                if isa == "AVX512":
+                    raise subprocess.CalledProcessError(1, command)
+
+            output = root / "output"
+            output.mkdir()
+            args = SimpleNamespace(e2e_bundle=bundle, model_ramdisk_root=root,
+                                   run_url="https://example.test/run")
+            with patch.object(suite, "ROOT", root), \
+                 patch.object(suite, "build_driver", return_value="driver"), \
+                 patch.object(suite, "run_in_driver", side_effect=run_lane), \
+                 patch.object(chart, "render_chart", return_value="<svg/>"):
+                result = suite.run_benchmarks(args, pair, output)
+            self.assertEqual(calls, ["AVX512", "AVX2"])
+            self.assertFalse(result["passed"])
+            self.assertTrue((output / "results.json").exists())
+            self.assertEqual(result["variants"]["AVX512"]["comparisons"],
+                             reports["AVX512"]["comparisons"])
 
     def test_failed_second_isa_stops_all_benchmarks_before_first_launch(self):
         from types import SimpleNamespace
@@ -652,6 +798,324 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
             self.assertEqual(workflow["concurrency"]["group"], "llaminar-develop-image-gate")
             self.assertEqual(workflow["concurrency"]["cancel-in-progress"], "false")
+
+    def test_master_pr_uses_exact_develop_ref_and_requires_e2e_before_benchmarks(self):
+        import yaml
+        workflow = yaml.load((ROOT / ".github/workflows/master-pr-certification.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"pull_request"})
+        self.assertEqual(workflow["on"]["pull_request"]["branches"], ["master"])
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["e2e"]["needs"], "source")
+        self.assertEqual(jobs["benchmarks"]["needs"], "e2e")
+        self.assertEqual(jobs["e2e"]["concurrency"]["group"], "llaminar-develop-image-gate")
+        self.assertEqual(jobs["benchmarks"]["concurrency"]["group"], "llaminar-develop-image-gate")
+        self.assertEqual(jobs["benchmarks"]["permissions"]["pull-requests"], "write")
+        text = (ROOT / ".github/workflows/master-pr-certification.yml").read_text()
+        self.assertIn("--expected-source-revision \"$HEAD_SHA\"", text)
+        self.assertIn(":develop-$HEAD_SHA", text)
+        self.assertIn("--e2e-bundle", text)
+        self.assertIn("scripts/ci/post_pr_benchmark_rag.py", text)
+        self.assertNotIn("--publish", text)
+
+    def test_pr_wait_accepts_only_exact_successful_develop_push(self):
+        revision = "a" * 40
+        branch = {"commit": {"sha": revision}}
+        response = {"workflow_runs": [
+            {"id": 7, "head_sha": "b" * 40, "head_branch": "develop",
+             "event": "push", "status": "completed", "conclusion": "success"},
+            {"id": 8, "head_sha": revision, "head_branch": "develop",
+             "event": "push", "status": "completed", "conclusion": "success"},
+        ]}
+        with patch.object(image_wait, "github_json", side_effect=[branch, response]) as github:
+            self.assertEqual(image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1), 8)
+        self.assertEqual(github.call_count, 2)
+        with patch.object(image_wait, "github_json", side_effect=[branch, {
+                "workflow_runs": [{**response["workflow_runs"][1], "conclusion": "failure"}]}]):
+            with self.assertRaisesRegex(ValueError, "without publishing both ISAs"):
+                image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1)
+        with patch.object(image_wait, "github_json", return_value={"commit": {"sha": "b" * 40}}):
+            with self.assertRaisesRegex(ValueError, "no longer the current develop"):
+                image_wait.wait_for_image_gate("Llaminar/llaminar", revision, 1)
+
+    def test_master_release_dates_and_ref_tags_are_unambiguous(self):
+        day = "2026-09-23"
+        master = "d" * 40
+        self.assertEqual(master_release.release_tag(day, [], master), (day + ".1", None))
+        earlier = {"tag_name": day + ".1", "target_commitish": "e" * 40,
+                   "draft": False, "published_at": "2026-09-23T12:00:00Z"}
+        self.assertEqual(master_release.release_tag(day, [earlier], master),
+                         (day + ".2", day + ".1"))
+        draft = {"tag_name": day + ".2", "target_commitish": master,
+                 "draft": True, "published_at": None}
+        self.assertEqual(master_release.release_tag(day, [earlier, draft], master),
+                         (day + ".2", day + ".1"))
+        with self.assertRaisesRegex(ValueError, "already has a published release"):
+            master_release.release_tag(day, [earlier, {**draft, "draft": False}], master)
+        self.assertEqual(master_release.master_image_tags("Llaminar/llaminar", master,
+                         day + ".2", "AVX512"), (
+                         "ghcr.io/llaminar/llaminar:2026-09-23.2",
+                         "ghcr.io/llaminar/llaminar:master-" + master,
+                         "ghcr.io/llaminar/llaminar:master"))
+        self.assertEqual(master_release.master_image_tags("Llaminar/llaminar", master,
+                         day + ".2", "AVX2"), (
+                         "ghcr.io/llaminar/llaminar:2026-09-23.2-avx2",
+                         "ghcr.io/llaminar/llaminar:master-avx2-" + master,
+                         "ghcr.io/llaminar/llaminar:master-avx2"))
+
+    def test_master_release_never_rewrites_conflicting_immutable_image(self):
+        image = {"id": "sha256:" + "a" * 64,
+                 "registry_ref": "ghcr.io/llaminar/llaminar@sha256:" + "b" * 64}
+        with patch.object(master_release, "remote_image_id", return_value="sha256:" + "c" * 64), \
+             patch.object(master_release.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "immutable release image"):
+                master_release.promote_tag("ghcr.io/llaminar/llaminar:2026-09-23.1",
+                                           image, immutable=True)
+            run.assert_not_called()
+        with patch.object(master_release, "remote_image_id",
+                          side_effect=[None, image["id"]]), \
+             patch.object(master_release.subprocess, "run") as run:
+            master_release.promote_tag("ghcr.io/llaminar/llaminar:2026-09-23.1",
+                                       image, immutable=True)
+            self.assertEqual(run.call_args.args[0][:4],
+                             ["docker", "buildx", "imagetools", "create"])
+
+    def test_master_aliases_move_only_after_proof_assets_are_uploaded(self):
+        pair = image_pair()
+        events = []
+
+        def record_run(command, **_kwargs):
+            events.append(("gh", command[:3]))
+
+        def record_tag(alias, _image, *, immutable):
+            events.append(("tag", immutable, alias))
+
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(master_release.subprocess, "run", side_effect=record_run), \
+             patch.object(master_release, "promote_tag", side_effect=record_tag):
+            master_release.publish("Llaminar/llaminar", "d" * 40, "2026-09-23.1",
+                                   Path(temporary) / "notes.md", [Path(temporary) / "e2e.json"],
+                                   {"pair": pair}, draft_exists=False)
+        upload = next(index for index, event in enumerate(events)
+                      if event[0] == "gh" and event[1][:3] == ["gh", "release", "upload"])
+        self.assertTrue(all(event[1] for event in events[:upload] if event[0] == "tag"))
+        self.assertTrue(all(not event[1] for event in events[upload + 1:] if event[0] == "tag"))
+        self.assertEqual(events[-1], ("gh", ["gh", "release", "edit"]))
+
+    def test_release_revalidates_every_attached_e2e_and_benchmark_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            e2e_root, benchmark_root = root / "e2e", root / "benchmarks"
+            e2e_root.mkdir()
+            benchmark_root.mkdir()
+            pair = image_pair()
+            pair["workflow_revision"] = pair["source"]["revision"]
+            manifest = write_e2e_bundle(e2e_root, pair)
+            write_json(benchmark_root / "images.json", pair)
+            write_json(benchmark_root / "manifest.json", manifest)
+            result = {"source": pair["source"], "images": pair["images"],
+                      "repository": pair["repository"], "branch": "develop",
+                      "passed": True,
+                      "regression_threshold_pct": 10,
+                      "scope": "full-http-e2e-and-benchmarks",
+                      "full_image_certification": False, "variants": {}}
+            for isa in suite.ISAS:
+                e2e = json.loads((e2e_root / isa.lower() / "e2e.json").read_text())
+                report = benchmark_report(pair, manifest, e2e, isa)
+                write_json(benchmark_root / isa.lower() / "benchmarks.json", report)
+                result["variants"][isa] = {"report_digest": digest(report),
+                    "e2e_report_digest": digest(e2e),
+                    "comparisons": report["comparisons"], "cells": report["cells"]}
+            write_json(benchmark_root / "results.json", result)
+            admitted = master_release.validate_proof(
+                e2e_root, benchmark_root, pair["repository"],
+                pair["source"]["revision"], pair["source"]["tree"])
+            self.assertEqual(admitted["pair"], pair)
+            initial = master_release.release_notes("2026-09-23.1", None, [], admitted,
+                pair["repository"], "https://github.com/example/actions/runs/1", "d" * 40)
+            self.assertIn("Initial dated release", initial)
+            self.assertIn("e2e-avx512.json", initial)
+            self.assertIn("benchmark-results.json", initial)
+            self.assertNotIn("- 123abc", initial)
+            later = master_release.release_notes("2026-09-23.2", "2026-09-23.1",
+                ["123abc fix: restore prefix"], admitted, pair["repository"],
+                "https://github.com/example/actions/runs/2", "d" * 40)
+            self.assertIn("123abc fix: restore prefix", later)
+            with self.assertRaisesRegex(ValueError, "master tree"):
+                master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
+                                              pair["source"]["revision"], "f" * 40)
+            result["variants"]["AVX2"]["report_digest"] = "wrong"
+            write_json(benchmark_root / "results.json", result)
+            with self.assertRaisesRegex(ValueError, "compact benchmark numbers"):
+                master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
+                                              pair["source"]["revision"], pair["source"]["tree"])
+
+    def test_master_ruleset_requires_source_and_both_phase_checks(self):
+        current = {"name": "master", "target": "branch", "enforcement": "disabled",
+                   "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+                   "bypass_actors": [], "rules": [{"type": "pull_request", "parameters": {
+                       "allowed_merge_methods": ["squash"]}},
+                       {"type": "required_status_checks", "parameters": {
+                           "required_status_checks": [{"context": "CI complete"}]}}]}
+        proposed = master_ruleset.proposed_ruleset(current)
+        self.assertEqual(proposed["enforcement"], "active")
+        self.assertEqual(proposed["rules"][0], current["rules"][0])
+        checks = proposed["rules"][1]["parameters"]["required_status_checks"]
+        self.assertEqual([check["context"] for check in checks], list(master_ruleset.REQUIRED_CHECKS))
+        self.assertTrue(all(check["integration_id"] == 15368 for check in checks))
+
+    def test_develop_guard_prevents_deletion_and_admits_the_master_ancestry_join(self):
+        current = {"name": "develop", "target": "branch", "enforcement": "disabled",
+                   "conditions": {"ref_name": {"include": ["refs/heads/develop"], "exclude": []}},
+                   "bypass_actors": [], "rules": [{"type": "deletion"},
+                                                  {"type": "non_fast_forward"},
+                                                  {"type": "required_linear_history"}]}
+        proposed = master_ruleset.proposed_develop_ruleset(current)
+        self.assertEqual(proposed["enforcement"], "active")
+        self.assertEqual({rule["type"] for rule in proposed["rules"]},
+                         {"deletion", "non_fast_forward"})
+        self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)
+        current["rules"].append({"type": "required_status_checks"})
+        with self.assertRaisesRegex(ValueError, "unrelated PR or status-check"):
+            master_ruleset.proposed_develop_ruleset(current)
+
+    def test_obsolete_policy_installers_cannot_restore_the_old_master_check(self):
+        for name in ("apply-rulesets.sh", "apply-branch-protection.sh"):
+            self.assertFalse((ROOT / ".github/scripts" / name).exists())
+
+    def test_master_release_workflow_promotes_only_after_pr_artifact_validation(self):
+        import yaml
+        workflow = yaml.load((ROOT / ".github/workflows/release.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["on"]["push"]["branches"], ["master"])
+        self.assertEqual(set(workflow["jobs"]), {"promote", "high_water"})
+        self.assertEqual(workflow["jobs"]["promote"]["concurrency"]["group"],
+                         "llaminar-develop-image-gate")
+        self.assertEqual(workflow["jobs"]["high_water"]["needs"], "promote")
+        text = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("scripts/ci/publish_master_release.py", text)
+        self.assertIn("scripts/ci/publish_pr_high_water.py", text)
+        self.assertNotIn("release-please", text)
+
+    def test_post_merge_high_water_combines_both_isas_and_uses_skip_ci(self):
+        pair = image_pair()
+        baseline = {"schema": 1, "regression_threshold_pct": 10, "entries": {}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            chart = root / "benchmarks.svg"
+            chart.write_text("<svg/>")
+            result = benchmark_result()
+            rows = {isa: [{"case": "Suite/Tiny.ProductionParity/ROCm",
+                           "identity": {"case": "cell", "cpu_isa": isa},
+                           "tokens_per_second": {"prefill": 100.0, "decode": 50.0}}]
+                    for isa in suite.ISAS}
+            evidence = {"pair": pair, "result": result, "benchmark_directory": root,
+                        "benchmarks": {isa: {"baseline_digest": digest(baseline),
+                                            "cells": rows[isa]} for isa in suite.ISAS}}
+            with patch.object(high_water, "git_file", return_value=(ROOT / "README.md").read_bytes()):
+                payloads = high_water.proposed_payloads(evidence, baseline)
+            self.assertEqual(len(json.loads(payloads[high_water.HIGH_WATER])["entries"]), 2)
+            self.assertEqual(payloads[str(suite.REPORT_DIRECTORY / "benchmarks.svg")], b"<svg/>")
+            evidence["benchmarks"]["AVX2"]["baseline_digest"] = "stale"
+            with self.assertRaisesRegex(ValueError, "different source high-water"):
+                high_water.proposed_payloads(evidence, baseline)
+
+    def test_high_water_commit_joins_identical_master_tree_without_other_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "high_water.json").write_text("old\n")
+            subprocess.run(["git", "add", "high_water.json"], cwd=root, check=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                            "commit", "-qm", "base"], cwd=root, check=True)
+            parent = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                             text=True).strip()
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                            "commit", "-qm", "squashed master", "--allow-empty"], cwd=root,
+                           check=True)
+            master = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                             text=True).strip()
+            with patch.object(high_water, "ROOT", root):
+                committed = high_water.commit_payloads(parent, master,
+                                                       {"high_water.json": b"new\n"}, 7)
+                self.assertEqual(high_water.git("rev-parse", f"{committed}^1"), parent)
+                self.assertEqual(high_water.git("rev-parse", f"{committed}^2"), master)
+                self.assertIn("[skip ci]", high_water.git("log", "-1", "--format=%s", committed))
+                self.assertEqual(high_water.git_file(committed, "high_water.json"), b"new\n")
+                unchanged = high_water.commit_payloads(parent, master,
+                                                       {"high_water.json": b"old\n"}, 7)
+                self.assertNotEqual(unchanged, parent)
+                self.assertEqual(high_water.git("rev-parse", f"{unchanged}^2"), master)
+                (root / "high_water.json").write_text("unrelated master tree\n")
+                subprocess.run(["git", "add", "high_water.json"], cwd=root, check=True)
+                subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                "commit", "-qm", "different master tree"], cwd=root,
+                               check=True)
+                different = high_water.git("rev-parse", "HEAD")
+                with self.assertRaisesRegex(ValueError, "trees differ"):
+                    high_water.commit_payloads(parent, different,
+                                               {"high_water.json": b"new\n"}, 7)
+
+    def test_post_merge_publication_fast_forwards_develop_and_retries_idempotently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, checkout = root / "remote.git", root / "checkout"
+            subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+            subprocess.run(["git", "clone", "-q", str(remote), str(checkout)], check=True)
+
+            def command(*args):
+                return subprocess.check_output(["git", *args], cwd=checkout,
+                                               text=True).strip()
+
+            command("switch", "-q", "-c", "develop")
+            (checkout / "benchmarks/production").mkdir(parents=True)
+            baseline = {"schema": 1, "regression_threshold_pct": 10, "entries": {}}
+            write_json(checkout / high_water.HIGH_WATER, baseline)
+            (checkout / "README.md").write_text(
+                "intro\n" + suite.README_BEGIN + "\nold\n" + suite.README_END + "\n")
+            command("add", ".")
+            command("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "develop source")
+            source = command("rev-parse", "HEAD")
+            tree = command("rev-parse", "HEAD^{tree}")
+            command("push", "-q", "origin", "develop")
+            command("switch", "-q", "-c", "master")
+            command("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                    "commit", "-qm", "master squash", "--allow-empty")
+            master = command("rev-parse", "HEAD")
+            self.assertEqual(command("rev-parse", "HEAD^{tree}"), tree)
+            source_identity = {"revision": source, "tree": tree, "dirty": False}
+            result = benchmark_result()
+            result["source"] = source_identity
+            rows = {isa: [{"case": "Suite/Tiny.ProductionParity/ROCm",
+                           "identity": {"case": "cell", "cpu_isa": isa},
+                           "tokens_per_second": {"prefill": 100.0, "decode": 50.0}}]
+                    for isa in suite.ISAS}
+            evidence = {"pair": {"source": source_identity}, "result": result,
+                        "benchmarks": {isa: {"baseline_digest": digest(baseline),
+                                            "cells": rows[isa]} for isa in suite.ISAS}}
+            benchmark_directory = root / "benchmarks"
+            benchmark_directory.mkdir()
+            (benchmark_directory / "benchmarks.svg").write_text("<svg/>")
+            with patch.object(high_water, "ROOT", checkout), \
+                 patch.object(master_release, "merged_develop_pr",
+                              return_value={"head": {"sha": source}, "number": 7}), \
+                 patch.object(master_release, "certified_pr_run", return_value={"id": 99}), \
+                 patch.object(master_release, "download_proof",
+                              return_value=(root / "e2e", benchmark_directory)), \
+                 patch.object(master_release, "validate_proof", return_value=evidence):
+                first = high_water.publish("Llaminar/llaminar", master, root / "proof")
+                second = high_water.publish("Llaminar/llaminar", master, root / "proof-retry")
+            self.assertFalse(first["reused"])
+            self.assertTrue(second["reused"])
+            self.assertEqual(first["develop_sha"], second["develop_sha"])
+            self.assertEqual(command("rev-parse", "FETCH_HEAD"), first["develop_sha"])
+            self.assertIn("[skip ci]", command("log", "-1", "--format=%s", first["develop_sha"]))
+            self.assertEqual(command("rev-parse", f"{first['develop_sha']}^1"), source)
+            self.assertEqual(command("rev-parse", f"{first['develop_sha']}^2"), master)
+            self.assertEqual(command("merge-base", master, first["develop_sha"]), master)
+            marks = json.loads(command("show", f"{first['develop_sha']}:{high_water.HIGH_WATER}"))
+            self.assertEqual(len(marks["entries"]), 2)
 
     def test_workflows_keep_generated_evidence_out_of_the_checkout(self):
         """A cache-owner driver may not poison the persistent ARC worktree."""

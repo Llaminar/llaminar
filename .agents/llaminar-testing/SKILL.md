@@ -36,10 +36,33 @@ The enabled `develop` GitHub workflow is intentionally narrower than that
 routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
 build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
 Unit and ProductionTestPreflight transaction inside each builder, and publish
-the two tested `develop` runtime tags. It does not run model discovery,
+the two tested `develop` runtime tags **and exact source-SHA tags**. It does not run model discovery,
 generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
 certificate. Use it for fast shippable developer images; use the full pipeline
 when requesting a certified artifact.
+The `develop` → `master` PR gate is separate: its required pull-request E2E
+check waits for the exact develop-head image pair, proves both ISAs on the full
+HTTP matrix, then its dependent benchmark check consumes that same image-bound
+E2E receipt. The benchmark check runs both ISAs even when the first has a
+complete red ratchet report, comments the per-cell red/amber/green numbers on
+the PR, and fails if any measured phase exceeds the high-water tolerance.
+Manual-dispatch E2E or benchmark runs cannot satisfy these PR checks. Do not
+commit benchmark evidence to the open PR head: `[skip ci]` would strand its
+required checks. After a certified squash merge, the master release publisher compares
+the merge **tree** with the tested develop image tree, revalidates both phase
+artifacts, and promotes those immutable image digests to dated and master/SHA
+tags. It attaches the per-ISA E2E and benchmark JSON plus chart to the GitHub
+release. The first dated release uses concise bootstrap notes; later notes
+cover commits since the preceding release. Its dependent job then commits the
+combined upward-only AVX512/AVX2 high-water marks, result JSON, chart, and
+README block to `develop` with `[skip ci]`. That fast-forward commit has the
+tested develop head and certified squash-merged master commit as its two
+parents, keeping the next strict PR up-to-date without rebuilding the image.
+It does not change the certified master tree. See `docs/production-ci.md` before
+editing the branch ruleset or release workflow. Keep the existing `develop`
+deletion/force-push guard active, but do not require linear history there:
+GitHub's auto-delete-on-merge setting must not remove that persistent branch
+before the post-merge evidence commit.
 On the production ARC scale set, the runner uses the host Docker Unix socket
 rather than DIND so CI and local host work use one daemon and one safe Docker
 cache. Never point two Docker daemons at the same writable data root. Its
@@ -106,6 +129,12 @@ substitute for the production path.
 - For complete AVX512/AVX2 image and benchmark certification, use
   `scripts/ci/run_production_pipeline.py` and `docs/production-ci.md`. Both full
   E2E server suites precede benchmarks; one-off benchmarks cannot certify images.
+- Before publishing a changed benchmark runtime, use
+  `run_model_parity_benchmarks.py --diagnostic --diagnostic-binary PATH` with
+  the complete exported typed E2E manifest. This local Release run preserves
+  the canonical 512-token prefill/256-token decode workload and all cells but
+  cannot mint an image certificate. Verify newly tagged HTTP cells locally as
+  well; only the published-image PR workflow can certify the image pair.
 - To explicitly inventory or run diagnostic mathematical campaigns, follow **Run a campaign**.
 - For a numerical or path failure, also read
   [CSV evidence](references/csv-evidence.md).

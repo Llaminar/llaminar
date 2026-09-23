@@ -12,7 +12,6 @@
  */
 
 #include "app/modes/BenchmarkMode.h"
-#include "app/modes/BenchmarkPrefillBucketPolicy.h"
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -23,7 +22,6 @@
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
 
-#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -47,102 +45,27 @@ namespace llaminar2
             return oss.str();
         }
 
-        /// @brief Detect whether this benchmark run executes a multi-device
-        ///        (tensor- or pipeline-parallel) configuration whose per-device
-        ///        graphs contain collective stages.
-        ///
-        /// Padded bucketed prefill is intentionally unsupported when collective
-        /// nodes are present (Phase 6 fail-loud guard in ForwardExecutionEngine):
-        /// padding the sequence to a bucket length would desynchronize collective
-        /// sizes across participants. For these runs we must execute the exact
-        /// prefill length instead of a padded bucket.
-        ///
-        /// @param config  Parsed orchestration configuration for this run.
-        /// @param mpi_ctx MPI context (used to detect global/multi-rank TP).
-        /// @return true if the run uses TP/PP collectives and must not bucket prefill.
-        bool benchmarkUsesCollectives(const OrchestrationConfig &config,
-                                      const std::shared_ptr<IMPIContext> &mpi_ctx)
-        {
-            // Simple tensor parallelism (degree or explicit device list).
-            if (config.tp_degree > 1 || config.tp_devices.size() > 1)
-                return true;
-            // Hybrid local/global TP degrees.
-            if (config.tp_local_degree > 1 || config.tp_global_degree > 1)
-                return true;
-            // Pipeline parallelism (simple degree or named domains / pp-stages).
-            if (config.pp_degree > 1 || config.usesNamedDomains())
-                return true;
-            // Global TP/PP distributed across multiple MPI ranks.
-            if (mpi_ctx && mpi_ctx->world_size() > 1)
-                return true;
-            return false;
-        }
-
-        /// @brief Opt benchmark mode into production bucketed prefill defaults.
-        void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
-                                              const OrchestrationConfig &config)
+        /**
+         * @brief Report the already-published production prefill policy.
+         *
+         * Benchmarking must not change graph or bucket settings according to
+         * topology. The same 512-token request works through the serving
+         * runner's captured chunk scheduler even when a PP graph has a
+         * 256-row activation arena. Disabling buckets here used to bypass that
+         * scheduler and send the whole prompt to one undersized graph.
+         */
+        void logBenchmarkPrefillPolicy()
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
             const bool user_selected_bucket_sizes = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
             const bool user_selected_gpu_graphs = env.presence.has("LLAMINAR_GPU_GRAPHS");
-
-            // Multi-device TP/PP runs cannot use padded bucketed prefill (collective
-            // stages would desynchronize). Only auto-enable bucketing for
-            // single-device runs; an explicit user opt-in is still honored (and will
-            // hit the fail-loud guard if it is incompatible with collectives).
-            const bool uses_collectives = benchmarkUsesCollectives(config, mpi_ctx);
-
-            /*
-             * ExpertOverlay owns an explicit heterogeneous segmented-capture
-             * protocol. Its root-published physical bucket is common to every
-             * rank and participant, including a padded final segment, so its
-             * collective shapes cannot diverge. Ordinary TP/PP configurations
-             * still need the conservative fail-loud policy below.
-             */
-            const bool segmented_collective_capture_authority =
-                config.moe_routed_expert_plan &&
-                config.moe_routed_expert_plan
-                    ->usesExpertOverlayAuthority();
-            const BenchmarkPrefillBucketDisableReason disable_reason =
-                benchmarkPrefillBucketDisableReason(
-                    uses_collectives,
-                    /*moe_rebalancing_active=*/false,
-                    segmented_collective_capture_authority);
-
-            if (!user_selected_bucket_mode)
-            {
-                if (disable_reason != BenchmarkPrefillBucketDisableReason::None)
-                {
-                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0", 1);
-                    const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);
-                    LOG_INFO("[Benchmark] " << reason
-                                            << " — leaving prefill graph bucketing disabled "
-                                               "(running exact prefill length)");
-                }
-                else
-                {
-                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
-                }
-            }
-            else if (!env.execution.prefill_graph_buckets && !user_selected_gpu_graphs)
-            {
-                setenv("LLAMINAR_GPU_GRAPHS", "0", 1);
-            }
-
-            // Leave LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES unset unless the user
-            // explicitly supplied it. DebugEnv then reloads the production
-            // geometric bucket ladder instead of a benchmark-prompt-sized list.
-            auto &mutable_env = mutableDebugEnv();
-            mutable_env.presence.reload();
-            mutable_env.execution.reload();
-
-            const auto &exec = debugEnv().execution;
+            const auto &exec = env.execution;
             LOG_INFO("[Benchmark] Prefill graph buckets "
                      << (exec.prefill_graph_buckets ? "enabled" : "disabled")
                      << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
                      << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
-                     << "; mode=" << (user_selected_bucket_mode ? "env override" : "benchmark default")
+                     << "; mode=" << (user_selected_bucket_mode ? "env override" : "production default")
                      << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
                      << (user_selected_gpu_graphs ? " (env override)" : ""));
         }
@@ -231,7 +154,7 @@ namespace llaminar2
         LOG_DEBUG("Running benchmark mode on coordinated authority rank "
                   << runner->coordinatedRootRank() << "...");
 
-        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
+        logBenchmarkPrefillPolicy();
 
         /*
          * Benchmarking and serving share this exact application-startup

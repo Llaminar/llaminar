@@ -286,7 +286,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     }
 
     /** @return Every unique 122B ExpertOverlay topology in the production matrix. */
-    const std::array<Qwen122OverlayTopologySpec, 9> &
+    const std::array<Qwen122OverlayTopologySpec, 10> &
     qwen122OverlayTopologySpecs()
     {
         // Certification is a subset of this canonical topology inventory, not
@@ -300,8 +300,11 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
             // receive their own readiness budget, not a longer request timeout.
             .profile = {.readiness_timeout_seconds = 180},
         }};
-        static const std::array<Qwen122OverlayTopologySpec, 9> specs{{
+        static const std::array<Qwen122OverlayTopologySpec, 10> specs{{
             {"CUDA2_ROCm4_2xMPI_NodeExpertOverlay", 2, 4, 0, 2,
+             Qwen122ContinuationBackend::CUDA,
+             ModelParityDynamicSpeedupWitness::Disabled, dynamic_certification},
+            {"CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay", 2, 4, 2, 2,
              Qwen122ContinuationBackend::CUDA,
              ModelParityDynamicSpeedupWitness::Disabled, dynamic_certification},
             {"ROCm1_CPU2_2xMPI_NodeExpertOverlay", 0, 1, 2, 2,

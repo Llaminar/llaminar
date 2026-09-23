@@ -9761,6 +9761,15 @@ if(ZLIB_FOUND)
         NO_MODELS
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
     )
+    add_v2_test(V2_Integration_Qwen122E2ESelectionGeometry
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen35moe_122b_node_expert_overlay_matrix>
+            --gtest_filter=Qwen122E2ECertification.*
+        LABELS "V2;Integration;ProductionTestPreflight;ExpertOverlay;E2E;Planning;Geometry;Regression"
+        MPI_PROCS 1
+        TIMEOUT 120
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+    )
 
     message(STATUS "V2: Qwen3.5 MoE 122B ExpertOverlay topology matrix enabled")
 
@@ -10980,6 +10989,11 @@ add_v2_test(V2_Integration_AutomaticMixedVendorOverlayRankBoundary
         --gtest_filter=AutomaticOrchestrationCandidates.ExactDeviceCountsMixedVendorOverlayRequiresRealRankBoundary
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CUDA;ROCm;MPI;GraphCapture;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+add_v2_test(V2_Integration_AutomaticMultiTierOverlayCandidates
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.MultiTierOverlay*
+    LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;MPI;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 add_v2_test(V2_Integration_AutomaticOverlayDensePolicyCandidates
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=AutomaticOrchestrationCandidates.LocalMoETPCompilesWithOneOverlayAuthority:AutomaticOrchestrationCandidates.MultiTierLocalGpuContinuationOffersBothAdmittedDensePolicies
@@ -11753,6 +11767,16 @@ add_v2_test(V2_Unit_Commands
     LABELS "V2;Unit;CLI;Commands;DescribeCommand;PlanCommand"
     MPI_PROCS 1
 )
+
+# Guard the production prefill policy at the benchmark frontend boundary.
+# This catches benchmark-only bucket/graph overrides before a real 512-token
+# prompt reaches a PP graph with a smaller activation arena.
+add_test(NAME V2_Integration_BenchmarkPrefillProductionPolicy
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_benchmark_prefill_production_policy.py)
+set_tests_properties(V2_Integration_BenchmarkPrefillProductionPolicy PROPERTIES
+    LABELS "V2;Integration;Benchmark;PipelineParallel;GraphCapture;Regression"
+    TIMEOUT 30)
 
 # RuntimeInitPhase: dry-run preflight lifecycle and reporting
 add_executable(v2_test_runtime_init_phase
@@ -18884,6 +18908,11 @@ add_v2_test(V2_Integration_AutomaticOverlayAdaptiveQuota
         --gtest_filter=OrchestrationCandidateAdmission.AutomaticOverlayKeepsLiveExpertQuotaAdaptive
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;ROCm;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_AutomaticMultiTierOverlayAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=AutomaticOrchestrationPlanner.MultiTierOverlayAdmissionAndSelection
+    LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_CapturedPipelineMemoryAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.CapturedPipelineChannelAccountingIsExactAndBackendSymmetric:RankMemoryPlanInputs.CapturedPipelineChannelsFollowDomainsNotDeviceOrdinals
@@ -19576,6 +19605,7 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_BenchmarkPrefillProductionPolicy
     V2_Integration_HTTPCellDeadline
     V2_Integration_ServerGpuMemoryTelemetry
     V2_Integration_ExpertOverlayRetirementProgress

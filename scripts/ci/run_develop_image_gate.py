@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import uuid
@@ -36,6 +37,33 @@ def runtime_tag(base: str, isa: str) -> str:
     if not isinstance(base, str) or not base or any(character.isspace() for character in base):
         raise ValueError("develop image tag must be a nonempty Docker reference without whitespace")
     return base + ("-avx2" if isa == "AVX2" else "")
+
+
+def revision_tag(base: str, isa: str, revision: str) -> str:
+    """Name one source-pinned sibling without changing the public ISA grammar."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("develop publication requires a full Git revision")
+    return runtime_tag(f"{base}-{revision}", isa)
+
+
+def remote_image_id(tag: str) -> str | None:
+    """Read a registry tag's config digest before writing a source-pinned alias.
+
+    A missing manifest is the only admissible cache miss; auth or transport
+    errors must never masquerade as permission to overwrite a ref tag.
+    """
+    probe = subprocess.run(["docker", "buildx", "imagetools", "inspect", "--raw", tag],
+                           capture_output=True, text=True, check=False)
+    if probe.returncode != 0:
+        if any(marker in probe.stderr.lower() for marker in ("not found", "manifest unknown")):
+            return None
+        raise subprocess.CalledProcessError(probe.returncode, probe.args,
+                                            output=probe.stdout, stderr=probe.stderr)
+    manifest = json.loads(probe.stdout)
+    identity = manifest.get("config", {}).get("digest")
+    if not isinstance(identity, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
+        raise ValueError("source-pinned registry tag is not a single-platform image")
+    return identity
 
 
 def run_prerequisites(images: dict, directory: Path) -> dict:
@@ -69,15 +97,22 @@ def run_prerequisites(images: dict, directory: Path) -> dict:
     return report
 
 
-def publish_runtime(images: dict, isa: str, base: str, directory: Path) -> dict:
-    """Publish one tested runtime by immutable local ID, never a mutable build tag."""
+def publish_runtime(images: dict, isa: str, base: str, revision: str,
+                    directory: Path) -> dict:
+    """Publish a tested source-ref alias before moving its branch alias."""
     runtime = images[ImageRole.RUNTIME.value]
     tag = runtime_tag(base, isa)
-    run(["docker", "tag", runtime["id"], tag], directory / "publish.log")
-    if image_identity(tag)["id"] != runtime["id"]:
-        raise ValueError("develop publication tag no longer names its tested runtime image")
-    run(["docker", "push", tag], directory / "publish.log")
-    return {"tag": tag, "image": runtime["id"]}
+    pinned = revision_tag(base, isa, revision)
+    existing = remote_image_id(pinned)
+    if existing is not None and existing != runtime["id"]:
+        raise ValueError("source-pinned develop tag already names different image bytes")
+    for alias in (pinned, tag):
+        run(["docker", "tag", runtime["id"], alias], directory / "publish.log")
+        if image_identity(alias)["id"] != runtime["id"]:
+            raise ValueError("develop publication tag no longer names its tested runtime image")
+        if alias != pinned or existing is None:
+            run(["docker", "push", alias], directory / "publish.log")
+    return {"tag": tag, "ref_tag": pinned, "image": runtime["id"]}
 
 
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
@@ -141,8 +176,8 @@ def main(argv: list[str] | None = None) -> int:
             for isa in args.cpu_isas:
                 images = {ImageRole.TEST_RUNNER.value: {"id": receipt["variants"][isa]["test_runner_image"]},
                           ImageRole.RUNTIME.value: {"id": receipt["variants"][isa]["runtime_image"]}}
-                receipt["variants"][isa]["publication"] = publish_runtime(images, isa, args.image,
-                                                                             args.output / isa.lower())
+                receipt["variants"][isa]["publication"] = publish_runtime(
+                    images, isa, args.image, source["revision"], args.output / isa.lower())
                 write_json(args.output / "develop-image-gate.json", receipt)
             receipt["published"] = True
         write_json(args.output / "develop-image-gate.json", receipt)

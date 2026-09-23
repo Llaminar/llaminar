@@ -1647,6 +1647,58 @@ class BenchmarkPolicyTests(unittest.TestCase):
                     benchmark.main([*argv, "--e2e-report", str(path / "e2e.json")])
                 hardware.assert_not_called()
 
+    def test_local_binary_requires_diagnostic_and_never_inspects_an_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            artifacts.write_json(path / "manifest.json", manifest())
+            argv = ["--manifest", str(path / "manifest.json"), "--source-revision", "revision",
+                    "--diagnostic-binary", sys.executable, "--report", str(path / "out.json")]
+            with patch.object(benchmark, "image_identity") as inspect, \
+                 patch.object(benchmark, "hardware_identity", side_effect=RuntimeError("admitted")):
+                with self.assertRaises(SystemExit) as error:
+                    benchmark.main(argv)
+                self.assertEqual(error.exception.code, 2)
+                with self.assertRaisesRegex(RuntimeError, "admitted"):
+                    benchmark.main([*argv, "--diagnostic"])
+                inspect.assert_not_called()
+
+    def test_local_binary_uses_canonical_argv_without_docker_and_keeps_output_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            artifacts.write_json(path / "benchmark.json", measurement())
+            with patch.object(benchmark.subprocess, "Popen") as launch, \
+                 patch.object(benchmark.docker_paths, "device_args") as devices:
+                launch.return_value.wait.return_value = 0
+                result = benchmark.run_cell(None, "CUDA", path, path / "model.gguf",
+                                            cell()["configuration"], workload(),
+                                            diagnostic_binary=Path(sys.executable))
+            self.assertEqual(result, measurement())
+            command = launch.call_args.args[0]
+            self.assertEqual(command[0], sys.executable)
+            self.assertEqual(command[1:], benchmark.benchmark_arguments(
+                cell()["configuration"], str(path / "model.gguf"),
+                str(path / "benchmark.json"), workload()))
+            self.assertTrue(launch.call_args.kwargs["start_new_session"])
+            environment = launch.call_args.kwargs["env"]
+            self.assertEqual(environment["LLAMINAR_BENCHMARK_ITERATIONS"], "3")
+            self.assertEqual(environment["LLAMINAR_BENCHMARK_WARMUP_ITERATIONS"], "1")
+            devices.assert_not_called()
+
+    def test_local_binary_timeout_retires_its_mpi_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with patch.object(benchmark.subprocess, "Popen") as launch, \
+                 patch.object(benchmark.os, "killpg") as retire:
+                launch.return_value.pid = 12345
+                launch.return_value.wait.side_effect = [
+                    subprocess.TimeoutExpired("local benchmark", 900), 0]
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    benchmark.run_cell(None, "CUDA", path, path / "model.gguf",
+                                       cell()["configuration"], workload(),
+                                       diagnostic_binary=Path(sys.executable))
+            retire.assert_called_once_with(12345, signal.SIGKILL)
+            self.assertEqual(launch.return_value.wait.call_count, 2)
+
     def test_timeout_retires_the_exact_container_and_never_inherits_profiling(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

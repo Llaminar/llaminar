@@ -16,7 +16,10 @@ routes local development checks, model diagnostics, and this full image gate.
 full-backend test-runner/runtime pairs, runs the complete Unit and
 `ProductionTestPreflight` transaction inside each test runner, then publishes
 only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
-`ghcr.io/llaminar/llaminar:develop-avx2`. It does not run model discovery,
+`ghcr.io/llaminar/llaminar:develop-avx2`. It also publishes source-pinned
+`develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags for
+the same tested bytes. A conflicting existing source-pinned tag is fatal; the
+branch tags are movable. It does not run model discovery,
 generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
 or image certification. Its test runner contains the complete model-free
 Unit/preflight inventory but not diagnostic model-parity matrices needed only
@@ -181,6 +184,59 @@ flowchart TD
     C --> O[Explicit full-certification publication: both images and one combined result commit]
 ```
 
+## Master PR certification and release
+
+A same-repository PR from `develop` to `master` triggers
+`.github/workflows/master-pr-certification.yml`. Its first job waits for the
+successful develop push image gate at the PR's **exact head SHA**. It never
+substitutes the mutable `develop` tag. The required E2E check pulls that
+source-pinned AVX512/AVX2 pair, verifies image labels and source tree, and runs
+the full canonical HTTP suite. The required benchmark check then consumes the
+completed E2E pair receipt and runs every tagged benchmark cell on those same
+image digests. Both jobs retain compact per-ISA JSON evidence; benchmarks do
+not run after an E2E failure. A complete red benchmark report still lets the
+other ISA finish, so the PR receives a per-cell red/amber/green table of both
+prefill and decode numbers. A red phase fails the required benchmark check;
+amber is below the prior high-water mark but inside the configured tolerance.
+The branch-policy check admits only `develop`.
+
+`scripts/ci/apply_master_ruleset.py` installs the four required GitHub Actions
+checks on the existing master ruleset with strict up-to-date PR semantics and
+squash-only merge. It also activates the existing develop deletion and
+force-push guard, so GitHub's auto-delete-on-merge setting cannot remove the
+persistent source branch. This guard does not add a PR, status-check, or
+linear-history requirement to develop: the post-squash publisher must record
+the certified master commit as a second parent of its fast-forward evidence
+commit, making the next develop PR up-to-date with master without rewriting
+either branch.
+Run the installer without `--apply` to inspect both proposals; only apply
+after the PR workflow has emitted its checks. A manual-dispatch workflow
+run cannot satisfy a required PR check, so the diagnostic workflows below are
+not substitutes for this gate.
+
+After the certified PR is squash-merged, `.github/workflows/release.yml`
+validates that the resulting **master tree** equals the tested develop image
+tree. Its publisher revalidates both E2E reports, both complete benchmark
+reports, the exact image pair and the successful PR workflow before making any
+registry change. It creates a dated GitHub release such as `2026-09-23.1`,
+then `.2` if another merge releases that UTC day. The first release has concise
+bootstrap notes; later releases list commits since the previous release. The
+release attaches the E2E receipts/reports, benchmark JSON and SVG chart. It
+promotes the certified image digests to the dated tags,
+`master-<full master SHA>` / `master-avx2-<full master SHA>`, and finally the
+movable `master` / `master-avx2` tags. No image is rebuilt on master.
+After release publication, a separate dependent job advances the combined
+upward-only high-water marks and checked-in benchmark result/chart on `develop`
+with a two-parent `[skip ci]` evidence commit. Its first parent is the tested
+develop head; its second parent is the same-tree squash commit just certified
+on master. This must happen **after merge**: putting a
+skip-ci commit on the open PR head would leave required PR checks pending on an
+untested revision. The publication is fast-forward-only and refuses a
+concurrent develop change; a failed high-water job can be rerun independently
+of the successful release job. The evidence-only `[skip ci]` commit is not a
+new release candidate by itself: wait for the next ordinary develop source
+commit and its exact-ref image build before opening another master PR.
+
 ## Manual published-image workflows
 
 Two separate **manual-dispatch-only** workflows consume the branch's existing
@@ -278,8 +334,9 @@ passed those gates.
 Local runs do not commit implicitly; `--publish` explicitly enables the same
 branch publication as Actions. Publication uses a private index and a normal
 fast-forward push, retaining concurrent source changes and leaving the user's
-checkout/index untouched. The bookkeeping commit includes `[skip ci]` so a
-chart update does not rebuild the measured images. Full logs stay in Actions
+checkout/index untouched. The bookkeeping commit also receives a develop
+source-pinned image pair through the ordinary CI gate; skipping CI would leave
+the next master PR without an image for its exact head SHA. Full logs stay in Actions
 artifacts; `benchmarks/production/published/results.json` and `benchmarks.svg`
 are the compact checked-in evidence. These workflows do **not** run saved-token
 or remote-MPI regression, mint a full production-image certificate, modify

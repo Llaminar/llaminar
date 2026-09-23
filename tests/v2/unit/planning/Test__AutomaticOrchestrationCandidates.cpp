@@ -16,6 +16,7 @@
 #include "utils/NUMATopology.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <map>
 #include <set>
 
 using namespace llaminar2;
@@ -394,6 +395,164 @@ TEST(AutomaticOrchestrationCandidates,
         EXPECT_NE(domains[0].owner_rank, domains[1].owner_rank);
         compile(proposal, true);
     }
+}
+
+/**
+ * @brief A public auto request can require every participant in three tiers.
+ *
+ * Both MPI ranks see the same GPUs, but only the rank on the other socket can
+ * execute the foreign GPU tier. CPU remains a two-socket domain rather than
+ * two idle one-socket decorations. Search may also propose finer GPU-tier
+ * partitions; every published candidate still compiles and keeps the exact
+ * requested physical counts.
+ */
+TEST(AutomaticOrchestrationCandidates,
+     MultiTierOverlayUsesAllCUDAAndROCmAndCPUParticipants)
+{
+    auto inventory = hosts(2);
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].local_rank = 1;
+    cards(inventory, 0, DeviceType::CUDA, 2);
+    cards(inventory, 0, DeviceType::ROCm, 4);
+    for (auto &gpu : inventory.ranks[0].gpus)
+        if (gpu.type == DeviceType::ROCm)
+            gpu.numa_node = inventory.ranks[1].cpu.numa_node;
+    inventory.ranks[1].gpus = inventory.ranks[0].gpus;
+    inventory.buildNodeAggregations();
+
+    auto config = request({DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm},
+        {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {
+        {DeviceType::CPU, 2}, {DeviceType::CUDA, 2}, {DeviceType::ROCm, 4}};
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_FALSE(proposals.empty());
+    bool three_tier_cuda_continuation = false;
+    for (const auto &proposal : proposals)
+    {
+        const auto &overlay = *proposal.config.moe_routed_expert_plan;
+        ASSERT_GE(overlay.domains.size(), 3u);
+        ASSERT_EQ(overlay.routed_tiers.size(), overlay.domains.size());
+        EXPECT_EQ(proposal.membership.discoveryRanks().size(), 2u);
+        std::map<DeviceType, std::size_t> participant_counts;
+        for (std::size_t index = 0; index < overlay.domains.size(); ++index)
+        {
+            const auto &domain = overlay.domains[index];
+            EXPECT_EQ(overlay.routed_tiers[index].domain, domain.name);
+            EXPECT_EQ(overlay.routed_tiers[index].priority,
+                      static_cast<int>(index));
+            for (const auto &participant : domain.participants)
+                ++participant_counts[participant.device_type];
+        }
+        EXPECT_EQ(participant_counts[DeviceType::CUDA], 2u);
+        EXPECT_EQ(participant_counts[DeviceType::ROCm], 4u);
+        EXPECT_EQ(participant_counts[DeviceType::CPU], 2u);
+        three_tier_cuda_continuation |=
+            overlay.domains.size() == 3u &&
+            overlay.domains.front().participants.front().isCUDA();
+        compile(proposal, true);
+    }
+    EXPECT_TRUE(three_tier_cuda_continuation);
+}
+
+/**
+ * @brief Search depth follows disjoint physical ownership, not a tier limit.
+ *
+ * A second CUDA owner rank cannot be folded into the first rank-local GPU
+ * domain. The planner must therefore represent two CUDA domains, one ROCm
+ * domain, and a node-wide CPU domain in the same candidate.
+ */
+TEST(AutomaticOrchestrationCandidates,
+     MultiTierOverlayCanExtendBeyondThreeDomains)
+{
+    auto inventory = hosts(3);
+    for (int rank = 1; rank < 3; ++rank)
+    {
+        inventory.ranks[rank].node_id = inventory.ranks[0].node_id;
+        inventory.ranks[rank].hostname = inventory.ranks[0].hostname;
+        inventory.ranks[rank].local_rank = rank;
+    }
+    cards(inventory, 0, DeviceType::CUDA, 1);
+    cards(inventory, 1, DeviceType::ROCm, 1);
+    cards(inventory, 2, DeviceType::CUDA, 1);
+    inventory.ranks[2].gpus.front().local_device_id = 5;
+    inventory.ranks[2].gpus.front().uuid = "cuda-other-owner";
+    inventory.buildNodeAggregations();
+
+    auto config = request({DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm},
+        {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {
+        {DeviceType::CPU, 3}, {DeviceType::CUDA, 2}, {DeviceType::ROCm, 1}};
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_FALSE(proposals.empty());
+    bool four_domains = false;
+    for (const auto &proposal : proposals)
+    {
+        const auto &overlay = *proposal.config.moe_routed_expert_plan;
+        if (overlay.domains.size() != 4u) continue;
+        four_domains = true;
+        ASSERT_EQ(overlay.routed_tiers.size(), 4u);
+        for (std::size_t index = 0; index < overlay.routed_tiers.size(); ++index)
+            EXPECT_EQ(overlay.routed_tiers[index].priority,
+                      static_cast<int>(index));
+        compile(proposal, true);
+    }
+    EXPECT_TRUE(four_domains);
+
+    // Omission of cardinality is still genuine auto search: it must not
+    // silently restore the historical pair-only domain ceiling.
+    config.automatic_planning.device_counts.reset();
+    const auto unconstrained = candidates(config, inventory, true);
+    EXPECT_TRUE(std::any_of(unconstrained.begin(), unconstrained.end(),
+        [](const AutomaticOrchestrationCandidate &proposal)
+        {
+            return proposal.config.moe_routed_expert_plan &&
+                   proposal.config.moe_routed_expert_plan->domains.size() >= 4u;
+        }));
+}
+
+/**
+ * @brief Adding another independently owned GPU pool adds another tier.
+ *
+ * The mixed-vendor planner must not replace the old pair-only ceiling with a
+ * new fixed count. Each GPU pool below belongs to a distinct rank; the CPU
+ * domain spans all four NUMA owners on the same physical node.
+ */
+TEST(AutomaticOrchestrationCandidates,
+     MultiTierOverlayCanExtendToFiveDomains)
+{
+    auto inventory = hosts(4);
+    for (int rank = 1; rank < 4; ++rank)
+    {
+        inventory.ranks[rank].node_id = inventory.ranks[0].node_id;
+        inventory.ranks[rank].hostname = inventory.ranks[0].hostname;
+        inventory.ranks[rank].local_rank = rank;
+    }
+    cards(inventory, 0, DeviceType::CUDA, 1);
+    cards(inventory, 1, DeviceType::ROCm, 1);
+    cards(inventory, 2, DeviceType::CUDA, 1);
+    cards(inventory, 3, DeviceType::ROCm, 1);
+    inventory.ranks[2].gpus.front().local_device_id = 5;
+    inventory.ranks[2].gpus.front().uuid = "cuda-other-owner";
+    inventory.ranks[3].gpus.front().local_device_id = 5;
+    inventory.ranks[3].gpus.front().uuid = "rocm-other-owner";
+    inventory.buildNodeAggregations();
+
+    auto config = request({DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm},
+        {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {
+        {DeviceType::CPU, 4}, {DeviceType::CUDA, 2}, {DeviceType::ROCm, 2}};
+    const auto proposals = candidates(config, inventory, true);
+    const auto found = std::find_if(proposals.begin(), proposals.end(),
+        [](const AutomaticOrchestrationCandidate &proposal)
+        {
+            const auto &overlay = proposal.config.moe_routed_expert_plan;
+            return overlay && overlay->domains.size() == 5u &&
+                   overlay->domains.front().participants.front().isCUDA();
+        });
+    ASSERT_NE(found, proposals.end());
+    ASSERT_EQ(found->config.moe_routed_expert_plan->routed_tiers.size(), 5u);
+    compile(*found, true);
 }
 
 TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsUsePhysicalNotRankCardinality)

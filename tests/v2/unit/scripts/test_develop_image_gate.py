@@ -43,7 +43,7 @@ class DevelopImageGateTests(unittest.TestCase):
 
     def test_builds_and_tests_both_images_before_any_publication(self):
         """The two required gates finish before either mutable registry tag moves."""
-        source = {"revision": "revision", "tree": "tree", "dirty": False}
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
         events = []
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "output"
@@ -58,14 +58,17 @@ class DevelopImageGateTests(unittest.TestCase):
                 events.append(("prerequisites", built["runtime"]["id"]))
                 return prerequisite_report()
 
-            def publish(built, isa, tag, directory):
+            def publish(built, isa, tag, revision, directory):
+                self.assertEqual(revision, source["revision"])
                 if isa == "AVX512":
                     self.assertEqual(events, [
                         ("build", "AVX512"), ("prerequisites", "runtime-avx512"),
                         ("build", "AVX2"), ("prerequisites", "runtime-avx2"),
                     ])
                 events.append(("publish", isa))
-                return {"tag": gate.runtime_tag(tag, isa), "image": built["runtime"]["id"]}
+                return {"tag": gate.runtime_tag(tag, isa),
+                        "ref_tag": gate.revision_tag(tag, isa, revision),
+                        "image": built["runtime"]["id"]}
 
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "device_lease", side_effect=lambda: nullcontext()), \
@@ -88,10 +91,12 @@ class DevelopImageGateTests(unittest.TestCase):
                              gate.TestRunnerInventory.MODEL_FREE.value)
             self.assertEqual(receipt["variants"]["AVX2"]["publication"]["tag"],
                              "ghcr.io/llaminar/llaminar:develop-avx2")
+            self.assertEqual(receipt["variants"]["AVX2"]["publication"]["ref_tag"],
+                             "ghcr.io/llaminar/llaminar:develop-" + "a" * 40 + "-avx2")
 
     def test_a_failed_preflight_prevents_every_registry_mutation(self):
         """No public tag moves until every image has passed its own installed gate."""
-        source = {"revision": "revision", "tree": "tree", "dirty": False}
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "output"
             with patch.object(gate, "source_identity", return_value=source), \
@@ -104,6 +109,45 @@ class DevelopImageGateTests(unittest.TestCase):
                     gate.main(["--output", str(output), "--publish",
                                "--image", "ghcr.io/llaminar/llaminar:develop"])
             publish.assert_not_called()
+
+    def test_ref_tag_is_immutable_and_published_before_mutable_branch(self):
+        source = "a" * 40
+        runtime = {"runtime": {"id": "sha256:" + "1" * 64}}
+        base = "ghcr.io/llaminar/llaminar:develop"
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(gate, "remote_image_id", return_value=None), \
+                 patch.object(gate, "run") as execute, \
+                 patch.object(gate, "image_identity", return_value=runtime["runtime"]):
+                result = gate.publish_runtime(runtime, "AVX2", base, source, directory)
+            pinned = base + "-" + source + "-avx2"
+            mutable = base + "-avx2"
+            self.assertEqual(result["ref_tag"], pinned)
+            self.assertEqual([call.args[0][:2] for call in execute.call_args_list],
+                             [["docker", "tag"], ["docker", "push"],
+                              ["docker", "tag"], ["docker", "push"]])
+            self.assertEqual(execute.call_args_list[1].args[0][-1], pinned)
+            self.assertEqual(execute.call_args_list[3].args[0][-1], mutable)
+            with patch.object(gate, "remote_image_id", return_value="sha256:" + "2" * 64), \
+                 patch.object(gate, "run") as execute:
+                with self.assertRaisesRegex(ValueError, "different image bytes"):
+                    gate.publish_runtime(runtime, "AVX2", base, source, directory)
+                execute.assert_not_called()
+
+    def test_registry_probe_distinguishes_missing_from_transport_failure(self):
+        manifest = '{"config":{"digest":"sha256:' + "1" * 64 + '"}}'
+        with patch.object(gate.subprocess, "run", return_value=type("Result", (), {
+                "returncode": 0, "stdout": manifest, "stderr": ""})()):
+            self.assertEqual(gate.remote_image_id("example:ref"), "sha256:" + "1" * 64)
+        with patch.object(gate.subprocess, "run", return_value=type("Result", (), {
+                "returncode": 1, "stdout": "", "stderr": "manifest unknown",
+                "args": ["docker"]})()):
+            self.assertIsNone(gate.remote_image_id("example:missing"))
+        with patch.object(gate.subprocess, "run", return_value=type("Result", (), {
+                "returncode": 1, "stdout": "", "stderr": "network unavailable",
+                "args": ["docker"]})()):
+            with self.assertRaises(gate.subprocess.CalledProcessError):
+                gate.remote_image_id("example:failed")
 
 
 if __name__ == "__main__":

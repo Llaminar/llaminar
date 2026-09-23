@@ -1,143 +1,133 @@
-name: Release
+name: Master release — promote PR-certified images
 
+# Master accepts only a develop PR whose published-image E2E and benchmark
+# checks passed. The merge is normally squashed, so the release validates the
+# resulting tree against the tested develop image rather than equating SHAs.
 on:
   push:
     branches: [master]
 
-# Cancel stale runs for the same branch.
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
   packages: write
-  pull-requests: write
-  issues: write
+  actions: read
+  pull-requests: read
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+concurrency:
+  group: llaminar-master-release
+  cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Release Please maintains a standing release PR from conventional commits
-  # that land on master. When that PR is merged, release-please creates a
-  # GitHub Release + tag; the subsequent push (the release commit itself)
-  # triggers the publish job below with a concrete version number.
-  # ---------------------------------------------------------------------------
-  release-please:
-    name: Release Please
-    runs-on: ubuntu-24.04
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      major: ${{ steps.release.outputs.major }}
-      minor: ${{ steps.release.outputs.minor }}
-      patch: ${{ steps.release.outputs.patch }}
-      version: ${{ steps.release.outputs.version }}
-    steps:
-      - uses: googleapis/release-please-action@v4
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-
-  # ---------------------------------------------------------------------------
-  # Re-run the full CI gate suite on master pushes. Ensures that a direct
-  # commit to master (or the merge commit from a develop→master PR) still has
-  # all gates pass before we ship anything.
-  # ---------------------------------------------------------------------------
-  ci:
-    name: CI gates
-    needs: release-please
-    uses: ./.github/workflows/ci.yml
-    secrets: inherit
-    with:
-      image-tag: ${{ needs.release-please.outputs.tag_name || github.sha }}
-
-  # ---------------------------------------------------------------------------
-  # On a release commit, the CI workflow above has already built and pushed
-  # the versioned runtime image (tag = release tag_name, e.g. v0.1.0). Here
-  # we just add the semver aliases (latest, major, major.minor) pointing at
-  # the same digest, and edit the GitHub Release notes to reference it.
-  # ---------------------------------------------------------------------------
-  publish-release:
-    name: Publish release artefacts
-    if: needs.release-please.outputs.release_created == 'true'
-    needs: [release-please, ci]
+  promote:
+    name: Promote exact images and publish dated GitHub release
     runs-on: [llaminar-xeon-host]
-    timeout-minutes: 30
+    timeout-minutes: 90
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Alias versioned image to latest / major / major.minor
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-          MAJOR: ${{ needs.release-please.outputs.major }}
-          MINOR: ${{ needs.release-please.outputs.minor }}
-          CERTIFIED_AVX512: ${{ needs.ci.outputs.image-ref-avx512 }}
-          CERTIFIED_AVX2: ${{ needs.ci.outputs.image-ref-avx2 }}
+      - name: Retire legacy checkout evidence before Actions cleans the worktree
+        shell: bash
         run: |
           set -euo pipefail
-          for isa in AVX512 AVX2; do
-            suffix=""
-            SRC="${CERTIFIED_AVX512}"
-            if [[ "$isa" == AVX2 ]]; then
-              suffix="-avx2"
-              SRC="${CERTIFIED_AVX2}"
-            fi
-            docker pull "${SRC}"
-            for alias in latest "${MAJOR}" "${MAJOR}.${MINOR}"; do
-              dst="${REGISTRY}/${IMAGE_NAME,,}:${alias}${suffix}"
-              docker tag "${SRC}" "${dst}"
-              docker push "${dst}"
-            done
-            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${SRC}" | awk -F'@' '{print $2}')
-            echo "DIGEST_${isa}=${DIGEST}" >> "${GITHUB_ENV}"
-          done
-
-      - name: Attach image reference to release
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          legacy="$GITHUB_WORKSPACE/parity-results"
+          if [[ -d "$legacy" ]]; then
+            docker run --rm --user 0:0 --entrypoint /bin/rm \
+              --mount "type=bind,src=$legacy,dst=/legacy" \
+              "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
+              -rf /legacy/published-e2e /legacy/published-benchmarks
+          fi
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
+      - name: Install GitHub CLI on a minimal ARC runner
+        shell: bash
         run: |
-          cat > /tmp/release-note.md <<EOF
-          ## Docker image
+          set -euo pipefail
+          if ! command -v gh >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends gh
+          fi
+          gh --version
+      - name: Authenticate PR evidence and promote the exact runtime bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MASTER_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/publish_master_release.py \
+            --repository "$REPOSITORY" --master-sha "$MASTER_SHA" \
+            --output "$RUNNER_TEMP/llaminar-master-release-$GITHUB_RUN_ID"
+      - name: Retain master release receipt and notes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-release-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/llaminar-master-release-${{ github.run_id }}/master-release.json
+            ${{ runner.temp }}/llaminar-master-release-${{ github.run_id }}/release-notes.md
+          if-no-files-found: warn
+          retention-days: 90
 
-          Published to GitHub Container Registry:
-
-          \`\`\`
-          docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}
-          docker pull ${REGISTRY}/${IMAGE_NAME}:latest
-          docker pull ${REGISTRY}/${IMAGE_NAME}:${TAG}-avx2
-          docker pull ${REGISTRY}/${IMAGE_NAME}:latest-avx2
-          \`\`\`
-
-          Independently certified image digests:
-          AVX512: \`${DIGEST_AVX512}\`
-          AVX2: \`${DIGEST_AVX2}\`
-
-          ### Quick start
-
-          \`\`\`
-          docker run --gpus all --rm -it \\
-              -v /path/to/models:/models:ro \\
-              -p 8080:8080 \\
-              ${REGISTRY}/${IMAGE_NAME}:${TAG} \\
-              --serve --port 8080 -d cuda:0 -m /models/<your-model>.gguf
-          \`\`\`
-          EOF
-          gh release view "${TAG}" --json body --jq .body > /tmp/existing-body.md || echo "" > /tmp/existing-body.md
-          cat /tmp/existing-body.md /tmp/release-note.md > /tmp/final-body.md
-          gh release edit "${TAG}" --notes-file /tmp/final-body.md
+  high_water:
+    name: Persist PR-certified high water on develop
+    needs: promote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends gh
+          fi
+      - name: Commit upward-only benchmark marks and numbers after merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MASTER_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/publish_pr_high_water.py \
+            --repository "$REPOSITORY" --master-sha "$MASTER_SHA" \
+            --output "$RUNNER_TEMP/llaminar-pr-high-water-$GITHUB_RUN_ID"
+      - name: Retain high-water publication receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-high-water-${{ github.sha }}
+          path: ${{ runner.temp }}/llaminar-pr-high-water-${{ github.run_id }}/high-water-publication.json
+          if-no-files-found: warn
+          retention-days: 90

@@ -1248,7 +1248,7 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
     };
 
     /** @return Every unique 122B ExpertOverlay topology in the production matrix. */
-    const std::array<Qwen122OverlayTopologySpec, 9> &
+    const std::array<Qwen122OverlayTopologySpec, 10> &
     qwen122OverlayTopologySpecs();
 
     /**

@@ -238,7 +238,7 @@ TEST(Qwen122NumericalThresholdGeometry,
  *
  * Every Dynamic cell still proves physical movement. Matched throughput is
  * intentionally sampled once for CUDA/CPU and once for ROCm/CPU rather than
- * multiplied over all nine topologies, both owner orders, and six MTP modes.
+ * multiplied over all ten topologies, both owner orders, and six MTP modes.
  */
 TEST(Qwen122DynamicWaveGeometry,
      ProductionMatrixSelectsOnlyTypedTransportSpeedupWitnesses)
@@ -282,8 +282,8 @@ TEST(Qwen122DynamicWaveGeometry,
         }
     }
 
-    EXPECT_EQ(dynamic_cells, 108u);
-    EXPECT_EQ(movement_only_cells, 106u);
+    EXPECT_EQ(dynamic_cells, 120u);
+    EXPECT_EQ(movement_only_cells, 118u);
     EXPECT_EQ(
         witness_topologies,
         (std::set<std::string>{
@@ -291,8 +291,8 @@ TEST(Qwen122DynamicWaveGeometry,
             "CUDA2_CPU2_2xMPI_NodeExpertOverlay",
         }));
 }
-/** @brief HTTP certification tags select four existing Dynamic/adaptive cells only. */
-TEST(Qwen122E2ECertification, SelectsInitialTopologySubsetWithoutExpandingParity)
+/** @brief HTTP certification tags select five existing Dynamic/adaptive cells only. */
+TEST(Qwen122E2ECertification, SelectsTaggedTopologySubsetWithoutExpandingParity)
 {
     std::set<std::string> selected;
     for (const auto &spec : qwen122OverlayTopologySpecs())
@@ -342,7 +342,63 @@ TEST(Qwen122E2ECertification, SelectsInitialTopologySubsetWithoutExpandingParity
         "ROCm2_CPU2_2xMPI_NodeExpertOverlay",
         "ROCm4_CPU2_2xMPI_NodeExpertOverlay",
         "CUDA2_ROCm4_2xMPI_NodeExpertOverlay",
+        "CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay",
     }));
+}
+
+/**
+ * @brief Pin the three-tier 122B certificate to one canonical topology.
+ *
+ * The mathematical cell declares the tier order, while HTTP certification
+ * exports only strategy and physical device-count constraints. This test
+ * prevents either projection from silently becoming a two-tier case.
+ */
+TEST(Qwen122E2ECertification, ThreeTierCellRequiresAllEightParticipants)
+{
+    constexpr std::string_view kTopologyId =
+        "CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay";
+    const auto &cases = qwen122ExpertOverlayParityCases();
+    const auto found = std::find_if(
+        cases.begin(), cases.end(),
+        [kTopologyId](const ModelParityCase &cell)
+        {
+            return cell.topology.test_id == kTopologyId &&
+                   cell.e2e_certification.has_value();
+        });
+    ASSERT_NE(found, cases.end());
+    const auto &cell = *found;
+    ASSERT_TRUE(cell.topology.expert_overlay_plan);
+    const auto &plan = *cell.topology.expert_overlay_plan;
+    ASSERT_EQ(plan.domains.size(), 3u);
+    ASSERT_EQ(plan.routed_tiers.size(), 3u);
+    EXPECT_EQ(plan.continuation_domain, plan.domains.front().name);
+    EXPECT_EQ(plan.domains[0].backend, CollectiveBackendType::NCCL);
+    EXPECT_EQ(plan.domains[1].backend, CollectiveBackendType::RCCL);
+    EXPECT_EQ(plan.domains[2].backend, CollectiveBackendType::UPI);
+    EXPECT_EQ(plan.domains[0].participants.size(), 2u);
+    EXPECT_EQ(plan.domains[1].participants.size(), 4u);
+    EXPECT_EQ(plan.domains[2].participants.size(), 2u);
+    for (std::size_t i = 0; i < plan.routed_tiers.size(); ++i)
+    {
+        EXPECT_EQ(plan.routed_tiers[i].domain, plan.domains[i].name);
+        EXPECT_EQ(plan.routed_tiers[i].priority, static_cast<int>(i));
+    }
+    EXPECT_TRUE(plan.routed_tiers.back().fallback);
+
+    const auto arguments = modelParityServerArguments(
+        cell, ModelParityRuntimePlacementProjection::AutomaticCell);
+    const auto value_for = [&](std::string_view flag) -> std::string
+    {
+        const auto flag_it = std::find(arguments.begin(), arguments.end(),
+                                       std::string(flag));
+        if (flag_it == arguments.end() || std::next(flag_it) == arguments.end())
+            throw std::logic_error("Missing automatic E2E constraint: " +
+                                   std::string(flag));
+        return *std::next(flag_it);
+    };
+    EXPECT_EQ(value_for("--only-backends"), "cpu,cuda,rocm");
+    EXPECT_EQ(value_for("--auto-device-counts"), "cpu=2,cuda=2,rocm=4");
+    EXPECT_EQ(value_for("--only-strategies"), "expert-overlay");
 }
 
 INSTANTIATE_TEST_SUITE_P(

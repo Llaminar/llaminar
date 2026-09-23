@@ -285,7 +285,8 @@ homogeneous stage groups and layer boundary; CUDA and ROCm never form one
 vendor-native TP collective. The Qwen3.5 MoE 122B topology declarations
 also select Dynamic movement, ordinal initial placement, and dynamic-depth MTP
 for two CUDA GPUs plus two CPU sockets, two or four ROCm GPUs plus two CPU
-sockets, and two CUDA GPUs plus four ROCm GPUs. Mathematical diagnostics retain
+sockets, two CUDA GPUs plus four ROCm GPUs, and that mixed-GPU topology with
+two CPU sockets as a third tier. Mathematical diagnostics retain
 their declared continuation and tier order. HTTP auto selection constrains
 backend counts and the ExpertOverlay family but chooses domain roles and
 capacity using measured topology costs. On the certification host the GPUs
