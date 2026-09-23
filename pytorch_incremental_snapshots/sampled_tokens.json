@@ -1,9 +1,0 @@
-{
-  "sampled_tokens": [
-    6,
-    25010,
-    10
-  ],
-  "num_tokens": 3,
-  "description": "Greedy-sampled tokens from incremental decode"
-}

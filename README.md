@@ -3,7 +3,7 @@ An LLM inferencing engine in C++, with custom quantised kernels for CPU AVX512-V
 
 Llaminar tries to solve a variety of problems encountered in other projects:
 
-* **Tensor and Pipeline Parallelism:** natively supported, mix and match heterogenous domains.
+* **Tensor, Pipeline, and Expert Parallelism:** natively supported, mix and match heterogenous domains.
 * **Multiple vendors:** Mix and match CPU, ROCm and CUDA, simultaneously and natively.
 * **Easy scaling:** Built from the ground-up on OpenMPI with the goal of enabling scaling across clusters of machines. NUMA-aware.
 * **IaC-like experience:** Plan, then deploy.
@@ -13,6 +13,8 @@ Llaminar is **experimental** and very much in an **alpha** stage of development.
 [Quickstart](#quickstart) · [Planning and topology](#planning-and-topology) ·
 [Benchmarks](#benchmarks) · [Development](#development) ·
 [Architecture](#llaminar-architecture)
+
+**Discord:** https://discord.com/channels/1404857025854312528/1519609695793446979
 
 ## Supported Hardware
 
