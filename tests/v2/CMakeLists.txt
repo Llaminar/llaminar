@@ -2875,6 +2875,23 @@ set_tests_properties(V2_Integration_AutomaticMpiRankEvidence PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_ServerDockerDeviceIntent
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_docker_device_intent.py
+)
+set_tests_properties(V2_Unit_ServerDockerDeviceIntent PROPERTIES
+    LABELS "V2;Unit;E2E;Server;Planning;Container;Regression"
+    TIMEOUT 30
+)
+add_test(NAME V2_Integration_ServerDockerAutoCUDADevices
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_docker_device_intent.py
+)
+set_tests_properties(V2_Integration_ServerDockerAutoCUDADevices PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;E2E;Server;Planning;Container;CUDA;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_AcceleratorBuildTypeFlags
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_accelerator_build_type_flags.py

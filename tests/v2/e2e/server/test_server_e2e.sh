@@ -127,6 +127,7 @@ set -euo pipefail
 # ─── Configuration ────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+source "$SCRIPT_DIR/docker_device_intent.sh"
 
 BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_release/llaminar2}"
 SERVER_MODE="${LLAMINAR_E2E_SERVER_MODE:-local}"
@@ -529,16 +530,6 @@ docker_supports_nvidia_gpus() {
     # run path so devcontainers do not incorrectly fall back to manual mounts.
     [[ -n "${CONTAINER_IMAGE:-}" ]] || return 1
     docker run --rm --gpus all --entrypoint /bin/true "$CONTAINER_IMAGE" >/dev/null 2>&1
-}
-
-docker_args_need_cuda() {
-    local arg
-    for arg in "$@"; do
-        case "$arg" in
-            cuda:*|*cuda:*) return 0 ;;
-        esac
-    done
-    return 1
 }
 
 nvidia_driver_lib_path() {
