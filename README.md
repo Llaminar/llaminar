@@ -10,7 +10,8 @@ Llaminar tries to solve a variety of problems encountered in other projects:
 
 Llaminar is **experimental** and very much in an **alpha** stage of development. Use it with that in mind and expect the odd segfault.
 
-[Quickstart](#quickstart) · [Planning and topology](#planning-and-topology) ·
+[Quickstart](#quickstart) · [E2E-tested recipes](#e2e-tested-auto-recipes) ·
+[Planning and topology](#planning-and-topology) ·
 [Benchmarks](#benchmarks) · [Development](#development) ·
 [Architecture](#llaminar-architecture)
 
@@ -230,7 +231,406 @@ a homogeneous one-domain MoE candidate is currently labeled `tp` even though it
 executes through ExpertOverlay. That filter would exclude it. Do not combine
 auto-search filters with explicit placement or a saved apply plan.
 
-### Explicit placement when needed
+### E2E-tested auto recipes
+
+These recipes cover every topology in the canonical HTTP E2E matrix. Run the
+Quickstart's image, model-directory, and hardware setup first; each command
+then starts one server. Use the NVIDIA, AMD, mixed-vendor, or CPU-only
+`DEVICE_ARGS` block that matches the recipe. The named GGUF must exist under
+`MODEL_DIR`. All examples request the matrix's FP16 KV storage and dynamic MTP;
+multi-participant MoE examples also request Dynamic expert maintenance and
+ordinal initial ownership. The HTTP test harness adds its own workload and
+diagnostic settings, so these are user-facing launch examples, not literal
+test invocations.
+
+`--auto` plus backend, strategy, and device-count constraints asks the planner
+to choose *which* devices, rank ownership, PP layer split, expert tier roles,
+and capacity. The exact count is a requirement: insufficient hardware or
+memory fails admission rather than quietly selecting a smaller topology.
+The two-GPU MoE recipes use `tp` as the auto strategy because their one-domain
+ExpertOverlay execution is classified that way by the planner.
+
+#### Qwen 3.8 dense 27B
+
+<details>
+<summary>1 CUDA GPU · 8K context</summary>
+
+The simplest NVIDIA deployment; no inter-device collective.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends cuda --auto-device-counts cuda=1 \
+  --only-strategies single --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>1 ROCm GPU · 32K context</summary>
+
+The single-MI50 E2E profile uses the larger admitted context.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 32768 \
+  --auto --only-backends rocm --auto-device-counts rocm=1 \
+  --only-strategies single --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA GPUs · tensor parallel</summary>
+
+Both NVIDIA GPUs shard each layer; auto chooses their physical identities.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends cuda --auto-device-counts cuda=2 \
+  --only-strategies tp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 ROCm GPUs · tensor parallel</summary>
+
+Both AMD GPUs shard each layer within one native ROCm collective.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends rocm --auto-device-counts rocm=2 \
+  --only-strategies tp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA GPUs · pipeline parallel</summary>
+
+Auto assigns consecutive model layers to two one-GPU stages.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends cuda --auto-device-counts cuda=2 \
+  --only-strategies pp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 ROCm GPUs · pipeline parallel</summary>
+
+Auto assigns consecutive model layers to two one-GPU stages.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends rocm --auto-device-counts rocm=2 \
+  --only-strategies pp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA + 2 ROCm GPUs · TP within each PP stage</summary>
+
+Auto builds a CUDA TP domain and a ROCm TP domain, then pipelines them. CUDA
+and ROCm do not form one cross-vendor NCCL/RCCL group.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.8-27B-IQ4_XS.gguf --context-length 8192 \
+  --auto --only-backends cuda,rocm \
+  --auto-device-counts cuda=2,rocm=2 --only-strategies pp \
+  --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+#### Qwen 3.6 MoE 35B
+
+<details>
+<summary>1 CUDA GPU · ExpertOverlay on one device</summary>
+
+One GPU owns the routed experts; no inter-device migration is needed.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf --context-length 8192 \
+  --auto --only-backends cuda --auto-device-counts cuda=1 \
+  --only-strategies single --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>1 ROCm GPU · ExpertOverlay on one device</summary>
+
+The same single-device MoE path on one AMD GPU.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf --context-length 8192 \
+  --auto --only-backends rocm --auto-device-counts rocm=1 \
+  --only-strategies single --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 local CPU NUMA endpoints · NodeTP and dynamic expert rebalance</summary>
+
+Use the Quickstart's CPU-only `DEVICE_ARGS=()`. Two local MPI ranks
+participate; the single expert tier can rebalance skew but cannot promote
+between tiers.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf --context-length 8192 \
+  --mpi-procs 2 --auto --only-backends cpu \
+  --auto-device-counts cpu=2 --only-strategies tp \
+  --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+#### Ornith 1.5 MoE 35B
+
+Ornith uses its own `Ornith-1.5-35B-Q4_K_M.gguf` weights, not the Qwen 3.6
+GGUF, even though both use the same MoE model family.
+
+<details>
+<summary>1 ROCm GPU · ExpertOverlay on one device</summary>
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
+  --auto --only-backends rocm --auto-device-counts rocm=1 \
+  --only-strategies single --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA GPUs · one-domain ExpertOverlay</summary>
+
+Both GPUs participate in the homogeneous MoE domain; `tp` is the planner's
+strategy label for this one-domain ExpertOverlay configuration.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
+  --auto --only-backends cuda --auto-device-counts cuda=2 \
+  --only-strategies tp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>2 ROCm GPUs · one-domain ExpertOverlay</summary>
+
+The same homogeneous expert placement on two AMD GPUs.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
+  --auto --only-backends rocm --auto-device-counts rocm=2 \
+  --only-strategies tp --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>2 local CPU NUMA endpoints · NodeTP and dynamic expert rebalance</summary>
+
+Use `DEVICE_ARGS=()`. Two local MPI ranks share the CPU expert tier.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
+  --mpi-procs 2 --auto --only-backends cpu \
+  --auto-device-counts cpu=2 --only-strategies tp \
+  --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+#### Qwen 3.5 MoE 122B
+
+Keep all four `Qwen3.5-122B-A10B-UD-Q8_K_XL` GGUF shards together under
+`MODEL_DIR`; `-m` names the first shard. Each recipe runs two local MPI ranks.
+The planner selects the continuation domain, tier priorities, expert
+capacities, and device-to-rank placement from the observed hardware; the
+backend counts do not hard-code any of those roles.
+
+<details>
+<summary>2 CUDA GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+
+Use the NVIDIA `DEVICE_ARGS` block; the CPU endpoints need no extra Docker
+device mapping.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf \
+  --context-length 8192 --mpi-procs 2 --auto \
+  --only-backends cuda,cpu --auto-device-counts cuda=2,cpu=2 \
+  --only-strategies expert-overlay --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>2 ROCm GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf \
+  --context-length 8192 --mpi-procs 2 --auto \
+  --only-backends rocm,cpu --auto-device-counts rocm=2,cpu=2 \
+  --only-strategies expert-overlay --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>4 ROCm GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf \
+  --context-length 8192 --mpi-procs 2 --auto \
+  --only-backends rocm,cpu --auto-device-counts rocm=4,cpu=2 \
+  --only-strategies expert-overlay --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA + 4 ROCm GPUs · two-vendor ExpertOverlay</summary>
+
+Use the Quickstart's mixed-vendor `DEVICE_ARGS`. The GPUs form separate
+vendor-native domains; auto decides which domain continues the model.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf \
+  --context-length 8192 --mpi-procs 2 --auto \
+  --only-backends cuda,rocm --auto-device-counts cuda=2,rocm=4 \
+  --only-strategies expert-overlay --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+<details>
+<summary>2 CUDA + 4 ROCm GPUs + 2 CPU NUMA endpoints · three-tier ExpertOverlay</summary>
+
+Use mixed-vendor `DEVICE_ARGS`. Auto admits all three hardware groups and
+chooses the continuation and lower-priority expert tiers.
+
+```bash
+docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
+  -m /models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf \
+  --context-length 8192 --mpi-procs 2 --auto \
+  --only-backends cuda,rocm,cpu --auto-device-counts cuda=2,rocm=4,cpu=2 \
+  --only-strategies expert-overlay --kv-cache-precision fp16 \
+  --mtp --mtp-depth-policy dynamic \
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+```
+
+</details>
+
+#### Qwen 3.6 MoE 35B · cross-host CPU experts
+
+The cross-host E2E projection has two more topology intents: one local ROCm
+continuation GPU with either one or two remote CPU hosts. Each intent is tested
+through both auto `plan`/`serve --config` and direct auto `serve`. These
+frontend examples run *inside a prepared controller runtime container* with
+the matching image and GGUF already staged on the remote containers, private
+MPI/SSH connectivity, and a mounted hostfile. A standalone controller
+`docker run` cannot provision or start the remote peers. See the cluster
+setup notes in the advanced disclosure below. Choose *one* route from each
+expanded example; `serve` runs until stopped.
+
+<details>
+<summary>1 ROCm GPU + 1 remote CPU host · auto plan/apply or direct serve</summary>
+
+`/cluster/hosts-1` must name the GPU controller and exactly one CPU peer.
+`--auto-hosts all` requires real work on both physical hosts.
+
+```bash
+REMOTE_ARGS=(
+  --mpi-hostfile /cluster/hosts-1 --auto-hosts all
+  --only-backends rocm,cpu --auto-device-counts rocm=1,cpu=1
+  --only-strategies expert-overlay --context-length 8192
+  --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+)
+llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  "${REMOTE_ARGS[@]}" --output /cluster/remote-1.json
+llaminar2 serve --config /cluster/remote-1.json
+
+# Or, instead of plan/apply, start with default auto selection:
+llaminar2 serve -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf "${REMOTE_ARGS[@]}"
+```
+
+</details>
+
+<details>
+<summary>1 ROCm GPU + 2 remote CPU hosts · auto plan/apply or direct serve</summary>
+
+`/cluster/hosts-2` must name the GPU controller and two distinct CPU peers.
+The planner selects the expert placement across all three hosts.
+
+```bash
+REMOTE_ARGS=(
+  --mpi-hostfile /cluster/hosts-2 --auto-hosts all
+  --only-backends rocm,cpu --auto-device-counts rocm=1,cpu=2
+  --only-strategies expert-overlay --context-length 8192
+  --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic
+  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+)
+llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  "${REMOTE_ARGS[@]}" --output /cluster/remote-2.json
+llaminar2 serve --config /cluster/remote-2.json
+
+# Or, instead of plan/apply, start with default auto selection:
+llaminar2 serve -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf "${REMOTE_ARGS[@]}"
+```
+
+</details>
+
+<details>
+<summary>Advanced: authored placement and MPI cluster setup</summary>
+
+**Explicit placement when needed**
 
 Use explicit topology for a required deployment shape or a controlled comparison,
 after measuring auto. These examples reuse the Quickstart Docker arguments.
@@ -306,7 +706,7 @@ Use `serve --dry-run --explain-placement` to inspect an authored topology.
 `--validate-only` checks syntax/configuration, not model fit or successful
 inference.
 
-### Remote CPU experts with an MPI hostfile
+**Remote CPU experts with an MPI hostfile**
 
 The same auto planner can use remote CPU machines for an MoE model. Provision
 the same source revision of Llaminar and the GGUF at the same path on every
@@ -322,23 +722,10 @@ For example, `/cluster/hosts` may contain one GPU host and two CPU hosts:
 10.10.0.22 slots=1
 ```
 
-Run the public frontend on the GPU controller, inside the prepared MPI runtime
-environment:
-
-```bash
-llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
-  --mpi-hostfile /cluster/hosts --auto-hosts all \
-  --only-backends rocm,cpu --only-strategies expert-overlay \
-  --context-length 32768 --mtp --mtp-depth-policy dynamic \
-  --output /cluster/remote-experts.json
-
-llaminar2 serve --config /cluster/remote-experts.json
-```
-
-Here the explicit strategy constraint requests a cross-host expert topology,
-and `--auto-hosts all` requires participation on every machine. Inspect the
-selected continuation, tier capacities, and remote participants. For direct
-automatic serving, replace `plan` with `serve` and omit `--output`.
+Run one of the cross-host auto recipes above from the prepared GPU controller
+container. The hostfile must contain exactly the controller and the selected
+number of remote CPU hosts. Inspect the selected continuation, tier capacities,
+and remote participants before accepting a plan.
 
 A hostfile does **not** provision machines, distribute weights/images, or turn
 node-local shared memory into a network transport. In Docker deployments,
@@ -347,6 +734,8 @@ beside them on the host. The
 [Azure cross-host workflow](docs/production-ci.md#azure-resources-for-cross-host-e2e)
 automates image/model staging, plan/apply and direct-serve checks, evidence of
 remote CPU expert work, and VM lifecycle management.
+
+</details>
 
 ## Benchmarks
 
