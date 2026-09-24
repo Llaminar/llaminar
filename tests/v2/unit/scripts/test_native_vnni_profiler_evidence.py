@@ -891,7 +891,7 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
         self.assertIn("runtime.decode.arithmetic_intensity", q4_record)
 
     def test_cpu_prefill_schedule_features_match_production_task_grids(self) -> None:
-        """Candidate-aware features reproduce all three full-K launch formulas."""
+        """Candidate-aware features reproduce every full-K launch formula."""
 
         base = runtime_key(cuda_observation())
         key = dataclasses.replace(
@@ -924,6 +924,14 @@ class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
                 "config.n_block_chunks": math.log1p(1.0),
             },
         )
+        four_row_grid = _cpu_prefill_schedule_features(
+            dataclasses.replace(key, m=15),
+            {"config.route": "four_row_grid",
+             "config.n_block_chunks": math.log1p(4.0)},
+        )
+        self.assertEqual(four_row_grid["schedule.cpu_prefill.parallel_tasks"], 4 * 8)
+        self.assertEqual(four_row_grid["schedule.cpu_prefill.rows_per_task"], 4)
+        self.assertEqual(four_row_grid["schedule.cpu_prefill.m_pair_utilization"], 15 / 16)
 
         self.assertEqual(
             row_chunk["schedule.cpu_prefill.parallel_tasks"],

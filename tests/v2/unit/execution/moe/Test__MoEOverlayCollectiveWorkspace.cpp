@@ -12,6 +12,7 @@
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoEOverlayHostDispatchRows.h"
 #include "execution/moe/MoESparseRequestIdentity.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
@@ -1824,6 +1825,120 @@ TEST(
     EXPECT_FLOAT_EQ(inbound.route_weights_host[1], 0.8f);
     EXPECT_FLOAT_EQ(inbound.hidden_rows_fp32[0], 1.0f);
     EXPECT_FLOAT_EQ(inbound.hidden_rows_fp32[4], 9.0f);
+}
+
+/** @test Linear row traversal visits exactly the producer's ordered entry spans. */
+TEST(Test__MoEOverlayCollectiveWorkspace, HostDispatchRowsVisitEveryRouteExactlyOnce)
+{
+    for (int rows : {1, 15, 512, 4096})
+    {
+        MoEExpertTierDispatch tier;
+        for (int row = 0; row < rows; ++row)
+        {
+            tier.token_rows.push_back(row);
+            for (int slot = 0; slot < row % 9; ++slot)
+                tier.entries.push_back({.token_row = row, .route_slot = slot,
+                    .expert_id = slot, .route_weight = 0.125f,
+                    .destination_participant = slot % 3});
+        }
+        const MoEOverlayHostDispatchRows view(tier, rows);
+        size_t visited_rows = 0;
+        size_t visited_entries = 0;
+        ASSERT_TRUE(view.forEachRow([&](int row, auto entries) {
+            EXPECT_EQ(row, visited_rows++);
+            EXPECT_EQ(entries.size(), static_cast<size_t>(row % 9));
+            for (const auto &entry : entries)
+                EXPECT_EQ(&entry, &tier.entries[visited_entries++]);
+            return true;
+        }));
+        EXPECT_EQ(visited_rows, tier.token_rows.size());
+        EXPECT_EQ(visited_entries, tier.entries.size());
+    }
+}
+
+/** @test Malformed ordering/coverage is rejected before a visitor can publish. */
+TEST(Test__MoEOverlayCollectiveWorkspace, HostDispatchRowsRejectMalformedDescriptors)
+{
+    MoEExpertTierDispatch tier;
+    tier.token_rows = {0, 2};
+    tier.entries = {{.token_row = 0}, {.token_row = 2}};
+    EXPECT_NO_THROW((void)MoEOverlayHostDispatchRows(tier, 3));
+    std::swap(tier.entries[0], tier.entries[1]);
+    EXPECT_THROW((void)MoEOverlayHostDispatchRows(tier, 3), std::invalid_argument);
+    std::swap(tier.entries[0], tier.entries[1]);
+    for (const std::vector<int> rows : {
+             std::vector<int>{0}, {0, 0, 2}, {2, 0}, {-1, 0, 2}, {0, 2, 3}})
+    {
+        tier.token_rows = rows;
+        EXPECT_THROW((void)MoEOverlayHostDispatchRows(tier, 3), std::invalid_argument);
+    }
+    tier.token_rows = {0, 2};
+    tier.entries[0].token_row = 1;
+    EXPECT_THROW((void)MoEOverlayHostDispatchRows(tier, 3), std::invalid_argument);
+}
+
+/** @test A full prefill packet keeps exact row/route identity after parallel copying. */
+TEST(Test__MoEOverlayCollectiveWorkspace, HostDispatchPrefillCopiesOnlyTargetedLiveRows)
+{
+    constexpr int rows = 256;
+    constexpr int width = 1024;
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(rows, rows * 2, width, 2, DeviceId::cpu());
+    MoEOverlayLocalSparseCollectiveContext collective(
+        {.participant_count = 1, .slot_count = 2});
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    FP32Tensor hidden({rows, width});
+    FP32Tensor indices({rows, 2});
+    FP32Tensor weights({rows, 2});
+    for (size_t i = 0; i < hidden.numel(); ++i)
+        hidden.mutable_data()[i] = static_cast<float>(i) * 0.25f;
+    MoEExpertTierDispatch tier;
+    for (int row = 0; row < rows; ++row)
+    {
+        tier.token_rows.push_back(row);
+        for (int slot = 0; slot < 2; ++slot)
+            tier.entries.push_back({.token_row = row, .route_slot = slot,
+                .expert_id = row % 8, .route_weight = 0.5f,
+                .destination_participant = row % 2});
+    }
+    auto inbound = workspace.dispatchReceive(rows, 1);
+    MoESparseDispatchStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.collective_context = &collective;
+    params.workspace = &workspace;
+    params.key = dispatchKey(143);
+    params.source_participant = 0;
+    params.target_participant = 0;
+    params.hidden = &hidden;
+    params.routing_indices = &indices;
+    params.routing_weights = &weights;
+    params.seq_len = rows;
+    params.top_k = 2;
+    params.d_model = width;
+    params.tier_dispatch = &tier;
+    params.fixed_residency_epoch = 41;
+    params.tier_index = 1;
+    params.inbound_rows = &inbound;
+    MoESparseDispatchStage stage(std::move(params));
+    ASSERT_TRUE(stage.execute(&ctx));
+    ASSERT_TRUE(stage.manualGraphBoundaryComplete());
+    ASSERT_EQ(inbound.live_row_count, rows / 2);
+    ASSERT_EQ(inbound.live_entry_count, rows);
+    for (int row = 0; row < rows / 2; ++row)
+    {
+        EXPECT_EQ(inbound.row_ids_host[row], row * 2);
+        EXPECT_EQ(inbound.entry_offsets_host[row], row * 2);
+        EXPECT_EQ(std::memcmp(inbound.hidden_rows_fp32 + row * width,
+                             hidden.data() + row * 2 * width,
+                             width * sizeof(float)), 0);
+        for (int slot = 0; slot < 2; ++slot)
+        {
+            EXPECT_EQ(inbound.original_route_slots_host[row * 2 + slot], row * 4 + slot);
+            EXPECT_EQ(inbound.compact_route_slots_host[row * 2 + slot], row * 2 + slot);
+            EXPECT_EQ(inbound.route_weights_host[row * 2 + slot], 0.5f);
+        }
+    }
+    EXPECT_EQ(inbound.entry_offsets_host[rows / 2], rows);
 }
 
 TEST(

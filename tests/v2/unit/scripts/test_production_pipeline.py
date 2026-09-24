@@ -54,6 +54,7 @@ from test_generation_movement_ledger import empty_ledger, ledger as movement_led
 from test_model_parity_inventory import remote_cases
 from test_server_tool_calling import row_for, tools as tool_fixtures
 from test_server_execution_contract import automatic_evidence
+from test_gpu_driver_diagnostics import clean_evidence as clean_driver_evidence
 
 
 def cell(name="cell"):
@@ -2242,6 +2243,7 @@ class CrossHostRunnerTests(unittest.TestCase):
         proof = {"case": scenario["id"], "scenario": scenario, "execution": {"observed": True}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
+            artifacts.write_json(path / "cell.driver-diagnostics.json", clean_driver_evidence())
             artifacts.write_json(path / "long_context_results.json", complete)
             artifacts.write_json(path / "runtime.cross-host.json", proof)
             artifacts.write_json(path / "tool_calling_results.json", {"schema": 1, "complete": True,
@@ -2311,6 +2313,7 @@ class CrossHostRunnerTests(unittest.TestCase):
                     scenario = next(row for row in parent["configuration"]["cross_host_e2e"]
                                     if row["id"] == ident)
                     log.write("preserved HTTP diagnostic\n")
+                    artifacts.write_json(directory / "cell.driver-diagnostics.json", clean_driver_evidence())
                     artifacts.write_json(directory / "runtime.cross-host.json", {
                         "case": ident, "scenario": scenario, "execution": {"observed": True}})
                     artifacts.write_json(directory / "long_context_results.json", {

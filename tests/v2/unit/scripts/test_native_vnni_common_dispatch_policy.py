@@ -1972,7 +1972,16 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             ),
             4,
         )
-        self.assertEqual(len(cpu_prefill.entries), 12)
+        self.assertEqual(len(cpu_prefill.entries), 16)
+        wide_prefill = [entry for entry in cpu_prefill.entries
+                        if entry.config_json.get("route") == "four_row_grid"]
+        self.assertEqual(len(wide_prefill), 4)
+        self.assertEqual({entry.config_json["n_block_chunks"] for entry in wide_prefill},
+                         {1, 2, 4, 8})
+        for entry in wide_prefill:
+            self.assertEqual(entry.config_json["row_tile"], 4)
+            self.assertEqual(entry.config_json["runtime_isa"], "AVX512")
+            self.assertEqual(entry.config_json["minimum_m"], 3)
         self.assertEqual(
             cpu_prefill.entries[0].candidate_id,
             "cpu.nvnni.prefill.row_chunk_grid.full_k",

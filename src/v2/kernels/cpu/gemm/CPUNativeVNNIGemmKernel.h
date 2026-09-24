@@ -1019,6 +1019,8 @@ namespace llaminar2::cpu::native_vnni
              * generated authority.
              */
             VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
+            /** Distinguish prompt work from equally large speculative batches. */
+            ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
         };
 
         /** Maximum gate/up descriptors for one 256-expert MoE layer. */
@@ -1027,8 +1029,10 @@ namespace llaminar2::cpu::native_vnni
         /**
          * @brief Execute unequal-M pre-quantized projections in one CPU team.
          *
-         * Every descriptor independently resolves the sealed M=1/grouped
-         * decode policy for its codebook, geometry, ISA, and row count. The
+         * Every descriptor independently resolves its typed scheduling purpose:
+         * sealed M=1/grouped decode policy, or the ordinary compact-prefill
+         * policy, for its codebook, geometry, ISA, and row count. Both retain
+         * the same serial-decode arithmetic tree. The
          * underlying launcher shares one persistent OpenMP team across the
          * entire descriptor set, eliminating per-expert team reconstruction.
          * No descriptor is replayed row by row and no alternate arithmetic
@@ -1092,6 +1096,7 @@ namespace llaminar2::cpu::native_vnni
                     .verifier_schedule = source.rows > 1
                         ? source.verifier_schedule
                         : VerifierRowsPolicy::Auto,
+                    .purpose = source.purpose,
                 };
                 total_rows += source.rows;
                 max_rows = std::max(max_rows, source.rows);

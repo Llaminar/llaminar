@@ -887,30 +887,49 @@ namespace llaminar2
          * Parallelizing only the outer row loop leaves almost the whole socket
          * idle at the production MTP depths: M=3 engages three workers while
          * each worker streams a complete 2 MiB Qwen3.6-35B gate matrix. Flatten
-         * the independent (row, expert) dot products across the whole team so
+         * the independent (row tile, expert) dots across the whole team so
          * every positive M retains the M=1 router's expert parallelism.
          *
-         * The first workshare writes each independent scalar logit with the
-         * exact ISA-dispatched dot product used by M=1. Its implicit barrier
+         * Four adjacent rows share each gate-weight load and expose independent
+         * FMA chains. Their per-row reduction trees are identical to M=1; the
+         * remaining one to three rows use the original scalar-output primitive.
+         * Work remains parallel across experts even for one-row decode.
+         * The first workshare writes each independent logit. Its implicit barrier
          * publishes the complete matrix before the second workshare assigns
          * whole rows to workers. Softmax, partial_sort, top-k summation, and
          * normalization then retain their serial per-row operation order. The
          * schedule changes ownership only; it cannot change any row's bytes.
          */
+        const int row_tiles = seq_len / 4 + (seq_len % 4 != 0);
         auto route_rows = [&]()
         {
 #pragma omp for collapse(2) schedule(static)
-            for (int row = 0; row < seq_len; ++row)
+            for (int tile = 0; tile < row_tiles; ++tile)
             {
                 for (int expert = 0; expert < num_experts; ++expert)
                 {
-                    result.router_logits[
-                        static_cast<size_t>(row) * num_experts + expert] =
-                        primitives::vec_dot(
-                            gate_weights +
-                                static_cast<size_t>(expert) * d_model,
-                            hidden + static_cast<size_t>(row) * d_model,
-                            d_model);
+                    const int first_row = tile * 4;
+                    const float *weights = gate_weights +
+                        static_cast<size_t>(expert) * d_model;
+                    if (seq_len - first_row >= 4)
+                    {
+                        primitives::vec_dot_four_rows(
+                            weights,
+                            hidden + static_cast<size_t>(first_row) * d_model,
+                            d_model, static_cast<size_t>(d_model),
+                            result.router_logits.data() +
+                                static_cast<size_t>(first_row) * num_experts + expert,
+                            static_cast<size_t>(num_experts));
+                    }
+                    else
+                    {
+                        for (int row = first_row; row < seq_len; ++row)
+                            result.router_logits[
+                                static_cast<size_t>(row) * num_experts + expert] =
+                                primitives::vec_dot(weights,
+                                    hidden + static_cast<size_t>(row) * d_model,
+                                    d_model);
+                    }
                 }
             }
 
@@ -967,7 +986,7 @@ namespace llaminar2
                 "cpu",
                 {{"rows", std::to_string(seq_len)},
                  {"num_experts", std::to_string(num_experts)},
-                 {"schedule", "row_expert_then_row_finalize"},
+                 {"schedule", "four_row_expert_then_row_finalize"},
                  {"arithmetic_order", "serial_decode_per_row"}});
         }
 

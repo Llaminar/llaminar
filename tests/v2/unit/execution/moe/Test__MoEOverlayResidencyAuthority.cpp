@@ -7,6 +7,8 @@
  * demotion across hot/warm/cold domains, two-phase publication ordering,
  * ticket-epoch overlap, deferred shadow capacity, rollback, static immobility,
  * and PerfStats evidence.
+ * Request-admission regressions hold the real economy lock explicitly, proving
+ * that background planning cannot stall an already-active inference request.
  */
 
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
@@ -22,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -34,6 +37,22 @@
 
 namespace llaminar2::test
 {
+    /**
+     * @brief Force the proposal/admission interleaving without expensive planning.
+     *
+     * Only the maintenance lock is exposed. Tests still call the production
+     * admission API and cannot replace its state transition or return value.
+     */
+    struct MoEOverlayResidencyAuthorityConcurrencyPeer
+    {
+        /** @return A lease holding the same mutex as background proposal scoring. */
+        static std::unique_lock<std::mutex> holdProposalLock(
+            MoEOverlayResidencyAuthority &authority)
+        {
+            return std::unique_lock<std::mutex>(authority.economy_mutex_);
+        }
+    };
+
     namespace
     {
         class ScopedPerfStats final
@@ -1822,8 +1841,10 @@ namespace llaminar2::test
     {
         for (const auto phase : {ExpertHistogramSource::PrefillChunk,
                                  ExpertHistogramSource::GroupedVerifier})
+        for (const int repetitions : {1, 2, 17, 384})
         {
             SCOPED_TRACE(static_cast<int>(phase));
+            SCOPED_TRACE(repetitions);
             auto histogram = oneTierHistogram(2);
             const auto config = MoEOverlayResidencyAuthority::Config{
                 .initial_plan = oneTierTwoParticipantPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced),
@@ -1840,8 +1861,18 @@ namespace llaminar2::test
                     .minimum_window_activations = 1},
                 .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1,
             };
-            const auto split = observedRouteBatches({{0, 1}, {3, 4}}, 2, phase);
-            const auto joined = observedRouteBatches({{0, 1, 3, 4}}, 2, phase);
+            // Repetition may share a computed score, but must not collapse
+            // dependent invocations into one parallel group. Every repeated
+            // window has the same per-token payoff and chosen ownership.
+            std::vector<std::vector<int>> split_routes, joined_routes;
+            for (int repetition = 0; repetition < repetitions; ++repetition)
+            {
+                split_routes.push_back({0, 1});
+                split_routes.push_back({3, 4});
+                joined_routes.push_back({0, 1, 3, 4});
+            }
+            const auto split = observedRouteBatches(split_routes, 2, phase);
+            const auto joined = observedRouteBatches(joined_routes, 2, phase);
             ASSERT_EQ(split->source_expert_counts, joined->source_expert_counts);
             ASSERT_EQ(split->source_token_counts, joined->source_token_counts);
             MoEOverlayResidencyAuthority split_authority(config);
@@ -2768,6 +2799,73 @@ namespace llaminar2::test
         EXPECT_EQ(admission->tags.at("capacity_rejected_cycles"), "0");
         EXPECT_EQ(admission->tags.at("capacity_bounded"), "false");
         EXPECT_EQ(admission->tags.at("policy_bounded"), "true");
+    }
+
+    TEST(Test__MoEOverlayResidencyAuthority,
+         ActiveDemandAdmissionDoesNotWaitForEconomyPlanner)
+    {
+        auto histogram = histogramWithCounts({0, 0, 0, 0, 0, 0});
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = threeTierPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+        });
+        ASSERT_EQ(authority.progressEconomyEvidenceRebase(),
+                  MoEOverlayHistogramRebaseProgress::Complete);
+        authority.installEconomyCertification(
+            threeTierServiceProfile(),
+            threeParticipantMigrationProfile(1, 1),
+            MoEOverlayMigrationEconomyPolicy{});
+        ASSERT_EQ(authority.activateOptimizationDemandAtRequestBoundary(),
+                  MoEOverlayDemandActivationResult::Activated);
+
+        // Hold the real planner mutex until admission has returned. This is a
+        // dependency test, not a timing benchmark: no planner completion can
+        // unblock a regressed implementation before we check its result.
+        auto planner =
+            MoEOverlayResidencyAuthorityConcurrencyPeer::holdProposalLock(authority);
+        auto admission = std::async(std::launch::async, [&]
+        {
+            for (int request = 0; request < 32; ++request)
+                if (authority.activateOptimizationDemandAtRequestBoundary() !=
+                    MoEOverlayDemandActivationResult::AlreadyActive)
+                    return false;
+            return true;
+        });
+        EXPECT_EQ(admission.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        // Always release before joining, including on assertion failure.
+        planner.unlock();
+        EXPECT_TRUE(admission.get());
+        EXPECT_TRUE(authority.optimizationDemandActive());
+    }
+
+    TEST(Test__MoEOverlayResidencyAuthority,
+         UncertifiedDemandAdmissionDoesNotWaitForEconomyPlanner)
+    {
+        auto histogram = histogramWithCounts({0, 0, 0, 0, 0, 0});
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = threeTierPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced,
+                RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+        });
+        auto planner =
+            MoEOverlayResidencyAuthorityConcurrencyPeer::holdProposalLock(authority);
+        auto admission = std::async(std::launch::async, [&]
+        {
+            return authority.activateOptimizationDemandAtRequestBoundary();
+        });
+        EXPECT_EQ(admission.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        planner.unlock();
+        EXPECT_EQ(admission.get(), MoEOverlayDemandActivationResult::NotReady);
+        EXPECT_FALSE(authority.optimizationDemandActive());
     }
 
     TEST(

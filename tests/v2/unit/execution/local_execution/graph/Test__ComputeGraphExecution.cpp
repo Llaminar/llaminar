@@ -12,6 +12,7 @@
  * - Multi-device execution
  * - Snapshot callbacks
  * - Statistics tracking
+ * - Sparse rank-batch fork/local-compute/join order without serial socket waits
  */
 
 #include <gtest/gtest.h>
@@ -24,6 +25,7 @@
 #include "backends/NativeParallelGraphBranch.h"
 #include "execution/moe/MoEOverlayRankBatchGraphSchedule.h"
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <set>
 #include <string>
@@ -87,6 +89,87 @@ TEST(MoEOverlayRankBatchGraphSchedule, RejectsMissingAliasedAndMistypedNodes)
         EXPECT_THROW(wireMoEOverlayRankBatchForkJoin(graph, lanes), std::invalid_argument);
     EXPECT_TRUE(graph.getNode("return")->dependencies.empty())
         << "Validate the entire declaration before mutating graph edges";
+}
+
+/** @test Local experts finish before a remote wait, while all returns keep their order. */
+TEST(MoEOverlayRankBatchGraphSchedule, LocalComputeOverlapsEveryPeerBeforeOrderedJoin)
+{
+    for (int peers = 1; peers <= 8; ++peers)
+    for (int locals = 1; locals <= 3; ++locals)
+    {
+        SCOPED_TRACE(::testing::Message() << "peers=" << peers << " locals=" << locals);
+        ComputeGraph graph;
+        std::vector<MoEOverlayRankBatchGraphLane> remote;
+        std::vector<MoEOverlayLocalExpertGraphLane> local;
+        std::vector<int> consumed;
+        int submitted = 0;
+        int computed = 0;
+        for (int index = 0; index < locals; ++index)
+        {
+            const auto suffix = std::to_string(index);
+            local.push_back({"local_send" + suffix, "local_compute" + suffix, "local_return" + suffix});
+            auto dispatch = std::make_unique<MockComputeStage>(ComputeStageType::MOE_SPARSE_DISPATCH);
+            dispatch->setOnExecute([&](IDeviceContext *) { EXPECT_EQ(submitted, peers); });
+            auto compute = std::make_unique<MockComputeStage>(ComputeStageType::MOE_LOCAL_EXPERT);
+            compute->setOnExecute([&](IDeviceContext *) {
+                EXPECT_TRUE(consumed.empty());
+                ++computed;
+            });
+            auto returned = std::make_unique<MockComputeStage>(ComputeStageType::MOE_SPARSE_RETURN_REDUCE);
+            returned->setOnExecute([&, index](IDeviceContext *) { consumed.push_back(peers + index); });
+            graph.addNode(local.back().returned, std::move(returned), DeviceId::cpu());
+            graph.addNode(local.back().compute, std::move(compute), DeviceId::cpu());
+            graph.addNode(local.back().dispatch, std::move(dispatch), DeviceId::cpu());
+        }
+        for (int index = 0; index < peers; ++index)
+        {
+            const auto suffix = std::to_string(index);
+            remote.push_back({"remote_send" + suffix, "remote_return" + suffix});
+            auto dispatch = std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_DISPATCH);
+            dispatch->setOnExecute([&](IDeviceContext *) { ++submitted; });
+            auto returned = std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE);
+            returned->setOnExecute([&, index](IDeviceContext *) {
+                EXPECT_EQ(submitted, peers);
+                EXPECT_EQ(computed, locals) << "Remote wait must not strand local CPU work";
+                consumed.push_back(index);
+            });
+            graph.addNode(remote.back().returned, std::move(returned), DeviceId::cpu());
+            graph.addNode(remote.back().dispatch, std::move(dispatch), DeviceId::cpu());
+        }
+        wireMoEOverlayRankBatchForkJoin(graph, remote, local);
+        for (auto *stage : graph.getExecutionStages())
+            ASSERT_TRUE(stage->execute(nullptr));
+        ASSERT_EQ(consumed.size(), static_cast<size_t>(peers + locals));
+        for (int index = 0; index < peers + locals; ++index)
+            EXPECT_EQ(consumed[index], index);
+    }
+}
+
+/** @test Invalid local declarations cannot partially mutate the remote schedule. */
+TEST(MoEOverlayRankBatchGraphSchedule, RejectsInvalidLocalWorkBeforeAddingAnyEdges)
+{
+    ComputeGraph graph;
+    graph.addNode("send", std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_DISPATCH), DeviceId::cpu());
+    graph.addNode("return", std::make_unique<MockComputeStage>(ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE), DeviceId::cpu());
+    graph.addNode("local_send", std::make_unique<MockComputeStage>(ComputeStageType::MOE_SPARSE_DISPATCH), DeviceId::cpu());
+    graph.addNode("compute", std::make_unique<MockComputeStage>(ComputeStageType::MOE_LOCAL_EXPERT), DeviceId::cpu());
+    graph.addNode("local_return", std::make_unique<MockComputeStage>(ComputeStageType::MOE_SPARSE_RETURN_REDUCE), DeviceId::cpu());
+    const std::array<MoEOverlayRankBatchGraphLane, 1> remote{{{"send", "return"}}};
+    const std::vector<std::vector<MoEOverlayLocalExpertGraphLane>> invalid{
+        {{"missing", "compute", "local_return"}},
+        {{"local_send", "missing", "local_return"}},
+        {{"local_send", "compute", "missing"}},
+        {{"send", "compute", "local_return"}},
+        {{"local_send", "local_send", "local_return"}},
+        {{"local_send", "compute", "return"}},
+        {{"local_send", "compute", "local_return"}, {"local_send", "compute", "local_return"}},
+    };
+    for (const auto &local : invalid)
+    {
+        EXPECT_THROW(wireMoEOverlayRankBatchForkJoin(graph, remote, local), std::invalid_argument);
+        EXPECT_TRUE(graph.getNode("return")->dependencies.empty());
+        EXPECT_TRUE(graph.getNode("compute")->dependencies.empty());
+    }
 }
 
 namespace

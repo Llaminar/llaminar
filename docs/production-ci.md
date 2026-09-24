@@ -366,6 +366,25 @@ ownership merely because the GitHub runner has a different UID. The driver
 also supplies GPU memory-telemetry tools missing from the runner pod. Its
 distinct image role cannot be mistaken for a tested runtime or a release.
 
+Every HTTP/token-generation server lifecycle also brackets the serving host's
+kernel log. New AMDGPU/NVIDIA warnings, Xid errors, IH-ring overflows, GPU
+faults/resets and driver workqueue warnings fail the cell even when all HTTP
+checks pass. Each `*.driver-diagnostics.json` retains the new records and
+offending messages. Older warnings are excluded by a boot-qualified log
+cursor; a reboot, cleared/wrapped log, missing permissions or incomplete
+observation fails closed. Direct local runs require readable `dmesg --json
+--decode` or noninteractive sudo for that read-only command. Published-image
+runs grant `SYSLOG` and read-only `/dev/kmsg` access only to the existing
+suite-driver tools container; the cache-owning user delegates the read to a
+root exec in that same container. The device mount also avoids the legacy
+`dmesg` syslog reader's expensive JSON expansion on the tools image.
+The read authenticates the shared kernel boot. No inference-image privileges,
+kernel settings, driver settings or test precision are changed. Run GPU cells
+without unrelated accelerator workloads: a shared kernel warning is unsafe
+certification evidence even when its originating process is unclear. Current
+cross-host cells use remote CPU workers; a future remote GPU cell must obtain
+equivalent driver-health evidence on that physical host as well.
+
 The same orchestration is available locally:
 
 ```bash

@@ -6,6 +6,8 @@
  * changes FP32 parenthesization after movement. Exercise the production packed
  * gather and final stage under every two/three-participant ownership map and
  * packet arrival order, including missing and duplicate publication failures.
+ * Parallel prefill packing must preserve every payload bit, append boundaries,
+ * and count publication under odd worker budgets and nested single callers.
  */
 
 #include "execution/moe/MoEOverlayCanonicalHostReturn.h"
@@ -16,6 +18,8 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -153,4 +157,72 @@ TEST(MoEOverlayCanonicalHostReturn, FinalReducerRejectsMissingAndDuplicateSlots)
         for (int column = 0; column < 33; ++column)
             EXPECT_EQ(output.data()[column], -77.0f);
     }
+}
+
+/** @test Parallel packing preserves row bits, appended identity and untouched tail capacity. */
+TEST(MoEOverlayCanonicalHostReturn, PrefillPackingIsByteExactForEveryWorkerBudget)
+{
+    namespace record = canonical_moe_route_record;
+    const int original_threads = omp_get_max_threads();
+    for (int threads : {1, 2, 3, 4, 5, 6, 7})
+    for (size_t rows : {1u, 15u, 128u, 512u})
+    for (size_t width : {33u, 2048u})
+    {
+        SCOPED_TRACE(::testing::Message() << threads << " workers, rows=" << rows << " width=" << width);
+        omp_set_num_threads(threads);
+        std::vector<float> payload(rows * width);
+        std::vector<int32_t> slots(rows);
+        for (size_t index = 0; index < payload.size(); ++index)
+            payload[index] = std::bit_cast<float>(0x7fc00000u + static_cast<uint32_t>(index % 65536u));
+        for (size_t row = 0; row < rows; ++row)
+            slots[row] = static_cast<int32_t>(3 * row + 1);
+        std::vector<float> expected((2 * rows + 1) * (width + 1) + 1, -99.0f);
+        auto actual = expected;
+        MoEOverlayReturnRows packet;
+        packet.d_model = static_cast<int>(width);
+        packet.layout = MoEOverlayReturnLayout::CanonicalExpertRoutes;
+        packet.residency_epoch = 1;
+        packet.live_row_count = packet.row_capacity = rows;
+        packet.row_ids_host = slots.data();
+        packet.output_rows_fp32 = payload.data();
+        for (size_t append = 0; append < 2; ++append)
+        {
+            for (size_t row = 0; row < rows; ++row)
+            {
+                float *destination = record::record(expected.data(), append * rows + row, width);
+                std::memcpy(destination, payload.data() + row * width, width * sizeof(float));
+                record::writeFlatRouteSlot(destination, width, slots[row]);
+            }
+            EXPECT_TRUE(record::writeRecordCount(expected.data(), expected.size(), (append + 1) * rows));
+            EXPECT_TRUE(gatherMoEOverlayCanonicalHostReturn(packet, actual,
+                append == 0 ? MoEOverlayCanonicalGatherBoundary::Begin : MoEOverlayCanonicalGatherBoundary::Append));
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)), 0);
+        }
+    }
+    omp_set_num_threads(original_threads);
+}
+
+/** @test One caller inside an existing team cannot introduce an orphaned OpenMP workshare. */
+TEST(MoEOverlayCanonicalHostReturn, RowWorkJoinsAndPreservesNestedSingleCaller)
+{
+    const int original_threads = omp_get_max_threads();
+    omp_set_num_threads(3);
+    std::array<std::atomic<unsigned>, 512> visits{};
+#pragma omp parallel
+    {
+#pragma omp single
+        {
+            forEachMoEOverlayHostRow(visits.size(), 8192, [&](size_t row) {
+                visits[row].fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+    }
+    for (auto &visits_for_row : visits)
+        EXPECT_EQ(visits_for_row.load(), 1u);
+    forEachMoEOverlayHostRow(visits.size(), 8192, [&](size_t row) {
+        visits[row].fetch_add(1, std::memory_order_relaxed);
+    });
+    for (auto &visits_for_row : visits)
+        EXPECT_EQ(visits_for_row.load(), 2u);
+    omp_set_num_threads(original_threads);
 }

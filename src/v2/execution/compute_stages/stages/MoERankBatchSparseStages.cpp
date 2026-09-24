@@ -12,6 +12,8 @@
 
 #include "MoERankBatchSparseStages.h"
 #include "../../moe/MoEOverlayCanonicalHostReturn.h"
+#include "../../moe/MoEOverlayHostDispatchRows.h"
+#include "../../moe/MoEOverlayHostRowWork.h"
 
 #include "../../../collective/ITPContext.h"
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
@@ -398,18 +400,12 @@ namespace llaminar2
 
         size_t entry_cursor = 0;
         size_t compact_row = 0;
-        for (const int token_row : tier.token_rows)
-        {
-            if (token_row < 0 || token_row >= logical_seq_len)
-            {
-                LOG_ERROR("[MoERankBatchDispatchStage] Tier token row exceeds live sequence length");
-                return false;
-            }
+        const MoEOverlayHostDispatchRows ordered_rows(tier, logical_seq_len);
+        if (!ordered_rows.forEachRow([&](int token_row, auto row_entries) {
             const size_t row_begin = entry_cursor;
-            for (const auto &entry : tier.entries)
+            for (const auto &entry : row_entries)
             {
-                if (entry.token_row != token_row ||
-                    entry.destination_participant != participant)
+                if (entry.destination_participant != participant)
                 {
                     continue;
                 }
@@ -432,7 +428,7 @@ namespace llaminar2
                 ++entry_cursor;
             }
             if (entry_cursor == row_begin)
-                continue;
+                return true;
             if (compact_row >= outbound.row_capacity)
             {
                 LOG_ERROR("[MoERankBatchDispatchStage] Participant compact rows exceed fixed capacity");
@@ -441,14 +437,22 @@ namespace llaminar2
             outbound.row_ids_host[compact_row] = token_row;
             outbound.entry_offsets_host[compact_row] =
                 static_cast<int32_t>(row_begin);
+            ++compact_row;
+            return true;
+        }))
+            return false;
+
+        // Metadata fixes disjoint destinations first; join all row copies before
+        // publishing live counts and sending this participant's immutable packet.
+        forEachMoEOverlayHostRow(compact_row,
+            static_cast<size_t>(params_.d_model) * sizeof(float), [&](size_t row) {
             std::memcpy(
                 outbound.hidden_rows_fp32 +
-                    compact_row * static_cast<size_t>(params_.d_model),
-                hidden + static_cast<size_t>(token_row) *
+                    row * static_cast<size_t>(params_.d_model),
+                hidden + static_cast<size_t>(outbound.row_ids_host[row]) *
                              static_cast<size_t>(params_.d_model),
                 static_cast<size_t>(params_.d_model) * sizeof(float));
-            ++compact_row;
-        }
+        });
         if (entry_cursor != expected_entries)
         {
             LOG_ERROR("[MoERankBatchDispatchStage] Tier token rows do not cover every targeted route");

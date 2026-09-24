@@ -6,6 +6,8 @@
  * typed stage policies, ownership, data bindings, and dependency edges. Sparse
  * CPU publication must gather raw routes, apply one ordered root fold, and only
  * then broadcast; a participant-local partial sum cannot replace that contract.
+ * Remote expert dispatch overlaps local compute, and local host payloads are
+ * consumed through their original stable storage instead of a redundant copy.
  */
 
 #include <gtest/gtest.h>
@@ -18,6 +20,7 @@
 #include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
@@ -1343,6 +1346,35 @@ TEST(Test__Qwen35MoEGraph,
         const auto *return_consumer = publication_node;
         if (rank == 0)
         {
+            const auto order = graph.getExecutionOrder();
+            const auto position = [&](ComputeStageType type) {
+                return std::find_if(order.begin(), order.end(), [&](const auto &name) {
+                    return graph.getNode(name)->stage->type() == type;
+                });
+            };
+            const auto remote_dispatch = position(ComputeStageType::MOE_RANK_BATCH_DISPATCH);
+            const auto local_compute = position(ComputeStageType::MOE_LOCAL_EXPERT);
+            const auto remote_return = position(ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE);
+            ASSERT_NE(remote_dispatch, order.end());
+            ASSERT_NE(local_compute, order.end());
+            ASSERT_NE(remote_return, order.end());
+            EXPECT_LT(remote_dispatch, local_compute);
+            EXPECT_LT(local_compute, remote_return) << "Do not wait away CPU socket parallelism";
+            const auto local_return = position(ComputeStageType::MOE_SPARSE_RETURN_REDUCE);
+            ASSERT_NE(local_return, order.end());
+            const auto *local_return_stage = dynamic_cast<const MoESparseReturnReduceStage *>(
+                graph.getNode(*local_return)->stage.get());
+            ASSERT_NE(local_return_stage, nullptr);
+            EXPECT_EQ(local_return_stage->params().inbound_rows,
+                      local_return_stage->params().outbound_rows);
+            const auto local_dispatch = position(ComputeStageType::MOE_SPARSE_DISPATCH);
+            ASSERT_NE(local_dispatch, order.end());
+            const auto *local_dispatch_stage = dynamic_cast<const MoESparseDispatchStage *>(
+                graph.getNode(*local_dispatch)->stage.get());
+            ASSERT_NE(local_dispatch_stage, nullptr);
+            const auto &dispatch_params = local_dispatch_stage->params();
+            EXPECT_EQ(dispatch_params.inbound_rows->hidden_rows_fp32,
+                      dispatch_params.workspace->localExpertInput(0, 0).hidden_rows_fp32);
             ASSERT_NE(fold_node, nullptr);
             const auto *fold = dynamic_cast<const MoECanonicalRouteReduceStage *>(fold_node->stage.get());
             ASSERT_NE(fold, nullptr);

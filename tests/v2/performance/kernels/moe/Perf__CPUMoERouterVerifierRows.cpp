@@ -12,6 +12,8 @@
  * in serial row order. Every softmax probability, selected expert, normalized
  * top-k weight, and Q8_1 activation byte must match. Input generation, result
  * validation, and capacity warmup are outside the canonical timing samples.
+ * An explicit profiler-only mode repeats one selected grouped transaction;
+ * it never times the serial oracle or emits canonical benchmark evidence.
  */
 
 #include <gtest/gtest.h>
@@ -365,6 +367,26 @@ TEST(Perf__CPUMoERouterVerifierRows,
     const int iterations = envPositiveInt("LLAMINAR_CPU_MOE_ROUTER_ITERATIONS", 30);
     const std::vector<float> hidden = makeHidden(max_rows);
     const std::vector<float> gate = makeGateWeights();
+
+    const int profile_iterations =
+        envPositiveInt("LLAMINAR_CPU_MOE_ROUTER_PROFILE_ITERATIONS", 0);
+    if (profile_iterations > 0)
+    {
+        ASSERT_EQ(rows.size(), 1u)
+            << "One profiler invocation must select exactly one runtime M";
+        CPUMoEKernel kernel;
+        MoERoutingResult result;
+        // Capacity preparation is deliberately outside the long repeated
+        // interval. The ordinary mode above owns serial-byte certification.
+        ASSERT_TRUE(kernel.route(hidden.data(), gate.data(), rows.front(),
+            kDModel, kNumExperts, kTopK, true, result));
+        for (int iteration = 0; iteration < profile_iterations; ++iteration)
+            ASSERT_TRUE(kernel.route(hidden.data(), gate.data(), rows.front(),
+                kDModel, kNumExperts, kTopK, true, result));
+        std::cout << "profiler_only,rows=" << rows.front()
+                  << ",iterations=" << profile_iterations << '\n';
+        return;
+    }
 
     std::cout << "backend,threads,m,d_model,num_experts,top_k,grouped_us,serial_us,speedup,byte_exact\n";
     for (const int row_count : rows)

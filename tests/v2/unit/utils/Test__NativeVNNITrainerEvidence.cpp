@@ -1,6 +1,10 @@
 /**
  * @file Test__NativeVNNITrainerEvidence.cpp
  * @brief CPU-only contract tests for cross-backend trainer evidence math.
+ *
+ * Probe planning shares the production scheduler. These device-free tests
+ * also distinguish unsupported candidate labels from the physical evidence
+ * they reuse, preventing ISA normalization from minting false timing wins.
  */
 
 #include "utils/NativeVNNITrainerEvidence.h"
@@ -101,7 +105,7 @@ namespace
                 64,
                 4096,
                 28),
-            llaminar2::test::trainer::kCPUPrefillTwoRowNbc1Candidate);
+            "cpu.nvnni.prefill.two_row_pair_grid.nbc1.full_k");
         EXPECT_EQ(
             expectedCPUPrefillPhysicalCandidateId(
                 "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise",
@@ -127,6 +131,24 @@ namespace
                 4096,
                 28),
             compatible);
+    }
+
+    TEST(Test__NativeVNNITrainerEvidence, FourRowProbeRetainsUnsupportedCellsWithoutTimingAliases)
+    {
+        for (int nbc : {1, 2, 4, 8})
+        for (bool avx512 : {false, true})
+        for (int rows : {2, 3, 15, 128})
+        {
+            const auto requested = "cpu.nvnni.prefill.four_row_grid.nbc" + std::to_string(nbc) + ".full_k";
+            const auto paired = "cpu.nvnni.prefill.two_row_pair_grid.nbc" + std::to_string(nbc) + ".full_k";
+            EXPECT_EQ(expectedCPUPrefillPhysicalCandidateId(requested, false, false, false,
+                avx512, rows, 1024, 28), avx512 && rows >= 3 ? requested : paired);
+        }
+        EXPECT_EQ(expectedCPUPrefillPhysicalCandidateId(
+            "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise", false, true, false,
+            true, 128, 2048, 28,
+            llaminar2::cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale),
+            "cpu.nvnni.prefill.four_row_grid.nbc1.full_k");
     }
 
     TEST(Test__NativeVNNITrainerEvidence, NativeBytesDistinguishSignedZero)

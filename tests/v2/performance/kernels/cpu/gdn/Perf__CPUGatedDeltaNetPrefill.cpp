@@ -47,6 +47,7 @@ namespace
         AlignedVector<float> state;
         AlignedVector<float> output;
 
+        /** @brief Allocate and populate one persistent, finite input geometry. */
         PrefillFixture(int row_count, int head_count, int key_width, int value_width)
             : rows(row_count),
               n_heads(head_count),
@@ -152,6 +153,37 @@ namespace
         return samples[samples.size() / 2];
     }
 } // namespace
+
+/**
+ * @brief Isolate a subnormal-gated TP head from normal gates and other kernels.
+ *
+ * A real Qwen head drives exp(g) into FP32 gradual underflow. This fixture
+ * covers that production regime rather than only normal synthetic gates.
+ * Canonical latency remains separate from profiler collection. This is a
+ * latency diagnostic, not a mathematical certificate; byte-equivalence checks
+ * belong to the CPU GDN integration suite rather than a timing tolerance.
+ */
+TEST(Perf__CPUGatedDeltaNetPrefill, SubnormalGateHead)
+{
+    omp_set_dynamic(0);
+    int threads = 28;
+    if (const char *configured = std::getenv("LLAMINAR_CPU_GDN_PERF_THREADS"))
+        threads = std::max(1, std::stoi(configured));
+    omp_set_num_threads(threads);
+    PrefillFixture fixture(512, 8, 128, 128);
+    // Only one head has the tiny factor, as in the measured TP rank. Other
+    // heads retain their ordinary decay and share the same worker team.
+    fixture.a_log[0] = -133.0f;
+    fixture.dt_bias[0] = 0.0f;
+    for (int row = 0; row < fixture.rows; ++row)
+        fixture.alpha[static_cast<size_t>(row) * fixture.n_heads] = 0.0f;
+    const float gate = std::exp(fixture.a_log[0] *
+        std::log1p(std::exp(fixture.dt_bias[0])));
+    ASSERT_EQ(std::fpclassify(gate), FP_SUBNORMAL);
+    const double milliseconds = benchmarkPrefill(fixture, 3, 11);
+    std::cout << "CPU GDN subnormal head M=512 heads=8 d_k=128 d_v=128 threads="
+              << threads << " median_ms=" << milliseconds << '\n';
+}
 
 /**
  * @brief Report the warmed Qwen 3.6 prefill recurrence economy at TP=1/2.

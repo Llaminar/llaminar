@@ -7,8 +7,10 @@
  * both mutable tensors become device-authoritative only after a successful
  * launch. FP32, BF16, and FP16 use matching one-block-per-row CUDA/HIP kernels.
  *
- * CPU execution retains the fused cache-resident FP32 decode primitive for
- * M=1..4. Other native floating formats execute one typed residual-add call and
+ * CPU execution retains the fused cache-resident FP32 primitive for every M.
+ * Large prefill batches distribute independent rows across the socket without
+ * changing the per-row reduction tree or adding a nested worker team. Other
+ * native floating formats execute one typed residual-add call and
  * one typed RMSNorm call under this stage. Neither backend implementation calls
  * the serial runtime or replays M=1 stage executions in production.
  */
@@ -22,6 +24,7 @@
 #include "../../../kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../local_execution/graph/GraphCaptureGuard.h"
 #include <cmath>
 #include <string>
@@ -366,9 +369,9 @@ namespace llaminar2
             const float *gamma_data = gamma_base->data();
             float *out_data = norm_output_base->mutable_data();
 
-#if defined(__AVX512F__)
-            for (int r = 0; r < seq_len; ++r)
+            const auto process_row = [&](int r)
             {
+#if defined(__AVX512F__)
                 primitives::fused_residual_rmsnorm_row_avx512(
                     in_data + r * hidden_dim,
                     res_data + r * hidden_dim,
@@ -376,12 +379,9 @@ namespace llaminar2
                     out_data + r * hidden_dim,
                     static_cast<std::size_t>(hidden_dim),
                     params_.eps);
-            }
 #else
-            // Portable scalar implementation preserves the same two-pass row
-            // arithmetic when this translation unit has no AVX-512 target.
-            for (int r = 0; r < seq_len; ++r)
-            {
+                // Keep the AVX2 build's existing scalar reduction tree exactly;
+                // only independent row ownership changes in this optimization.
                 float *res_row = res_data + r * hidden_dim;
                 const float *in_row = in_data + r * hidden_dim;
                 float *out_row = out_data + r * hidden_dim;
@@ -398,8 +398,31 @@ namespace llaminar2
                 float inv_rms = 1.0f / std::sqrt(static_cast<float>(sum_sq / hidden_dim) + params_.eps);
                 for (int i = 0; i < hidden_dim; ++i)
                     out_row[i] = gamma_data[i] * res_row[i] * inv_rms;
-            }
 #endif
+            };
+            const bool parallel_rows = !omp_in_parallel() && seq_len >= 32 &&
+                num_elements >= 32768 && omp_get_max_threads() > 1;
+            if (parallel_rows)
+            {
+                // Each worker updates disjoint residual/output rows. The join
+                // publishes both tensors before tracing or the next graph stage.
+                const auto work = [&]() {
+#pragma omp for schedule(static)
+                    for (int r = 0; r < seq_len; ++r)
+                        process_row(r);
+                };
+                OMP_WORKSHARE_REGION(work);
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_fused_residual_rmsnorm_parallel_rows", seq_len,
+                    "prefill", "cpu", {{"workers", std::to_string(omp_get_max_threads())}});
+            }
+            else
+            {
+                // A graph stage may be called by one outer-team worker; it
+                // cannot introduce an orphaned workshare that requires its peers.
+                for (int r = 0; r < seq_len; ++r)
+                    process_row(r);
+            }
 
             traceOutput("residual", params_.residual);
             traceOutput("norm_output", params_.norm_output);

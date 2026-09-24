@@ -2382,12 +2382,13 @@ def _cpu_prefill_schedule_features(
 ) -> dict[str, float]:
     """Model the exact CPU ordinary-prefill task geometry for one candidate.
 
-    The three full-K CPU schedules perform identical arithmetic but expose very
+    The full-K CPU schedules perform identical arithmetic but expose very
     different units of work to OpenMP:
 
     * row-chunk-grid publishes one `(row, 64-column chunk)` task;
     * two-row N-major publishes one N-block task that visits every row pair;
     * two-row pair grids publish one `(row pair, N block)` task.
+    * four-row grids publish one `(four-row tile, N block)` task.
 
     Raw `(M,N,K)` and a categorical route name do not tell a learner where
     those schedules cross worker-wave boundaries. These features reproduce the
@@ -2404,6 +2405,7 @@ def _cpu_prefill_schedule_features(
         "row_chunk_grid",
         "two_row_full_output_tiles",
         "two_row_pair_grid",
+        "four_row_grid",
     }:
         return {}
     threads = _cpu_parallelism_width(key.architecture_class)
@@ -2421,7 +2423,10 @@ def _cpu_prefill_schedule_features(
         rows_per_task = 1
         m_pair_utilization = 1.0
     else:
-        row_pairs = (key.m + 1) // 2
+        # The historical feature key counts physical row groups, including
+        # single rows above; retain its ABI while admitting four-row groups.
+        row_tile = 4 if route == "four_row_grid" else 2
+        row_pairs = (key.m + row_tile - 1) // row_tile
         n_block_chunks = _flattened_positive_integer(
             candidate_features,
             "config.n_block_chunks",
@@ -2431,10 +2436,10 @@ def _cpu_prefill_schedule_features(
                 f"CPU prefill route {route!r} omits n_block_chunks"
             )
         n_blocks = (n_chunks + n_block_chunks - 1) // n_block_chunks
-        m_pair_utilization = key.m / float(row_pairs * 2)
-        if route == "two_row_pair_grid":
+        m_pair_utilization = key.m / float(row_pairs * row_tile)
+        if route in {"two_row_pair_grid", "four_row_grid"}:
             parallel_tasks = row_pairs * n_blocks
-            rows_per_task = min(2, key.m)
+            rows_per_task = min(row_tile, key.m)
         else:
             parallel_tasks = n_blocks
             rows_per_task = key.m

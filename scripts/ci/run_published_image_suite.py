@@ -257,6 +257,12 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
+        # The cache-owning non-root driver delegates only kernel-log reads to
+        # a root exec inside itself. Read-only kmsg avoids util-linux's legacy
+        # syslog JSON parser expanding each message into the remaining log.
+        # Neither this device nor SYSLOG is granted to inference images.
+        "--cap-add", "SYSLOG", "--device", "/dev/kmsg:/dev/kmsg:r",
+        "--env", f"LLAMINAR_E2E_KERNEL_READER_CONTAINER={name}",
         "--group-add", str(socket.stat().st_gid), *docker_paths.mounts(pairs),
         "--workdir", str(ROOT), "--env", "DOCKER_HOST=unix:///var/run/docker.sock",
         driver, "python3", *command[1:]]

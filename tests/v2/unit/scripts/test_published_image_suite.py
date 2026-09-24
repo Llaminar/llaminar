@@ -32,6 +32,7 @@ import run_model_parity_e2e as e2e
 import published_benchmark_chart as chart
 import build_public_docs as public_docs
 from production_artifacts import digest, ratchet, write_json
+from test_gpu_driver_diagnostics import clean_evidence as clean_driver_evidence
 
 
 def image_pair():
@@ -310,9 +311,11 @@ class PublishedImageSuiteTests(unittest.TestCase):
             outcomes = iter((1, 124, 0))
 
             def run_cell(_command, environment, _log, *, budget):
-                """Successful shell fixtures must retain the new tool evidence too."""
+                """Successful shell fixtures retain tool and driver-health evidence."""
                 code = next(outcomes)
                 if code == 0:
+                    write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "cell.driver-diagnostics.json",
+                               clean_driver_evidence())
                     write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "tool_calling_results.json",
                                {"schema": 1, "complete": True,
                                 "results": [row_for(probe) for probe in tools.PROBES]})
@@ -767,6 +770,10 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertIn((lane, str(lane), False), mounts)
             command = run.call_args.args[0]
             self.assertEqual(command[-3:], ["tools-image", "python3", "runner.py"])
+            self.assertIn("SYSLOG", command)
+            self.assertIn("/dev/kmsg:/dev/kmsg:r", command)
+            driver_name = command[command.index("--name") + 1]
+            self.assertIn(f"LLAMINAR_E2E_KERNEL_READER_CONTAINER={driver_name}", command)
             self.assertEqual(lane.stat().st_mode & 0o007, 0o005)
             repair = next(call.args[0] for call in cleanup.call_args_list
                           if call.args[0][:2] == ["docker", "run"])

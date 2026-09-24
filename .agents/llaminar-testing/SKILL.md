@@ -183,6 +183,15 @@ when a live server fix needs a sustained correctness/lifetime proof. This is a
 focused stress diagnostic, not a replacement for the complete eight-check E2E
 certificate and not permission to maintain another model/topology matrix.
 
+Bracket the server lifetime with `tests/v2/e2e/server/gpu_driver_diagnostics.py`
+`begin --state PATH` before startup and `finish --state PATH --report PATH`
+after teardown. The ordinary HTTP/generation harness does this automatically;
+an ad hoc stress loop must retain the same evidence. New AMDGPU/NVIDIA driver
+warnings or an unreadable/lost kernel-log interval fail the cell even if all
+responses are correct. Do not clear historical logs or skip the observer.
+Use the access setup in `docs/production-ci.md`; extra log-reading privileges
+belong to the tools container, not the certified inference image.
+
 Start the stress clock only after the Release server publishes `ServerReady`.
 First run one `run_needle_check` for each of `beginning`, `middle`, and `end` so
 all three exact prompts are admitted to prefix cache. Take the steady-state
