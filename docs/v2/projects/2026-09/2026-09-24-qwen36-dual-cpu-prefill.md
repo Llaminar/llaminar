@@ -1,22 +1,143 @@
 # Qwen3.6 MoE: dual-socket CPU prefill
 
-## Current checkpoint
+## Committed checkpoint
 
 Release prefill is **297–299 tok/s** on the matched 512-token dual-socket
 workload, with Dynamic maintenance enabled and real movement. Selective
 four-row weight reuse measures **298.66** and **297.04 tok/s** in independent
 runs, versus the previous 287.29 tok/s checkpoint. Both runs complete 20
 expert movements and preserve all three measured output token streams.
-The **350 tok/s goal remains open**; expert computation and dense projections
-are the leading remaining costs. No precision, format or GPU segment-cap
-change is included in this result.
+At that checkpoint, the **350 tok/s goal remained open**; expert computation
+and dense projections were the leading remaining costs. No precision, format
+or GPU segment-cap change is included in that result.
 
-The previous swap-scoring checkpoint passed **668 Unit + 364
-ProductionTestPreflight = 1,032 tests**, in 777.05 seconds. The four-row
-checkpoint adds two explicit preflight entries; its commit must pass the full
-**668 Unit + 366 preflight** hook. This is functional prerequisite evidence,
+The feature-branch checkpoint is **`5be486807`**. Its ordinary precommit hook
+passed **668 Unit + 366 ProductionTestPreflight = 1,034 tests** (76.41 seconds
+for Unit, 989.56 seconds for preflight), without a bypass. It has not been
+pushed. This is functional prerequisite evidence,
 not a driver-clean HTTP certificate: the previously reproduced MI50 IH-ring
 warnings remain unresolved. The new HTTP driver-log guard fails such cells.
+
+## Projection, GDN and attention checkpoint
+
+The latest repeated whole-model result is **349.57 / 351.44 tok/s** on the
+same two-socket, 512-token workload. All measured token streams remain
+unchanged and every run completes 20 expert movements. This is roughly
+350 tok/s, not a promise that every individual request exceeds that number.
+The user has now changed the active target to **50 tok/s decode with dynamic
+MTP on the same two CPU sockets**. That decode target is not yet measured or
+achieved. These native CPU results are not a hybrid-driver or release-image
+certificate. The ordinary commit hook runs the full Unit and production
+preflight gates before creating this checkpoint.
+
+| Change | Matched prefill tok/s | Evidence |
+|---|---:|---|
+| Fresh control with the committed Q6 group loop | 294.81 | Old group loop restored and rebuilt through ccache |
+| Expand the Q6 three/four-row integer group loop | 328.44 / 328.61 | Fixed K-block/FP32 order, unchanged output streams |
+| Also split assist-bound GDN heads into four static tasks | 319.19 | Rejected: isolated-kernel improvement did not survive whole-model measurement |
+| Cache-line GDN tiles with dynamic task ownership | 334.93 / 334.38 | Normal heads remain whole; only subnormal-gated heads split |
+| Cyclic whole-query ownership in causal attention | 341.56 / 344.52 | Canonical reductions unchanged; normal expert movement and output streams retained |
+| Remove the preprocessing output clear | 340.55 / 340.52 | Rejected: no demonstrated model-level benefit |
+| Split ordinary heads into two register tiles | 335.38 | Rejected: ordinary-gate micro latency and whole-model latency regress |
+| Fuse state update with the next token's decay/key reduction | 349.57 / 351.44 | AVX512 state traffic reduced, byte-exact outputs and snapshots retained |
+
+### Q6 projection: scope and arithmetic
+
+The AVX-512 Q6_K three/four-row primitive previously forced a four-iteration
+integer group loop to remain rolled. Expanding it removes register-copy loop
+back edges while retaining named integer/FP accumulators and the exact
+ascending K-block FP32 sum. The other compact multi-scale codebooks already
+expand these groups explicitly; nibble and expanded-INT8 kernels have distinct
+arithmetic/register layouts and were not changed speculatively.
+
+Six focused Integration registrations passed: AVX2/AVX512 four-row prefill,
+AVX2/AVX512 fused verifier schedules, production bucket-M invariance, and
+all-format grouped verifier rows. Short-row and prefill A/B CSVs retain full
+serial-row oracles and zero bit/repeat mismatches. Micro timings vary by shape
+and the unchanged two-row control also varies; the repeated whole-model A/B,
+not a universal microkernel speedup claim, supports retaining this change.
+
+### GDN recurrence: assist-bound head ownership
+
+An otherwise identical 512-row, eight-head, 128-by-128 recurrence fixture
+measures 3.9–4.0 ms with normal gates and 82.8–86.3 ms when one head has a
+subnormal decay. The real model's second rank has the same first-layer
+straggler. Profiler evidence attributes the delay to gradual-underflow
+hardware assists, not attention or collectives themselves.
+
+The kernel now classifies the already-computed decay bits after the existing
+preprocessing barrier. If workers outnumber heads, only a subnormal-gated head
+is partitioned into disjoint cache-line value-column ranges. Each task still
+walks tokens and key reductions in the same order. Ordinary heads retain their
+whole-head register tile. No extra state buffer, precision/format change,
+FTZ/DAZ mode, or recurrence approximation is introduced. Dynamic task
+ownership prevents expensive tiles from landing on one worker while others
+receive unused normal-head slots. It is CPU work scheduling, not expert
+placement policy.
+
+The isolated slow-head latency becomes about 30.5 ms (normal control 3.95 ms).
+Production PerfStats on rank 1 records eight 16-column tasks for head 3 per
+512-row request, including warmup. Assembly inspection finds no FP accumulator
+stack traffic in the specialized hot loops. A separate system-wide counter
+run still records FP assists; those counters are diagnostic, not canonical
+latency evidence.
+
+`CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact` compares outputs,
+terminal states and every padded snapshot against independent serial decode.
+It covers mixed heads, a head entering underflow mid-request, SIMD tails,
+M=1/15/33, both Q/K normalization modes and worker counts through 31. It is
+explicitly registered as `V2_Integration_CPU_GDNSubnormalHeadWorksharing` in
+ProductionTestPreflight. That regression plus four established GDN gates pass
+in AVX512, forced-AVX2 dispatch, and a separately compiled AVX2 build.
+
+### GDN: one state walk per subsequent token
+
+The retained AVX512 helper seeds the first token's decay/key sum once, then
+combines each token's update/output sum with the next token's decay/key sum.
+Each output and key accumulator still visits key rows in ascending order;
+every rounded multiply and FMA remains unchanged. Ordinary state briefly
+holds the next decayed row and ends with the fully updated terminal state.
+For MTP, the helper writes the current raw snapshot before seeding the next
+snapshot. Completed snapshots and the preserved initial state stay immutable.
+No additional state buffer is allocated.
+
+The matched normal-gate microbenchmark improves from about 4.0 ms to 2.19 ms.
+The expanded subnormal regression also poisons every output/snapshot and
+tests the production merged-QKV verifier's preserved-input contract. The
+five focused GDN registrations pass after this fusion. AVX2 retains its
+existing arithmetic implementation; no AVX2 fused-loop speedup is claimed.
+The `NormalGateHeadIsolated` and `SubnormalGateHeadIsolated` profiler cases
+keep the two gate regimes separate from canonical timing.
+
+### Attention: balance the causal triangle
+
+The earlier separate stage profile places full attention at about 5.9% of
+root-rank prefill wall time; GDN projections account for roughly 16.4% and
+recurrence 4.5%, with peer straggler delay additionally visible in collectives.
+Attention alone cannot explain the original gap. Its fresh 512-row causal
+bucket nevertheless has an obvious work imbalance: contiguous query ranges
+give late-query workers nearly twice the mean visible-KV work. A cyclic
+whole-row assignment preserves every canonical reduction. The baseline
+Q16_1, 8-head, d=256, M=KV=512 kernel measures about 6.81 ms; cyclic query
+ownership measures 4.23 ms and improves the complete model as shown above.
+Context-parallel/decode wave ownership is unchanged. The first experimental
+edit accidentally touched that separate loop; it was reverted before the
+correct query-loop experiment. Its `attention-cyclic-*` artifacts do not
+authenticate the retained optimization; `attention-query-cyclic-*` do.
+
+The new `V2_Integration_CPUFlashAttentionCausalRowOwnership` preflight case
+compares whole output bytes with one-worker execution across all nine native
+K/V pairings, M=31/512 and worker counts through 31. It passes with AVX512 and
+separate AVX2 compilation. Running the existing non-Q16 grouped-attention case
+in isolation exposed a fixture dependency on another test registering a CPU
+backend. The fixture now registers its own physical NUMA endpoint, and its
+device-free grouped-attention registration is explicitly in preflight too.
+
+Local evidence remains under `/tmp/llaminar-cpu-prefill.pzN2az/`, including
+`q6-rolled-control*`, `q6-group-unroll*`, `q6-unrolled-recheck*`,
+`gdn-cacheline-*`, `attention-query-cyclic-*`, and
+`gdn-state-pipeline-*`, and `attention-contiguous-baseline.log`. These artifacts
+are not source-controlled payloads.
 
 ## Experiment
 

@@ -672,10 +672,14 @@ namespace llaminar2::cpu::native_vnni
                     __m512i dot_low3 = _mm512_setzero_si512();
                     __m512i dot_high3 = _mm512_setzero_si512();
 
+                    // Four fixed groups reuse the same named accumulator
+                    // chains. Expose their boundaries to register allocation;
+                    // a rolled loop otherwise copies every live dot chain at
+                    // its back edge. The K-block and FP32 sum order is unchanged.
 #if defined(__clang__)
-#pragma clang loop unroll(disable)
+#pragma clang loop unroll(full)
 #elif defined(__GNUC__)
-#pragma GCC unroll 1
+#pragma GCC unroll 4
 #endif
                     for (int group = 0; group < 4; ++group)
                     {

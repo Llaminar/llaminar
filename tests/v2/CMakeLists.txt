@@ -13619,6 +13619,13 @@ add_v2_test(V2_Integration_CPUFlashAttentionQwenTPAllFormatTotality
     MPI_PROCS 1
     TIMEOUT 600
 )
+add_v2_test(V2_Integration_CPUFlashAttentionCausalRowOwnership
+    COMMAND $<TARGET_FILE:v2_perf_cpu_flash_attention_tile_tournament>
+            --gtest_filter=Perf__CPUFlashAttentionTileTournament.CausalPrefillWorkerOwnershipByteExact
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;Prefill;AllFormats;ThreadTotality;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 
 add_v2_test(V2_Unit_CPUFlashAttentionTournamentDriver
     COMMAND ${Python3_EXECUTABLE}
@@ -14089,8 +14096,9 @@ add_v2_test(V2_Integration_CPUFlashAttentionKernel
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_kernel>
             --gtest_filter=Test__CPUFlashAttentionKernel.PhysicalModesAndGroupedVerifierAreByteExactForEveryNonQ16NativeKVFormat:Test__CPUFlashAttentionKernel.WrappedNativeKVRingMatchesCompactForEveryNonQ16FormatAndM:Test__CPUFlashAttentionKernel.NativeRequestBatchWithUnequalWrappedHistoriesIsByteExactForEveryNonQ16Format
-    LABELS "V2;Integration;CPU;Attention;GroupedVerifier;ByteExact;AllFormats;MTotality;PhysicalModes;WrappedRing;FP32;FP16;BF16;Q8_1;TurboQuant;TQ4;TQ8"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;GroupedVerifier;ByteExact;AllFormats;MTotality;PhysicalModes;WrappedRing;FP32;FP16;BF16;Q8_1;TurboQuant;TQ4;TQ8"
     MPI_PROCS 1
+    NO_MODELS
 )
 
 # Wo transpose benchmark - compares row-major vs column-major GEMV
@@ -18665,6 +18673,14 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_GDNRecurrence
             --gtest_brief=1
     LABELS "V2;Integration;CPU;MTP;GroupedVerifierRows;DecodeEquivalent;GatedDeltaNet;Recurrence;StatePublication;FP32;Regression"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CPU_GDNSubnormalHeadWorksharing
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;GatedDeltaNet;Prefill;MTP;ThreadTotality;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: GDN Mathematical Correctness — Deep formula-level verification of

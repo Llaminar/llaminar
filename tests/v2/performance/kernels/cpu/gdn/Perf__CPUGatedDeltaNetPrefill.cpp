@@ -159,8 +159,11 @@ namespace
  *
  * A real Qwen head drives exp(g) into FP32 gradual underflow. This fixture
  * covers that production regime rather than only normal synthetic gates.
- * Canonical latency remains separate from profiler collection. This is a
- * latency diagnostic, not a mathematical certificate; byte-equivalence checks
+ * Measure an otherwise identical normal-gate control first, including the same
+ * 512 rows, initial state and eight local heads. This keeps gate economics
+ * separate from shape or worker-count differences. Canonical latency remains
+ * separate from profiler collection. This is a latency diagnostic, not a
+ * mathematical certificate; byte-equivalence checks
  * belong to the CPU GDN integration suite rather than a timing tolerance.
  */
 TEST(Perf__CPUGatedDeltaNetPrefill, SubnormalGateHead)
@@ -171,6 +174,7 @@ TEST(Perf__CPUGatedDeltaNetPrefill, SubnormalGateHead)
         threads = std::max(1, std::stoi(configured));
     omp_set_num_threads(threads);
     PrefillFixture fixture(512, 8, 128, 128);
+    const double normal_milliseconds = benchmarkPrefill(fixture, 3, 11);
     // Only one head has the tiny factor, as in the measured TP rank. Other
     // heads retain their ordinary decay and share the same worker team.
     fixture.a_log[0] = -133.0f;
@@ -182,7 +186,52 @@ TEST(Perf__CPUGatedDeltaNetPrefill, SubnormalGateHead)
     ASSERT_EQ(std::fpclassify(gate), FP_SUBNORMAL);
     const double milliseconds = benchmarkPrefill(fixture, 3, 11);
     std::cout << "CPU GDN subnormal head M=512 heads=8 d_k=128 d_v=128 threads="
-              << threads << " median_ms=" << milliseconds << '\n';
+              << threads << " normal_ms=" << normal_milliseconds
+              << " median_ms=" << milliseconds
+              << " subnormal_slowdown=" << milliseconds / normal_milliseconds << '\n';
+}
+
+/**
+ * @brief Isolated assist-bound shape for perf counters and ISA attribution.
+ *
+ * Unlike the matched control above, this entrypoint executes no normal-only
+ * comparison. Each profiler invocation therefore observes only one exact
+ * geometry and gate regime. Preparation and state resets are outside latency
+ * samples, and these profiled runs are never canonical timing evidence.
+ */
+TEST(Perf__CPUGatedDeltaNetPrefill, SubnormalGateHeadIsolated)
+{
+    omp_set_dynamic(0);
+    int threads = 28;
+    if (const char *configured = std::getenv("LLAMINAR_CPU_GDN_PERF_THREADS"))
+        threads = std::max(1, std::stoi(configured));
+    omp_set_num_threads(threads);
+    PrefillFixture fixture(512, 8, 128, 128);
+    fixture.a_log[0] = -133.0f;
+    fixture.dt_bias[0] = 0.0f;
+    for (int row = 0; row < fixture.rows; ++row)
+        fixture.alpha[static_cast<size_t>(row) * fixture.n_heads] = 0.0f;
+    std::cout << "CPU GDN isolated subnormal head threads=" << threads
+              << " median_ms=" << benchmarkPrefill(fixture, 3, 11) << '\n';
+}
+
+/**
+ * @brief Profile only the ordinary-gate, 512-row TP recurrence geometry.
+ *
+ * The longer sample series gives statistical profilers enough kernel samples
+ * without mixing head counts or the assist-bound gate regime. Timing from a
+ * profiled invocation is diagnostic only, never the canonical latency score.
+ */
+TEST(Perf__CPUGatedDeltaNetPrefill, NormalGateHeadIsolated)
+{
+    omp_set_dynamic(0);
+    int threads = 28;
+    if (const char *configured = std::getenv("LLAMINAR_CPU_GDN_PERF_THREADS"))
+        threads = std::max(1, std::stoi(configured));
+    omp_set_num_threads(threads);
+    PrefillFixture fixture(512, 8, 128, 128);
+    std::cout << "CPU GDN isolated normal heads threads=" << threads
+              << " median_ms=" << benchmarkPrefill(fixture, 3, 101) << '\n';
 }
 
 /**
