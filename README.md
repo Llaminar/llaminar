@@ -1,67 +1,104 @@
 # 🚿 Llaminar
-An LLM inferencing engine in C++, with custom quantised kernels for CPU AVX512-VNNI / AVX2, CUDA `sm86`, and ROCm `gfx906`.
 
-Llaminar tries to solve a variety of problems encountered in other projects:
+Llaminar runs large language models on CPUs, NVIDIA GPUs, AMD GPUs, or a mix of
+all three. It is written in C++ and includes its own kernels for quantised models.
+You can serve a model from one machine or share the work across a cluster.
 
-* **Tensor, Pipeline, and Expert Parallelism:** natively supported, mix and match heterogenous domains.
-* **Multiple vendors:** Mix and match CPU, ROCm and CUDA, simultaneously and natively.
-* **Easy scaling:** Built from the ground-up on OpenMPI with the goal of enabling scaling across clusters of machines. NUMA-aware.
-* **IaC-like experience:** Plan, then deploy.
+Give Llaminar a GGUF model and a context size, and its auto planner chooses how
+to use your hardware. You can start serving immediately, or save the plan to
+inspect and reuse it. Tensor parallelism, pipeline parallelism, and MoE expert
+placement let you make use of additional GPUs and CPU memory as your needs grow.
 
-Llaminar is **experimental** and very much in an **alpha** stage of development. Use it with that in mind and expect the odd segfault.
+Llaminar is in **alpha**. Expect rough edges while development continues.
 
-[Quickstart](#quickstart) · [E2E-tested recipes](#e2e-tested-auto-recipes) ·
+[Release benchmarks](#latest-release-benchmarks) · [Quickstart](#quickstart) ·
+[Tested configurations](#e2e-tested-auto-recipes) ·
 [Planning and topology](#planning-and-topology) ·
-[Benchmarks](#benchmarks) · [Development](#development) ·
+[Run a benchmark](#benchmarks) · [Development](#development) ·
 [Architecture](#llaminar-architecture)
 
 **Discord:** https://discord.com/channels/1404857025854312528/1519609695793446979
 
 ## Supported Hardware
 
-Llaminar supports:
+The current builds target the following hardware:
 
-* CPU inferencing (AVX512-VNNI and AVX2 runtime images)
-* CUDA inferencing (RTX-3090 / `sm86` initial support for now)
-* ROCm inferencing (`gfx906` only for now)
-* All of the above simultaneously
-* Tensor Parallel / Pipeline Parallel / MoE routed-expert placement (replicated,
-  apportioned, or tensor-sharded compute with explicit row assignment) (WiP)
+| Hardware | Support |
+|---|---|
+| x86-64 CPUs | Separate AVX512-VNNI and AVX2 images |
+| NVIDIA GPUs | CUDA `sm86`, initially tested on RTX 3090 |
+| AMD GPUs | ROCm `gfx906`, including the Instinct MI50 |
+
+You can combine supported CPUs and GPUs in the same deployment, including
+NVIDIA and AMD cards together. The [recipes below](#e2e-tested-auto-recipes)
+show the configurations covered by our end-to-end tests.
 
 ## Supported Models
 
-Llaminar supports the following model architectures initially:
+Use a GGUF file from one of these supported model families:
 
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
 * Qwen 3.5/3.6 (dense and MoE), including Qwen 3.8 dense GGUFs
 
+The tested examples below include Qwen 3.8 27B, Qwen 3.6 MoE 35B,
+Ornith 1.5 MoE 35B, and Qwen 3.5 MoE 122B.
+
+## Latest release benchmarks
+
+Release [2026-09-24.1](https://github.com/Llaminar/llaminar/releases/tag/2026-09-24.1)
+passed all 19 HTTP end-to-end configurations and their benchmarks on both the
+AVX512 and AVX2 images. The chart below shows those certified results.
+
+**Prefill** is how quickly the model reads your prompt. **Decode** is how quickly
+it writes the answer. Both are measured in tokens per second; higher is faster.
+Click the chart to download the full-size SVG.
+
+<!-- Embed the exact release chart from its immutable report commit. GitHub
+serves release-asset SVGs as downloads, which browsers cannot render inline.
+When updating this section, keep the chart and release links on the same report. -->
+[![Release 2026-09-24.1 benchmark results: prefill and decode speed for AVX512 and AVX2, grouped by model size](https://raw.githubusercontent.com/Llaminar/llaminar/392d7355744d5afa24a2671b0bdeb96882e8d3ac/benchmarks/production/published/benchmarks.svg)](https://github.com/Llaminar/llaminar/releases/download/2026-09-24.1/benchmarks.svg)
+
+Each pair of bars compares the two CPU builds on the same model and hardware.
+Use the printed token rates to compare different configurations: each pair has
+its own scale, with AVX512 as the reference. The chart also lists the prompt
+and output lengths used for each measurement.
+
+[Release notes and test reports](https://github.com/Llaminar/llaminar/releases/tag/2026-09-24.1) ·
+[Detailed results and image digests (JSON)](https://github.com/Llaminar/llaminar/releases/download/2026-09-24.1/benchmark-results.json) ·
+[Benchmark your own hardware](#benchmarks)
+
 ## Quickstart
 
-Start with the published Docker image and let the auto planner choose placement.
-You only need a supported GGUF, enough RAM/VRAM, and a Linux x86_64 host with
-Docker. The image includes CPU, CUDA, ROCm, MPI, and the required user-space
-libraries; model weights and host GPU drivers are not included.
+The easiest way to get started is with Docker. You will need a Linux x86-64
+machine, a supported GGUF model, and enough RAM or GPU memory to hold it.
+The image includes Llaminar and its runtime libraries. Install your GPU's driver
+on the host and download the model separately.
 
-The commands below use **Bash**. Run the setup blocks in the same shell.
+The three steps below start an OpenAI-compatible HTTP server. Run the setup
+commands in the same **Bash** terminal so their variables stay available.
 
 ### 1. Choose the image and model
 
-Select the image for your **CPU instruction set**, not your GPU vendor. Both
-images include all three compute backends.
+Choose the image that matches your **CPU**, even if you will run inference on a
+GPU. Both images support CPU, NVIDIA, and AMD execution. If your CPU does not
+support AVX512-VNNI, use the AVX2 image.
 
 | Host CPU | Certified release (default) | Nightly development |
 |---|---|---|
 | AVX512-VNNI | `ghcr.io/llaminar/llaminar:master` | `ghcr.io/llaminar/llaminar:develop` |
 | AVX2 | `ghcr.io/llaminar/llaminar:master-avx2` | `ghcr.io/llaminar/llaminar:develop-avx2` |
 
-The `master` tags point to the latest E2E- and benchmark-certified release.
-Choose a `develop` tag only when you want the nightly build: it passes Unit and
-production-preflight gates but is not a certified release. All four branch tags
-are mutable; pin an image digest when you need a repeatable deployment.
+Use `master` for the latest tested release. The optional `develop` tags provide
+nightly builds with newer changes; they pass unit and integration preflight
+tests but have not completed release certification. These tags move as new
+images are published. To keep a deployment on one version, use a dated release
+tag or image digest from the [release notes](https://github.com/Llaminar/llaminar/releases/latest).
 
-Set the directory containing your GGUF and its path **inside the container**.
-The filename below is an example; use a file you have downloaded.
+Set `MODEL_DIR` to the folder where you downloaded your model. Docker makes
+that folder available as `/models` inside the container, so `LLAMINAR_MODEL`
+uses the same filename with a `/models/` prefix. Replace the example filename
+with your own GGUF.
 
 ```bash
 export MODEL_DIR=/opt/llaminar-models
@@ -81,18 +118,31 @@ COMMON_RUN=(
 )
 ```
 
+`COMMON_RUN` holds the Docker options shared by the examples below, including
+the model folder and the network settings.
+
 ### 2. Expose the hardware
 
-Choose **one** setup below. This controls which devices Docker exposes; Llaminar
-will then plan across the available hardware.
+Expand the option that matches your machine and run its setup commands. These
+give the container access to your GPUs; Llaminar will decide how to use them
+when it loads the model.
 
-**NVIDIA:**
+<details>
+<summary>NVIDIA GPUs (CUDA)</summary>
+
+Use this on a host with the NVIDIA driver and NVIDIA Container Toolkit installed.
 
 ```bash
 DEVICE_ARGS=(--gpus all)
 ```
 
-**AMD:**
+</details>
+
+<details>
+<summary>AMD GPUs (ROCm), or a mix of AMD and NVIDIA GPUs</summary>
+
+This exposes the AMD GPU devices and gives the container access to their device
+groups. The group IDs are read from your host automatically.
 
 ```bash
 DEVICE_ARGS=(--device=/dev/kfd --device=/dev/dri --cap-add SYS_PTRACE)
@@ -103,14 +153,25 @@ for node in /dev/kfd /dev/dri/card* /dev/dri/renderD*; do
 done
 ```
 
-For a mixed AMD/NVIDIA host, run the AMD block and then add NVIDIA access:
+If the same machine also has NVIDIA GPUs, add access to those after running
+the AMD block:
 
 ```bash
 DEVICE_ARGS+=(--gpus all)
 ```
 
-For CPU-only execution, use `DEVICE_ARGS=()` instead. The same image runs on
-CPU-only hosts without GPU drivers.
+</details>
+
+<details>
+<summary>CPU only</summary>
+
+The same image works without GPU drivers. No device mappings are needed:
+
+```bash
+DEVICE_ARGS=()
+```
+
+</details>
 
 <details>
 <summary>Host setup and container permissions</summary>
@@ -144,19 +205,24 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
   --host 127.0.0.1 --port 8080
 ```
 
-No device or topology flags are required: `serve` defaults to automatic
-planning. It reads the model metadata, gathers hardware inventory, checks
-memory capacity, and selects placement. Start here before tuning device
-counts, expert quotas, precision, or collectives.
+Llaminar checks the model and available memory, then chooses a device layout
+automatically. The server stays in the foreground so you can see its startup
+progress. The 8,192-token context allows room for both your prompt and the
+generated answer.
 
-- To restrict compute to one backend, add `--only-backends rocm`, `cuda`, or `cpu`.
-- Increase `--context-length` to suit your workload and available memory; the
-  limit includes both prompt and generated tokens.
-- For a model with MTP weights, add `--mtp --mtp-depth-policy dynamic` to enable
-  adaptive speculative decoding. MTP is otherwise off; prefix caching is on by
-  default.
-- To accept connections from other machines, use `--host 0.0.0.0`. Expose it only
-  on a trusted network or behind an authenticated proxy.
+You can add these options to the command when you need them:
+
+| What you want | What to add or change |
+|---|---|
+| Use only AMD, NVIDIA, or CPU compute | `--only-backends rocm`, `cuda`, or `cpu` |
+| Allow a longer conversation | Increase `--context-length`, within available memory |
+| Enable multi-token prediction (MTP) | Add `--mtp --mtp-depth-policy dynamic`; the GGUF must include MTP weights |
+| Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
+
+MTP lets the model propose and verify several output tokens at a time. Dynamic
+depth adapts how many it proposes. Prefix caching, which reuses work from
+previous prompts, is enabled by default. If you expose the server to other
+machines, use a trusted network or an authenticated proxy.
 
 Wait for the server to become ready, then use another terminal:
 
@@ -174,21 +240,24 @@ curl --fail-with-body --no-buffer http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-OpenAI-compatible clients use `http://127.0.0.1:8080/v1` as the base URL.
-`GET /v1/models` lists the loaded model. Remove `"stream": true` for one complete
-JSON response. Stop the foreground server with Ctrl+C, or use `docker stop
-llaminar` from another terminal. Run one example at a time on the same devices.
+The answer streams back as it is generated. Remove `"stream": true` if you
+prefer to receive one complete JSON response.
+
+For OpenAI-compatible apps, set the base URL to `http://127.0.0.1:8080/v1`.
+You can query `http://127.0.0.1:8080/v1/models` to find the loaded model's name.
+Stop the server with Ctrl+C, or run `docker stop llaminar` from another terminal
+before trying another example on the same devices.
 
 ## Planning and topology
 
 ### Inspect a plan, then apply it
 
-`plan` and `serve` share inference options. Plan using the context, KV policy,
-and MTP policy you intend to serve; do not size one configuration and silently
-deploy another.
+You can ask Llaminar to show its choice before starting a server. The `plan`
+command checks your hardware and saves the selected layout to a JSON file.
+Later, `serve --config` uses that layout without repeating the search.
 
-Using the Quickstart variables, save a plan without requiring a writable host
-directory inside the non-root container:
+Using the variables from Quickstart, create a plan, copy it out of the
+container, and start a server from it:
 
 ```bash
 docker run "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
@@ -204,58 +273,88 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
   "$LLAMINAR_IMAGE" serve --config /config/plan.json
 ```
 
-The planning container intentionally omits `--rm` so its output can be copied
-after exit. Inspect the summary and saved JSON before applying it. A saved
-plan fixes placement; applying it does not rerun automatic selection.
+The planning container is kept until `docker cp` has retrieved the file, then
+removed. You can open `llaminar-plan.json` to review the selection before
+running the final command.
 
-Use constraints only when they express a real requirement:
+Use the same context size, KV-cache precision, and MTP settings when planning
+and serving: each affects how much memory the model needs. To guide the
+planner, add any of these options to `plan` or to an automatic `serve` command:
 
 | Intent | Option |
 |---|---|
 | Only ROCm compute | `--only-backends rocm` |
 | Exactly two ROCm devices, with automatic placement | `--only-backends rocm --auto-device-counts rocm=2` |
-| Only TP or PP candidates | `--only-strategies tp,pp` |
-| Prefer a backend when candidates otherwise tie | `--prefer-backend rocm` |
-| Rank for an expected request length | `--plan-workload 512,384` |
+| Consider only tensor or pipeline parallelism | `--only-strategies tp,pp` |
+| Prefer AMD when two choices have similar estimated performance | `--prefer-backend rocm` |
+| Optimize for roughly 512 prompt tokens and 384 output tokens | `--plan-workload 512,384` |
 | Require compute on every discovered host | `--auto-hosts all` |
 
-`--plan-workload` is an optional costing horizon, not a prompt generator or
-output limit. Auto may choose fewer devices when that is predicted to be faster.
-Use `--auto-device-counts` only when a count is required: it preserves automatic
-device selection and placement but rejects candidates with a different count.
-CPU counts refer to NUMA compute endpoints, not threads or MPI processes.
-Benchmark the result; a cost estimate is not a measured throughput guarantee.
+Auto may choose fewer devices if it expects them to be faster. Set
+`--auto-device-counts` when you want an exact count; otherwise leave it out.
+For CPUs, a device count means NUMA nodes: groups of CPU cores with their own
+local memory, often one per socket. It does not mean a thread count.
 
-Do not add an `expert-overlay` strategy filter merely because the model is MoE:
-a homogeneous one-domain MoE candidate is currently labeled `tp` even though it
-executes through ExpertOverlay. That filter would exclude it. Do not combine
-auto-search filters with explicit placement or a saved apply plan.
+`--plan-workload` helps estimate performance for your expected request size;
+it does not send a prompt or limit the output. You can
+[benchmark the selected layout](#benchmarks) to see how it performs in practice.
+
+<details>
+<summary>Choosing a parallelism strategy</summary>
+
+| Strategy | How the work is shared |
+|---|---|
+| Single device | One GPU or CPU NUMA node runs the model. |
+| Tensor parallelism (TP) | Devices work together on each layer, each computing part of it. |
+| Pipeline parallelism (PP) | Devices run different consecutive sections of the model's layers. |
+| ExpertOverlay | An MoE model's experts are spread across device groups, which can include both GPUs and CPUs. |
+
+For most uses, let auto choose the strategy too. The recipes below constrain
+it so you can try a particular tested configuration.
+
+One naming detail matters when you supply `--only-strategies`: a group of
+same-vendor devices running MoE is listed as `tp` by the planner, although its
+experts use ExpertOverlay. The two-GPU MoE recipes use that spelling. The
+`expert-overlay` filter selects layouts with separate expert groups or tiers.
+
+Auto filters guide a new selection. When using `--config` or specifying devices
+and tiers yourself, omit those filters because the placement is already given.
+
+</details>
 
 ### E2E-tested auto recipes
 
-These recipes cover every topology in the canonical HTTP E2E matrix. Run the
-Quickstart's image, model-directory, and hardware setup first; each command
-then starts one server. Use the NVIDIA, AMD, mixed-vendor, or CPU-only
-`DEVICE_ARGS` block that matches the recipe. The named GGUF must exist under
-`MODEL_DIR`. All examples request the matrix's FP16 KV storage and dynamic MTP;
-multi-participant MoE examples also request Dynamic expert maintenance and
-ordinal initial ownership. The HTTP test harness adds its own workload and
-diagnostic settings, so these are user-facing launch examples, not literal
-test invocations.
+Choose your model, then expand the hardware configuration you want to try.
+There is an example for every configuration in our HTTP end-to-end (E2E) test
+suite, plus the remote CPU tests. Each local command starts one server using
+the image and Docker options you set up in [Quickstart](#quickstart).
 
-`--auto` plus backend, strategy, and device-count constraints asks the planner
-to choose *which* devices, rank ownership, PP layer split, expert tier roles,
-and capacity. The exact count is a requirement: insufficient hardware or
-memory fails admission rather than quietly selecting a smaller topology.
-The two-GPU MoE recipes use `tp` as the auto strategy because their one-domain
-ExpertOverlay execution is classified that way by the planner.
+Before running a recipe, download its named GGUF into `MODEL_DIR` and select
+the matching NVIDIA, AMD, mixed-GPU, or CPU-only `DEVICE_ARGS` setup. All
+examples use dynamic MTP and FP16 KV-cache storage. Multi-device MoE examples
+also enable dynamic expert movement, so busy experts can move between devices
+as demand changes. Model activations remain FP32.
+
+The commands ask auto to use a particular device count and strategy. The
+planner still chooses the individual devices, how layers or experts are
+distributed, and how much memory each group can use. If the requested layout
+does not fit, it reports the problem. For unrestricted selection, use the
+shorter [Quickstart command](#3-serve-and-send-a-request).
+
+These are serving examples for the tested layouts. The test runner supplies
+its own prompts and checks when certifying a release.
 
 #### Qwen 3.8 dense 27B
+
+Start with one GPU if the model fits. The multi-GPU examples let you try
+splitting work within each layer (TP) or placing different layers on different
+GPUs (PP). They use an 8K context; the single-ROCm example uses 32K.
 
 <details>
 <summary>1 CUDA GPU · 8K context</summary>
 
-The simplest NVIDIA deployment; no inter-device collective.
+Run the entire model on one NVIDIA GPU. This avoids the cost of exchanging
+intermediate results between GPUs.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -270,7 +369,8 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>1 ROCm GPU · 32K context</summary>
 
-The single-MI50 E2E profile uses the larger admitted context.
+Run the entire model on one AMD GPU with room for a longer conversation.
+This 32K configuration is tested on a 32 GB MI50.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -285,7 +385,8 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 CUDA GPUs · tensor parallel</summary>
 
-Both NVIDIA GPUs shard each layer; auto chooses their physical identities.
+Both NVIDIA GPUs work on each model layer together. The planner chooses two
+available cards and divides the layer's tensors between them.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -300,7 +401,8 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 ROCm GPUs · tensor parallel</summary>
 
-Both AMD GPUs shard each layer within one native ROCm collective.
+Both AMD GPUs work on each layer together, sharing intermediate results through
+ROCm's collective communication library.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -315,7 +417,8 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 CUDA GPUs · pipeline parallel</summary>
 
-Auto assigns consecutive model layers to two one-GPU stages.
+One NVIDIA GPU runs the earlier layers and the other runs the later layers.
+The planner chooses where to split the model.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -330,7 +433,8 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 ROCm GPUs · pipeline parallel</summary>
 
-Auto assigns consecutive model layers to two one-GPU stages.
+One AMD GPU runs the earlier layers and the other runs the later layers.
+The planner chooses where to split the model.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -343,10 +447,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 CUDA + 2 ROCm GPUs · TP within each PP stage</summary>
+<summary>2 CUDA + 2 ROCm GPUs · combined tensor and pipeline parallelism</summary>
 
-Auto builds a CUDA TP domain and a ROCm TP domain, then pipelines them. CUDA
-and ROCm do not form one cross-vendor NCCL/RCCL group.
+Use both GPU vendors in one deployment. The two NVIDIA cards cooperate on one
+section of the model and the two AMD cards cooperate on another. The planner
+chooses the layer split and the order of those sections.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -360,10 +465,14 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 
 #### Qwen 3.6 MoE 35B
 
-<details>
-<summary>1 CUDA GPU · ExpertOverlay on one device</summary>
+This mixture-of-experts (MoE) model uses a subset of its experts for each token.
+The GPU examples keep the model on one card. The CPU example shares experts
+across two NUMA nodes. All three use an 8K context.
 
-One GPU owns the routed experts; no inter-device migration is needed.
+<details>
+<summary>1 CUDA GPU · whole model on one card</summary>
+
+Run the model and all of its experts on one NVIDIA GPU, with dynamic MTP enabled.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -376,9 +485,9 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>1 ROCm GPU · ExpertOverlay on one device</summary>
+<summary>1 ROCm GPU · whole model on one card</summary>
 
-The same single-device MoE path on one AMD GPU.
+Run the model and all of its experts on one AMD GPU, with dynamic MTP enabled.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -391,11 +500,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 local CPU NUMA endpoints · NodeTP and dynamic expert rebalance</summary>
+<summary>CPU only · 2 NUMA nodes, typically two sockets</summary>
 
-Use the Quickstart's CPU-only `DEVICE_ARGS=()`. Two local MPI ranks
-participate; the single expert tier can rebalance skew but cannot promote
-between tiers.
+Use both CPU NUMA nodes on the same machine, with one worker process per node.
+Experts can move between them to spread the load more evenly. Select the
+Quickstart's CPU-only setup (`DEVICE_ARGS=()`) before running this command.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -410,11 +519,14 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 
 #### Ornith 1.5 MoE 35B
 
-Ornith uses its own `Ornith-1.5-35B-Q4_K_M.gguf` weights, not the Qwen 3.6
-GGUF, even though both use the same MoE model family.
+Ornith is a fine-tune of the Qwen 3.6 MoE family. Download
+`Ornith-1.5-35B-Q4_K_M.gguf` for these examples; they all use an 8K context.
 
 <details>
-<summary>1 ROCm GPU · ExpertOverlay on one device</summary>
+<summary>1 ROCm GPU · whole model on one card</summary>
+
+Keep Ornith and all of its experts on one AMD GPU. This is the simplest
+Ornith configuration in the test suite.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -427,10 +539,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 CUDA GPUs · one-domain ExpertOverlay</summary>
+<summary>2 CUDA GPUs · experts shared across both cards</summary>
 
-Both GPUs participate in the homogeneous MoE domain; `tp` is the planner's
-strategy label for this one-domain ExpertOverlay configuration.
+Spread Ornith's experts across two NVIDIA GPUs. Dynamic movement can rebalance
+the experts as the workload changes. The planner calls this same-vendor layout
+`tp`, which is why that option appears in the command.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -444,9 +557,10 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 ROCm GPUs · one-domain ExpertOverlay</summary>
+<summary>2 ROCm GPUs · experts shared across both cards</summary>
 
-The same homogeneous expert placement on two AMD GPUs.
+Spread Ornith's experts across two AMD GPUs, with dynamic movement to rebalance
+their work. As in the NVIDIA example, the planner calls this layout `tp`.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -460,9 +574,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 local CPU NUMA endpoints · NodeTP and dynamic expert rebalance</summary>
+<summary>CPU only · 2 NUMA nodes, typically two sockets</summary>
 
-Use `DEVICE_ARGS=()`. Two local MPI ranks share the CPU expert tier.
+Run Ornith across two CPU NUMA nodes on one machine. Each node has its own
+worker process and local expert weights. Use the CPU-only setup
+(`DEVICE_ARGS=()`) first.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -477,17 +593,22 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 
 #### Qwen 3.5 MoE 122B
 
-Keep all four `Qwen3.5-122B-A10B-UD-Q8_K_XL` GGUF shards together under
-`MODEL_DIR`; `-m` names the first shard. Each recipe runs two local MPI ranks.
-The planner selects the continuation domain, tier priorities, expert
-capacities, and device-to-rank placement from the observed hardware; the
-backend counts do not hard-code any of those roles.
+This larger model is split across four GGUF files. Download all four
+`Qwen3.5-122B-A10B-UD-Q8_K_XL` parts into `MODEL_DIR` and pass the first part
+to `-m`, as shown below. Each recipe uses an 8K context and two MPI worker
+processes on the same machine.
+
+ExpertOverlay lets different groups of devices hold different experts. The
+planner chooses which group runs the main model and generates the answer
+(the *continuation*), then uses the other groups for additional expert work.
+It also sets their memory budgets. Dynamic movement can move frequently used
+experts to faster groups and balance the load within each group.
 
 <details>
-<summary>2 CUDA GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+<summary>2 CUDA GPUs + 2 CPU NUMA nodes</summary>
 
-Use the NVIDIA `DEVICE_ARGS` block; the CPU endpoints need no extra Docker
-device mapping.
+Combine two NVIDIA GPUs with CPU memory and compute on both NUMA nodes.
+Choose the NVIDIA Docker setup; CPU access needs no additional device flags.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -502,7 +623,10 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 ROCm GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+<summary>2 ROCm GPUs + 2 CPU NUMA nodes</summary>
+
+Combine two AMD GPUs with the two CPU NUMA nodes. Use the AMD Docker setup;
+the planner decides how many experts each group can hold.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -517,7 +641,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>4 ROCm GPUs + 2 CPU NUMA endpoints · ExpertOverlay</summary>
+<summary>4 ROCm GPUs + 2 CPU NUMA nodes</summary>
+
+Use four AMD GPUs and both CPU NUMA nodes for expert work. This adds GPU
+capacity while still allowing the model to use CPU memory. Choose the AMD
+Docker setup.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -532,10 +660,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 CUDA + 4 ROCm GPUs · two-vendor ExpertOverlay</summary>
+<summary>2 CUDA + 4 ROCm GPUs · GPU-only expert placement</summary>
 
-Use the Quickstart's mixed-vendor `DEVICE_ARGS`. The GPUs form separate
-vendor-native domains; auto decides which domain continues the model.
+Keep the model's compute on six GPUs. NVIDIA and AMD cards each form their own
+group, and auto chooses which group runs the main model. Use the mixed-GPU
+Docker setup so both vendors' devices are visible.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -550,10 +679,11 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 </details>
 
 <details>
-<summary>2 CUDA + 4 ROCm GPUs + 2 CPU NUMA endpoints · three-tier ExpertOverlay</summary>
+<summary>2 CUDA + 4 ROCm GPUs + 2 CPU NUMA nodes · three tiers</summary>
 
-Use mixed-vendor `DEVICE_ARGS`. Auto admits all three hardware groups and
-chooses the continuation and lower-priority expert tiers.
+Use all three types of hardware: NVIDIA GPUs, AMD GPUs, and CPUs. Auto assigns
+their roles and memory budgets, and dynamic movement can rebalance experts
+within and between the groups. Start with the mixed-GPU Docker setup.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -569,21 +699,24 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 
 #### Qwen 3.6 MoE 35B · cross-host CPU experts
 
-The cross-host E2E projection has two more topology intents: one local ROCm
-continuation GPU with either one or two remote CPU hosts. Each intent is tested
-through both auto `plan`/`serve --config` and direct auto `serve`. These
-frontend examples run *inside a prepared controller runtime container* with
-the matching image and GGUF already staged on the remote containers, private
-MPI/SSH connectivity, and a mounted hostfile. A standalone controller
-`docker run` cannot provision or start the remote peers. See the cluster
-setup notes in the advanced disclosure below. Choose *one* route from each
-expanded example; `serve` runs until stopped.
+You can also run the main model on a local AMD GPU while remote CPU machines
+compute some of its experts. We test this with one and two remote CPU hosts,
+using both a saved plan and direct automatic serving.
+
+These examples need a prepared cluster. Each machine must have the matching
+Llaminar image and model file, and the containers must be able to communicate
+over MPI and SSH. Run the commands inside the GPU host's runtime container,
+where `/cluster` contains your hostfiles and is writable for saving plans.
+See [MPI cluster setup](#mpi-cluster-setup) below for the prerequisites and an
+example hostfile.
 
 <details>
 <summary>1 ROCm GPU + 1 remote CPU host · auto plan/apply or direct serve</summary>
 
-`/cluster/hosts-1` must name the GPU controller and exactly one CPU peer.
-`--auto-hosts all` requires real work on both physical hosts.
+Use a hostfile at `/cluster/hosts-1` listing the GPU machine and one remote CPU
+machine. `--auto-hosts all` tells the planner to use both hosts.
+
+First set the options shared by planning and serving:
 
 ```bash
 REMOTE_ARGS=(
@@ -593,11 +726,19 @@ REMOTE_ARGS=(
   --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic
   --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
 )
+```
+
+To inspect a plan before starting the server:
+
+```bash
 llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
   "${REMOTE_ARGS[@]}" --output /cluster/remote-1.json
 llaminar2 serve --config /cluster/remote-1.json
+```
 
-# Or, instead of plan/apply, start with default auto selection:
+Or start the server directly, letting it plan during startup:
+
+```bash
 llaminar2 serve -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf "${REMOTE_ARGS[@]}"
 ```
 
@@ -606,8 +747,10 @@ llaminar2 serve -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf "${REMOTE_ARGS[@]}"
 <details>
 <summary>1 ROCm GPU + 2 remote CPU hosts · auto plan/apply or direct serve</summary>
 
-`/cluster/hosts-2` must name the GPU controller and two distinct CPU peers.
-The planner selects the expert placement across all three hosts.
+Use a hostfile at `/cluster/hosts-2` listing the GPU machine and two separate
+CPU machines. The planner distributes expert work across all three hosts.
+
+First set the shared options:
 
 ```bash
 REMOTE_ARGS=(
@@ -617,24 +760,32 @@ REMOTE_ARGS=(
   --kv-cache-precision fp16 --mtp --mtp-depth-policy dynamic
   --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
 )
+```
+
+To inspect and save the plan, then serve it:
+
+```bash
 llaminar2 plan -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
   "${REMOTE_ARGS[@]}" --output /cluster/remote-2.json
 llaminar2 serve --config /cluster/remote-2.json
+```
 
-# Or, instead of plan/apply, start with default auto selection:
+Or let the server plan during startup:
+
+```bash
 llaminar2 serve -m /models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf "${REMOTE_ARGS[@]}"
 ```
 
 </details>
 
 <details>
-<summary>Advanced: authored placement and MPI cluster setup</summary>
+<summary>Advanced: choose devices and expert tiers yourself</summary>
 
 **Explicit placement when needed**
 
-Use explicit topology for a required deployment shape or a controlled comparison,
-after measuring auto. These examples reuse the Quickstart Docker arguments.
-GPU IDs and model geometry must match your machine and GGUF.
+If you need a specific layout, you can choose devices directly. These examples
+reuse the Quickstart Docker options. Check the GPU IDs on your machine before
+copying them; the auto recipes handle that selection for you.
 
 **Single device:** `--device rocm:0` or `cuda:0` selects one GPU; `cpu:0` selects
 one CPU NUMA endpoint. Bare `--device cpu` selects all local CPU NUMA endpoints.
@@ -669,9 +820,9 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
   --pp-stage '0=early:0-31' --pp-stage '1=late:32-63'
 ```
 
-**MoE ExpertOverlay:** whole routed experts are apportioned across participants,
-rather than dividing the model into layer ranges. For an MoE GGUF, a GPU
-continuation tier and two CPU NUMA endpoints can be declared as:
+**MoE ExpertOverlay:** distribute whole experts between groups of devices.
+Here, two AMD GPUs run the main model and two CPU NUMA nodes provide additional
+capacity for expert work:
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
@@ -680,41 +831,46 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
   --expert-tier 'capacity=cpu:0,cpu:1;priority=10'
 ```
 
-Tier names are labels; smaller integer priorities are preferred. The lowest
-priority number selects the default continuation domain, which owns the main
-inference/sampling path. The greatest priority number is the derived
-final-coverage tier; there is no `fallback=true` switch. A single GPU tier is
-valid too; a CPU tier is not mandatory.
+Each `--expert-tier` names a group of devices and gives it an integer priority.
+Lower numbers are preferred. In this example, priority `0` selects the GPUs
+to run the main model and generate tokens; priority `10` adds CPU capacity.
+The names `accelerator` and `capacity` are labels you can choose yourself.
+You can also define a single GPU tier without any CPU experts.
 
-Capacity is automatic. Avoid hard-coded expert counts; optional
-`;memory-mb=N` and `;max-experts-per-layer=N` restrict a tier when needed.
-Inside tier declarations use explicit addresses such as `cpu:0,cpu:1`, not
-bare `cpu`. Use the IDs actually present on the host.
+Llaminar calculates how many experts fit in each group. To impose a smaller
+budget, add `;memory-mb=N` or `;max-experts-per-layer=N` to that tier.
+Tier declarations need individual device addresses such as `cpu:0,cpu:1`;
+use the IDs present on your host.
 
-Dynamic residency maintenance is on by default. It considers both promotion
-between tiers and skew reduction within a tier, subject to migration economics.
-`--moe-residency-maintenance off` disables maintenance for a static control;
-`observe` collects demand without moving experts. Initial ownership
-(`--moe-routed-expert-owner-order ordinal|random`) is a separate choice.
-`--moe-hot-expert-cache` controls optional extra replicas and defaults to `off`;
-it is not the capacity of the tier's uniquely owned experts.
+Dynamic expert movement is enabled by default. It considers moving busy experts
+to faster tiers and spreading work more evenly among devices in the same tier.
+Moves are made when their estimated benefit justifies the transfer cost.
 
-For migration windows, transfer slots, concurrency, and advanced domain
-overrides, consult `serve --help` and the
-[configuration guide](AGENTS.md#run-and-inspect-configuration).
-Use `serve --dry-run --explain-placement` to inspect an authored topology.
-`--validate-only` checks syntax/configuration, not model fit or successful
-inference.
+Use `--moe-residency-maintenance off` to keep experts in their initial positions,
+or `observe` to collect demand information without moving them. The separate
+`--moe-routed-expert-owner-order ordinal|random` option chooses the initial
+layout. Extra cached copies of experts are controlled by `--moe-hot-expert-cache`,
+which is off by default.
 
-**Remote CPU experts with an MPI hostfile**
+For more tuning options, see `serve --help` and the
+[configuration guide](AGENTS.md#run-and-inspect-configuration). To inspect
+your explicit layout before serving, add `--dry-run --explain-placement`.
 
-The same auto planner can use remote CPU machines for an MoE model. Provision
-the same source revision of Llaminar and the GGUF at the same path on every
-host. Runtime images may use different CPU ISAs for different hosts, but must
-be revision-compatible. Arrange passwordless MPI/SSH launch and private network
-connectivity first.
+</details>
 
-For example, `/cluster/hosts` may contain one GPU host and two CPU hosts:
+#### MPI cluster setup
+
+<details>
+<summary>Prepare a GPU host and remote CPU hosts</summary>
+
+MPI coordinates the worker processes on your machines. Before using the remote
+recipes, prepare each host with the same version of Llaminar and the GGUF at the
+same path. You can use the AVX2 image on one host and AVX512 on another, provided
+they are from the same release. Set up passwordless SSH between the runtime
+containers and make sure MPI can communicate over your private network.
+
+A hostfile lists the machines that may take part. For a GPU host at
+`10.10.0.10` and two CPU hosts, the file looks like this:
 
 ```text
 10.10.0.10 slots=1
@@ -722,32 +878,36 @@ For example, `/cluster/hosts` may contain one GPU host and two CPU hosts:
 10.10.0.22 slots=1
 ```
 
-Run one of the cross-host auto recipes above from the prepared GPU controller
-container. The hostfile must contain exactly the controller and the selected
-number of remote CPU hosts. Inspect the selected continuation, tier capacities,
-and remote participants before accepting a plan.
+For the one-CPU-host recipe, keep only the first two lines and save it as
+`/cluster/hosts-1`. For the two-CPU-host recipe, use all three lines in
+`/cluster/hosts-2`. Replace the addresses with your own. Each `slots=1` entry
+allows one MPI worker process on that host.
 
-A hostfile does **not** provision machines, distribute weights/images, or turn
-node-local shared memory into a network transport. In Docker deployments,
-remote MPI daemons must run inside their matching runtime containers, not
-beside them on the host. The
+Mount the hostfile into the GPU container and run one of the remote recipes
+there. The hostfile describes the cluster; you still need to start and connect
+the remote containers and provide their model files. MPI workers must run
+inside those containers so they use the same runtime libraries.
+
+For a working example of this setup, the
 [Azure cross-host workflow](docs/production-ci.md#azure-resources-for-cross-host-e2e)
-automates image/model staging, plan/apply and direct-serve checks, evidence of
-remote CPU expert work, and VM lifecycle management.
+prepares VMs, transfers the image and model, runs the remote tests, and manages
+the VMs afterward.
 
 </details>
 
 ## Benchmarks
 
-Use the `benchmark` subcommand to measure prefill and generation through the
-production runtime. Use a published runtime image or a **Release** source
-build, and stop other inference jobs on the same devices before measuring.
+Want to see how your own hardware performs? The `benchmark` command loads the
+model, warms it up, and measures prompt processing and answer generation.
+It uses the same production runtime as the server. Stop other inference jobs
+on the same devices before running it.
 
 ### Run a benchmark and save the result
 
-This uses the Quickstart variables, automatic placement, the built-in text
-prompt, and a 256-token generation budget. It prints a timing table and exports
-JSON; the temporary container is retained just long enough to copy the result.
+Using your Quickstart settings, this command chooses a layout automatically
+and requests up to 256 output tokens from a built-in prompt. It prints a timing
+table and saves a JSON report. The next two commands copy the report to your
+current directory and remove the finished container.
 
 ```bash
 docker run "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" \
@@ -760,12 +920,15 @@ docker cp llaminar-benchmark:/tmp/benchmark.json ./benchmark.json
 docker rm llaminar-benchmark
 ```
 
-To benchmark your own prompt, use either `--prompt "your text"` or
-`--prompt-file /models/benchmark-prompt.txt` (a readable text file under
-`MODEL_DIR`). The file is consumed as raw text, not an HTTP chat template.
-Prompt tokens plus the requested output must fit the context.
+To use your own prompt, add `--prompt "your text"`, or put a text file in
+`MODEL_DIR` and use `--prompt-file /models/benchmark-prompt.txt`. The benchmark
+reads that text directly. Leave enough context space for both the prompt and
+the requested output.
 
-For a source build, the equivalent command is:
+<details>
+<summary>Run the same benchmark from a source build</summary>
+
+Build in Release mode for representative performance:
 
 ```bash
 ./build_v2_release/llaminar2 benchmark \
@@ -774,49 +937,63 @@ For a source build, the equivalent command is:
   --benchmark-json-output /tmp/benchmark.json
 ```
 
-Both examples leave MTP off. For an MTP-capable model, add
-`--mtp --mtp-depth-policy dynamic` and save a separate result. To compare runtime
-changes on **identical placement**, benchmark a saved plan with `--config` in
-place of `-m` and placement flags, using the plan mount shown above. Include
-MTP in the plan if it is part of the intended workload.
+</details>
+
+To measure MTP, add `--mtp --mtp-depth-policy dynamic` for a model that includes
+MTP weights. Save it as a separate result so you can compare with MTP off.
 
 ### Read the numbers
 
-- **Prefill tok/s** measures processing the prompt. Use the actual reported
-  token count; neither a context limit nor a byte count is a prefill length.
-- **Decode tok/s** measures generated output. JSON also reports
-  `throughput_tokens_per_sec.decode_after_prefill`, excluding the token produced
-  by terminal prefill; match this denominator when comparing other engines.
-- **Warmup and samples:** the default is one warmup followed by three measured
-  iterations. Model loading, readiness preparation, and warmup are outside the
-  reported steady-state throughput.
-- **Prefix cache:** each iteration clears request state and purges reusable
-  prefixes before timing full prefill. These are full-prompt measurements, not
-  cached-prefix speed claims.
-- **Evidence:** JSON includes individual iterations, actual token counts,
-  generated token IDs, the resolved configuration, and MTP/cache observations.
-  Check `success` and the workload before comparing headline rates.
+- **Prefill tok/s:** how quickly the model reads the prompt. The report gives
+  its actual token count, which is usually much smaller than the context limit.
+- **Decode tok/s:** how quickly the model generates the answer.
+- **Repeated measurements:** by default, one warmup is followed by three timed
+  runs. Loading the model and preparing it for inference are excluded.
+- **Fresh prompts:** cached prefixes are cleared between runs so each prefill
+  measurement processes the whole prompt.
+
+The JSON report includes the individual runs, token counts, generated token IDs,
+and selected settings. Check that `success` is true before using a result.
+
+<details>
+<summary>Repeatable comparisons and more benchmark options</summary>
 
 For a longer sample set, pass `-e LLAMINAR_BENCHMARK_ITERATIONS=5` before the
 Docker image name; `LLAMINAR_BENCHMARK_WARMUP_ITERATIONS` controls warmup count.
 With a local binary, supply these as ordinary environment variables.
 
-Keep the GGUF, prompt bytes, output length, context, sampling, KV policy, MTP
-policy, image revision, and device placement fixed for an A/B. Measure the
-defaults first and label any tuning separately. Use `--temperature 0 --seed 42`
-for a greedy baseline, not `--deterministic`: that diagnostic flag also changes
-kernel dispatch. Leave profiling/debug overrides off for timing runs.
+When comparing two builds, keep the model, prompt, output length, context, and
+runtime options the same. A saved plan helps keep the device layout fixed:
+pass `--config` instead of `-m` and the placement flags, using the plan mount
+from the [planning example](#inspect-a-plan-then-apply-it). Include MTP when
+creating the plan if you intend to benchmark it.
 
-### Published benchmark results
+The examples use `--temperature 0 --seed 42` for greedy sampling. Avoid adding
+`--deterministic` just for a benchmark: it also changes kernel selection.
+Leave profiling and debug options off while measuring throughput.
 
-These scores use the exact canonical E2E configurations, including their
-explicit MTP and expert-movement settings—not an auto-planner/default-policy
-performance sweep. Context is the allocated capacity; each timing request uses
-the prompt and decode lengths shown in the chart.
+For comparisons with other engines, the JSON field
+`throughput_tokens_per_sec.decode_after_prefill` excludes the first output
+token produced at the end of prefill. Use matching token counts and timing
+boundaries in both engines.
 
-Results are grouped by model size (27B, 35B, 122B). Within each cell, prefill
-and decode each use that cell's AVX512 result as the 100% reference for AVX2.
-Compare absolute tok/s values across cells, not their normalized bar lengths.
+See the [llama.cpp comparison workflow](.agents/llama-cpp-comparison/SKILL.md)
+for matching workloads and profiling across engines.
+
+</details>
+
+### Release results and reports
+
+The [release chart near the top of this page](#latest-release-benchmarks)
+links to the release and its attached JSON reports. Those reports contain the
+exact model files, settings, hardware, and image digests used for measurement.
+
+<details>
+<summary>CI benchmark report recorded in this checkout</summary>
+
+This separate report is updated by benchmark CI and belongs to the source
+revision shown below. Use the release links above for the current release's
+results. Each configuration's AVX512 result sets the scale for its pair of bars.
 
 <!-- published-benchmarks:begin -->
 
@@ -827,18 +1004,21 @@ Tested image source: [`6f823000cd06`](https://github.com/Llaminar/llaminar/commi
 
 <!-- published-benchmarks:end -->
 
-Ad hoc benchmarking does not certify an image. The
-[production CI pipeline](docs/production-ci.md) benchmarks only E2E-tagged
-canonical cells, after both ISA images finish their full E2E suites. Official
-runs maintain [high-water marks](benchmarks/production/high_water.json) and
-compact results under `benchmarks/production/results/`. AVX2 and AVX512 evidence
-is separate. The ordinary develop image gate runs Unit/preflight only.
+</details>
 
-See the [testing workflow](.agents/llaminar-testing/SKILL.md) for certification
-and the [llama.cpp comparison workflow](.agents/llama-cpp-comparison/SKILL.md)
-for matched cross-engine workloads and profiling.
+Release benchmarks run after both images pass their full HTTP E2E suites.
+CI also tracks [previous best results](benchmarks/production/high_water.json)
+to catch performance regressions. See the
+[production CI guide](docs/production-ci.md) for the release process and the
+[testing workflow](.agents/llaminar-testing/SKILL.md) for running its checks.
 
 ## HTTP diagnostics
+
+For debugging or automated checks, the API can return token IDs and runtime
+statistics alongside an answer.
+
+<details>
+<summary>Request token IDs, prefix-cache statistics, and MTP details</summary>
 
 Non-streaming `/v1/chat/completions` requests may include
 `"return_token_ids": true` to receive the actual templated prompt IDs and committed
@@ -856,6 +1036,8 @@ per-request deltas: do not sum successive responses. Movement axis and physical
 transfer direction are distinct; unknown ranks are `null` and estimated weight
 bytes are labeled as estimates. Export reads the existing immutable journal
 without driving maintenance.
+
+</details>
 
 ## Development
 
@@ -908,6 +1090,13 @@ in that repository, then update the source gitlink; do not add them to the
 source tree or Docker build context.
 
 ## Llaminar Architecture
+
+Llaminar builds a compute graph for each model, assigns its work to the chosen
+devices, and coordinates communication between them. The same runtime supports
+one device, multiple GPUs, CPU sockets, and clusters of machines.
+
+<details>
+<summary>How model graphs, MPI, collectives, and GPU capture fit together</summary>
 
 Llaminar V2 is a kernel-centric inference runtime for CPU, CUDA, ROCm, and
 mixed-vendor deployments. Model-specific graph builders declare the exact compute
@@ -1023,6 +1212,8 @@ configuration is an error, not a reason to silently switch to eager inference.
 The result is one execution model that scales down to a single CPU socket and
 up to heterogeneous multi-GPU, multi-socket, and multi-rank deployments while
 keeping placement, collectives, and graph replay explicit.
+
+</details>
 
 ## The Llaminar Philosophy
 
