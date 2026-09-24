@@ -431,7 +431,7 @@ Compare absolute tok/s values across cells, not their normalized bar lengths.
 
 ![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)
 
-Tested image source: [`6f823000cd06`](https://github.com/Llaminar/llaminar/commit/6f823000cd0654cf70b1187cae2128aff551ce95). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
+Tested image source: [`ff61316f3184`](https://github.com/Llaminar/llaminar/commit/ff61316f3184a2846201445833c6fd4687d4142e). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
 [Exact configurations, image digests and samples](benchmarks/production/published/results.json). This is E2E/benchmark evidence, not full production-image certification.
 
 <!-- published-benchmarks:end -->
