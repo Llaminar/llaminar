@@ -49,14 +49,15 @@ The commands below use **Bash**. Run the setup blocks in the same shell.
 Select the image for your **CPU instruction set**, not your GPU vendor. Both
 images include all three compute backends.
 
-| Host CPU | Develop image |
-|---|---|
-| AVX512-VNNI | `ghcr.io/llaminar/llaminar:develop` |
-| AVX2 | `ghcr.io/llaminar/llaminar:develop-avx2` |
+| Host CPU | Certified release (default) | Nightly development |
+|---|---|---|
+| AVX512-VNNI | `ghcr.io/llaminar/llaminar:master` | `ghcr.io/llaminar/llaminar:develop` |
+| AVX2 | `ghcr.io/llaminar/llaminar:master-avx2` | `ghcr.io/llaminar/llaminar:develop-avx2` |
 
-These mutable tags pass the full Unit and production-preflight gates before CI
-publishes them. They are development builds, not full E2E/benchmark-certified
-releases. Pin an image digest when you need a repeatable deployment.
+The `master` tags point to the latest E2E- and benchmark-certified release.
+Choose a `develop` tag only when you want the nightly build: it passes Unit and
+production-preflight gates but is not a certified release. All four branch tags
+are mutable; pin an image digest when you need a repeatable deployment.
 
 Set the directory containing your GGUF and its path **inside the container**.
 The filename below is an example; use a file you have downloaded.
@@ -64,8 +65,9 @@ The filename below is an example; use a file you have downloaded.
 ```bash
 export MODEL_DIR=/opt/llaminar-models
 export LLAMINAR_MODEL=/models/Qwen3.8-27B-IQ4_XS.gguf
-export LLAMINAR_IMAGE=ghcr.io/llaminar/llaminar:develop
-# For an AVX2 host, use ghcr.io/llaminar/llaminar:develop-avx2 instead.
+export LLAMINAR_IMAGE=ghcr.io/llaminar/llaminar:master
+# For an AVX2 host, use ghcr.io/llaminar/llaminar:master-avx2 instead.
+# For a nightly build, use the corresponding develop tag in the table above.
 
 docker pull "$LLAMINAR_IMAGE"
 
