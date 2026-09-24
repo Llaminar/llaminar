@@ -1,0 +1,42 @@
+site_name: Llaminar
+site_description: Documentation, release notes, and certified inference results for Llaminar.
+site_url: https://llaminar.github.io/llaminar/
+repo_url: https://github.com/Llaminar/llaminar
+repo_name: Llaminar on GitHub
+edit_uri: ''
+docs_dir: docs/public
+theme:
+  name: material
+  font: false
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+plugins:
+  - search
+markdown_extensions:
+  - tables
+  - fenced_code
+  - admonition
+extra_css:
+  - stylesheets/extra.css
+nav:
+  - Home: index.md
+
+# The builder appends the release archive from published release evidence.
+# Add general documentation pages above as docs/public grows.

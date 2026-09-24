@@ -12,6 +12,7 @@ placement let you make use of additional GPUs and CPU memory as your needs grow.
 Llaminar is in **alpha**. Expect rough edges while development continues.
 
 [Release benchmarks](#latest-release-benchmarks) · [Quickstart](#quickstart) ·
+[Documentation](https://llaminar.github.io/llaminar/) ·
 [Tested configurations](#e2e-tested-auto-recipes) ·
 [Planning and topology](#planning-and-topology) ·
 [Run a benchmark](#benchmarks) · [Development](#development) ·
@@ -46,26 +47,25 @@ Ornith 1.5 MoE 35B, and Qwen 3.5 MoE 122B.
 
 ## Latest release benchmarks
 
-Release [2026-09-24.1](https://github.com/Llaminar/llaminar/releases/tag/2026-09-24.1)
-passed all 19 HTTP end-to-end configurations and their benchmarks on both the
-AVX512 and AVX2 images. The chart below shows those certified results.
+The [latest release](https://llaminar.github.io/llaminar/releases/latest/)
+includes HTTP end-to-end test certificates and benchmark certificates for both
+the AVX512 and AVX2 images. The chart below shows that release's measured results.
 
 **Prefill** is how quickly the model reads your prompt. **Decode** is how quickly
 it writes the answer. Both are measured in tokens per second; higher is faster.
 Click the chart to download the full-size SVG.
 
-<!-- Embed the exact release chart from its immutable report commit. GitHub
-serves release-asset SVGs as downloads, which browsers cannot render inline.
-When updating this section, keep the chart and release links on the same report. -->
-[![Release 2026-09-24.1 benchmark results: prefill and decode speed for AVX512 and AVX2, grouped by model size](https://raw.githubusercontent.com/Llaminar/llaminar/392d7355744d5afa24a2671b0bdeb96882e8d3ac/benchmarks/production/published/benchmarks.svg)](https://github.com/Llaminar/llaminar/releases/download/2026-09-24.1/benchmarks.svg)
+<!-- The release workflow publishes this stable Pages URL from the latest
+published release's original evidence. No dates, counts, or commit pins here. -->
+[![Latest release benchmark results: prefill and decode speed for AVX512 and AVX2, grouped by model size](https://llaminar.github.io/llaminar/releases/latest/assets/benchmarks.svg)](https://llaminar.github.io/llaminar/releases/latest/assets/benchmarks.svg)
 
 Each pair of bars compares the two CPU builds on the same model and hardware.
 Use the printed token rates to compare different configurations: each pair has
 its own scale, with AVX512 as the reference. The chart also lists the prompt
 and output lengths used for each measurement.
 
-[Release notes and test reports](https://github.com/Llaminar/llaminar/releases/tag/2026-09-24.1) ·
-[Detailed results and image digests (JSON)](https://github.com/Llaminar/llaminar/releases/download/2026-09-24.1/benchmark-results.json) ·
+[Release notes and test reports](https://llaminar.github.io/llaminar/releases/latest/) ·
+[Detailed results and image digests (JSON)](https://llaminar.github.io/llaminar/releases/latest/assets/benchmark-results.json) ·
 [Benchmark your own hardware](#benchmarks)
 
 ## Quickstart

@@ -30,6 +30,7 @@ import post_pr_benchmark_rag as benchmark_rag
 import publish_pr_high_water as high_water
 import run_model_parity_e2e as e2e
 import published_benchmark_chart as chart
+import build_public_docs as public_docs
 from production_artifacts import digest, ratchet, write_json
 
 
@@ -127,6 +128,155 @@ def benchmark_report(pair, manifest, e2e, isa):
             "manifest_digest": digest(manifest), "e2e_report_digest": digest(e2e), "cells": rows,
             "baseline_digest": digest(baseline), "proposed_high_water": proposed,
             "comparisons": comparisons}
+
+
+def public_release_bundle(root, tag="2026-09-24.1"):
+    """Use the release publisher's actual asset map for a tiny archived proof."""
+    pair = image_pair()
+    pair["workflow_revision"] = pair["source"]["revision"]
+    e2e_root, benchmark_root = root / "e2e", root / "benchmarks"
+    e2e_root.mkdir(parents=True)
+    benchmark_root.mkdir()
+    manifest = write_e2e_bundle(e2e_root, pair)
+    result = {"source": pair["source"], "images": pair["images"],
+              "repository": pair["repository"], "branch": "develop", "passed": True,
+              "scope": "full-http-e2e-and-benchmarks", "full_image_certification": False,
+              "recorded_at_utc": "2026-09-24T00:00:00+00:00", "variants": {}}
+    for isa in suite.ISAS:
+        e2e_report = json.loads((e2e_root / isa.lower() / "e2e.json").read_text())
+        report = benchmark_report(pair, manifest, e2e_report, isa)
+        for row in report["cells"]:
+            row["prefill_tokens"] = 512
+        write_json(benchmark_root / isa.lower() / "benchmarks.json", report)
+        result["variants"][isa] = {
+            "report_digest": digest(report), "e2e_report_digest": digest(e2e_report),
+            "comparisons": report["comparisons"], "cells": report["cells"],
+            "workload": {"decode_tokens": 256}}
+    write_json(benchmark_root / "results.json", result)
+    (benchmark_root / "benchmarks.svg").write_text(chart.render_chart(result))
+    paths = master_release.release_assets(e2e_root, benchmark_root, root)
+    metadata = {"id": int(tag.split(".")[1]), "tag_name": tag,
+                "draft": False, "prerelease": False,
+                "published_at": "2026-09-24T00:00:00Z",
+                "body": "# Release notes\n\nImproved inference. <script>bad()</script>",
+                "assets": [{"name": path.name} for path in paths]}
+    return metadata, root / "assets"
+
+
+class PublicDocumentationTests(unittest.TestCase):
+    """Published pages retain complete certificates and cannot invent a pass."""
+
+    def test_release_reports_render_both_isas_and_keep_original_downloads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata, assets = public_release_bundle(root / "bundle")
+            evidence = public_docs.load_evidence("Llaminar/llaminar", metadata, assets)
+            destination = root / "page"
+            public_docs.render_release(evidence, destination)
+            self.assertIn("All **1 configurations**", (destination / "index.md").read_text())
+            self.assertIn("Passed | Passed", (destination / "e2e.md").read_text())
+            self.assertIn("1,000.0", (destination / "benchmarks.md").read_text())
+            self.assertIn("&lt;script&gt;", (destination / "release-notes.md").read_text())
+            self.assertNotIn("<script>", (destination / "release-notes.md").read_text())
+            for asset in assets.iterdir():
+                self.assertEqual(asset.read_bytes(), (destination / "assets" / asset.name).read_bytes())
+
+    def test_incomplete_or_mixed_certificates_do_not_become_public_green_pages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata, assets = public_release_bundle(root / "bundle")
+            report_path = assets / "benchmark-avx2.json"
+            original = json.loads(report_path.read_text())
+            for field, value in (("complete", False), ("image", "wrong"),
+                                 ("cells", []), ("diagnostic", True)):
+                with self.subTest(field=field):
+                    write_json(report_path, {**original, field: value})
+                    with self.assertRaisesRegex(ValueError, "benchmark certificate"):
+                        public_docs.load_evidence("Llaminar/llaminar", metadata, assets)
+            write_json(report_path, original)
+            e2e_path = assets / "e2e-avx2.json"
+            changed = json.loads(e2e_path.read_text())
+            changed["unrecorded_extra_field"] = True
+            write_json(e2e_path, changed)
+            with self.assertRaisesRegex(ValueError, "differs from its receipt"):
+                public_docs.load_evidence("Llaminar/llaminar", metadata, assets)
+
+    def test_documentation_does_not_rejudge_historical_high_water(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata, assets = public_release_bundle(root / "bundle")
+            # The archived proof must not read a future checkout's baseline.
+            with patch.object(suite, "ROOT", root / "no-current-baseline"):
+                public_docs.load_evidence("Llaminar/llaminar", metadata, assets)
+            altered = json.loads((assets / "benchmark-results.json").read_text())
+            altered["variants"]["AVX2"]["cells"][0]["tokens_per_second"]["decode"] += 1
+            write_json(assets / "benchmark-results.json", altered)
+            with self.assertRaisesRegex(ValueError, "compact benchmark differs"):
+                public_docs.load_evidence("Llaminar/llaminar", metadata, assets)
+
+    def test_archive_is_complete_and_latest_follows_github_not_a_benchmark_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "index.md").write_text("# Authored documentation\n")
+            records, bundles = [], {}
+            for tag in ("2026-09-24.1", "2026-09-24.2"):
+                record, assets = public_release_bundle(root / tag, tag)
+                records.append(record)
+                bundles[tag] = assets
+            def download(repository, record, destination):
+                """Supply the unchanged offline release attachments."""
+                import shutil
+                shutil.copytree(bundles[record["tag_name"]], destination)
+            output = root / "generated"
+            with patch.object(public_docs, "published_releases", return_value=(records, records[0]["tag_name"])), \
+                 patch.object(public_docs, "download_assets", side_effect=download):
+                public_docs.prepare_docs("Llaminar/llaminar", output, source)
+            self.assertIn("2026-09-24.1", (output / "docs/releases/latest/index.md").read_text())
+            self.assertTrue((output / "docs/releases/2026-09-24.2/index.md").exists())
+            self.assertEqual((source / "index.md").read_text(), "# Authored documentation\n")
+            self.assertFalse((source / "releases").exists())
+
+    def test_archive_paginates_and_excludes_drafts_and_prereleases(self):
+        rows = [{"tag_name": f"2026-09-24.{n}", "draft": False, "prerelease": False}
+                for n in range(1, 101)]
+        tail = [{"tag_name": "2026-09-25.1", "draft": True, "prerelease": False},
+                {"tag_name": "2026-09-26.1", "draft": False, "prerelease": True}]
+        with patch.object(public_docs, "github_json", side_effect=[rows, tail, {"tag_name": "2026-09-24.10"}]):
+            archive, latest = public_docs.published_releases("Llaminar/llaminar")
+        self.assertEqual(len(archive), 100)
+        self.assertEqual(archive[0]["tag_name"], "2026-09-24.100")
+        self.assertEqual(latest, "2026-09-24.10")
+
+    def test_empty_archive_still_publishes_authored_documentation(self):
+        """General docs can launch before the first certified release exists."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "index.md").write_text("# Documentation\n")
+            with patch.object(public_docs, "github_json", return_value=[]) as github, \
+                 patch.object(public_docs, "download_assets") as download:
+                nav = public_docs.prepare_docs("Llaminar/llaminar", root / "generated", source)
+            github.assert_called_once()
+            download.assert_not_called()
+            self.assertEqual(nav, [{"Archive": "releases/index.md"}])
+            self.assertIn("No dated releases", (root / "generated/docs/releases/index.md").read_text())
+            self.assertFalse((root / "generated/docs/releases/latest").exists())
+
+    def test_docs_workflow_uses_pages_and_never_invokes_inference(self):
+        import yaml
+        workflow = yaml.load((ROOT / ".github/workflows/docs.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertIn("workflow_call", workflow["on"])
+        self.assertEqual(workflow["permissions"]["pages"], "write")
+        self.assertEqual(workflow["jobs"]["publish"]["runs-on"], "ubuntu-24.04")
+        steps = workflow["jobs"]["publish"]["steps"]
+        self.assertTrue(any(step.get("uses", "").startswith("actions/deploy-pages@") for step in steps))
+        commands = "\n".join(step.get("run", "") for step in steps)
+        self.assertIn("scripts/ci/build_public_docs.py", commands)
+        self.assertNotIn("run_production_pipeline.py", commands)
+        self.assertNotIn("docker", commands)
 
 
 class PublishedImageSuiteTests(unittest.TestCase):
@@ -863,6 +1013,25 @@ class PublishedImageSuiteTests(unittest.TestCase):
                          "ghcr.io/llaminar/llaminar:master-avx2-" + master,
                          "ghcr.io/llaminar/llaminar:master-avx2"))
 
+    def test_master_release_finds_squash_pr_when_commit_index_is_empty(self):
+        """A squash merge may be visible on the PR before GitHub's commit index."""
+        master = "d" * 40
+        pr = {"number": 9, "merged_at": "2026-09-24T08:03:08Z",
+              "merge_commit_sha": master,
+              "head": {"ref": "develop", "repo": {"full_name": "Llaminar/llaminar"}},
+              "base": {"ref": "master"}}
+        unrelated = {**pr, "merge_commit_sha": "e" * 40}
+        with patch.object(master_release, "github_json",
+                          side_effect=[[], [unrelated, pr]]) as github:
+            self.assertEqual(master_release.merged_develop_pr("Llaminar/llaminar", master), pr)
+        self.assertEqual(github.call_count, 2)
+        self.assertEqual(github.call_args_list[1].args[0],
+                         "repos/Llaminar/llaminar/pulls")
+        with patch.object(master_release, "github_json",
+                          side_effect=[[], [unrelated]]):
+            with self.assertRaisesRegex(ValueError, "not one merged"):
+                master_release.merged_develop_pr("Llaminar/llaminar", master)
+
     def test_master_release_never_rewrites_conflicting_immutable_image(self):
         image = {"id": "sha256:" + "a" * 64,
                  "registry_ref": "ghcr.io/llaminar/llaminar@sha256:" + "b" * 64}
@@ -987,12 +1156,19 @@ class PublishedImageSuiteTests(unittest.TestCase):
         import yaml
         workflow = yaml.load((ROOT / ".github/workflows/release.yml").read_text(),
                              Loader=yaml.BaseLoader)
-        self.assertEqual(workflow["on"]["push"]["branches"], ["master"])
-        self.assertEqual(set(workflow["jobs"]), {"promote", "high_water"})
+        self.assertEqual(set(workflow["on"]), {"pull_request_target", "workflow_dispatch"})
+        self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["master"])
+        self.assertEqual(workflow["on"]["pull_request_target"]["types"], ["closed"])
+        self.assertEqual(set(workflow["jobs"]), {"promote", "high_water", "documentation"})
+        self.assertEqual(workflow["jobs"]["documentation"]["needs"], "promote")
+        self.assertEqual(workflow["jobs"]["documentation"]["uses"], "./.github/workflows/docs.yml")
         self.assertEqual(workflow["jobs"]["promote"]["concurrency"]["group"],
                          "llaminar-develop-image-gate")
         self.assertEqual(workflow["jobs"]["high_water"]["needs"], "promote")
         text = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("github.event.pull_request.merged == true", text)
+        self.assertIn("github.event.pull_request.merge_commit_sha", text)
+        self.assertIn("github.ref == 'refs/heads/master'", text)
         self.assertIn("scripts/ci/publish_master_release.py", text)
         self.assertIn("scripts/ci/publish_pr_high_water.py", text)
         self.assertNotIn("release-please", text)

@@ -33,13 +33,33 @@ def git(*arguments: str) -> str:
 
 
 def merged_develop_pr(repository: str, master_sha: str) -> dict:
-    """Find the one same-repository develop PR responsible for this master SHA."""
-    candidates = github_json(f"repos/{repository}/commits/{master_sha}/pulls")
-    matched = [pr for pr in candidates
-               if pr.get("merged_at") and pr.get("merge_commit_sha") == master_sha
-               and pr.get("head", {}).get("ref") == "develop"
-               and pr.get("base", {}).get("ref") == "master"
-               and pr.get("head", {}).get("repo", {}).get("full_name", "").lower() == repository.lower()]
+    """Find the merged develop PR by its exact master commit identity.
+
+    GitHub's commit-to-PR index may omit a newly created squash commit even
+    after the PR itself publishes ``merge_commit_sha``. The closed-PR listing
+    is a second view of the same typed merge identity, not a weaker match on
+    commit message text or branch names alone.
+    """
+    def matches(pr: dict) -> bool:
+        return (bool(pr.get("merged_at"))
+                and pr.get("merge_commit_sha") == master_sha
+                and pr.get("head", {}).get("ref") == "develop"
+                and pr.get("base", {}).get("ref") == "master"
+                and pr.get("head", {}).get("repo", {}).get("full_name", "").lower()
+                == repository.lower())
+
+    matched = [pr for pr in github_json(f"repos/{repository}/commits/{master_sha}/pulls")
+               if matches(pr)]
+    if not matched:
+        # Only the exact merge SHA may admit a listing candidate. Stop once
+        # the recent closed-PR inventory ends; never guess from a squash title.
+        for page in range(1, 21):
+            candidates = github_json(f"repos/{repository}/pulls", "state=closed",
+                                     "base=master", "sort=updated", "direction=desc",
+                                     "per_page=100", f"page={page}")
+            matched.extend(pr for pr in candidates if matches(pr))
+            if matched or len(candidates) < 100:
+                break
     if len(matched) != 1:
         raise ValueError("master commit is not one merged same-repository develop PR")
     return matched[0]
@@ -198,10 +218,8 @@ def release_notes(tag: str, previous_tag: str | None, changes: list[str],
     return "\n".join(lines)
 
 
-def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
-    """Copy only compact authenticated receipts, reports and numbers."""
-    assets = output / "assets"
-    assets.mkdir()
+def release_asset_sources(e2e: Path, benchmarks: Path) -> dict[str, Path]:
+    """Name the public evidence once for release upload and documentation."""
     sources = {
         "image-pair.json": e2e / "images.json",
         "matrix.json": e2e / "manifest.json",
@@ -212,6 +230,14 @@ def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
     for isa in suite.ISAS:
         sources[f"e2e-{isa.lower()}.json"] = e2e / isa.lower() / "e2e.json"
         sources[f"benchmark-{isa.lower()}.json"] = benchmarks / isa.lower() / "benchmarks.json"
+    return sources
+
+
+def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
+    """Copy only compact authenticated receipts, reports and numbers."""
+    assets = output / "assets"
+    assets.mkdir()
+    sources = release_asset_sources(e2e, benchmarks)
     for name, source in sources.items():
         shutil.copyfile(source, assets / name)
     return list(assets.iterdir())

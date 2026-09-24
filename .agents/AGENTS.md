@@ -256,6 +256,7 @@ documentation.
 | Runtime environment variables | `src/v2/utils/DebugEnv.h` |
 | Test names, labels, and registration | `tests/v2/CMakeLists.txt` |
 | Testing workflow | `.agents/llaminar-testing/SKILL.md`, `tests/v2/integration/parity/README.md`, `docs/production-ci.md`, and CMake registration |
+| Public docs and release reports | `docs/public/`, `mkdocs.public.yml`, `scripts/ci/build_public_docs.py`; published GitHub release attachments own the evidence |
 | Backend tuning procedure | `.agents/*-tuning/SKILL.md` |
 
 Files under `docs/v2/projects/` are dated plans, investigations, and handoffs.
