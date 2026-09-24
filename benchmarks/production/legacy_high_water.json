@@ -1,0 +1,189 @@
+{
+  "_comment": "Canonical performance baselines. Update with: .githooks/run_benchmark_check.sh --update-baseline",
+  "regression_threshold_pct": 10,
+  "models": [
+    {
+      "name": "Qwen 2.5 7B Instruct Q8_0",
+      "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "cuda:0": {
+          "prefill_tok_s": 4915.22,
+          "decode_tok_s": 93.97,
+          "regression_threshold_pct": 5,
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        },
+        "rocm:0": {
+          "prefill_tok_s": 1183.62,
+          "decode_tok_s": 77.33,
+          "regression_threshold_pct": 5,
+          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        },
+        "cpu": {
+          "regression_threshold_pct": 25,
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 334.59,
+              "decode_tok_s": 18.12,
+              "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 142.93,
+              "decode_tok_s": 17.75,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 4B Q8_0",
+      "model": "models/Qwen3.5-4B-Q8_0.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "cpu": {
+          "regression_threshold_pct": 25,
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 394.34,
+              "decode_tok_s": 26.12,
+              "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 184.00,
+              "decode_tok_s": 25.51,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
+        },
+        "cuda:0": {
+          "prefill_tok_s": 5910.97,
+          "decode_tok_s": 144.96,
+          "regression_threshold_pct": 10,
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        },
+        "rocm:0": {
+          "prefill_tok_s": 1668.46,
+          "decode_tok_s": 102.58,
+          "regression_threshold_pct": 10,
+          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 35B MoE Q4_K_XL",
+      "model": "models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+      "decode_tokens": 128,
+      "env": {
+        "LLAMINAR_MOE_REBALANCE": "off"
+      },
+      "devices": {
+        "cpu:0": {
+          "regression_threshold_pct": 25,
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 134.57,
+              "decode_tok_s": 18.56,
+              "_comment": "High-water mark set at commit 3a03cfd2 on 2026-05-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 72.92,
+              "decode_tok_s": 17.05,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
+        },
+        "cpu": {
+          "regression_threshold_pct": 25,
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 192.42,
+              "decode_tok_s": 25.26,
+              "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 120.23,
+              "decode_tok_s": 22.74,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
+        },
+        "rocm:0": {
+          "prefill_tok_s": 1304.55,
+          "decode_tok_s": 80.65,
+          "regression_threshold_pct": 10,
+          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 35B MoE Q3_K_S",
+      "model": "models/Qwen3.5-35B-A3B-Q3_K_S.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "cuda:0": {
+          "prefill_tok_s": 2015.0,
+          "decode_tok_s": 116.4,
+          "regression_threshold_pct": 10,
+          "_comment": "Realistic baseline recorded at commit ec078498. Human-approved (IQ3_S/IQ3_XXS expert decode is compute-bound; prefill gap to llama.cpp is structural). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "cpu": {
+          "regression_threshold_pct": 25,
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 78.23,
+              "decode_tok_s": 6.95,
+              "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 34.18,
+              "decode_tok_s": 6.52,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
+        },
+        "rocm:0": {
+          "prefill_tok_s": 229.32,
+          "decode_tok_s": 28.08,
+          "regression_threshold_pct": 10,
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M TP2 ROCm",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "tp": {
+          "prefill_tok_s": 352.35,
+          "decode_tok_s": 29.43,
+          "regression_threshold_pct": 10,
+          "extra_flags": "--tp-devices rocm:0,rocm:1",
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M PP2 CUDA+ROCm",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "pp": {
+          "prefill_tok_s": 274.37,
+          "decode_tok_s": 17.51,
+          "regression_threshold_pct": 10,
+          "extra_flags": "--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-15 --pp-stage 1=rocm_pp:16-63",
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    }
+  ]
+}

@@ -16,6 +16,7 @@
 #include <cstdio>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "ROCmSwiGLUDecodeEquivalentMath.h"
 
 namespace
 {
@@ -60,24 +61,6 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
     return result;
 }
 
-// =========================================================================
-// Activation Functions
-// =========================================================================
-
-// SiLU activation using fast math intrinsics (gfx906 tuned)
-// Uses __expf → v_exp_f32 SFU (~4 cycles) instead of expf (~15 insns)
-// Uses __builtin_amdgcn_rcpf → bare v_rcp_f32 SFU (~4 cycles)
-//   NOTE: __frcp_rn() on HIP still emits full IEEE division chain
-//   (v_div_scale + v_rcp + v_fma×5 + v_div_fmas + v_div_fixup = 9 insns, ~40 cycles)
-//   The GCN builtin maps directly to a single v_rcp_f32 instruction.
-// Accuracy: v_rcp_f32 is ~1 ULP; for sigmoid ∈ [0,1] this is negligible.
-// Net savings: ~50 cycles per element on gfx906
-__device__ __forceinline__ float silu_fast(float x)
-{
-    float e = __expf(-x);                           // v_exp_f32 SFU (~4 cycles)
-    return x * __builtin_amdgcn_rcpf(1.0f + e);      // v_rcp_f32 SFU (~4 cycles)
-}
-
 } // anonymous namespace
 
 // =========================================================================
@@ -118,10 +101,10 @@ __global__ void rocm_swiglu_fp32_kernel(
         float4 g = gate4[vec_idx];
         float4 u = up4[vec_idx];
         float4 r;
-        r.x = silu_fast(g.x) * u.x;
-        r.y = silu_fast(g.y) * u.y;
-        r.z = silu_fast(g.z) * u.z;
-        r.w = silu_fast(g.w) * u.w;
+        r.x = llaminar2::rocm::decode_equivalent::swigluValue(g.x, u.x);
+        r.y = llaminar2::rocm::decode_equivalent::swigluValue(g.y, u.y);
+        r.z = llaminar2::rocm::decode_equivalent::swigluValue(g.z, u.z);
+        r.w = llaminar2::rocm::decode_equivalent::swigluValue(g.w, u.w);
         out4[vec_idx] = r;
     }
 
@@ -130,7 +113,9 @@ __global__ void rocm_swiglu_fp32_kernel(
     const int tail_idx = tail_start + (blockIdx.x * blockDim.x + threadIdx.x);
     if (tail_idx >= tail_start && tail_idx < size && vec_idx >= size4)
     {
-        output[tail_idx] = silu_fast(gate[tail_idx]) * up[tail_idx];
+        output[tail_idx] =
+            llaminar2::rocm::decode_equivalent::swigluValue(
+                gate[tail_idx], up[tail_idx]);
     }
 }
 
@@ -148,7 +133,8 @@ __global__ void rocm_swiglu_bf16_kernel(
     {
         float g = bf16_to_float(gate[idx]);
         float u = bf16_to_float(up[idx]);
-        output[idx] = float_to_bf16(silu_fast(g) * u);
+        output[idx] = float_to_bf16(
+            llaminar2::rocm::decode_equivalent::swigluValue(g, u));
     }
 }
 
@@ -166,7 +152,8 @@ __global__ void rocm_swiglu_fp16_kernel(
     {
         float g = fp16_to_float(gate[idx]);
         float u = fp16_to_float(up[idx]);
-        output[idx] = float_to_fp16(silu_fast(g) * u);
+        output[idx] = float_to_fp16(
+            llaminar2::rocm::decode_equivalent::swigluValue(g, u));
     }
 }
 

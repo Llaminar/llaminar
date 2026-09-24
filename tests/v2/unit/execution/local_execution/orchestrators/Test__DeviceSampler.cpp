@@ -10,8 +10,12 @@
 
 #include "execution/local_execution/orchestrators/DeviceSampler.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "tensors/Tensors.h"
 #include "utils/Sampler.h"
+#include <array>
+#include <cstring>
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace llaminar2;
@@ -132,6 +136,131 @@ TEST_F(Test__DeviceSampler, SampleGreedy_MultiRunnerWithLogitsLocal_ReturnsNeg1_
     EXPECT_EQ(DeviceSampler::sampleGreedy(runners), -1);
 }
 
+TEST_F(Test__DeviceSampler, SampleGreedyRowsFromLocalInfos_PreservesCrossShardTieBreak)
+{
+    auto shard0 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{3, 2},
+        DeviceId::cpu());
+    auto shard1 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{3, 3},
+        DeviceId::cpu());
+
+    const std::vector<float> shard0_data = {
+        0.0f, 1.0f,
+        4.0f, 10.0f,
+        7.0f, 1.0f};
+    const std::vector<float> shard1_data = {
+        2.0f, 3.0f, 4.0f,
+        10.0f, 3.0f, 2.0f,
+        0.0f, 7.0f, 8.0f};
+    std::memcpy(
+        shard0->mutable_data(),
+        shard0_data.data(),
+        shard0_data.size() * sizeof(float));
+    std::memcpy(
+        shard1->mutable_data(),
+        shard1_data.data(),
+        shard1_data.size() * sizeof(float));
+
+    std::vector<LogitsLocalInfo> infos;
+    infos.push_back(LogitsLocalInfo{
+        nullptr,
+        std::nullopt,
+        2,
+        0,
+        shard0.get(),
+        nullptr,
+        nullptr,
+        nullptr,
+        0});
+    infos.push_back(LogitsLocalInfo{
+        nullptr,
+        std::nullopt,
+        3,
+        0,
+        shard1.get(),
+        nullptr,
+        nullptr,
+        nullptr,
+        0});
+
+    std::array<int32_t, 2> tokens = {-1, -1};
+    ASSERT_TRUE(DeviceSampler::sampleGreedyRowsFromLocalInfos(
+        infos,
+        /*start_row=*/1,
+        static_cast<int>(tokens.size()),
+        tokens.data()));
+
+    EXPECT_EQ(tokens[0], 1)
+        << "row 1 ties at value 10 across shards, so the lower global token wins";
+    EXPECT_EQ(tokens[1], 4)
+        << "row 2 should pick shard 1 local column 2 with shard offset";
+}
+
+TEST_F(Test__DeviceSampler, SampleGreedyRowsFromLocalInfos_UsesExplicitVocabOffsets)
+{
+    auto high_offset_shard = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{2, 2},
+        DeviceId::cpu());
+    auto zero_offset_shard = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{2, 3},
+        DeviceId::cpu());
+
+    /*
+     * The high-offset shard is intentionally listed first.  Production
+     * LocalTP runners are not allowed to rely on participant vector order for
+     * token ids; the graph's TP config owns the vocabulary range.
+     */
+    const std::vector<float> high_offset_data = {
+        1.0f, 9.0f,
+        10.0f, 2.0f};
+    const std::vector<float> zero_offset_data = {
+        0.0f, 10.0f, 3.0f,
+        1.0f, 2.0f, 8.0f};
+    std::memcpy(
+        high_offset_shard->mutable_data(),
+        high_offset_data.data(),
+        high_offset_data.size() * sizeof(float));
+    std::memcpy(
+        zero_offset_shard->mutable_data(),
+        zero_offset_data.data(),
+        zero_offset_data.size() * sizeof(float));
+
+    std::vector<LogitsLocalInfo> infos;
+    infos.push_back(LogitsLocalInfo{
+        nullptr,
+        std::nullopt,
+        2,
+        5,
+        high_offset_shard.get(),
+        nullptr,
+        nullptr,
+        nullptr,
+        0});
+    infos.push_back(LogitsLocalInfo{
+        nullptr,
+        std::nullopt,
+        3,
+        0,
+        zero_offset_shard.get(),
+        nullptr,
+        nullptr,
+        nullptr,
+        0});
+
+    std::array<int32_t, 2> tokens = {-1, -1};
+    ASSERT_TRUE(DeviceSampler::sampleGreedyRowsFromLocalInfos(
+        infos,
+        /*start_row=*/0,
+        static_cast<int>(tokens.size()),
+        tokens.data()));
+
+    EXPECT_EQ(tokens[0], 1)
+        << "row 0 should pick the zero-offset shard despite it being second";
+    EXPECT_EQ(tokens[1], 5)
+        << "row 1 should preserve the first shard's explicit vocab offset";
+}
+
 // =============================================================================
 // 2. sample() edge cases
 // =============================================================================
@@ -142,7 +271,7 @@ TEST_F(Test__DeviceSampler, Sample_Greedy_DelegatesToSampleGreedy)
     SamplingParams params;
     params.temperature = 0.0f; // is_greedy() should be true
     // Single runner → sampleGreedy returns -1
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_EmptyRunners_ReturnsNeg1)
@@ -151,7 +280,7 @@ TEST_F(Test__DeviceSampler, Sample_EmptyRunners_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(empty, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(empty, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_SingleRunner_ReturnsNeg1)
@@ -160,7 +289,7 @@ TEST_F(Test__DeviceSampler, Sample_SingleRunner_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }
 
 TEST_F(Test__DeviceSampler, Sample_MultiRunnerNoLogitsLocal_ReturnsNeg1)
@@ -169,5 +298,5 @@ TEST_F(Test__DeviceSampler, Sample_MultiRunnerNoLogitsLocal_ReturnsNeg1)
     SamplingParams params;
     params.temperature = 0.8f;
     params.top_k = 40;
-    EXPECT_EQ(DeviceSampler::sample(runners, params), -1);
+    EXPECT_EQ(DeviceSampler::sample(runners, params, 0.5f), -1);
 }

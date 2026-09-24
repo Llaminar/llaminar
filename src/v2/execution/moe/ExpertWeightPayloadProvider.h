@@ -72,10 +72,6 @@ namespace llaminar2
         /// Returns nullopt if no payload is registered.
         std::optional<ExpertWeightBlobs> payloadFor(int layer, int expert_id) const;
 
-        /// Get a read-only reference to the payload for (layer, expert).
-        /// Returns nullptr if no payload is registered.
-        const ExpertWeightBlobs *payloadPtr(int layer, int expert_id) const;
-
         /// Build a received-weights map for a single layer (for registerAndPrepareNewExperts).
         std::unordered_map<int, ExpertWeightBlobs> payloadsForLayer(int layer) const;
 

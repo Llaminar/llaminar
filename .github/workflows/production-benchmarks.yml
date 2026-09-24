@@ -19,14 +19,39 @@ concurrency:
 
 jobs:
   benchmarks:
-    runs-on: [llaminar-bench]
+    runs-on: [llaminar-xeon-host]
     timeout-minutes: 360
     steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retire legacy checkout evidence with its cache-owner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy="$GITHUB_WORKSPACE/parity-results"
+          if [[ -d "$legacy" ]]; then
+            docker run --rm --user 0:0 --entrypoint /bin/rm \
+              --mount "type=bind,src=$legacy,dst=/legacy" \
+              "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
+              -rf /legacy/published-e2e /legacy/published-benchmarks
+          fi
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: false
           lfs: false
+      # Stock ARC runners are minimal: unlike GitHub-hosted runners, they do
+      # not include the CLI used to authenticate and fetch the E2E artifact.
+      - name: Install GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gh
+          gh --version
       - uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
@@ -35,18 +60,13 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Benchmark the E2E-proven image pair and publish chart plus JSON
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           E2E_RUN: ${{ inputs.e2e_run }}
         run: |
-          python3 scripts/ci/run_published_image_suite.py benchmarks \
-            --e2e-run "$E2E_RUN" --output parity-results/published-benchmarks \
+          exec python3 scripts/ci/run_published_image_suite.py benchmarks \
+            --e2e-run "$E2E_RUN" --output "$RUNNER_TEMP/llaminar-published-benchmarks-$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --publish
       - name: Retain complete benchmark evidence
@@ -54,6 +74,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: published-benchmarks-${{ github.run_id }}
-          path: parity-results/published-benchmarks/
+          path: ${{ runner.temp }}/llaminar-published-benchmarks-${{ github.run_id }}/
           if-no-files-found: error
           retention-days: 30

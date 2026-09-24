@@ -9,6 +9,7 @@
  * - Array allocation with RAII
  * - NUMABuffer wrapper
  * - Statistics tracking
+ * - Typed final-weight placement rejects invalid identities before allocation
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -16,13 +17,63 @@
 
 #include <gtest/gtest.h>
 #include "memory/NUMAAllocator.h"
+#include "memory/CPUWeightStoragePlacement.h"
+#include "memory/NUMAPageQuery.h"
+#include "tensors/AlignedVector.h"
 
+#include <cstdlib>
+#include <cerrno>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 #include <numeric>
 
+#include <sched.h>
+#include <numaif.h>
+#include <unistd.h>
+
 using namespace llaminar2;
+
+TEST(Test__NUMAAllocator, CPUWeightPlacementRejectsNegativeNodeBeforeAllocation)
+{
+    EXPECT_THROW(CPUWeightStoragePlacement::onNode(-1), std::invalid_argument);
+    EXPECT_THROW(CPUWeightStoragePlacement::onNode(-42), std::invalid_argument);
+    auto empty = CPUWeightStoragePlacement::local().allocate<uint8_t>(0);
+    EXPECT_TRUE(empty.empty());
+}
+
+TEST(Test__NUMAAllocator, BatchedNUMAObservationRequiresActualResolvedNode)
+{
+    uint8_t retained_page = 0xa5;
+    int resolutions = 0;
+    const auto resolve = [&](const void *address) {
+        EXPECT_EQ(address, &retained_page);
+        ++resolutions;
+        return 7; // Deliberately differs from both ordinary fixture nodes.
+    };
+    EXPECT_EQ(resolveObservedNUMANode(0, &retained_page, resolve), 0);
+    EXPECT_EQ(resolveObservedNUMANode(1, &retained_page, resolve), 1);
+    EXPECT_EQ(resolveObservedNUMANode(-EFAULT, &retained_page, resolve), -EFAULT);
+    EXPECT_EQ(resolveObservedNUMANode(-EACCES, &retained_page, resolve), -EACCES);
+    EXPECT_EQ(resolutions, 0);
+    EXPECT_EQ(resolveObservedNUMANode(-ENOENT, &retained_page, resolve), 7);
+    EXPECT_EQ(resolutions, 1);
+    EXPECT_EQ(resolveObservedNUMANode(-ENOENT, &retained_page,
+        [](const void *) { return -EFAULT; }), -EFAULT);
+    EXPECT_EQ(retained_page, 0xa5); // Completion never re-touches or repairs bytes.
+}
+
+TEST(Test__NUMAAllocator, PhysicalNodeLookupRejectsInaccessibleGuard)
+{
+    const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    auto guarded = AlignedVector<uint8_t>::pageMappedUninitialized(page);
+    guarded.front() = 0xa5;
+    const auto *guard = reinterpret_cast<const void *>(
+        reinterpret_cast<uintptr_t>(guarded.data()) - page);
+    EXPECT_EQ(NUMAAllocator::instance().getNUMANodeForAddress(guard), -1);
+    EXPECT_EQ(guarded.front(), 0xa5);
+}
 
 // ============================================================================
 // Singleton Tests
@@ -181,6 +232,163 @@ TEST(Test__NUMAAllocator, AllocateAndTouchZeroInit)
     }
 
     allocator.free(ptr, size);
+}
+
+TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size = 4096;
+    constexpr size_t bytes = 3 * page_size;
+    std::unique_ptr<void, decltype(&std::free)> storage(
+        std::aligned_alloc(page_size, bytes), &std::free);
+    ASSERT_NE(storage, nullptr);
+
+    cpu_set_t incoming_affinity{};
+    ASSERT_EQ(sched_getaffinity(
+                  0, sizeof(incoming_affinity), &incoming_affinity),
+              0);
+
+    // Repeatedly alternate nodes so recycled resident pages cannot make a
+    // policy-only implementation appear correct. Each preparation must also
+    // restore the exact launcher/container affinity before returning.
+    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 1;
+    for (int round = 0; round < rounds; ++round)
+    {
+        const int target_node = round % allocator.numNUMANodes();
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.get(), bytes, target_node));
+
+        cpu_set_t restored_affinity{};
+        ASSERT_EQ(sched_getaffinity(
+                      0, sizeof(restored_affinity), &restored_affinity),
+                  0);
+        EXPECT_TRUE(CPU_EQUAL(&incoming_affinity, &restored_affinity));
+
+        // Simulate the transport's full overwrite after preparation.
+        std::memset(storage.get(), 0xA5, bytes);
+        const auto *data = static_cast<const uint8_t *>(storage.get());
+        for (size_t offset = 0; offset < bytes; offset += page_size)
+        {
+            EXPECT_EQ(
+                allocator.getNUMANodeForAddress(data + offset),
+                target_node)
+                << "round " << round << " page offset " << offset
+                << " ignored certified first touch";
+        }
+    }
+}
+
+TEST(Test__NUMAAllocator, FirstTouchOverridesInheritedRemoteMemoryPolicy)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable() || allocator.numNUMANodes() < 2)
+        GTEST_SKIP() << "Two NUMA nodes are required for conflicting-policy proof";
+
+    constexpr size_t bytes = 3u * 4096u;
+    constexpr unsigned long max_nodes = sizeof(unsigned long) * 8u;
+    const unsigned long preferred_node_zero = 1ul;
+    int policy_error = 0;
+    bool allocated_on_requested_node = false;
+    int restored_mode = -1;
+    unsigned long restored_nodes = 0;
+
+    // A separate thread lets the kernel discard this deliberately conflicting
+    // policy at exit, even if an assertion later fails in the test process.
+    std::thread worker([&] {
+        if (set_mempolicy(MPOL_PREFERRED, &preferred_node_zero, max_nodes) != 0)
+        {
+            policy_error = errno;
+            return;
+        }
+
+        void *memory = allocator.allocateOnNode(bytes, 1, 4096);
+        if (memory)
+        {
+            allocated_on_requested_node =
+                allocator.getNUMANodeForAddress(memory) == 1;
+            allocator.free(memory, bytes);
+        }
+
+        if (get_mempolicy(&restored_mode, &restored_nodes, max_nodes,
+                          nullptr, 0) != 0)
+            policy_error = errno;
+    });
+    worker.join();
+
+    if (policy_error != 0)
+        GTEST_SKIP() << "This environment cannot set/query thread NUMA policy: "
+                     << std::strerror(policy_error);
+    EXPECT_TRUE(allocated_on_requested_node)
+        << "First touch must target the requested NUMA node despite an "
+           "inherited policy preferring a remote node";
+    EXPECT_EQ(restored_mode, MPOL_PREFERRED);
+    EXPECT_EQ(restored_nodes & preferred_node_zero, preferred_node_zero)
+        << "First-touch policy must be restored for subsequent allocations";
+}
+
+TEST(Test__NUMAAllocator, DedicatedMappingsSurviveAlternatingNodeChurn)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size =
+        NUMAAllocator::externalRangeAlignment();
+    constexpr size_t pages_per_round = 384;
+    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 4;
+    for (int round = 0; round < rounds; ++round)
+    {
+        const int target_node = round % allocator.numNUMANodes();
+        auto storage =
+            AlignedVector<std::uint8_t>::pageMappedUninitialized(
+                pages_per_round * page_size - 17u);
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.data(), storage.size(), target_node));
+
+        for (size_t offset = 0;
+             offset < storage.allocationBytes();
+             offset += page_size)
+        {
+            ASSERT_EQ(
+                allocator.getNUMANodeForAddress(storage.data() + offset),
+                target_node)
+                << "round " << round << " page offset " << offset;
+        }
+    }
+}
+
+TEST(Test__NUMAAllocator, HugePageAdvisedMappingsRetainExactFirstTouchNode)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size =
+        NUMAAllocator::externalRangeAlignment();
+    constexpr size_t mapping_bytes = 4u * 1024u * 1024u;
+    const int rounds = allocator.numNUMANodes() > 1 ? 16 : 4;
+    for (int round = 0; round < rounds; ++round)
+    {
+        const int target_node = round % allocator.numNUMANodes();
+        auto storage =
+            AlignedVector<std::uint8_t>::pageMappedUninitialized(
+                mapping_bytes);
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.data(), storage.size(), target_node));
+
+        for (size_t offset = 0; offset < storage.allocationBytes();
+             offset += page_size)
+        {
+            ASSERT_EQ(
+                allocator.getNUMANodeForAddress(storage.data() + offset),
+                target_node)
+                << "round " << round << " page offset " << offset
+                << " escaped the exact first-touch node";
+        }
+    }
 }
 
 // ============================================================================

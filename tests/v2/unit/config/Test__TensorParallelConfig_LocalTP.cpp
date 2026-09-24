@@ -156,7 +156,10 @@ namespace llaminar2
 
             bool hasBARBackedOutputs(const std::string & /*stage_name*/) const override { return false; }
             void clearBARBackedOutputs() override {}
-            bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
+            bool reserveCollectiveResources(
+                size_t /*bytes*/,
+                size_t /*fp16_scratch_elements*/,
+                const std::shared_ptr<PhysicalMemoryAuthority> & /*memory_authority*/) override { return true; }
 
             // =====================================================================
             // ILocalTPContext Implementation - Broadcast (no-op)

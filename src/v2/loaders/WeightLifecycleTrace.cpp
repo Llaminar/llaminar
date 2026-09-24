@@ -164,10 +164,11 @@ namespace llaminar2
         case WeightInferenceMode::Unknown: return "Unknown";
         case WeightInferenceMode::SingleDevice: return "SingleDevice";
         case WeightInferenceMode::LocalTP: return "LocalTP";
-        case WeightInferenceMode::NodeLocalTP: return "NodeLocalTP";
+        case WeightInferenceMode::NodeTP: return "NodeTP";
         case WeightInferenceMode::GlobalTP: return "GlobalTP";
         case WeightInferenceMode::LocalPP: return "LocalPP";
         case WeightInferenceMode::HybridPPTP: return "HybridPPTP";
+        case WeightInferenceMode::ExpertOverlayRank: return "ExpertOverlayRank";
         }
         return "Unknown";
     }

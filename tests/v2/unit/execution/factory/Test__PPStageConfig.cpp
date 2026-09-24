@@ -2,7 +2,9 @@
  * @file Test__FactoryPPStageConfig.cpp
  * @brief Unit tests for FactoryPPStageConfig struct in InferenceRunnerFactory
  *
- * Tests validation and layer counting for Pipeline Parallelism stage configuration.
+ * Tests local and model-bound validation and layer counting. Bounds and global
+ * component ownership must be checked before a stage allocates buffers or
+ * loads weights; trailing MTP blocks are not main-forward pipeline layers.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -11,8 +13,181 @@
 #include <gtest/gtest.h>
 
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "backends/BackendManager.h"
+#include "mocks/MockModelContext.h"
+#include "utils/TestTensorFactory.h"
 
 using namespace llaminar2;
+using namespace llaminar2::test;
+
+namespace
+{
+    /** @brief A stage-local convenience count must not replace global metadata. */
+    class ScopedCountModelContext final : public MockModelContext
+    {
+    public:
+        /** @return This participant's six main-forward layers. */
+        int blockCount() const override { return 6; }
+        /** @return The complete model's count, including its next-N block. */
+        int totalBlockCount() const override { return 25; }
+    };
+
+    /** @brief Metadata-free contexts must fail before any stage materialization. */
+    class MissingLoaderModelContext final : public MockModelContext
+    {
+    public:
+        /** @return No metadata authority, deliberately exercising rejection. */
+        std::shared_ptr<IModelLoader> loader() override { return {}; }
+    };
+}
+
+/** @test Every valid main-forward partition retains its model-bound scope. */
+TEST(Test__FactoryPPStageConfig, ModelBoundScopeAcceptsEveryPartition)
+{
+    constexpr int layers = 24;
+    MockModelContext model;
+    model.setBlockCount(layers);
+    for (int first = 0; first < layers; ++first)
+        for (int last = first + 1; last <= layers; ++last)
+        {
+            const FactoryPPStageConfig scope{
+                .first_layer = first, .last_layer = last,
+                .has_embedding = first == 0, .has_lm_head = last == layers};
+            EXPECT_NO_THROW(scope.requireValidForModel(model));
+        }
+}
+
+/** @test A sidecar block or malformed range cannot enter main PP geometry. */
+TEST(Test__FactoryPPStageConfig, ModelBoundScopeRejectsOutOfRangeBeforeAllocation)
+{
+    MockModelContext model;
+    model.setBlockCount(24);
+    for (const auto scope : {FactoryPPStageConfig{0, 25},
+                             FactoryPPStageConfig{-1, 4},
+                             FactoryPPStageConfig{4, 4},
+                             FactoryPPStageConfig{8, 4}})
+        EXPECT_THROW(scope.requireValidForModel(model), std::invalid_argument);
+    model.setBlockCount(0);
+    EXPECT_THROW((FactoryPPStageConfig{0, 1}.requireValidForModel(model)),
+                 std::invalid_argument);
+}
+
+/** @test A valid local range is insufficient to claim a global component. */
+TEST(Test__FactoryPPStageConfig, ModelBoundScopeRejectsMisplacedGlobalOwners)
+{
+    MockModelContext model;
+    model.setBlockCount(24);
+    EXPECT_THROW((FactoryPPStageConfig{4, 24, true, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+    EXPECT_THROW((FactoryPPStageConfig{0, 20, true, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+}
+
+/** @test Sidecar metadata and a stage-local count cannot change global PP bounds. */
+TEST(Test__FactoryPPStageConfig, ModelMetadataOwnsMainBoundaryDespiteStageOverride)
+{
+    ScopedCountModelContext model;
+    model.setArchitecture("qwen35");
+    model.setBlockCount(25);
+    model.mockLoader().setIntParam("qwen35.nextn_predict_layers", 1);
+    model.mockLoader().addTensor("blk.24.nextn.eh_proj.weight",
+        TestTensorFactory::createFP32({1, 1}));
+    ASSERT_EQ(model.blockCount(), 6);
+    ASSERT_EQ(model.totalBlockCount(), 25);
+
+    EXPECT_NO_THROW((FactoryPPStageConfig{18, 24, false, true}.requireValidForModel(model)));
+    EXPECT_NO_THROW((FactoryPPStageConfig{0, 6, true, false}.requireValidForModel(model)));
+    EXPECT_THROW((FactoryPPStageConfig{18, 25, false, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+    EXPECT_THROW((FactoryPPStageConfig{0, 6, true, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+    EXPECT_EQ(model.getWeightCallCount(), 0u);
+    EXPECT_EQ(model.loadTensorCallCount(), 0u);
+}
+
+/** @test A next-N depth number alone is not evidence of a trailing sidecar block. */
+TEST(Test__FactoryPPStageConfig, MainBoundaryRetainsBlocksWithoutNextNTensor)
+{
+    MockModelContext model;
+    model.setArchitecture("qwen35");
+    model.setBlockCount(25);
+    model.mockLoader().setIntParam("qwen35.nextn_predict_layers", 1);
+    EXPECT_NO_THROW((FactoryPPStageConfig{18, 25, false, true}.requireValidForModel(model)));
+    EXPECT_THROW((FactoryPPStageConfig{18, 24, false, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+}
+
+/** @test The injected production factory rejects invalid scope before device work. */
+TEST(Test__FactoryPPStageConfig, InjectedFactoryRejectsInvalidScopeBeforeMaterialization)
+{
+    auto model = std::make_shared<MockModelContext>();
+    model->setBlockCount(24);
+    InferenceRunnerConfig config;
+    config.pp_stage_config = FactoryPPStageConfig{18, 25, false, true};
+    EXPECT_THROW(createTestableInferenceRunner(model, DeviceId::cpu(), config),
+                 std::invalid_argument);
+    EXPECT_EQ(model->getWeightCallCount(), 0u);
+    EXPECT_EQ(model->loadTensorCallCount(), 0u);
+}
+
+/**
+ * @test PP construction cannot materialize a graph before its input is bound.
+ *
+ * CPU MoE normally requests an eager workspace family, so this device-free
+ * fixture exercises the same premature factory transition as GPU MTP. Only
+ * global weights are supplied deliberately: stage construction may allocate
+ * its admitted banks, but graph declaration belongs to the enclosing pipeline
+ * after every stage and transport edge exists. Neither a head, an interior
+ * stage nor the tail may enter graph declaration from the participant factory.
+ */
+TEST(Test__FactoryPPStageConfig, PipelineConstructionLeavesGraphDeclarationToComposer)
+{
+    initCPUBackend(-1);
+    auto model = MockModelContextBuilder()
+        .setArchitecture("qwen35moe").setBlockCount(3)
+        .setEmbeddingLength(32).setHeadCount(1).setHeadCountKV(1)
+        .setFeedForwardLength(64).setVocabSize(32).setContextLength(64)
+        .addTensor("token_embd.weight", TestTensorFactory::createFP32({32, 32}))
+        .addTensor("output_norm.weight", TestTensorFactory::createFP32({32}))
+        .addTensor("output.weight", TestTensorFactory::createFP32({32, 32}))
+        .build();
+    auto &loader = model->mockLoader();
+    loader.setIntParam("qwen35moe.expert_count", 4);
+    loader.setIntParam("qwen35moe.expert_used_count", 2);
+    loader.setIntParam("qwen35moe.expert_feed_forward_length", 64);
+    loader.setIntParam("qwen35moe.full_attention_interval", 1);
+    loader.setIntParam("qwen35moe.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35moe.ssm.state_size", 32);
+    loader.setIntParam("qwen35moe.ssm.inner_size", 32);
+    loader.setIntParam("qwen35moe.ssm.group_count", 1);
+    loader.setIntParam("qwen35moe.ssm.time_step_rank", 1);
+
+    for (int stage = 0; stage < 3; ++stage)
+    {
+        SCOPED_TRACE(stage);
+        InferenceRunnerConfig config;
+        config.max_seq_len = config.activation_seq_len = 64;
+        config.pp_stage_config = FactoryPPStageConfig{
+            stage, stage + 1, stage == 0, stage == 2};
+        auto runner = createTestableInferenceRunner(model, DeviceId::cpu(), config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_NE(runner->getHiddenState(), nullptr);
+        auto *device = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
+        ASSERT_NE(device, nullptr);
+        if (stage != 0)
+            EXPECT_FALSE(device->materializeForwardGraphForShape(1))
+                << "Deferring construction must not weaken the required input-owner check";
+    }
+}
+
+/** @test Missing metadata is an admission error, never permission to guess bounds. */
+TEST(Test__FactoryPPStageConfig, MissingModelMetadataRejectsScope)
+{
+    MissingLoaderModelContext model;
+    EXPECT_THROW((FactoryPPStageConfig{0, 1, true, true}.requireValidForModel(model)),
+                 std::invalid_argument);
+}
 
 // =============================================================================
 // FactoryPPStageConfig Validation Tests

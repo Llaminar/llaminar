@@ -2,19 +2,140 @@
  * @file ModelLoader.cpp
  * @brief Streamlined GGUF model loader implementation for Llaminar V2
  * @author David Sanftenberg
+ *
+ * The retained directory supplies native shape, block geometry and source
+ * format identity to both execution loading and bounded planning samples.
+ * ggufToTensorType is the shared native-format decoder used by file loading
+ * and admitted MPI sample reception; adding a format must not create a second
+ * name/size catalog in the distributed planner. Native owned/borrowed payload
+ * factories preserve bytes rather than dequantizing them for transport.
  */
 
 #include "../utils/Logger.h"
+#include "../utils/WeightLoadingProfiler.h"
+#include "../utils/OpenMPUtils.h"
 #include "ModelLoader.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
 #include "../utils/MPIContext.h"
 #include <cstring>
 #include <iostream>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /** Minimum selected payload that repays one OpenMP team launch. */
+        constexpr size_t kParallelExpertSelectionCopyBytes =
+            8u * 1024u * 1024u;
+
+        /** Disjoint first-touch chunks let one contiguous expert span use the socket. */
+        constexpr size_t kExpertSelectionCopyChunkBytes = 1024u * 1024u;
+
+        /**
+         * @brief Copy into final native storage, first-touching disjoint pages.
+         * @param destination Uninitialized final tensor allocation.
+         * @param source Validated mapped source interval.
+         * @param bytes Exact native payload size, including its final partial chunk.
+         *
+         * Existing OpenMP workers may each load an unrelated tensor. They must
+         * not enter a collective workshare or create another nested team.
+         */
+        void copyMappedNativePayload(void *destination, const void *source, size_t bytes)
+        {
+            if (omp_in_parallel() || bytes < kParallelExpertSelectionCopyBytes)
+            {
+                std::memcpy(destination, source, bytes);
+                return;
+            }
+            const size_t chunks = bytes / kExpertSelectionCopyChunkBytes +
+                                  (bytes % kExpertSelectionCopyChunkBytes != 0u);
+            auto copy_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (size_t chunk = 0; chunk < chunks; ++chunk)
+                {
+                    const size_t offset = chunk * kExpertSelectionCopyChunkBytes;
+                    std::memcpy(static_cast<uint8_t *>(destination) + offset,
+                        static_cast<const uint8_t *>(source) + offset,
+                        std::min(kExpertSelectionCopyChunkBytes, bytes - offset));
+                }
+            };
+            OMP_WORKSHARE_REGION(copy_work);
+        }
+
+        /**
+         * @brief Adopt one aligned native-codebook expert selection.
+         *
+         * Explicit expert selections cannot generally borrow one contiguous mmap
+         * interval. This helper preserves the original tensor format while
+         * placing the packed bytes through the loader's NUMA-aware factory when
+         * available. The already populated allocation becomes final tensor
+         * storage; this function performs no byte copy, dequantization, or
+         * format substitution.
+         */
+        std::shared_ptr<TensorBase> createOwnedNativeQuantizedTensor(
+            TensorFactory *factory,
+            TensorType type,
+            const std::vector<size_t> &shape,
+            AlignedVector<uint8_t> raw)
+        {
+            if (factory)
+                return std::shared_ptr<TensorBase>(
+                    factory->createQuantizedOwned(type, shape, std::move(raw)));
+
+            switch (type)
+            {
+            case TensorType::Q4_0:
+                return std::make_shared<Q4_0Tensor>(shape, std::move(raw));
+            case TensorType::Q4_1:
+                return std::make_shared<Q4_1Tensor>(shape, std::move(raw));
+            case TensorType::Q5_0:
+                return std::make_shared<Q5_0Tensor>(shape, std::move(raw));
+            case TensorType::Q5_1:
+                return std::make_shared<Q5_1Tensor>(shape, std::move(raw));
+            case TensorType::Q8_0:
+                return std::make_shared<Q8_0Tensor>(shape, std::move(raw));
+            case TensorType::Q2_K:
+                return std::make_shared<Q2_KTensor>(shape, std::move(raw));
+            case TensorType::Q3_K:
+                return std::make_shared<Q3_KTensor>(shape, std::move(raw));
+            case TensorType::Q4_K:
+                return std::make_shared<Q4_KTensor>(shape, std::move(raw));
+            case TensorType::Q5_K:
+                return std::make_shared<Q5_KTensor>(shape, std::move(raw));
+            case TensorType::Q6_K:
+                return std::make_shared<Q6_KTensor>(shape, std::move(raw));
+            case TensorType::Q8_K:
+                return std::make_shared<Q8_KTensor>(shape, std::move(raw));
+            case TensorType::IQ4_NL:
+                return std::make_shared<IQ4_NLTensor>(shape, std::move(raw));
+            case TensorType::IQ4_XS:
+                return std::make_shared<IQ4_XSTensor>(shape, std::move(raw));
+            case TensorType::IQ3_S:
+                return std::make_shared<IQ3_STensor>(shape, std::move(raw));
+            case TensorType::IQ3_XXS:
+                return std::make_shared<IQ3_XXSTensor>(shape, std::move(raw));
+            case TensorType::IQ2_S:
+                return std::make_shared<IQ2_STensor>(shape, std::move(raw));
+            case TensorType::IQ2_XS:
+                return std::make_shared<IQ2_XSTensor>(shape, std::move(raw));
+            case TensorType::IQ2_XXS:
+                return std::make_shared<IQ2_XXSTensor>(shape, std::move(raw));
+            case TensorType::IQ1_S:
+                return std::make_shared<IQ1_STensor>(shape, std::move(raw));
+            case TensorType::IQ1_M:
+                return std::make_shared<IQ1_MTensor>(shape, std::move(raw));
+            default:
+                throw std::runtime_error(
+                    "ModelLoader cannot materialize selected experts for tensor type " +
+                    std::to_string(static_cast<int>(type)));
+            }
+        }
+    } // namespace
 
     // =============================================================================
     // GGUF VALUE ACCESSORS
@@ -136,13 +257,19 @@ namespace llaminar2
     // =============================================================================
 
     /**
-     * @brief Convert GGUF quantization type to V2 TensorType
-     * @note Only valid for quantized types (caller must check isQuantized() first)
+     * @brief Resolve the shared native source format for loading and MPI sample reception.
+     * @throws std::invalid_argument for formats with no native GGUF weight implementation.
      */
-    static TensorType ggufToTensorType(GGUFTensorType type)
+    TensorType ggufToTensorType(GGUFTensorType type)
     {
         switch (type)
         {
+        case GGUFTensorType::F32:
+            return TensorType::FP32;
+        case GGUFTensorType::F16:
+            return TensorType::FP16;
+        case GGUFTensorType::BF16:
+            return TensorType::BF16;
         case GGUFTensorType::Q4_0:
             return TensorType::Q4_0;
         case GGUFTensorType::Q4_1:
@@ -184,8 +311,9 @@ namespace llaminar2
         case GGUFTensorType::IQ1_M:
             return TensorType::IQ1_M;
         default:
-            LOG_ERROR("[ModelLoader] ggufToTensorType: unsupported type " << static_cast<int>(type));
-            return TensorType::Q8_0; // Fallback (should never reach here)
+            throw std::invalid_argument(
+                "[ModelLoader] Unsupported GGUF tensor type " +
+                std::to_string(static_cast<int>(type)));
         }
     }
 
@@ -444,14 +572,24 @@ namespace llaminar2
         // Memory-map the file for zero-syscall tensor loading.
         // Pass NUMA node so mmap pages are bound to the correct socket,
         // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        // For GPU targets, skip NUMA binding and whole-file MAP_POPULATE:
-        // weights are uploaded to VRAM, so the host mapping is only staging.
-        // Demand paging avoids pathological cold-load stalls where the process
-        // blocks faulting the entire GGUF before the first upload starts.
-        const int mmap_numa_node = target_is_gpu_ ? -1 : (factory_ ? factory_->getNumaNode() : -1);
+        // Device staging does not retain host payload pages, so binding that
+        // transient mapping to one socket provides no ownership benefit.
+        // Sparse CPU selection does retain its selected output tensors on the
+        // factory's NUMA node, but the source mapping still stays lazy: mbind
+        // applies to pages that are actually read without first-touching the
+        // unrelated remainder of the GGUF.
+        const bool device_staging =
+            payload_access_pattern_ ==
+            ModelPayloadAccessPattern::DeviceStaging;
+        const bool demand_paged =
+            payload_access_pattern_ !=
+            ModelPayloadAccessPattern::DenseCpuResident;
+        const int mmap_numa_node =
+            device_staging ? -1
+                           : (factory_ ? factory_->getNumaNode() : -1);
         const MmapRegion::PrefaultPolicy mmap_prefault_policy =
-            target_is_gpu_ ? MmapRegion::PrefaultPolicy::DemandPaged
-                           : MmapRegion::PrefaultPolicy::Auto;
+            demand_paged ? MmapRegion::PrefaultPolicy::DemandPaged
+                         : MmapRegion::PrefaultPolicy::Auto;
         if (use_mmap_)
         {
             mmap_region_ = MmapRegion::create(
@@ -464,7 +602,8 @@ namespace llaminar2
                 LOG_DEBUG("[ModelLoader] mmap enabled: " << file_path
                                                          << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
                                                          << (skip_mmap_cache_eviction_ ? " [cache-warm]" : "")
-                                                         << (target_is_gpu_ ? " [gpu-target, demand-paged]" : ""));
+                                                         << " [payload-access="
+                                                         << toString(payload_access_pattern_) << "]");
 
                 // If multi-part, also mmap the split files
                 if (model_.split_count > 1)
@@ -666,8 +805,30 @@ namespace llaminar2
                 ggufToTensorType(info->type), shape, src, info->size_bytes, std::move(mmap_owner));
         }
 
-        // Read raw bytes from file (non-zero-copy paths: FP32/FP16/BF16, weight conversion, or no-mmap)
+        // Native floating payloads read directly into their final typed owner.
+        // The raw-byte vector remains for quantized/conversion paths only: a
+        // float read must not zero then copy two or three full-model buffers.
         std::vector<uint8_t> raw;
+        AlignedVector<float> fp32_storage;
+        AlignedVector<uint16_t> fp16_storage, bf16_storage;
+        auto allocate_payload = [&]() -> uint8_t *
+        {
+            switch (info->type)
+            {
+            case GGUFTensorType::F32:
+                fp32_storage.resize_uninitialized(info->size_bytes / sizeof(float));
+                return reinterpret_cast<uint8_t *>(fp32_storage.data());
+            case GGUFTensorType::F16:
+                fp16_storage.resize_uninitialized(info->size_bytes / sizeof(uint16_t));
+                return reinterpret_cast<uint8_t *>(fp16_storage.data());
+            case GGUFTensorType::BF16:
+                bf16_storage.resize_uninitialized(info->size_bytes / sizeof(uint16_t));
+                return reinterpret_cast<uint8_t *>(bf16_storage.data());
+            default:
+                raw.resize(info->size_bytes);
+                return raw.data();
+            }
+        };
         if (mmap_region_)
         {
             // MMAP FAST PATH: No mutex, no syscall — memcpy from mapped region
@@ -689,8 +850,7 @@ namespace llaminar2
             }
 
             const uint8_t *src = region->data() + data_offset + info->offset;
-            raw.resize(info->size_bytes);
-            std::memcpy(raw.data(), src, info->size_bytes);
+            copyMappedNativePayload(allocate_payload(), src, info->size_bytes);
         }
         else
         {
@@ -731,8 +891,7 @@ namespace llaminar2
             }
 
             // Read raw bytes
-            raw.resize(info->size_bytes);
-            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+            if (!stream->read(reinterpret_cast<char *>(allocate_payload()), info->size_bytes))
             {
                 LOG_ERROR("[ModelLoader] Failed to read tensor data: " << tensor_name);
                 return nullptr;
@@ -782,52 +941,21 @@ namespace llaminar2
         switch (info->type)
         {
         case GGUFTensorType::F32:
-            // FP32: Copy raw bytes as float array (NUMA-aware parallel copy)
-            if (factory_)
-            {
-                auto fp32_tensor = factory_->createFP32(shape);
-                TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
-                tensor = std::move(fp32_tensor);
-            }
-            else
-            {
-                tensor = std::make_shared<FP32Tensor>(shape);
-                TensorFactory::numaMemcpy(tensor->mutable_data(), raw.data(), raw.size());
-            }
+            tensor = factory_
+                ? std::shared_ptr<TensorBase>(factory_->createFP32Owned(shape, std::move(fp32_storage)))
+                : std::make_shared<FP32Tensor>(shape, std::move(fp32_storage));
             break;
 
         case GGUFTensorType::F16:
-            // FP16: Raw data is already in FP16 format (uint16_t)
-            if (factory_)
-            {
-                // Convert raw bytes to uint16_t vector
-                std::vector<uint16_t> fp16_data(raw.size() / 2);
-                std::memcpy(fp16_data.data(), raw.data(), raw.size());
-                tensor = factory_->createFP16(shape, fp16_data);
-            }
-            else
-            {
-                std::vector<uint16_t> fp16_data(raw.size() / 2);
-                std::memcpy(fp16_data.data(), raw.data(), raw.size());
-                tensor = std::make_shared<FP16Tensor>(shape, fp16_data);
-            }
+            tensor = factory_
+                ? std::shared_ptr<TensorBase>(factory_->createFP16Owned(shape, std::move(fp16_storage)))
+                : std::make_shared<FP16Tensor>(shape, std::move(fp16_storage));
             break;
 
         case GGUFTensorType::BF16:
-            // BF16: Raw data is in BF16 format (uint16_t, different from FP16)
-            if (factory_)
-            {
-                // Convert raw bytes to uint16_t vector
-                std::vector<uint16_t> bf16_data(raw.size() / 2);
-                std::memcpy(bf16_data.data(), raw.data(), raw.size());
-                tensor = factory_->createBF16(shape, bf16_data);
-            }
-            else
-            {
-                std::vector<uint16_t> bf16_data(raw.size() / 2);
-                std::memcpy(bf16_data.data(), raw.data(), raw.size());
-                tensor = std::make_shared<BF16Tensor>(shape, bf16_data);
-            }
+            tensor = factory_
+                ? std::shared_ptr<TensorBase>(factory_->createBF16Owned(shape, std::move(bf16_storage)))
+                : std::make_shared<BF16Tensor>(shape, std::move(bf16_storage));
             break;
 
         // IQ formats (4-bit, 2-bit, 3-bit, 1-bit non-linear quantization)
@@ -1133,9 +1261,30 @@ namespace llaminar2
         // Calculate slice byte range
         size_t slice_offset = row_start * bytes_per_row;
         size_t slice_bytes = slice_rows * bytes_per_row;
+        std::vector<size_t> slice_shape = {slice_rows, cols};
 
         LOG_TRACE("[ModelLoader] Row slice " << tensor_name << ": rows [" << row_start << ", " << row_end
                                              << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // Quantized row slices are contiguous in GGUF. Keep them as a view into
+        // the demand-paged mapping instead of allocating and copying the entire
+        // TP shard into anonymous RAM before GPU preparation begins.
+        if (mmap_region_ && info->isQuantized() &&
+            weight_precision == WeightPrecision::NATIVE && factory_)
+        {
+            auto mmap_owner = getMmapRegion(info);
+            const uint64_t end_offset = getDataOffset(info) + info->offset +
+                                        slice_offset + slice_bytes;
+            if (!mmap_owner || end_offset > mmap_owner->size())
+            {
+                LOG_ERROR("[ModelLoader] Row slice extends past end of mapped file: " << tensor_name);
+                return nullptr;
+            }
+            return factory_->createQuantizedZeroCopy(
+                ggufToTensorType(info->type), slice_shape,
+                getMmapPtr(info) + slice_offset, slice_bytes,
+                std::move(mmap_owner));
+        }
 
         // Ensure NUMA binding before allocating the temporary read buffer
         if (factory_)
@@ -1197,9 +1346,6 @@ namespace llaminar2
                 return nullptr;
             }
         } // Release file_mutex_ - tensor creation can proceed in parallel
-
-        // Create shape for sliced tensor
-        std::vector<size_t> slice_shape = {slice_rows, cols};
 
         // Handle weight precision conversion (same as loadTensor)
         bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
@@ -1497,275 +1643,359 @@ namespace llaminar2
         return tensor;
     }
 
+    /**
+     * @brief Adapt a contiguous expert interval to the canonical selection loader.
+     *
+     * Contiguity changes source addressing, not allocation ownership. In
+     * particular, floating weights must be copied once into their final native
+     * storage rather than passing through raw, typed, and tensor copies.
+     * Invalid intervals retain this API's null-result validation contract.
+     */
     std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSlice(
         const std::string &tensor_name,
         size_t expert_start, size_t expert_end,
         DeviceId device,
         WeightPrecision weight_precision)
     {
-        if (!loaded_)
+        const GGUFTensorInfo *info = loaded_ ? model_.findTensor(tensor_name) : nullptr;
+        if (!info || info->dimensions.size() != 3u ||
+            expert_start >= expert_end || expert_end > info->dimensions[2])
         {
-            LOG_ERROR("[ModelLoader] Model not loaded");
+            LOG_ERROR("[ModelLoader] Invalid expert interval [" << expert_start
+                      << ", " << expert_end << ") for " << tensor_name);
             return nullptr;
         }
 
-        // Find tensor metadata
+        std::vector<size_t> expert_ids(expert_end - expert_start);
+        std::iota(expert_ids.begin(), expert_ids.end(), expert_start);
+        return loadTensorExpertSelection(
+            tensor_name, expert_ids, device, weight_precision);
+    }
+
+    /**
+     * @brief Load ordered experts directly into one final native allocation.
+     *
+     * Consecutive quantized experts may retain a checked mapping lease; every
+     * other selection copies into uninitialized tensor-owned pages. No second
+     * tensor constructor copy or redundant zero-fill is permitted here.
+     */
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSelection(
+        const std::string &tensor_name,
+        const std::vector<size_t> &expert_ids,
+        DeviceId device,
+        WeightPrecision weight_precision)
+    {
+        if (!loaded_)
+            throw std::runtime_error(
+                "[ModelLoader] Explicit expert selection requires a loaded model");
+        if (expert_ids.empty())
+            throw std::invalid_argument(
+                "[ModelLoader] Explicit expert selection cannot be empty");
+
         const GGUFTensorInfo *info = model_.findTensor(tensor_name);
         if (!info)
+            throw std::invalid_argument(
+                "[ModelLoader] Tensor not found for explicit expert selection: " + tensor_name);
+        if (info->dimensions.size() != 3u)
+            throw std::invalid_argument(
+                "[ModelLoader] Explicit expert selection requires a 3D tensor: " + tensor_name);
+
+        const size_t ne0 = info->dimensions[0];
+        const size_t ne1 = info->dimensions[1];
+        const size_t ne2 = info->dimensions[2];
+        for (size_t index = 0; index < expert_ids.size(); ++index)
         {
-            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
-            return nullptr;
-        }
-
-        // Validate tensor is 3D (expert-packed: [cols, rows_per_expert, num_experts])
-        if (info->dimensions.size() != 3)
-        {
-            LOG_ERROR("[ModelLoader] Expert slicing requires 3D tensor, got "
-                      << info->dimensions.size() << "D for: " << tensor_name);
-            return nullptr;
-        }
-
-        size_t ne0 = info->dimensions[0]; // cols (fastest varying)
-        size_t ne1 = info->dimensions[1]; // rows per expert
-        size_t ne2 = info->dimensions[2]; // num_experts (slowest varying)
-
-        // Validate expert range
-        if (expert_start >= ne2 || expert_end > ne2 || expert_start >= expert_end)
-        {
-            LOG_ERROR("[ModelLoader] Invalid expert range [" << expert_start << ", " << expert_end
-                                                             << ") for tensor with " << ne2 << " experts: " << tensor_name);
-            return nullptr;
-        }
-
-        size_t local_count = expert_end - expert_start;
-
-        // Calculate bytes per expert: each expert has ne1 rows of ne0 columns
-        size_t bytes_per_row = 0;
-        size_t block_size = info->getBlockSize();
-        size_t type_size = info->getTypeSize();
-
-        if (block_size > 0)
-        {
-            if (ne0 % block_size != 0)
+            if (expert_ids[index] >= ne2 ||
+                (index > 0u && expert_ids[index] <= expert_ids[index - 1u]))
             {
-                LOG_ERROR("[ModelLoader] Expert tensor columns (" << ne0 << ") not divisible by block size ("
-                                                                  << block_size << ") for: " << tensor_name);
-                return nullptr;
+                throw std::invalid_argument(
+                    "[ModelLoader] Explicit expert IDs must be unique, strictly increasing, and in range for " +
+                    tensor_name);
             }
-            size_t blocks_per_row = ne0 / block_size;
-            bytes_per_row = blocks_per_row * type_size;
         }
-        else
+
+        bool contiguous = true;
+        for (size_t index = 1; index < expert_ids.size(); ++index)
+            contiguous = contiguous && expert_ids[index] == expert_ids[index - 1u] + 1u;
+        const size_t block_size = info->getBlockSize();
+        const size_t type_size = info->getTypeSize();
+        if (block_size > 0u && ne0 % block_size != 0u)
         {
-            bytes_per_row = ne0 * type_size;
+            throw std::runtime_error(
+                "[ModelLoader] Expert columns are not aligned to the tensor block size for " +
+                tensor_name);
+        }
+        const size_t bytes_per_row = block_size > 0u
+                                         ? (ne0 / block_size) * type_size
+                                         : ne0 * type_size;
+        const size_t bytes_per_expert = ne1 * bytes_per_row;
+        if (bytes_per_expert == 0u ||
+            expert_ids.size() > std::numeric_limits<size_t>::max() / bytes_per_expert)
+        {
+            throw std::overflow_error(
+                "[ModelLoader] Explicit expert selection byte size overflow for " + tensor_name);
         }
 
-        size_t bytes_per_expert = ne1 * bytes_per_row;
-        size_t slice_offset = expert_start * bytes_per_expert;
-        size_t slice_bytes = local_count * bytes_per_expert;
-
-        LOG_TRACE("[ModelLoader] Expert slice " << tensor_name << ": experts [" << expert_start << ", " << expert_end
-                                                << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
-
-        // Ensure NUMA binding before allocating the read buffer
+        const size_t packed_byte_count = expert_ids.size() * bytes_per_expert;
+        const std::vector<size_t> packed_shape = {ne0, ne1, expert_ids.size()};
+        if (mmap_region_)
+        {
+            // Validate before pointer arithmetic or allocation. The final selected
+            // expert bounds every preceding run because IDs are strictly ordered.
+            auto owner = getMmapRegion(info);
+            const uint64_t data_offset = getDataOffset(info);
+            if (!owner || data_offset > owner->size() ||
+                info->offset > owner->size() - data_offset ||
+                expert_ids.back() >=
+                    (owner->size() - data_offset - info->offset) / bytes_per_expert)
+                throw std::runtime_error(
+                    "[ModelLoader] Expert selection exceeds mapped file: " + tensor_name);
+            if (contiguous && info->isQuantized() &&
+                weight_precision == WeightPrecision::NATIVE && factory_)
+                return factory_->createQuantizedZeroCopy(
+                    ggufToTensorType(info->type), packed_shape,
+                    getMmapPtr(info) + expert_ids.front() * bytes_per_expert,
+                    packed_byte_count, std::move(owner));
+        }
         if (factory_)
-        {
             factory_->ensureNumaBinding();
+        std::vector<uint8_t> raw;
+        AlignedVector<uint8_t> quantized_storage;
+        AlignedVector<float> fp32_storage;
+        AlignedVector<uint16_t> fp16_storage;
+        AlignedVector<uint16_t> bf16_storage;
+        uint8_t *packed_destination = nullptr;
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "weights.expert_selection.allocate");
+            switch (info->type)
+            {
+            case GGUFTensorType::F32:
+                if (packed_byte_count % sizeof(float) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid FP32 expert-selection byte count for " + tensor_name);
+                fp32_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(float));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    fp32_storage.data());
+                break;
+            case GGUFTensorType::F16:
+                if (packed_byte_count % sizeof(uint16_t) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid FP16 expert-selection byte count for " + tensor_name);
+                fp16_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(uint16_t));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    fp16_storage.data());
+                break;
+            case GGUFTensorType::BF16:
+                if (packed_byte_count % sizeof(uint16_t) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid BF16 expert-selection byte count for " + tensor_name);
+                bf16_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(uint16_t));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    bf16_storage.data());
+                break;
+            default:
+                if (info->isQuantized() &&
+                    weight_precision == WeightPrecision::NATIVE)
+                {
+                    // The GGUF copy first-touches the exact final tensor pages.
+                    // Avoid zeroing tens of gigabytes that are immediately
+                    // overwritten, and retain the allocation through packing.
+                    quantized_storage.resize_uninitialized(packed_byte_count);
+                    packed_destination = quantized_storage.data();
+                }
+                else
+                {
+                    raw.resize(packed_byte_count);
+                    packed_destination = raw.data();
+                }
+                break;
+            }
         }
 
-        // Read only the expert slice bytes
-        std::vector<uint8_t> raw;
+        /** One disjoint native-byte interval in source and destination storage. */
+        struct ExpertCopyRun
+        {
+            size_t source_offset;
+            size_t destination_offset;
+            size_t byte_count;
+        };
+        std::vector<ExpertCopyRun> copy_runs;
+        copy_runs.reserve(expert_ids.size());
+        {
+            size_t packed_begin = 0u;
+            while (packed_begin < expert_ids.size())
+            {
+                size_t packed_end = packed_begin + 1u;
+                while (packed_end < expert_ids.size() &&
+                       expert_ids[packed_end] == expert_ids[packed_end - 1u] + 1u)
+                {
+                    ++packed_end;
+                }
+                copy_runs.push_back(ExpertCopyRun{
+                    .source_offset =
+                        expert_ids[packed_begin] * bytes_per_expert,
+                    .destination_offset =
+                        packed_begin * bytes_per_expert,
+                    .byte_count =
+                        (packed_end - packed_begin) * bytes_per_expert});
+                packed_begin = packed_end;
+            }
+        }
+
+        auto for_each_run = [&](auto &&copy_run)
+        {
+            for (const ExpertCopyRun &run : copy_runs)
+                copy_run(
+                    run.source_offset,
+                    run.destination_offset,
+                    run.byte_count);
+        };
+
         if (mmap_region_)
         {
             const uint8_t *tensor_base = getMmapPtr(info);
-            const uint8_t *src = tensor_base + slice_offset;
-            raw.resize(slice_bytes);
-            std::memcpy(raw.data(), src, slice_bytes);
+            if (!tensor_base)
+                throw std::runtime_error(
+                    "[ModelLoader] Missing mmap base for explicit expert selection: " + tensor_name);
+            {
+                ScopedWeightLoadDetailTimer timer(
+                    "weights.expert_selection.source_copy");
+                // A single contiguous selection is often hundreds of MiB. Split
+                // it, too, so page faults and the sole copy use physical workers.
+                std::vector<ExpertCopyRun> chunks;
+                for (const auto &run : copy_runs)
+                {
+                    for (size_t offset = 0; offset < run.byte_count;)
+                    {
+                        const size_t bytes = std::min(
+                            kExpertSelectionCopyChunkBytes, run.byte_count - offset);
+                        chunks.push_back({run.source_offset + offset,
+                                          run.destination_offset + offset, bytes});
+                        offset += bytes;
+                    }
+                }
+                auto copy_chunk = [&](size_t index)
+                {
+                    const auto &run = chunks[index];
+                    std::memcpy(
+                        packed_destination + run.destination_offset,
+                        tensor_base + run.source_offset,
+                        run.byte_count);
+                };
+                // An existing worker may be loading its own independent tensor;
+                // it cannot enlist unrelated workers in a collective omp-for.
+                if (omp_in_parallel() || packed_byte_count < kParallelExpertSelectionCopyBytes)
+                {
+                    for (size_t index = 0; index < chunks.size(); ++index)
+                        copy_chunk(index);
+                }
+                else
+                {
+                    auto copy_work = [&]()
+                    {
+#pragma omp for schedule(static)
+                        for (size_t index = 0; index < chunks.size(); ++index)
+                            copy_chunk(index);
+                    };
+                    OMP_WORKSHARE_REGION(copy_work);
+                }
+            }
         }
         else
         {
             std::lock_guard<std::mutex> lock(file_mutex_);
-
             std::ifstream *stream = &file_stream_;
             uint64_t data_offset = model_.data_offset;
-
             if (model_.split_count > 1)
             {
                 if (info->split_idx == 0)
                 {
-                    stream = &file_stream_;
                     data_offset = model_.split_data_offsets[0];
                 }
                 else if (info->split_idx < model_.split_count)
                 {
-                    stream = &split_streams_[info->split_idx - 1];
+                    stream = &split_streams_[info->split_idx - 1u];
                     data_offset = model_.split_data_offsets[info->split_idx];
                 }
                 else
                 {
-                    LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
-                    return nullptr;
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid split index for explicit expert selection: " + tensor_name);
                 }
             }
 
-            stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
-            if (!(*stream))
             {
-                LOG_ERROR("[ModelLoader] Failed to seek to expert slice for: " << tensor_name);
-                return nullptr;
-            }
-
-            raw.resize(slice_bytes);
-            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
-            {
-                LOG_ERROR("[ModelLoader] Failed to read expert slice data for: " << tensor_name);
-                return nullptr;
+                ScopedWeightLoadDetailTimer timer(
+                    "weights.expert_selection.source_copy");
+                for_each_run(
+                    [&](size_t source_offset, size_t destination_offset, size_t byte_count)
+                    {
+                        stream->clear();
+                        stream->seekg(
+                            data_offset + info->offset + source_offset,
+                            std::ios::beg);
+                        if (!(*stream) ||
+                            !stream->read(
+                                reinterpret_cast<char *>(packed_destination + destination_offset),
+                                static_cast<std::streamsize>(byte_count)))
+                        {
+                            throw std::runtime_error(
+                                "[ModelLoader] Failed reading explicit expert selection for " + tensor_name);
+                        }
+                    });
             }
         }
 
-        // Create 3D shape for the sliced tensor
-        std::vector<size_t> slice_shape = {ne0, ne1, local_count};
-
-        // Handle weight precision conversion
-        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
-        if (should_convert)
+        if (info->isQuantized() && weight_precision != WeightPrecision::NATIVE)
         {
-            switch (weight_precision)
-            {
-            case WeightPrecision::CONVERT_TO_FP32:
-                return dequantizeToFP32(info, slice_shape, raw);
-            case WeightPrecision::CONVERT_TO_INT8:
-                return dequantizeToINT8(info, slice_shape, raw);
-            default:
-                LOG_WARN("[ModelLoader] Unsupported conversion for expert slice, keeping native");
-                break;
-            }
+            if (weight_precision == WeightPrecision::CONVERT_TO_FP32)
+                return dequantizeToFP32(info, packed_shape, raw);
+            if (weight_precision == WeightPrecision::CONVERT_TO_INT8)
+                return dequantizeToINT8(info, packed_shape, raw);
+            throw std::invalid_argument(
+                "[ModelLoader] Explicit expert selection does not support the requested weight conversion for " +
+                tensor_name);
         }
 
-        // Create tensor using factory (NUMA-aware) or direct construction
-        std::shared_ptr<TensorBase> tensor;
-        TensorType ttype = ggufToTensorType(info->type);
-
-        if (info->isQuantized())
+        LOG_TRACE("[ModelLoader] Packed " << expert_ids.size()
+                                           << "/" << ne2
+                                           << " explicit experts for " << tensor_name
+                                           << " into " << packed_byte_count << " bytes");
+        ScopedWeightLoadDetailTimer tensor_timer(
+            "weights.expert_selection.create_owned_tensor");
+        if (info->type == GGUFTensorType::F32)
         {
-            if (factory_)
-            {
-                tensor = factory_->createQuantized(ttype, slice_shape, raw);
-            }
-            else
-            {
-                // Non-factory path: use the same createTensorFromRawData pattern as WeightManager
-                // This handles all quantized types without a massive switch
-                switch (ttype)
-                {
-                case TensorType::Q4_0:
-                    tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q4_1:
-                    tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q5_0:
-                    tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q5_1:
-                    tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q8_0:
-                    tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q2_K:
-                    tensor = std::make_shared<Q2_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q3_K:
-                    tensor = std::make_shared<Q3_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q4_K:
-                    tensor = std::make_shared<Q4_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q5_K:
-                    tensor = std::make_shared<Q5_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q6_K:
-                    tensor = std::make_shared<Q6_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::Q8_K:
-                    tensor = std::make_shared<Q8_KTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ4_NL:
-                    tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ4_XS:
-                    tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ3_S:
-                    tensor = std::make_shared<IQ3_STensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ3_XXS:
-                    tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ2_S:
-                    tensor = std::make_shared<IQ2_STensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ2_XS:
-                    tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ2_XXS:
-                    tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ1_S:
-                    tensor = std::make_shared<IQ1_STensor>(slice_shape, raw);
-                    break;
-                case TensorType::IQ1_M:
-                    tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
-                    break;
-                default:
-                    LOG_ERROR("[ModelLoader] Unsupported quantized type for expert slicing: " << static_cast<int>(ttype));
-                    return nullptr;
-                }
-            }
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createFP32Owned(
+                             packed_shape, std::move(fp32_storage), device))
+                       : std::make_shared<FP32Tensor>(
+                             packed_shape, std::move(fp32_storage), device);
         }
-        else
+        if (info->type == GGUFTensorType::F16)
         {
-            // Non-quantized: FP32, FP16, BF16
-            switch (info->type)
-            {
-            case GGUFTensorType::F32:
-                if (factory_)
-                {
-                    auto fp32_tensor = factory_->createFP32(slice_shape, device);
-                    TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
-                    tensor = std::move(fp32_tensor);
-                }
-                else
-                {
-                    tensor = std::make_shared<FP32Tensor>(slice_shape);
-                    std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
-                }
-                break;
-            case GGUFTensorType::F16:
-            {
-                std::vector<uint16_t> fp16_data(raw.size() / 2);
-                std::memcpy(fp16_data.data(), raw.data(), raw.size());
-                tensor = factory_ ? factory_->createFP16(slice_shape, fp16_data)
-                                  : std::make_shared<FP16Tensor>(slice_shape, fp16_data);
-                break;
-            }
-            case GGUFTensorType::BF16:
-            {
-                std::vector<uint16_t> bf16_data(raw.size() / 2);
-                std::memcpy(bf16_data.data(), raw.data(), raw.size());
-                tensor = factory_ ? factory_->createBF16(slice_shape, bf16_data)
-                                  : std::make_shared<BF16Tensor>(slice_shape, bf16_data);
-                break;
-            }
-            default:
-                LOG_ERROR("[ModelLoader] Unsupported tensor type for expert slicing: "
-                          << static_cast<int>(info->type));
-                return nullptr;
-            }
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createFP16Owned(
+                             packed_shape, std::move(fp16_storage)))
+                       : std::make_shared<FP16Tensor>(
+                             packed_shape, std::move(fp16_storage));
         }
-
-        return tensor;
+        if (info->type == GGUFTensorType::BF16)
+        {
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createBF16Owned(
+                             packed_shape, std::move(bf16_storage)))
+                       : std::make_shared<BF16Tensor>(
+                             packed_shape, std::move(bf16_storage));
+        }
+        return createOwnedNativeQuantizedTensor(
+            factory_,
+            ggufToTensorType(info->type),
+            packed_shape,
+            std::move(quantized_storage));
     }
 
     std::shared_ptr<TensorBase> ModelLoader::loadTensorColumnSlice(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install-rocm.sh
 #
-# Install AMD ROCm 7.1.1. The user-space stack is installed inside the
+# Install AMD ROCm 7.2.4. The user-space stack is installed inside the
 # container; the kernel driver is expected on the host and passed through
 # via /dev/kfd + /dev/dri + the render/video groups.
 #
@@ -16,8 +16,8 @@
 set -euo pipefail
 
 MODE="${MODE:-full}"
-ROCM_VERSION="${ROCM_VERSION:-7.1.1}"
-ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.1.1.70101-1}"
+ROCM_VERSION="${ROCM_VERSION:-7.2.4}"
+ROCM_DEB_VERSION="${ROCM_DEB_VERSION:-7.2.4.70204-1}"
 export DEBIAN_FRONTEND=noninteractive
 
 APT_OPTS=(
@@ -108,16 +108,22 @@ case "${MODE}" in
         # --no-dkms: the kernel driver comes from the host; don't rebuild it
         # inside the container.
         amdgpu-install --usecase=rocm --no-dkms -y
+        # ROCclr includes GL interop in its HIP-only source build. Declare the
+        # GL/GLX headers explicitly instead of relying on full-SDK recommends.
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            rocm-llvm-dev libglvnd-dev
         ;;
     build)
         # Direct package closure needed by CMake:
         # - hipcc/amdclang + HIP headers/runtime
         # - hipBLAS/hipBLASLt headers and shared libraries
         # - ROCm CMake/device libs for HIP and RCCL source builds
+        # - GL/GLX development closure for the repaired HIP runtime's ROCclr
         # - RCCL dev package for headers/system fallback when source build is off
         apt-get "${APT_OPTS[@]}" update
         apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
             rocm-llvm \
+            rocm-llvm-dev \
             rocm-cmake \
             rocm-device-libs \
             hipcc \
@@ -125,6 +131,7 @@ case "${MODE}" in
             hip-dev \
             hsa-rocr-dev \
             libdrm-dev \
+            libglvnd-dev \
             hipblas-dev \
             hipblaslt-dev \
             rocblas-dev \
@@ -156,6 +163,14 @@ if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/nu
 fi
 rm -rf /tmp/rocblas-arch /tmp/rocblas-arch.pkg.tar.zst
 
-apt-get autoremove -y
+# Keep parallel graph construction and native packet replay, with the same
+# repaired HIP runtime in development, release builds, and exported images.
+if [[ "${MODE}" != runtime ]]; then
+    bash "$(dirname -- "${BASH_SOURCE[0]}")/install-hip-graph-runtime.sh"
+fi
+
+# Do not run autoremove here.  The caller owns the surrounding image and may
+# intentionally have build tools marked as automatically installed; a ROCm
+# installer must not make lifecycle decisions for unrelated packages.
 apt-get clean
 rm -rf /var/lib/apt/lists/*

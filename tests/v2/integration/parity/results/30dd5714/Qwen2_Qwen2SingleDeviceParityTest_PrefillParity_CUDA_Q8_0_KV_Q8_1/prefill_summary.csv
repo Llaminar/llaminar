@@ -1,0 +1,2 @@
+backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed
+CUDA_Q8_0_KV_Q8_1,0.998707,0.00387664,1,1,true,7,25,true

@@ -105,7 +105,7 @@ namespace llaminar2
                                                      << " dtype=" << params_.buffer->dtype_name());
         }
 
-        LOG_DEBUG("[AllreduceStage] Execute: buffer=" << params_.buffer
+        LOG_TRACE("[AllreduceStage] Execute: buffer=" << params_.buffer
                                                       << " count=" << count << " has_mpi_ctx=" << (params_.mpi_ctx != nullptr));
         if (!params_.mpi_ctx)
         {

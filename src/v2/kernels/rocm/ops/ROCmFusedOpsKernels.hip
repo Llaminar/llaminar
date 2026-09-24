@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "ROCmSwiGLUDecodeEquivalentMath.h"
 
 namespace {
 
@@ -45,21 +46,6 @@ __device__ __forceinline__ uint16_t float_to_fp16(float f)
 {
     __half h = __float2half(f);
     return *reinterpret_cast<uint16_t*>(&h);
-}
-
-/**
- * @brief SiLU math shared with the standalone ROCm SwiGLU decode kernel.
- *
- * The MTP grouped verifier compares multi-row kernels against serial decode
- * row-by-row.  Using the same fast exponential and reciprocal sequence here is
- * therefore a correctness requirement, not only a speed choice; a different
- * libm/division path can quantize activations differently and amplify through
- * later recurrent state.
- */
-__device__ __forceinline__ float silu_fast(float x)
-{
-    float e = __expf(-x);
-    return x * __builtin_amdgcn_rcpf(1.0f + e);
 }
 
 } // anonymous namespace
@@ -100,7 +86,8 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
         float u = row_up[k_start + lane];
 
         // SwiGLU: silu(gate) * up
-        float val = silu_fast(g) * u;
+        const float val =
+            llaminar2::rocm::decode_equivalent::swigluValue(g, u);
 
         // Warp-level max_abs reduction via shuffle
         float abs_val = fabsf(val);
@@ -110,12 +97,13 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
             abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
         }
 
-        float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-        float inv_scale = 1.0f / scale;
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
+        const float inv_scale = 1.0f / scale;
 
-        float qval = val * inv_scale;
-        const int q = static_cast<int>(
-            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        const int q =
+            llaminar2::rocm::decode_equivalent::quantizeQ8(
+                val, inv_scale);
         row_int8[k_start + lane] = static_cast<int8_t>(q);
 
         int q_sum = q;
@@ -416,6 +404,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
@@ -448,6 +440,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 
@@ -480,6 +476,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         llaminar2::HipDeviceGuard::setDevice(device_idx);
         (void)hipGetLastError();
 

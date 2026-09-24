@@ -23,6 +23,10 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "interfaces/IMPIContext.h"
 
+#include <fstream>
+#include <iterator>
+#include <string_view>
+
 using namespace llaminar2;
 using namespace testing;
 
@@ -143,6 +147,12 @@ namespace
             if (r)
                 *r = MPI_REQUEST_NULL;
         }
+        bool test(MPI_Request *r, MPI_Status *) const override
+        {
+            if (r)
+                *r = MPI_REQUEST_NULL;
+            return r != nullptr;
+        }
         void waitAll(std::vector<MPI_Request> &reqs) const override
         {
             for (auto &r : reqs)
@@ -196,6 +206,11 @@ namespace
         const float *logits() const override { return logits_.data(); }
         int vocab_size() const override { return VOCAB_SIZE; }
         void clear_cache() override { clear_cache_count_++; }
+        bool purgePrefixCache() override
+        {
+            ++purge_prefix_cache_count_;
+            return purge_prefix_cache_success_;
+        }
         int get_position() const override { return 0; }
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
@@ -209,6 +224,14 @@ namespace
             return requires_mpi_coordinated_decode_sampling_;
         }
 
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            stop_tokens_ = stop_tokens;
+            ++configure_stop_tokens_count_;
+            return true;
+        }
+
         void setSkipLogitsGatherDecode(bool skip) override
         {
             skip_logits_gather_ = skip;
@@ -218,10 +241,13 @@ namespace
         // Test inspection
         int forwardCallCount() const { return forward_call_count_; }
         int clearCacheCount() const { return clear_cache_count_; }
+        int purgePrefixCacheCount() const { return purge_prefix_cache_count_; }
         int sampleGreedyOnDeviceCount() const { return sample_greedy_on_device_count_; }
         int skipLogitsCalls() const { return skip_logits_calls_; }
         bool skipLogitsGather() const { return skip_logits_gather_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
+        const std::vector<int32_t> &stopTokens() const { return stop_tokens_; }
+        int configureStopTokensCount() const { return configure_stop_tokens_count_; }
 
         // Failure injection
         void setForwardSuccess(bool success) { forward_success_ = success; }
@@ -233,11 +259,16 @@ namespace
         {
             requires_mpi_coordinated_decode_sampling_ = required;
         }
+        void setPurgePrefixCacheSuccess(bool success)
+        {
+            purge_prefix_cache_success_ = success;
+        }
 
     private:
         std::vector<float> logits_;
         int forward_call_count_{0};
         int clear_cache_count_{0};
+        int purge_prefix_cache_count_{0};
         int sample_greedy_on_device_count_{0};
         int skip_logits_calls_{0};
         int sample_greedy_on_device_token_{-1};
@@ -245,8 +276,11 @@ namespace
         bool forward_success_{true};
         bool throw_on_forward_{false};
         bool requires_mpi_coordinated_decode_sampling_{false};
+        bool purge_prefix_cache_success_{true};
         int fail_after_n_forwards_{0}; // 0 = disabled
         std::vector<int> last_forward_tokens_;
+        std::vector<int32_t> stop_tokens_;
+        int configure_stop_tokens_count_{0};
     };
 
     // =========================================================================
@@ -288,7 +322,10 @@ namespace
             RecordingMPIContext *mpi;
         };
 
-        RunnerBundle createRunner(int mpi_rank, int mpi_world_size)
+        RunnerBundle createRunner(
+            int mpi_rank,
+            int mpi_world_size,
+            int retained_mtp_draft_capacity = 0)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get();
@@ -298,8 +335,17 @@ namespace
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.prefix_cache.enabled = false;
+            config.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+            config.mtp.graph_capacity_draft_tokens =
+                retained_mtp_draft_capacity;
 
             auto plan = createPlan(mpi_rank);
+            plan.runtime.prefix_cache.enabled = false;
+            plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+            plan.runtime.mtp = config.mtp;
 
             auto runner = std::make_unique<OrchestrationRunner>(
                 std::move(config), plan, std::move(mock), mpi);
@@ -356,7 +402,7 @@ namespace
 
         // Expected broadcasts:
         // 1. Command tag (PREFILL = 3)
-        // 2. Token count (5)
+        // 2. Typed header: token count plus retired prefill/decode progress
         // 3. Token data (10, 20, 30, 40, 50)
         ASSERT_EQ(mpi->broadcastCount(), 3u);
 
@@ -367,11 +413,10 @@ namespace
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL));
 
-        // Token count
+        // Typed prefill command header
         const auto &count = mpi->broadcasts()[1];
         EXPECT_EQ(count.type, RecordingMPIContext::BroadcastRecord::Type::INT32);
-        ASSERT_EQ(count.int_data.size(), 1u);
-        EXPECT_EQ(count.int_data[0], 5);
+        EXPECT_THAT(count.int_data, ElementsAre(5, 0, 0));
 
         // Token data
         const auto &data = mpi->broadcasts()[2];
@@ -436,11 +481,11 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
     }
 
-    TEST_F(Test__MPICoordinatedMode, DecodeStepSkipsDeviceSamplerWhenCoordinatedSamplingDisabled)
+    TEST_F(Test__MPICoordinatedMode, RootDecodeSamplesWhenWorkerSamplingCollectiveIsDisabled)
     {
         auto [runner, mock, mpi] = createRunner(0, 2);
         runner->setMPICoordinatedMode(true);
@@ -453,13 +498,15 @@ namespace
         GenerationResult result = runner->decodeStep();
 
         ASSERT_TRUE(result.success()) << result.error;
-        EXPECT_THAT(result.tokens, ElementsAre(3));
-        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 0);
+        // The flag describes worker participation in a sharded sampler; rank
+        // zero remains the authoritative sampler for every coordinated decode.
+        EXPECT_THAT(result.tokens, ElementsAre(7));
+        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 1);
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
-        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
     TEST_F(Test__MPICoordinatedMode, DecodeStepUsesDeviceSamplerWhenCoordinatedSamplingEnabled)
@@ -480,7 +527,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
@@ -499,7 +546,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 2u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::FORCE_DECODE_TOKEN));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(90));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(90, 0, 0));
         EXPECT_EQ(mpi->barrierCount(), 1u);
     }
 
@@ -533,6 +580,39 @@ namespace
         EXPECT_EQ(mock->clearCacheCount(), 1);
     }
 
+    TEST_F(Test__MPICoordinatedMode,
+           PurgePrefixCacheBroadcastsCommandAndInvokesLocalAuthority)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->purgePrefixCache());
+
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        const auto &cmd = mpi->broadcasts()[0];
+        EXPECT_EQ(cmd.type,
+                  RecordingMPIContext::BroadcastRecord::Type::INT32);
+        ASSERT_EQ(cmd.int_data.size(), 1u);
+        EXPECT_EQ(
+            cmd.int_data[0],
+            static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::PURGE_PREFIX_CACHE));
+        EXPECT_EQ(mock->purgePrefixCacheCount(), 1);
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           PurgePrefixCachePropagatesLocalLeaseRejection)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 1);
+        mock->setPurgePrefixCacheSuccess(false);
+
+        EXPECT_FALSE(runner->purgePrefixCache());
+        EXPECT_EQ(mock->purgePrefixCacheCount(), 1);
+        EXPECT_NE(
+            runner->lastError().find("active cache lease"),
+            std::string::npos);
+    }
+
     // =========================================================================
     // setSamplingParams() Coordination Tests
     // =========================================================================
@@ -550,7 +630,7 @@ namespace
 
         runner->setSamplingParams(params);
 
-        // Expected: command tag + 4 float params
+        // Expected: command tag + the complete six-field sampling policy.
         ASSERT_EQ(mpi->broadcastCount(), 2u);
 
         // Command tag
@@ -558,14 +638,54 @@ namespace
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING));
 
-        // Params buffer (4 floats: temperature, top_p, top_k, seed)
+        // Params buffer: temperature, top_p, top_k, seed, and both penalties.
         const auto &data = mpi->broadcasts()[1];
         EXPECT_EQ(data.type, RecordingMPIContext::BroadcastRecord::Type::FLOAT);
-        ASSERT_EQ(data.float_data.size(), 4u);
+        ASSERT_EQ(data.float_data.size(), 6u);
         EXPECT_FLOAT_EQ(data.float_data[0], 0.7f);
         EXPECT_FLOAT_EQ(data.float_data[1], 0.9f);
         EXPECT_FLOAT_EQ(data.float_data[2], 40.0f);
         EXPECT_FLOAT_EQ(data.float_data[3], 42.0f);
+        EXPECT_FLOAT_EQ(data.float_data[4], 0.0f);
+        EXPECT_FLOAT_EQ(data.float_data[5], 0.0f);
+    }
+
+    // =========================================================================
+    // setStopTokens() Coordination Tests
+    // =========================================================================
+
+    TEST_F(Test__MPICoordinatedMode, SetStopTokensBroadcastsCompleteRequestPolicy)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->setStopTokens({151643, 151645});
+
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_STOP_TOKENS)));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(2));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data,
+                    ElementsAre(151643, 151645));
+        EXPECT_THAT(mock->stopTokens(), ElementsAre(151643, 151645));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, SetEmptyStopPolicyPublishesZeroCountOnly)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->setStopTokens({});
+
+        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_STOP_TOKENS)));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_TRUE(mock->stopTokens().empty());
     }
 
     // =========================================================================
@@ -627,7 +747,7 @@ namespace
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
     }
 
-    TEST_F(Test__MPICoordinatedMode, ShutdownNoopForSingleRank)
+    TEST_F(Test__MPICoordinatedMode, ShutdownSingleRankSendsNoWireCommand)
     {
         auto [runner, mock, mpi] = createRunner(0, 1);
         runner->setMPICoordinatedMode(true);
@@ -635,6 +755,169 @@ namespace
         runner->shutdownMPIWorkers();
 
         EXPECT_EQ(mpi->broadcastCount(), 0u);
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           RetainedRunnerYieldReopensOneCommandChannel)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->yieldMPIWorkersForRetainedRunner())
+            << runner->lastError();
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        EXPECT_THAT(
+            mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::YIELD_RETAINED_RUNNER)));
+
+        /* The fixture boundary disables command publication while every rank
+         * independently installs its next typed request policy. Re-enabling
+         * reopens exactly the yielded lifecycle, after which terminal shutdown
+         * remains a distinct command. */
+        runner->setMPICoordinatedMode(false);
+        runner->setMPICoordinatedMode(true);
+        runner->shutdownMPIWorkers();
+
+        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        EXPECT_THAT(
+            mpi->broadcasts()[1].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)));
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           RetainedRunnerYieldRejectsLiveRequestState)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        const size_t broadcasts_before_yield = mpi->broadcastCount();
+
+        EXPECT_FALSE(runner->yieldMPIWorkersForRetainedRunner());
+        EXPECT_THAT(
+            runner->lastError(),
+            HasSubstr("request-owned state is reset"));
+        EXPECT_EQ(mpi->broadcastCount(), broadcasts_before_yield)
+            << "A rejected yield must not publish a partial lifecycle edge";
+    }
+
+    TEST_F(Test__MPICoordinatedMode, ShutdownMPIWorkersIsIdempotent)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        // A fixture may close workers explicitly before its runner is
+        // destroyed.  The lifecycle-owned shutdown must not send a second
+        // command after those workers have already left their receive loop.
+        runner->shutdownMPIWorkers();
+        runner->shutdownMPIWorkers();
+
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           RootRejectsRequestResetAfterWorkerShutdown)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->shutdownMPIWorkers();
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+
+        EXPECT_THROW(runner->clearCache(), AssertionError);
+        EXPECT_EQ(mpi->broadcastCount(), 1u)
+            << "A rejected post-shutdown reset must not publish another command";
+        EXPECT_EQ(mock->clearCacheCount(), 0)
+            << "A rejected post-shutdown reset must not mutate root-local state";
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           ShutdownPublishesTerminalAdmissionBeforeCollectiveDrain)
+    {
+        /* This is an architecture sanitizer for a real MPI deadlock: worker
+         * ranks block in the command Bcast, so the root cannot enter a
+         * maintenance Barrier until SHUTDOWN has released that receive. The
+         * runtime test above proves wire identity and this source invariant
+         * locks down the otherwise unobservable cross-component ordering. */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto function_begin = text.find(
+            "void OrchestrationRunner::shutdownMPIWorkers()");
+        ASSERT_NE(function_begin, std::string::npos);
+        const auto function_end = text.find(
+            "[[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand",
+            function_begin);
+        ASSERT_NE(function_end, std::string::npos);
+        const std::string_view body(
+            text.data() + function_begin,
+            function_end - function_begin);
+        const auto publish = body.find(
+            "broadcastCommand(MPICommand::SHUTDOWN);");
+        const auto drain = body.find(
+            "shutdownMoEExpertOverlayResidencyMaintenance(",
+            publish);
+        const auto terminal_drain_intent = body.find(
+            "MoEOverlayMaintenanceDrainIntent::TerminalContextSeal",
+            drain);
+        ASSERT_NE(publish, std::string_view::npos);
+        ASSERT_NE(drain, std::string_view::npos);
+        ASSERT_NE(terminal_drain_intent, std::string_view::npos);
+        EXPECT_LT(publish, drain)
+            << "Barrier-before-Bcast mismatches the root maintenance drain "
+               "against the worker command receive and deadlocks teardown";
+        EXPECT_LT(drain, terminal_drain_intent)
+            << "Terminal shutdown must name the terminal context-seal drain "
+               "rather than relying on an implicit maintenance policy";
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           SingleRankTerminalAdmissionStillDrainsResidencyMaintenance)
+    {
+        /* A one-rank topology has no command wire to observe, so lock down the
+         * lifecycle edge structurally. Real device integration independently
+         * proves that this drain retires old banks and recycles live slots. */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto function_begin = text.find(
+            "void OrchestrationRunner::shutdownMPIWorkers()");
+        ASSERT_NE(function_begin, std::string::npos);
+        const auto function_end = text.find(
+            "[[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand",
+            function_begin);
+        ASSERT_NE(function_end, std::string::npos);
+        const std::string_view body(
+            text.data() + function_begin,
+            function_end - function_begin);
+        const auto single_rank_branch = body.find(
+            "if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)");
+        const auto local_drain = body.find(
+            "shutdownMoEExpertOverlayResidencyMaintenance(",
+            single_rank_branch);
+        const auto terminal_drain_intent = body.find(
+            "MoEOverlayMaintenanceDrainIntent::TerminalContextSeal",
+            local_drain);
+        const auto multi_rank_authority_check = body.find(
+            "if (mpi_ctx_->rank() != mpi_coordinated_root_rank_)",
+            single_rank_branch);
+        ASSERT_NE(single_rank_branch, std::string_view::npos);
+        ASSERT_NE(local_drain, std::string_view::npos);
+        ASSERT_NE(terminal_drain_intent, std::string_view::npos);
+        ASSERT_NE(multi_rank_authority_check, std::string_view::npos);
+        EXPECT_LT(single_rank_branch, local_drain);
+        EXPECT_LT(local_drain, terminal_drain_intent);
+        EXPECT_LT(terminal_drain_intent, multi_rank_authority_check);
+        EXPECT_LT(local_drain, multi_rank_authority_check)
+            << "Single-rank terminal admission returned before draining the "
+               "model-lifetime residency service";
     }
 
     // =========================================================================
@@ -810,6 +1093,15 @@ namespace
             script_.push_back(std::move(e));
         }
 
+        /** @brief Add an exact previously recorded int32 payload. */
+        void scriptInt32(const std::vector<int32_t> &data)
+        {
+            ScriptEntry e;
+            e.type = ScriptEntry::Type::INT32;
+            e.int_data = data;
+            script_.push_back(std::move(e));
+        }
+
         /// Add a scripted float broadcast response
         void scriptFloat(std::initializer_list<float> data)
         {
@@ -903,6 +1195,12 @@ namespace
             if (r)
                 *r = MPI_REQUEST_NULL;
         }
+        bool test(MPI_Request *r, MPI_Status *) const override
+        {
+            if (r)
+                *r = MPI_REQUEST_NULL;
+            return r != nullptr;
+        }
         void waitAll(std::vector<MPI_Request> &reqs) const override
         {
             for (auto &r : reqs)
@@ -941,7 +1239,8 @@ namespace
     };
 
     static WorkerBundle createWorkerRunner(
-        std::shared_ptr<ScriptedMPIContext> scripted_mpi)
+        std::shared_ptr<ScriptedMPIContext> scripted_mpi,
+        int retained_mtp_draft_capacity = 0)
     {
         auto mock = std::make_unique<MockInferenceRunner>();
         auto *mock_ptr = mock.get();
@@ -949,6 +1248,11 @@ namespace
 
         OrchestrationConfig config;
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
+        config.prefix_cache.enabled = false;
+        config.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+        config.mtp.graph_capacity_draft_tokens =
+            retained_mtp_draft_capacity;
 
         RankExecutionPlan plan;
         plan.rank = scripted_mpi->rank();
@@ -960,6 +1264,10 @@ namespace
         plan.has_embedding = true;
         plan.has_lm_head = true;
         plan.primary_device = GlobalDeviceAddress::cpu();
+        plan.runtime.prefix_cache.enabled = false;
+        plan.runtime.prefix_cache.storage_mode =
+            PrefixCacheStorageMode::Disabled;
+        plan.runtime.mtp = config.mtp;
 
         auto runner = std::make_unique<OrchestrationRunner>(
             std::move(config), plan, std::move(mock), scripted_mpi);
@@ -978,6 +1286,197 @@ namespace
     // Worker Loop Dispatch Tests
     // =========================================================================
 
+    TEST_F(Test__MPICoordinatedMode,
+           TypedMTPRequestPolicyRoundTripsExactlyFromRootToWorker)
+    {
+        auto root = createRunner(
+            /*mpi_rank=*/0,
+            /*mpi_world_size=*/2,
+            /*retained_mtp_draft_capacity=*/15);
+        root.runner->setMPICoordinatedMode(true);
+
+        MTPRequestPolicy policy;
+        policy.enabled = true;
+        policy.draft_tokens = 7;
+        policy.verify_mode = MTPVerifyMode::SpeculativeSampling;
+        policy.require_terminal_hidden_for_full_hit = false;
+        policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        policy.depth_policy.backend = MTPDepthPolicyBackend::ROCm;
+        policy.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+        policy.depth_policy.min_depth = 1;
+        policy.depth_policy.max_depth = 15;
+        policy.depth_policy.initial_depth = 7;
+        policy.depth_policy.window_size = 19;
+        policy.depth_policy.min_samples = 5;
+        policy.depth_policy.cooldown_steps = 2;
+        policy.depth_policy.promote_consecutive_windows = 4;
+        policy.depth_policy.use_generated_policy = false;
+        policy.depth_policy.promote_full_accept_rate = 0.987654321012345;
+        policy.depth_policy.demote_zero_accept_rate = 0.234567890123456;
+        policy.depth_policy.demote_acceptance_rate = 0.543210987654321;
+
+        ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy))
+            << root.runner->lastError();
+        ASSERT_EQ(root.mpi->broadcastCount(), 2u);
+        ASSERT_THAT(
+            root.mpi->broadcasts()[0].int_data,
+            ElementsAre(static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)));
+        ASSERT_EQ(root.mpi->broadcasts()[1].int_data.size(), 23u);
+
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+        scripted->scriptInt32(root.mpi->broadcasts()[1].int_data);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)});
+        auto worker = createWorkerRunner(
+            scripted,
+            /*retained_mtp_draft_capacity=*/15);
+        worker.runner->runMPIWorkerLoop();
+
+        const MTPRequestPolicy installed =
+            worker.runner->mtpRequestPolicy();
+        EXPECT_EQ(installed.enabled, policy.enabled);
+        EXPECT_EQ(installed.draft_tokens, policy.draft_tokens);
+        EXPECT_EQ(installed.verify_mode, policy.verify_mode);
+        EXPECT_EQ(
+            installed.require_terminal_hidden_for_full_hit,
+            policy.require_terminal_hidden_for_full_hit);
+        EXPECT_EQ(installed.depth_policy.mode, policy.depth_policy.mode);
+        EXPECT_EQ(installed.depth_policy.backend, policy.depth_policy.backend);
+        EXPECT_EQ(
+            installed.depth_policy.model_class,
+            policy.depth_policy.model_class);
+        EXPECT_EQ(installed.depth_policy.min_depth, policy.depth_policy.min_depth);
+        EXPECT_EQ(installed.depth_policy.max_depth, policy.depth_policy.max_depth);
+        EXPECT_EQ(
+            installed.depth_policy.initial_depth,
+            policy.depth_policy.initial_depth);
+        EXPECT_EQ(installed.depth_policy.window_size, policy.depth_policy.window_size);
+        EXPECT_EQ(installed.depth_policy.min_samples, policy.depth_policy.min_samples);
+        EXPECT_EQ(
+            installed.depth_policy.cooldown_steps,
+            policy.depth_policy.cooldown_steps);
+        EXPECT_EQ(
+            installed.depth_policy.promote_consecutive_windows,
+            policy.depth_policy.promote_consecutive_windows);
+        EXPECT_EQ(
+            installed.depth_policy.use_generated_policy,
+            policy.depth_policy.use_generated_policy);
+        EXPECT_DOUBLE_EQ(
+            installed.depth_policy.promote_full_accept_rate,
+            policy.depth_policy.promote_full_accept_rate);
+        EXPECT_EQ(
+            installed.depth_policy.demote_zero_accept_rate,
+            policy.depth_policy.demote_zero_accept_rate);
+        EXPECT_DOUBLE_EQ(
+            installed.depth_policy.demote_acceptance_rate,
+            policy.depth_policy.demote_acceptance_rate);
+        EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           WorkerRetainedYieldCanEnterASecondSession)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::YIELD_RETAINED_RUNNER)});
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+        EXPECT_EQ(mpi->scriptPosition(), 1u);
+
+        runner->setMPICoordinatedMode(false);
+        runner->setMPICoordinatedMode(true);
+        runner->runMPIWorkerLoop();
+        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+    }
+
+    /** @brief Automatic intent and explicit zero survive root/follower admission. */
+    TEST_F(Test__MPICoordinatedMode, TypedMTPRequestPolicyPreservesAutomaticThreshold)
+    {
+        for (const auto threshold : {std::optional<double>{}, std::optional<double>{0.0},
+                                    std::optional<double>{0.30}})
+        {
+            auto root = createRunner(/*mpi_rank=*/0, /*mpi_world_size=*/2,
+                                     /*retained_mtp_draft_capacity=*/15);
+            root.runner->setMPICoordinatedMode(true);
+            MTPRequestPolicy policy;
+            policy.enabled = true;
+            policy.draft_tokens = 15;
+            policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+            policy.depth_policy.demote_zero_accept_rate = threshold;
+            ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy));
+            ASSERT_EQ(root.mpi->broadcasts().size(), 2u);
+            auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+            scripted->scriptInt32(root.mpi->broadcasts()[1].int_data);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
+            auto worker = createWorkerRunner(scripted, /*retained_mtp_draft_capacity=*/15);
+            worker.runner->runMPIWorkerLoop();
+            EXPECT_EQ(worker.runner->mtpRequestPolicy().depth_policy.demote_zero_accept_rate, threshold);
+            EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+        }
+    }
+
+    /** @brief An automatic threshold cannot hide stale explicit wire bytes. */
+    TEST_F(Test__MPICoordinatedMode, TypedMTPRequestPolicyRejectsMalformedAutomaticThreshold)
+    {
+        auto root = createRunner(/*mpi_rank=*/0, /*mpi_world_size=*/2,
+                                 /*retained_mtp_draft_capacity=*/15);
+        root.runner->setMPICoordinatedMode(true);
+        MTPRequestPolicy policy;
+        policy.enabled = true;
+        policy.draft_tokens = 15;
+        policy.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        ASSERT_TRUE(root.runner->configureMTPRequestPolicy(policy));
+        for (const std::size_t offset : {18u, 22u})
+        {
+            auto malformed = root.mpi->broadcasts()[1].int_data;
+            malformed[offset] = 2;
+            auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+            scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+            scripted->scriptInt32(malformed);
+            auto worker = createWorkerRunner(scripted, /*retained_mtp_draft_capacity=*/15);
+            EXPECT_THROW(worker.runner->runMPIWorkerLoop(), std::runtime_error);
+            EXPECT_FALSE(worker.runner->mtpRequestPolicy().enabled);
+        }
+    }
+
+    /**
+     * @brief A malformed policy frame is terminal for a coordinated follower.
+     *
+     * Continuing after an unknown wire version could leave ranks selecting
+     * different retained graph families. The scripted context has no live MPI
+     * communicator, so the production fatal path throws instead of aborting
+     * the test process.
+     */
+    TEST_F(Test__MPICoordinatedMode,
+           TypedMTPRequestPolicyRejectsUnknownWireVersionFatally)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(
+                OrchestrationRunner::MPICommand::SET_MTP_REQUEST_POLICY)});
+        std::vector<int32_t> malformed(23u, 0);
+        malformed[0] = 99;
+        scripted->scriptInt32(malformed);
+
+        auto worker = createWorkerRunner(
+            scripted,
+            /*retained_mtp_draft_capacity=*/15);
+        EXPECT_THROW(worker.runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_FALSE(worker.runner->mtpRequestPolicy().enabled);
+        EXPECT_EQ(scripted->scriptPosition(), scripted->scriptSize());
+    }
+
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesClearCache)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
@@ -990,13 +1489,30 @@ namespace
         EXPECT_EQ(mock->clearCacheCount(), 1);
     }
 
+    TEST_F(Test__MPICoordinatedMode,
+           WorkerShutdownClosesLocalRequestAdmission)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+
+        EXPECT_THROW(runner->clearCache(), AssertionError);
+        EXPECT_EQ(mock->clearCacheCount(), 0)
+            << "A follower cannot mutate request state after leaving its loop";
+        EXPECT_EQ(mpi->scriptPosition(), 1u)
+            << "No command receive may occur after terminal SHUTDOWN";
+    }
+
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesPrefill)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // PREFILL command
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        // Token count
-        scripted->scriptInt32({3});
+        // Token count plus retired prefill/decode progress
+        scripted->scriptInt32({3, 0, 0});
         // Token data
         scripted->scriptInt32({100, 200, 300});
         // SHUTDOWN
@@ -1009,12 +1525,50 @@ namespace
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(100, 200, 300));
     }
 
+    TEST_F(
+        Test__MPICoordinatedMode,
+        WorkerPrefillActivatesExpertOverlayDemandBeforeFollowerTickets)
+    {
+        /*
+         * The injected runner seam does not materialize a physical
+         * ExpertOverlay authority. Lock down the command wiring structurally;
+         * authority and histogram transition semantics have their own
+         * device-free tests, while production parity proves this exact branch
+         * with a retained transaction follower and real weights.
+         */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto prefill_case = text.find("case MPICommand::PREFILL:");
+        ASSERT_NE(prefill_case, std::string::npos);
+        const auto next_case = text.find(
+            "case MPICommand::DECODE_STEP:", prefill_case);
+        ASSERT_NE(next_case, std::string::npos);
+        const std::string_view body(
+            text.data() + prefill_case,
+            next_case - prefill_case);
+        const auto activation = body.find(
+            "activateMoEOverlayDemandAtRequestBoundary()");
+        const auto follower = body.find(
+            "if (moe_overlay_inference_transaction_follower_)");
+        const auto ticket = body.find("->runOneCommand()", follower);
+        ASSERT_NE(activation, std::string_view::npos);
+        ASSERT_NE(follower, std::string_view::npos);
+        ASSERT_NE(ticket, std::string_view::npos);
+        EXPECT_LT(activation, follower);
+        EXPECT_LT(activation, ticket)
+            << "A remote ExpertOverlay request must leave certification "
+               "quarantine before its first retained graph ticket executes";
+    }
+
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesDecodeStep)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // Prefill first so decode has state
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({1});
+        scripted->scriptInt32({1, 0, 0});
         scripted->scriptInt32({42});
         // First decode: consumes prefill logits (no forward)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
@@ -1038,7 +1592,7 @@ namespace
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({1});
+        scripted->scriptInt32({1, 0, 0});
         scripted->scriptInt32({42});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1074,6 +1628,37 @@ namespace
         EXPECT_EQ(params.seed, 42u);
     }
 
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopInstallsRootStopPolicyBeforeInference)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SET_STOP_TOKENS)});
+        scripted->scriptInt32({2});
+        scripted->scriptInt32({151643, 151645});
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+
+        EXPECT_THAT(mock->stopTokens(), ElementsAre(151643, 151645));
+        EXPECT_EQ(mock->configureStopTokensCount(), 1);
+        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+    }
+
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopRejectsMalformedNegativeStopCount)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32({static_cast<int32_t>(
+            OrchestrationRunner::MPICommand::SET_STOP_TOKENS)});
+        scripted->scriptInt32({-1});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_TRUE(mock->stopTokens().empty());
+    }
+
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesSkipLogitsDecode)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
@@ -1095,7 +1680,7 @@ namespace
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING)});
         scripted->scriptFloat({0.0f, 1.0f, 0.0f, 0.0f}); // greedy params
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1115,7 +1700,7 @@ namespace
         EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize()); // All script entries consumed
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopHandlesUnknownCommand)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsOnUnknownCommand)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({999}); // Unknown command
@@ -1123,13 +1708,15 @@ namespace
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
 
-        // Should not crash — unknown command is logged and skipped
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        // A command tag disagreement means rank schedules can no longer be
+        // proven equivalent. The test communicator throws instead of aborting
+        // a process, and the following SHUTDOWN must remain unread.
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_EQ(mpi->scriptPosition(), 1u);
     }
 
     // =========================================================================
-    // Error / Exception Handling — Rank Desync Prevention
+    // Error / Exception Handling — Fail Fast Before Rank Desynchronization
     // =========================================================================
 
     TEST_F(Test__MPICoordinatedMode, PrefillFailureStillCompletesProtocol)
@@ -1177,40 +1764,39 @@ namespace
         EXPECT_EQ(mpi->broadcastCount(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterPrefillFailure)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterPrefillFailure)
     {
         // Scenario: Worker receives PREFILL, its forward() fails.
-        // The worker loop should NOT exit — it should continue to the next
-        // command. Otherwise rank 0 sends the next command and the worker
-        // misses it → deadlock.
+        // It must not return to the command loop: rank 0 may already be
+        // blocked in a sparse collective that this worker will not enter.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
-        // After failed prefill, worker continues and receives next command
+        // This command must remain unread after the failure.
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
         mock->setForwardSuccess(false);
 
-        // Worker loop should complete without hanging
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
+        // Scripted MPI has no live communicator, so the production abort edge
+        // is represented as a deterministic exception.
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
-        // Both prefill (failed) and clear_cache were processed
         EXPECT_EQ(mock->forwardCallCount(), 1); // prefill called forward
-        EXPECT_EQ(mock->clearCacheCount(), 1);  // continued to clear_cache
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize()); // All consumed
+        EXPECT_EQ(mock->clearCacheCount(), 0);  // no later command is allowed
+        EXPECT_EQ(mpi->scriptPosition(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterPrefillException)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterPrefillException)
     {
         // Scenario: Worker's forward() throws during PREFILL.
-        // OrchestrationRunner::prefill() catches std::exception internally,
-        // so the worker loop should survive and process the next command.
+        // prefill() converts it into a failure; that failure still must stop
+        // this worker before it consumes a later coordinated command.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
@@ -1218,23 +1804,21 @@ namespace
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
         mock->setThrowOnForward(true);
 
-        // Worker loop should complete — prefill() catches the exception
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
-        // Worker continued past the failed prefill
-        EXPECT_EQ(mock->clearCacheCount(), 1);
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        EXPECT_EQ(mock->clearCacheCount(), 0);
+        EXPECT_EQ(mpi->scriptPosition(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterDecodeStepFailure)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterDecodeStepFailure)
     {
         // Scenario: Worker's forward() fails during DECODE_STEP.
-        // decodeStep() returns an error result but does not throw.
-        // The worker loop should continue to the next command.
+        // decodeStep() returns an error result, which must terminate the real
+        // MPI job rather than let the worker drift to the next command.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // Prefill to set up state (1st forward call — succeeds)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2});
+        scripted->scriptInt32({2, 0, 0});
         scripted->scriptInt32({10, 20});
         // First decode uses prefill logits (no forward call)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
@@ -1243,7 +1827,7 @@ namespace
         // Second decode calls forward — the 2nd forward call — which we fail
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
-        // Should still continue past the failed decode
+        // This command must remain unread after the failed decode.
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
@@ -1251,14 +1835,12 @@ namespace
         // Let prefill's forward succeed, then fail on the 2nd forward (decode)
         mock->setFailAfterNForwards(1);
 
-        runner->runMPIWorkerLoop();
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
         // 2 forward calls total: prefill (success) + decode (failure)
         EXPECT_EQ(mock->forwardCallCount(), 2);
-        // Loop continued past decode failure to process clear_cache
-        EXPECT_EQ(mock->clearCacheCount(), 1);
-        // All script entries consumed (no hang)
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        EXPECT_EQ(mock->clearCacheCount(), 0);
+        EXPECT_EQ(mpi->scriptPosition(), 8u);
     }
 
     TEST_F(Test__MPICoordinatedMode, EmptyPrefillDoesNotBroadcast)
@@ -1287,7 +1869,7 @@ namespace
         // Request 1: clear → prefill → decode → decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({3}); // token count
+        scripted->scriptInt32({3, 0, 0}); // token count and retired progress
         scripted->scriptInt32({1, 2, 3}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1299,7 +1881,7 @@ namespace
         // Request 2: clear → prefill → decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({4, 5}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget

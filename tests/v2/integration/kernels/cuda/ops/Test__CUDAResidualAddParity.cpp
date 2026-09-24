@@ -18,6 +18,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
@@ -119,9 +120,23 @@ namespace
         void SetUp() override
         {
             SKIP_IF_NO_CUDA();
+            ASSERT_EQ(
+                cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+                cudaSuccess);
+        }
+
+        void TearDown() override
+        {
+            if (stream_)
+            {
+                EXPECT_EQ(cudaStreamDestroy(stream_), cudaSuccess);
+                stream_ = nullptr;
+            }
         }
 
 #ifdef HAVE_CUDA
+        cudaStream_t stream_ = nullptr;
+
         // Helper to allocate GPU memory and copy data
         float *allocGpuFloat(size_t count)
         {
@@ -519,20 +534,21 @@ namespace
 
         // Upload tensors to GPU using ensureOnDevice (as the pipeline does)
         DeviceId cuda_device = DeviceId::cuda(0);
-        ASSERT_TRUE(input->ensureOnDevice(cuda_device));
-        ASSERT_TRUE(residual->ensureOnDevice(cuda_device));
-        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(input->ensureOnDevice(cuda_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(cuda_device, stream_));
+        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device, stream_));
 
         // CUDA kernel using apply_tensor() API (what the pipeline actually uses)
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_tensor(
             input.get(), residual.get(), cuda_output.get(),
             num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
         // Mark output dirty and sync back to host
-        cuda_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(cuda_output, stream_);
         const float *result = cuda_output->data(); // This syncs GPU→host
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";
@@ -564,17 +580,18 @@ namespace
             num_elements, nullptr, -1));
 
         DeviceId cuda_device = DeviceId::cuda(0);
-        ASSERT_TRUE(input->ensureOnDevice(cuda_device));
-        ASSERT_TRUE(residual->ensureOnDevice(cuda_device));
-        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device));
+        ASSERT_TRUE(input->ensureOnDevice(cuda_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(cuda_device, stream_));
+        ASSERT_TRUE(cuda_output->ensureOnDevice(cuda_device, stream_));
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_tensor(
             input.get(), residual.get(), cuda_output.get(),
             num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
-        cuda_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        TransferEngine::publishCurrentDeviceWrite(cuda_output, stream_);
         const float *result = cuda_output->data();
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "CUDA output contains NaN/Inf";

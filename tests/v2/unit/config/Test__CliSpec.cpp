@@ -81,6 +81,17 @@ TEST(Test__CliSpec, ParsesBareFlags)
     EXPECT_TRUE(c.flag_b);
 }
 
+TEST(Test__CliSpec, CommandExtensionsCannotShadowLongShortOrAliasNames)
+{
+    for (const auto *name : {"--flag-a", "-a", "--alias-b"})
+    {
+        auto spec = buildTestSpec();
+        CliSpec<TestConfig> extension;
+        extension.add({.long_name = "--command-output", .aliases = {name}});
+        EXPECT_THROW(spec.extend(extension), std::invalid_argument) << name;
+    }
+}
+
 TEST(Test__CliSpec, AliasesAreAccepted)
 {
     auto spec = buildTestSpec();

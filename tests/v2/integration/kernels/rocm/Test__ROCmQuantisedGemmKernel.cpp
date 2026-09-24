@@ -20,6 +20,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <cmath>
 #include <cstdlib>
 #include <numeric>
@@ -352,9 +353,26 @@ namespace llaminar2
                         (void)hipGetDeviceProperties(&props, 0);
                         LOG_INFO("[Integration] ROCm device: " << props.name
                                                                << " (" << props.gcnArchName << ")");
+                        ASSERT_EQ(
+                            hipStreamCreateWithFlags(
+                                &stream_,
+                                hipStreamNonBlocking),
+                            hipSuccess);
                     }
 #else
                     has_rocm_device_ = false;
+#endif
+                }
+
+                void TearDown() override
+                {
+#ifdef HAVE_ROCM
+                    workspace_.reset();
+                    if (stream_)
+                    {
+                        EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+                        stream_ = nullptr;
+                    }
 #endif
                 }
 
@@ -388,6 +406,8 @@ namespace llaminar2
                 bool has_rocm_device_ = false;
 
 #ifdef HAVE_ROCM
+                hipStream_t stream_ = nullptr;
+
                 // Workspace manager for GEMM kernel tests
                 std::unique_ptr<DeviceWorkspaceManager> workspace_;
 
@@ -409,6 +429,7 @@ namespace llaminar2
                         return false;
                     }
                     kernel.bindWorkspace(workspace_.get());
+                    kernel.setGPUStream(stream_);
                     return true;
                 }
 
@@ -2051,6 +2072,7 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     {input.get(), wq.get(), wk.get(), wv.get(), bias_q.get(), bias_k.get(), bias_v.get()},
                     {rocm_q.get(), rocm_k.get(), rocm_v.get()},
+                    static_cast<void *>(stream_),
                     [&]()
                     {
                         return rocm_stage.execute(&rocm_ctx);
@@ -2211,6 +2233,7 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
+                    static_cast<void *>(stream_),
                     [&]()
                     {
                         return rocm_stage.execute(&rocm_ctx);
@@ -2390,6 +2413,7 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
+                    static_cast<void *>(stream_),
                     [&]()
                     {
                         return rocm_stage.execute(&rocm_ctx);
@@ -2553,11 +2577,14 @@ namespace llaminar2
                 DeviceWorkspaceManager proj_workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
                 ASSERT_TRUE(proj_workspace.allocate(proj_reqs));
                 rocm_proj_stage.bindWorkspace(&proj_workspace);
+                rocm_proj_stage.setGPUStream(static_cast<void *>(stream_));
 
                 const std::initializer_list<TensorBase *> proj_inputs = {
                     input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
                 const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), proj_inputs, proj_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_proj_stage.execute(&rocm_ctx); }))
                     << "ROCm Q/K projection failed for layer-3 snapshot input";
                 rocm_proj_stage.unbindWorkspace();
@@ -2604,19 +2631,25 @@ namespace llaminar2
                 QKNormStage rocm_q_norm_stage(rocm_q_norm_params);
                 QKNormStage cpu_k_norm_stage(cpu_k_norm_params);
                 QKNormStage rocm_k_norm_stage(rocm_k_norm_params);
+                rocm_q_norm_stage.setGPUStream(static_cast<void *>(stream_));
+                rocm_k_norm_stage.setGPUStream(static_cast<void *>(stream_));
 
                 ASSERT_TRUE(cpu_q_norm_stage.execute(&cpu_ctx)) << "CPU Q norm failed for layer-3 snapshot input";
                 ASSERT_TRUE(cpu_k_norm_stage.execute(&cpu_ctx)) << "CPU K norm failed for layer-3 snapshot input";
 
                 const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
                 const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), qnorm_inputs, qnorm_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_q_norm_stage.execute(&rocm_ctx); }))
                     << "ROCm Q norm failed for layer-3 snapshot input";
 
                 const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
                 const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), knorm_inputs, knorm_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_k_norm_stage.execute(&rocm_ctx); }))
                     << "ROCm K norm failed for layer-3 snapshot input";
 
@@ -2738,11 +2771,14 @@ namespace llaminar2
                 DeviceWorkspaceManager proj_workspace(DeviceId::rocm(0), 128 * 1024 * 1024);
                 ASSERT_TRUE(proj_workspace.allocate(proj_reqs));
                 rocm_proj_stage.bindWorkspace(&proj_workspace);
+                rocm_proj_stage.setGPUStream(static_cast<void *>(stream_));
 
                 const std::initializer_list<TensorBase *> proj_inputs = {
                     input.get(), rocm_wq.get(), rocm_wk.get(), rocm_wv.get(), rocm_bias_q.get(), rocm_bias_k.get(), rocm_bias_v.get()};
                 const std::initializer_list<TensorBase *> proj_outputs = {rocm_q.get(), rocm_k.get(), rocm_v.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), proj_inputs, proj_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), proj_inputs, proj_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_proj_stage.execute(&rocm_ctx); }))
                     << "ROCm Q/K projection failed";
                 rocm_proj_stage.unbindWorkspace();
@@ -2789,19 +2825,25 @@ namespace llaminar2
                 QKNormStage rocm_q_norm_stage(rocm_q_norm_params);
                 QKNormStage cpu_k_norm_stage(cpu_k_norm_params);
                 QKNormStage rocm_k_norm_stage(rocm_k_norm_params);
+                rocm_q_norm_stage.setGPUStream(static_cast<void *>(stream_));
+                rocm_k_norm_stage.setGPUStream(static_cast<void *>(stream_));
 
                 ASSERT_TRUE(cpu_q_norm_stage.execute(&cpu_ctx)) << "CPU Q norm failed";
                 ASSERT_TRUE(cpu_k_norm_stage.execute(&cpu_ctx)) << "CPU K norm failed";
 
                 const std::initializer_list<TensorBase *> qnorm_inputs = {rocm_q.get(), rocm_q_norm.get()};
                 const std::initializer_list<TensorBase *> qnorm_outputs = {rocm_q.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), qnorm_inputs, qnorm_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), qnorm_inputs, qnorm_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_q_norm_stage.execute(&rocm_ctx); }))
                     << "ROCm Q norm failed";
 
                 const std::initializer_list<TensorBase *> knorm_inputs = {rocm_k.get(), rocm_k_norm.get()};
                 const std::initializer_list<TensorBase *> knorm_outputs = {rocm_k.get()};
-                ASSERT_TRUE(with_gpu_coherence(DeviceId::rocm(0), knorm_inputs, knorm_outputs, [&]()
+                ASSERT_TRUE(with_gpu_coherence(
+                    DeviceId::rocm(0), knorm_inputs, knorm_outputs,
+                    static_cast<void *>(stream_), [&]()
                                                { return rocm_k_norm_stage.execute(&rocm_ctx); }))
                     << "ROCm K norm failed";
 
@@ -2925,6 +2967,7 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
+                    static_cast<void *>(stream_),
                     [&]()
                     {
                         return rocm_stage.execute(&rocm_ctx);
@@ -3060,6 +3103,7 @@ namespace llaminar2
                         DeviceId::rocm(0),
                         rocm_inputs,
                         rocm_outputs,
+                        static_cast<void *>(stream_),
                         [&]()
                         {
                             return rocm_stage.execute(&rocm_ctx);
@@ -3259,6 +3303,7 @@ namespace llaminar2
                     DeviceId::rocm(0),
                     rocm_inputs,
                     rocm_outputs,
+                    static_cast<void *>(stream_),
                     [&]()
                     {
                         return rocm_stage.execute(&rocm_ctx);
@@ -3667,7 +3712,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 // CPU reference
                 const float *in_host = input->data();
@@ -3725,7 +3770,7 @@ namespace llaminar2
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -3781,7 +3826,7 @@ namespace llaminar2
                 }
 
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4000,7 +4045,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4054,8 +4099,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias.get()));
                 (void)hipDeviceSynchronize();
-                output_no_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                output_with_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output_no_bias, stream_);
+                TransferEngine::publishCurrentDeviceWrite(output_with_bias, stream_);
 
                 const float *no_bias = output_no_bias->data();
                 const float *with_bias = output_with_bias->data();
@@ -4105,7 +4150,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4153,7 +4198,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4196,7 +4241,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4250,8 +4295,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_with_bias.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias.get()));
                 (void)hipDeviceSynchronize();
-                output_no_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                output_with_bias->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output_no_bias, stream_);
+                TransferEngine::publishCurrentDeviceWrite(output_with_bias, stream_);
 
                 const float *no_bias = output_no_bias->data();
                 const float *with_bias = output_with_bias->data();
@@ -4301,7 +4346,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4366,7 +4411,7 @@ namespace llaminar2
                     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                     (void)hipDeviceSynchronize();
-                    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                     std::vector<float> ref(static_cast<size_t>(M) * N);
                     cpuFP32GemmRef(in_host, W_q8_fp32.data(), ref.data(), M, N, K);
@@ -4387,7 +4432,7 @@ namespace llaminar2
                     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                     (void)hipDeviceSynchronize();
-                    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                     std::vector<float> ref(static_cast<size_t>(M) * N);
                     cpuFP32GemmRef(in_host, W_q4_fp32.data(), ref.data(), M, N, K);
@@ -4433,7 +4478,7 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
 
                 const float *in_host = input->data();
                 std::vector<float> ref(static_cast<size_t>(M) * N);
@@ -4479,14 +4524,14 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K));
                 (void)hipDeviceSynchronize();
-                output_separate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output_separate, stream_);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel, output_fused.get(), N, nullptr, "q4_0_native_fused");
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
-                output_fused->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(output_fused, stream_);
 
                 const float *separate = output_separate->data();
                 const float *fused = output_fused->data();
@@ -4554,9 +4599,9 @@ namespace llaminar2
                 ASSERT_TRUE(kernel.multiply_tensor(input.get(), separate_v.get(), M, N, K,
                                                    true, 1.0f, 0.0f, bias_v.get()));
                 (void)hipDeviceSynchronize();
-                separate_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(separate_q, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate_k, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate_v, stream_);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel, fused_q.get(), N, bias_q.get(), "q_bias");
@@ -4565,9 +4610,9 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 (void)hipDeviceSynchronize();
-                fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(fused_q, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused_k, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused_v, stream_);
 
                 const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * N);
                 const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * N);
@@ -4655,9 +4700,9 @@ namespace llaminar2
                 ASSERT_TRUE(v_kernel.multiply_tensor(input.get(), separate_v.get(), M, Nv, K,
                                                      true, 1.0f, 0.0f, bias_v.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(separate_q, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate_k, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate_v, stream_);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&q_kernel, fused_q.get(), Nq, bias_q.get(), "q_q8_blockwise");
@@ -4666,9 +4711,9 @@ namespace llaminar2
 
                 ASSERT_TRUE(q_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused_q->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused_k->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused_v->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(fused_q, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused_k, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused_v, stream_);
 
                 const float q_cos = cosineSim(fused_q->data(), separate_q->data(), static_cast<size_t>(M) * Nq);
                 const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * Nk);
@@ -4738,8 +4783,8 @@ namespace llaminar2
                 ASSERT_TRUE(up_kernel.multiply_tensor(input.get(), separate_up.get(), M, N, K,
                                                       true, 1.0f, 0.0f, bias_up.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate_gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate_up->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(separate_gate, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate_up, stream_);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&gate_kernel, fused_gate.get(), N, bias_gate.get(), "gate_q8_blockwise");
@@ -4747,8 +4792,8 @@ namespace llaminar2
 
                 ASSERT_TRUE(gate_kernel.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused_gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused_up->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(fused_gate, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused_up, stream_);
 
                 const float gate_cos = cosineSim(fused_gate->data(), separate_gate->data(), static_cast<size_t>(M) * N);
                 const float up_cos = cosineSim(fused_up->data(), separate_up->data(), static_cast<size_t>(M) * N);
@@ -4814,8 +4859,8 @@ namespace llaminar2
                 ASSERT_TRUE(kernel1.multiply_tensor(input.get(), separate1.get(), M, N, K,
                                                     true, 1.0f, 0.0f, bias1.get()));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                separate0->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                separate1->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(separate0, stream_);
+                TransferEngine::publishCurrentDeviceWrite(separate1, stream_);
 
                 std::vector<ITensorGemm::TensorProjectionDesc> projections;
                 projections.emplace_back(&kernel0, fused0.get(), N, bias0.get(), "proj0_q8_blockwise_gridkpar");
@@ -4823,8 +4868,8 @@ namespace llaminar2
 
                 ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
                 ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
-                fused0->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                fused1->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishCurrentDeviceWrite(fused0, stream_);
+                TransferEngine::publishCurrentDeviceWrite(fused1, stream_);
 
                 const float cos0 = cosineSim(fused0->data(), separate0->data(), static_cast<size_t>(M) * N);
                 const float cos1 = cosineSim(fused1->data(), separate1->data(), static_cast<size_t>(M) * N);
@@ -4908,14 +4953,14 @@ namespace llaminar2
 
                     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_separate.get(), M, N, K)) << test_case.name;
                     (void)hipDeviceSynchronize();
-                    output_separate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishCurrentDeviceWrite(output_separate, stream_);
 
                     std::vector<ITensorGemm::TensorProjectionDesc> projections;
                     projections.emplace_back(&kernel, output_fused.get(), N, nullptr, test_case.name);
 
                     ASSERT_TRUE(kernel.multiply_fused_tensor(input.get(), projections, M, K)) << test_case.name;
                     (void)hipDeviceSynchronize();
-                    output_fused->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishCurrentDeviceWrite(output_fused, stream_);
 
                     const float *separate = output_separate->data();
                     const float *fused = output_fused->data();

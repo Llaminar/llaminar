@@ -1,18 +1,30 @@
 /**
  * @file RuntimeInitPhase.cpp
  * @brief Post-MPI runtime initialization
+ *
+ * Bootstrap observations specialize user intent before CPU/GPU allocator
+ * singletons and captured runners are created. Physical CPU locality comes
+ * from affinity, never from the numeric MPI rank or a hostfile slot order.
+ * Model-aware placement belongs to the shared rank resolver. Startup reports
+ * the runner's resolved configuration instead of binding an overlay itself.
+ * Saved rank selection is interpreted before CPU placement. Automatic search
+ * runs once on discovery root and publishes a complete apply document. Both
+ * selections enter the same MPI admission transaction before runner creation.
+ * Excluded discovery processes retire without acquiring an inference runner.
  */
 
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
-#include "app/MPIShutdown.h"
 #include "app/ChatTemplateResolver.h"
+#include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "backends/InventoryPrinter.h"
 #include "config/OrchestrationConfigParser.h"
-#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/RankInitializationLifecycle.h"
+#include <type_traits>
 #include "models/IGraphConfigBuilder.h"
+#include "planning/ClusterInventoryGatherer.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Tokenizer.h"
 #include "utils/Logger.h"
@@ -23,345 +35,438 @@
 #include <algorithm>
 #include <cstdlib>
 #include <omp.h>
+#include <sstream>
+#include <stdexcept>
 
 namespace llaminar2
 {
+    RuntimeInitPhase::RuntimeInitPhase()
+        : RuntimeInitPhase(AutomaticPlanningStartup::preparation()) {}
 
-    std::optional<AppContext> RuntimeInitPhase::execute(OrchestrationConfig &config,
-                                                        int &argc, char **&argv)
+    RuntimeInitPhase::RuntimeInitPhase(AutomaticPlanningStartup::Prepare prepare)
+        : prepare_(std::move(prepare))
     {
-        // OpenMPI vader CMA workaround
-        MPIEnvironmentInfo mpi_env = MPIBootstrap::detectMPIEnvironment();
-        if (mpi_env.is_mpi_process && debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
+        if (!prepare_) throw std::invalid_argument("Frontend initialization requires evidence preparation");
+    }
+
+    void RuntimeInitPhase::resolveCPUShorthand(
+        OrchestrationConfig &config, int mpi_rank, int mpi_world_size,
+        const NUMAInfo &numa_info)
+    {
+        if (!config.cpu_global_tp_all_local) return;
+        if (mpi_world_size <= 0 || mpi_rank < 0 || mpi_rank >= mpi_world_size)
+            throw std::runtime_error("CPU shorthand requires an admitted MPI rank");
+        if (!numa_info.detection_succeeded || numa_info.local_numa_node < 0)
+            throw std::runtime_error("CPU shorthand requires observed NUMA affinity");
+        // Validate before mutating the configuration. The backend placement
+        // resolver also checks any existing explicit identity on a repeat call.
+        const int numa_node = resolveCPUBackendNUMANode(
+            config, mpi_rank, mpi_world_size, numa_info);
+        config.device_mode = DeviceAssignmentMode::EXPLICIT;
+        config.device_map = {{mpi_rank, GlobalDeviceAddress::cpu(numa_node)}};
+        config.device_map_numa_explicit = {{mpi_rank, true}};
+        config.device_for_this_rank.reset();
+        config.device_for_this_rank_numa_explicit = false;
+        if (config.tp_scope == TPScope::AUTO) config.tp_scope = TPScope::GLOBAL;
+        if (config.tp_degree <= 1) config.tp_degree = mpi_world_size;
+    }
+
+    int RuntimeInitPhase::resolveCPUBackendNUMANode(
+        const OrchestrationConfig &config,
+        int mpi_rank,
+        int mpi_world_size,
+        const NUMAInfo &numa_info)
+    {
+        std::optional<int> explicit_node;
+        const auto declare_explicit_node =
+            [&](int node, const char *source)
         {
-            setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+            if (node < 0)
+            {
+                throw std::runtime_error(
+                    std::string(source) +
+                    " declared CPU NUMA placement without an exact node");
+            }
+            if (explicit_node.has_value() && *explicit_node != node)
+            {
+                throw std::runtime_error(
+                    "Conflicting explicit CPU NUMA declarations for rank " +
+                    std::to_string(mpi_rank));
+            }
+            explicit_node = node;
+        };
+
+        if (config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isCPU() &&
+            config.device_for_this_rank_numa_explicit)
+        {
+            declare_explicit_node(
+                config.device_for_this_rank->numa_node,
+                "--device");
         }
 
-        // Initialize MPI
-        int provided;
-        MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-
-        // Re-parse arguments (MPI_Init may modify argc/argv)
-        OrchestrationConfigParser parser;
-        config = parser.parseArgs(argc, argv);
-
-        auto mpi_ctx = MPIContextFactory::global();
-
-        // Honor --threads override (if > 0). MPIBootstrap has already set
-        // OMP_NUM_THREADS based on topology; --threads lets the user force a
-        // specific count. OpenMP-threaded BLAS backends (OpenBLAS, MKL) also
-        // honor OMP_NUM_THREADS, so this single override propagates.
-        if (config.n_threads > 0)
+        for (const auto &[mapped_rank, address] : config.device_map)
         {
-            setenv("OMP_NUM_THREADS", std::to_string(config.n_threads).c_str(), 1);
-            omp_set_num_threads(config.n_threads);
+            if (mapped_rank != mpi_rank || !address.isCPU())
+                continue;
+
+            const auto explicit_it = std::find_if(
+                config.device_map_numa_explicit.begin(),
+                config.device_map_numa_explicit.end(),
+                [mapped_rank](const auto &entry)
+                {
+                    return entry.first == mapped_rank;
+                });
+            if (explicit_it != config.device_map_numa_explicit.end() &&
+                explicit_it->second)
+            {
+                declare_explicit_node(address.numa_node, "--device-map");
+            }
         }
 
-        // Check OMP_NUM_THREADS
+        if (explicit_node.has_value())
+        {
+            if (numa_info.detection_succeeded &&
+                numa_info.local_numa_node != *explicit_node)
+            {
+                throw std::runtime_error(
+                    "Explicit CPU NUMA node " +
+                    std::to_string(*explicit_node) +
+                    " disagrees with rank affinity on node " +
+                    std::to_string(numa_info.local_numa_node));
+            }
+            return *explicit_node;
+        }
+
+        if (mpi_world_size > 1 || config.cpu_global_tp_all_local)
+        {
+            if (!numa_info.detection_succeeded ||
+                numa_info.local_numa_node < 0)
+            {
+                throw std::runtime_error(
+                    "Rank-local CPU backend initialization requires exact NUMA affinity");
+            }
+            return numa_info.local_numa_node;
+        }
+
+        return -1;
+    }
+
+    bool RuntimeInitPhase::requiresHostWideAcceleratorVisibility(
+        const OrchestrationConfig &config,
+        int mpi_rank)
+    {
+        const auto intent = resolveOrchestrationIntent(config);
+        if (const auto *automatic = std::get_if<AutomaticOrchestrationRequest>(&intent))
+        {
+            // A hostfile may provide just one rank on a multi-socket node.
+            // Automatic search must see allowed accelerators on every socket,
+            // not only the socket to which MPI happened to bind that rank.
+            return automatic->allows(DeviceType::CUDA) || automatic->allows(DeviceType::ROCm);
+        }
+        const auto contains_gpu = [](const auto &devices)
+        {
+            return std::any_of(
+                devices.begin(), devices.end(),
+                [](const GlobalDeviceAddress &device)
+                { return device.isGPU(); });
+        };
+
+        if (config.device_for_this_rank.has_value() &&
+            config.device_for_this_rank->isGPU())
+        {
+            return true;
+        }
+        if (std::any_of(
+                config.device_map.begin(), config.device_map.end(),
+                [mpi_rank](const auto &entry)
+                {
+                    return entry.first == mpi_rank && entry.second.isGPU();
+                }))
+        {
+            return true;
+        }
+        if (contains_gpu(config.tp_devices) || config.tp_degree > 1)
+            return true;
+
+        if (std::any_of(
+                config.domain_definitions.begin(),
+                config.domain_definitions.end(),
+                [&](const DomainDefinition &domain)
+                { return contains_gpu(domain.devices); }))
+        {
+            return true;
+        }
+
+        const auto &overlay = config.moe_routed_expert_plan;
+        if (!overlay || !overlay->usesExpertOverlayAuthority())
+            return false;
+
+        if (std::any_of(
+                overlay->domains.begin(), overlay->domains.end(),
+                [&](const RoutedExpertDomain &domain)
+                { return contains_gpu(domain.participants); }))
+        {
+            return true;
+        }
+        return std::any_of(
+            overlay->dense_domains.begin(), overlay->dense_domains.end(),
+            [&](const ExecutionDomainDefinition &domain)
+            { return contains_gpu(domain.participants); });
+    }
+
+    void RuntimeInitPhase::initializeDiscoveryRuntime(
+        const OrchestrationConfig &config,
+        int discovery_rank,
+        int discovery_world_size)
+    {
+        if (discovery_rank < 0 || discovery_world_size <= 0 ||
+            discovery_rank >= discovery_world_size)
+        {
+            throw std::invalid_argument(
+                "Discovery runtime initialization requires a valid communicator rank");
+        }
+
+        // The command and serving frontends must expose the same fixed worker
+        // geometry to planning.  This changes neither affinity nor physical
+        // inventory; it only installs an explicit user-requested team before
+        // the inventory records it.
+        MPIBootstrapPhase::configureRequestedCPUThreads(config);
         if (std::getenv("OMP_NUM_THREADS") == nullptr)
         {
-            LOG_WARN("[Main] Running under MPI without OMP_NUM_THREADS set. For strict per-rank core pinning, "
-                     "launch with canonical wrapper or set OMP_NUM_THREADS/OMP_PLACES/OMP_PROC_BIND in the launcher.");
+            LOG_WARN("MPI runtime has no OMP_NUM_THREADS; use the canonical bootstrap for worker placement");
         }
 
-        // Detect NUMA node for MPI rank
-        auto numa_info = NUMATopology::detectLocalNUMANode();
-
-        const bool cpu_explicit_numa_mode =
-            config.device_for_this_rank.has_value() &&
-            config.device_for_this_rank->isCPU() &&
-            config.device_for_this_rank_numa_explicit;
-
-        const bool cpu_global_mode = config.cpu_global_tp_all_local;
-
-        // CPU affinity verification
-        if (cpu_explicit_numa_mode || cpu_global_mode)
+        const auto numa = NUMATopology::detectLocalNUMANode();
+        const auto execution_rank = config.execution_rank_selection
+            ? config.execution_rank_selection->executionRank(discovery_rank)
+            : std::optional<int>{discovery_rank};
+        const int execution_size = config.execution_rank_selection
+            ? config.execution_rank_selection->size()
+            : discovery_world_size;
+        const bool explicit_cpu = execution_rank && config.device_for_this_rank &&
+            config.device_for_this_rank->isCPU() && config.device_for_this_rank_numa_explicit;
+        if (execution_rank && (explicit_cpu || config.cpu_global_tp_all_local))
         {
-            int required_numa = -1;
-            if (cpu_explicit_numa_mode)
+            const int required = explicit_cpu ? config.device_for_this_rank->numa_node
+                : (numa.detection_succeeded ? numa.local_numa_node : -1);
+            std::string detail;
+            if (!MPIBootstrapPhase::verifyStartupThreadAffinity(required, true, detail))
             {
-                required_numa = config.device_for_this_rank->numa_node;
-            }
-            else if (numa_info.detection_succeeded)
-            {
-                required_numa = numa_info.local_numa_node;
-            }
-
-            std::string affinity_details;
-            const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(
-                required_numa, true, affinity_details);
-
-            const bool strict_assert = []()
-            {
-                return debugEnv().runtime_debug.assert_thread_affinity;
-            }();
-
-            if (!affinity_ok)
-            {
-                const bool fail_fast = strict_assert || cpu_explicit_numa_mode;
-                if (fail_fast)
+                if (explicit_cpu || debugEnv().runtime_debug.assert_thread_affinity)
                 {
-                    LOG_ERROR("[Main] Startup thread affinity verification failed: " << affinity_details);
-                    LOG_ERROR("[Main] Fix launcher pinning (mpirun binding/cpu-set) or set LLAMINAR_ASSERT_THREAD_AFFINITY=0 to downgrade to warning");
-                    mpiShutdown();
-                    return std::nullopt;
+                    throw std::runtime_error(
+                        "Startup thread affinity verification failed: " + detail);
                 }
-
-                LOG_WARN("[Main] Startup thread affinity verification warning: " << affinity_details);
-            }
-            else
-            {
-                LOG_DEBUG("[Main] Startup thread affinity verification passed");
+                LOG_WARN("Startup thread affinity verification warning: " << detail);
             }
         }
 
-        // CPU shorthand runtime semantics
-        if (config.cpu_global_tp_all_local)
+        // CPU backend identity is an admission prerequisite even when this
+        // command stops after planning.  Projection sampling allocates the
+        // exact workspace ABI through IBackend; returning a host allocation
+        // without this rank-local backend would measure an endpoint that
+        // production inference cannot own.
+        if (execution_rank)
         {
-            int local_rank = 0;
-            MPI_Comm local_comm = MPI_COMM_NULL;
-            if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_ctx->rank(), MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
-            {
-                MPI_Comm_rank(local_comm, &local_rank);
-                MPI_Comm_free(&local_comm);
-            }
-
-            config.device_mode = DeviceAssignmentMode::EXPLICIT;
-            config.device_map.clear();
-            config.device_map.emplace_back(mpi_ctx->rank(), GlobalDeviceAddress::cpu(local_rank));
-            config.device_map_numa_explicit.clear();
-            config.device_map_numa_explicit.emplace_back(mpi_ctx->rank(), true);
-
-            // Clear the original -d flag to avoid validation conflicts
-            // (device_map now owns the per-rank assignment)
-            config.device_for_this_rank = std::nullopt;
-            config.device_for_this_rank_numa_explicit = false;
-
-            if (config.tp_scope == TPScope::AUTO)
-            {
-                config.tp_scope = TPScope::GLOBAL;
-            }
-            if (config.tp_degree <= 1)
-            {
-                config.tp_degree = mpi_ctx->world_size();
-            }
-
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_DEBUG("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
-                          << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
-            }
-        }
-
-        // Set logger rank
-        Logger::getInstance().setRank(mpi_ctx->rank());
-
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_DEBUG("=== NUMA Topology Detection ===");
-        }
-
-        LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] NUMA node: " << numa_info.local_numa_node
-                           << " (detection: " << numa_info.detection_method << ")");
-
-        if (!numa_info.detection_succeeded && mpi_ctx->rank() == 0)
-        {
-            LOG_WARN("NUMA detection failed, using fallback node 0. This may impact multi-socket performance.");
-        }
-
-        // Initialize DeviceManager
-        const bool self_bootstrapped = (std::getenv("LLAMINAR_SELF_BOOTSTRAPPED") != nullptr);
-
-        int device_manager_numa_filter;
-        if (self_bootstrapped)
-        {
-            device_manager_numa_filter = -1;
-            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Self-bootstrapped: initialising DeviceManager without NUMA filtering");
+            initCPUBackend(resolveCPUBackendNUMANode(
+                config, *execution_rank, execution_size, numa));
         }
         else
         {
-            device_manager_numa_filter = numa_info.local_numa_node;
+            // Excluded saved-plan ranks still join discovery and must publish
+            // their actual host observation.  They do not borrow another
+            // execution rank's requested NUMA identity.
+            initCPUBackend(numa.detection_succeeded ? numa.local_numa_node : -1);
+        }
 
-            std::optional<GlobalDeviceAddress> mapped_device_for_rank;
-            for (const auto &[mapped_rank, mapped_addr] : config.device_map)
+        // GPU visibility is an inventory fact, not a CPU-affinity heuristic.
+        // A permitted accelerator backend therefore requires the full host
+        // view before the planner can choose an owning rank or tier.
+        const bool host_wide = std::getenv("LLAMINAR_SELF_BOOTSTRAPPED") != nullptr ||
+            requiresHostWideAcceleratorVisibility(config, execution_rank.value_or(-1));
+        DeviceManager::instance().initialize(
+            host_wide ? -1 : numa.local_numa_node, false);
+    }
+
+    bool RuntimeInitPhase::runDryRunPreflight(IOrchestrationRunner &runner,
+                                              int mpi_rank,
+                                              std::ostream &out)
+    {
+        if (!runner.initializeForDryRun())
+        {
+            if (mpi_rank == 0) LOG_ERROR("--dry-run preflight failed: " << runner.lastError());
+            return false;
+        }
+        if (mpi_rank == 0)
+            out << "\n=== Resolved Orchestration Plan ===\n"
+                << runner.config().toString() << std::endl;
+        return true;
+    }
+
+    RuntimeInitResult RuntimeInitPhase::execute(OrchestrationConfig &config,
+                                                int &argc, char **&argv)
+    {
+        const auto mpi_env = MPIBootstrap::detectMPIEnvironment();
+        if (mpi_env.is_mpi_process &&
+            debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
+            setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+
+        // Declared before every dependent owner. Early returns and exceptions
+        // release those owners before this scope finalizes the process.
+        auto session = MPIProcessSession::initialize(argc, argv);
+        try
+        {
+            auto mpi_ctx = MPIContextFactory::global();
+            Logger::getInstance().setRank(mpi_ctx->rank());
+            std::uint32_t ordinal = 0;
+            const auto phase = [&](std::string_view name, const auto &work)
             {
-                if (mapped_rank == mpi_ctx->rank())
+                const auto result = RankInitializationLifecycle::execute(
+                    {ordinal++, name}, work, [&](auto identity, auto outcome)
+                    {
+                        return MPIRankInitializationConsensus::reach(
+                            mpi_ctx->communicator(), identity, outcome);
+                    });
+                if (!result.succeeded())
+                    throw std::runtime_error(result.diagnostic("Frontend initialization"));
+            };
+
+            phase("prepare_local_runtime", [&]
+            {
+                // MPI may modify argv. Preserve command intent across parsing;
+                // malformed local input must reach consensus before discovery.
+                const bool benchmark = config.benchmark_mode;
+                const bool serve = config.serve_mode;
+                config = OrchestrationConfigParser{}.parseArgs(argc, argv);
+                config.benchmark_mode = config.benchmark_mode || benchmark;
+                config.serve_mode = config.serve_mode || serve;
+                if (config.model_path.empty())
+                    throw std::invalid_argument("Model path required (-m)");
+
+                const auto numa = NUMATopology::detectLocalNUMANode();
+                const auto selected_rank = config.execution_rank_selection ?
+                    config.execution_rank_selection->executionRank(mpi_ctx->rank()) :
+                    std::optional<int>{mpi_ctx->rank()};
+                const int selected_size = config.execution_rank_selection ?
+                    config.execution_rank_selection->size() : mpi_ctx->world_size();
+
+                // Materialize this legacy shorthand before the shared
+                // discovery initializer observes CPU ownership.  The plan
+                // command does not mutate its automatic request this way.
+                if (selected_rank)
                 {
-                    mapped_device_for_rank = mapped_addr;
-                    break;
+                    resolveCPUShorthand(config, *selected_rank, selected_size, numa);
+                }
+                initializeDiscoveryRuntime(config, mpi_ctx->rank(), mpi_ctx->world_size());
+                return true;
+            });
+
+            // Discovery already owns its collective failure/publication
+            // transaction. Only observers consume this immutable inventory.
+            const auto cluster = gatherClusterInventory(mpi_ctx, config.hostfile);
+
+            if (std::holds_alternative<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(config)))
+            {
+                // Evidence collection uses every discovery participant before
+                // selection narrows membership. Plan and serve share this exact
+                // source/measurement/selection/publication lifecycle.
+                auto startup = AutomaticPlanningStartup::run(config, *cluster, mpi_ctx, prepare_);
+                config = std::move(startup.applied);
+                if (startup.root_selection)
+                {
+                    const auto &selected = *startup.root_selection;
+                    LOG_INFO("[AutomaticPlanning] selected strategy="
+                        << orchestrationStrategyName(selected.candidate().strategy())
+                        << " proposed=" << selected.counts().proposed
+                        << " evaluated=" << selected.counts().evaluated
+                        << " request_seconds=" << selected.cost().requestSeconds());
                 }
             }
 
-            const bool has_gpu_request =
-                (config.device_for_this_rank.has_value() && config.device_for_this_rank->isGPU()) ||
-                (mapped_device_for_rank.has_value() && mapped_device_for_rank->isGPU()) ||
-                std::any_of(config.tp_devices.begin(), config.tp_devices.end(),
-                            [](const GlobalDeviceAddress &d)
-                            { return d.isGPU(); }) ||
-                std::any_of(config.domain_definitions.begin(), config.domain_definitions.end(),
-                            [](const DomainDefinition &dom)
-                            {
-                                return std::any_of(dom.devices.begin(), dom.devices.end(),
-                                                   [](const GlobalDeviceAddress &d)
-                                                   { return d.isGPU(); });
-                            }) ||
-                (config.tp_degree > 1);
-
-            if (has_gpu_request)
+            std::optional<ExecutionRankSelection> selection;
+            phase("prepare_execution_selection", [&]
             {
-                device_manager_numa_filter = -1;
-                LOG_INFO("[Main] GPU device(s) requested; initialising DeviceManager without NUMA filtering");
-            }
-        }
-
-        auto &dm = DeviceManager::instance();
-        dm.initialize(device_manager_numa_filter, false); // No local table printing
-
-        // Build cluster inventory on ALL ranks (collective MPI_Allgatherv inside).
-        // Printing is rank-0 only, but the exchange must be collective across
-        // the world communicator. Calling clusterInventory() only on rank 0
-        // leaves other ranks out of the collective and causes subsequent
-        // MPI collectives (e.g. syncInitStep Allreduce) to mis-match and
-        // report MPI_ERR_TRUNCATE.
-        const auto &cluster = mpi_ctx->concrete_topology().clusterInventory();
-        if (mpi_ctx->rank() == 0)
-        {
-            InventoryPrinter::printClusterInventory(cluster);
-        }
-
-        std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_plan;
-        if (config.moe_expert_parallel_plan && config.moe_expert_parallel_plan->isTieredOverlay())
-        {
-            try
-            {
-                overlay_execution_plan = resolveMoEExpertOverlayExecutionPlan(
-                    config.moe_expert_parallel_plan,
-                    MoEExpertOverlayExecutionPlanResolverOptions{
-                        .current_world_rank = mpi_ctx->rank(),
-                        .world_size = mpi_ctx->world_size(),
-                    });
-            }
-            catch (const std::exception &e)
-            {
-                LOG_ERROR("[Main] failed to resolve MoE expert overlay execution plan: " << e.what());
-                mpiShutdown();
-                return std::nullopt;
-            }
-
-            if (debugEnv().moe_expert_overlay.trace && mpi_ctx->rank() == 0)
-            {
-                LOG_INFO("[MoEExpertOverlayExecutionPlan]\n"
-                         << overlay_execution_plan->diagnostics());
-            }
-        }
-
-        // --explain-placement: dump the resolved orchestration config on rank 0.
-        if (config.explain_placement && mpi_ctx->rank() == 0)
-        {
-            std::cout << "\n=== Placement Explanation ===\n"
-                      << config.toString() << std::endl;
-            if (overlay_execution_plan)
-            {
-                std::cout << "\n=== MoE Expert Overlay Role Plan ===\n"
-                          << overlay_execution_plan->diagnostics() << std::endl;
-            }
-        }
-
-        // Dry-run check (post-MPI)
-        if (config.dry_run)
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
-        // Validate model path
-        if (config.model_path.empty())
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Error: Model path required (-m)\n\n");
-                std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
-        // Create and initialize OrchestrationRunner
-        auto factory = createOrchestrationRunnerFactory();
-        auto runner = factory->createFromOrchestrationConfig(config);
-
-        if (!runner)
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Error: Failed to create orchestration runner");
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
-        if (!runner->initialize())
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Failed to initialize: " << runner->lastError());
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
-        // Get tokenizer
-        auto tokenizer = runner->tokenizer();
-        if (!tokenizer)
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Failed to get tokenizer from runner");
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
-        // Apply chat template override
-        ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
-
-        // Model-specific chat template override. Applied only when the user has
-        // not provided an explicit --chat-template, so user wishes take priority.
-        // This lets a model's graph-config builder bundle a community-maintained
-        // template that fixes known issues with the GGUF-embedded one.
-        if (config.chat_template_override.empty())
-        {
-            const std::string &architecture = runner->architecture();
-            if (!architecture.empty())
-            {
-                auto config_builder = createGraphConfigBuilder(architecture);
-                if (config_builder)
+                if (config.execution_rank_selection)
                 {
-                    auto model_template = config_builder->chatTemplateOverride();
-                    if (model_template.has_value() && !model_template->empty())
+                    if (!std::holds_alternative<ApplyOrchestrationRequest>(resolveOrchestrationIntent(config)))
+                        throw std::invalid_argument("Saved execution ranks require apply intent");
+                    selection = *config.execution_rank_selection;
+                }
+                else selection = ExecutionRankSelection::all(mpi_ctx->world_size());
+                if (mpi_ctx->is_root()) InventoryPrinter::printClusterInventory(*cluster);
+                return true;
+            });
+            // Every discovery rank enters the same existing admission protocol,
+            // including unselected ranks and callers with identity membership.
+            // It rejects asymmetric intent before splitting. The active context
+            // retains discovery and its inventory; no second exchange occurs.
+            auto admitted = MPIContextFactory::selectRanks(mpi_ctx, selection->discoveryRanks());
+            if (std::holds_alternative<InactiveMPIRank>(admitted))
+                return RuntimeInitExit::Completed;
+            mpi_ctx = std::get<std::shared_ptr<MPIContext>>(std::move(admitted));
+            Logger::getInstance().setRank(mpi_ctx->rank());
+
+            std::unique_ptr<IOrchestrationRunner> runner;
+            phase("construct_runner", [&]
+            {
+                auto factory = createOrchestrationRunnerFactory(mpi_ctx);
+                runner = factory->createFromOrchestrationConfig(config);
+                return runner != nullptr;
+            });
+            if (config.dry_run)
+                return runDryRunPreflight(*runner, mpi_ctx->rank(), std::cout)
+                    ? RuntimeInitExit::Completed : RuntimeInitExit::Failed;
+
+            // Runner initialization owns graph/model phase consensus. This
+            // frontend must not wrap it in a competing initialization protocol.
+            if (!runner->initialize())
+            {
+                if (mpi_ctx->is_root()) LOG_ERROR("Failed to initialize: " << runner->lastError());
+                return RuntimeInitExit::Failed;
+            }
+
+            OrchestrationConfig ready_config;
+            std::shared_ptr<ITokenizer> tokenizer;
+            phase("prepare_frontend_context", [&]
+            {
+                config = runner->config();
+                ready_config = config;
+                if (config.explain_placement && mpi_ctx->is_root())
+                    std::cout << "\n=== Placement Explanation ===\n" << config.toString() << std::endl;
+                tokenizer = runner->tokenizer();
+                if (!tokenizer) throw std::runtime_error("Runner did not publish a tokenizer");
+                ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
+                if (config.chat_template_override.empty() && !runner->architecture().empty())
+                {
+                    auto builder = createGraphConfigBuilder(runner->architecture());
+                    if (builder)
                     {
-                        if (mpi_ctx->rank() == 0)
-                        {
-                            LOG_DEBUG("Using model-specific chat template override for '"
-                                      << architecture << "' ("
-                                      << model_template->size() << " bytes)");
-                        }
-                        tokenizer->setChatTemplate(
-                            ChatTemplate::create(*model_template, "", ""));
+                        const auto model_template = builder->chatTemplateOverride();
+                        if (model_template && !model_template->empty())
+                            tokenizer->setChatTemplate(ChatTemplate::create(*model_template, "", ""));
                     }
                 }
-            }
-        }
+                return true;
+            });
 
-        return AppContext{
-            .config = config,
-            .mpi_ctx = std::move(mpi_ctx),
-            .runner = std::move(runner),
-            .tokenizer = std::move(tokenizer)};
+            // All throwing preparation is complete before transferring the
+            // finalizer. A failed partial aggregate must never finalize MPI
+            // before a still-local runner; these moves are statically no-throw.
+            static_assert(std::is_nothrow_move_constructible_v<OrchestrationConfig>);
+            static_assert(std::is_nothrow_move_constructible_v<AppContext>);
+            return AppContext{
+                .mpi_session = std::move(session),
+                .config = std::move(ready_config),
+                .mpi_ctx = std::move(mpi_ctx),
+                .runner = std::move(runner),
+                .tokenizer = std::move(tokenizer)};
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(error.what());
+            return RuntimeInitExit::Failed;
+        }
     }
 
 } // namespace llaminar2

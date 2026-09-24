@@ -1,0 +1,11 @@
+{
+  "schema_version": "cpu-native-vnni-serial-m1-arithmetic-contract-v1",
+  "contract_hash": "sha256:d4995e9bd837f2fbb656fa2c55d7462b4667ad721c818e4a238cf6aeb2676c76",
+  "description": "Ordered CPU NativeVNNI serial M=1 accumulation and K-part reduction arithmetic used as the bitwise oracle for grouped verifier rows.",
+  "invariants": [
+    "Each output element accumulates K blocks in increasing source order.",
+    "K-part partials are reduced in increasing tile order with the production FP32 reduction routine.",
+    "N-chunk scheduling and learned dispatch selection may change without changing this arithmetic contract.",
+    "Any change to accumulation precision, K partition boundaries, reduction order, or correction arithmetic requires a new contract version and hash."
+  ]
+}

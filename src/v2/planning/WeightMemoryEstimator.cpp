@@ -1,6 +1,17 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/WeightShardGeometry.h"
+#include "kernels/common/EmbedQ8Block.h"
+#include "kernels/common/PreparedEmbeddingWeights.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/NativeVnniFormatInfo.h"
+
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
 
 /**
  * @file WeightMemoryEstimator.cpp
@@ -21,14 +32,6 @@ namespace llaminar2
             const char *quant_type;
             size_t block_bytes;
             size_t block_elements;
-        };
-
-        struct GPUNativeVNNILayout
-        {
-            const char *quant_type;
-            int payload_bytes_per_32;
-            bool is_asymmetric;
-            bool has_emins;
         };
 
         constexpr NativeBlockLayout kNativeBlockLayouts[] = {
@@ -62,49 +65,9 @@ namespace llaminar2
             {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
         };
 
-        constexpr GPUNativeVNNILayout kGPUNativeVNNILayouts[] = {
-            {"Q4_0", 16, false, false},
-            {"IQ4_NL", 16, false, false},
-            {"Q4_1", 16, true, false},
-            {"Q5_0", 20, false, false},
-            {"Q5_1", 20, true, false},
-            {"Q8_0", 32, false, false},
-            {"Q8_1", 32, false, false},
-            {"Q2_K", 8, true, true},
-            {"Q3_K", 12, true, false},
-            {"Q3_K_S", 12, true, false},
-            {"Q3_K_M", 12, true, false},
-            {"Q3_K_L", 12, true, false},
-            {"Q4_K", 16, true, false},
-            {"Q4_K_S", 16, true, false},
-            {"Q4_K_M", 16, true, false},
-            {"Q5_K", 20, true, false},
-            {"Q5_K_S", 20, true, false},
-            {"Q5_K_M", 20, true, false},
-            {"Q6_K", 24, true, false},
-            {"IQ4_XS", 16, false, false},
-            {"IQ2_XXS", 8, false, false},
-            {"IQ2_XS", 9, true, false},
-            {"IQ3_XXS", 12, false, false},
-            {"IQ2_S", 9, true, false},
-            {"IQ3_S", 13, false, false},
-            {"IQ1_S", 6, true, false},
-            {"IQ1_M", 6, true, false},
-        };
-
         const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)
         {
             for (const auto &layout : kNativeBlockLayouts)
-            {
-                if (quant_type == layout.quant_type)
-                    return &layout;
-            }
-            return nullptr;
-        }
-
-        const GPUNativeVNNILayout *findGPUNativeVNNILayout(const std::string &quant_type)
-        {
-            for (const auto &layout : kGPUNativeVNNILayouts)
             {
                 if (quant_type == layout.quant_type)
                     return &layout;
@@ -116,7 +79,209 @@ namespace llaminar2
         {
             return static_cast<float>(block_bytes) / static_cast<float>(block_elements);
         }
+
+        bool isEmbeddingTensor(const std::string &name)
+        {
+            return name.find("token_embd") != std::string::npos ||
+                   name.find("embed_tokens") != std::string::npos;
+        }
+
+        bool isLMHeadTensor(const std::string &name)
+        {
+            return name == "output.weight" ||
+                   name.find("lm_head") != std::string::npos;
+        }
+
+        /**
+         * @brief Identify the three routed-expert parent tensors.
+         *
+         * Shared experts deliberately use the `shexp` spelling and remain part
+         * of the continuation's non-routed model authority. Matching the full
+         * suffix avoids treating ordinary dense FFN tensors as expert slabs.
+         */
+        bool isRoutedExpertTensor(const std::string &name)
+        {
+            return name.ends_with(".ffn_gate_exps.weight") ||
+                   name.ends_with(".ffn_up_exps.weight") ||
+                   name.ends_with(".ffn_down_exps.weight");
+        }
+
+        bool isQuantizedFormat(const std::string &quant_type)
+        {
+            return quant_type != "F32" &&
+                   quant_type != "F16" &&
+                   quant_type != "FP16" &&
+                   quant_type != "BF16";
+        }
+
+        constexpr size_t kWeightPoolAlignment = 256;
+
+        size_t alignUp(size_t bytes, size_t alignment)
+        {
+            return (bytes + alignment - 1) & ~(alignment - 1);
+        }
+
+        /** @brief Price one model-owned FP32 representation without overflow. */
+        size_t preparedFp32Bytes(size_t elements, DeviceId device)
+        {
+            if (elements >
+                std::numeric_limits<size_t>::max() / sizeof(float))
+            {
+                throw std::overflow_error(
+                    "Prepared FP32 weight allocation overflows size_t");
+            }
+            const size_t bytes = elements * sizeof(float);
+            return device.is_gpu()
+                       ? alignUp(bytes, kWeightPoolAlignment)
+                       : bytes;
+        }
+
+        size_t exactGpuPackedMatrixBytes(
+            size_t rows,
+            size_t columns,
+            const NativeVnniFormatInfo &format)
+        {
+            const NativeVnniPackedRegionSizes regions =
+                nativeVnniPackedRegionSizes(rows, columns, format);
+
+            /*
+             * WeightVRAMPool starts every independently-addressable region at
+             * a 256-byte boundary. Rounding each non-empty region gives the
+             * exact aggregate pool contribution except for at most one final
+             * trailing alignment unit, and is deliberately conservative for
+             * preflight admission.
+             */
+            size_t bytes = alignUp(regions.payload_bytes, kWeightPoolAlignment);
+            bytes += alignUp(regions.scales_bytes, kWeightPoolAlignment);
+            if (regions.mins_bytes > 0)
+                bytes += alignUp(regions.mins_bytes, kWeightPoolAlignment);
+            if (regions.emins_bytes > 0)
+                bytes += alignUp(regions.emins_bytes, kWeightPoolAlignment);
+            return bytes;
+        }
+
+        /** @brief Scale bytes by an exact logical-element subset without under-admission. */
+        size_t selectedElementBytes(
+            size_t complete_bytes,
+            size_t selected_elements,
+            size_t complete_elements)
+        {
+            if (selected_elements == 0u || complete_bytes == 0u)
+                return 0u;
+            if (selected_elements == complete_elements)
+                return complete_bytes;
+            if (complete_elements == 0u ||
+                selected_elements > complete_elements)
+            {
+                throw std::invalid_argument(
+                    "Weight shard element fraction is outside its source tensor");
+            }
+
+            const size_t quotient = complete_bytes / complete_elements;
+            const size_t remainder = complete_bytes % complete_elements;
+            if (quotient >
+                std::numeric_limits<size_t>::max() / selected_elements)
+            {
+                throw std::overflow_error(
+                    "Weight shard byte quotient overflows size_t");
+            }
+            const size_t quotient_bytes = quotient * selected_elements;
+            if (remainder >
+                (std::numeric_limits<size_t>::max() - complete_elements + 1u) /
+                    selected_elements)
+            {
+                throw std::overflow_error(
+                    "Weight shard byte remainder overflows size_t");
+            }
+            const size_t remainder_bytes =
+                (remainder * selected_elements + complete_elements - 1u) /
+                complete_elements;
+            if (quotient_bytes >
+                std::numeric_limits<size_t>::max() - remainder_bytes)
+            {
+                throw std::overflow_error(
+                    "Weight shard byte total overflows size_t");
+            }
+            return quotient_bytes + remainder_bytes;
+        }
+
     } // anonymous namespace
+
+    DeviceWeightResidency::DeviceWeightResidency(
+        Kind kind,
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+        : kind_(kind),
+          model_expert_count_(model_expert_count),
+          selected_by_layer_(std::move(selected_by_layer))
+    {
+        if (kind_ == Kind::FullModel)
+        {
+            if (model_expert_count_ != 0 || !selected_by_layer_.empty())
+                throw std::invalid_argument(
+                    "Full-model weight residency cannot carry routed-expert selections");
+            return;
+        }
+        if (model_expert_count_ <= 0 || selected_by_layer_.empty())
+        {
+            throw std::invalid_argument(
+                "Selected routed-expert residency requires positive model geometry and layer counts");
+        }
+        for (size_t layer = 0; layer < selected_by_layer_.size(); ++layer)
+        {
+            const int count = selected_by_layer_[layer];
+            if (count < 0 || count > model_expert_count_)
+            {
+                throw std::invalid_argument(
+                    "Selected routed-expert count for layer " +
+                    std::to_string(layer) + " is outside [0, " +
+                    std::to_string(model_expert_count_) + "]");
+            }
+        }
+    }
+
+    DeviceWeightResidency
+    DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+    {
+        return DeviceWeightResidency(
+            Kind::ContinuationWithSelectedRoutedExperts,
+            model_expert_count,
+            std::move(selected_by_layer));
+    }
+
+    DeviceWeightResidency
+    DeviceWeightResidency::selectedRoutedExpertsOnly(
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+    {
+        return DeviceWeightResidency(
+            Kind::SelectedRoutedExpertsOnly,
+            model_expert_count,
+            std::move(selected_by_layer));
+    }
+
+    bool DeviceWeightResidency::includesNonRoutedWeights() const noexcept
+    {
+        return kind_ != Kind::SelectedRoutedExpertsOnly;
+    }
+
+    bool DeviceWeightResidency::selectsRoutedExperts() const noexcept
+    {
+        return kind_ != Kind::FullModel;
+    }
+
+    int DeviceWeightResidency::selectedRoutedExpertsForLayer(int layer) const
+    {
+        if (layer < 0 || static_cast<size_t>(layer) >= selected_by_layer_.size())
+        {
+            throw std::out_of_range(
+                "Routed-expert residency has no owner-map entry for layer " +
+                std::to_string(layer));
+        }
+        return selected_by_layer_[static_cast<size_t>(layer)];
+    }
 
     float WeightMemoryEstimator::getNativeBytesPerWeight(const std::string &quant_type)
     {
@@ -151,16 +316,18 @@ namespace llaminar2
         if (quant_type == "F32")
             return 4.0f;
 
-        if (const auto *layout = findGPUNativeVNNILayout(quant_type))
+        if (const auto *format =
+                native_vnni_formats::forQuantType(quant_type))
         {
-            const int scale_bytes = sizeof(uint16_t);
-            const int min_bytes = layout->is_asymmetric ? static_cast<int>(sizeof(uint16_t)) : 0;
-            const int emin_bytes = layout->has_emins ? static_cast<int>(sizeof(uint32_t)) : 0;
-            return static_cast<float>(layout->payload_bytes_per_32 + scale_bytes + min_bytes + emin_bytes) / 32.0f;
+            const size_t metadata_bytes =
+                sizeof(uint16_t) +
+                (format->is_asymmetric ? sizeof(uint16_t) : 0) +
+                (format->has_emins ? sizeof(uint32_t) : 0);
+            return static_cast<float>(
+                       static_cast<size_t>(format->payload_bytes) +
+                       metadata_bytes) /
+                   32.0f;
         }
-
-        if (quant_type == "Q8_K")
-            return blockBytesPerWeight(sizeof(Q8_KBlock), Q8_KBlock::BLOCK_SIZE);
 
         return getCUDAPackedBytesPerWeight(K);
     }
@@ -182,91 +349,245 @@ namespace llaminar2
         return 1.125f; // Default: assume int8 packing
     }
 
-    bool WeightMemoryEstimator::isShardedTensor(const std::string &name)
-    {
-        // Column-parallel: attn_q, attn_k, attn_v, ffn_gate, ffn_up, output (lm_head)
-        // Row-parallel: attn_output (Wo), ffn_down
-        return name.find("attn_q") != std::string::npos ||
-               name.find("attn_k") != std::string::npos ||
-               name.find("attn_v") != std::string::npos ||
-               name.find("attn_output") != std::string::npos ||
-               name.find("ffn_gate") != std::string::npos ||
-               name.find("ffn_up") != std::string::npos ||
-               name.find("ffn_down") != std::string::npos ||
-               name == "output.weight";
-    }
-
-    bool WeightMemoryEstimator::isReplicatedTensor(const std::string &name)
-    {
-        // Norms, embedding, and biases are replicated
-        return name.find("norm") != std::string::npos ||
-               name.find("token_embd") != std::string::npos ||
-               name.find("embed_tokens") != std::string::npos ||
-               name.find("bias") != std::string::npos;
-    }
-
     WeightEstimate WeightMemoryEstimator::estimate(
         const ModelMemoryProfile &profile,
         DeviceId device,
         int shard_index,
         int total_shards,
         int first_layer,
-        int last_layer)
+        int last_layer,
+        const DeviceWeightResidency &residency,
+        const std::optional<DeviceShardingAssignment>
+            &tensor_parallel_assignment,
+        WeightComponentScope components)
     {
+        if (total_shards <= 0 || shard_index < 0 ||
+            shard_index >= total_shards)
+        {
+            throw std::invalid_argument(
+                "Weight memory estimator received an invalid TP shard identity");
+        }
+        if (tensor_parallel_assignment.has_value() &&
+            (total_shards <= 1 ||
+             tensor_parallel_assignment->local_rank != shard_index ||
+             tensor_parallel_assignment->device != device ||
+             !tensor_parallel_assignment->isValid()))
+        {
+            throw std::invalid_argument(
+                "Weight memory estimator TP assignment does not match its physical participant");
+        }
         if (last_layer < 0)
         {
             last_layer = profile.n_layers - 1;
         }
 
-        WeightEstimate est;
+        if (residency.selectsRoutedExperts())
+        {
+            if (profile.expert_count <= 0)
+            {
+                throw std::invalid_argument(
+                    "Selected routed-expert memory planning requires model expert_count metadata");
+            }
+            if (profile.expert_count != residency.modelExpertCount())
+            {
+                throw std::invalid_argument(
+                    "Routed-expert residency denominator does not match the model profile");
+            }
+        }
 
-        for (const auto &t : profile.tensors)
+        bool owns_embedding = false;
+        bool owns_terminal = false;
+        switch (components)
+        {
+        case WeightComponentScope::EmbeddingAndTerminal:
+            owns_embedding = owns_terminal = true;
+            break;
+        case WeightComponentScope::Embedding: owns_embedding = true; break;
+        case WeightComponentScope::Terminal: owns_terminal = true; break;
+        case WeightComponentScope::Intermediate:
+        case WeightComponentScope::LayersOnly: break;
+        default:
+            throw std::invalid_argument("Weight estimate has an invalid global component scope");
+        }
+
+        WeightEstimate est;
+        const WeightShardGeometryResolver geometry_resolver(
+            profile, device, shard_index, total_shards, tensor_parallel_assignment);
+        const bool has_explicit_lm_head = std::any_of(
+            profile.tensors.begin(),
+            profile.tensors.end(),
+            [](const TensorSizeInfo &tensor)
+            {
+                return isLMHeadTensor(tensor.name);
+            });
+
+        // Each call describes one semantic runtime use. A tied vocabulary has
+        // one GGUF source but distinct lookup and GEMM representations on GPU.
+        // Resolving its output alias through the normal schema also preserves
+        // head sharding when it differs from embedding sharding.
+        const auto accumulate = [&](const TensorSizeInfo &t, bool count_native)
         {
             // Filter by PP layer range
             if (t.layer_index >= 0)
             {
                 if (t.layer_index < first_layer || t.layer_index > last_layer)
-                    continue;
+                    return;
             }
-            // Non-layer tensors (embedding, lm_head, final_norm) are included on all PP stages
-            // In a real PP setup you'd filter embedding to first stage and lm_head to last,
-            // but for estimation this is conservative (slight overcount).
 
-            size_t native = t.native_bytes;
+            const bool routed_expert_tensor = isRoutedExpertTensor(t.name);
+            if (!routed_expert_tensor && !residency.includesNonRoutedWeights())
+                return;
 
-            // TP sharding: divide shardable weights by shard count
-            if (total_shards > 1 && isShardedTensor(t.name))
+            int selected_routed_experts = profile.expert_count;
+            if (routed_expert_tensor && residency.selectsRoutedExperts())
             {
-                native = native / static_cast<size_t>(total_shards);
-            }
-            // Replicated tensors: full copy on each shard (no division)
-
-            est.native_bytes += native;
-
-            // Compute device-specific packed size
-            size_t device_size;
-            if (device.is_gpu())
-            {
-                float bytes_per_weight = getGPUPackedBytesPerWeight(t.quant_type, t.K);
-                size_t elements = t.elements;
-                if (total_shards > 1 && isShardedTensor(t.name))
+                if (t.layer_index < 0)
                 {
-                    elements = elements / static_cast<size_t>(total_shards);
+                    throw std::invalid_argument(
+                        "Routed-expert tensor lacks a model layer index: " + t.name);
                 }
-                device_size = static_cast<size_t>(static_cast<float>(elements) * bytes_per_weight);
+                selected_routed_experts =
+                    residency.selectedRoutedExpertsForLayer(t.layer_index);
+                if (selected_routed_experts == 0)
+                    return;
+            }
+
+            const auto geometry = geometry_resolver.resolve(t,
+                routed_expert_tensor && residency.selectsRoutedExperts()
+                    ? std::optional<size_t>(static_cast<size_t>(selected_routed_experts))
+                    : std::nullopt);
+            const size_t selected_elements = geometry.elements();
+            const size_t native = selectedElementBytes(
+                t.native_bytes, selected_elements, t.elements);
+
+            if (count_native)
+                est.native_bytes += native;
+
+            // Compute the exact runtime representation selected by loading.
+            size_t device_size;
+            const WeightRole role = inferWeightRole(t.name);
+            const auto prepared_representation =
+                PreparedWeightRepresentationContract::resolve(
+                    role, std::string_view(t.quant_type));
+            if (prepared_representation ==
+                ModelPreparedWeightRepresentation::FP32)
+            {
+                /*
+                 * These bytes replace the source codebook in the persistent
+                 * execution pool. The same typed contract is consumed by
+                 * WeightManager before it constructs that pool.
+                 */
+                device_size = preparedFp32Bytes(selected_elements, device);
+            }
+            else if (device.is_gpu())
+            {
+                if (isEmbeddingTensor(t.name) &&
+                    isQuantizedFormat(t.quant_type) &&
+                    profile.d_model > 0)
+                {
+                    /*
+                     * GPU embedding lookup consumes the universal EmbedQ8
+                     * representation, not the GEMM-native packed layout.
+                     * A model with tied output weights also needs a separate
+                     * GEMM representation because the LM head performs a
+                     * matrix multiply over the same logical source tensor.
+                     */
+                    if (selected_elements %
+                            static_cast<size_t>(profile.d_model) !=
+                        0u)
+                    {
+                        throw std::invalid_argument(
+                            "Prepared embedding TP slice is not row integral: " +
+                            t.name);
+                    }
+                    const size_t local_rows =
+                        selected_elements /
+                        static_cast<size_t>(profile.d_model);
+                    device_size =
+                        PreparedEmbeddingWeights::allocationBytes(
+                            local_rows,
+                            profile.d_model);
+                    est.prepared_embedding_bytes += device_size;
+
+                }
+                else
+                {
+                    if (const auto *format =
+                            native_vnni_formats::forQuantType(t.quant_type);
+                        format && t.K > 0)
+                    {
+                        // Packing is a function of N and K, not merely N*K.
+                        // In particular an input shard keeps every output row;
+                        // reinterpreting it as fewer full-K rows can underprice
+                        // row/block padding on both CUDA and ROCm.
+                        const auto &matrix = geometry.matrix();
+                        const size_t rows = matrix
+                            ? matrix->rows * matrix->instances : selected_elements / t.K;
+                        const size_t columns = matrix ? matrix->columns : t.K;
+                        device_size = exactGpuPackedMatrixBytes(rows, columns, *format);
+                    }
+                    else
+                    {
+                        const float bytes_per_weight =
+                            getGPUPackedBytesPerWeight(t.quant_type, t.K);
+                        device_size = static_cast<size_t>(
+                            static_cast<float>(selected_elements) *
+                            bytes_per_weight);
+                    }
+                }
             }
             else
             {
                 // CPU: VNNI packing
                 float bytes_per_weight = getCPUPackedBytesPerWeight(t.quant_type);
-                size_t elements = t.elements;
-                if (total_shards > 1 && isShardedTensor(t.name))
-                {
-                    elements = elements / static_cast<size_t>(total_shards);
-                }
-                device_size = static_cast<size_t>(static_cast<float>(elements) * bytes_per_weight);
+                device_size = static_cast<size_t>(
+                    static_cast<float>(selected_elements) * bytes_per_weight);
             }
+            if (device.is_gpu() && isEmbeddingTensor(t.name) &&
+                !isQuantizedFormat(t.quant_type))
+            {
+                // "Prepared" describes the graph-ready lookup view, not only
+                // the EmbedQ8 representation. Native floating lookup reads a
+                // raw device allocation prepared by WeightManager. Publish its
+                // existing bytes as a component so a mirrored vocabulary view
+                // is admitted beside the primary shard. This is a subset of
+                // device_bytes, never a second primary allocation charge.
+                est.prepared_embedding_bytes += device_size;
+            }
+            if (isLMHeadTensor(t.name))
+                est.lm_head_bytes += device_size;
             est.device_bytes += device_size;
+        };
+
+        for (const auto &t : profile.tensors)
+        {
+            if (t.layer_index < 0 && components == WeightComponentScope::LayersOnly)
+                continue;
+            if (isEmbeddingTensor(t.name))
+            {
+                if (owns_embedding)
+                    accumulate(t, true);
+                if (owns_terminal && !has_explicit_lm_head && residency.includesNonRoutedWeights())
+                {
+                    auto head = t;
+                    head.name = "output.weight";
+                    const auto before = est.device_bytes;
+                    const auto previous_head = est.lm_head_bytes;
+                    accumulate(head, !owns_embedding);
+                    const auto tied_bytes = est.lm_head_bytes - previous_head;
+                    est.tied_lm_head_bytes += tied_bytes;
+                    // CPU's existing prepared-source contract shares a tied
+                    // tensor within the same participant. A GPU has a separate
+                    // GEMM pool entry, including for FP32/FP16/BF16 sources.
+                    if (device.is_cpu() && owns_embedding)
+                        est.device_bytes = before;
+                }
+                continue;
+            }
+            if (!owns_terminal &&
+                (isLMHeadTensor(t.name) || inferWeightRole(t.name) == WeightRole::OutputNorm))
+                continue;
+            accumulate(t, true);
         }
 
         return est;

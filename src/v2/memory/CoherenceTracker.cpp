@@ -4,9 +4,13 @@
  */
 
 #include "CoherenceTracker.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/TensorClasses.h"
+#include "transfer/TransferEngine.h"
 #include "utils/Logger.h"
 #include "utils/Assertions.h"
+
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -15,6 +19,18 @@ namespace llaminar2
     {
         if (!tensor)
             return true; // External or null — nothing to do
+
+        /*
+         * Native capture is validation-only: allocation, upload, migration, and
+         * external event discovery have already happened before beginCapture().
+         * TransferEngine consults the scoped dependency ledger to distinguish an
+         * earlier recorded producer from a strict graph-external input.
+         */
+        if (target.is_gpu() && currentGraphCaptureDependencyLedger())
+        {
+            TransferEngine::requireDeviceInput(tensor, target, stream);
+            return true;
+        }
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
         // Invariant: if the arena says DEVICE is authoritative, the tensor
@@ -38,23 +54,31 @@ namespace llaminar2
         // Use tensor's canonical coherence state for transfer decisions,
         // with arena-level UNINITIALIZED check from CoherenceState
         if (!state.needsTransferTo(target, tensor->coherenceState()))
-            return true; // Already in the right place
+        {
+            /*
+             * Correct residency does not imply correct stream ordering. The
+             * producer may have published device authority on another stream,
+             * so every GPU read must join that event to its exact consumer.
+             */
+            if (target.is_gpu())
+                TransferEngine::requireDeviceInput(tensor, target, stream);
+            return true;
+        }
 
         if (target.is_gpu())
         {
-            // Need data on GPU — upload from host
-            if (!tensor->ensureOnDevice(target, stream))
-            {
-                LOG_ERROR("CoherenceTracker: failed to upload tensor to " << target.to_string());
-                return false;
-            }
+            // TransferEngine validates the exact stream, performs any upload,
+            // and joins an existing producer event before arena consumers run.
+            TransferEngine::prepareDeviceInput(tensor, target, stream);
         }
         else
         {
-            // Need data on CPU — download from GPU
-            if (!tensor->ensureOnHost(stream))
+            // CPU materialization is an explicit transfer boundary.
+            const auto result = TransferEngine::instance().download(tensor);
+            if (!result.success)
             {
-                LOG_ERROR("CoherenceTracker: failed to download tensor to host");
+                LOG_ERROR("CoherenceTracker: failed to download tensor to host: "
+                          << result.error);
                 return false;
             }
         }
@@ -69,12 +93,16 @@ namespace llaminar2
 
         if (target.is_gpu())
         {
-            // Allocate GPU buffer if not yet allocated (don't transfer data)
-            if (!tensor->allocateOnDevice(target, stream))
-            {
-                LOG_ERROR("CoherenceTracker: failed to allocate device buffer on " << target.to_string());
-                return false;
-            }
+            /*
+             * Capture preflight has already established stable output
+             * addresses. Recording may validate that allocation but must not
+             * call the placement-capable API, even when it would happen to be
+             * a no-op for the current process state.
+             */
+            if (isGraphCaptureActive())
+                TransferEngine::requireDeviceOutput(tensor, target, stream);
+            else
+                TransferEngine::prepareDeviceOutput(tensor, target, stream);
         }
         // CPU writes just use the existing host buffer — nothing to allocate
 
@@ -98,35 +126,68 @@ namespace llaminar2
     void CoherenceTracker::markWrittenWithEvent(TensorBase *tensor, CoherenceState &state,
                                                 DeviceId device, void *stream)
     {
-        markWritten(state, device);
+        if (!tensor)
+        {
+            throw std::invalid_argument(
+                "CoherenceTracker::markWrittenWithEvent requires a tensor");
+        }
+        if (device.is_gpu() && !stream)
+        {
+            throw std::invalid_argument(
+                "CoherenceTracker::markWrittenWithEvent requires the exact "
+                "non-null GPU producer stream");
+        }
 
-        // Also update the tensor's canonical coherence state and record a GPU event
-        // for fine-grained D2H sync when tensor->data() is later called.
-        if (device.is_gpu() && tensor)
+        /*
+         * Publish the tensor-level contract first. Event creation or recording
+         * can fail, and the arena must not expose device authority unless that
+         * exact producer dependency was committed successfully.
+         */
+        if (device.is_gpu())
         {
-            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+            TransferEngine::publishDeviceWrite(tensor, device, stream);
+            if (currentGraphCaptureDependencyLedger())
+            {
+                /*
+                 * The producer is only recorded.  ScopedGraphCaptureStage owns
+                 * the in-transaction edge, and the post-launch graph boundary
+                 * will publish real global authority.
+                 */
+                return;
+            }
         }
-        else if (device.is_cpu() && tensor)
+        else
         {
-            tensor->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
+            TransferEngine::publishHostWrite(tensor);
         }
+
+        markWritten(state, device);
     }
 
     void CoherenceTracker::markWrittenFlagsOnly(TensorBase *tensor, CoherenceState &state,
                                                 DeviceId device)
     {
+        if (device.is_gpu() && currentGraphCaptureDependencyLedger())
+        {
+            /*
+             * Do not make a recorded-but-unlaunched write globally visible.
+             * Stage completion advances the capture ledger without mutating the
+             * arena or TensorBase coherence state.
+             */
+            return;
+        }
+
         markWritten(state, device);
 
-        // Lightweight: update tensor coherence state without event recording.
-        // The executor synchronizes streams at step boundaries, so per-tensor
-        // events are unnecessary overhead during graph replay.
+        // Lightweight graph-replay publication: the graph executor owns the
+        // single replay-completion event, so per-tensor events are redundant.
         if (device.is_gpu() && tensor)
         {
-            tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+            TransferEngine::publishGraphOwnedDeviceWrite(tensor, device);
         }
         else if (device.is_cpu() && tensor)
         {
-            tensor->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
+            TransferEngine::publishHostWrite(tensor);
         }
     }
 

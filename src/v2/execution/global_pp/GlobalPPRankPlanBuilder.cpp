@@ -2,6 +2,12 @@
  * @file GlobalPPRankPlanBuilder.cpp
  * @brief Implementation of per-rank plan builder for Global PP
  *
+ * Stage order and directed transfer edges are projected, not rediscovered.
+ * Bound physical membership travels unchanged to both endpoint actions, so a
+ * receiver never reconstructs node locality from a peer number or hostname.
+ * Structural, unbound plans remain useful for device-free geometry validation;
+ * their checked physical-connection accessor rejects transport preparation.
+ *
  * @author David Sanftenberg
  * @date February 2026
  */
@@ -167,6 +173,8 @@ namespace llaminar2
                     ta.mpi_tag = t.mpi_tag;
                     ta.from_stage = t.from_stage;
                     ta.to_stage = t.to_stage;
+                    ta.connection = t.connection;
+                    if (ta.connection) (void)ta.physicalConnection(rank);
                     result.push_back(ta);
                 }
                 continue;
@@ -185,6 +193,8 @@ namespace llaminar2
                 ta.mpi_tag = t.mpi_tag;
                 ta.from_stage = t.from_stage;
                 ta.to_stage = t.to_stage;
+                ta.connection = t.connection;
+                if (ta.connection) (void)ta.physicalConnection(rank);
                 result.push_back(ta);
             }
             else if (t.receiver_rank == rank)
@@ -195,6 +205,8 @@ namespace llaminar2
                 ta.mpi_tag = t.mpi_tag;
                 ta.from_stage = t.from_stage;
                 ta.to_stage = t.to_stage;
+                ta.connection = t.connection;
+                if (ta.connection) (void)ta.physicalConnection(rank);
                 result.push_back(ta);
             }
         }

@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ARC values for the xeon production runner.  This runner deliberately uses
+# the node's one Docker daemon through its Unix socket.  A Docker graph store
+# is single-writer state: a DIND sidecar must not share /var/lib/docker (or a
+# writable cache directory) with the host daemon.  Mounting the socket means
+# image layers, BuildKit records and runtime device configuration have exactly
+# one authority and are reused by local host Docker work and CI alike.
+
+controllerServiceAccount:
+  name: arc-gha-rs-controller
+  namespace: arc-systems
+
+# This repository-scoped endpoint is intentional.  The CI token is allowed to
+# administer this repository's runners, but it is not an organization-owner
+# credential; using the organization endpoint makes ARC fail with HTTP 403
+# before it can create the listener or an ephemeral runner pod.
+githubConfigUrl: https://github.com/Llaminar/llaminar
+githubConfigSecret: arc-github-app
+runnerGroup: default
+# Route workflows by this unique scale-set name.  The old organization-level
+# `llaminar-bench` scale set may remain registered after a control-plane loss;
+# retaining that shared label would let GitHub dispatch work to its dead
+# identities instead of this repository-scoped listener.
+runnerScaleSetName: llaminar-xeon-host
+scaleSetLabels: []
+minRunners: 1
+maxRunners: 1
+
+template:
+  spec:
+    # Explicitly clear the old restartable DIND init container. --reuse-values
+    # otherwise retains omitted list keys from the previous Helm revision.
+    initContainers: []
+    # The node Docker socket is root:docker on this host.  The stock runner
+    # image is uid 1001 and already supplies its own primary group, so only
+    # the host socket's explicitly checked supplemental group is required.
+    securityContext:
+      supplementalGroups:
+        - 125
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command:
+          - /home/runner/run.sh
+        # Requests reserve enough capacity for the action control plane without
+        # constraining its burst behaviour.  In particular, do not add a CPU
+        # limit: Kubernetes implements one as a CFS quota, which would throttle
+        # the runner.  BuildKit and the test containers are launched through
+        # the host Docker daemon and own their own host-level cgroups; they are
+        # not children of this pod's cgroup.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+        env:
+          - name: DOCKER_HOST
+            value: unix:///var/run/docker.sock
+          - name: RUNNER_WAIT_FOR_DOCKER_IN_SECONDS
+            value: "120"
+          # This is a physical-host mount, not an emptyDir.  It retains the
+          # Buildx external cache when ARC
+          # replaces a runner pod. Dockerfile compiler mounts remain in the
+          # named BuildKit worker hosted by the same host Docker daemon.
+          - name: LLAMINAR_DOCKER_BUILD_CACHE_ROOT
+            value: /var/cache/llaminar/ccache/buildkit
+          - name: LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE
+            value: 200GB
+          # These paths are mounted at their exact host spelling in both the
+          # runner and the daemon namespace.  docker_paths.py rejects every
+          # undeclared source rather than guessing a Kubernetes translation.
+          - name: LLAMINAR_DOCKER_SHARED_ROOTS
+            value: /home/runner/_work:/opt/llaminar-models:/mnt/llaminar-production-parity:/var/cache/llaminar/ccache
+        volumeMounts:
+          - name: work
+            mountPath: /home/runner/_work
+          - name: host-docker-socket
+            mountPath: /var/run/docker.sock
+          - name: llaminar-models
+            mountPath: /opt/llaminar-models
+            readOnly: true
+          - name: llaminar-production-parity
+            mountPath: /mnt/llaminar-production-parity
+            readOnly: true
+          - name: llaminar-nvidia-libs
+            mountPath: /opt/llaminar-nvidia-libs
+            readOnly: true
+          - name: llaminar-ccache
+            mountPath: /var/cache/llaminar/ccache
+    volumes:
+      # This exact host path is also the runner's in-pod path.  Host Docker
+      # can therefore bind the checkout and evidence paths without a DIND
+      # translation or a duplicate source tree.
+      - name: work
+        hostPath:
+          path: /home/runner/_work
+          type: Directory
+      - name: host-docker-socket
+        hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+      - name: llaminar-models
+        hostPath:
+          path: /opt/llaminar-models
+          type: Directory
+      # setup_production_parity_tmpfs.sh adopts a preexisting named tmpfs with
+      # a bind mount, so this is always the existing pages—not a second tmpfs.
+      - name: llaminar-production-parity
+        hostPath:
+          path: /mnt/llaminar-production-parity
+          type: Directory
+      - name: llaminar-nvidia-libs
+        hostPath:
+          path: /opt/llaminar-nvidia-libs
+          type: Directory
+      # Prepared once on the physical host and mounted at the same spelling in
+      # the k3d runner.  Directory intentionally fails closed if the host
+      # contract was not prepared; an emptyDir here would erase cache evidence
+      # when ARC recycles the pod.
+      - name: llaminar-ccache
+        hostPath:
+          path: /var/cache/llaminar/ccache
+          type: Directory

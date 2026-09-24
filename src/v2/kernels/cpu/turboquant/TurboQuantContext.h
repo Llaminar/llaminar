@@ -14,8 +14,10 @@
 
 #include "TurboQuantRotation.h"
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace llaminar2
@@ -60,18 +62,60 @@ namespace llaminar2
                 return *this;
 
             std::lock_guard<std::mutex> lock(derived_mutex_);
+            return get_or_create_layer_unlocked(layer_idx);
+        }
+
+        /**
+         * @brief Resolve several derived contexts while taking the cache lock once.
+         *
+         * TurboQuant KV kernels reuse one deterministic rotation per KV head.
+         * Resolving that context inside a `(row, head)` loop used to acquire the
+         * same mutex once per head per row, obscuring otherwise useful SIMD work.
+         * This bulk API copies stable context pointers into caller-owned storage
+         * under one lock. The caller can then execute a parallel hot loop without
+         * synchronization or temporary allocation.
+         *
+         * @param count Number of consecutive contexts, starting at index zero.
+         * @param[out] out Caller-owned pointer array.
+         * @param capacity Number of entries available in `out`.
+         * @throws std::invalid_argument for an invalid output contract.
+         */
+        void resolve_layer_contexts(
+            int count,
+            const TurboQuantContext **out,
+            size_t capacity) const
+        {
+            if (count < 0 || !out || capacity < static_cast<size_t>(count))
+            {
+                throw std::invalid_argument(
+                    "TurboQuantContext::resolve_layer_contexts: invalid output contract");
+            }
+
+            std::lock_guard<std::mutex> lock(derived_mutex_);
+            for (int index = 0; index < count; ++index)
+            {
+                out[index] = &get_or_create_layer_unlocked(index);
+            }
+        }
+
+    private:
+        /**
+         * @brief Resolve one derived context while `derived_mutex_` is held.
+         */
+        const TurboQuantContext &get_or_create_layer_unlocked(int layer_idx) const
+        {
             auto it = derived_contexts_.find(layer_idx);
             if (it != derived_contexts_.end())
                 return *it->second;
 
-            const uint64_t rot_seed = mix_seed(rotation_seed_, static_cast<uint64_t>(layer_idx) + 1ULL);
+            const uint64_t rot_seed =
+                mix_seed(rotation_seed_, static_cast<uint64_t>(layer_idx) + 1ULL);
             auto derived = std::make_shared<TurboQuantContext>(head_dim_, rot_seed);
             const TurboQuantContext &ref = *derived;
             derived_contexts_.emplace(layer_idx, std::move(derived));
             return ref;
         }
 
-    private:
         static uint64_t mix_seed(uint64_t base, uint64_t salt)
         {
             uint64_t z = base + 0x9E3779B97F4A7C15ULL + (salt << 6) + (salt >> 2);

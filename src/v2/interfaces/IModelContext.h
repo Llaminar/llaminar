@@ -17,6 +17,7 @@
 #include "../loaders/IWeightManager.h"
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -66,6 +67,20 @@ namespace llaminar2
          * @return Path to the model file (may be dummy path for mocks)
          */
         virtual const std::string &path() const = 0;
+
+        /**
+         * @brief Return every ordered file backing this loaded model artifact.
+         *
+         * Single-file contexts inherit the primary path. Concrete split-GGUF
+         * contexts override this surface so durable runtime caches invalidate
+         * when any shard changes. The returned paths describe the model already
+         * admitted by this context; callers must not reinterpret them as files
+         * to load independently.
+         */
+        virtual std::vector<std::string> artifactPaths() const
+        {
+            return {path()};
+        }
 
         /**
          * @brief Get architecture string

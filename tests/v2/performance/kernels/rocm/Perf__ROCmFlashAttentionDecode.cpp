@@ -142,9 +142,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
                 num_cus_ = props.multiProcessorCount;
             }
@@ -152,11 +152,11 @@ namespace
         }
 
         // =========================================================================
-        // Core benchmark: runs flash decoding with auto split-K selection
+        // Core diagnostic benchmark: runs one explicit physical split envelope
         // =========================================================================
         DecodeResult benchmarkDecode(
             int n_heads, int n_kv_heads, int head_dim, int kv_len,
-            int forced_splits = 0) // 0 = auto
+            int forced_splits = -1)
         {
             DecodeResult result{};
 #ifndef HAVE_ROCM
@@ -172,13 +172,13 @@ namespace
             float *d_Q = nullptr, *d_K = nullptr, *d_V = nullptr, *d_O = nullptr;
             float *d_O_partial = nullptr, *d_m_partial = nullptr, *d_l_partial = nullptr;
 
-            hipMalloc(&d_Q, q_size * sizeof(float));
-            hipMalloc(&d_K, kv_size * sizeof(float));
-            hipMalloc(&d_V, kv_size * sizeof(float));
-            hipMalloc(&d_O, out_size * sizeof(float));
-            hipMalloc(&d_O_partial, partial_size * sizeof(float));
-            hipMalloc(&d_m_partial, static_cast<size_t>(n_heads) * MAX_SPLITS * sizeof(float));
-            hipMalloc(&d_l_partial, static_cast<size_t>(n_heads) * MAX_SPLITS * sizeof(float));
+            (void)hipMalloc(&d_Q, q_size * sizeof(float));
+            (void)hipMalloc(&d_K, kv_size * sizeof(float));
+            (void)hipMalloc(&d_V, kv_size * sizeof(float));
+            (void)hipMalloc(&d_O, out_size * sizeof(float));
+            (void)hipMalloc(&d_O_partial, partial_size * sizeof(float));
+            (void)hipMalloc(&d_m_partial, static_cast<size_t>(n_heads) * MAX_SPLITS * sizeof(float));
+            (void)hipMalloc(&d_l_partial, static_cast<size_t>(n_heads) * MAX_SPLITS * sizeof(float));
 
             // Initialize with random data
             {
@@ -192,68 +192,79 @@ namespace
                 for (auto &v : h_V)
                     v = dist(rng);
 
-                hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-                hipMemcpy(d_K, h_K.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-                hipMemcpy(d_V, h_V.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_K.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_V.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // device_params is a GPU-dereferenced pointer in the kernel.
             // Pass nullptr so the kernel uses the kv_len argument directly.
 
-            // Warmup (also triggers autotuning)
+            /*
+             * This legacy diagnostic invokes the C launcher directly rather
+             * than the graph-captured production wrapper. Choose the same
+             * capacity-derived physical envelope explicitly; zero no longer
+             * means online autotuning.
+             */
+            const int stable_splits =
+                forced_splits > 0
+                    ? forced_splits
+                    : (kv_len <= 64 ? 1 : (kv_len < 128 ? 2 : (kv_len < 256 ? 4 : 8)));
+
+            // Warmup
             for (int i = 0; i < WARMUP_ITERS; ++i)
             {
                 int rc = hipFlashAttn_decode_fp32(
                     d_Q, d_K, d_V, d_O,
                     d_O_partial, d_m_partial, d_l_partial,
                     batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-                    forced_splits, nullptr, nullptr);
+                    stable_splits, nullptr, nullptr);
                 if (rc != 0)
                 {
                     result.success = false;
                     goto cleanup;
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Benchmark with HIP events
             {
                 hipEvent_t ev_start, ev_stop;
-                hipEventCreate(&ev_start);
-                hipEventCreate(&ev_stop);
+                (void)hipEventCreate(&ev_start);
+                (void)hipEventCreate(&ev_stop);
 
                 std::vector<double> times_us;
                 times_us.reserve(BENCH_ITERS);
 
                 for (int i = 0; i < BENCH_ITERS; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, nullptr);
+                    (void)hipDeviceSynchronize();
+                    (void)hipEventRecord(ev_start, nullptr);
 
                     int rc = hipFlashAttn_decode_fp32(
                         d_Q, d_K, d_V, d_O,
                         d_O_partial, d_m_partial, d_l_partial,
                         batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-                        forced_splits, nullptr, nullptr);
+                        stable_splits, nullptr, nullptr);
                     if (rc != 0)
                     {
                         result.success = false;
-                        hipEventDestroy(ev_start);
-                        hipEventDestroy(ev_stop);
+                        (void)hipEventDestroy(ev_start);
+                        (void)hipEventDestroy(ev_stop);
                         goto cleanup;
                     }
 
-                    hipEventRecord(ev_stop, nullptr);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, nullptr);
+                    (void)hipEventSynchronize(ev_stop);
 
                     float ms = 0.0f;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times_us.push_back(static_cast<double>(ms) * 1000.0);
                 }
 
-                hipEventDestroy(ev_start);
-                hipEventDestroy(ev_stop);
+                (void)hipEventDestroy(ev_start);
+                (void)hipEventDestroy(ev_stop);
 
                 std::sort(times_us.begin(), times_us.end());
                 result.min_us = times_us.front();
@@ -545,10 +556,7 @@ namespace
                 }
 
                 char best_cell[32];
-                if (best_splits == 0)
-                    snprintf(best_cell, sizeof(best_cell), "auto");
-                else
-                    snprintf(best_cell, sizeof(best_cell), "s=%d", best_splits);
+                snprintf(best_cell, sizeof(best_cell), "s=%d", best_splits);
                 table << best_cell;
 
                 table << fort::endr;
@@ -600,7 +608,7 @@ namespace
             kQwen7B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+                        /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -612,7 +620,7 @@ namespace
             kQwen7B,
             /*tp_degree=*/4,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -624,7 +632,7 @@ namespace
             kQwen05B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     // ---------------------------------------------------------------------------
@@ -645,7 +653,7 @@ namespace
             kQwen14B,
             /*tp_degree=*/2,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
     TEST_F(ROCmFlashAttentionDecodePerf, Qwen14B_TP4_SplitKSweep)
@@ -654,7 +662,7 @@ namespace
             kQwen14B,
             /*tp_degree=*/4,
             /*kv_lengths=*/{128, 256, 512, 1024, 2048, 4096},
-            /*split_counts=*/{0, 1, 2, 4, 8, 16, 32});
+            /*split_counts=*/{1, 2, 4, 8, 16, 32});
     }
 
 } // anonymous namespace

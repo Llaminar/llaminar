@@ -120,7 +120,7 @@ broken, or uneconomical implementation.
     failures in a loop (up to 20 iterations when appropriate), reduce them to a
     focused test, then fold the invariant into the all-format/backend sweep and
     canonical integration gate. Every production defect must also have its
-    focused regression registered explicitly in the `ProductionParityPreflight`
+    focused regression registered explicitly in the `ProductionTestPreflight`
     suite; broad Unit or backend coverage does not replace that preflight entry.
 
 ### Performance and Observability
@@ -322,6 +322,15 @@ second runtime search. Select the compatible library explicitly when configuring
 a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
 
+ROCm graph execution also requires the canonical HIP runtime built by
+`scripts/docker/install-hip-graph-runtime.sh`. Development and release builders
+install its race-free graph-identity repair; Release images copy that exact DSO
+from the builder. Outside those images, install the matching `rocm-llvm-dev`
+package and run this installer before ROCm gates. Do not disable packet capture
+or serialize independent graph builders to hide an unfixed system HIP runtime.
+`V2_Integration_HIPConcurrentGraphIdentity` is the focused preflight proof that
+every operation survives concurrent construction and replay.
+
 Full-backend binaries also run on CPU-only cluster members. Keep CUDA Driver
 API binding in `CUDADriverApi`, prepared before CUDA graph recording; do not
 restore a public `CUDA::cuda_driver` dependency or inject toolkit stubs into
@@ -408,6 +417,12 @@ topology across runs.
 Use constraints deliberately:
 
 - `--only-backends cpu,cuda,rocm` restricts compute, not host control/storage.
+- `--auto-device-counts cuda=2,rocm=2` requires exact physical compute counts
+  for the named backends while leaving endpoint identities, rank ownership,
+  layer splits and tier choices to auto. CPU counts mean NUMA endpoints, not
+  threads or MPI ranks. Combine with `--only-backends` to exclude other
+  backends; unlisted counts are unconstrained. Use this for an actual topology
+  requirement, not to reproduce an old default-performance score.
 - `--only-strategies single,tp,pp,expert-overlay` restricts candidate families.
   Do not add it merely because a model is MoE. A homogeneous single-domain MoE
   candidate is currently labeled `tp` even though its runtime uses ExpertOverlay;
@@ -690,8 +705,8 @@ ctest --test-dir build_v2_integration \
 ```
 
 The registered pre-commit hook builds only `v2_unit_gate` and
-`v2_production_parity_preflight_gate`, then runs the full Unit namespace and
-`ProductionParityPreflight` label on every branch. It runs no model campaigns,
+`v2_production_test_preflight_gate`, then runs the full Unit namespace and
+`ProductionTestPreflight` label on every branch. It runs no model campaigns,
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
 The full shippable-image gate is `scripts/ci/run_production_pipeline.py`:
@@ -713,7 +728,7 @@ pre-commit.
 
 The enabled `develop` GitHub workflow is deliberately smaller: it invokes
 `scripts/ci/run_develop_image_gate.py` to build AVX512 and AVX2 full-backend
-images, run only the complete Unit and `ProductionParityPreflight` gates inside
+images, run only the complete Unit and `ProductionTestPreflight` gates inside
 each builder, and publish the two tested `develop` runtime tags. It does not
 run model/generation/parity/E2E/benchmark certification and must not be
 expanded into a second production-pipeline implementation. See
@@ -773,7 +788,7 @@ hand-picked PyTorch parity baseline: it keeps reference generation, live-path
 execution, every checkpoint comparison, CSV evidence, and the shared economy
 target in one registered matrix. Before model admission, a build must pass the
 complete CMake-owned `V2_Unit_*` suite and the model-free
-`ProductionParityPreflight` integration label. Unchanged local diagnostic runs
+`ProductionTestPreflight` integration label. Unchanged local diagnostic runs
 reuse their canonical receipt across cells; refresh it after a build or test
 inventory change, not for every cell. The driver validates receipt freshness
 and completeness. Device-free regressions join the

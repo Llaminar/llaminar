@@ -1,12 +1,15 @@
 /**
  * @file ComputeBackend.cpp
- * @brief Device manager and backend implementation
+ * @brief DeviceManager ownership of one observed hardware inventory and its views.
+ *
+ * Initialization publishes HardwareInventory before any cluster projection or
+ * display. NUMA-filtered device lists and peer queries are views of that value,
+ * never independent discovery/accounting paths.
  *
  * Supports:
  * - CPU (OpenBLAS/MKL)
  * - NVIDIA CUDA
  * - AMD ROCm
- * - Vulkan (cross-vendor)
  *
  * Phase 6: Multi-GPU (heterogeneous)
  * GPU enumeration is now in separate compilation units to avoid header conflicts:
@@ -19,8 +22,6 @@
 
 #include "ComputeBackend.h"
 #include "HardwareInventory.h"
-#include "GPUEnumeration.h"
-#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
 #include "../utils/NUMATopology.h"
@@ -49,9 +50,6 @@
 //   - backends/GPUEnumeration.h (declarations)
 // ============================================================================
 
-#ifdef HAVE_VULKAN
-#include <vulkan/vulkan.h>
-#endif
 
 namespace llaminar2
 {
@@ -77,275 +75,10 @@ namespace llaminar2
         }
     }
 
-    // ============================================================================
-    // CPU Device Enumeration
-    // ============================================================================
-
-    static ComputeDevice enumerate_cpu_device(int numa_node = -1)
-    {
-        ComputeDevice dev;
-
-        dev.type = ComputeBackendType::CPU;
-        dev.name = "CPU";
-
-        dev.device_id = 0;
-        dev.compute_capability = 0;
-        dev.numa_node = numa_node;
-
-        // Get memory info - prefer NUMA-local memory if node specified
-#ifdef __linux__
-        if (numa_node >= 0 && numa_available() >= 0)
-        {
-            // Get NUMA-local memory for this node
-            long long numa_size = numa_node_size64(numa_node, nullptr);
-            if (numa_size > 0)
-            {
-                dev.total_memory_bytes = static_cast<size_t>(numa_size);
-                // Free memory approximation: assume ~90% available
-                long long numa_free = 0;
-                numa_node_size64(numa_node, &numa_free);
-                dev.free_memory_bytes = (numa_free > 0) ? static_cast<size_t>(numa_free) : dev.total_memory_bytes;
-            }
-            else
-            {
-                // Fallback to system memory divided by NUMA nodes
-                int num_nodes = numa_num_configured_nodes();
-                FILE *meminfo = fopen("/proc/meminfo", "r");
-                if (meminfo)
-                {
-                    char line[256];
-                    while (fgets(line, sizeof(line), meminfo))
-                    {
-                        if (strncmp(line, "MemAvailable:", 13) == 0)
-                        {
-                            unsigned long kb = 0;
-                            if (sscanf(line + 13, "%lu", &kb) == 1)
-                            {
-                                dev.total_memory_bytes = static_cast<size_t>(kb) * 1024 / (num_nodes > 0 ? num_nodes : 1);
-                                dev.free_memory_bytes = dev.total_memory_bytes;
-                            }
-                            break;
-                        }
-                    }
-                    fclose(meminfo);
-                }
-            }
-        }
-        else
-        {
-            // No NUMA node specified, get total system memory
-            FILE *meminfo = fopen("/proc/meminfo", "r");
-            if (meminfo)
-            {
-                char line[256];
-                while (fgets(line, sizeof(line), meminfo))
-                {
-                    if (strncmp(line, "MemAvailable:", 13) == 0)
-                    {
-                        unsigned long kb = 0;
-                        if (sscanf(line + 13, "%lu", &kb) == 1)
-                        {
-                            dev.total_memory_bytes = static_cast<size_t>(kb) * 1024;
-                            dev.free_memory_bytes = dev.total_memory_bytes;
-                        }
-                        break;
-                    }
-                }
-                fclose(meminfo);
-            }
-        }
-#else
-        // Fallback: assume 16 GB
-        dev.total_memory_bytes = 16ULL * 1024 * 1024 * 1024;
-        dev.free_memory_bytes = dev.total_memory_bytes;
-#endif
-
-        dev.supports_fp16 = false; // Depends on CPU features (AVX512-FP16)
-        dev.supports_bf16 = true;  // Software emulation always available
-        dev.supports_int8 = true;  // VNNI/DP4A support (detect at runtime)
-
-        return dev;
-    }
-
-    // ============================================================================
-    // CUDA Device Enumeration (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU Device Enumeration (Phase 6: Separate compilation units)
-    // ============================================================================
-    // CUDA and ROCm enumeration moved to separate files to avoid header conflicts:
-    //   - CUDAEnumeration.cu (CUDA runtime headers only)
-    //   - ROCmEnumeration.cpp (HIP runtime headers only, compiled with hipcc)
-    // This enables heterogeneous multi-GPU (NVIDIA + AMD in same binary).
-    // ============================================================================
-
-    // Wrapper functions that call into separate compilation units
-    static std::vector<ComputeDevice> enumerate_cuda_devices()
-    {
-#ifdef HAVE_CUDA
-        return cuda_enumeration::enumerate_cuda_devices();
-#else
-        return {};
-#endif
-    }
-
-    static std::vector<ComputeDevice> enumerate_rocm_devices()
-    {
-#ifdef HAVE_ROCM
-        return rocm_enumeration::enumerate_rocm_devices();
-#else
-        return {};
-#endif
-    }
-
-    // ============================================================================
-    // Vulkan Device Enumeration (DEPRECATED - Phase 3)
-    // ============================================================================
-    // Vulkan support is currently stubbed out.
-    // ============================================================================
-
-#if 0 // Vulkan enumeration disabled (Phase 3)
-#ifdef HAVE_VULKAN
-    static std::vector<ComputeDevice> enumerate_vulkan_devices()
-    {
-        std::vector<ComputeDevice> devices;
-
-        // Create Vulkan instance
-        VkApplicationInfo app_info = {};
-        app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        app_info.pApplicationName = "Llaminar";
-        app_info.applicationVersion = VK_MAKE_VERSION(2, 0, 0);
-        app_info.pEngineName = "Llaminar";
-        app_info.engineVersion = VK_MAKE_VERSION(2, 0, 0);
-        app_info.apiVersion = VK_API_VERSION_1_2;
-
-        VkInstanceCreateInfo create_info = {};
-        create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        create_info.pApplicationInfo = &app_info;
-
-        VkInstance instance = VK_NULL_HANDLE;
-        if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS)
-        {
-            return devices; // Vulkan not available
-        }
-
-        // Enumerate physical devices
-        uint32_t device_count = 0;
-        vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
-
-        if (device_count == 0)
-        {
-            vkDestroyInstance(instance, nullptr);
-            return devices;
-        }
-
-        std::vector<VkPhysicalDevice> physical_devices(device_count);
-        vkEnumeratePhysicalDevices(instance, &device_count, physical_devices.data());
-
-        for (uint32_t i = 0; i < device_count; ++i)
-        {
-            VkPhysicalDeviceProperties props;
-            vkGetPhysicalDeviceProperties(physical_devices[i], &props);
-
-            VkPhysicalDeviceMemoryProperties mem_props;
-            vkGetPhysicalDeviceMemoryProperties(physical_devices[i], &mem_props);
-
-            ComputeDevice dev;
-            dev.type = ComputeBackendType::GPU_VULKAN;
-            dev.name = std::string(props.deviceName);
-            dev.device_id = i;
-            dev.compute_capability = VK_VERSION_MAJOR(props.apiVersion) * 10 +
-                                     VK_VERSION_MINOR(props.apiVersion);
-
-            // Sum up device-local memory heaps
-            dev.total_memory_bytes = 0;
-            for (uint32_t j = 0; j < mem_props.memoryHeapCount; ++j)
-            {
-                if (mem_props.memoryHeaps[j].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                {
-                    dev.total_memory_bytes += mem_props.memoryHeaps[j].size;
-                }
-            }
-            dev.free_memory_bytes = dev.total_memory_bytes; // Approximate
-
-            // Vulkan feature support (query via extensions)
-            dev.supports_fp16 = true;  // VK_KHR_shader_float16_int8
-            dev.supports_bf16 = false; // Limited BF16 support in Vulkan
-            dev.supports_int8 = true;  // VK_KHR_shader_float16_int8
-
-            devices.push_back(dev);
-        }
-
-        vkDestroyInstance(instance, nullptr);
-        return devices;
-    }
-#else
-    static std::vector<ComputeDevice> enumerate_vulkan_devices()
-    {
-        return {}; // Vulkan not available
-    }
-#endif
-#endif // #if 0 - Vulkan enumeration disabled (Phase 3)
-
-    // Replacement stub (always returns empty)
-    static std::vector<ComputeDevice> enumerate_vulkan_devices()
-    {
-        return {}; // Vulkan enumeration moved to IBackend (Phase 3)
-    }
-
-    // ============================================================================
-    // DeviceManager Implementation
-    // ============================================================================
-
     namespace
     {
         // Read CPU model name per socket from /proc/cpuinfo
         // Returns socket_id -> model name (different sockets may have different CPUs)
-        std::map<int, std::string> read_cpu_model_names_per_socket()
-        {
-            std::map<int, std::string> result;
-            std::ifstream cpuinfo("/proc/cpuinfo");
-            if (!cpuinfo.is_open())
-                return result;
-
-            int current_physical_id = -1;
-            std::string current_model;
-            std::string line;
-            while (std::getline(cpuinfo, line))
-            {
-                if (line.compare(0, 11, "physical id") == 0)
-                {
-                    auto pos = line.find(':');
-                    if (pos != std::string::npos)
-                        current_physical_id = std::atoi(line.c_str() + pos + 1);
-                }
-                else if (line.compare(0, 10, "model name") == 0)
-                {
-                    auto pos = line.find(':');
-                    if (pos != std::string::npos)
-                    {
-                        std::string name = line.substr(pos + 1);
-                        auto start = name.find_first_not_of(" \t");
-                        if (start != std::string::npos)
-                            name = name.substr(start);
-                        current_model = name;
-                    }
-                }
-                else if (line.empty() || line[0] == '\n')
-                {
-                    // End of a CPU block
-                    if (current_physical_id >= 0 && !current_model.empty())
-                        result[current_physical_id] = current_model;
-                    current_physical_id = -1;
-                    current_model.clear();
-                }
-            }
-            // Handle last block (file may not end with blank line)
-            if (current_physical_id >= 0 && !current_model.empty())
-                result[current_physical_id] = current_model;
-
-            return result;
-        }
-
         // Format memory size as "XX GB"
         std::string format_memory_gb(size_t bytes)
         {
@@ -444,7 +177,12 @@ namespace llaminar2
 
             log_table(table.to_string());
 
-            // Print degraded link warnings after the table
+            /*
+             * Enumeration precedes model traffic, and autonomous PCIe power
+             * management may temporarily reduce link speed or width. Keep the
+             * observation available as a diagnostic without presenting this
+             * pre-workload snapshot as an inference failure.
+             */
             for (const auto &dev : devices)
             {
                 if (dev.pcie.degraded)
@@ -464,16 +202,16 @@ namespace llaminar2
                     const char *type_prefix = (dev.type == ComputeBackendType::GPU_CUDA) ? "cuda" : "rocm";
                     if (!dev.pcie.bottleneck_bdf.empty())
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf
-                                        << " (bottleneck at upstream bridge " << dev.pcie.bottleneck_bdf << ")");
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf
+                                       << " (narrowest upstream bridge " << dev.pcie.bottleneck_bdf << ")");
                     }
                     else
                     {
-                        LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
-                                        << " link degraded: " << format_pcie_link(dev.pcie)
-                                        << " — capable of " << cap_buf);
+                        LOG_DEBUG("  " << type_prefix << ":" << dev.device_id
+                                       << " pre-workload link snapshot: " << format_pcie_link(dev.pcie)
+                                       << "; capable of " << cap_buf);
                     }
                 }
             }
@@ -557,122 +295,33 @@ namespace llaminar2
             LOG_DEBUG("[DeviceManager] Initializing without NUMA filtering (all devices visible)");
         }
 
-        // Always enumerate CPU first (device index 0)
-        // Pass NUMA node so memory reporting is NUMA-local
-        auto cpu_dev = enumerate_cpu_device(local_numa_node >= 0 ? local_numa_node : 0);
-        devices_.push_back(cpu_dev);
+        // Publish one complete observation independent of logging. Hardware
+        // discovery already owns vendor startup policy, NUMA and P2P queries;
+        // repeating those queries here used to leave hardware() unpopulated.
+        hardware_ = std::make_unique<HardwareInventory>(HardwareInventory::detect());
+        devices_.push_back(hardware_->cpuDevice(local_numa_node));
 
-        const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
-        const bool force_cpu_only_startup = (cpu_only_env && std::atoi(cpu_only_env) != 0);
-
-        // Selective backend skip: when we know the target backend, skip the other(s)
-        // to avoid expensive GPU driver initialization (~250ms per CUDA device).
-        const char *skip_cuda_env = std::getenv("LLAMINAR_SKIP_CUDA_STARTUP");
-        const bool skip_cuda = (skip_cuda_env && std::atoi(skip_cuda_env) != 0);
-        const char *skip_rocm_env = std::getenv("LLAMINAR_SKIP_ROCM_STARTUP");
-        const bool skip_rocm = (skip_rocm_env && std::atoi(skip_rocm_env) != 0);
-
-        // Enumerate GPUs with optional NUMA filtering
-        std::vector<ComputeDevice> cuda_devices;
-        std::vector<ComputeDevice> rocm_devices;
-        std::vector<ComputeDevice> vulkan_devices;
-
-        if (!force_cpu_only_startup)
+        auto cuda_devices = hardware_->cuda_devices;
+        auto rocm_devices = hardware_->rocm_devices;
+        const auto retainLocal = [local_numa_node](std::vector<ComputeDevice> &devices)
         {
-            if (!skip_cuda)
-                cuda_devices = enumerate_cuda_devices();
-            else
-                LOG_INFO("[DeviceManager] Skipping CUDA enumeration (LLAMINAR_SKIP_CUDA_STARTUP=1)");
-
-            if (!skip_rocm)
-                rocm_devices = enumerate_rocm_devices();
-            else
-                LOG_INFO("[DeviceManager] Skipping ROCm enumeration (LLAMINAR_SKIP_ROCM_STARTUP=1)");
-
-            vulkan_devices = enumerate_vulkan_devices();
-        }
-        else
-        {
-            LOG_DEBUG("[DeviceManager] CPU-only startup fast-path active: skipping GPU enumeration");
-        }
-
-        // Filter CUDA devices by NUMA affinity
-        if (local_numa_node >= 0)
-        {
-            std::vector<ComputeDevice> filtered_cuda;
-            for (auto &dev : cuda_devices)
+            if (local_numa_node < 0) return;
+            std::erase_if(devices, [local_numa_node](const ComputeDevice &device)
             {
-                auto gpu_info = NUMATopology::getCUDAGPUNUMANode(dev.device_id);
-                dev.numa_node = gpu_info.numa_node;
-
-                if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
-                {
-                    filtered_cuda.push_back(dev);
-                    LOG_DEBUG("[DeviceManager] Including CUDA GPU " << dev.device_id
-                                                                    << " (NUMA node " << gpu_info.numa_node << ", " << gpu_info.detection_method << ")");
-                }
-                else
-                {
-                    LOG_DEBUG("[DeviceManager] Filtering out CUDA GPU " << dev.device_id
-                                                                        << " (on NUMA node " << gpu_info.numa_node << ", process on node " << local_numa_node << ")");
-                }
-            }
-            cuda_devices = filtered_cuda;
-        }
-        else
-        {
-            // No filtering, but still populate NUMA info for logging
-            for (auto &dev : cuda_devices)
-            {
-                auto gpu_info = NUMATopology::getCUDAGPUNUMANode(dev.device_id);
-                dev.numa_node = gpu_info.numa_node;
-            }
-        }
-
-#ifdef HAVE_ROCM
-        // Filter ROCm devices by NUMA affinity
-        if (local_numa_node >= 0)
-        {
-            std::vector<ComputeDevice> filtered_rocm;
-            for (auto &dev : rocm_devices)
-            {
-                auto gpu_info = NUMATopology::getROCmGPUNUMANode(dev.device_id);
-                dev.numa_node = gpu_info.numa_node;
-
-                if (NUMATopology::isGPULocalToProcess(gpu_info.numa_node, local_numa_node))
-                {
-                    filtered_rocm.push_back(dev);
-                    LOG_DEBUG("[DeviceManager] Including ROCm GPU " << dev.device_id
-                                                                    << " (NUMA node " << gpu_info.numa_node << ")");
-                }
-                else
-                {
-                    LOG_DEBUG("[DeviceManager] Filtering out ROCm GPU " << dev.device_id
-                                                                        << " (on NUMA node " << gpu_info.numa_node << ")");
-                }
-            }
-            rocm_devices = filtered_rocm;
-        }
-        else
-        {
-            // No filtering, populate NUMA info
-            for (auto &dev : rocm_devices)
-            {
-                auto gpu_info = NUMATopology::getROCmGPUNUMANode(dev.device_id);
-                dev.numa_node = gpu_info.numa_node;
-            }
-        }
-#endif
-
-        // Vulkan devices: not filtered (NUMA affinity unknown)
-        for (auto &dev : vulkan_devices)
-        {
-            dev.numa_node = -1; // Unknown
-        }
-
+                return !NUMATopology::isGPULocalToProcess(device.numa_node, local_numa_node);
+            });
+        };
+        retainLocal(cuda_devices);
+        retainLocal(rocm_devices);
         devices_.insert(devices_.end(), cuda_devices.begin(), cuda_devices.end());
         devices_.insert(devices_.end(), rocm_devices.begin(), rocm_devices.end());
-        devices_.insert(devices_.end(), vulkan_devices.begin(), vulkan_devices.end());
+
+        // Peer matrices retain their real backend ordinal maps. Exact-domain
+        // queries select edges by ordinal, so filtered views cannot renumber
+        // devices or turn asymmetric access into an all-peer assertion.
+        p2p_matrices_.clear();
+        if (hardware_->cuda_p2p) p2p_matrices_.push_back(*hardware_->cuda_p2p);
+        if (hardware_->rocm_p2p) p2p_matrices_.push_back(*hardware_->rocm_p2p);
 
         // Resize contexts_ vector to match devices
         contexts_.resize(devices_.size(), nullptr);
@@ -686,156 +335,9 @@ namespace llaminar2
 
             // --- CPU table (per-socket detail) ---
             {
-                auto cpu_models = read_cpu_model_names_per_socket();
-
-                // Per-socket info
-                struct SocketInfo
-                {
-                    int socket_id = -1;
-                    int numa_node = -1;
-                    std::string model_name = "Unknown CPU";
-                    std::vector<int> physical_cores; // First thread of each core
-                    std::vector<int> ht_threads;     // Sibling threads (HT)
-                    size_t memory_bytes = 0;
-                };
-                std::vector<SocketInfo> sockets;
-
-                int num_numa = (numa_available() >= 0) ? numa_num_configured_nodes() : 1;
-                int total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-
-                // Map each CPU to its socket and detect HT siblings
-                // socket_id -> { core_id -> vector<cpu_id> }
-                std::map<int, std::map<int, std::vector<int>>> socket_core_map;
-                std::map<int, int> socket_to_numa; // socket -> NUMA node
-
-                for (int cpu = 0; cpu < total_cpus; ++cpu)
-                {
-                    char path[256];
-                    int pkg = 0, core = 0;
-
-                    snprintf(path, sizeof(path),
-                             "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
-                    FILE *f = fopen(path, "r");
-                    if (f)
-                    {
-                        if (fscanf(f, "%d", &pkg) != 1)
-                            pkg = 0;
-                        fclose(f);
-                    }
-
-                    snprintf(path, sizeof(path),
-                             "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
-                    f = fopen(path, "r");
-                    if (f)
-                    {
-                        if (fscanf(f, "%d", &core) != 1)
-                            core = 0;
-                        fclose(f);
-                    }
-
-                    socket_core_map[pkg][core].push_back(cpu);
-
-                    // Detect NUMA node for this CPU
-                    if (socket_to_numa.find(pkg) == socket_to_numa.end())
-                    {
-                        for (int n = 0; n < num_numa; ++n)
-                        {
-                            char numa_path[256];
-                            snprintf(numa_path, sizeof(numa_path),
-                                     "/sys/devices/system/cpu/cpu%d/node%d", cpu, n);
-                            struct stat st;
-                            if (stat(numa_path, &st) == 0)
-                            {
-                                socket_to_numa[pkg] = n;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Build SocketInfo for each socket
-                for (auto &[pkg, cores] : socket_core_map)
-                {
-                    SocketInfo si;
-                    si.socket_id = pkg;
-                    si.numa_node = (socket_to_numa.count(pkg) > 0) ? socket_to_numa[pkg] : pkg;
-                    if (cpu_models.count(pkg) > 0)
-                        si.model_name = cpu_models[pkg];
-
-                    for (auto &[core_id, cpus] : cores)
-                    {
-                        // Sort CPUs: lowest is the physical core, rest are HT siblings
-                        std::sort(cpus.begin(), cpus.end());
-                        si.physical_cores.push_back(cpus[0]);
-                        for (size_t i = 1; i < cpus.size(); ++i)
-                            si.ht_threads.push_back(cpus[i]);
-                    }
-                    std::sort(si.physical_cores.begin(), si.physical_cores.end());
-                    std::sort(si.ht_threads.begin(), si.ht_threads.end());
-
-                    // Per-NUMA memory
-                    if (numa_available() >= 0 && si.numa_node >= 0)
-                    {
-                        long long sz = numa_node_size64(si.numa_node, nullptr);
-                        if (sz > 0)
-                            si.memory_bytes = static_cast<size_t>(sz);
-                    }
-
-                    sockets.push_back(std::move(si));
-                }
-
-                // Sort sockets by ID
-                std::sort(sockets.begin(), sockets.end(),
-                          [](const SocketInfo &a, const SocketInfo &b)
-                          { return a.socket_id < b.socket_id; });
-
-                // Fallback: if no sockets detected, create a single entry
-                if (sockets.empty())
-                {
-                    SocketInfo si;
-                    si.socket_id = 0;
-                    si.numa_node = 0;
-
-                    for (const auto &dev : devices_)
-                        if (dev.type == ComputeBackendType::CPU)
-                        {
-                            si.memory_bytes = dev.total_memory_bytes;
-                            break;
-                        }
-
-                    sockets.push_back(si);
-                }
-
-                // Helper: format a sorted vector of ints as compact ranges (e.g., "0-27, 56-83")
-                auto format_cpu_ranges = [](const std::vector<int> &cpus) -> std::string
-                {
-                    if (cpus.empty())
-                        return "-";
-                    std::ostringstream oss;
-                    int start = cpus[0], prev = cpus[0];
-                    for (size_t i = 1; i <= cpus.size(); ++i)
-                    {
-                        if (i < cpus.size() && cpus[i] == prev + 1)
-                        {
-                            prev = cpus[i];
-                        }
-                        else
-                        {
-                            if (oss.tellp() > 0)
-                                oss << ", ";
-                            if (start == prev)
-                                oss << start;
-                            else
-                                oss << start << "-" << prev;
-                            if (i < cpus.size())
-                            {
-                                start = cpus[i];
-                                prev = cpus[i];
-                            }
-                        }
-                    }
-                    return oss.str();
-                };
+                // Display consumes the exact same observation as planning;
+                // quiet startup and verbose startup publish identical facts.
+                const auto &sockets = hardware_->cpu_sockets;
 
                 // Compute total memory for title
                 size_t total_mem = 0;
@@ -893,8 +395,8 @@ namespace llaminar2
                         cpu_table << std::to_string(s.socket_id)
                                   << s.model_name
                                   << std::to_string(s.numa_node)
-                                  << format_cpu_ranges(s.physical_cores)
-                                  << format_cpu_ranges(s.ht_threads)
+                                  << HardwareInventory::formatCpuRanges(s.physical_cores)
+                                  << HardwareInventory::formatCpuRanges(s.ht_threads)
                                   << cores_str
                                   << format_memory_gb(s.memory_bytes)
                                   << fort::endr;
@@ -904,7 +406,7 @@ namespace llaminar2
                         cpu_table << std::to_string(s.socket_id)
                                   << s.model_name
                                   << std::to_string(s.numa_node)
-                                  << format_cpu_ranges(s.physical_cores)
+                                  << HardwareInventory::formatCpuRanges(s.physical_cores)
                                   << cores_str
                                   << format_memory_gb(s.memory_bytes)
                                   << fort::endr;
@@ -945,25 +447,13 @@ namespace llaminar2
             }
 
             // --- P2P access matrices ---
-            p2p_matrices_.clear();
-
-#ifdef HAVE_CUDA
-            if (cuda_devices.size() > 1)
+            for (const auto &matrix : p2p_matrices_)
             {
-                auto cuda_p2p = cuda_enumeration::query_p2p_matrix(cuda_devices);
-                log_p2p_table("CUDA", cuda_p2p);
-                p2p_matrices_.push_back(std::move(cuda_p2p));
+                if (matrix.backend == ComputeBackendType::GPU_CUDA)
+                    log_p2p_table("CUDA", matrix);
+                else if (matrix.backend == ComputeBackendType::GPU_ROCM)
+                    log_p2p_table("ROCm", matrix);
             }
-#endif
-
-#ifdef HAVE_ROCM
-            if (rocm_devices.size() > 1)
-            {
-                auto rocm_p2p = rocm_enumeration::query_p2p_matrix(rocm_devices);
-                log_p2p_table("ROCm", rocm_p2p);
-                p2p_matrices_.push_back(std::move(rocm_p2p));
-            }
-#endif
 
         } // end if (!inventory_logged_)
 
@@ -1002,91 +492,7 @@ namespace llaminar2
             ctx = std::make_shared<CPUComputeContext>();
             break;
 
-#if 0 // GPU context creation disabled (Phase 3)
-#ifdef HAVE_CUDA
-        case ComputeBackendType::GPU_CUDA:
-        {
-            auto cuda_ctx = std::make_shared<CUDAComputeContext>();
-            if (cudaSetDevice(device.device_id) != cudaSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to set CUDA device "
-                          << device.device_id << "");
-                return nullptr;
-            }
-
-            cudaStream_t stream;
-            if (cudaStreamCreate(&stream) != cudaSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create CUDA stream");
-                return nullptr;
-            }
-            cuda_ctx->stream = stream;
-            cuda_ctx->device_id = device.device_id;
-
-            cublasHandle_t cublas_handle;
-            if (cublasCreate(&cublas_handle) != CUBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create cuBLAS handle");
-                cudaStreamDestroy(stream);
-                return nullptr;
-            }
-            cublasSetStream(cublas_handle, stream);
-            cuda_ctx->cublas_handle = cublas_handle;
-            ctx = cuda_ctx;
-            break;
-        }
-#endif
-
-#ifdef HAVE_ROCM
-        case ComputeBackendType::GPU_ROCM:
-        {
-            auto rocm_ctx = std::make_shared<ROCmComputeContext>();
-            if (hipSetDevice(device.device_id) != hipSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to set ROCm device "
-                          << device.device_id << "");
-                return nullptr;
-            }
-
-            hipStream_t stream;
-            if (hipStreamCreate(&stream) != hipSuccess)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create HIP stream");
-                return nullptr;
-            }
-            rocm_ctx->stream = stream;
-            rocm_ctx->device_id = device.device_id;
-
-            hipblasHandle_t hipblas_handle;
-            if (hipblasCreate(&hipblas_handle) != HIPBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[DeviceManager] Failed to create hipBLAS handle");
-                hipStreamDestroy(stream);
-                return nullptr;
-            }
-            hipblasSetStream(hipblas_handle, stream);
-            // Disable atomic reductions for deterministic GEMM output.
-            hipblasSetAtomicsMode(hipblas_handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-            rocm_ctx->hipblas_handle = hipblas_handle;
-            ctx = rocm_ctx;
-            break;
-        }
-#endif
-
-#ifdef HAVE_VULKAN
-        case ComputeBackendType::GPU_VULKAN:
-            // TODO: Vulkan context initialization
-            ctx = std::make_shared<VulkanComputeContext>();
-            LOG_ERROR("[DeviceManager] Vulkan context creation not fully implemented");
-            break;
-#else
-        case ComputeBackendType::GPU_VULKAN:
-            LOG_ERROR("[DeviceManager] Vulkan not available in this build");
-            return nullptr;
-#endif
-#endif // #if 0 - GPU context creation disabled (Phase 3)
-
-        // GPU context creation now handled by IBackend (Phase 3)
+        // GPU context creation is owned by IBackend.
         case ComputeBackendType::GPU_CUDA:
         case ComputeBackendType::GPU_ROCM:
         case ComputeBackendType::GPU_VULKAN:
@@ -1147,6 +553,62 @@ namespace llaminar2
         }
 
         return find_device(backend_type, device.ordinal) >= 0;
+    }
+
+    std::optional<PeerAccessCoverage> DeviceManager::peerAccessCoverage(
+        const std::vector<DeviceId> &devices) const
+    {
+        if (devices.size() < 2u || !devices.front().is_gpu())
+            return std::nullopt;
+
+        const DeviceType backend_type = devices.front().type;
+        std::vector<int> ordinals;
+        ordinals.reserve(devices.size());
+        for (const DeviceId &device : devices)
+        {
+            if (!device.is_gpu() || device.type != backend_type)
+                return std::nullopt;
+            ordinals.push_back(device.ordinal);
+        }
+
+        const ComputeBackendType matrix_backend =
+            backend_type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend == matrix_backend)
+                return matrix.coverageForDevices(ordinals);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<bool> DeviceManager::peerAccessAvailable(
+        DeviceId accessor,
+        DeviceId peer) const
+    {
+        if (!accessor.is_gpu() || !peer.is_gpu() || accessor == peer ||
+            accessor.type != peer.type)
+        {
+            return std::nullopt;
+        }
+
+        const ComputeBackendType matrix_backend =
+            accessor.type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend != matrix_backend)
+                continue;
+            if (!matrix.indexForDevice(accessor.ordinal).has_value() ||
+                !matrix.indexForDevice(peer.ordinal).has_value())
+            {
+                return std::nullopt;
+            }
+            return matrix.canAccessDevice(accessor.ordinal, peer.ordinal);
+        }
+        return std::nullopt;
     }
 
     bool DeviceManager::deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const
@@ -1392,161 +854,5 @@ namespace llaminar2
         // Use KernelFactory::createSwiGLU() instead.
         return nullptr;
     }
-
-    // ============================================================================
-    // CUDAComputeContext Implementation (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU context implementations moved to IBackend interface.
-    // See backends/cuda/CUDABackend.cu for new CUDA implementation.
-    // ============================================================================
-
-#if 0 // CUDA context methods disabled (Phase 3)
-#ifdef HAVE_CUDA
-    void *CUDAComputeContext::allocate(size_t bytes)
-    {
-        void *ptr = nullptr;
-        cudaError_t err = cudaMalloc(&ptr, bytes);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] Failed to allocate " << bytes << " bytes: "
-                                                   << cudaGetErrorString(err) << "");
-            return nullptr;
-        }
-        return ptr;
-    }
-
-    void CUDAComputeContext::free(void *ptr)
-    {
-        if (ptr)
-        {
-            cudaFree(ptr);
-        }
-    }
-
-    void CUDAComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] copy_to_device failed: " << cudaGetErrorString(err) << "");
-        }
-    }
-
-    void CUDAComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        cudaError_t err = cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDA] copy_from_device failed: " << cudaGetErrorString(err) << "");
-        }
-    }
-
-    void CUDAComputeContext::synchronize()
-    {
-        if (stream)
-        {
-            cudaStreamSynchronize(stream);
-        }
-        else
-        {
-            cudaDeviceSynchronize();
-        }
-    }
-#endif
-
-    // ============================================================================
-    // ROCmComputeContext Implementation (DEPRECATED - Phase 3)
-    // ============================================================================
-    // GPU context implementations moved to IBackend interface.
-    // See backends/rocm/ROCmBackend.cpp for new ROCm implementation.
-    // ============================================================================
-
-#ifdef HAVE_ROCM
-    void *ROCmComputeContext::allocate(size_t bytes)
-    {
-        void *ptr = nullptr;
-        hipError_t err = hipMalloc(&ptr, bytes);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] Failed to allocate " << bytes << " bytes");
-            return nullptr;
-        }
-        return ptr;
-    }
-
-    void ROCmComputeContext::free(void *ptr)
-    {
-        if (ptr)
-        {
-            hipFree(ptr);
-        }
-    }
-
-    void ROCmComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] copy_to_device failed");
-        }
-    }
-
-    void ROCmComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCm] copy_from_device failed");
-        }
-    }
-
-    void ROCmComputeContext::synchronize()
-    {
-        if (stream)
-        {
-            hipStreamSynchronize(stream);
-        }
-        else
-        {
-            hipDeviceSynchronize();
-        }
-    }
-#endif
-
-    // ============================================================================
-    // VulkanComputeContext Implementation (Stub)
-    // ============================================================================
-
-#ifdef HAVE_VULKAN
-    void *VulkanComputeContext::allocate(size_t bytes)
-    {
-        // TODO: Vulkan buffer allocation
-        LOG_ERROR("[Vulkan] allocate() not yet implemented");
-        return nullptr;
-    }
-
-    void VulkanComputeContext::free(void *ptr)
-    {
-        // TODO: Vulkan buffer deallocation
-    }
-
-    void VulkanComputeContext::copy_to_device(void *dst, const void *src, size_t bytes)
-    {
-        // TODO: Vulkan staging buffer upload
-        LOG_ERROR("[Vulkan] copy_to_device() not yet implemented");
-    }
-
-    void VulkanComputeContext::copy_from_device(void *dst, const void *src, size_t bytes)
-    {
-        // TODO: Vulkan staging buffer download
-        LOG_ERROR("[Vulkan] copy_from_device() not yet implemented");
-    }
-
-    void VulkanComputeContext::synchronize()
-    {
-        // TODO: Vulkan queue submit + wait
-    }
-#endif
-#endif // #if 0 - GPU context methods disabled (Phase 3)
 
 } // namespace llaminar2

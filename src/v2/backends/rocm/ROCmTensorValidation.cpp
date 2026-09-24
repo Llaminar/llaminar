@@ -1,8 +1,10 @@
 /**
  * @file ROCmTensorValidation.cpp
- * @brief ROCm GPU-accelerated tensor validation kernels
+ * @brief Stream-ordered ROCm tensor validation kernels.
  *
- * HIP kernels for NaN/Inf/Zero detection without D2H transfer.
+ * HIP kernels for NaN/Inf/zero detection without tensor materialization on the
+ * host. Validation uses persistent per-device diagnostic storage and the exact
+ * producer stream; only the compact result crosses D2H after an event.
  *
  * @author David Sanftenberg
  */
@@ -14,6 +16,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace llaminar2
@@ -34,6 +38,51 @@ namespace llaminar2
         float sample_min;
         float sample_max;
     };
+
+    /** Initialize one persistent validation record on its execution stream. */
+    __global__ void initializeValidationResultROCm(DeviceValidationResult *result)
+    {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+        {
+            result->has_nan = 0;
+            result->has_inf = 0;
+            result->appears_zero = 1;
+            result->nan_count = 0;
+            result->inf_count = 0;
+            result->zero_count = 0;
+            result->total_checked = 0;
+            result->sample_min = std::numeric_limits<float>::max();
+            result->sample_max = std::numeric_limits<float>::lowest();
+        }
+    }
+
+    /** Atomic float minimum with correct ordering for negative values. */
+    __device__ void atomicMinFloatROCm(float *address, float value)
+    {
+        int *bits = reinterpret_cast<int *>(address);
+        int observed = *bits;
+        while (value < __int_as_float(observed))
+        {
+            const int assumed = observed;
+            observed = atomicCAS(bits, assumed, __float_as_int(value));
+            if (observed == assumed)
+                break;
+        }
+    }
+
+    /** Atomic float maximum with correct ordering for negative values. */
+    __device__ void atomicMaxFloatROCm(float *address, float value)
+    {
+        int *bits = reinterpret_cast<int *>(address);
+        int observed = *bits;
+        while (value > __int_as_float(observed))
+        {
+            const int assumed = observed;
+            observed = atomicCAS(bits, assumed, __float_as_int(value));
+            if (observed == assumed)
+                break;
+        }
+    }
 
     // =========================================================================
     // HIP Validation Kernels
@@ -74,6 +123,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
         float local_min = std::numeric_limits<float>::max();
         float local_max = std::numeric_limits<float>::lowest();
 
@@ -99,6 +149,10 @@ namespace llaminar2
                 {
                     local_zero++;
                 }
+                else
+                {
+                    local_nonzero = true;
+                }
                 // Track min/max of finite values
                 local_min = fminf(local_min, val);
                 local_max = fmaxf(local_max, val);
@@ -112,24 +166,19 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_min < std::numeric_limits<float>::max() ||
-            local_max > std::numeric_limits<float>::lowest())
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         // Use atomicMin/Max for floats (reinterpret as int for ordered comparison)
         // This works because IEEE floats have the property that their bit patterns
         // sort correctly when interpreted as signed integers (for positive values)
         if (local_min < std::numeric_limits<float>::max())
         {
-            // For positive floats, we can use atomicMin on the bit pattern
-            // For negative floats, we'd need special handling, but min/max are mainly for debugging
-            atomicMin(reinterpret_cast<int *>(&s_min), __float_as_int(local_min));
+            atomicMinFloatROCm(&s_min, local_min);
         }
         if (local_max > std::numeric_limits<float>::lowest())
         {
-            atomicMax(reinterpret_cast<int *>(&s_max), __float_as_int(local_max));
+            atomicMaxFloatROCm(&s_max, local_max);
         }
 
         __syncthreads();
@@ -149,8 +198,8 @@ namespace llaminar2
                 atomicAnd(&result->appears_zero, 0u);
 
             // Update global min/max
-            atomicMin(reinterpret_cast<int *>(&result->sample_min), __float_as_int(s_min));
-            atomicMax(reinterpret_cast<int *>(&result->sample_max), __float_as_int(s_max));
+            atomicMinFloatROCm(&result->sample_min, s_min);
+            atomicMaxFloatROCm(&result->sample_max, s_max);
         }
     }
 
@@ -179,6 +228,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
 
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         size_t stride = blockDim.x * gridDim.x;
@@ -204,6 +254,10 @@ namespace llaminar2
             {
                 local_zero++;
             }
+            else
+            {
+                local_nonzero = true;
+            }
         }
 
         if (local_nan > 0)
@@ -212,10 +266,8 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_nan == 0 && local_inf == 0 && local_zero < (num_elements / (blockDim.x * gridDim.x) + 1))
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         __syncthreads();
 
@@ -259,6 +311,7 @@ namespace llaminar2
         unsigned int local_nan = 0;
         unsigned int local_inf = 0;
         unsigned int local_zero = 0;
+        bool local_nonzero = false;
 
         size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
         size_t stride = blockDim.x * gridDim.x;
@@ -284,6 +337,10 @@ namespace llaminar2
             {
                 local_zero++;
             }
+            else
+            {
+                local_nonzero = true;
+            }
         }
 
         if (local_nan > 0)
@@ -292,10 +349,8 @@ namespace llaminar2
             atomicAdd(&s_inf_count, local_inf);
         if (local_zero > 0)
             atomicAdd(&s_zero_count, local_zero);
-        if (local_nan == 0 && local_inf == 0 && local_zero < (num_elements / (blockDim.x * gridDim.x) + 1))
-        {
-            atomicAdd(&s_has_nonzero, 1u);
-        }
+        if (local_nonzero)
+            atomicOr(&s_has_nonzero, 1u);
 
         __syncthreads();
 
@@ -323,174 +378,155 @@ namespace llaminar2
     public:
         explicit ROCmTensorValidator(int device_id) : device_id_(device_id)
         {
-            // Set device before allocation to ensure buffer is on correct device
-            hipError_t err = hipSetDevice(device_id);
-            if (err != hipSuccess)
+            requireSuccess(hipSetDevice(device_id_), "hipSetDevice during construction");
+            requireSuccess(
+                hipMalloc(&d_result_, sizeof(DeviceValidationResult)),
+                "hipMalloc persistent device result");
+
+            hipError_t host_error = hipHostMalloc(
+                reinterpret_cast<void **>(&h_result_),
+                sizeof(DeviceValidationResult));
+            if (host_error != hipSuccess)
             {
-                LOG_ERROR("[ROCmTensorValidator] Failed to set device " << device_id);
+                (void)hipFree(d_result_);
                 d_result_ = nullptr;
-                return;
+                requireSuccess(host_error, "hipHostMalloc persistent host result");
             }
 
-            // Allocate device-side result buffer ON THIS DEVICE
-            err = hipMalloc(&d_result_, sizeof(DeviceValidationResult));
-            if (err != hipSuccess)
+            hipError_t event_error = hipEventCreateWithFlags(
+                &completion_event_,
+                hipEventDisableTiming);
+            if (event_error != hipSuccess)
             {
-                LOG_ERROR("[ROCmTensorValidator] Failed to allocate device result buffer on device " << device_id);
+                (void)hipHostFree(h_result_);
+                h_result_ = nullptr;
+                (void)hipFree(d_result_);
                 d_result_ = nullptr;
+                requireSuccess(event_error, "hipEventCreateWithFlags completion event");
             }
         }
 
         ~ROCmTensorValidator() override
         {
+            (void)hipSetDevice(device_id_);
+            if (completion_event_)
+                (void)hipEventDestroy(completion_event_);
+            if (h_result_)
+                (void)hipHostFree(h_result_);
             if (d_result_)
-            {
-                // Set device before freeing
-                (void)hipSetDevice(device_id_);
                 (void)hipFree(d_result_);
-                d_result_ = nullptr;
-            }
         }
 
-        bool validateFP32Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
+        [[nodiscard]] TensorValidationResult validate(
+            const void *device_ptr,
+            size_t num_elements,
+            TensorValidationDataType data_type,
+            ExplicitGPUStream producer_stream) override
         {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
+            if (!device_ptr)
+                throw std::invalid_argument("ROCmTensorValidator requires a non-null device pointer");
+            if (num_elements == 0)
+                throw std::invalid_argument("ROCmTensorValidator requires a positive element count");
 
-            // Verify we're validating on the device this validator was created for
-            if (device_id != device_id_)
+            std::lock_guard<std::mutex> invocation_lock(invocation_mutex_);
+            requireSuccess(hipSetDevice(device_id_), "hipSetDevice before validation");
+            auto stream = reinterpret_cast<hipStream_t>(producer_stream.get());
+            const int block_size = 256;
+            const int max_blocks = 1024;
+            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
+
+            hipLaunchKernelGGL(
+                initializeValidationResultROCm,
+                dim3(1),
+                dim3(1),
+                0,
+                stream,
+                d_result_);
+            requireSuccess(hipGetLastError(), "initialize validation result launch");
+
+            switch (data_type)
             {
-                LOG_WARN("[ROCmTensorValidator] Device mismatch: validator for device " << device_id_
-                         << " but asked to validate on device " << device_id);
-                return false;
+            case TensorValidationDataType::FP32:
+                hipLaunchKernelGGL(
+                    validateFP32Kernel,
+                    dim3(num_blocks),
+                    dim3(block_size),
+                    0,
+                    stream,
+                    static_cast<const float *>(device_ptr),
+                    num_elements,
+                    d_result_);
+                break;
+            case TensorValidationDataType::BF16:
+                hipLaunchKernelGGL(
+                    validateBF16Kernel,
+                    dim3(num_blocks),
+                    dim3(block_size),
+                    0,
+                    stream,
+                    static_cast<const uint16_t *>(device_ptr),
+                    num_elements,
+                    d_result_);
+                break;
+            case TensorValidationDataType::FP16:
+                hipLaunchKernelGGL(
+                    validateFP16Kernel,
+                    dim3(num_blocks),
+                    dim3(block_size),
+                    0,
+                    stream,
+                    static_cast<const uint16_t *>(device_ptr),
+                    num_elements,
+                    d_result_);
+                break;
             }
+            requireSuccess(hipGetLastError(), "tensor validation kernel launch");
 
-            hipError_t err = hipSetDevice(device_id);
-            if (err != hipSuccess)
-                return false;
+            requireSuccess(
+                hipMemcpyAsync(
+                    h_result_,
+                    d_result_,
+                    sizeof(DeviceValidationResult),
+                    hipMemcpyDeviceToHost,
+                    stream),
+                "compact validation result D2H");
+            requireSuccess(
+                hipEventRecord(completion_event_, stream),
+                "validation completion event publication");
+            requireSuccess(
+                hipEventSynchronize(completion_event_),
+                "validation completion event wait");
 
-            // Initialize result on device
-            DeviceValidationResult init = {};
-            init.appears_zero = 1; // Start assuming all zeros
-            init.sample_min = std::numeric_limits<float>::max();
-            init.sample_max = std::numeric_limits<float>::lowest();
-
-            err = hipMemcpy(d_result_, &init, sizeof(DeviceValidationResult), hipMemcpyHostToDevice);
-            if (err != hipSuccess)
-                return false;
-
-            // Launch kernel
-            const int block_size = 256;
-            const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
-
-            hipLaunchKernelGGL(validateFP32Kernel, dim3(num_blocks), dim3(block_size), 0, 0,
-                               static_cast<const float *>(device_ptr),
-                               num_elements,
-                               d_result_);
-
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool validateBF16Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
-        {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
-
-            hipError_t err = hipSetDevice(device_id);
-            if (err != hipSuccess)
-                return false;
-
-            DeviceValidationResult init = {};
-            init.appears_zero = 1;
-
-            err = hipMemcpy(d_result_, &init, sizeof(DeviceValidationResult), hipMemcpyHostToDevice);
-            if (err != hipSuccess)
-                return false;
-
-            const int block_size = 256;
-            const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
-
-            hipLaunchKernelGGL(validateBF16Kernel, dim3(num_blocks), dim3(block_size), 0, 0,
-                               static_cast<const uint16_t *>(device_ptr),
-                               num_elements,
-                               d_result_);
-
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool validateFP16Async(const void *device_ptr,
-                               size_t num_elements,
-                               int device_id) override
-        {
-            if (!d_result_ || !device_ptr || num_elements == 0)
-                return false;
-
-            hipError_t err = hipSetDevice(device_id);
-            if (err != hipSuccess)
-                return false;
-
-            DeviceValidationResult init = {};
-            init.appears_zero = 1;
-
-            err = hipMemcpy(d_result_, &init, sizeof(DeviceValidationResult), hipMemcpyHostToDevice);
-            if (err != hipSuccess)
-                return false;
-
-            const int block_size = 256;
-            const int max_blocks = 1024;
-            int num_blocks = std::min(max_blocks, (int)((num_elements + block_size - 1) / block_size));
-
-            hipLaunchKernelGGL(validateFP16Kernel, dim3(num_blocks), dim3(block_size), 0, 0,
-                               static_cast<const uint16_t *>(device_ptr),
-                               num_elements,
-                               d_result_);
-
-            last_num_elements_ = num_elements;
-            return true;
-        }
-
-        bool getResult(TensorValidationResult &result) override
-        {
-            if (!d_result_)
-                return false;
-
-            // Synchronize and copy result
-            hipError_t err = hipDeviceSynchronize();
-            if (err != hipSuccess)
-                return false;
-
-            DeviceValidationResult d_res;
-            err = hipMemcpy(&d_res, d_result_, sizeof(DeviceValidationResult), hipMemcpyDeviceToHost);
-            if (err != hipSuccess)
-                return false;
-
-            // Convert to host result struct
-            result.has_nan = (d_res.has_nan != 0);
-            result.has_inf = (d_res.has_inf != 0);
-            result.appears_zero = (d_res.appears_zero != 0);
+            TensorValidationResult result;
+            result.has_nan = (h_result_->has_nan != 0);
+            result.has_inf = (h_result_->has_inf != 0);
+            result.appears_zero = (h_result_->appears_zero != 0);
             result.valid = !result.has_nan && !result.has_inf;
-            result.nan_count = d_res.nan_count;
-            result.inf_count = d_res.inf_count;
-            result.zero_count = d_res.zero_count;
-            result.total_checked = static_cast<uint32_t>(last_num_elements_);
-            result.sample_min = d_res.sample_min;
-            result.sample_max = d_res.sample_max;
-
-            return true;
+            result.nan_count = h_result_->nan_count;
+            result.inf_count = h_result_->inf_count;
+            result.zero_count = h_result_->zero_count;
+            result.total_checked = static_cast<uint32_t>(
+                std::min(num_elements, static_cast<size_t>(UINT32_MAX)));
+            result.sample_min = h_result_->sample_min;
+            result.sample_max = h_result_->sample_max;
+            return result;
         }
 
     private:
+        static void requireSuccess(hipError_t error, const char *operation)
+        {
+            if (error == hipSuccess)
+                return;
+            throw std::runtime_error(
+                std::string("ROCmTensorValidator ") + operation + " failed: " +
+                hipGetErrorString(error));
+        }
+
         DeviceValidationResult *d_result_ = nullptr;
-        size_t last_num_elements_ = 0;
+        DeviceValidationResult *h_result_ = nullptr;
+        hipEvent_t completion_event_ = nullptr;
         int device_id_ = -1;
+        std::mutex invocation_mutex_;
     };
 
     // =========================================================================
@@ -499,6 +535,28 @@ namespace llaminar2
 
     static std::mutex g_rocm_validator_mutex;
     static std::unordered_map<int, std::unique_ptr<ROCmTensorValidator>> g_rocm_validators;
+
+    ITensorValidator *getROCmTensorValidator(int device_id)
+    {
+        if (device_id < 0)
+        {
+            LOG_ERROR("[getROCmTensorValidator] Invalid device ordinal " << device_id);
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+
+        auto it = g_rocm_validators.find(device_id);
+        if (it == g_rocm_validators.end())
+        {
+            auto validator = std::make_unique<ROCmTensorValidator>(device_id);
+            auto *ptr = validator.get();
+            g_rocm_validators[device_id] = std::move(validator);
+            LOG_DEBUG("[getROCmTensorValidator] Created validator for device " << device_id);
+            return ptr;
+        }
+        return it->second.get();
+    }
 
     ITensorValidator *getROCmTensorValidator()
     {
@@ -511,19 +569,29 @@ namespace llaminar2
             return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+        return getROCmTensorValidator(device_id);
+    }
 
-        auto it = g_rocm_validators.find(device_id);
-        if (it == g_rocm_validators.end())
+    /**
+     * @brief Destroy one validator before its HIP runtime generation resets.
+     *
+     * Registry publication is removed before destructor work enters HIP, so no
+     * caller can acquire a validator whose device allocation or completion
+     * event is in the process of retirement.
+     */
+    bool retireROCmTensorValidatorRuntimeGeneration(int device_id)
+    {
+        std::unique_ptr<ROCmTensorValidator> retired;
         {
-            // Create a new validator for this device
-            auto validator = std::make_unique<ROCmTensorValidator>(device_id);
-            auto* ptr = validator.get();
-            g_rocm_validators[device_id] = std::move(validator);
-            LOG_DEBUG("[getROCmTensorValidator] Created validator for device " << device_id);
-            return ptr;
+            std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+            const auto iterator = g_rocm_validators.find(device_id);
+            if (iterator == g_rocm_validators.end())
+                return true;
+            retired = std::move(iterator->second);
+            g_rocm_validators.erase(iterator);
         }
-        return it->second.get();
+        retired.reset();
+        return true;
     }
 
 } // namespace llaminar2
@@ -532,4 +600,16 @@ namespace llaminar2
 extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidator()
 {
     return llaminar2::getROCmTensorValidator();
+}
+
+extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidatorForDevice(int device_id)
+{
+    return llaminar2::getROCmTensorValidator(device_id);
+}
+
+/** @brief C-linkage retirement hook owned by ROCm backend lifecycle code. */
+extern "C" bool llaminar2_retireROCmTensorValidatorRuntimeGeneration(
+    int device_id)
+{
+    return llaminar2::retireROCmTensorValidatorRuntimeGeneration(device_id);
 }

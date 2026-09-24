@@ -7,19 +7,28 @@
  * HiddenStateRowSelectStage so replay-param updates are exercised across real
  * lengths. The graph is intentionally tiny so the test isolates cache lifecycle
  * behavior while still using DeviceGraphExecutor, backend streams, and HIP/CUDA
- * graph capture/replay.
+ * graph capture/replay. Deferred decode additionally proves that a private
+ * sampler-stream handoff never suppresses public tensor event publication to
+ * a pipeline transfer consumer.
  * Backend-specific wrapper files provide the registration/support/device hooks.
  */
 
 #pragma once
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/BackendManager.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/compute_stages/stages/OrdinaryGenerationSamplingStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
+#include "execution/mtp/DeviceGenerationContract.h"
+#include "execution/mtp/DeviceGenerationGraphProgram.h"
+#include "execution/mtp/HostedDeviceGenerationLifecycle.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
@@ -27,15 +36,19 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
+#include "../../../utils/GraphArenaTestHarness.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -48,7 +61,8 @@ using namespace llaminar2;
 namespace
 {
     constexpr int kExactBucketSeqLen = 64;
-    constexpr int kLargeBucketSeqLen = 128;
+    constexpr int kLargeBucketSeqLen = 4096;
+    constexpr int kLongContextSeqLen = 256 * 1024 + 1;
     constexpr int kHiddenDim = 64;
     constexpr int kKVProbeHeadDim = 32;
     constexpr int kKVProbeHeads = 1;
@@ -128,11 +142,9 @@ namespace
     /**
      * @brief Capturable one-kernel GPU stage used by the prefill cache test.
      *
-     * The stage opts out of executor-managed coherence because this test does
-     * not use a BufferArena. Instead, it performs the minimal tensor uploads and
-     * output state transitions needed for graph capture. The actual work is the
-     * backend residual-add kernel, so HIP/CUDA graph capture records real GPU
-     * nodes rather than a mock callback.
+     * The stage uses the same BufferArena contract and prepared-input API as a
+     * production stage. The actual work is the backend residual-add kernel, so
+     * HIP/CUDA graph capture records real GPU nodes rather than a mock callback.
      */
     class GPUResidualAddProbeStage final : public IComputeStage
     {
@@ -163,15 +175,15 @@ namespace
                 return false;
             }
 
-            // Warmup uploads happen before capture. During capture, these calls
-            // only verify the already-resident device buffers and avoid syncs.
-            if (!input_->ensureOnDevice(device(), gpuStream()) ||
-                !residual_->ensureOnDevice(device(), gpuStream()) ||
-                !output_->allocateOnDevice(device(), gpuStream()))
-            {
-                LOG_ERROR("[GPUResidualAddProbeStage] Failed to prepare GPU tensors");
-                return false;
-            }
+            /*
+             * DeviceGraphExecutor owns all movement and storage preparation.
+             * The stage may only consume the exact device buffers established
+             * from bufferContract() on its producer stream.
+             */
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(input_);
+            execution.requirePreparedInput(residual_);
+            execution.requirePreparedOutput(output_);
 
             ITensorResidualAdd *kernel = nullptr;
             try
@@ -197,8 +209,7 @@ namespace
                 return false;
 
             ++execute_count_;
-            output_->transitionToWithEvent(
-                TensorCoherenceState::DEVICE_AUTHORITATIVE, device(), gpuStream());
+            TransferEngine::publishDeviceWrite(output_, device(), gpuStream());
             return true;
         }
 
@@ -211,19 +222,15 @@ namespace
                    backend == ComputeBackendType::GPU_ROCM;
         }
 
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
-        bool isGraphCapturable() const override { return true; }
-        bool needsOnGraphReplayed() const override { return true; }
-
-        void onGraphReplayed() override
+        StageBufferContract bufferContract() const override
         {
-            ++replay_callback_count_;
-            if (output_)
-            {
-                output_->transitionToWithEvent(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE, device(), gpuStream());
-            }
+            return StageBufferContract::build()
+                .addInput(BufferId::HIDDEN_STATE)
+                .addInput(BufferId::RESIDUAL)
+                .addOutput(BufferId::ATTN_OUTPUT);
         }
+
+        bool isGraphCapturable() const override { return true; }
 
         size_t estimatedFlops() const override
         {
@@ -236,7 +243,6 @@ namespace
         }
 
         int executeCount() const { return execute_count_; }
-        int replayCallbackCount() const { return replay_callback_count_; }
 
     private:
         StageDumpInfo buildDumpInfoImpl() const override
@@ -255,40 +261,26 @@ namespace
         int rows_ = 0;
         int cols_ = 0;
         int execute_count_ = 0;
-        int replay_callback_count_ = 0;
     };
 
     /**
-     * @brief Row-select probe that keeps real kernels but disables arena coherence.
+     * @brief RoPE probe that keeps production dynamic-position behavior.
      *
-     * The shared graph-cache fixture does not allocate a BufferArena; tensors are
-     * managed directly by the synthetic stages. This subclass preserves the
-     * production HiddenStateRowSelectStage replay-param behavior while matching
-     * the fixture's manual-coherence contract.
+     * This subclass changes only backend eligibility for the small integration
+     * graph. Buffer ownership and stream ordering remain the production
+     * RoPEStage contract.
      */
-    class GPUHiddenStateRowSelectProbeStage final : public HiddenStateRowSelectStage
+    class GPURoPEProbeStage final : public RoPEStage
     {
     public:
-        explicit GPUHiddenStateRowSelectProbeStage(HiddenStateRowSelectStage::Params params)
-            : HiddenStateRowSelectStage(std::move(params)) {}
+        explicit GPURoPEProbeStage(RoPEStage::Params params)
+            : RoPEStage(std::move(params)) {}
 
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
-    };
-
-    /**
-     * @brief KV-cache append probe that keeps production replay-param behavior.
-     *
-     * The synthetic graph owns tensors directly rather than through BufferArena,
-     * so this subclass disables executor coherence while still using the real
-     * backend KV cache append kernels and host-side replay callback contract.
-     */
-    class GPUKVCacheAppendProbeStage final : public KVCacheAppendStage
-    {
-    public:
-        explicit GPUKVCacheAppendProbeStage(KVCacheAppendStage::Params params)
-            : KVCacheAppendStage(std::move(params)) {}
-
-        CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::GPU_CUDA ||
+                   backend == ComputeBackendType::GPU_ROCM;
+        }
     };
 
     /**
@@ -297,9 +289,205 @@ namespace
     class PrefillGraphCacheTestHost final : public IForwardExecutionHost
     {
     public:
-        PrefillGraphCacheTestHost(DeviceId device, IDeviceContext *ctx)
-            : device_(device), ctx_(ctx)
+        PrefillGraphCacheTestHost(
+            DeviceId device,
+            IDeviceContext *ctx,
+            test::GraphArenaTestHarness *arena_harness)
+            : device_(device), ctx_(ctx), arena_harness_(arena_harness)
         {
+            initializePersistentArenaTensors();
+        }
+
+        ~PrefillGraphCacheTestHost() override
+        {
+            if (!resident_length_backend_)
+                return;
+
+            /*
+             * Integration teardown is an explicit host ownership boundary. The
+             * test has already materialized its final graph output, but drain
+             * once before releasing the admission event and storage so a failed
+             * assertion cannot let asynchronous GPU work outlive this fixture.
+             */
+            if (ctx_)
+                (void)ctx_->synchronize();
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (resident_length_event_)
+                resident_length_backend_->destroyEvent(
+                    resident_length_event_,
+                    ordinal);
+            if (resident_length_device_)
+                resident_length_backend_->free(
+                    resident_length_device_,
+                    ordinal);
+            if (resident_length_host_)
+                resident_length_backend_->freePinned(
+                    resident_length_host_,
+                    ordinal);
+            if (resident_position_ids_device_)
+                resident_length_backend_->free(
+                    resident_position_ids_device_,
+                    ordinal);
+            if (resident_position_ids_host_)
+                resident_length_backend_->freePinned(
+                    resident_position_ids_host_,
+                    ordinal);
+        }
+
+        /**
+         * @brief Admit one real request length into persistent device storage.
+         *
+         * This is the small integration equivalent of
+         * DeviceGraphOrchestrator::admitRequestInputsOnDevice(). The allocation
+         * and readiness event are persistent; each invocation changes only the
+         * pinned source scalar and enqueues one H2D admission copy. The forward
+         * prelude consumes the event with a GPU-side wait, so no host stream or
+         * device synchronization enters the execution path.
+         */
+        bool admitResidentRequestLength(int real_seq_len)
+        {
+            return admitResidentRequestMetadata(
+                real_seq_len,
+                /*position_ids=*/nullptr,
+                /*position_row_count=*/0);
+        }
+
+        /**
+         * @brief Admit real-row count and absolute positions as one GPU transaction.
+         *
+         * The pinned source storage, device destination storage, producer
+         * stream, and publication event all persist for the fixture lifetime.
+         * Replays therefore mutate only buffer contents while every captured
+         * kernel retains the same device address. The event is recorded after
+         * both H2D copies, making one stream wait sufficient to order every
+         * request-metadata consumer.
+         *
+         * @param real_seq_len Number of non-padding rows in the request.
+         * @param position_ids Flattened absolute position rows, or null when
+         *        this invocation only needs resident length metadata.
+         * @param position_row_count Physical number of position rows.
+         * @return true after the complete metadata transaction is enqueued.
+         */
+        bool admitResidentRequestMetadata(
+            int real_seq_len,
+            const int *position_ids,
+            int position_row_count)
+        {
+            if (real_seq_len <= 0 || !device_.is_gpu())
+                return false;
+            if ((position_ids == nullptr) != (position_row_count == 0) ||
+                position_row_count < 0)
+            {
+                return false;
+            }
+
+            if (!resident_length_backend_)
+            {
+                resident_length_backend_ = getBackendFor(device_);
+                if (!resident_length_backend_)
+                    return false;
+
+                const int ordinal = device_.toKernelDeviceIndex();
+                resident_length_device_ =
+                    resident_length_backend_->allocate(
+                        sizeof(int32_t),
+                        ordinal);
+                resident_length_host_ =
+                    static_cast<int32_t *>(
+                        resident_length_backend_->allocatePinned(
+                            sizeof(int32_t),
+                            ordinal));
+                resident_length_event_ =
+                    resident_length_backend_->createEvent(ordinal);
+                IWorkerGPUContext *gpu_ctx = getWorkerGPUContext(device_);
+                if (gpu_ctx)
+                {
+                    /*
+                     * The worker creates its default stream during asynchronous
+                     * context initialization. Reading defaultStream() directly
+                     * from the test thread races that publication and can
+                     * observe a transient null handle. Resolve the stream on
+                     * the owning worker after initialization has completed;
+                     * subsequent admission copies may enqueue against the
+                     * stable CUDA/HIP stream handle from any host thread.
+                     */
+                    gpu_ctx->submitAndWait([&]()
+                    {
+                        resident_length_producer_stream_ =
+                            gpu_ctx->defaultStream();
+                    });
+                }
+                if (!resident_length_device_ ||
+                    !resident_length_host_ ||
+                    !resident_length_event_ ||
+                    !resident_length_producer_stream_)
+                {
+                    return false;
+                }
+            }
+
+            if (position_row_count > 0 &&
+                !ensureResidentPositionCapacity(position_row_count))
+            {
+                return false;
+            }
+
+            *resident_length_host_ = static_cast<int32_t>(real_seq_len);
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (!resident_length_backend_->hostToDeviceOnStream(
+                    resident_length_device_,
+                    resident_length_host_,
+                    sizeof(int32_t),
+                    ordinal,
+                    resident_length_producer_stream_))
+            {
+                return false;
+            }
+
+            if (position_row_count > 0)
+            {
+                static_assert(
+                    sizeof(int) == sizeof(int32_t),
+                    "Resident position admission requires 32-bit host ints");
+                const size_t position_bytes =
+                    static_cast<size_t>(position_row_count) * sizeof(int32_t);
+                std::memcpy(
+                    resident_position_ids_host_,
+                    position_ids,
+                    position_bytes);
+                if (!resident_length_backend_->hostToDeviceOnStream(
+                        resident_position_ids_device_,
+                        resident_position_ids_host_,
+                        position_bytes,
+                        ordinal,
+                        resident_length_producer_stream_))
+                {
+                    return false;
+                }
+            }
+
+            if (!resident_length_backend_->recordEvent(
+                    resident_length_event_,
+                    ordinal,
+                    resident_length_producer_stream_))
+            {
+                return false;
+            }
+            resident_length_pending_ = true;
+            resident_position_ids_pending_ = position_row_count > 0;
+            return true;
+        }
+
+        /// @brief Return the stable device owner used by padded graph kernels.
+        const int32_t *residentRequestLengthDevice() const
+        {
+            return static_cast<const int32_t *>(resident_length_device_);
+        }
+
+        /// @brief Return the stable device owner for admitted absolute positions.
+        const int32_t *residentPositionIdsDevice() const
+        {
+            return static_cast<const int32_t *>(resident_position_ids_device_);
         }
 
         GraphBuildResult buildForwardGraph(const ForwardInput &input) override
@@ -312,55 +500,25 @@ namespace
             stage_ = nullptr;
             row_select_stage_ = nullptr;
             kv_append_stage_ = nullptr;
+            rope_stage_ = nullptr;
 
             if (input.device != device_ || input.seq_len <= 0)
                 return GraphBuildResult("invalid input for GPU prefill graph cache test");
+            if (!arena_bindings_ready_)
+                return GraphBuildResult("failed to initialize persistent arena bindings");
+            if (input.seq_len > kLargeBucketSeqLen)
+                return GraphBuildResult("prefill graph cache test exceeded persistent bucket capacity");
 
-            if (use_kv_append_probe_ && !kv_cache_)
+            if (use_kv_append_probe_ &&
+                !initializeKVCacheProbeForTesting())
             {
-                try
-                {
-                    llaminar::v2::kernels::KVCacheConfig config;
-                    config.precision = ActivationPrecision::FP32;
-                    config.device = device_;
-                    config.num_layers = 1;
-                    config.batch_size = 1;
-                    config.max_seq_len = 512;
-                    config.n_kv_heads = kKVProbeHeads;
-                    config.head_dim = kKVProbeHeadDim;
-                    kv_cache_ = llaminar::v2::kernels::KernelFactory::createKVCache(config);
-                }
-                catch (const std::exception &e)
-                {
-                    return GraphBuildResult(std::string("failed to create GPU KV cache probe: ") + e.what());
-                }
-                if (!kv_cache_)
-                    return GraphBuildResult("failed to create GPU KV cache probe");
+                return GraphBuildResult(
+                    "failed to create GPU KV cache probe");
             }
 
-            auto input_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-            auto residual_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-            auto output_tensor = std::make_unique<FP32Tensor>(
-                std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kHiddenDim)},
-                DeviceId::cpu());
-
-            const size_t count = static_cast<size_t>(input.seq_len) * static_cast<size_t>(kHiddenDim);
-            for (size_t i = 0; i < count; ++i)
-            {
-                input_tensor->mutable_data()[i] = 1.0f + static_cast<float>(i % 17) * 0.125f;
-                residual_tensor->mutable_data()[i] = 0.25f + static_cast<float>(i % 13) * 0.0625f;
-            }
-
-            FP32Tensor *input_ptr = input_tensor.get();
-            FP32Tensor *residual_ptr = residual_tensor.get();
-            FP32Tensor *residual_output_ptr = output_tensor.get();
-            tensors_.push_back(std::move(input_tensor));
-            tensors_.push_back(std::move(residual_tensor));
-            tensors_.push_back(std::move(output_tensor));
+            FP32Tensor *input_ptr = input_tensor_;
+            FP32Tensor *residual_ptr = residual_tensor_;
+            FP32Tensor *residual_output_ptr = residual_output_tensor_;
 
             auto stage = std::make_unique<GPUResidualAddProbeStage>(
                 "gpu_residual_add_probe",
@@ -375,35 +533,28 @@ namespace
             ComputeGraph graph;
             graph.addNode("gpu_residual_add_probe", std::move(stage), device_);
 
+            if (embedding_table_)
+            {
+                // The production embedding is the producer of HIDDEN_STATE;
+                // no host token upload or test copy substitutes for this edge.
+                EmbeddingStage::Params embedding;
+                embedding.device_id = device_;
+                embedding.embed_table = embedding_table_;
+                embedding.token_ids_device = input.token_ids_device;
+                embedding.output = input_ptr;
+                embedding.num_tokens = input.seq_len;
+                embedding.d_model = kHiddenDim;
+                embedding.vocab_size = static_cast<int>(embedding_table_->rows());
+                embedding.output_buffer_id = BufferId::HIDDEN_STATE;
+                graph.addNode("resident_embedding",
+                    std::make_unique<EmbeddingStage>(embedding), device_);
+                graph.addDependency("gpu_residual_add_probe", "resident_embedding");
+            }
+
             if (use_kv_append_probe_)
             {
-                auto k_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kKVProbeDim)},
-                    DeviceId::cpu());
-                auto v_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{static_cast<size_t>(input.seq_len), static_cast<size_t>(kKVProbeDim)},
-                    DeviceId::cpu());
-
-                const int real_seq_len = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
-                for (int row = 0; row < input.seq_len; ++row)
-                {
-                    const bool hostile_pad = row >= real_seq_len;
-                    for (int col = 0; col < kKVProbeDim; ++col)
-                    {
-                        const size_t idx = static_cast<size_t>(row) * kKVProbeDim + col;
-                        k_tensor->mutable_data()[idx] = hostile_pad
-                                                            ? 11.0f + static_cast<float>(col) * 0.125f
-                                                            : 0.01f * static_cast<float>((row + col) % 19 + 1);
-                        v_tensor->mutable_data()[idx] = hostile_pad
-                                                            ? 29.0f + static_cast<float>(row - real_seq_len) * 3.0f
-                                                            : 0.02f * static_cast<float>((row * 3 + col) % 23 + 1);
-                    }
-                }
-
-                FP32Tensor *k_ptr = k_tensor.get();
-                FP32Tensor *v_ptr = v_tensor.get();
-                tensors_.push_back(std::move(k_tensor));
-                tensors_.push_back(std::move(v_tensor));
+                FP32Tensor *k_ptr = k_tensor_;
+                FP32Tensor *v_ptr = v_tensor_;
 
                 KVCacheAppendStage::Params kv_params;
                 kv_params.K = k_ptr;
@@ -416,8 +567,12 @@ namespace
                 kv_params.batch_size = 1;
                 kv_params.head_dim = kKVProbeHeadDim;
                 kv_params.device_id = device_;
+                kv_params.request_sequence_lengths_device =
+                    input.sequence_lengths_device;
+                kv_params.k_buffer_id = BufferId::K_PROJ;
+                kv_params.v_buffer_id = BufferId::V_PROJ;
 
-                auto kv_stage = std::make_unique<GPUKVCacheAppendProbeStage>(kv_params);
+                auto kv_stage = std::make_unique<KVCacheAppendStage>(kv_params);
                 kv_append_stage_ = kv_stage.get();
                 graph.addNode("kv_append_probe", std::move(kv_stage), device_);
                 graph.addDependency("kv_append_probe", "gpu_residual_add_probe");
@@ -425,10 +580,7 @@ namespace
 
             if (use_row_select_probe_)
             {
-                auto selected_row_tensor = std::make_unique<FP32Tensor>(
-                    std::vector<size_t>{1, static_cast<size_t>(kHiddenDim)},
-                    DeviceId::cpu());
-                output_tensor_ = selected_row_tensor.get();
+                output_tensor_ = selected_row_tensor_;
 
                 const int initial_real_seq_len = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
                 HiddenStateRowSelectStage::Params row_params;
@@ -438,15 +590,48 @@ namespace
                 row_params.d_model = kHiddenDim;
                 row_params.selected_row_idx = initial_real_seq_len - 1;
                 row_params.device_id = device_;
+                row_params.selection_policy =
+                    input.sequence_lengths_device
+                        ? HiddenStateRowSelectStage::SelectionPolicy::
+                              DeviceResidentRequestLength
+                        : HiddenStateRowSelectStage::SelectionPolicy::
+                              DynamicDeviceScalar;
+                row_params.request_sequence_length_device =
+                    input.sequence_lengths_device;
+                row_params.input_buffer_id = BufferId::ATTN_OUTPUT;
+                row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
 
-                auto row_select_stage = std::make_unique<GPUHiddenStateRowSelectProbeStage>(row_params);
+                auto row_select_stage = std::make_unique<HiddenStateRowSelectStage>(row_params);
                 row_select_stage_ = row_select_stage.get();
-                tensors_.push_back(std::move(selected_row_tensor));
                 graph.addNode("hidden_state_row_select", std::move(row_select_stage), device_);
                 graph.addDependency("hidden_state_row_select", "gpu_residual_add_probe");
             }
             else
             {
+                output_tensor_ = residual_output_ptr;
+            }
+
+            if (use_rope_probe_)
+            {
+                RoPEStage::Params rope_params;
+                rope_params.Q = residual_output_ptr;
+                rope_params.K = nullptr;
+                rope_params.n_heads = 1;
+                rope_params.n_kv_heads = 0;
+                rope_params.head_dim = kHiddenDim;
+                rope_params.pos_offset = input.position_offset;
+                rope_params.theta_base = 10000.0f;
+                rope_params.seq_len = input.seq_len;
+                rope_params.partial_rotary_factor = 1.0f;
+                rope_params.position_ids = input.position_ids;
+                rope_params.position_ids_device = input.position_ids_device;
+                rope_params.device_id = device_;
+                rope_params.q_buffer_id = BufferId::ATTN_OUTPUT;
+
+                auto rope_stage = std::make_unique<GPURoPEProbeStage>(rope_params);
+                rope_stage_ = rope_stage.get();
+                graph.addNode("rope_position_probe", std::move(rope_stage), device_);
+                graph.addDependency("rope_position_probe", "gpu_residual_add_probe");
                 output_tensor_ = residual_output_ptr;
             }
 
@@ -462,9 +647,16 @@ namespace
             return device == device_ ? ctx_ : nullptr;
         }
 
-        std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override
+        IWorkerGPUContext *getWorkerGPUContext(DeviceId device) override
         {
-            return {{device_, ctx_}};
+            if (device != device_ || !device.is_gpu())
+                return nullptr;
+            return &GPUDeviceContextPool::instance().getContext(device);
+        }
+
+        bool workerGPUContextUsesProcessPool(DeviceId device) const override
+        {
+            return device == device_ && device.is_gpu();
         }
 
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph, int workspace_seq_len) override
@@ -502,22 +694,132 @@ namespace
             return true;
         }
 
-        void syncLogitsAtBoundary(IDeviceContext *ctx) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override
         {
             ++sync_logits_calls;
-            if (ctx)
-                ctx->synchronize();
+            if (!ctx || !ctx->isGPU() || !output.execution.stream ||
+                !output.logits || output.logits != output_tensor_)
+                return false;
+
+            /*
+             * Mirror the production device result boundary exactly. Tensor
+             * event records made while capture is active are graph nodes rather
+             * than replay-completion fences, so republish the graph-declared
+             * tensor after executable launch without forcing host visibility.
+             */
+            TransferEngine::publishDeviceWrite(
+                output.logits,
+                ctx->deviceId(),
+                output.execution.stream);
+            return true;
         }
 
-        TensorBase *logitsTensor() override { return output_tensor_; }
-
-        DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
-            bool, IDeviceContext *, int) const override
+        void commitSuccessfulForwardOutput(
+            const ForwardOutput &output) override
         {
-            return {};
+            if (!output.execution.valid || !output.execution.stream ||
+                output.execution.device != device_ ||
+                output.logits != output_tensor_)
+            {
+                throw std::logic_error(
+                    "Prefill graph fixture received an invalid successful-output publication");
+            }
+            ++committed_forward_output_calls;
+            last_committed_logits = output.logits;
+            last_committed_execution = output.execution;
         }
 
-        PPCopyInfo resolvePPCopyInfo(const ForwardInput &) const override { return {}; }
+        bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override
+        {
+            if (!resident_length_pending_)
+                return true;
+            if (!resident_length_backend_ ||
+                !resident_length_event_ ||
+                !resident_length_producer_stream_ ||
+                !execution_stream ||
+                execution_device != device_ ||
+                input.sequence_lengths_device != residentRequestLengthDevice() ||
+                (resident_position_ids_pending_ &&
+                 input.position_ids_device != residentPositionIdsDevice()))
+            {
+                return false;
+            }
+
+            if (execution_stream != resident_length_producer_stream_ &&
+                !resident_length_backend_->streamWaitEvent(
+                    execution_stream,
+                    resident_length_event_,
+                    device_.toKernelDeviceIndex()))
+            {
+                return false;
+            }
+            resident_length_pending_ = false;
+            resident_position_ids_pending_ = false;
+            return true;
+        }
+
+        /**
+         * @brief Select the probe's declared captured execution policy.
+         * @return Full native replay for deferred decode; segmentation only
+         *         when the fixture explicitly declares a heterogeneous boundary.
+         */
+        DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
+            bool, IDeviceContext *) const override
+        {
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay =
+                heterogeneous_segmented_prefill_ || deferred_decode_;
+            policy.heterogeneous_segmented_enabled =
+                heterogeneous_segmented_prefill_;
+            if (heterogeneous_segmented_prefill_)
+            {
+                policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        AllowHeterogeneousBoundarySegmentation;
+            }
+            return policy;
+        }
+
+        /** @brief Enable the ordinary asynchronous graph-to-sampler contract. */
+        void enableDeferredDecodeProbe() { deferred_decode_ = true; }
+
+        /** @return Whether the test's sampler consumes graph completion on device. */
+        bool shouldDeferMainDecodeFinalSync() const override
+        {
+            return deferred_decode_;
+        }
+
+        /** @brief Retain the private handoff independently of tensor publication. */
+        void setPendingMainDecodeStream(void *stream) override
+        {
+            deferred_decode_stream = stream;
+        }
+
+        /**
+         * @brief Bind an optional PP ingress to the retained graph's input.
+         *
+         * The caller owns the upstream tensor; the arena owns the destination.
+         * This is the same copy contract used by a non-embedding model stage,
+         * without introducing a test-only copy inside the compute graph.
+         */
+        PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override
+        {
+            if (!input.external_hidden_state)
+                return {};
+            PPCopyInfo info;
+            info.external_hidden = input.external_hidden_state;
+            info.working_buffer = input_tensor_;
+            info.device = device_;
+            info.copy_bytes = static_cast<size_t>(input.seq_len) *
+                              static_cast<size_t>(kHiddenDim) * sizeof(float);
+            info.needs_copy = true;
+            return info;
+        }
 
         uint64_t moePlacementEpoch() const override { return placement_epoch; }
         std::string prefillGraphDomainId() const override { return domain_id; }
@@ -557,8 +859,133 @@ namespace
         /// @brief Enable the row-select replay-param consumer for padded bucket tests.
         void setUseRowSelectProbe(bool enabled) { use_row_select_probe_ = enabled; }
 
+        /**
+         * @brief Route prefill through the production segmented graph authority.
+         *
+         * This exercises the lifecycle used by explicitly heterogeneous
+         * inference domains while retaining the same small real GPU kernel.
+         */
+        void setHeterogeneousSegmentedPrefill(bool enabled)
+        {
+            heterogeneous_segmented_prefill_ = enabled;
+        }
+
+        /**
+         * @brief Prepare immutable external inputs before segmented capture.
+         *
+         * Production arena admission establishes these device copies before
+         * capture preflight. This fixture normally lets monolithic warmup do
+         * that work implicitly, so the segmented regression performs the
+         * equivalent one-time setup explicitly and outside inference timing.
+         */
+        bool preparePersistentGraphInputsForTesting()
+        {
+            if (!device_.is_gpu() || !input_tensor_ || !residual_tensor_)
+                return false;
+
+            IWorkerGPUContext *gpu_ctx = getWorkerGPUContext(device_);
+            IBackend *backend = getBackendFor(device_);
+            if (!gpu_ctx || !backend)
+                return false;
+
+            void *stream = nullptr;
+            gpu_ctx->submitAndWait([&]() { stream = gpu_ctx->defaultStream(); });
+            return stream &&
+                   input_tensor_->ensureOnDevice(device_, stream) &&
+                   residual_tensor_->ensureOnDevice(device_, stream) &&
+                   backend->synchronizeStream(
+                       stream, device_.toKernelDeviceIndex());
+        }
+
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
+
+        /**
+         * @brief Materialize the persistent KV probe before graph construction.
+         *
+         * Device-owned chunk materialization binds the canonical cached-token
+         * address as graph identity. The cache therefore has to exist before
+         * ForwardExecutionEngine asks this host to build its first graph.
+         */
+        bool initializeKVCacheProbeForTesting()
+        {
+            if (!use_kv_append_probe_)
+                return false;
+            if (kv_cache_)
+                return true;
+            try
+            {
+                llaminar::v2::kernels::KVCacheConfig config;
+                config.precision = ActivationPrecision::FP32;
+                config.device = device_;
+                config.num_layers = 1;
+                config.batch_size = 1;
+                config.max_seq_len = kv_cache_capacity_;
+                config.n_kv_heads = kKVProbeHeads;
+                config.head_dim = kKVProbeHeadDim;
+                kv_cache_ =
+                    llaminar::v2::kernels::KernelFactory::createKVCache(
+                        config);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[PrefillGraphCacheTestHost] Failed to initialize KV probe: "
+                          << e.what());
+                return false;
+            }
+            return kv_cache_ != nullptr;
+        }
+
+        /** @return Canonical device progress address owned by the KV probe. */
+        const int32_t *kvSequenceCachedTokensDeviceForTesting() const
+        {
+            return kv_cache_
+                       ? kv_cache_->deviceSequenceCachedTokenCountPtr(0)
+                       : nullptr;
+        }
+
+        /** @brief Reset real cache data on its exact fixture stream, preserving captured addresses. */
+        bool resetKVCacheProbeForTesting(void *stream)
+        {
+            return kv_cache_ && stream && kv_cache_->resetRequestState(
+                IKVCache::StateResetContext::testReinitialization(stream, "resident-generation-reset"));
+        }
+
+        /**
+         * @brief Set the logical capacity of the lazily-created KV probe.
+         *
+         * The capacity is immutable once the cache exists because changing it
+         * would replace device addresses embedded in captured executables.
+         * Long-context tests call this before their first graph build, while
+         * ordinary lifecycle tests retain the compact default allocation.
+         *
+         * @param max_tokens Positive logical token capacity.
+         * @return true when the capacity was accepted before cache creation.
+         */
+        bool setKVCacheCapacityForTesting(int max_tokens)
+        {
+            if (max_tokens <= 0 || kv_cache_)
+                return false;
+            kv_cache_capacity_ = max_tokens;
+            return true;
+        }
+
+        /// @brief Enable the real GPU RoPE dynamic-position consumer.
+        void setUseRoPEProbe(bool enabled) { use_rope_probe_ = enabled; }
+
+        /**
+         * @brief Bind a real embedding producer before any graph is built.
+         * @param table Fixture-owned immutable weights outliving every cached graph.
+         * @return False for a late rebind or incompatible hidden geometry.
+         */
+        bool bindEmbeddingTable(FP32Tensor &table)
+        {
+            if (build_calls != 0 || embedding_table_ ||
+                table.rows() == 0 || table.cols() != kHiddenDim)
+                return false;
+            embedding_table_ = &table;
+            return true;
+        }
 
         /// @brief Make chunk maintenance emulate a placement-changing rebalance.
         void setPlacementChangingMaintenance(
@@ -579,6 +1006,33 @@ namespace
         /// @brief Return the tensor exposed as logits/hidden by the synthetic graph.
         FP32Tensor *outputTensor() const { return output_tensor_; }
 
+        /**
+         * @brief Admit the probe's constant residual operand before setup capture.
+         *
+         * Address-only materialization intentionally does not upload activation
+         * payloads. This fixture input is external to the graph just like the
+         * live upstream PP activation, and needs its own producer publication.
+         */
+        bool admitProbeResidual(void *stream)
+        {
+            if (!residual_tensor_->ensureOnDevice(device_, stream))
+                return false;
+            TransferEngine::publishDeviceWrite(residual_tensor_, device_, stream);
+            return true;
+        }
+
+        /** @brief Publish fixture-owned K/V inputs before setup-only append capture. */
+        bool admitProbeKVInputs(void *stream)
+        {
+            for (auto *tensor : {k_tensor_, v_tensor_})
+            {
+                if (!tensor->ensureOnDevice(device_, stream))
+                    return false;
+                TransferEngine::publishDeviceWrite(tensor, device_, stream);
+            }
+            return true;
+        }
+
         /// @brief Return the residual probe stage built for the cached graph.
         GPUResidualAddProbeStage *stage() const { return stage_; }
 
@@ -588,14 +1042,28 @@ namespace
         /// @brief Return the optional KV append stage built for padded bucket tests.
         KVCacheAppendStage *kvAppendStage() const { return kv_append_stage_; }
 
+        /// @brief Return the optional RoPE stage built for dynamic-position tests.
+        RoPEStage *ropeStage() const { return rope_stage_; }
+
         /// @brief Return the logical cached-token count for the probe KV cache.
         int kvCachedTokensForTesting() const
         {
             return kv_cache_ ? kv_cache_->get_cached_tokens(0, 0) : 0;
         }
 
-        /// @brief Return the device mirror of the probe KV cached-token count.
-        int kvDeviceCachedTokensForTesting() const
+        /**
+         * @brief Read the device-owned probe count on one exact observation stream.
+         *
+         * The caller must first enqueue any producer-event dependency required
+         * by that stream. Synchronizing only the observation stream then proves
+         * the transfer cannot accidentally rely on unrelated device work.
+         *
+         * @param observation_stream Explicit stream for the terminal D2H copy,
+         *        or null to use the fixture's backend stream in legacy tests.
+         * @return Cached-token count, or -1 when the observation contract fails.
+         */
+        int kvDeviceCachedTokensForTesting(
+            void *observation_stream = nullptr) const
         {
             if (!kv_cache_ || !ctx_)
                 return -1;
@@ -608,14 +1076,14 @@ namespace
                 return -1;
 
             int value = -1;
-            void *stream = nullptr;
-            if (device_.is_cuda())
+            void *stream = observation_stream;
+            if (!stream && device_.is_cuda())
             {
                 stream = GPUDeviceContextPool::instance()
                              .getNvidiaContext(device_.toKernelDeviceIndex())
                              .defaultStream();
             }
-            else if (device_.is_rocm())
+            else if (!stream && device_.is_rocm())
             {
                 stream = GPUDeviceContextPool::instance()
                              .getAMDContext(device_.toKernelDeviceIndex())
@@ -632,7 +1100,12 @@ namespace
             {
                 return -1;
             }
-            ctx_->synchronize();
+            if (!backend->synchronizeStream(
+                    stream,
+                    device_.toKernelDeviceIndex()))
+            {
+                return -1;
+            }
             return value;
         }
 
@@ -640,6 +1113,11 @@ namespace
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
         int sync_logits_calls = 0;
+        bool deferred_decode_ = false; ///< Test-only selection of the production deferred policy.
+        void *deferred_decode_stream = nullptr; ///< Exact private sampler handoff, not public tensor readiness.
+        int committed_forward_output_calls = 0;
+        TensorBase *last_committed_logits = nullptr;
+        ForwardExecutionProvenance last_committed_execution{};
         int last_workspace_seq_len = -1;
         int last_build_seq_len = 0;
         int last_build_bucket_seq_len = 0;
@@ -653,15 +1131,146 @@ namespace
         PrefillChunkMaintenanceDecision last_maintenance_decision{};
 
     private:
+        /**
+         * @brief Create one stable arena address set shared by every cached bucket.
+         *
+         * The production graph cache captures arena-owned addresses once and may
+         * retain several bucket geometries concurrently. This fixture therefore
+         * allocates the largest tested shape once, binds each semantic BufferId
+         * once, and varies only the active row count in stage parameters. A
+         * per-build rebind would invalidate older cached executables and conceal
+         * exactly the lifetime bugs this suite is intended to catch.
+         */
+        void initializePersistentArenaTensors()
+        {
+            if (!arena_harness_)
+                return;
+
+            const std::vector<size_t> hidden_shape{
+                static_cast<size_t>(kLargeBucketSeqLen),
+                static_cast<size_t>(kHiddenDim)};
+            const std::vector<size_t> kv_shape{
+                static_cast<size_t>(kLargeBucketSeqLen),
+                static_cast<size_t>(kKVProbeDim)};
+
+            input_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::HIDDEN_STATE,
+                hidden_shape,
+                DeviceId::cpu());
+            residual_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::RESIDUAL,
+                hidden_shape,
+                DeviceId::cpu());
+            residual_output_tensor_ =
+                arena_harness_->createPersistentTensor<FP32Tensor>(
+                    BufferId::ATTN_OUTPUT,
+                    hidden_shape,
+                    DeviceId::cpu());
+            selected_row_tensor_ =
+                arena_harness_->createPersistentTensor<FP32Tensor>(
+                    BufferId::LM_HEAD_INPUT_ROW,
+                std::vector<size_t>{1, static_cast<size_t>(kHiddenDim)},
+                DeviceId::cpu());
+            k_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::K_PROJ,
+                kv_shape,
+                DeviceId::cpu());
+            v_tensor_ = arena_harness_->createPersistentTensor<FP32Tensor>(
+                BufferId::V_PROJ,
+                kv_shape,
+                DeviceId::cpu());
+
+            const size_t hidden_count =
+                static_cast<size_t>(kLargeBucketSeqLen) *
+                static_cast<size_t>(kHiddenDim);
+            for (size_t i = 0; i < hidden_count; ++i)
+            {
+                input_tensor_->mutable_data()[i] =
+                    1.0f + static_cast<float>(i % 17) * 0.125f;
+                residual_tensor_->mutable_data()[i] =
+                    0.25f + static_cast<float>(i % 13) * 0.0625f;
+            }
+
+            for (int row = 0; row < kLargeBucketSeqLen; ++row)
+            {
+                for (int col = 0; col < kKVProbeDim; ++col)
+                {
+                    const size_t index =
+                        static_cast<size_t>(row) *
+                            static_cast<size_t>(kKVProbeDim) +
+                        static_cast<size_t>(col);
+                    k_tensor_->mutable_data()[index] =
+                        0.01f * static_cast<float>((row + col) % 19 + 1);
+                    v_tensor_->mutable_data()[index] =
+                        0.02f * static_cast<float>((row * 3 + col) % 23 + 1);
+                }
+            }
+
+            arena_bindings_ready_ = true;
+        }
+
+        /**
+         * @brief Materialize stable pinned/device position storage before launch.
+         *
+         * Capacity may grow only between fixture invocations, before admission
+         * is published. It never changes while an executable is capturing or
+         * replaying. Production obtains the same stronger property from
+         * BufferArena's request-input allocation.
+         */
+        bool ensureResidentPositionCapacity(int required_rows)
+        {
+            if (required_rows <= resident_position_ids_capacity_)
+                return resident_position_ids_device_ && resident_position_ids_host_;
+            if (!resident_length_backend_ || resident_length_pending_)
+                return false;
+
+            const int ordinal = device_.toKernelDeviceIndex();
+            if (resident_position_ids_device_)
+                resident_length_backend_->free(
+                    resident_position_ids_device_,
+                    ordinal);
+            if (resident_position_ids_host_)
+                resident_length_backend_->freePinned(
+                    resident_position_ids_host_,
+                    ordinal);
+            resident_position_ids_device_ = nullptr;
+            resident_position_ids_host_ = nullptr;
+            resident_position_ids_capacity_ = 0;
+
+            const size_t bytes =
+                static_cast<size_t>(required_rows) * sizeof(int32_t);
+            resident_position_ids_device_ =
+                resident_length_backend_->allocate(bytes, ordinal);
+            resident_position_ids_host_ =
+                static_cast<int32_t *>(
+                    resident_length_backend_->allocatePinned(bytes, ordinal));
+            if (!resident_position_ids_device_ || !resident_position_ids_host_)
+                return false;
+
+            resident_position_ids_capacity_ = required_rows;
+            return true;
+        }
+
         DeviceId device_;
         IDeviceContext *ctx_ = nullptr;
+        test::GraphArenaTestHarness *arena_harness_ = nullptr; ///< Borrowed stable arena/tensor owner.
+        bool arena_bindings_ready_ = false;
+        bool heterogeneous_segmented_prefill_ = false; ///< Select the heterogeneous GraphSegmentCache prefill path.
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
+        bool use_rope_probe_ = false;       ///< Whether to append real GPU RoPEStage after residual add.
+        int kv_cache_capacity_ = 512;       ///< Immutable logical capacity selected before lazy cache creation.
         bool rebalance_requested_on_boundary_ = false;
         bool bump_epoch_on_maintenance_ = false;
         uint64_t topology_delta_on_maintenance_ = 0;
         ForwardExecutionEngine *engine_to_clear_on_maintenance_ = nullptr;
-        std::vector<std::unique_ptr<FP32Tensor>> tensors_;
+        FP32Tensor *input_tensor_ = nullptr;
+        FP32Tensor *embedding_table_ = nullptr; ///< Optional borrowed producer weights, never a second token authority.
+        FP32Tensor *residual_tensor_ = nullptr;
+        FP32Tensor *residual_output_tensor_ = nullptr;
+        FP32Tensor *selected_row_tensor_ = nullptr;
+        FP32Tensor *k_tensor_ = nullptr;
+        FP32Tensor *v_tensor_ = nullptr;
         std::unique_ptr<IKVCache> kv_cache_;
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
         int workspace_seq_len_ = 0;
@@ -669,18 +1278,31 @@ namespace
         GPUResidualAddProbeStage *stage_ = nullptr;
         HiddenStateRowSelectStage *row_select_stage_ = nullptr;
         KVCacheAppendStage *kv_append_stage_ = nullptr;
+        RoPEStage *rope_stage_ = nullptr;
+        IBackend *resident_length_backend_ = nullptr; ///< Borrowed backend for request admission.
+        int32_t *resident_length_host_ = nullptr; ///< Persistent pinned scalar copied at admission.
+        void *resident_length_device_ = nullptr; ///< Persistent device INT32 real-row owner.
+        void *resident_length_event_ = nullptr; ///< Exact admission-completion event.
+        void *resident_length_producer_stream_ = nullptr; ///< Stream that publishes admission.
+        bool resident_length_pending_ = false; ///< True until the graph stream consumes the event.
+        int32_t *resident_position_ids_host_ = nullptr; ///< Persistent pinned absolute positions.
+        void *resident_position_ids_device_ = nullptr; ///< Stable device absolute-position rows.
+        int resident_position_ids_capacity_ = 0; ///< Allocated flattened position-row capacity.
+        bool resident_position_ids_pending_ = false; ///< Whether the current event publishes positions.
     };
 
     ForwardGraphSignature bucketedPrefillSignature(
         DeviceId device,
         int seq_len,
-        uint64_t moe_placement_epoch = 0)
+        uint64_t moe_placement_epoch = 0,
+        const int32_t *device_sequence_lengths = nullptr)
     {
         ForwardGraphSignature signature;
         signature.seq_len = seq_len;
         signature.batch_size = 1;
         signature.device = device;
         signature.decode = false;
+        signature.position_policy = ForwardPositionPolicy::ContiguousOffset;
         signature.standard_path = true;
         signature.pp_stage_enabled = false;
         signature.pp_first_layer = -1;
@@ -689,6 +1311,7 @@ namespace
         signature.pp_has_lm_head = false;
         signature.is_bucketed_prefill = true;
         signature.bucket_seq_len = seq_len;
+        signature.device_sequence_lengths = device_sequence_lengths;
         signature.moe_placement_epoch = moe_placement_epoch;
         return signature;
     }
@@ -765,6 +1388,44 @@ namespace
         }
     }
 
+    /**
+     * @brief Capture a stable prefix of the current probe output tensor.
+     *
+     * Prefill graph replay leaves tensors device-authoritative; FP32Tensor::data()
+     * is the fixture boundary that synchronizes the small output back to host so
+     * tests can compare graph launches without adding bespoke backend copies.
+     */
+    std::vector<float> captureProbeOutputPrefix(
+        PrefillGraphCacheTestHost &host,
+        size_t max_elements)
+    {
+        auto *output = host.outputTensor();
+        EXPECT_NE(output, nullptr);
+        if (!output)
+            return {};
+        const float *data = output->data();
+        EXPECT_NE(data, nullptr);
+        if (!data)
+            return {};
+
+        const size_t count = std::min(
+            max_elements,
+            static_cast<size_t>(kExactBucketSeqLen) * static_cast<size_t>(kHiddenDim));
+        return std::vector<float>(data, data + count);
+    }
+
+    /// @brief Return the maximum absolute elementwise difference between two vectors.
+    double maxAbsDiff(const std::vector<float> &lhs, const std::vector<float> &rhs)
+    {
+        const size_t count = std::min(lhs.size(), rhs.size());
+        double max_abs = 0.0;
+        for (size_t i = 0; i < count; ++i)
+            max_abs = std::max(max_abs, std::abs(static_cast<double>(lhs[i]) - static_cast<double>(rhs[i])));
+        if (lhs.size() != rhs.size())
+            max_abs = std::numeric_limits<double>::infinity();
+        return max_abs;
+    }
+
     class PrefillGraphCacheExecutionTest : public ::testing::Test
     {
     protected:
@@ -781,12 +1442,15 @@ namespace
             GraphExecutorConfig executor_config;
             executor_config.enable_validation = false;
             executor_ = std::make_unique<DeviceGraphExecutor>(executor_config);
+            graph_arena_.bindExecutor(*executor_);
 
             ForwardExecutionEngine::Config engine_config;
             engine_config.cache_config.enabled = true;
-            engine_config.has_unified_pp = false;
             engine_ = std::make_unique<ForwardExecutionEngine>(std::move(engine_config), *executor_);
-            host_ = std::make_unique<PrefillGraphCacheTestHost>(device_, device_ctx_.get());
+            host_ = std::make_unique<PrefillGraphCacheTestHost>(
+                device_,
+                device_ctx_.get(),
+                &graph_arena_);
         }
 
         void TearDown() override
@@ -797,12 +1461,653 @@ namespace
             device_ctx_.reset();
         }
 
+        /**
+         * @brief Execute one planned prefill chunk through resident length metadata.
+         */
+        bool runResidentPrefillChunk(
+            const ForwardInput &input,
+            const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan,
+            ForwardOutput &output)
+        {
+            if (!host_->admitResidentRequestLength(plan.chunk.real_count))
+                return false;
+            ForwardInput resident_input = input;
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->runPrefillChunk(
+                resident_input,
+                plan,
+                output,
+                *host_);
+        }
+
+        /**
+         * @brief Execute a prefill chunk with all mutable GPU metadata resident.
+         *
+         * This is the production-equivalent path used by graph replay
+         * regressions whose result depends on absolute positions. The host
+         * vectors are admission sources only; RoPE receives the persistent
+         * device pointer and the graph stream consumes one publication event.
+         */
+        bool runFullyResidentPrefillChunk(
+            const ForwardInput &input,
+            const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan,
+            ForwardOutput &output)
+        {
+            const auto &positions = plan.chunk.position_ids;
+            if (!host_->admitResidentRequestMetadata(
+                    plan.chunk.real_count,
+                    positions.data(),
+                    static_cast<int>(positions.size())))
+            {
+                return false;
+            }
+            ForwardInput resident_input = input;
+            resident_input.position_ids_device =
+                host_->residentPositionIdsDevice();
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->runPrefillChunk(
+                resident_input,
+                plan,
+                output,
+                *host_);
+        }
+
+        /**
+         * @brief Execute one raw server-style prefill through resident metadata.
+         */
+        bool executeResidentPrefill(
+            const ForwardInput &input,
+            ForwardOutput &output)
+        {
+            const int real_seq_len =
+                input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
+            if (!host_->admitResidentRequestLength(real_seq_len))
+                return false;
+            ForwardInput resident_input = input;
+            resident_input.sequence_lengths_device =
+                host_->residentRequestLengthDevice();
+            return engine_->execute(
+                resident_input,
+                output,
+                *host_);
+        }
+
+        std::unique_ptr<FP32Tensor> embedding_table_; ///< Destroyed after all native graph/arena owners, even on assertion failure.
+        test::GraphArenaTestHarness graph_arena_;
         DeviceId device_ = DeviceId::cpu();
         std::unique_ptr<IDeviceContext> device_ctx_;
         std::unique_ptr<DeviceGraphExecutor> executor_;
         std::unique_ptr<ForwardExecutionEngine> engine_;
         std::unique_ptr<PrefillGraphCacheTestHost> host_;
     };
+
+#include "Test__ResidentOrdinaryForwardCommon.inc"
+
+    /**
+     * @brief Setup-only PP graphs consume new ingress bytes on their first replay.
+     *
+     * Materialize several shapes before any inference, as the serving runner
+     * does. Revisit both shapes across request reset with different upstream
+     * payloads. All rows must match exact binary fractions, with no rebuild or
+     * recapture: initialization values are never valid inference inputs.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, SetupMaterializedPipelineIngressAcrossBucketsAndReset)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        });
+        constexpr int max_rows = 256;
+        ForwardExecutionEngine::Config engine_config;
+        engine_config.cache_config.enabled = true;
+        FactoryPPStageConfig pp_stage;
+        pp_stage.first_layer = 1;
+        pp_stage.last_layer = 2;
+        pp_stage.has_embedding = false;
+        pp_stage.has_lm_head = true;
+        engine_config.pp_stage_config = pp_stage;
+        engine_ = std::make_unique<ForwardExecutionEngine>(
+            std::move(engine_config), *executor_);
+        auto upstream = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{max_rows, kHiddenDim});
+        auto tokens = makeSequentialInts(max_rows, 1000);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.device = device_;
+        input.position_policy = ForwardPositionPolicy::ContiguousOffset;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        input.external_hidden_state = upstream.get();
+        input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        ForwardOutput output;
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        void *producer_stream = nullptr;
+        worker->submitAndWait([&]() { producer_stream = worker->defaultStream(); });
+        ASSERT_NE(producer_stream, nullptr);
+        ASSERT_TRUE(host_->admitProbeResidual(producer_stream));
+        ASSERT_TRUE(upstream->ensureOnDevice(device_, producer_stream));
+        TransferEngine::publishDeviceWrite(upstream.get(), device_, producer_stream);
+
+        for (const int rows : {64, 256})
+        {
+            input.seq_len = rows;
+            input.real_seq_len = rows;
+            input.bucket_seq_len = rows;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+        }
+        ASSERT_EQ(host_->build_calls, 2);
+        EXPECT_EQ(host_->committed_forward_output_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        for (int request = 0; request < 2; ++request)
+        {
+            for (const int rows : {64, 256, 64})
+            {
+                SCOPED_TRACE(::testing::Message() << "request=" << request << " rows=" << rows);
+                float *payload = upstream->mutable_data();
+                const size_t count = static_cast<size_t>(rows) * kHiddenDim;
+                for (size_t i = 0; i < count; ++i)
+                    payload[i] = static_cast<float>(request + rows) +
+                                 static_cast<float>(i % 7) * 0.125f;
+                ASSERT_TRUE(upstream->ensureOnDevice(device_, producer_stream));
+                TransferEngine::publishDeviceWrite(upstream.get(), device_, producer_stream);
+                input.seq_len = rows;
+                input.real_seq_len = rows;
+                input.bucket_seq_len = rows;
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                ASSERT_NE(output.logits, nullptr);
+                const auto *actual = static_cast<FP32Tensor *>(output.logits)->data();
+                for (size_t i = 0; i < count; ++i)
+                    ASSERT_EQ(actual[i], payload[i] + 0.25f +
+                                            static_cast<float>(i % 13) * 0.0625f)
+                        << "element=" << i;
+                EXPECT_EQ(host_->build_calls, 2);
+            }
+            engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host_->committed_forward_output_calls, 6);
+        for (const int rows : {64, 256})
+        {
+            auto signature = bucketedPrefillSignature(device_, rows);
+            signature.standard_path = false;
+            signature.pp_stage_enabled = true;
+            signature.pp_first_layer = pp_stage.first_layer;
+            signature.pp_last_layer = pp_stage.last_layer;
+            signature.pp_has_lm_head = true;
+            const auto snapshot = engine_->prefillGraphCacheSnapshot(
+                signature, prefillGraphKey(device_, rows));
+            ASSERT_TRUE(snapshot.has_value());
+            EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+            EXPECT_EQ(snapshot->capture_count, 1u);
+            EXPECT_EQ(snapshot->warmup_count, 0u);
+            EXPECT_EQ(snapshot->replay_count, rows == 64 ? 4 : 2);
+            EXPECT_GT(snapshot->node_count, 0u);
+        }
+    }
+
+    /**
+     * @brief A deferred decode result is published for public transfer consumers.
+     *
+     * The real captured residual kernel produces a different row on every
+     * replay. Copy it through TransferEngine before observing the destination.
+     * A private sampler handoff alone cannot order that independent transfer
+     * stream. Setup must launch nothing; request reset must preserve capture.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, DeferredDecodePublishesPipelineTransferResult)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        FP32Tensor downstream(std::vector<size_t>{1, kHiddenDim});
+        int token = 17;
+        int position = 139;
+        ForwardInput input;
+        input.token_ids = &token;
+        input.position_ids = &position;
+        input.position_offset = position;
+        input.batch_size = 1;
+        input.seq_len = 1;
+        input.real_seq_len = 1;
+        input.device = device_;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.external_hidden_state = &upstream;
+        input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        void *admission_stream = nullptr;
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&]() { admission_stream = worker->defaultStream(); });
+        ASSERT_NE(admission_stream, nullptr);
+        ASSERT_TRUE(host_->admitProbeResidual(admission_stream));
+        ASSERT_TRUE(upstream.ensureOnDevice(device_, admission_stream));
+        ASSERT_TRUE(downstream.ensureOnDevice(device_, admission_stream));
+        TransferEngine::publishDeviceWrite(&upstream, device_, admission_stream);
+        TransferEngine::publishDeviceWrite(&downstream, device_, admission_stream);
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->execute(input, output, *host_));
+        EXPECT_EQ(host_->committed_forward_output_calls, 0);
+        EXPECT_EQ(host_->sync_logits_calls, 0);
+        input.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+        for (int step = 0; step < 6; ++step)
+        {
+            SCOPED_TRACE(step);
+            auto *payload = upstream.mutable_data();
+            for (int i = 0; i < kHiddenDim; ++i)
+                payload[i] = static_cast<float>(step * 4) + static_cast<float>(i) * 0.125f;
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, admission_stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, admission_stream);
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            ASSERT_EQ(host_->deferred_decode_stream, output.execution.stream);
+            ASSERT_NE(host_->deferred_decode_stream, nullptr);
+            EXPECT_EQ(host_->sync_logits_calls, step + 1)
+                << "A private stream handoff must not suppress the public result event.";
+            const auto transfer = TransferEngine::instance().copyActivation(
+                output.hidden, &downstream, device_, kHiddenDim * sizeof(float));
+            ASSERT_TRUE(transfer.success);
+            const auto *actual = downstream.data();
+            for (int i = 0; i < kHiddenDim; ++i)
+                ASSERT_EQ(actual[i], payload[i] + 0.25f + static_cast<float>(i % 13) * 0.0625f);
+            EXPECT_EQ(host_->build_calls, 1);
+            if (step == 2)
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+        }
+        EXPECT_EQ(host_->committed_forward_output_calls, 6);
+    }
+
+    /**
+     * @brief Export and compose a real native child without an initial inference run.
+     *
+     * The same capture address survives twenty request resets. The retained
+     * parent, rather than a preparatory forward call, performs the arithmetic;
+     * its output is observed only after publishing the exact completion edge.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, UnlaunchedDecodeChildComposesAcrossRequestResets)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{139});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            ASSERT_NE(stream, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            ForwardInput input;
+            input.token_ids_device = static_cast<const int32_t *>(tokens->gpu_data_ptr());
+            input.position_ids_device = static_cast<const int32_t *>(positions->gpu_data_ptr());
+            input.position_offset = 139;
+            input.batch_size = 1;
+            input.seq_len = 1;
+            input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            const auto observations = engine_->replayCacheObservations(1);
+            ASSERT_EQ(observations.size(), 1u);
+            std::string error;
+            const auto child = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+            ASSERT_TRUE(child.has_value()) << error;
+            ASSERT_TRUE(engine_->retainedDecodeGraph(observations.front().signature, &error)) << error;
+            ASSERT_NE(child->capture, nullptr);
+            EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            EXPECT_EQ(host_->sync_logits_calls, 0);
+            auto parent = worker->createGraphCapture(stream);
+            const GPUOrderedTimelineStep steps[] = {{
+                .name = "unlaunched production forward", .capture = child->capture}};
+            ASSERT_TRUE(parent && parent->buildOrderedTimelineTransaction(steps));
+            ASSERT_TRUE(parent->instantiate());
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                // Address-only setup never uploads live activation bytes. An
+                // upstream producer admits each request before the retained
+                // child consumes it, without changing any captured address.
+                auto *payload = upstream.mutable_data();
+                for (int i = 0; i < kHiddenDim; ++i)
+                    payload[i] = static_cast<float>(request * 4) +
+                                 static_cast<float>(i % 17) * 0.125f;
+                ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+                // The setup call reuses immutable topology; it must neither
+                // execute nor replace the child borrowed by the retained parent.
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto retained = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+                ASSERT_TRUE(retained.has_value()) << error;
+                EXPECT_EQ(retained->capture, child->capture);
+                ASSERT_TRUE(parent->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                const auto *actual = static_cast<FP32Tensor *>(output.logits)->data();
+                for (int i = 0; i < kHiddenDim; ++i)
+                    ASSERT_FLOAT_EQ(actual[i], payload[i] + 0.25f +
+                                                  static_cast<float>(i % 13) * 0.0625f);
+                EXPECT_EQ(host_->build_calls, 1);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+            }
+        });
+    }
+
+    /**
+     * @brief Retained children keep their own resident RoPE input across request resets.
+     *
+     * Two equal-shape production forwards differ only by their position-row
+     * address. Each must keep its own executable. Poisoning the other bank
+     * proves that a retained parent reads the address it actually captured,
+     * while twenty resets prove content changes do not cause recapture.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, ResidentPositionOwnersRetainDistinctChildren)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        host_->setUseRoPEProbe(true);
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        std::array<INT32Tensor *, 2> positions{
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::REQUEST_POSITION_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{2}),
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::MTP_POSITION_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{17})};
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            std::fill_n(upstream.mutable_data(), kHiddenDim, 0.5f);
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            for (auto *row : positions) {
+                ASSERT_TRUE(row->ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(row, device_, stream);
+            }
+            ForwardInput input;
+            input.token_ids_device = tokens->gpu_data_ptr();
+            input.position_offset = 1;
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            std::array<ForwardGraphSignature, 2> signatures;
+            std::array<const IGPUGraphCapture *, 2> children{};
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> parents;
+            std::array<std::vector<float>, 2> expected;
+            std::string error;
+            for (int owner = 0; owner < 2; ++owner) {
+                input.position_ids_device = positions[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto observations = engine_->replayCacheObservations(1);
+                ASSERT_EQ(observations.size(), static_cast<size_t>(owner + 1));
+                for (const auto &observation : observations)
+                    if (owner == 0 || observation.signature != signatures[0])
+                        signatures[owner] = observation.signature;
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                children[owner] = child->capture;
+                parents[owner] = worker->createGraphCapture(stream);
+                const GPUOrderedTimelineStep steps[] = {{.name = "resident position owner", .capture = child->capture}};
+                ASSERT_TRUE(parents[owner] && parents[owner]->buildOrderedTimelineTransaction(steps));
+                ASSERT_TRUE(parents[owner]->instantiate() && parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                expected[owner] = captureProbeOutputPrefix(*host_, kHiddenDim);
+            }
+            ASSERT_GT(maxAbsDiff(expected[0], expected[1]), 1.0e-3);
+            EXPECT_NE(children[0], children[1]);
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                const int owner = request % 2;
+                const int32_t live = owner == 0 ? 2 : 17;
+                const int32_t poison = 1000 + request;
+                ASSERT_TRUE(backend->hostToDevice(positions[owner]->gpu_data_ptr(), &live,
+                    sizeof(live), device_.gpu_ordinal(), stream));
+                ASSERT_TRUE(backend->hostToDevice(positions[1 - owner]->gpu_data_ptr(), &poison,
+                    sizeof(poison), device_.gpu_ordinal(), stream));
+                input.position_ids_device = positions[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                EXPECT_EQ(child->capture, children[owner]);
+                ASSERT_TRUE(parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                EXPECT_EQ(captureProbeOutputPrefix(*host_, kHiddenDim), expected[owner]);
+                EXPECT_EQ(host_->build_calls, 2);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+            }
+        });
+    }
+
+    /**
+     * @brief Real embedding children retain token owners without a host replay prelude.
+     *
+     * Each owner is captured once, then only its native parent is launched.
+     * Alternating distinct token banks and poisoning the inactive bank catches
+     * both a missing cache identity and embedding-kernel pointer aliasing. The
+     * exact CPU oracle uses binary fractions, not a previous device result.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, ResidentTokenOwnersRetainDistinctEmbeddingChildren)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        constexpr int vocab = 64;
+        embedding_table_ = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{vocab, kHiddenDim});
+        auto *weights = embedding_table_->mutable_data();
+        for (int token = 0; token < vocab; ++token)
+            for (int col = 0; col < kHiddenDim; ++col)
+                weights[token * kHiddenDim + col] =
+                    static_cast<float>(token) + static_cast<float>(col) * 0.125f;
+        ASSERT_TRUE(host_->bindEmbeddingTable(*embedding_table_));
+        host_->enableDeferredDecodeProbe();
+        std::array<INT32Tensor *, 2> tokens{
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::REQUEST_TOKEN_IDS,
+                std::vector<size_t>{1}, std::vector<int32_t>{2}),
+            graph_arena_.createPersistentTensor<INT32Tensor>(BufferId::MTP_CONDITION_TOKEN,
+                std::vector<size_t>{1}, std::vector<int32_t>{17})};
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{1});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(embedding_table_->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(embedding_table_.get(), device_, stream);
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            for (auto *row : tokens) {
+                ASSERT_TRUE(row->ensureOnDevice(device_, stream));
+                TransferEngine::publishDeviceWrite(row, device_, stream);
+            }
+            ForwardInput input;
+            input.position_ids_device = positions->gpu_data_ptr();
+            input.position_offset = 1;
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            std::array<ForwardGraphSignature, 2> signatures;
+            std::array<const IGPUGraphCapture *, 2> children{};
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> parents;
+            std::string error;
+            for (int owner = 0; owner < 2; ++owner) {
+                input.token_ids_device = tokens[owner]->gpu_data_ptr();
+                ASSERT_TRUE(engine_->execute(input, output, *host_));
+                const auto observations = engine_->replayCacheObservations(1);
+                ASSERT_EQ(observations.size(), static_cast<size_t>(owner + 1));
+                for (const auto &observation : observations)
+                    if (observation.signature.device_token_ids == input.token_ids_device)
+                        signatures[owner] = observation.signature;
+                const auto child = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(child.has_value()) << error;
+                children[owner] = child->capture;
+                parents[owner] = worker->createGraphCapture(stream);
+                const GPUOrderedTimelineStep steps[] = {{.name = "resident token owner", .capture = child->capture}};
+                ASSERT_TRUE(parents[owner] && parents[owner]->buildOrderedTimelineTransaction(steps));
+                ASSERT_TRUE(parents[owner]->instantiate());
+            }
+            EXPECT_NE(children[0], children[1]);
+            for (int request = 0; request < 20; ++request) {
+                SCOPED_TRACE(request);
+                const int owner = request % 2;
+                const int32_t live = request + 1, poison = vocab - 1;
+                ASSERT_TRUE(backend->hostToDevice(tokens[owner]->gpu_data_ptr(), &live,
+                    sizeof(live), device_.gpu_ordinal(), stream));
+                ASSERT_TRUE(backend->hostToDevice(tokens[1 - owner]->gpu_data_ptr(), &poison,
+                    sizeof(poison), device_.gpu_ordinal(), stream));
+                // Deliberately no engine invocation or dynamic-param update:
+                // a complete generation parent must consume its resident row.
+                ASSERT_TRUE(parents[owner]->launch());
+                TransferEngine::publishDeviceWrite(output.logits, device_, stream);
+                const auto actual = captureProbeOutputPrefix(*host_, kHiddenDim);
+                ASSERT_EQ(actual.size(), static_cast<size_t>(kHiddenDim));
+                for (int col = 0; col < kHiddenDim; ++col)
+                    EXPECT_FLOAT_EQ(actual[col], static_cast<float>(live) +
+                        static_cast<float>(col) * 0.125f +
+                        0.25f + static_cast<float>(col % 13) * 0.0625f);
+                engine_->resetSessionReplayState(/*preserve_replay_safe_graphs=*/true);
+                const auto retained = engine_->deviceLoopGraphTemplate(signatures[owner], &error);
+                ASSERT_TRUE(retained.has_value()) << error;
+                EXPECT_EQ(retained->capture, children[owner]);
+                EXPECT_EQ(host_->build_calls, 2);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            }
+        });
+    }
+
+    /**
+     * @brief A retained decode child snapshots live KV on every launch, without a host prelude.
+     *
+     * The real append kernel advances the canonical cache count. Its next
+     * iteration must snapshot that new count before any model root can mutate
+     * it. Only the parent is launched after setup: no engine call refreshes
+     * dynamic parameters or positions between the twenty native replays.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, DecodePositionSnapshotIsInsideRetainedChild)
+    {
+        ScopedDebugEnv env({{"LLAMINAR_GPU_GRAPHS", "1"},
+                            {"LLAMINAR_GPU_STAGE_TIMING", "0"},
+                            {"LLAMINAR_GPU_STAGE_TIMING_DETAIL", "0"}});
+        host_->enableDeferredDecodeProbe();
+        host_->setUseKVAppendProbe(true);
+        ForwardExecutionEngine::Config config;
+        config.cache_config.enabled = true;
+        config.pp_stage_config = FactoryPPStageConfig{
+            .first_layer = 1, .last_layer = 2,
+            .has_embedding = false, .has_lm_head = true};
+        engine_ = std::make_unique<ForwardExecutionEngine>(config, *executor_);
+        FP32Tensor upstream(std::vector<size_t>{1, kHiddenDim});
+        auto *tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{1}, std::vector<int32_t>{17});
+        auto *positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{1}, std::vector<int32_t>{-77});
+        auto *worker = host_->getWorkerGPUContext(device_);
+        ASSERT_NE(worker, nullptr);
+        worker->submitAndWait([&] {
+            void *const stream = worker->defaultStream();
+            auto *backend = getBackendFor(device_);
+            ASSERT_NE(backend, nullptr);
+            ASSERT_TRUE(host_->initializeKVCacheProbeForTesting());
+            ASSERT_TRUE(host_->admitProbeResidual(stream));
+            ASSERT_TRUE(host_->admitProbeKVInputs(stream));
+            ASSERT_TRUE(upstream.ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(&upstream, device_, stream);
+            ASSERT_TRUE(tokens->ensureOnDevice(device_, stream));
+            ASSERT_TRUE(positions->ensureOnDevice(device_, stream));
+            TransferEngine::publishDeviceWrite(tokens, device_, stream);
+            TransferEngine::publishDeviceWrite(positions, device_, stream);
+            ForwardInput input;
+            input.token_ids_device = tokens->gpu_data_ptr();
+            input.position_ids_device = positions->gpu_data_ptr();
+            input.position_offset = 1; // History-bearing geometry, never the live position authority.
+            input.batch_size = input.seq_len = input.real_seq_len = 1;
+            input.device = device_;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.external_hidden_state = &upstream;
+            input.device_decode_position = DeviceDecodePositionBinding{
+                backend, host_->kvSequenceCachedTokensDeviceForTesting(),
+                static_cast<int32_t *>(positions->gpu_data_ptr())};
+            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            ForwardOutput output;
+            ASSERT_TRUE(engine_->execute(input, output, *host_));
+            const auto observations = engine_->replayCacheObservations(1);
+            ASSERT_EQ(observations.size(), 1u);
+            EXPECT_EQ(observations.front().signature.device_decode_position, input.device_decode_position);
+            std::string error;
+            const auto child = engine_->deviceLoopGraphTemplate(observations.front().signature, &error);
+            ASSERT_TRUE(child.has_value()) << error;
+            auto parent = worker->createGraphCapture(stream);
+            const GPUOrderedTimelineStep steps[] = {{
+                .name = "decode with in-graph KV snapshot", .capture = child->capture}};
+            ASSERT_TRUE(parent && parent->buildOrderedTimelineTransaction(steps));
+            ASSERT_TRUE(parent->instantiate());
+            int32_t observed = 0;
+            ASSERT_TRUE(backend->deviceToHost(&observed, positions->gpu_data_ptr(), sizeof(observed),
+                device_.gpu_ordinal(), stream));
+            ASSERT_EQ(observed, -77) << "Setup-only recording must not execute the position snapshot.";
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                SCOPED_TRACE(replay);
+                ASSERT_TRUE(parent->launch());
+                ASSERT_TRUE(backend->deviceToHost(&observed, positions->gpu_data_ptr(), sizeof(observed),
+                    device_.gpu_ordinal(), stream));
+                ASSERT_EQ(observed, replay) << "Snapshot must precede this replay's actual KV append.";
+                EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(stream), replay + 1);
+                EXPECT_EQ(host_->build_calls, 1);
+                EXPECT_EQ(host_->committed_forward_output_calls, 0);
+            }
+        });
+    }
 
     TEST_F(PrefillGraphCacheExecutionTest, ExactBucketWarmupCaptureReplayLifecycle)
     {
@@ -834,7 +2139,10 @@ namespace
         ASSERT_EQ(plan.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
@@ -884,8 +2192,87 @@ namespace
         ASSERT_NE(host_->stage(), nullptr);
         EXPECT_GE(host_->stage()->executeCount(), 2)
             << "Normal build/warmup and capture recording execute the stage directly.";
-        EXPECT_GE(host_->stage()->replayCallbackCount(), 2)
-            << "Capture launch and Ready replay both run post-graph callbacks.";
+    }
+
+    /**
+     * @brief The public prefill probe follows the executable that actually runs.
+     *
+     * Heterogeneous prefill bypasses the monolithic PrefillGraphCache and owns
+     * its native executable in GraphSegmentCache. The regression is complete
+     * only if the same backend-neutral snapshot consumed by server/benchmark
+     * readiness reports capture and each subsequent replay from that authority.
+     */
+    TEST_F(
+        PrefillGraphCacheExecutionTest,
+        HeterogeneousSegmentedLifecycleReportsAuthoritativeCaptureAndReplay)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->setHeterogeneousSegmentedPrefill(true);
+        ASSERT_TRUE(host_->preparePersistentGraphInputsForTesting());
+        auto tokens = makeSequentialInts(kExactBucketSeqLen, 1700);
+        ForwardInput base_input;
+        base_input.token_ids = tokens.data();
+        base_input.batch_size = 1;
+        base_input.seq_len = kExactBucketSeqLen;
+        base_input.device = device_;
+
+        const auto plan =
+            ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+                base_input,
+                debugEnv().execution.prefill_graph_bucket_sizes,
+                kPadTokenId,
+                /*allow_padded_execution=*/false);
+        ASSERT_TRUE(plan) << plan.error;
+
+        ForwardOutput output;
+        const auto signature = bucketedPrefillSignature(
+            device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto key = prefillGraphKey(
+            device_,
+            kExactBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_capture =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_capture.has_value());
+        EXPECT_EQ(after_capture->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_capture->capture_count, 1u);
+        EXPECT_EQ(after_capture->replay_count, 1);
+        EXPECT_GT(after_capture->node_count, 0u);
+        EXPECT_EQ(after_capture->capture_phase, "capture");
+        EXPECT_EQ(
+            after_capture->recapture_reason,
+            "heterogeneous_boundary_segmentation");
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_replay =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_replay.has_value());
+        EXPECT_EQ(after_replay->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_replay->capture_count, 1u);
+        EXPECT_EQ(after_replay->replay_count, 2);
+        EXPECT_GT(after_replay->node_count, 0u);
+        EXPECT_EQ(after_replay->capture_phase, "replay");
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_second_replay =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_second_replay.has_value());
+        EXPECT_EQ(after_second_replay->capture_count, 1u);
+        EXPECT_EQ(after_second_replay->replay_count, 3);
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, SessionResetDropsCapturedPrefillExecutable)
@@ -916,7 +2303,10 @@ namespace
         ASSERT_TRUE(plan) << plan.error;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
@@ -983,7 +2373,10 @@ namespace
         ASSERT_TRUE(plan) << plan.error;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kExactBucketSeqLen,
+            host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input, plan, output, *host_));
@@ -1001,7 +2394,7 @@ namespace
         ASSERT_GT(nodes_before_reset, 0u);
 
         engine_->resetSessionReplayState(
-            /*preserve_replay_safe_segmented_captures=*/true);
+            /*preserve_replay_safe_graphs=*/true);
 
         auto preserved = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(preserved.has_value());
@@ -1069,7 +2462,7 @@ namespace
         ASSERT_EQ(warmed->capture_count, 0u);
 
         engine_->resetSessionReplayState(
-            /*preserve_replay_safe_segmented_captures=*/true);
+            /*preserve_replay_safe_graphs=*/true);
 
         auto initialized = engine_->prefillGraphCacheSnapshot(signature, key);
         ASSERT_TRUE(initialized.has_value());
@@ -1171,6 +2564,341 @@ namespace
         EXPECT_EQ(snapshot->topology_signature, 0x4400u);
         EXPECT_EQ(snapshot->capture_phase, "replay");
         EXPECT_EQ(snapshot->recapture_reason, "none");
+    }
+
+    /**
+     * @brief Prove 256K-context chunk totality through one captured GPU graph.
+     *
+     * A 256K request contains 64 complete 4096-row prefill buckets. The extra
+     * token deliberately creates a sixty-fifth padded bucket, exercising the
+     * two boundaries most likely to hide an off-by-one or padded-row advance:
+     * exactly 256K and the first row beyond it. Every chunk publishes its real
+     * row count through resident device metadata, and the production KV append
+     * stage must advance by those real rows while the same graph executable is
+     * captured once and replayed for the entire logical request. The fixture
+     * deliberately retains the production 256-row raw-prompt graph minimum:
+     * the one-row tail is scheduler-admitted into the transaction bucket and
+     * must not be mistaken for an independent short prompt.
+     */
+    TEST_F(PrefillGraphCacheExecutionTest, LongContext256KPlusTailIsMTotal)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4096"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "256"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "1"},
+        });
+        PerfStatsCollector::reset();
+
+        host_->setUseKVAppendProbe(true);
+        ASSERT_TRUE(host_->setKVCacheCapacityForTesting(kLongContextSeqLen));
+        ASSERT_TRUE(host_->initializeKVCacheProbeForTesting());
+
+        IBackend *backend = getBackendFor(device_);
+        ASSERT_NE(backend, nullptr);
+        void *admission_stream = nullptr;
+        if (device_.is_cuda())
+        {
+            admission_stream = GPUDeviceContextPool::instance()
+                                   .getNvidiaContext(
+                                       device_.toKernelDeviceIndex())
+                                   .defaultStream();
+        }
+        else if (device_.is_rocm())
+        {
+            admission_stream = GPUDeviceContextPool::instance()
+                                   .getAMDContext(
+                                       device_.toKernelDeviceIndex())
+                                   .defaultStream();
+        }
+        ASSERT_NE(admission_stream, nullptr);
+
+        std::vector<int32_t> request_tokens(
+            static_cast<size_t>(kLongContextSeqLen));
+        std::vector<int32_t> request_positions(
+            static_cast<size_t>(kLongContextSeqLen));
+        for (int row = 0; row < kLongContextSeqLen; ++row)
+        {
+            request_tokens[static_cast<size_t>(row)] = 17000 + row;
+            request_positions[static_cast<size_t>(row)] = row;
+        }
+        /*
+         * Bind every captured address through the same semantic arena slots as
+         * production.  The harness owns these tensors until teardown, while
+         * discardAllCachedGraphs() below releases executable references before
+         * that ownership ends.
+         */
+        auto *request_token_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_TOKEN_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLongContextSeqLen)},
+                request_tokens);
+        auto *request_position_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_POSITION_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLongContextSeqLen)},
+                request_positions);
+        auto *request_total_rows =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::REQUEST_BATCH_GEOMETRY,
+                std::vector<size_t>{1},
+                std::vector<int32_t>{kLongContextSeqLen});
+        auto *chunk_token_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_TOKEN_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLargeBucketSeqLen)});
+        auto *chunk_position_bank =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_POSITION_IDS,
+                std::vector<size_t>{
+                    static_cast<size_t>(kLargeBucketSeqLen)});
+        auto *chunk_geometry =
+            graph_arena_.createPersistentTensor<INT32Tensor>(
+                BufferId::PREFILL_CHUNK_GEOMETRY,
+                std::vector<size_t>{2});
+        ASSERT_TRUE(request_token_bank->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(request_position_bank->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(request_total_rows->ensureOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_token_bank->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_position_bank->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(chunk_geometry->allocateOnDevice(
+            device_, admission_stream));
+        ASSERT_TRUE(backend->synchronizeStream(
+            admission_stream,
+            device_.toKernelDeviceIndex()));
+
+        const int32_t *cached_tokens_device =
+            host_->kvSequenceCachedTokensDeviceForTesting();
+        ASSERT_NE(cached_tokens_device, nullptr);
+        constexpr uint64_t kChunkCaptureIdentity = UINT64_C(0x25600001);
+        ForwardInput input;
+        input.token_ids = nullptr;
+        input.token_ids_device = chunk_token_bank->gpu_data_ptr();
+        input.position_ids = nullptr;
+        input.position_ids_device = chunk_position_bank->gpu_data_ptr();
+        input.position_policy = ForwardPositionPolicy::ExplicitRows;
+        input.batch_size = 1;
+        input.seq_len = kLongContextSeqLen;
+        input.real_seq_len = kLongContextSeqLen;
+        input.sequence_lengths_device =
+            static_cast<const int32_t *>(chunk_geometry->gpu_data_ptr());
+        input.device = device_;
+        input.device_prefill_chunk = DevicePrefillChunkGraphBinding{
+            .backend = backend,
+            .request_token_ids_device = static_cast<const int32_t *>(
+                request_token_bank->gpu_data_ptr()),
+            .request_position_ids_device = static_cast<const int32_t *>(
+                request_position_bank->gpu_data_ptr()),
+            .request_total_rows_device = static_cast<const int32_t *>(
+                request_total_rows->gpu_data_ptr()),
+            .cached_tokens_device = cached_tokens_device,
+            .chunk_token_ids_device = static_cast<int32_t *>(
+                chunk_token_bank->gpu_data_ptr()),
+            .chunk_position_ids_device = static_cast<int32_t *>(
+                chunk_position_bank->gpu_data_ptr()),
+            .chunk_real_rows_device = static_cast<int32_t *>(
+                chunk_geometry->gpu_data_ptr()),
+            .chunk_row_stride_device = static_cast<int32_t *>(
+                                           chunk_geometry->gpu_data_ptr()) +
+                                       1,
+            .request_row_capacity = kLongContextSeqLen,
+            .bucket_seq_len = kLargeBucketSeqLen,
+            .pad_token_id = kPadTokenId,
+            .capture_identity = kChunkCaptureIdentity,
+        };
+        ASSERT_TRUE(input.device_prefill_chunk->valid());
+
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = {kLargeBucketSeqLen};
+        policy.fixed_chunk_real_tokens = kLargeBucketSeqLen;
+        policy.real_token_count = kLongContextSeqLen;
+
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input,
+            policy,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 65u);
+
+        int expected_offset = 0;
+        uint64_t real_rows = 0;
+        for (size_t index = 0; index < schedule.chunks.size(); ++index)
+        {
+            const auto &plan = schedule.chunks[index];
+            SCOPED_TRACE(index);
+            EXPECT_EQ(plan.chunk_index, static_cast<int>(index));
+            EXPECT_EQ(plan.chunk.token_offset, expected_offset);
+            EXPECT_EQ(plan.chunk.bucket_seq_len, kLargeBucketSeqLen);
+            const int expected_real_rows =
+                index + 1 == schedule.chunks.size()
+                    ? 1
+                    : kLargeBucketSeqLen;
+            EXPECT_EQ(plan.chunk.real_count, expected_real_rows);
+            expected_offset += plan.chunk.real_count;
+            real_rows += static_cast<uint64_t>(plan.chunk.real_count);
+        }
+        EXPECT_EQ(expected_offset, kLongContextSeqLen);
+        EXPECT_EQ(real_rows, static_cast<uint64_t>(kLongContextSeqLen));
+
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->runPrefillChunkSchedule(
+            input,
+            schedule,
+            output,
+            *host_));
+
+        EXPECT_EQ(host_->committed_forward_output_calls, 65)
+            << "Every chunk, including the one-row terminal tail, must publish "
+               "through the same successful-forward boundary used by sampling.";
+        EXPECT_EQ(host_->last_committed_logits, output.logits);
+        EXPECT_TRUE(host_->last_committed_execution.valid);
+        EXPECT_EQ(host_->last_committed_execution.graph_seq_len,
+                  kLargeBucketSeqLen);
+
+        ASSERT_TRUE(output.execution.valid);
+        ASSERT_EQ(output.execution.device, device_);
+        ASSERT_NE(output.execution.stream, nullptr);
+
+        /*
+         * Cached replay is deliberately asynchronous. Terminal diagnostics
+         * therefore consume its exact producer edge before reading any KV or
+         * chunk state on the fixture's observation stream. A profiler can
+         * stretch the final replay enough to expose this ordering requirement;
+         * relying on ordinary launch timing made the old test intermittently
+         * observe 262144 rows before the one-row tail append completed.
+         */
+        const int device_ordinal = device_.toKernelDeviceIndex();
+        void *const raw_completion_event =
+            backend->createEvent(device_ordinal);
+        ASSERT_NE(raw_completion_event, nullptr);
+        const std::shared_ptr<void> completion_event(
+            raw_completion_event,
+            [backend, device_ordinal](void *event)
+            {
+                backend->destroyEvent(event, device_ordinal);
+            });
+        ASSERT_TRUE(backend->recordEvent(
+            completion_event.get(),
+            device_ordinal,
+            output.execution.stream));
+        ASSERT_TRUE(backend->streamWaitEvent(
+            admission_stream,
+            completion_event.get(),
+            device_ordinal));
+
+        EXPECT_EQ(host_->build_calls, 1)
+            << "Every 4096-row chunk must share one stable graph topology.";
+        EXPECT_EQ(host_->maintenance_calls, 0);
+        EXPECT_EQ(
+            host_->kvDeviceCachedTokensForTesting(admission_stream),
+            kLongContextSeqLen)
+            << "The padded one-row tail must advance KV by one, not 4096.";
+
+        const auto signature = bucketedPrefillSignature(
+            device_,
+            kLargeBucketSeqLen,
+            host_->placement_epoch,
+            input.sequence_lengths_device);
+        auto device_chunk_signature = signature;
+        device_chunk_signature.device_token_ids = chunk_token_bank->gpu_data_ptr();
+        device_chunk_signature.device_position_ids = chunk_position_bank->gpu_data_ptr();
+        device_chunk_signature.position_policy =
+            ForwardPositionPolicy::ExplicitRows;
+        device_chunk_signature.device_prefill_chunk_capture_identity =
+            kChunkCaptureIdentity;
+        const auto key = prefillGraphKey(
+            device_,
+            kLargeBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+        const auto snapshot = engine_->prefillGraphCacheSnapshot(
+            device_chunk_signature,
+            key);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(snapshot->warmup_count, 1u);
+        EXPECT_EQ(snapshot->capture_count, 1u);
+        EXPECT_EQ(snapshot->replay_count, 64);
+        EXPECT_GE(snapshot->node_count, 2u)
+            << "The complete residual-plus-KV probe must be one non-empty graph.";
+        EXPECT_EQ(snapshot->chunk_index, 64);
+        EXPECT_EQ(snapshot->real_token_start, 256 * 1024);
+        EXPECT_EQ(snapshot->real_token_count, 1);
+        EXPECT_EQ(snapshot->real_token_end, kLongContextSeqLen);
+        EXPECT_EQ(snapshot->capture_phase, "replay");
+        EXPECT_EQ(snapshot->recapture_reason, "none");
+
+        const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+        const PerfStatsCollector::Tags terminal_replay_tags = {
+            {"bucket_seq_len", std::to_string(kLargeBucketSeqLen)},
+            {"cache_phase", "ready"},
+            {"capture_phase", "replay"},
+            {"chunk_index", "64"},
+            {"domain_id", "single"},
+            {"participant_id", "0"},
+            {"placement_epoch", "0"},
+            {"real_token_count", "1"},
+            {"real_token_end", std::to_string(kLongContextSeqLen)},
+            {"real_token_start", std::to_string(256 * 1024)},
+            {"recapture_reason", "none"},
+            {"topology_signature", "0"}};
+        EXPECT_DOUBLE_EQ(
+            findPrefillGraphLifecycleCounter(records, terminal_replay_tags),
+            1.0);
+
+        std::array<int32_t, 4> terminal_tokens{};
+        std::array<int32_t, 4> terminal_positions{};
+        std::array<int32_t, 2> terminal_geometry{};
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_tokens.data(),
+            chunk_token_bank->gpu_data_ptr(),
+            terminal_tokens.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_positions.data(),
+            chunk_position_bank->gpu_data_ptr(),
+            terminal_positions.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->deviceToHostOnStream(
+            terminal_geometry.data(),
+            chunk_geometry->gpu_data_ptr(),
+            terminal_geometry.size() * sizeof(int32_t),
+            device_.toKernelDeviceIndex(),
+            admission_stream));
+        ASSERT_TRUE(backend->synchronizeStream(
+            admission_stream,
+            device_.toKernelDeviceIndex()));
+        EXPECT_EQ(terminal_geometry[0], 1);
+        EXPECT_EQ(terminal_geometry[1], kLargeBucketSeqLen);
+        EXPECT_EQ(terminal_tokens[0], request_tokens.back());
+        EXPECT_EQ(terminal_tokens[1], kPadTokenId);
+        EXPECT_EQ(terminal_tokens[2], kPadTokenId);
+        EXPECT_EQ(terminal_tokens[3], kPadTokenId);
+        EXPECT_EQ(terminal_positions[0], kLongContextSeqLen - 1);
+        EXPECT_EQ(terminal_positions[1], kLongContextSeqLen);
+        EXPECT_EQ(terminal_positions[2], kLongContextSeqLen + 1);
+        EXPECT_EQ(terminal_positions[3], kLongContextSeqLen + 2);
+
+        engine_->discardAllCachedGraphs();
+        PerfStatsCollector::reset();
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleForcedRebalanceRecapturesNewPlacementEpoch)
@@ -1320,7 +3048,6 @@ namespace
         ASSERT_EQ(plan63.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
         const auto key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,
@@ -1329,7 +3056,12 @@ namespace
             host_->placement_epoch,
             host_->topology_signature);
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input61, plan61, output));
+        // Admission creates the stable owner. Cache assertions must name that
+        // exact address, not the pre-admission null slot or a presence flag.
+        const auto signature = bucketedPrefillSignature(
+            device_, kExactBucketSeqLen, host_->placement_epoch,
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->build_calls, 1);
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
@@ -1337,7 +3069,13 @@ namespace
         EXPECT_EQ(host_->last_workspace_seq_len, kExactBucketSeqLen);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
+        EXPECT_EQ(
+            host_->rowSelectStage()->selectionPolicyForTesting(),
+            HiddenStateRowSelectStage::SelectionPolicy::
+                DeviceResidentRequestLength);
+        EXPECT_EQ(
+            host_->rowSelectStage()->requestSequenceLengthDeviceForTesting(),
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "First padded cache miss must append only real prompt tokens.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1364,9 +3102,8 @@ namespace
         EXPECT_EQ(after_build->capture_phase, "warmup");
         EXPECT_EQ(after_build->recapture_reason, "none");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input63, plan63, output));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
             << "Capture launch callback must advance KV metadata by real tokens only.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1387,12 +3124,8 @@ namespace
         EXPECT_EQ(after_capture->capture_phase, "capture");
         EXPECT_EQ(after_capture->recapture_reason, "armed_warmup");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input61, plan61, output));
         EXPECT_EQ(host_->build_calls, 1);
-        // The monolithic cache test proves the engine delivers updated real-length
-        // metadata before Ready replay. The dedicated row-select graph tests verify
-        // the backend-level selected-row device output for no-recapture replays.
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
                   (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";
@@ -1418,7 +3151,7 @@ namespace
         EXPECT_EQ(after_replay->capture_phase, "replay");
         EXPECT_EQ(after_replay->recapture_reason, "none");
 
-        ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
+        ASSERT_TRUE(runResidentPrefillChunk(input63, plan63, output));
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
             << "Second Ready replay must keep GPU KV count mirror aligned.";
         auto after_second_replay = engine_->prefillGraphCacheSnapshot(signature, key);
@@ -1447,13 +3180,90 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(PrefillGraphCacheExecutionTest, ServerStyleRawExecuteReusesPaddedBucketAcrossRealLengths)
+    TEST_F(PrefillGraphCacheExecutionTest, RoPEPositionRowsRefreshAcrossPaddedBucketReplay)
     {
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
             {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->setUseRoPEProbe(true);
+
+        auto tokens61 = makeSequentialInts(kExactBucketSeqLen - 3, 7000);
+        ForwardInput input61;
+        input61.token_ids = tokens61.data();
+        input61.batch_size = 1;
+        input61.seq_len = kExactBucketSeqLen - 3;
+        input61.token_offset = 128;
+        input61.position_offset = 128;
+        input61.device = device_;
+
+        auto tokens63 = makeSequentialInts(kExactBucketSeqLen - 1, 8000);
+        ForwardInput input63;
+        input63.token_ids = tokens63.data();
+        input63.batch_size = 1;
+        input63.seq_len = kExactBucketSeqLen - 1;
+        input63.token_offset = 512;
+        input63.position_offset = 512;
+        input63.device = device_;
+
+        const auto plan61 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input61,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(plan61) << plan61.error;
+        ASSERT_TRUE(plan61.padding_required);
+
+        const auto plan63 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+            input63,
+            debugEnv().execution.prefill_graph_bucket_sizes,
+            kPadTokenId,
+            /*allow_padded_execution=*/true);
+        ASSERT_TRUE(plan63) << plan63.error;
+        ASSERT_TRUE(plan63.padding_required);
+
+        ForwardOutput output;
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input61, plan61, output));
+        ASSERT_NE(host_->ropeStage(), nullptr);
+        const auto output_pos128_warmup = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos128_warmup.empty());
+
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input63, plan63, output));
+        const auto output_pos512_capture = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos512_capture.empty());
+        EXPECT_GT(maxAbsDiff(output_pos128_warmup, output_pos512_capture), 1.0e-3)
+            << "RoPE probe positions 128..191 and 512..575 must produce distinct output, "
+               "otherwise this regression cannot prove metadata freshness.";
+
+        ASSERT_TRUE(runFullyResidentPrefillChunk(input61, plan61, output));
+        const auto output_pos128_replay = captureProbeOutputPrefix(*host_, 512);
+        ASSERT_FALSE(output_pos128_replay.empty());
+        const double warmup_replay_diff =
+            maxAbsDiff(output_pos128_warmup, output_pos128_replay);
+        const double capture_replay_diff =
+            maxAbsDiff(output_pos512_capture, output_pos128_replay);
+        EXPECT_LT(warmup_replay_diff, 1.0e-5)
+            << "Ready replay must refresh RoPE's workspace position rows back to the current "
+               "chunk instead of reusing the rows captured for the previous real length. "
+            << "warmup_replay_diff=" << warmup_replay_diff
+            << " capture_replay_diff=" << capture_replay_diff;
+    }
+
+    TEST_F(PrefillGraphCacheExecutionTest, ServerStyleShortRawExecuteUsesMinimumBucketAndReusesAcrossRealLengths)
+    {
+        constexpr int kMinimumPhysicalBucket = 256;
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,256"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "256"},
             {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
             {"LLAMINAR_VALIDATE_BUFFERS", "0"},
             {"LLAMINAR_VALIDATE_INPUTS", "0"},
@@ -1484,17 +3294,25 @@ namespace
         input63.device = device_;
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
-        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+        const auto key = prefillGraphKey(device_, kMinimumPhysicalBucket);
 
-        ASSERT_TRUE(engine_->execute(input61, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input61, output));
+        const auto signature = bucketedPrefillSignature(
+            device_, kMinimumPhysicalBucket, /*moe_placement_epoch=*/0,
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_build_seq_len, kMinimumPhysicalBucket);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
-        EXPECT_EQ(host_->last_build_bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_build_bucket_seq_len, kMinimumPhysicalBucket);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
+        EXPECT_EQ(
+            host_->rowSelectStage()->selectionPolicyForTesting(),
+            HiddenStateRowSelectStage::SelectionPolicy::
+                DeviceResidentRequestLength);
+        EXPECT_EQ(
+            host_->rowSelectStage()->requestSequenceLengthDeviceForTesting(),
+            host_->residentRequestLengthDevice());
         EXPECT_EQ(host_->kvCachedTokensForTesting(), kExactBucketSeqLen - 3)
             << "Raw execute cache miss must append only real prompt tokens.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1509,10 +3327,9 @@ namespace
         EXPECT_EQ(after_build->warmup_count, 1u);
         EXPECT_EQ(after_build->capture_count, 0u);
 
-        ASSERT_TRUE(engine_->execute(input63, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input63, output));
         EXPECT_EQ(host_->build_calls, 1)
             << "Server-style prompts in one bucket must reuse the cached forward graph.";
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 2);
         EXPECT_EQ(host_->kvCachedTokensForTesting(), (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1))
             << "Capture launch must append by the second request's real length, not the bucket length.";
         EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(), host_->kvCachedTokensForTesting())
@@ -1527,9 +3344,8 @@ namespace
         EXPECT_EQ(after_capture->replay_count, 1);
         EXPECT_GT(after_capture->node_count, 0u);
 
-        ASSERT_TRUE(engine_->execute(input61, output, *host_));
+        ASSERT_TRUE(executeResidentPrefill(input61, output));
         EXPECT_EQ(host_->build_calls, 1);
-        EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);
         EXPECT_EQ(host_->kvCachedTokensForTesting(),
                   (kExactBucketSeqLen - 3) + (kExactBucketSeqLen - 1) + (kExactBucketSeqLen - 3))
             << "Ready replay must advance KV metadata by the latest real length, not the bucket length.";
@@ -1548,6 +3364,7 @@ namespace
 
     TEST_F(PrefillGraphCacheExecutionTest, CrossBucketEvictionRecapturesEligibleBucket)
     {
+        constexpr int kEvictionBucketSeqLen = 128;
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
@@ -1567,11 +3384,11 @@ namespace
         input64.seq_len = kExactBucketSeqLen;
         input64.device = device_;
 
-        auto tokens128 = makeSequentialInts(kLargeBucketSeqLen, 8000);
+        auto tokens128 = makeSequentialInts(kEvictionBucketSeqLen, 8000);
         ForwardInput input128;
         input128.token_ids = tokens128.data();
         input128.batch_size = 1;
-        input128.seq_len = kLargeBucketSeqLen;
+        input128.seq_len = kEvictionBucketSeqLen;
         input128.device = device_;
 
         const auto plan64 = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
@@ -1588,13 +3405,13 @@ namespace
             kPadTokenId,
             /*allow_padded_execution=*/false);
         ASSERT_TRUE(plan128) << plan128.error;
-        ASSERT_EQ(plan128.chunk.bucket_seq_len, kLargeBucketSeqLen);
+        ASSERT_EQ(plan128.chunk.bucket_seq_len, kEvictionBucketSeqLen);
 
         ForwardOutput output;
         const auto signature64 = bucketedPrefillSignature(device_, kExactBucketSeqLen);
         const auto key64 = prefillGraphKey(device_, kExactBucketSeqLen);
-        const auto signature128 = bucketedPrefillSignature(device_, kLargeBucketSeqLen);
-        const auto key128 = prefillGraphKey(device_, kLargeBucketSeqLen);
+        const auto signature128 = bucketedPrefillSignature(device_, kEvictionBucketSeqLen);
+        const auto key128 = prefillGraphKey(device_, kEvictionBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));
         ASSERT_TRUE(engine_->runPrefillChunk(input64, plan64, output, *host_));

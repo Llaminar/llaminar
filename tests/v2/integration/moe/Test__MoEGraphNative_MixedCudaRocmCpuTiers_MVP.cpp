@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/HardwareInventory.h"
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "integration/moe/MoEGraphNativeRoutedTierTestUtils.h"
 #include "mocks/MockComputeStage.h"
 
@@ -44,50 +44,50 @@ namespace llaminar2::test
 #endif
         }
 
-        ExpertComputeDomain cudaDomain()
+        RoutedExpertDomain cudaDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "hot_cuda_domain";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain rocmDomain()
+        RoutedExpertDomain rocmDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "warm_rocm_domain";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain cpuDomain()
+        RoutedExpertDomain cpuDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "cold_cpu_domain";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::MPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier routedTier(
+        RoutedExpertTier routedTier(
             const std::string &name,
             const std::string &domain,
             int priority,
             int capacity,
             bool fallback = false)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -96,9 +96,9 @@ namespace llaminar2::test
             return tier;
         }
 
-        MoEExpertModelMetadata metadata()
+        MoERoutedExpertModelMetadata metadata()
         {
-            MoEExpertModelMetadata model;
+            MoERoutedExpertModelMetadata model;
             model.num_layers = 1;
             model.num_experts = kNumExperts;
             model.d_model = kDModel;
@@ -108,24 +108,24 @@ namespace llaminar2::test
             return model;
         }
 
-        MoEExpertParallelPlan makeMixedPlan()
+        MoERoutedExpertPlacementPlan makeMixedPlan()
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "hot_cuda_domain";
             plan.shared_expert_domain = "hot_cuda_domain";
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan.domains = {cudaDomain(), rocmDomain(), cpuDomain()};
             plan.routed_tiers = {
                 routedTier("hot_cuda", "hot_cuda_domain", 0, 1),
                 routedTier("warm_rocm", "warm_rocm_domain", 1, 1),
                 routedTier("cold_cpu", "cold_cpu_domain", 99, 0, true),
             };
-            return MoEExpertParallelPlanner::plan(plan, metadata()).planned_plan;
+            return MoERoutedExpertPlacementPlanner::plan(plan, metadata()).planned_plan;
         }
 
-        void expectOwnerMapHasMixedCanonicalOwners(const MoEExpertParallelPlan &plan,
+        void expectOwnerMapHasMixedCanonicalOwners(const MoERoutedExpertPlacementPlan &plan,
                                                    const MoEExpertOwnerMap &owner_map)
         {
             bool saw_cuda = false;
@@ -189,7 +189,7 @@ namespace llaminar2::test
 
         const auto plan = makeMixedPlan();
         EXPECT_EQ(plan.placements.front().routed_expert_tier, (std::vector<int>{0, 1, 2, 2}));
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         plan,
                         {.layer_count = 1, .routed_expert_count = kNumExperts})
                         .ok());

@@ -489,28 +489,48 @@ namespace llaminar2
         StageShardingConfig getStageShardingConfig() const override
         {
             return {
-                // Embedding - replicated (full table on each device)
-                {"EMBEDDING", SnapshotShardingMode::REPLICATED},
+                // Vocab-parallel embedding emits partial rows before the
+                // explicit embedding allreduce and replicated rows after it.
+                {"EMBEDDING", SnapshotShardingMode::ROW_PARALLEL},
+                {"EMBEDDING_ALLREDUCED", SnapshotShardingMode::REPLICATED},
 
                 // Attention projections - column-parallel (split by heads)
                 {"Q_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"K_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"V_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"QKV_PROJECTION", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"Q_NORM", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"K_NORM", SnapshotShardingMode::COLUMN_PARALLEL},
 
                 // RoPE outputs - column-parallel (per-head)
                 {"Q_ROPE", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"K_ROPE", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"KV_APPEND_SOURCE_K", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"KV_APPEND_SOURCE_V", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"KV_CACHE_K", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"KV_CACHE_V", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"ATTENTION_EFFECTIVE_K", SnapshotShardingMode::COLUMN_PARALLEL},
+                {"ATTENTION_EFFECTIVE_V", SnapshotShardingMode::COLUMN_PARALLEL},
+
+                // Device-owned request cursors are scalar diagnostics copied
+                // from canonical per-request state.  Every TP participant must
+                // observe the same count and terminal position, so indexed
+                // request families are replicated rather than concatenated.
+                {"ATTENTION_DEVICE_KV_COUNT_REQUEST_*", SnapshotShardingMode::REPLICATED},
+                {"ATTENTION_DEVICE_KV_HEAD_REQUEST_*", SnapshotShardingMode::REPLICATED},
 
                 // Attention context - column-parallel (split by heads)
                 {"ATTENTION_CONTEXT", SnapshotShardingMode::COLUMN_PARALLEL},
 
-                // Attention output (Wo) - row-parallel (AllReduce combines)
+                // Attention output (Wo) - row-parallel before AllReduce, replicated after it.
                 {"ATTENTION_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
+                {"ATTENTION_OUTPUT_ALLREDUCED", SnapshotShardingMode::REPLICATED},
 
                 // Norms - replicated
                 {"ATTENTION_NORM", SnapshotShardingMode::REPLICATED},
+                {"ATTENTION_NORM_RESIDUAL_OUT", SnapshotShardingMode::REPLICATED},
                 {"FFN_NORM", SnapshotShardingMode::REPLICATED},
+                {"FFN_NORM_RESIDUAL_OUT", SnapshotShardingMode::REPLICATED},
                 {"FINAL_NORM", SnapshotShardingMode::REPLICATED},
 
                 // FFN - column-parallel for gate/up, row-parallel for down
@@ -520,8 +540,10 @@ namespace llaminar2
                 {"FUSED_FFN_GATE_UP", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"FFN_SWIGLU", SnapshotShardingMode::COLUMN_PARALLEL},
                 {"FFN_DOWN", SnapshotShardingMode::ROW_PARALLEL},
+                {"FFN_DOWN_ALLREDUCED", SnapshotShardingMode::REPLICATED},
 
                 // Residuals - replicated (after AllReduce)
+                {"ATTENTION_RESIDUAL", SnapshotShardingMode::REPLICATED},
                 {"FFN_RESIDUAL", SnapshotShardingMode::REPLICATED},
 
                 // LM head - column-parallel then AllGather

@@ -29,6 +29,7 @@
 #include "execution/debug/StageDumper.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "loaders/ModelContext.h"
+#include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
@@ -119,6 +120,15 @@ namespace llaminar2::test
             // Initialize DeviceManager (required for device backends)
             DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
+            // This fixture constructs a runner below the production
+            // RuntimeInitPhase boundary, so it must publish the same explicit
+            // CPU allocation authority that production bootstrap installs.
+            // WorkspaceAllocator intentionally refuses to invent an aggregate
+            // CPU backend because doing so could erase a later rank-local NUMA
+            // declaration.
+            initCPUBackend(-1);
+            ASSERT_TRUE(hasCPUBackend());
+
             // Clean up any existing dumps
             if (fs::exists(DUMP_DIR))
             {
@@ -171,7 +181,8 @@ namespace llaminar2::test
 
             // Run minimal prefill (just a few tokens)
             std::vector<int32_t> tokens = {151644, 872, 198}; // <|im_start|>user\n
-            runner->forward(tokens.data(), tokens.size());
+            ASSERT_TRUE(runner->forward(tokens.data(), tokens.size()))
+                << "Production graph execution failed before stage-dump publication";
 
             // Disable dumping after test
             setenv("LLAMINAR_STAGE_DUMP_ENABLED", "0", 1);

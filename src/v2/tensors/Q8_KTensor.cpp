@@ -24,10 +24,19 @@
 namespace llaminar2
 {
 
-    Q8_KTensor::Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
+    Q8_KTensor::Q8_KTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : Q8_KTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    Q8_KTensor::Q8_KTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
         : shape_(shape),
           is_view_(false),
-          raw_data_(raw_data),
+          raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
@@ -258,10 +267,11 @@ namespace llaminar2
 
     Q8_KTensor::~Q8_KTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -501,6 +511,26 @@ namespace llaminar2
         }
 
         return row_scale;
+    }
+
+    /**
+     * @brief Pack one logical 32-value Q8_K slice as raw INT8 plus unit scale.
+     *
+     * Eight logical execution blocks share one 256-value Q8_K source block.
+     * `bsums` are derived acceleration metadata, so preserving `qs` exactly is
+     * sufficient for both execution and lossless reverse repack.
+     */
+    void Q8_KTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
+    {
+        const int superblocks_per_row = (ctx.blocks_per_row + 7) / 8;
+        const int superblock = b / 8;
+        const int subblock = b % 8;
+        const auto *block = &typed_data()[
+            static_cast<size_t>(source_n) * static_cast<size_t>(superblocks_per_row) +
+            static_cast<size_t>(superblock)];
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        std::memcpy(vnniPayloadDst(ctx, linear), block->qs + subblock * 32, 32);
+        ctx.scales_array[linear] = fp32_to_fp16(1.0f);
     }
 
 } // namespace llaminar2

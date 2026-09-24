@@ -19,8 +19,8 @@
 #include "NvidiaDeviceContext.h"
 #include "../GPUDeviceContextPool.h"
 #include "../GPUEnumeration.h"
+#include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
-#include <cstdlib>
 #include <memory>
 
 namespace llaminar2
@@ -50,15 +50,14 @@ namespace llaminar2
          */
         void doRegisterNvidiaFactory()
         {
-            const char *cpu_only_env = std::getenv("LLAMINAR_FORCE_CPU_ONLY_STARTUP");
-            if (cpu_only_env && std::atoi(cpu_only_env) != 0)
+            const auto &startup = debugEnv().backend_startup;
+            if (startup.force_cpu_only)
             {
                 LOG_INFO("[NvidiaContextFactory] Skipping CUDA factory registration (LLAMINAR_FORCE_CPU_ONLY_STARTUP=1)");
                 return;
             }
 
-            const char *skip_cuda_env = std::getenv("LLAMINAR_SKIP_CUDA_STARTUP");
-            if (skip_cuda_env && std::atoi(skip_cuda_env) != 0)
+            if (!startup.cudaEnabled())
             {
                 LOG_INFO("[NvidiaContextFactory] Skipping CUDA factory registration (LLAMINAR_SKIP_CUDA_STARTUP=1)");
                 return;

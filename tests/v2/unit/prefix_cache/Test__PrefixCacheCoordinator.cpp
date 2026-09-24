@@ -1,6 +1,18 @@
+/**
+ * @file Test__PrefixCacheCoordinator.cpp
+ * @brief Device-free coverage of nested prefix admission and common-hit rules.
+ *
+ * Coordination must retain the complete observed placement interval without
+ * manufacturing a later identity or mixing differently shaped payload keys.
+ * Fake collectives exercise rank boundaries without loading a real model.
+ */
 #include "execution/prefix_cache/PrefixCacheCoordinator.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <optional>
 #include <mpi.h>
 #include <vector>
 
@@ -8,6 +20,7 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Build one authenticated synthetic participant lookup for a reduction. */
     PrefixParticipantLookup participant(
         int id,
         int tokens,
@@ -22,7 +35,7 @@ namespace
         lookup.domain_id = "test-domain";
         lookup.participant_id = id;
         lookup.device = DeviceId::cpu();
-        lookup.placement_epoch = 7;
+        lookup.placement_epochs = PrefixPlacementEpochSpan::at(7);
         lookup.fingerprint_key = fingerprint_key;
         lookup.supported = supported;
         lookup.cache_enabled = true;
@@ -38,6 +51,7 @@ namespace
         return lookup;
     }
 
+    /** @brief Script collective metadata results without starting GPU work. */
     class FakeDomainCoordinator : public IPrefixCollectiveCoordinator
     {
     public:
@@ -46,8 +60,11 @@ namespace
         bool or_bool = true;
         bool fail = false;
         std::vector<uint64_t> max_uint64_results;
+        std::optional<PrefixPlacementEpochSpan> placement_epochs;
+        size_t placement_epoch_call_count = 0;
         size_t max_uint64_call_count = 0;
 
+        /** @copydoc IPrefixCollectiveCoordinator::allMinInt */
         bool allMinInt(int, int *global_value) override
         {
             if (fail)
@@ -56,6 +73,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IPrefixCollectiveCoordinator::allMinUInt64 */
         bool allMinUInt64(uint64_t, uint64_t *global_value) override
         {
             if (fail)
@@ -64,6 +82,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IPrefixCollectiveCoordinator::allMaxUInt64 */
         bool allMaxUInt64(uint64_t local_value, uint64_t *global_value) override
         {
             if (fail)
@@ -78,6 +97,18 @@ namespace
             return true;
         }
 
+        /** @copydoc IPrefixCollectiveCoordinator::allPlacementEpochs */
+        bool allPlacementEpochs(PrefixPlacementEpochSpan local_value,
+                                PrefixPlacementEpochSpan *global_value) override
+        {
+            if (fail || !global_value)
+                return false;
+            ++placement_epoch_call_count;
+            *global_value = placement_epochs.value_or(local_value);
+            return true;
+        }
+
+        /** @copydoc IPrefixCollectiveCoordinator::allAndBool */
         bool allAndBool(bool, bool *global_value) override
         {
             if (fail)
@@ -86,6 +117,7 @@ namespace
             return true;
         }
 
+        /** @copydoc IPrefixCollectiveCoordinator::allOrBool */
         bool allOrBool(bool, bool *global_value) override
         {
             if (fail)
@@ -105,7 +137,7 @@ TEST(Test__PrefixCacheCoordinator, ClampsToMinimumMatchedTokensAndBlocks)
 
     EXPECT_TRUE(result.supported);
     EXPECT_EQ(result.domain_id, "test-domain");
-    EXPECT_EQ(result.placement_epoch, 7u);
+    EXPECT_EQ(result.placement_epochs, PrefixPlacementEpochSpan::at(7));
     EXPECT_EQ(result.fingerprint_key, 0x1000u);
     EXPECT_TRUE(result.cache_enabled);
     EXPECT_EQ(result.common_matched_tokens, 4);
@@ -184,7 +216,8 @@ TEST(Test__PrefixCacheCoordinator, DomainCoordinatorReducesPlacementEpoch)
 {
     FakeDomainCoordinator coordinator;
     coordinator.min_int = 8;
-    coordinator.max_uint64_results = {0x1000u, 19u};
+    coordinator.max_uint64_results = {0x1000u};
+    coordinator.placement_epochs = PrefixPlacementEpochSpan::covering(7, 19);
 
     auto result = coordinatePrefixLookups({
         participant(/*id=*/0, /*tokens=*/8, /*terminal_logits=*/true, /*terminal_hidden=*/true),
@@ -193,7 +226,8 @@ TEST(Test__PrefixCacheCoordinator, DomainCoordinatorReducesPlacementEpoch)
 
     EXPECT_TRUE(result.supported);
     EXPECT_EQ(result.fingerprint_key, 0x1000u);
-    EXPECT_EQ(result.placement_epoch, 19u);
+    EXPECT_EQ(result.placement_epochs, PrefixPlacementEpochSpan::covering(7, 19));
+    EXPECT_EQ(coordinator.placement_epoch_call_count, 1u);
 }
 
 TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
@@ -204,7 +238,7 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     hit.cached_tokens = 6;
     hit.block_size = 2;
     hit.fingerprint_key = 0xfeed;
-    hit.placement_epoch = 13;
+    hit.placement_epochs = PrefixPlacementEpochSpan::at(13);
     hit.requires_terminal_logits = true;
     hit.requires_terminal_hidden = true;
     hit.has_terminal_logits = true;
@@ -216,7 +250,7 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     EXPECT_EQ(participant.participant_id, 3);
     EXPECT_EQ(participant.device, DeviceId::rocm(1));
     EXPECT_EQ(participant.fingerprint_key, 0xfeedu);
-    EXPECT_EQ(participant.placement_epoch, 13u);
+    EXPECT_EQ(participant.placement_epochs, PrefixPlacementEpochSpan::at(13));
     EXPECT_TRUE(participant.supported);
     EXPECT_TRUE(participant.cache_enabled);
     EXPECT_TRUE(participant.hit);
@@ -226,6 +260,52 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     EXPECT_TRUE(participant.requires_terminal_hidden);
     EXPECT_TRUE(participant.has_terminal_logits);
     EXPECT_FALSE(participant.has_terminal_hidden);
+}
+
+/** @test Metadata without an archive cannot certify a partial terminal chunk. */
+TEST(Test__PrefixCacheCoordinator, MetadataOnlyHitRequiresCompleteBlockCoverage)
+{
+    PrefixLookupResult hit;
+    hit.supported = hit.cache_enabled = true;
+    hit.cached_tokens = 3;
+    hit.block_size = 2;
+    const auto participant = makePrefixParticipantLookup(0, DeviceId::cpu(), hit);
+    EXPECT_EQ(participant.matched_blocks, 1);
+    const auto aggregate = makePrefixLookupResult(coordinatePrefixLookups({participant}), 2);
+    EXPECT_EQ(aggregate.cached_tokens, 2);
+    EXPECT_FALSE(aggregate.has_terminal_logits);
+    EXPECT_FALSE(aggregate.has_terminal_hidden);
+}
+
+/** @test One recurrent image covers the same token frontier as many KV records. */
+TEST(Test__PrefixCacheCoordinator, RecurrentCheckpointCountsLogicalCoverage)
+{
+    PrefixLookupResult hit;
+    hit.supported = hit.cache_enabled = true;
+    hit.cached_tokens = 9;
+    hit.block_size = 4;
+    hit.requires_terminal_hidden = hit.requires_terminal_logits = false;
+    PrefixBlockHandle terminal;
+    terminal.key = makePrefixCacheKey(0xfeed, 0x1234, 2, 8, {17});
+    terminal.layout.block_size = 4;
+    terminal.layout.total_layers = terminal.layout.gdn_layers = 1;
+    terminal.layout.hybrid_host_state_bytes = terminal.layout.hybrid_state_bytes = 8;
+    terminal.layout.includes_hybrid_state = terminal.has_hybrid_state = true;
+    terminal.total_bytes = terminal.layout.totalBytes();
+    hit.blocks.push_back(terminal);
+
+    auto recurrent = makePrefixParticipantLookup(0, DeviceId::cpu(), hit, {},
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally);
+    EXPECT_EQ(recurrent.matched_blocks, 3);
+    auto attention = recurrent;
+    attention.participant_id = 1;
+    attention.matched_blocks = 3;
+    const auto aggregate = makePrefixLookupResult(
+        coordinatePrefixLookups({recurrent, attention}), 4);
+    EXPECT_EQ(aggregate.cached_tokens, 9);
+    EXPECT_EQ(hit.clampedTo(aggregate.cached_tokens).cached_tokens, 9);
+    EXPECT_EQ(hit.clampedTo(8).cached_tokens, 0)
+        << "A recurrent image cannot be rewound to a frontier it never captured";
 }
 
 TEST(Test__PrefixCacheCoordinator, BuildsAggregateLookupResultForRunnerCode)
@@ -241,11 +321,42 @@ TEST(Test__PrefixCacheCoordinator, BuildsAggregateLookupResultForRunnerCode)
     EXPECT_TRUE(aggregate.cache_enabled);
     EXPECT_EQ(aggregate.cached_tokens, 4);
     EXPECT_EQ(aggregate.fingerprint_key, 0x1000u);
-    EXPECT_EQ(aggregate.placement_epoch, 7u);
+    EXPECT_EQ(aggregate.placement_epochs, PrefixPlacementEpochSpan::at(7));
     EXPECT_EQ(aggregate.block_size, 2);
     EXPECT_TRUE(aggregate.has_terminal_logits);
     EXPECT_TRUE(aggregate.has_terminal_hidden);
     EXPECT_TRUE(aggregate.bypass_reason.empty());
+}
+
+/** @brief Nested TP/PP projection preserves both endpoints in every arrival order. */
+TEST(Test__PrefixCacheCoordinator, AdmissionSpanSurvivesNestedCoordination)
+{
+    std::array<uint64_t, 3> epochs{0, 7, 19};
+    do
+    {
+        std::vector<PrefixParticipantLookup> leaves;
+        for (size_t index = 0; index < epochs.size(); ++index)
+        {
+            auto leaf = participant(static_cast<int>(index), 0, false, false);
+            leaf.placement_epochs = PrefixPlacementEpochSpan::at(epochs[index]);
+            leaves.push_back(leaf);
+        }
+        const auto inner = coordinatePrefixLookups(std::move(leaves));
+        const auto outer = coordinatePrefixLookups({makePrefixParticipantLookup(
+            0, DeviceId::cpu(), makePrefixLookupResult(inner, 2))});
+        EXPECT_EQ(outer.placement_epochs, PrefixPlacementEpochSpan::covering(0, 19));
+    } while (std::next_permutation(epochs.begin(), epochs.end()));
+}
+
+/** @brief Invalid spans cannot enter the typed interface; valid maxima do not overflow. */
+TEST(Test__PrefixCacheCoordinator, AdmissionSpanRejectsReversedEndpoints)
+{
+    EXPECT_THROW(PrefixPlacementEpochSpan::covering(8, 7), std::invalid_argument);
+    constexpr auto maximum = std::numeric_limits<uint64_t>::max();
+    constexpr auto merged = PrefixPlacementEpochSpan::at(maximum).mergedWith(
+        PrefixPlacementEpochSpan::at(0));
+    EXPECT_EQ(merged.earliest(), 0u);
+    EXPECT_EQ(merged.latest(), maximum);
 }
 
 TEST(Test__PrefixCacheCoordinator, AggregateLookupDoesNotAdvertisePartialBlockTokens)
@@ -298,6 +409,11 @@ TEST(Test__PrefixCacheCoordinator, MPICoordinatorReducesSingleRankScalars)
     EXPECT_TRUE(coordinator.allMaxUInt64(11, &max_u64));
     EXPECT_EQ(max_u64, 11u);
 
+    PrefixPlacementEpochSpan span;
+    EXPECT_TRUE(coordinator.allPlacementEpochs(
+        PrefixPlacementEpochSpan::covering(11, 19), &span));
+    EXPECT_EQ(span, PrefixPlacementEpochSpan::covering(11, 19));
+
     bool bool_value = false;
     EXPECT_TRUE(coordinator.allAndBool(true, &bool_value));
     EXPECT_TRUE(bool_value);
@@ -340,8 +456,10 @@ TEST(Test__PrefixCacheCoordinator, IgnoresFingerprintMismatchWhenParticipantsOwn
                               /*fingerprint_key=*/0x2000,
                               /*requires_terminal_logits=*/true,
                               /*requires_terminal_hidden=*/false);
-    stage0.fingerprint_must_match = false;
-    stage1.fingerprint_must_match = false;
+    stage0.fingerprint_policy =
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally;
+    stage1.fingerprint_policy =
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally;
 
     auto result = coordinatePrefixLookups({stage0, stage1});
 

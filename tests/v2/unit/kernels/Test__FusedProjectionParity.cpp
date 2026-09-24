@@ -13,14 +13,17 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <vector>
 
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/CPUProjectionTestWorkspace.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -105,6 +108,18 @@ protected:
             projs.push_back(std::move(pd));
         }
 
+        // Fused and serial invocations are mutually exclusive. Admit the maximum
+        // named requirement once, then explicitly pass that same arena to both.
+        WorkspaceRequirements requirements;
+        for (const auto &projection : projs)
+        {
+            const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(projection.kernel.get());
+            EXPECT_NE(consumer, nullptr);
+            if (!consumer) return 1e10f;
+            requirements.merge(consumer->getWorkspaceRequirements(m));
+        }
+        CPUProjectionTestWorkspace workspace(requirements);
+
         // --- Path 1: multiply_fused_tensor ---
         {
             std::vector<ITensorGemm::TensorProjectionDesc> fused_descs;
@@ -119,7 +134,7 @@ protected:
             }
 
             bool fused_ok = projs[0].kernel->multiply_fused_tensor(
-                input.get(), fused_descs, m, k);
+                input.get(), fused_descs, m, k, nullptr, workspace.get());
             EXPECT_TRUE(fused_ok) << "multiply_fused_tensor failed";
             if (!fused_ok)
                 return 1e10f;
@@ -130,7 +145,8 @@ protected:
         {
             bool seq_ok = projs[i].kernel->multiply_tensor(
                 input.get(), projs[i].output_sequential.get(),
-                m, proj_specs[i].n, k);
+                m, proj_specs[i].n, k, false, 1.0f, 0.0f, nullptr,
+                nullptr, -1, workspace.get());
             EXPECT_TRUE(seq_ok) << "multiply_tensor failed for projection " << i;
             if (!seq_ok)
                 return 1e10f;
@@ -267,4 +283,191 @@ TEST_F(FusedProjectionParity, Q4_0_SingleProjection_M1)
 
     EXPECT_LT(max_diff, PARITY_TOLERANCE)
         << "Q4_0 single projection (M=1) diverges from sequential";
+}
+
+/**
+ * @brief FP32 sparse rows remain valid inputs to FP16/BF16 expert weights.
+ *
+ * Heterogeneous ExpertOverlay packets deliberately use FP32 host rows even
+ * when a CPU tier owns floating 16-bit expert weights. Exercise the ordinary
+ * fused gate/up transaction at decode, small-prefill, and maximum retained MTP
+ * depth, and require byte identity with the corresponding direct projections.
+ */
+TEST_F(FusedProjectionParity,
+       CPUFloating16WeightsAcceptFP32SparseRowsInFusedProjection)
+{
+    constexpr int K = 64;
+    constexpr int N0 = 48;
+    constexpr int N1 = 32;
+
+    for (const TensorType weight_type :
+         {TensorType::FP16, TensorType::BF16})
+    {
+        SCOPED_TRACE(
+            std::string("weight_type=") +
+            std::to_string(static_cast<int>(weight_type)));
+        std::unique_ptr<TensorBase> weights0;
+        std::unique_ptr<TensorBase> weights1;
+        if (weight_type == TensorType::FP16)
+        {
+            weights0 = TestTensorFactory::createFP16Random(
+                {N0, K}, -0.25f, 0.25f, 3101);
+            weights1 = TestTensorFactory::createFP16Random(
+                {N1, K}, -0.25f, 0.25f, 3102);
+        }
+        else
+        {
+            weights0 = TestTensorFactory::createBF16Random(
+                {N0, K}, -0.25f, 0.25f, 3201);
+            weights1 = TestTensorFactory::createBF16Random(
+                {N1, K}, -0.25f, 0.25f, 3202);
+        }
+        ASSERT_NE(weights0, nullptr);
+        ASSERT_NE(weights1, nullptr);
+
+        gemm::FloatingPointGemmKernel kernel0(weights0.get());
+        gemm::FloatingPointGemmKernel kernel1(weights1.get());
+        for (const int m : std::array{1, 6, 15})
+        {
+            SCOPED_TRACE(std::string("m=") + std::to_string(m));
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m), K},
+                -0.75f,
+                0.75f,
+                static_cast<uint32_t>(3300 + m));
+            ASSERT_NE(input, nullptr);
+
+            FP32Tensor fused0({static_cast<size_t>(m), N0});
+            FP32Tensor fused1({static_cast<size_t>(m), N1});
+            FP32Tensor direct0({static_cast<size_t>(m), N0});
+            FP32Tensor direct1({static_cast<size_t>(m), N1});
+            std::vector<ITensorGemm::TensorProjectionDesc> projections{
+                {&kernel0, &fused0, N0, nullptr, "gate"},
+                {&kernel1, &fused1, N1, nullptr, "up"},
+            };
+
+            ASSERT_TRUE(kernel0.multiply_fused_tensor(
+                input.get(), projections, m, K));
+            ASSERT_TRUE(kernel0.multiply_tensor(
+                input.get(), &direct0, m, N0, K));
+            ASSERT_TRUE(kernel1.multiply_tensor(
+                input.get(), &direct1, m, N1, K));
+            EXPECT_EQ(
+                std::memcmp(
+                    fused0.data(),
+                    direct0.data(),
+                    fused0.numel() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    fused1.data(),
+                    direct1.data(),
+                    fused1.numel() * sizeof(float)),
+                0);
+        }
+    }
+}
+
+/**
+ * @brief Mixed FP32×16-bit grouped verifier rows equal serial decode bytes.
+ *
+ * Dynamic MTP may admit every depth through 15. The grouped implementation is
+ * allowed to share decoded weights across rows, but each row must retain the
+ * exact scalar-K reduction order of the one-token mixed-precision path.
+ */
+TEST_F(FusedProjectionParity,
+       CPUFloating16WeightsFP32GroupedVerifierMatchesSerialDecode)
+{
+    constexpr int K = 64;
+    constexpr int N0 = 48;
+    constexpr int N1 = 32;
+
+    for (const TensorType weight_type :
+         {TensorType::FP16, TensorType::BF16})
+    {
+        SCOPED_TRACE(
+            std::string("weight_type=") +
+            std::to_string(static_cast<int>(weight_type)));
+        std::unique_ptr<TensorBase> weights0;
+        std::unique_ptr<TensorBase> weights1;
+        if (weight_type == TensorType::FP16)
+        {
+            weights0 = TestTensorFactory::createFP16Random(
+                {N0, K}, -0.25f, 0.25f, 3401);
+            weights1 = TestTensorFactory::createFP16Random(
+                {N1, K}, -0.25f, 0.25f, 3402);
+        }
+        else
+        {
+            weights0 = TestTensorFactory::createBF16Random(
+                {N0, K}, -0.25f, 0.25f, 3501);
+            weights1 = TestTensorFactory::createBF16Random(
+                {N1, K}, -0.25f, 0.25f, 3502);
+        }
+        ASSERT_NE(weights0, nullptr);
+        ASSERT_NE(weights1, nullptr);
+
+        gemm::FloatingPointGemmKernel kernel0(weights0.get());
+        gemm::FloatingPointGemmKernel kernel1(weights1.get());
+        for (const int m : std::array{2, 3, 15})
+        {
+            SCOPED_TRACE(std::string("m=") + std::to_string(m));
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m), K},
+                -0.75f,
+                0.75f,
+                static_cast<uint32_t>(3600 + m));
+            ASSERT_NE(input, nullptr);
+
+            FP32Tensor grouped0({static_cast<size_t>(m), N0});
+            FP32Tensor grouped1({static_cast<size_t>(m), N1});
+            std::vector<ITensorGemm::TensorProjectionDesc> projections{
+                {&kernel0, &grouped0, N0, nullptr, "gate"},
+                {&kernel1, &grouped1, N1, nullptr, "up"},
+            };
+            ASSERT_TRUE(
+                kernel0.multiply_fused_verifier_rows_decode_equivalent(
+                    input.get(), projections, m, K));
+
+            std::vector<float> serial0(
+                static_cast<size_t>(m) * N0);
+            std::vector<float> serial1(
+                static_cast<size_t>(m) * N1);
+            for (int row = 0; row < m; ++row)
+            {
+                FP32Tensor row_input({1u, static_cast<size_t>(K)});
+                FP32Tensor row0({1u, static_cast<size_t>(N0)});
+                FP32Tensor row1({1u, static_cast<size_t>(N1)});
+                std::memcpy(
+                    row_input.mutable_data(),
+                    input->data() + static_cast<size_t>(row) * K,
+                    static_cast<size_t>(K) * sizeof(float));
+                ASSERT_TRUE(kernel0.multiply_tensor(
+                    &row_input, &row0, 1, N0, K));
+                ASSERT_TRUE(kernel1.multiply_tensor(
+                    &row_input, &row1, 1, N1, K));
+                std::memcpy(
+                    serial0.data() + static_cast<size_t>(row) * N0,
+                    row0.data(),
+                    static_cast<size_t>(N0) * sizeof(float));
+                std::memcpy(
+                    serial1.data() + static_cast<size_t>(row) * N1,
+                    row1.data(),
+                    static_cast<size_t>(N1) * sizeof(float));
+            }
+
+            EXPECT_EQ(
+                std::memcmp(
+                    grouped0.data(),
+                    serial0.data(),
+                    serial0.size() * sizeof(float)),
+                0);
+            EXPECT_EQ(
+                std::memcmp(
+                    grouped1.data(),
+                    serial1.data(),
+                    serial1.size() * sizeof(float)),
+                0);
+        }
+    }
 }

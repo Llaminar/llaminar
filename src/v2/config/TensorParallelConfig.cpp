@@ -142,6 +142,14 @@ namespace llaminar2
             {
                 return "Assignment " + std::to_string(i) + " has invalid device";
             }
+            if (assignments_[i].head_count <= 0 ||
+                assignments_[i].kv_head_count <= 0 ||
+                assignments_[i].d_ff_count <= 0 ||
+                assignments_[i].vocab_count <= 0)
+            {
+                return "Assignment " + std::to_string(i) +
+                       " has an empty query, KV, FFN, or vocabulary shard";
+            }
         }
 
         // Check for duplicate devices
@@ -354,9 +362,13 @@ namespace llaminar2
         if (kv_replicated)
         {
             kv_head_counts.assign(devices.size(), n_kv_heads);
-            LOG_INFO("[TensorParallelConfig] GQA replication: n_kv_heads=" << n_kv_heads
-                                                                           << " < tp_degree=" << devices.size()
-                                                                           << ", replicating K/V on all devices");
+            // Candidate enumeration invokes this splitter for every optional
+            // width.  Replication is expected geometry, not an operator event;
+            // retain the useful diagnosis without flooding normal planning
+            // output once per candidate.
+            LOG_DEBUG("[TensorParallelConfig] GQA replication: n_kv_heads=" << n_kv_heads
+                                                                            << " < tp_degree=" << devices.size()
+                                                                            << ", replicating K/V on all devices");
         }
         else
         {

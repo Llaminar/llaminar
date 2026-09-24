@@ -26,7 +26,7 @@ namespace llaminar2
         bool participant_world_rank_known = false;
         int owner_world_rank = -1;
         WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
-        ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
+        RoutedExpertResidencyPolicy residency_policy = RoutedExpertResidencyPolicy::Disabled;
         size_t estimated_routed_bytes = 0;
         size_t memory_budget_bytes = 0;
         bool fallback = false;
@@ -41,7 +41,7 @@ namespace llaminar2
         bool participant_world_rank_known = false;
         int owner_world_rank = -1;
         WeightResidencyCategory residency_category = WeightResidencyCategory::Unspecified;
-        ExpertResidencyPolicy residency_policy = ExpertResidencyPolicy::Disabled;
+        RoutedExpertResidencyPolicy residency_policy = RoutedExpertResidencyPolicy::Disabled;
         bool accelerator = false;
         bool fallback = false;
         size_t memory_budget_bytes = 0;
@@ -88,6 +88,38 @@ namespace llaminar2
         bool hasCpuRoutedAssignments() const;
         std::vector<DeviceId> acceleratorDevices() const;
         MoEExpertOverlayPreparationPlan filteredForRank(const OverlayRankPlan &rank_plan) const;
+
+        /**
+         * @brief Restrict preparation ownership to one graph participant device.
+         *
+         * A per-device graph runner may prepare only the routed experts assigned
+         * to its own device.  Keeping this restriction in the immutable plan
+         * makes it impossible for one LocalTP runner to repack another runner's
+         * experts through WeightManager's process-wide caches.  The returned
+         * diagnostics are rebuilt from the retained requests, so logs describe
+         * the exact work owned by the caller rather than the rank-wide plan.
+         *
+         * @param device Device owned by the graph runner performing preparation.
+         * @return A plan containing only requests whose device equals @p device.
+         */
+        MoEExpertOverlayPreparationPlan filteredForDevice(DeviceId device) const;
+
+        /**
+         * @brief Restrict preparation to an explicit graph execution device set.
+         *
+         * A heterogeneous continuation root can execute its captured GPU graph
+         * and one or more colocated CPU sparse endpoints.  Those endpoints are
+         * one graph ownership unit even though their prepared engines have
+         * different physical devices.  Callers provide the complete typed set;
+         * no domain name or implicit host-fallback rule is reconstructed here.
+         *
+         * @param devices Exact devices whose rank-local requests are retained.
+         * @return A plan with rebuilt diagnostics for only those devices.
+         * @throws std::invalid_argument when @p devices is empty or contains an
+         *         invalid or duplicate device.
+         */
+        MoEExpertOverlayPreparationPlan filteredForDevices(
+            const std::vector<DeviceId> &devices) const;
 
         bool shouldPrepare(
             DeviceId device,

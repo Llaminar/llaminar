@@ -1,3 +1,12 @@
+/**
+ * @file WeightLoadProgress.h
+ * @brief Thread-safe local rendering and non-owning distributed publication of model-load progress.
+ *
+ * A setup scope owns any distributed progress publisher. This renderer keeps
+ * only a weak publication edge so failed model initialization cannot retain an
+ * MPI window or its polling thread through an ownership cycle.
+ */
+
 #pragma once
 
 #include <chrono>
@@ -77,8 +86,8 @@ namespace llaminar2
         int registerDevice(const std::string &label, size_t total_bytes)
         {
             int agg_idx = -1;
-            if (aggregator_)
-                agg_idx = aggregator_->publishDevice(label, total_bytes);
+            if (auto aggregator = aggregator_.lock())
+                agg_idx = aggregator->publishDevice(label, total_bytes);
 
             std::lock_guard<std::mutex> lock(mu_);
             int idx = static_cast<int>(devices_.size());
@@ -109,9 +118,10 @@ namespace llaminar2
                 return;
 
             // Publish to aggregator window (all ranks, including non-rendering)
-            if (aggregator_ && devices_[device_idx].aggregator_idx >= 0)
+            if (auto aggregator = aggregator_.lock();
+                aggregator && devices_[device_idx].aggregator_idx >= 0)
             {
-                aggregator_->publishProgress(devices_[device_idx].aggregator_idx, bytes_loaded);
+                aggregator->publishProgress(devices_[device_idx].aggregator_idx, bytes_loaded);
             }
 
             if (!enabled_)
@@ -135,9 +145,10 @@ namespace llaminar2
                 return;
 
             // Publish to aggregator window
-            if (aggregator_ && devices_[device_idx].aggregator_idx >= 0)
+            if (auto aggregator = aggregator_.lock();
+                aggregator && devices_[device_idx].aggregator_idx >= 0)
             {
-                aggregator_->publishFinished(devices_[device_idx].aggregator_idx);
+                aggregator->publishFinished(devices_[device_idx].aggregator_idx);
             }
 
             auto &dev = devices_[device_idx];
@@ -181,7 +192,7 @@ namespace llaminar2
             if (device_idx < 0)
                 return nullptr;
             // Need a callback if we're rendering OR publishing to aggregator
-            if (!enabled_ && !aggregator_)
+            if (!enabled_ && aggregator_.expired())
                 return nullptr;
             return [this, device_idx](size_t bytes_loaded, size_t /*total_bytes*/)
             {
@@ -198,7 +209,7 @@ namespace llaminar2
 
         std::shared_ptr<IProgressPublisher> aggregator() const
         {
-            return aggregator_;
+            return aggregator_.lock();
         }
 
     private:
@@ -255,7 +266,14 @@ namespace llaminar2
         int lines_rendered_ = 0;
         bool header_printed_ = false;
         std::chrono::steady_clock::time_point last_render_time_;
-        std::shared_ptr<IProgressPublisher> aggregator_;
+        /*
+         * The setup scope owns the publisher. Keeping a weak edge here is
+         * essential because WeightLoadProgressAggregator owns the rank-0
+         * renderer while its polling thread is active. A strong reverse edge
+         * would form a cycle that survives failed model initialization and lets
+         * the polling thread outlive its MPI window.
+         */
+        std::weak_ptr<IProgressPublisher> aggregator_;
     };
 
 } // namespace llaminar2

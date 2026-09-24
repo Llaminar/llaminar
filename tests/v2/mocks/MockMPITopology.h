@@ -135,6 +135,20 @@ namespace llaminar2::test
         const RankPlacement &placement() const override { return placements_[rank_]; }
         const RankPlacement &get_placement(int r) const override;
         const std::vector<RankPlacement> &all_placements() const override { return placements_; }
+        bool same_node(int rank_a, int rank_b) const override
+        {
+            if (rank_a < 0 || rank_b < 0 || rank_a >= world_size_ ||
+                rank_b >= world_size_)
+            {
+                return false;
+            }
+            return placements_[static_cast<size_t>(rank_a)].node_id ==
+                   placements_[static_cast<size_t>(rank_b)].node_id;
+        }
+        uint64_t node_shared_memory_namespace() const override
+        {
+            return 0x4d4f434b544f504fULL;
+        }
 
         // =========================================================================
         // IMPITopology Implementation - Role Queries
@@ -992,6 +1006,8 @@ namespace llaminar2::test
                         gpu.type = DeviceType::ROCm;
                     }
                     gpu.local_device_id = dev.device_id;
+                    gpu.uuid = "fixture-" + std::to_string(r) + "-" +
+                               std::to_string(static_cast<int>(gpu.type)) + "-" + std::to_string(dev.device_id);
                     gpu.memory_bytes = dev.memory_bytes;
                     gpu.compute_units = static_cast<int>(dev.compute_units);
                     gpu.name = dev.name;

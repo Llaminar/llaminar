@@ -1,0 +1,6946 @@
+#!/usr/bin/env python3
+"""Regression tests for isolated NativeVNNI profiler sidecars.
+
+Synthetic records exercise request identity, exact-stream attribution, physical
+dispatch ownership, and feature publication without launching an accelerator.
+Canonical timing remains unchanged by the independently supplied counters.
+"""
+
+from __future__ import annotations
+
+import csv
+import dataclasses
+import json
+import math
+import os
+import sys
+import tempfile
+import time
+import unittest
+import weakref
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+KERNEL_PERF_ROOT = REPO_ROOT / "tests" / "v2" / "performance" / "kernels"
+if str(KERNEL_PERF_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERNEL_PERF_ROOT))
+
+from native_vnni_dispatch.candidate_registry import (  # noqa: E402
+    cpu_native_vnni_decode_registry,
+    cuda_native_vnni_gemv_registry,
+    rocm_native_vnni_decode_formula_registry,
+    rocm_native_vnni_decode_registry,
+)
+from native_vnni_dispatch.candidate_observation import (  # noqa: E402
+    read_observation_rows,
+    write_observation_csv,
+)
+from native_vnni_dispatch.corpus import (  # noqa: E402
+    ObservationCorpus,
+    runtime_key,
+)
+from native_vnni_dispatch.cuda_shape_resolved import (  # noqa: E402
+    project_cuda_shape_resolved_candidates,
+    resolve_cuda_concrete_candidate_id,
+)
+from native_vnni_dispatch.rocm_shape_resolved import (  # noqa: E402
+    project_rocm_shape_resolved_candidates,
+    resolve_rocm_concrete_candidate_id,
+)
+from native_vnni_dispatch.format_registry import format_spec  # noqa: E402
+from native_vnni_dispatch.profiler_collectors import (  # noqa: E402
+    CollectorOptions,
+    _append_checkpoint_journal,
+    _apply_device_placement,
+    _build_cpu_process_batches,
+    _build_gpu_process_batches,
+    build_argument_parser as build_profiler_collector_argument_parser,
+    _collect_cpu,
+    _collect_cpu_batch,
+    _collect_cuda_batch,
+    _collect_rocm_batch,
+    _convert_ncu_value,
+    _cpu_batch_environment,
+    _cuda_batch_environment,
+    _rocm_batch_environment,
+    _partition_cuda_batch_dispatches,
+    _parse_cpu_lane_lists,
+    _resolve_gpu_process_batch_size,
+    _load_incremental_evidence,
+    _NCUDispatchRecord,
+    _profile_environment,
+    _sha256_files,
+    _tool_command,
+    _trainer_arguments,
+    _validate_gpu_process_batch_size,
+    _write_binary_provenance,
+    _write_checkpoint,
+    _write_cpu_batch_plan,
+    _write_gpu_batch_plan,
+    collect_request,
+    parse_ncu_csv,
+    parse_perf_stat,
+    parse_rocprof_batch_csvs,
+    parse_rocprof_csvs,
+)
+from native_vnni_dispatch.profiler_checkpoint import (  # noqa: E402
+    recover_complete_checkpoint,
+)
+from native_vnni_dispatch.profiler_reparse import (  # noqa: E402
+    _unit_only_record,
+    reparse_cuda_evidence,
+    upgrade_cuda_evidence,
+)
+from native_vnni_dispatch.profiler_evidence import (  # noqa: E402
+    ProfilerRequest,
+    EXPECTED_PROFILER_TOOL,
+    LEGACY_PROFILER_REQUEST_SCHEMA_VERSION,
+    PROFILER_COLLECTOR_VERSION,
+    PROFILER_METRIC_SET_VERSION,
+    MetricAvailability,
+    ProfiledDispatch,
+    ProfiledDispatchKind,
+    ProfilerEvidence,
+    ProfilerEvidenceManifest,
+    ProfilerEvidenceStatus,
+    ProfilerMetric,
+    ProfilerRequestManifest,
+    build_missing_profiler_request_transaction,
+    build_profiler_request_manifest,
+    count_uncovered_profiler_requests,
+    compose_profiler_evidence,
+    compact_profiler_observation_witnesses,
+    metric_definitions,
+    _ordered_compose_source_paths,
+    _profiler_requests_for_observations,
+    profiler_feature_rows,
+    profiler_request_for_observation,
+    read_profiler_feature_observation_witnesses,
+    read_profiler_evidence_manifest,
+    read_profiler_request_manifest,
+    validate_profiler_evidence_coverage,
+    write_profiler_feature_csv,
+    write_profiler_feature_csv_from_files,
+    write_profiler_evidence_manifest,
+    write_profiler_request_manifest,
+)
+import native_vnni_dispatch.profiler_evidence as profiler_evidence  # noqa: E402
+import native_vnni_dispatch.profiler_model as profiler_model  # noqa: E402
+import native_vnni_dispatch.segmented_policy as segmented_policy  # noqa: E402
+from native_vnni_dispatch.profiler_model import (  # noqa: E402
+    _center_complete_candidate_relative_auxiliary,
+    _cpu_decode_schedule_features,
+    _cpu_verifier_schedule_features,
+    _mask_held_out_profiler_anchor,
+    _model_record,
+    _normalized_metric_features,
+    _cpu_prefill_schedule_features,
+    _profiler_auxiliary_target_record,
+    _profiler_model_input_record,
+    apply_profiler_regret_predictions,
+    build_profiler_feature_catalog,
+    build_profiler_model_record_index,
+    build_profiler_observation_index,
+    load_profiler_feature_catalog,
+    merge_profiler_feature_catalogs,
+)
+from native_vnni_dispatch.schema import (  # noqa: E402
+    Backend,
+    ExecutionMode,
+    FEATURE_SCHEMA_VERSION,
+    LEARNER_VERSION,
+    NativeVNNIObservation,
+    P95_REGRET_BUDGET,
+    POLICY_ABI,
+    SCHEMA_VERSION,
+    SemanticContract,
+    classify_aspect,
+)
+from native_vnni_dispatch.segmented_policy import (  # noqa: E402
+    CandidatePointCost,
+    PolicyFitCache,
+    ProfilerInfluence,
+    _CompactFoldTask,
+    _domain_fold_tasks,
+    _domain_profiler_prediction_requests,
+    _domain_profiler_prediction_request_keys,
+    _evaluate_placement_fold,
+    _fit_profiler_prediction_pool,
+    _populate_profiler_prediction_cache,
+    _profiler_teacher_candidate_costs,
+    _profiler_model_digests_for_pools,
+    _profiler_transfer_key,
+    _rank_domain_cross_validations,
+    fit_domain_rules,
+    fit_generic_policy,
+)
+
+
+def deterministic_test_profiler_surrogate(
+    _training_matrix,
+    targets,
+    prediction_matrix,
+    *,
+    device,
+):
+    """Provide a native-thread-free deterministic unit-test surrogate."""
+
+    if not device:
+        raise AssertionError("unit surrogate requires an explicit device")
+    value = float(np.mean(np.asarray(targets)[:, 0], dtype=np.float64))
+    return np.full(len(prediction_matrix), value, dtype=np.float64)
+
+
+def cuda_observation(
+    *,
+    source_format: str = "Q4_0",
+    candidate_id: str = "cuda.nvnni.decode.fast_m1.wide.tn128.cpt1",
+    supported: bool = True,
+    forced_route_ok: bool = True,
+) -> NativeVNNIObservation:
+    """Build one registry-authentic timing observation for sidecar tests."""
+
+    registry = cuda_native_vnni_gemv_registry()
+    candidate = registry.resolve(candidate_id)
+    spec = format_spec(source_format)
+    n = 2048
+    k = 4096
+    result = NativeVNNIObservation(
+        schema_version=SCHEMA_VERSION,
+        run_id="profile-unit-run",
+        corpus_id="sha256:profile-unit-corpus",
+        git_revision="0123456789abcdef",
+        build_id="profile-unit-release-build",
+        compiler_id="profile-unit-nvcc",
+        policy_abi=POLICY_ABI,
+        learner_version=LEARNER_VERSION,
+        backend=Backend.CUDA,
+        architecture_class="unit-sm80-native-vnni-v1",
+        device_name="unit-cuda-device",
+        driver_runtime="unit-cuda-runtime",
+        threading_or_stream_mode="explicit_non_default_stream",
+        semantic_contract=SemanticContract.FAST,
+        operation_kind="NativeVNNIDecodeProjection",
+        bundle_signature="single-native-vnni-projection:fp32-output:v2",
+        projection_n_vector=(n,),
+        source_format=spec.label,
+        source_codebook_id=spec.source_codebook_id,
+        prepared_family_id=spec.prepared_family("cuda"),
+        packing_abi=spec.packing_abi("cuda"),
+        runtime_codebook_id=spec.runtime_codebook("cuda"),
+        shape_group_id="profile-unit-shape-group",
+        shape_name="profile-unit-shape",
+        execution_mode=ExecutionMode.GRAPH_CAPTURED,
+        m=1,
+        aggregate_n=n,
+        k=k,
+        aspect_ratio=float(n) / float(k),
+        aspect_bucket=classify_aspect(n, k),
+        work_items=n * k,
+        n_tail_class="n_mod_256=0",
+        k_tail_class="k_mod_256=0",
+        alignment_class="cuda_gpu_prepared_native_vnni_16b_aligned",
+        candidate_id=candidate.candidate_id,
+        effective_candidate_id=candidate.effective_candidate_id,
+        candidate_family=candidate.candidate_family,
+        config_json=candidate.config_json,
+        supported=supported,
+        graph_capture_ok=True,
+        generic_eligible=True,
+        arithmetic_fingerprint=candidate.arithmetic_fingerprint,
+        serial_m1_policy_id="cuda.production.serial.m1",
+        serial_m1_policy_hash="sha256:serial-policy",
+        candidate_policy_hash=candidate.candidate_policy_hash(),
+        ordered_reduction=candidate.ordered_reduction,
+        uses_atomic_reduction=candidate.uses_atomic_reduction,
+        trial_set_hash="sha256:profile-unit-trials",
+        numerical_correctness=True,
+        bitwise_equal=True,
+        repeat_equal=True,
+        mismatch_count=0,
+        first_mismatch_index=None,
+        grouped_output_digest="sha256:profile-unit-output",
+        serial_output_digest="sha256:profile-unit-output",
+        max_abs=0.0,
+        relative_l2=0.0,
+        cosine=1.0,
+        symmetric_kld=0.0,
+        warmup_count=5,
+        sample_count=30,
+        min_us=10.0,
+        median_us=11.0,
+        p95_us=12.0,
+        mad_us=0.2,
+        cv=0.01,
+        timing_sample_hash="fnv1a64:0123456789abcdef",
+        effective_bandwidth_gbs=100.0,
+        forced_route_ok=forced_route_ok,
+        observed_candidate_id=candidate.effective_candidate_id,
+        route_counter_ok=forced_route_ok,
+        workspace_ok=True,
+        explicit_stream_ok=True,
+    )
+    result.validate()
+    return result
+
+
+def cpu_decode_observation(
+    *,
+    candidate_id: str = "cpu.nvnni.decode.n_chunk_grid.nbc1",
+) -> NativeVNNIObservation:
+    """Build one registry-authentic CPU M=1 timing observation."""
+
+    candidate = cpu_native_vnni_decode_registry().resolve(candidate_id)
+    spec = format_spec("Q4_0")
+    result = dataclasses.replace(
+        cuda_observation(),
+        backend=Backend.CPU,
+        architecture_class="unit-cascadelake|build=AVX2|runtime=AVX2|threads=28",
+        device_name="unit-cpu-socket",
+        driver_runtime="linux-perf-event-unit",
+        threading_or_stream_mode=(
+            "openmp:build=AVX2:requested=AVX2:effective=AVX2:threads=28"
+        ),
+        operation_kind="NativeVNNIFastM1Projection",
+        bundle_signature="single-native-vnni-decode:serial-full-k:fp32-output:v1",
+        source_format=spec.label,
+        source_codebook_id=spec.source_codebook_id,
+        prepared_family_id=spec.prepared_family("cpu"),
+        packing_abi=spec.packing_abi("cpu"),
+        runtime_codebook_id=spec.runtime_codebook("cpu"),
+        shape_group_id="cpu-decode:unit-shape:n2048:k4096",
+        shape_name="unit-cpu-decode-shape",
+        execution_mode=ExecutionMode.EAGER,
+        candidate_id=candidate.candidate_id,
+        effective_candidate_id=candidate.effective_candidate_id,
+        candidate_family=candidate.candidate_family,
+        config_json=candidate.config_json,
+        graph_capture_ok=False,
+        arithmetic_fingerprint=candidate.arithmetic_fingerprint,
+        serial_m1_policy_id="cpu.native_vnni.serial_m1.frozen",
+        serial_m1_policy_hash="sha256:cpu-serial-policy",
+        candidate_policy_hash=candidate.candidate_policy_hash(),
+        ordered_reduction=candidate.ordered_reduction,
+        uses_atomic_reduction=candidate.uses_atomic_reduction,
+        observed_candidate_id=candidate.effective_candidate_id,
+        explicit_stream_ok=False,
+    )
+    result.validate()
+    return result
+
+
+def rocm_decode_observation(
+    *,
+    candidate_id: str = "rocm.nvnni.decode.fast.kb1",
+    n: int = 2048,
+    k: int = 4096,
+) -> NativeVNNIObservation:
+    """Build one registry-authentic ROCm M=1 physical timing observation."""
+
+    candidate = rocm_native_vnni_decode_registry().resolve(candidate_id)
+    spec = format_spec("Q4_0")
+    result = dataclasses.replace(
+        cuda_observation(),
+        backend=Backend.ROCM,
+        architecture_class="unit-gfx906-native-vnni-v1",
+        device_name="unit-rocm-device",
+        driver_runtime="unit-rocm-runtime",
+        threading_or_stream_mode="hip_explicit_non_default_stream",
+        prepared_family_id=spec.prepared_family("rocm"),
+        packing_abi=spec.packing_abi("rocm"),
+        runtime_codebook_id=spec.runtime_codebook("rocm"),
+        shape_group_id=f"rocm-decode:unit-shape:n{n}:k{k}",
+        shape_name="unit-rocm-decode-shape",
+        projection_n_vector=(n,),
+        aggregate_n=n,
+        k=k,
+        aspect_ratio=float(n) / float(k),
+        aspect_bucket=classify_aspect(n, k),
+        work_items=n * k,
+        n_tail_class=f"n_mod_256={n % 256}",
+        k_tail_class=f"k_mod_256={k % 256}",
+        alignment_class="rocm_gpu_prepared_native_vnni_16b_aligned",
+        candidate_id=candidate.candidate_id,
+        effective_candidate_id=candidate.effective_candidate_id,
+        candidate_family=candidate.candidate_family,
+        config_json=candidate.config_json,
+        arithmetic_fingerprint=candidate.arithmetic_fingerprint,
+        serial_m1_policy_id="rocm.production.serial.m1",
+        serial_m1_policy_hash="sha256:rocm-serial-policy",
+        candidate_policy_hash=candidate.candidate_policy_hash(),
+        ordered_reduction=candidate.ordered_reduction,
+        uses_atomic_reduction=candidate.uses_atomic_reduction,
+        observed_candidate_id=candidate.effective_candidate_id,
+    )
+    result.validate()
+    return result
+
+
+def complete_metrics(
+    backend: Backend,
+    *,
+    scale: float = 1.0,
+) -> tuple[ProfilerMetric, ...]:
+    """Create a complete measured v1 metric inventory for one dispatch."""
+
+    return tuple(
+        ProfilerMetric(
+            metric_id=definition.metric_id,
+            category=definition.category,
+            unit=definition.unit,
+            availability=MetricAvailability.MEASURED,
+            value=scale * float(index + 1),
+            source_name=f"unit::{definition.metric_id}",
+            reason=None,
+        )
+        for index, definition in enumerate(metric_definitions(backend))
+    )
+
+
+def cuda_dispatch(
+    index: int = 0,
+    name: str = "unitKernel",
+    *,
+    metric_scale: float = 1.0,
+) -> ProfiledDispatch:
+    """Create one complete synthetic CUDA profiler dispatch."""
+
+    return ProfiledDispatch(
+        dispatch_index=index,
+        dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+        kernel_name=name,
+        kernel_fingerprint=(
+            "sha256:" + f"{index + 1:064x}"
+        ),
+        grid=(16, 1, 1),
+        block=(128, 1, 1),
+        metrics=complete_metrics(Backend.CUDA, scale=metric_scale),
+    )
+
+
+def rocm_dispatch(
+    index: int = 0,
+    name: str = "nativeVnniGemvKPartKernel",
+) -> ProfiledDispatch:
+    """Create one complete synthetic ROCm profiler dispatch."""
+
+    return ProfiledDispatch(
+        dispatch_index=index,
+        dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+        kernel_name=name,
+        kernel_fingerprint="sha256:" + f"{index + 1:064x}",
+        grid=(16, 1, 1),
+        block=(128, 1, 1),
+        metrics=complete_metrics(Backend.ROCM),
+    )
+
+
+def complete_evidence(request, dispatches=None) -> ProfilerEvidence:
+    """Build valid complete evidence for one supported request."""
+
+    return ProfilerEvidence(
+        request_id=request.request_id,
+        observation_digest=request.observation_digest,
+        backend=request.backend,
+        status=ProfilerEvidenceStatus.COMPLETE,
+        status_reason=None,
+        profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+        profiler_tool_version="unit-profiler-1.0",
+        metric_set_version=PROFILER_METRIC_SET_VERSION,
+        collector_version=PROFILER_COLLECTOR_VERSION,
+        command_digest="sha256:" + "1" * 64,
+        raw_artifact_digest="sha256:" + "2" * 64,
+        profiler_pass_count=3,
+        target_launches_per_profiler_pass=1,
+        dispatches=tuple(dispatches or (cuda_dispatch(),)),
+    )
+
+
+def evidence_manifest(requests, evidence) -> ProfilerEvidenceManifest:
+    """Bind records to one request manifest with exact provenance."""
+
+    return ProfilerEvidenceManifest(
+        request_manifest_digest=requests.digest(),
+        corpus_digest=requests.corpus_digest,
+        candidate_registry_digest=requests.candidate_registry_digest,
+        evidence=tuple(evidence),
+    )
+
+
+def profiler_model_fixture(
+    *,
+    second_candidate_metric_scale: float = 8.0,
+):
+    """Build a small complete two-candidate profiler-informed fit surface."""
+
+    candidate_ids = (
+        "cuda.nvnni.decode.fast_m1.wide.tn128.cpt1",
+        "cuda.nvnni.decode.fast_m1.wide.tn128.cpt2",
+    )
+    dimensions = (
+        (1024, 2048),
+        (1536, 3072),
+        (2048, 4096),
+        (3072, 6144),
+        (4096, 8192),
+    )
+    rows = []
+    costs = []
+    for shape_index, (n, k) in enumerate(dimensions):
+        for candidate_index, candidate_id in enumerate(candidate_ids):
+            median_us = 10.0 + shape_index + candidate_index
+            row = dataclasses.replace(
+                cuda_observation(candidate_id=candidate_id),
+                projection_n_vector=(n,),
+                aggregate_n=n,
+                k=k,
+                aspect_ratio=float(n) / float(k),
+                aspect_bucket=classify_aspect(n, k),
+                work_items=n * k,
+                shape_group_id=f"profile-model-shape-{shape_index}",
+                shape_name=f"profile-model-{n}x{k}",
+                n_tail_class=f"n_mod_256={n % 256}",
+                k_tail_class=f"k_mod_256={k % 256}",
+                min_us=median_us - 0.5,
+                median_us=median_us,
+                p95_us=median_us + 0.5,
+            )
+            rows.append(row)
+            regret = (
+                (0.01 + shape_index * 0.004)
+                if candidate_index == 0
+                else (0.12 - shape_index * 0.012)
+            )
+            costs.append(CandidatePointCost(
+                runtime_key=runtime_key(row),
+                shape_group_id=row.shape_group_id,
+                candidate_id=row.candidate_id,
+                max_surface_regret=regret,
+                p95_surface_regret=regret,
+                mean_surface_regret=regret,
+            ))
+    corpus = ObservationCorpus(tuple(rows))
+    requests = build_profiler_request_manifest(corpus)
+    evidence = evidence_manifest(requests, tuple(
+        complete_evidence(
+            request,
+            dispatches=(cuda_dispatch(
+                name=request.effective_candidate_id,
+                metric_scale=(
+                    1.0
+                    if request.candidate_id == candidate_ids[0]
+                    else second_candidate_metric_scale
+                ),
+            ),),
+        )
+        for request in requests.requests
+    ))
+    feature_rows = profiler_feature_rows(corpus, requests, evidence)
+    catalog = build_profiler_feature_catalog(
+        corpus,
+        feature_rows,
+        request_manifest_digest=requests.digest(),
+        evidence_manifest_digest=evidence.digest(),
+    )
+    return corpus, costs, requests, evidence, feature_rows, catalog
+
+
+class NativeVNNIProfilerEvidenceTest(unittest.TestCase):
+    """Prove timing isolation, request identity, and stratified profile use."""
+
+    def test_cuda_fused_schedule_owns_partitions_inside_each_cta(self) -> None:
+        """Unseen-shape features distinguish global and shared publication."""
+
+        key = dataclasses.replace(
+            runtime_key(cuda_observation()), projection_n_vector=(129,), aggregate_n=129, k=672, m=1,
+        )
+        def features(family: str, columns: int) -> dict[str, float | str]:
+            return {
+                "config.family": family, "config.tile_n": math.log1p(columns),
+                "config.cpt": math.log1p(1), "config.exact_kb": math.log1p(20),
+            }
+        global_kpar = profiler_model._cuda_decode_schedule_features(key, features("kpar", 32))
+        fused = profiler_model._cuda_decode_schedule_features(key, features("fused_kpar", 16))
+        self.assertEqual(global_kpar["schedule.cuda_decode.producer_tasks"], 100)
+        self.assertEqual(fused["schedule.cuda_decode.producer_tasks"], 9)
+        self.assertEqual(fused["schedule.cuda_decode.threads_per_cta"], 320)
+        self.assertEqual(global_kpar["schedule.cuda_decode.global_partial_bytes"], 10320)
+        self.assertEqual(fused["schedule.cuda_decode.global_partial_bytes"], 0)
+        self.assertEqual(fused["schedule.cuda_decode.shared_partial_bytes_per_cta"], 1280)
+        for candidate in (global_kpar, fused):
+            self.assertEqual(candidate["schedule.cuda_decode.k_partitions"], 20)
+            self.assertAlmostEqual(candidate["schedule.cuda_decode.partition_utilization"], 21 / 40)
+
+    def setUp(self) -> None:
+        """Keep unit tests independent of native threads and GPU execution."""
+
+        surrogate_patcher = mock.patch.object(
+            profiler_model,
+            "_fit_profiler_surrogate",
+            side_effect=deterministic_test_profiler_surrogate,
+        )
+        surrogate_patcher.start()
+        self.addCleanup(surrogate_patcher.stop)
+
+    def test_cpu_profiler_lanes_are_disjoint_and_preserve_socket_masks(self) -> None:
+        self.assertEqual(
+            _parse_cpu_lane_lists("0-27;28-55", 2),
+            ("0-27", "28-55"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            _parse_cpu_lane_lists("0-27;27-54", 2)
+        with self.assertRaisesRegex(ValueError, "defines 1"):
+            _parse_cpu_lane_lists("0-27", 2)
+
+    def test_request_is_bound_to_complete_timing_observation(self) -> None:
+        observation = cuda_observation()
+        request = profiler_request_for_observation(observation)
+
+        self.assertEqual(request.observation_digest, observation.digest())
+        self.assertEqual(request.timing_sample_hash, observation.timing_sample_hash)
+        self.assertEqual(request.target_launches_per_profiler_pass, 1)
+        self.assertTrue(request.profile_required)
+        self.assertEqual(
+            request.candidate_registry_surface, "cuda_native_vnni_gemv"
+        )
+
+        changed_timing = dataclasses.replace(observation, median_us=11.5)
+        changed_request = profiler_request_for_observation(changed_timing)
+        self.assertNotEqual(request.request_id, changed_request.request_id)
+        self.assertNotEqual(
+            request.observation_digest, changed_request.observation_digest
+        )
+
+    def test_device_counted_occupancy_owns_distinct_profile_requests(self) -> None:
+        """A full-row receipt or stale environment cannot certify shallow work."""
+
+        base = dataclasses.replace(cuda_observation(
+            candidate_id="cuda.nvnni.decode.verifier.inherit_serial_m1.r8"),
+            m=16, semantic_contract=SemanticContract.VERIFIER_SERIAL_M1_BITWISE,
+            generic_eligible=False)
+        rows = tuple(dataclasses.replace(base, active_rows=active) for active in (3, 16))
+        manifest = build_profiler_request_manifest(ObservationCorpus(rows))
+        self.assertEqual(len(manifest.requests), 2)
+        self.assertEqual({request.active_rows for request in manifest.requests}, {3, 16})
+        self.assertEqual(len(_build_gpu_process_batches(manifest.requests, maximum_size=20)), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            write_profiler_request_manifest(path, manifest)
+            raw_keys = profiler_evidence.read_profiler_request_coverage_keys(path)
+        self.assertEqual(raw_keys, profiler_evidence._covered_profiler_launch_keys((manifest,)))
+        self.assertEqual(len(raw_keys), 2)
+        for request in manifest.requests:
+            self.assertEqual(ProfilerRequest.from_mapping(request.canonical_mapping()), request)
+            with mock.patch.dict(os.environ, {"LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS": "99"}):
+                environment = _profile_environment(request, Path("/tmp/unused-counted-profile"))
+            self.assertEqual(environment["LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS"], str(request.active_rows))
+        legacy = profiler_request_for_observation(cuda_observation())
+        self.assertNotIn("active_rows", legacy.canonical_mapping())
+        self.assertEqual(ProfilerRequest.from_mapping(legacy.canonical_mapping()), legacy)
+        with mock.patch.dict(os.environ, {"LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS": "99"}):
+            self.assertNotIn("LLAMINAR_CUDA_NVNNI_DECODE_ACTIVE_ROWS",
+                             _profile_environment(legacy, Path("/tmp/unused-counted-profile")))
+
+    def test_parallel_request_build_is_byte_identical_to_serial(self) -> None:
+        """Forked conversion preserves exact request order and contents."""
+
+        base = cuda_observation()
+        observations = (
+            base,
+            dataclasses.replace(base, execution_mode=ExecutionMode.GRAPH_CAPTURED),
+        )
+        serial = _profiler_requests_for_observations(observations, workers=1)
+        parallel = _profiler_requests_for_observations(observations, workers=2)
+
+        self.assertEqual(
+            [request.canonical_mapping() for request in parallel],
+            [request.canonical_mapping() for request in serial],
+        )
+
+    def test_large_manifest_digests_are_memoized_without_changing_json(self) -> None:
+        """Repeated transaction validation must not rehash complete manifests."""
+
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        evidence = evidence_manifest(
+            requests,
+            (complete_evidence(requests.requests[0]),),
+        )
+        expected_request_digest = profiler_evidence._sha256_json(
+            requests.payload_mapping()
+        )
+        expected_evidence_digest = profiler_evidence._sha256_json(
+            evidence.payload_mapping()
+        )
+        request_mapping = requests.canonical_mapping()
+        evidence_mapping = evidence.canonical_mapping()
+
+        # Rebuild the manifests so the first digest call below is not already
+        # primed by evidence construction or canonical serialization.
+        requests = ProfilerRequestManifest(
+            corpus_digest=requests.corpus_digest,
+            candidate_registry_digest=requests.candidate_registry_digest,
+            requests=requests.requests,
+            learner_version=requests.learner_version,
+            feature_schema_version=requests.feature_schema_version,
+            schema_version=requests.schema_version,
+        )
+        evidence = ProfilerEvidenceManifest(
+            request_manifest_digest=requests.digest(),
+            corpus_digest=evidence.corpus_digest,
+            candidate_registry_digest=evidence.candidate_registry_digest,
+            evidence=evidence.evidence,
+            collector_version=evidence.collector_version,
+        )
+        # Prime neither manifest inside the patched interval. Reconstructing
+        # evidence necessarily hashes the request manifest once immediately
+        # before the patch, which is exactly the value later calls should reuse.
+        requests = ProfilerRequestManifest(
+            corpus_digest=requests.corpus_digest,
+            candidate_registry_digest=requests.candidate_registry_digest,
+            requests=requests.requests,
+            learner_version=requests.learner_version,
+            feature_schema_version=requests.feature_schema_version,
+            schema_version=requests.schema_version,
+        )
+
+        with mock.patch.object(
+            profiler_evidence,
+            "_sha256_manifest_records",
+            wraps=profiler_evidence._sha256_manifest_records,
+        ) as streaming_digest:
+            request_digest = requests.digest()
+            self.assertEqual(request_digest, requests.digest())
+            evidence_digest = evidence.digest()
+            self.assertEqual(evidence_digest, evidence.digest())
+
+        self.assertEqual(streaming_digest.call_count, 2)
+        self.assertEqual(request_digest, expected_request_digest)
+        self.assertEqual(evidence_digest, expected_evidence_digest)
+        self.assertEqual(requests.canonical_mapping(), request_mapping)
+        self.assertEqual(evidence.canonical_mapping(), evidence_mapping)
+
+    def test_cpu_decode_request_resolves_first_class_candidate_surface(self) -> None:
+        """CPU decode sampling retains three informative timing strata."""
+
+        manifest = build_profiler_request_manifest(ObservationCorpus(tuple(
+            cpu_decode_observation(candidate_id=candidate.candidate_id)
+            for candidate in cpu_native_vnni_decode_registry().entries
+        )))
+
+        self.assertEqual(len(manifest.requests), 3)
+        self.assertEqual(
+            {request.candidate_registry_surface for request in manifest.requests},
+            {"cpu_native_vnni_decode"},
+        )
+        self.assertEqual(
+            {request.operation_kind for request in manifest.requests},
+            {"NativeVNNIFastM1Projection"},
+        )
+
+    def test_manifest_profiles_fast_middle_and_slow_five_percent_per_cell(
+        self,
+    ) -> None:
+        """Every format/shape/M contest contributes all three timing bands."""
+
+        candidates = tuple(
+            candidate
+            for candidate in cuda_native_vnni_gemv_registry().entries
+            if candidate.effective_candidate_id == candidate.candidate_id
+            and SemanticContract.FAST in candidate.supported_contracts
+        )[:40]
+        self.assertEqual(len(candidates), 40)
+        observations = []
+        expected_digests = set()
+        expected_rank_indices = {0, 1, 19, 20, 38, 39}
+        for source_format in ("Q4_0", "Q5_0"):
+            for shape_index, (m, n, k) in enumerate((
+                (1, 2048, 4096),
+                (2, 3072, 6144),
+            )):
+                contest = []
+                for rank, candidate in enumerate(candidates):
+                    median_us = 10.0 + rank
+                    row = dataclasses.replace(
+                        cuda_observation(
+                            source_format=source_format,
+                            candidate_id=candidate.candidate_id,
+                        ),
+                        shape_group_id=(
+                            f"stratified:{source_format}:shape-{shape_index}:m{m}"
+                        ),
+                        shape_name=f"stratified-shape-{shape_index}",
+                        execution_mode=ExecutionMode.GRAPH_CAPTURED,
+                        m=m,
+                        projection_n_vector=(n,),
+                        aggregate_n=n,
+                        k=k,
+                        aspect_ratio=float(n) / float(k),
+                        aspect_bucket=classify_aspect(n, k),
+                        work_items=n * k,
+                        min_us=median_us - 0.25,
+                        median_us=median_us,
+                        p95_us=median_us + 0.25,
+                        timing_sample_hash=f"fnv1a64:{rank:016x}",
+                    )
+                    row.validate()
+                    contest.append(row)
+                    observations.append(row)
+                expected_digests.update(
+                    contest[index].digest() for index in expected_rank_indices
+                )
+
+        corpus = ObservationCorpus(tuple(observations))
+        serial_entries = profiler_evidence._stratified_profiler_observation_entries(
+            corpus,
+            workers=1,
+        )
+        with mock.patch.object(
+            profiler_evidence,
+            "_physical_core_count",
+            return_value=2,
+        ):
+            parallel_entries = (
+                profiler_evidence._stratified_profiler_observation_entries(
+                    corpus,
+                    workers=2,
+                )
+            )
+        self.assertEqual(
+            [
+                (launch_key, row.digest())
+                for launch_key, row in parallel_entries
+            ],
+            [
+                (launch_key, row.digest())
+                for launch_key, row in serial_entries
+            ],
+        )
+
+        manifest = build_profiler_request_manifest(corpus)
+
+        self.assertEqual(len(manifest.requests), 24)
+        self.assertEqual(
+            {request.observation_digest for request in manifest.requests},
+            expected_digests,
+        )
+        self.assertEqual(
+            {
+                (request.source_format, request.shape_name, request.m)
+                for request in manifest.requests
+            },
+            {
+                (source_format, f"stratified-shape-{shape_index}", m)
+                for source_format in ("Q4_0", "Q5_0")
+                for shape_index, m in ((0, 1), (1, 2))
+            },
+        )
+
+    def test_manifest_separates_distinct_prepared_codebook_kernels(self) -> None:
+        """A shared schedule ID must not alias different microkernels."""
+
+        q4 = cuda_observation(source_format="Q4_0")
+        q5 = cuda_observation(source_format="Q5_0")
+        manifest = build_profiler_request_manifest(ObservationCorpus((q4, q5)))
+
+        self.assertEqual(len(manifest.requests), 2)
+        self.assertEqual(
+            {request.source_format for request in manifest.requests},
+            {"Q4_0", "Q5_0"},
+        )
+
+    def test_runtime_format_width_and_counters_are_codebook_local(self) -> None:
+        """Each prepared kernel keeps both its byte geometry and counters."""
+
+        q4 = cuda_observation(source_format="Q4_0")
+        q5 = cuda_observation(source_format="Q5_0")
+        corpus = ObservationCorpus((q4, q5))
+        requests = build_profiler_request_manifest(corpus)
+        evidence = evidence_manifest(
+            requests,
+            tuple(complete_evidence(request) for request in requests.requests),
+        )
+        rows = profiler_feature_rows(corpus, requests, evidence)
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        q4_descriptor = catalog.descriptor_for(q4)
+        q5_descriptor = catalog.descriptor_for(q5)
+
+        self.assertNotEqual(q4_descriptor.key, q5_descriptor.key)
+        q4_record = _model_record(
+            runtime_key(q4), q4_descriptor, q4.source_format
+        )
+        q5_record = _model_record(
+            runtime_key(q5), q5_descriptor, q5.source_format
+        )
+
+        self.assertNotEqual(
+            q4_record["runtime.decode.log2_expected_bytes"],
+            q5_record["runtime.decode.log2_expected_bytes"],
+        )
+        self.assertIn("runtime.decode.arithmetic_intensity", q4_record)
+
+    def test_cpu_prefill_schedule_features_match_production_task_grids(self) -> None:
+        """Candidate-aware features reproduce all three full-K launch formulas."""
+
+        base = runtime_key(cuda_observation())
+        key = dataclasses.replace(
+            base,
+            backend=Backend.CPU,
+            architecture_class=(
+                "unit-cpu|build=AVX512|runtime=AVX512|threads=28"
+            ),
+            operation_kind="NativeVNNIPrefillProjection",
+            m=64,
+            aggregate_n=2048,
+            k=512,
+            projection_n_vector=(2048,),
+        )
+        row_chunk = _cpu_prefill_schedule_features(
+            key,
+            {"config.route": "row_chunk_grid"},
+        )
+        n_major = _cpu_prefill_schedule_features(
+            key,
+            {
+                "config.route": "two_row_full_output_tiles",
+                "config.n_block_chunks": math.log1p(1.0),
+            },
+        )
+        pair_grid = _cpu_prefill_schedule_features(
+            key,
+            {
+                "config.route": "two_row_pair_grid",
+                "config.n_block_chunks": math.log1p(1.0),
+            },
+        )
+
+        self.assertEqual(
+            row_chunk["schedule.cpu_prefill.parallel_tasks"],
+            64 * 32,
+        )
+        self.assertEqual(
+            n_major["schedule.cpu_prefill.parallel_tasks"],
+            32,
+        )
+        self.assertEqual(
+            pair_grid["schedule.cpu_prefill.parallel_tasks"],
+            32 * 32,
+        )
+        self.assertEqual(
+            row_chunk["schedule.cpu_prefill.parallel_waves"],
+            74,
+        )
+        self.assertEqual(
+            n_major["schedule.cpu_prefill.parallel_waves"],
+            2,
+        )
+        self.assertEqual(
+            pair_grid["schedule.cpu_prefill.parallel_waves"],
+            37,
+        )
+        self.assertEqual(
+            row_chunk["schedule.cpu_prefill.rows_per_task"],
+            1,
+        )
+        self.assertEqual(
+            n_major["schedule.cpu_prefill.rows_per_task"],
+            64,
+        )
+        self.assertEqual(
+            pair_grid["schedule.cpu_prefill.rows_per_task"],
+            2,
+        )
+        self.assertAlmostEqual(
+            pair_grid["schedule.cpu_prefill.final_wave_utilization"],
+            16.0 / 28.0,
+        )
+
+    def test_cpu_decode_schedule_features_match_production_task_grids(self) -> None:
+        """Expose full-K serial and K-part workshare transitions exactly."""
+
+        base = runtime_key(cuda_observation())
+        full_k = dataclasses.replace(
+            base,
+            backend=Backend.CPU,
+            architecture_class=(
+                "unit-cpu|build=AVX512|runtime=AVX2|threads=28"
+            ),
+            operation_kind="NativeVNNIFastM1Projection",
+            bundle_signature=(
+                "single-native-vnni-decode:serial-full-k:fp32-output:v1"
+            ),
+            m=1,
+            aggregate_n=2048,
+            k=4096,
+            projection_n_vector=(2048,),
+        )
+        nbc1 = _cpu_decode_schedule_features(
+            full_k,
+            {
+                "config.route": "n_chunk_grid",
+                "config.n_block_chunks": math.log1p(1.0),
+            },
+        )
+        nbc2 = _cpu_decode_schedule_features(
+            full_k,
+            {
+                "config.route": "n_chunk_grid",
+                "config.n_block_chunks": math.log1p(2.0),
+            },
+        )
+        kpart_nbc2 = _cpu_decode_schedule_features(
+            dataclasses.replace(
+                full_k,
+                bundle_signature=(
+                    "single-native-vnni-decode:serial-kpart:fp32-output:v1"
+                ),
+                k=4160,
+                launch_k_tiles=4,
+            ),
+            {
+                "config.route": "n_chunk_grid",
+                "config.n_block_chunks": math.log1p(2.0),
+            },
+        )
+
+        self.assertEqual(nbc1["schedule.cpu_decode.n_chunks"], 32)
+        self.assertEqual(nbc1["schedule.cpu_decode.n_blocks"], 32)
+        self.assertEqual(nbc1["schedule.cpu_decode.n_block_waves"], 2)
+        self.assertAlmostEqual(
+            nbc1["schedule.cpu_decode.final_n_block_wave_utilization"],
+            4.0 / 28.0,
+        )
+        self.assertEqual(
+            nbc1["schedule.cpu_decode.serial_full_k_fast_path"],
+            0.0,
+        )
+
+        # Sixteen N blocks are fewer than 28 workers, so production bypasses
+        # OpenMP and executes exactly sixteen serial blocks.
+        self.assertEqual(nbc2["schedule.cpu_decode.n_blocks"], 16)
+        self.assertEqual(
+            nbc2["schedule.cpu_decode.serial_full_k_fast_path"],
+            1.0,
+        )
+        self.assertEqual(nbc2["schedule.cpu_decode.openmp_region"], 0.0)
+        self.assertEqual(
+            nbc2["schedule.cpu_decode.serial_full_k_block_count"],
+            16.0,
+        )
+
+        # The same NBC under K-part stays inside OpenMP and publishes one
+        # candidate-dependent N-block axis plus the exact 32-task reduction.
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.serial_full_k_fast_path"],
+            0.0,
+        )
+        self.assertEqual(kpart_nbc2["schedule.cpu_decode.openmp_region"], 1.0)
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.kpart_producer_n_blocks"],
+            16.0,
+        )
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.kpart_reduction_tasks"],
+            32.0,
+        )
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.kpart_k_blocks"],
+            130.0,
+        )
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.kpart_k_blocks_per_tile"],
+            33.0,
+        )
+        self.assertEqual(
+            kpart_nbc2["schedule.cpu_decode.kpart_final_k_tile_blocks"],
+            31.0,
+        )
+        self.assertAlmostEqual(
+            kpart_nbc2[
+                "schedule.cpu_decode.kpart_final_k_tile_utilization"
+            ],
+            31.0 / 33.0,
+        )
+
+    def test_cpu_verifier_schedule_features_cover_every_grouped_route(self) -> None:
+        """Grouped features reproduce full-K, K-part, and direct-M2 grids."""
+
+        base = runtime_key(cuda_observation())
+        key = dataclasses.replace(
+            base,
+            backend=Backend.CPU,
+            architecture_class=(
+                "unit-cpu|build=AVX512|runtime=AVX512|threads=28"
+            ),
+            operation_kind="NativeVNNIDecodeProjection",
+            m=15,
+            aggregate_n=2048,
+            k=4096,
+            projection_n_vector=(2048,),
+            launch_k_tiles=0,
+        )
+
+        def features(
+            route: str,
+            row_tile: int,
+            nbc: int,
+            k_tile_policy: str,
+        ) -> dict[str, float | str]:
+            return {
+                "config.route": route,
+                "config.row_tile": math.log1p(row_tile),
+                "config.k_tile_policy": k_tile_policy,
+                "profile.launch_n_block_chunks": math.log1p(nbc),
+            }
+
+        row_chunk = _cpu_verifier_schedule_features(
+            key,
+            features("row_chunk_grid", 1, 1, "full_k"),
+        )
+        n_major_features = features(
+            "two_row_n_major", 2, 2, "full_k"
+        )
+        n_major_features["config.n_block_chunks"] = math.log1p(2)
+        n_major = _cpu_verifier_schedule_features(key, n_major_features)
+        pair_grid_features = features(
+            "two_row_pair_grid", 2, 4, "full_k"
+        )
+        pair_grid_features["config.n_block_chunks"] = math.log1p(4)
+        pair_grid = _cpu_verifier_schedule_features(key, pair_grid_features)
+        wide_kpart = _cpu_verifier_schedule_features(
+            dataclasses.replace(key, k=4160, launch_k_tiles=4),
+            features(
+                "decode_equivalent_kpart_rows",
+                4,
+                2,
+                "inherit_serial_m1",
+            ),
+        )
+        direct_m2 = _cpu_verifier_schedule_features(
+            dataclasses.replace(key, m=2, k=2048),
+            features(
+                "decode_equivalent_kpart_rows",
+                2,
+                2,
+                "inherit_serial_m1",
+            ),
+        )
+
+        self.assertEqual(row_chunk["schedule.cpu_verifier.producer_tasks"], 480)
+        self.assertEqual(n_major["schedule.cpu_verifier.producer_tasks"], 16)
+        self.assertEqual(pair_grid["schedule.cpu_verifier.producer_tasks"], 64)
+        self.assertEqual(pair_grid["schedule.cpu_verifier.row_tiles"], 8)
+        self.assertEqual(wide_kpart["schedule.cpu_verifier.producer_tasks"], 512)
+        self.assertEqual(
+            wide_kpart["schedule.cpu_verifier.kpart_reduction_tasks"],
+            480,
+        )
+        self.assertEqual(wide_kpart["schedule.cpu_verifier.kpart_k_tiles"], 4)
+        self.assertEqual(direct_m2["schedule.cpu_verifier.direct_small_m2"], 1)
+        self.assertEqual(direct_m2["schedule.cpu_verifier.openmp_region"], 0)
+
+        mismatched = features("two_row_pair_grid", 2, 4, "full_k")
+        mismatched["config.n_block_chunks"] = math.log1p(2)
+        with self.assertRaisesRegex(ValueError, "disagrees with candidate registry"):
+            _cpu_verifier_schedule_features(key, mismatched)
+
+    def test_profiler_record_retains_anchor_and_masks_held_dynamic_metrics(
+        self,
+    ) -> None:
+        """A held geometry may retain static resources but not its counters."""
+
+        observation = cuda_observation()
+        corpus = ObservationCorpus((observation,))
+        requests = build_profiler_request_manifest(corpus)
+        evidence = evidence_manifest(
+            requests,
+            tuple(
+                complete_evidence(request)
+                for request in requests.requests
+            ),
+        )
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            profiler_feature_rows(corpus, requests, evidence),
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        descriptor = catalog.descriptor_for(observation)
+        record = _model_record(
+            runtime_key(observation),
+            descriptor,
+            observation.source_format,
+        )
+
+        self.assertEqual(
+            descriptor.anchor_geometry,
+            (observation.aggregate_n, observation.k),
+        )
+        self.assertEqual(record["profile.anchor.abs_delta_log2_m"], 0.0)
+        self.assertEqual(record["profile.anchor.abs_delta_log2_n"], 0.0)
+        self.assertEqual(record["profile.anchor.abs_delta_log2_k"], 0.0)
+        self.assertIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            record,
+        )
+        self.assertIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
+            record,
+        )
+
+        masked = _mask_held_out_profiler_anchor(
+            record,
+            frozenset((descriptor.anchor_geometry,)),
+        )
+
+        self.assertEqual(
+            masked["profile.anchor.dynamic_metrics_available"],
+            0.0,
+        )
+        self.assertNotIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            masked,
+        )
+        self.assertIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
+            masked,
+        )
+        self.assertFalse(any(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p" in name
+            for name in masked
+        ))
+
+        model_inputs = _profiler_model_input_record(record)
+        auxiliary_targets = _profiler_auxiliary_target_record(record)
+        self.assertNotIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            model_inputs,
+        )
+        self.assertNotIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            auxiliary_targets,
+        )
+        self.assertNotIn("profile.dispatch_count", model_inputs)
+        self.assertNotIn("profile.dispatch_count", auxiliary_targets)
+        self.assertIn(
+            "metric.gpu.compute.compute_throughput_pct_of_peak.fraction_mean",
+            auxiliary_targets,
+        )
+        self.assertNotIn(
+            "metric.gpu.compute.alu_pipe_utilization_pct.fraction_mean",
+            auxiliary_targets,
+        )
+        self.assertNotIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
+            model_inputs,
+        )
+        self.assertIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
+            auxiliary_targets,
+        )
+        self.assertFalse(any(
+            name.startswith("profile.anchor.") for name in model_inputs
+        ))
+
+    def test_burned_point_uses_runtime_geometry_and_static_profiler_features(
+        self,
+    ) -> None:
+        """Unprofiled seal timings cannot inherit request-local GPU counters."""
+
+        corpus, costs, _requests, _evidence, _rows, catalog = (
+            profiler_model_fixture()
+        )
+        unseen_n = 5120
+        unseen_k = 10240
+        supplemental = tuple(
+            dataclasses.replace(
+                cost,
+                runtime_key=dataclasses.replace(
+                    cost.runtime_key,
+                    projection_n_vector=(unseen_n,),
+                    aggregate_n=unseen_n,
+                    k=unseen_k,
+                ),
+                shape_group_id="cpu-burned-seal:profiler-unit",
+            )
+            for cost in costs[:2]
+        )
+        records = build_profiler_model_record_index(
+            (*costs, *supplemental),
+            corpus,
+            catalog,
+        )
+
+        for cost in supplemental:
+            record = records[
+                (cost.runtime_key, cost.shape_group_id, cost.candidate_id)
+            ]
+            self.assertEqual(record["runtime.log2_n"], math.log2(unseen_n))
+            self.assertEqual(record["runtime.log2_k"], math.log2(unseen_k))
+            self.assertEqual(
+                record["profile.anchor.dynamic_metrics_available"],
+                0.0,
+            )
+            self.assertIn(
+                "metric.gpu.compute.registers_per_thread.maximum_log1p",
+                record,
+            )
+            self.assertNotIn(
+                "metric.gpu.decode.effective_gbytes_per_second_log1p",
+                record,
+            )
+
+    def test_profiler_observation_index_hashes_only_true_prefix_ties(
+        self,
+    ) -> None:
+        """Alias selection avoids SHA work unless cheap identities are equal."""
+
+        base = cuda_observation()
+        runtime = runtime_key(base)
+
+        class AliasCorpus:
+            """Supply controlled aliases without schema-level deduplication."""
+
+            def __init__(self, rows):
+                self.rows = tuple(rows)
+
+            def runtime_keys(self):
+                return (runtime,)
+
+            def rows_for_runtime_key(self, key):
+                return self.rows if key == runtime else ()
+
+        lexical_winner = dataclasses.replace(base, source_format="A_FORMAT")
+        lexical_loser = dataclasses.replace(base, source_format="Z_FORMAT")
+        with mock.patch.object(
+            NativeVNNIObservation,
+            "digest",
+            side_effect=AssertionError("digest must stay lazy"),
+        ):
+            selected = build_profiler_observation_index(
+                AliasCorpus((lexical_loser, lexical_winner))
+            )
+        self.assertIs(next(iter(selected.values())), lexical_winner)
+
+        tied_alias = dataclasses.replace(base, shape_name="digest-tie-break")
+        expected = min((base, tied_alias), key=lambda row: row.digest())
+        selected = build_profiler_observation_index(
+            AliasCorpus((base, tied_alias))
+        )
+        self.assertIs(next(iter(selected.values())), expected)
+
+    def test_profiler_exemplar_index_hashes_only_true_prefix_ties(self) -> None:
+        """Cross-geometry exemplar selection keeps digest evaluation lazy."""
+
+        base = cuda_observation()
+        runtime = runtime_key(base)
+        lexical_winner = dataclasses.replace(
+            base,
+            shape_group_id="a-exemplar",
+        )
+        lexical_loser = dataclasses.replace(
+            base,
+            shape_group_id="z-exemplar",
+        )
+        observations = {
+            (runtime, lexical_loser.shape_group_id, base.candidate_id): (
+                lexical_loser
+            ),
+            (runtime, lexical_winner.shape_group_id, base.candidate_id): (
+                lexical_winner
+            ),
+        }
+        with mock.patch.object(
+            NativeVNNIObservation,
+            "digest",
+            side_effect=AssertionError("digest must stay lazy"),
+        ):
+            exemplars = profiler_model._profiler_exemplar_index(observations)
+        self.assertIs(next(iter(exemplars.values())), lexical_winner)
+
+    def test_profiler_model_record_parallel_index_matches_serial_order(
+        self,
+    ) -> None:
+        """Physical-core shards preserve every model-visible record exactly."""
+
+        corpus, costs, _requests, _evidence, _rows, catalog = (
+            profiler_model_fixture()
+        )
+        # Repeating points across the would-be shard boundary also proves that
+        # first-occurrence deduplication remains a parent-owned stable step.
+        costs_with_duplicates = (*costs, costs[0], costs[-1])
+        observation_index = build_profiler_observation_index(corpus)
+        exemplar_index = profiler_model._profiler_exemplar_index(
+            observation_index
+        )
+        serial = build_profiler_model_record_index(
+            costs_with_duplicates,
+            corpus,
+            catalog,
+            observation_index=observation_index,
+            workers=1,
+            parallel_threshold=1,
+        )
+        with mock.patch.object(
+            profiler_model,
+            "_profiler_exemplar_index",
+            side_effect=AssertionError("shared exemplar index must be reused"),
+        ):
+            parallel = build_profiler_model_record_index(
+                costs_with_duplicates,
+                corpus,
+                catalog,
+                observation_index=observation_index,
+                exemplar_index=exemplar_index,
+                workers=2,
+                parallel_threshold=1,
+            )
+
+        self.assertEqual(list(parallel), list(serial))
+        self.assertEqual(
+            [list(record.items()) for record in parallel.values()],
+            [list(record.items()) for record in serial.values()],
+        )
+
+    def test_profiler_observation_index_reuses_corpus_runtime_buckets(
+        self,
+    ) -> None:
+        """Profiler indexing must not rehash every projected runtime row."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        with mock.patch.object(
+            corpus,
+            "runtime_key_for",
+            side_effect=AssertionError("runtime key was reconstructed"),
+        ):
+            index = build_profiler_observation_index(corpus)
+
+        expected_points = {
+            (cost.runtime_key, cost.shape_group_id, cost.candidate_id)
+            for cost in costs
+        }
+        self.assertEqual(set(index), expected_points)
+
+    def test_indexed_profiler_prediction_skips_exemplar_rebuild(self) -> None:
+        """Each held surface reuses records instead of rescanning the corpus."""
+
+        corpus, costs, _requests, _evidence, _rows, catalog = (
+            profiler_model_fixture()
+        )
+        observation_index = build_profiler_observation_index(corpus)
+        records = build_profiler_model_record_index(
+            costs,
+            corpus,
+            catalog,
+            observation_index=observation_index,
+            workers=1,
+        )
+        with mock.patch.object(
+            profiler_model,
+            "_profiler_exemplar_index",
+            side_effect=AssertionError("indexed prediction must not rescan"),
+        ), mock.patch.object(
+            profiler_model,
+            "_fit_profiler_surrogate",
+            side_effect=deterministic_test_profiler_surrogate,
+        ):
+            informed = apply_profiler_regret_predictions(
+                costs,
+                corpus,
+                catalog,
+                observation_index=observation_index,
+                model_training_costs=costs,
+                model_record_index=records,
+                _surrogate_device="cpu",
+            )
+        self.assertEqual(len(informed), len(costs))
+
+    def test_compact_profiler_matrix_is_prediction_exact_to_record_index(
+        self,
+    ) -> None:
+        """Numeric publication preserves every fitted prediction bit exactly."""
+
+        corpus, costs, _requests, _evidence, _rows, catalog = (
+            profiler_model_fixture()
+        )
+        observation_index = build_profiler_observation_index(corpus)
+        exemplar_index = profiler_model._profiler_exemplar_index(
+            observation_index
+        )
+        legacy_records = {
+            (cost.runtime_key, cost.shape_group_id, cost.candidate_id): (
+                profiler_model._profiler_record_for_cost(
+                    cost,
+                    observation_index,
+                    exemplar_index,
+                    catalog,
+                )
+            )
+            for cost in costs
+        }
+        compact_records = build_profiler_model_record_index(
+            costs,
+            corpus,
+            catalog,
+            observation_index=observation_index,
+            exemplar_index=exemplar_index,
+            workers=2,
+            parallel_threshold=1,
+        )
+        held_geometry = frozenset({(
+            costs[0].runtime_key.aggregate_n,
+            costs[0].runtime_key.k,
+        )})
+        training_costs = costs[2:]
+        try:
+            with mock.patch.object(
+                profiler_model,
+                "_fit_profiler_surrogate",
+                side_effect=deterministic_test_profiler_surrogate,
+            ):
+                legacy = apply_profiler_regret_predictions(
+                    costs,
+                    corpus,
+                    catalog,
+                    observation_index=observation_index,
+                    model_training_costs=training_costs,
+                    model_record_index=legacy_records,
+                    excluded_profiler_geometries=held_geometry,
+                    _surrogate_device="cpu",
+                )
+                compact = apply_profiler_regret_predictions(
+                    costs,
+                    corpus,
+                    catalog,
+                    observation_index=observation_index,
+                    model_training_costs=training_costs,
+                    model_record_index=compact_records,
+                    model_training_row_indices=range(2, len(costs)),
+                    prediction_row_indices=range(len(costs)),
+                    excluded_profiler_geometries=held_geometry,
+                    _surrogate_device="cpu",
+                )
+        finally:
+            compact_records.close()
+
+        self.assertEqual(
+            [row.profiler_predicted_regret for row in compact],
+            [row.profiler_predicted_regret for row in legacy],
+        )
+
+    def test_profiler_model_record_workers_cap_at_physical_cores(self) -> None:
+        """An explicit worker request cannot consume SMT sibling threads."""
+
+        with mock.patch.object(
+            profiler_model,
+            "_physical_core_count",
+            return_value=3,
+        ):
+            self.assertEqual(
+                profiler_model._profiler_model_record_worker_count(
+                    100_000,
+                    requested_workers=999,
+                    parallel_threshold=1,
+                ),
+                3,
+            )
+
+    def test_catalog_does_not_lend_counters_to_unprofiled_codebook(self) -> None:
+        """One codebook's counters cannot populate another descriptor."""
+
+        q4 = cuda_observation(source_format="Q4_0")
+        q5 = cuda_observation(source_format="Q5_0")
+        corpus = ObservationCorpus((q4, q5))
+        q4_requests = build_profiler_request_manifest(ObservationCorpus((q4,)))
+        evidence = evidence_manifest(
+            q4_requests,
+            tuple(
+                complete_evidence(request)
+                for request in q4_requests.requests
+            ),
+        )
+        rows = profiler_feature_rows(
+            ObservationCorpus((q4,)), q4_requests, evidence
+        )
+
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            rows,
+            request_manifest_digest=q4_requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+
+        self.assertIn("profile.dispatch_count", catalog.descriptor_for(q4).features)
+        self.assertNotIn(
+            "profile.dispatch_count",
+            catalog.descriptor_for(q5).features,
+        )
+        self.assertNotEqual(
+            catalog.descriptor_for(q4).key.prepared_family_id,
+            catalog.descriptor_for(q5).key.prepared_family_id,
+        )
+
+    def test_additive_catalog_merge_replaces_static_with_measured_evidence(self) -> None:
+        """A later isolated transaction upgrades only its physical candidate."""
+
+        q4 = cuda_observation(source_format="Q4_0")
+        q5 = cuda_observation(source_format="Q5_0")
+
+        def catalog_for(observation: NativeVNNIObservation):
+            source = ObservationCorpus((observation,))
+            requests = build_profiler_request_manifest(source)
+            evidence = evidence_manifest(
+                requests,
+                tuple(
+                    complete_evidence(request)
+                    for request in requests.requests
+                ),
+            )
+            return build_profiler_feature_catalog(
+                source,
+                profiler_feature_rows(source, requests, evidence),
+                request_manifest_digest=requests.digest(),
+                evidence_manifest_digest=evidence.digest(),
+            )
+
+        q4_catalog = catalog_for(q4)
+        q5_catalog = catalog_for(q5)
+        expanded = ObservationCorpus((q4, q5))
+        q4_only = merge_profiler_feature_catalogs(expanded, (q4_catalog,))
+        self.assertIn(
+            "profile.dispatch_count",
+            q4_only.descriptor_for(q4).features,
+        )
+        self.assertNotIn(
+            "profile.dispatch_count",
+            q4_only.descriptor_for(q5).features,
+        )
+
+        merged = merge_profiler_feature_catalogs(
+            expanded,
+            (q4_catalog, q5_catalog),
+        )
+        self.assertEqual(merged.corpus_digest, expanded.digest())
+        self.assertEqual(len(merged.descriptors), 2)
+        self.assertRegex(
+            merged.request_manifest_digest,
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertRegex(
+            merged.evidence_manifest_digest,
+            r"^sha256:[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            merged.descriptor_for(q4),
+            q4_catalog.descriptor_for(q4),
+        )
+        self.assertEqual(
+            merged.descriptor_for(q5),
+            q5_catalog.descriptor_for(q5),
+        )
+
+    def test_additive_evidence_composition_preserves_exact_measured_launches(
+        self,
+    ) -> None:
+        """Final publication unions source records without changing anchors."""
+
+        sources = []
+        original_request_ids = set()
+        for source_index, observation in enumerate((
+            cuda_observation(source_format="Q4_0"),
+            cuda_observation(source_format="Q5_0"),
+        )):
+            corpus = ObservationCorpus((observation,))
+            requests = build_profiler_request_manifest(corpus)
+            if source_index == 1:
+                # Candidate expansion is collected against the enlarged
+                # registry while retaining the older base transaction.
+                requests = dataclasses.replace(
+                    requests,
+                    candidate_registry_digest="sha256:" + "9" * 64,
+                    learner_version="native-vnni-bounded-tree-beam-regret-v17",
+                )
+            evidence = evidence_manifest(
+                requests,
+                tuple(complete_evidence(request) for request in requests.requests),
+            )
+            sources.append((corpus, requests, evidence))
+            original_request_ids.update(
+                request.request_id for request in requests.requests
+            )
+
+        composed = compose_profiler_evidence(sources)
+
+        self.assertEqual(len(composed.observations), 2)
+        self.assertEqual(len(composed.requests.requests), 2)
+        self.assertEqual(len(composed.evidence.evidence), 2)
+        self.assertNotEqual(
+            composed.requests.candidate_registry_digest,
+            sources[0][1].candidate_registry_digest,
+        )
+        self.assertEqual(
+            {request.request_id for request in composed.requests.requests},
+            original_request_ids,
+        )
+        self.assertTrue(
+            validate_profiler_evidence_coverage(
+                composed.requests,
+                composed.evidence,
+            ).complete
+        )
+        self.assertEqual(
+            len(profiler_feature_rows(
+                composed.observations,
+                composed.requests,
+                composed.evidence,
+            )),
+            2,
+        )
+
+    def test_compose_cli_parses_smallest_request_manifest_first(self) -> None:
+        """Large source objects must not inflate every later parser fork."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            triples = []
+            for name, size in (("large", 4096), ("small", 32), ("middle", 512)):
+                observation = root / f"{name}.csv"
+                request = root / f"{name}.requests.json"
+                evidence = root / f"{name}.evidence.json"
+                observation.write_text(name, encoding="utf-8")
+                request.write_bytes(b"x" * size)
+                evidence.write_text(name, encoding="utf-8")
+                triples.append((observation, request, evidence))
+
+            ordered = _ordered_compose_source_paths(
+                [str(item[0]) for item in triples],
+                [str(item[1]) for item in triples],
+                [str(item[2]) for item in triples],
+            )
+
+        self.assertEqual(
+            [item[1].name for item in ordered],
+            [
+                "small.requests.json",
+                "middle.requests.json",
+                "large.requests.json",
+            ],
+        )
+
+    def test_additive_composition_normalizes_compatible_feature_schemas(
+        self,
+    ) -> None:
+        """Feature engineering changes must not trigger profiler relaunches."""
+
+        sources = []
+        for index, observation in enumerate((
+            cuda_observation(source_format="Q4_0"),
+            cuda_observation(source_format="Q5_0"),
+        )):
+            corpus = ObservationCorpus((observation,))
+            requests = build_profiler_request_manifest(corpus)
+            if index == 0:
+                requests = dataclasses.replace(
+                    requests,
+                    feature_schema_version=(
+                        "execution-mode-n-k-work-aspect-tile-wave-tree-v8"
+                    ),
+                )
+            evidence = evidence_manifest(
+                requests,
+                tuple(
+                    complete_evidence(request)
+                    for request in requests.requests
+                ),
+            )
+            sources.append((corpus, requests, evidence))
+
+        composed = compose_profiler_evidence(sources)
+
+        self.assertEqual(
+            composed.requests.feature_schema_version,
+            FEATURE_SCHEMA_VERSION,
+        )
+        self.assertEqual(len(composed.requests.requests), 2)
+        self.assertEqual(len(composed.evidence.evidence), 2)
+        self.assertEqual(
+            len(profiler_feature_rows(
+                composed.observations,
+                composed.requests,
+                composed.evidence,
+            )),
+            2,
+        )
+
+    def test_missing_request_transaction_profiles_only_new_exact_point(self) -> None:
+        """A corpus extension keeps old launches and emits only its delta."""
+
+        old = cuda_observation()
+        new = dataclasses.replace(
+            old,
+            projection_n_vector=(3072,),
+            aggregate_n=3072,
+            aspect_ratio=3072.0 / float(old.k),
+            aspect_bucket=classify_aspect(3072, old.k),
+            work_items=3072 * old.k,
+            shape_group_id="profile-unit-shape-group-new",
+            shape_name="profile-unit-shape-new",
+            trial_set_hash="sha256:profile-unit-trials-new",
+            grouped_output_digest="sha256:profile-unit-output-new",
+            serial_output_digest="sha256:profile-unit-output-new",
+            timing_sample_hash="sha256:profile-unit-timing-new",
+        )
+        old_corpus = ObservationCorpus((old,))
+        covered = build_profiler_request_manifest(old_corpus)
+
+        with mock.patch.object(
+            profiler_evidence,
+            "_profiler_requests_for_observations",
+            wraps=profiler_evidence._profiler_requests_for_observations,
+        ) as parallel_request_builder:
+            observations, requests = build_missing_profiler_request_transaction(
+                ObservationCorpus((old, new)),
+                (covered,),
+            )
+
+        self.assertIsNotNone(observations)
+        self.assertIsNotNone(requests)
+        assert observations is not None
+        assert requests is not None
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(len(requests.requests), 1)
+        self.assertEqual(requests.requests[0].aggregate_n, 3072)
+        parallel_request_builder.assert_called_once()
+
+        with mock.patch.object(
+            profiler_evidence,
+            "profiler_request_for_observation",
+            wraps=profiler_request_for_observation,
+        ) as request_builder:
+            no_rows, no_requests = build_missing_profiler_request_transaction(
+                old_corpus,
+                (covered,),
+            )
+        self.assertIsNone(no_rows)
+        self.assertIsNone(no_requests)
+        request_builder.assert_not_called()
+
+    def test_profiler_resume_uses_physical_identity_across_run_provenance(self) -> None:
+        """A timestamped replay must not profile an unchanged launch again."""
+
+        original = cuda_observation()
+        covered = build_profiler_request_manifest(ObservationCorpus((original,)))
+        replay = dataclasses.replace(
+            original,
+            run_id="profile-unit-run-resumed",
+            corpus_id="sha256:profile-unit-corpus-resumed",
+            git_revision="profile-unit-revision-resumed",
+        )
+        replay_requests = build_profiler_request_manifest(
+            ObservationCorpus((replay,))
+        )
+
+        self.assertNotEqual(
+            covered.requests[0].request_id,
+            replay_requests.requests[0].request_id,
+        )
+        self.assertEqual(
+            count_uncovered_profiler_requests(replay_requests, (covered,)),
+            0,
+        )
+        missing_rows, missing_requests = build_missing_profiler_request_transaction(
+            ObservationCorpus((replay,)),
+            (covered,),
+        )
+        self.assertIsNone(missing_rows)
+        self.assertIsNone(missing_requests)
+
+    def test_raw_coverage_projection_matches_typed_manifest(self) -> None:
+        """The fast resume reader preserves exact physical launch identity."""
+
+        requests = build_profiler_request_manifest(ObservationCorpus((
+            cuda_observation(),
+        )))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            write_profiler_request_manifest(path, requests)
+            raw_keys = profiler_evidence.read_profiler_request_coverage_keys(path)
+
+        self.assertEqual(
+            raw_keys,
+            profiler_evidence._covered_profiler_launch_keys((requests,)),
+        )
+
+    def test_large_manifest_writer_parallel_output_matches_serial(self) -> None:
+        """Large request JSON streams atomically with deterministic ordering."""
+
+        records = tuple(
+            {"record_id": index, "payload": f"candidate-{index % 17}"}
+            for index in range(8192)
+        )
+        scalar_fields = {
+            "manifest_digest": "sha256:" + "a" * 64,
+            "request_count": len(records),
+            "schema_version": "unit-test-v1",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            serial_path = root / "serial.json"
+            parallel_path = root / "parallel.json"
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_MANIFEST_WRITE_WORKERS": "1"},
+            ):
+                profiler_evidence._write_manifest_records_json(
+                    serial_path, scalar_fields, "requests", records
+                )
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_MANIFEST_WRITE_WORKERS": "2"},
+            ):
+                profiler_evidence._write_manifest_records_json(
+                    parallel_path, scalar_fields, "requests", records
+                )
+
+            self.assertEqual(serial_path.read_bytes(), parallel_path.read_bytes())
+            document = json.loads(parallel_path.read_text(encoding="utf-8"))
+            self.assertEqual(document["request_count"], len(records))
+            self.assertEqual(document["requests"], list(records))
+            self.assertFalse(
+                parallel_path.with_name(
+                    parallel_path.name + ".inprogress"
+                ).exists()
+            )
+
+    def test_profiler_resume_invalidates_changed_kernel_contract(self) -> None:
+        """Changed arithmetic or scheduling is another physical obligation."""
+
+        current = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        request = current.requests[0]
+        stale = dataclasses.replace(
+            current,
+            requests=(dataclasses.replace(
+                request,
+                arithmetic_fingerprint="sha256:changed-arithmetic-contract",
+                schedule_signature=request.schedule_signature + "-changed",
+            ),),
+        )
+
+        self.assertEqual(
+            count_uncovered_profiler_requests(current, (stale,)),
+            1,
+        )
+
+    def test_additive_evidence_composition_rejects_incomplete_source(self) -> None:
+        """A missing candidate profile cannot disappear inside a final union."""
+
+        corpus = ObservationCorpus((cuda_observation(),))
+        requests = build_profiler_request_manifest(corpus)
+        incomplete = evidence_manifest(requests, ())
+
+        with self.assertRaisesRegex(ValueError, "coverage is incomplete"):
+            compose_profiler_evidence(((corpus, requests, incomplete),))
+
+    def test_additive_evidence_composition_rejects_conflicting_records(self) -> None:
+        """Two source transactions cannot rewrite one physical measurement."""
+
+        corpus = ObservationCorpus((cuda_observation(),))
+        requests = build_profiler_request_manifest(corpus)
+        first = evidence_manifest(
+            requests,
+            tuple(complete_evidence(request) for request in requests.requests),
+        )
+        second = evidence_manifest(
+            requests,
+            tuple(
+                complete_evidence(
+                    request,
+                    dispatches=(cuda_dispatch(metric_scale=2.0),),
+                )
+                for request in requests.requests
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "conflicting evidence"):
+            compose_profiler_evidence((
+                (corpus, requests, first),
+                (corpus, requests, second),
+            ))
+
+    def test_additive_evidence_accepts_independent_exact_candidate_points(self) -> None:
+        """Each candidate/geometry pair retains its own counter transaction."""
+
+        first = dataclasses.replace(
+            cuda_observation(
+                candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1"
+            ),
+            projection_n_vector=(1024,),
+            aggregate_n=1024,
+            k=2048,
+            aspect_ratio=0.5,
+            aspect_bucket=classify_aspect(1024, 2048),
+            work_items=1024 * 2048,
+            shape_group_id="profile-additive-first-anchor",
+            shape_name="profile-additive-first-anchor",
+        )
+        second = dataclasses.replace(
+            cuda_observation(
+                candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt2"
+            ),
+            projection_n_vector=(2048,),
+            aggregate_n=2048,
+            k=4096,
+            aspect_ratio=0.5,
+            aspect_bucket=classify_aspect(2048, 4096),
+            work_items=2048 * 4096,
+            shape_group_id="profile-additive-other-anchor",
+            shape_name="profile-additive-other-anchor",
+        )
+
+        def source_for(observation: NativeVNNIObservation):
+            corpus = ObservationCorpus((observation,))
+            requests = build_profiler_request_manifest(corpus)
+            evidence = evidence_manifest(
+                requests,
+                tuple(
+                    complete_evidence(request)
+                    for request in requests.requests
+                ),
+            )
+            catalog = build_profiler_feature_catalog(
+                corpus,
+                profiler_feature_rows(corpus, requests, evidence),
+                request_manifest_digest=requests.digest(),
+                evidence_manifest_digest=evidence.digest(),
+            )
+            return corpus, requests, evidence, catalog
+
+        first_source = source_for(first)
+        second_source = source_for(second)
+        composed = compose_profiler_evidence((
+            first_source[:3],
+            second_source[:3],
+        ))
+        self.assertEqual(len(composed.requests.requests), 2)
+        merged = merge_profiler_feature_catalogs(
+            ObservationCorpus((first, second)),
+            (first_source[3], second_source[3]),
+        )
+        self.assertEqual(len(merged.descriptors), 2)
+
+    def test_manifest_accepts_multiple_exact_points_for_one_candidate(self) -> None:
+        """Changing launch geometry creates another mandatory profile."""
+
+        manifest = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        first = manifest.requests[0]
+        second = dataclasses.replace(
+            first,
+            request_id=first.request_id + "-other-anchor",
+            observation_digest="sha256:" + "f" * 64,
+            projection_n_vector=(first.aggregate_n * 2,),
+            aggregate_n=first.aggregate_n * 2,
+        )
+
+        exact = ProfilerRequestManifest(
+            corpus_digest=manifest.corpus_digest,
+            candidate_registry_digest=manifest.candidate_registry_digest,
+            requests=(first, second),
+        )
+        self.assertEqual(len(exact.requests), 2)
+        with self.assertRaisesRegex(ValueError, "exactly one anchor"):
+            dataclasses.replace(
+                exact,
+                schema_version=LEGACY_PROFILER_REQUEST_SCHEMA_VERSION,
+            )
+
+    def test_manifest_profiles_every_measured_work_point(self) -> None:
+        base = cuda_observation()
+        observations = []
+        for n, k in ((1024, 2048), (2048, 4096), (4096, 8192)):
+            observations.append(dataclasses.replace(
+                base,
+                projection_n_vector=(n,),
+                aggregate_n=n,
+                k=k,
+                aspect_ratio=float(n) / float(k),
+                aspect_bucket=classify_aspect(n, k),
+                work_items=n * k,
+                shape_group_id=f"profile-unit:n{n}:k{k}",
+                shape_name=f"profile-unit-{n}x{k}",
+                n_tail_class=f"n_mod_256={n % 256}",
+                k_tail_class=f"k_mod_256={k % 256}",
+            ))
+
+        manifest = build_profiler_request_manifest(
+            ObservationCorpus(observations)
+        )
+
+        self.assertEqual(len(manifest.requests), 3)
+        self.assertEqual(
+            {(request.aggregate_n, request.k) for request in manifest.requests},
+            {(1024, 2048), (2048, 4096), (4096, 8192)},
+        )
+
+    def test_manifest_profiles_each_competing_candidate_at_each_measured_point(self) -> None:
+        """No candidate's counters are borrowed from another work point."""
+
+        candidate_geometries = {
+            "cuda.nvnni.decode.fast_m1.wide.tn128.cpt1": (
+                (1024, 2048),
+                (2048, 4096),
+                (4096, 8192),
+            ),
+            "cuda.nvnni.decode.fast_m1.wide.tn128.cpt2": (
+                (2048, 4096),
+                (4096, 8192),
+                (8192, 16384),
+            ),
+        }
+        observations = []
+        for candidate_id, geometries in candidate_geometries.items():
+            base = cuda_observation(candidate_id=candidate_id)
+            for n, k in geometries:
+                observations.append(dataclasses.replace(
+                    base,
+                    projection_n_vector=(n,),
+                    aggregate_n=n,
+                    k=k,
+                    aspect_ratio=float(n) / float(k),
+                    aspect_bucket=classify_aspect(n, k),
+                    work_items=n * k,
+                    shape_group_id=f"profile-common:{candidate_id}:n{n}:k{k}",
+                    shape_name=f"profile-common-{candidate_id}-{n}x{k}",
+                    n_tail_class=f"n_mod_256={n % 256}",
+                    k_tail_class=f"k_mod_256={k % 256}",
+                ))
+
+        manifest = build_profiler_request_manifest(ObservationCorpus(observations))
+
+        self.assertEqual(len(manifest.requests), 6)
+        self.assertEqual(
+            {(request.aggregate_n, request.k) for request in manifest.requests},
+            {
+                (1024, 2048),
+                (2048, 4096),
+                (4096, 8192),
+                (8192, 16384),
+            },
+        )
+
+    def test_manifest_accepts_sparse_disjoint_candidate_points(self) -> None:
+        """Sparse candidates remain independent exact profiling obligations."""
+
+        first = cuda_observation(
+            candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt1"
+        )
+        second = dataclasses.replace(
+            cuda_observation(
+                candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt2"
+            ),
+            projection_n_vector=(1024,),
+            aggregate_n=1024,
+            k=2048,
+            aspect_ratio=0.5,
+            aspect_bucket=classify_aspect(1024, 2048),
+            work_items=1024 * 2048,
+            shape_group_id="profile-disjoint",
+            shape_name="profile-disjoint",
+        )
+
+        manifest = build_profiler_request_manifest(
+            ObservationCorpus((first, second))
+        )
+        self.assertEqual(len(manifest.requests), 2)
+        self.assertEqual(
+            {(request.aggregate_n, request.k) for request in manifest.requests},
+            {(1024, 2048), (2048, 4096)},
+        )
+
+    def test_manifest_treats_m_as_part_of_the_profiled_invocation(self) -> None:
+        """The same template and N/K still require one profile per M."""
+
+        first = cuda_observation()
+        second = dataclasses.replace(
+            first,
+            m=2,
+            shape_group_id="profile-m2",
+            shape_name="profile-m2",
+            work_items=first.aggregate_n * first.k,
+        )
+        manifest = build_profiler_request_manifest(
+            ObservationCorpus((first, second))
+        )
+        self.assertEqual(len(manifest.requests), 2)
+        self.assertEqual({request.m for request in manifest.requests}, {1, 2})
+
+    def test_manifest_never_profiles_an_unreachable_representative_when_launchable(self) -> None:
+        """A candidate supported at any geometry receives real counter evidence."""
+
+        launchable = cuda_observation()
+        unreachable = dataclasses.replace(
+            cuda_observation(supported=False, forced_route_ok=False),
+            projection_n_vector=(1024,),
+            aggregate_n=1024,
+            k=2048,
+            aspect_ratio=0.5,
+            aspect_bucket=classify_aspect(1024, 2048),
+            work_items=1024 * 2048,
+            shape_group_id="profile-unreachable-shape",
+            shape_name="profile-unreachable",
+        )
+
+        manifest = build_profiler_request_manifest(ObservationCorpus((
+            unreachable,
+            launchable,
+        )))
+
+        self.assertEqual(len(manifest.requests), 1)
+        self.assertTrue(manifest.requests[0].profile_required)
+        self.assertEqual(manifest.requests[0].aggregate_n, launchable.aggregate_n)
+
+    def test_feature_export_joins_every_exact_request_to_full_corpus(self) -> None:
+        """Every measured physical point exports its attached profile row."""
+
+        base = cuda_observation()
+        observations = ObservationCorpus(tuple(
+            dataclasses.replace(
+                base,
+                projection_n_vector=(n,),
+                aggregate_n=n,
+                k=k,
+                aspect_ratio=float(n) / float(k),
+                aspect_bucket=classify_aspect(n, k),
+                work_items=n * k,
+                shape_group_id=f"profile-subset:n{n}:k{k}",
+                shape_name=f"profile-subset-{n}x{k}",
+                n_tail_class=f"n_mod_256={n % 256}",
+                k_tail_class=f"k_mod_256={k % 256}",
+            )
+            for n, k in ((1024, 2048), (2048, 4096), (4096, 8192))
+        ))
+        requests = build_profiler_request_manifest(observations)
+        evidence = evidence_manifest(
+            requests,
+            tuple(complete_evidence(request) for request in requests.requests),
+        )
+
+        rows = profiler_feature_rows(observations, requests, evidence)
+
+        self.assertEqual(len(requests.requests), 3)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            {row.observation.aggregate_n for row in rows},
+            {1024, 2048, 4096},
+        )
+
+    def test_compact_witnesses_authenticates_rows_from_retained_superset(self) -> None:
+        """Old profiler evidence remains reusable after its corpus is expanded."""
+
+        base = cuda_observation()
+        observations = ObservationCorpus(tuple(
+            dataclasses.replace(
+                base,
+                projection_n_vector=(n,),
+                aggregate_n=n,
+                k=k,
+                aspect_ratio=float(n) / float(k),
+                aspect_bucket=classify_aspect(n, k),
+                work_items=n * k,
+                shape_group_id=f"profile-witness:n{n}:k{k}",
+                shape_name=f"profile-witness-{n}x{k}",
+                n_tail_class=f"n_mod_256={n % 256}",
+                k_tail_class=f"k_mod_256={k % 256}",
+            )
+            for n, k in ((1024, 2048), (2048, 4096), (4096, 8192))
+        ))
+        requests = build_profiler_request_manifest(observations)
+        evidence = evidence_manifest(
+            requests,
+            tuple(complete_evidence(request) for request in requests.requests),
+        )
+
+        with mock.patch.object(
+            profiler_evidence,
+            "_parallel_export_observation_digests",
+            wraps=profiler_evidence._parallel_export_observation_digests,
+        ) as parallel_digests:
+            compact = compact_profiler_observation_witnesses(
+                observations,
+                requests,
+                evidence,
+            )
+
+        self.assertEqual(len(compact), 3)
+        self.assertEqual(parallel_digests.call_count, 2)
+        self.assertEqual(compact.digest(), observations.digest())
+        self.assertEqual(
+            len(profiler_feature_rows(compact, requests, evidence)),
+            3,
+        )
+
+        modified = ObservationCorpus(tuple(
+            dataclasses.replace(row, median_us=11.5)
+            if row.digest() == requests.requests[0].observation_digest
+            else row
+            for row in observations
+        ))
+        with self.assertRaisesRegex(
+            ValueError,
+            "omits 1 requested timing observations",
+        ):
+            compact_profiler_observation_witnesses(
+                modified,
+                requests,
+                evidence,
+            )
+
+    def test_feature_table_recovers_deduplicated_timing_witnesses(self) -> None:
+        """A retained feature CSV can restore lost compact source observations."""
+
+        observations = ObservationCorpus((cuda_observation(),))
+        requests = build_profiler_request_manifest(observations)
+        evidence = evidence_manifest(requests, (
+            complete_evidence(
+                requests.requests[0],
+                dispatches=(
+                    cuda_dispatch(0, "nativeVnniKPartProducer"),
+                    cuda_dispatch(1, "nativeVnniOrderedReducer"),
+                ),
+            ),
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "features.csv"
+            write_profiler_feature_csv(
+                path,
+                observations,
+                requests,
+                evidence,
+            )
+            recovered = read_profiler_feature_observation_witnesses((path,))
+
+            with path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[0]["profiler.observation_digest"] = "sha256:" + "0" * 64
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                read_profiler_feature_observation_witnesses((path,))
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered.digest(), observations.digest())
+
+    def test_profiler_model_totalizes_unprofiled_candidates_without_counters(
+        self,
+    ) -> None:
+        """Stratified evidence keeps every launchable candidate dispatchable."""
+
+        corpus, _costs, requests, evidence, rows, _catalog = (
+            profiler_model_fixture()
+        )
+        omitted_candidate = requests.requests[-1].candidate_id
+        incomplete_rows = tuple(
+            row
+            for row in rows
+            if row.observation.candidate_id != omitted_candidate
+        )
+
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            incomplete_rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        omitted = next(
+            row for row in corpus if row.candidate_id == omitted_candidate
+        )
+        descriptor = catalog.descriptor_for(omitted)
+        self.assertNotIn("profile.dispatch_count", descriptor.features)
+        self.assertTrue(
+            any(name.startswith("config.") for name in descriptor.features)
+        )
+
+    def test_stratified_profiler_teacher_trains_only_on_measured_rows(self) -> None:
+        """Sparse counters supervise sampled strata and predict every candidate."""
+
+        corpus, costs, requests, evidence, rows, _catalog = (
+            profiler_model_fixture()
+        )
+        sampled_shapes = {
+            "profile-model-shape-0",
+            "profile-model-shape-4",
+        }
+        sampled_rows = tuple(
+            row
+            for row in rows
+            if row.observation.shape_group_id in sampled_shapes
+        )
+        catalog = build_profiler_feature_catalog(
+            corpus,
+            sampled_rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        calls = []
+
+        def capture_surrogate(training_matrix, targets, prediction_matrix, *, device):
+            calls.append((
+                len(training_matrix),
+                len(prediction_matrix),
+                targets.shape[1],
+                device,
+            ))
+            return np.full(
+                len(prediction_matrix),
+                float(np.mean(targets[:, 0], dtype=np.float64)),
+                dtype=np.float64,
+            )
+
+        record_index = build_profiler_model_record_index(
+            costs,
+            corpus,
+            catalog,
+            workers=1,
+        )
+        try:
+            with mock.patch.object(
+                profiler_model,
+                "_fit_profiler_surrogate",
+                side_effect=capture_surrogate,
+            ):
+                predicted = apply_profiler_regret_predictions(
+                    costs,
+                    corpus,
+                    catalog,
+                    model_record_index=record_index,
+                    _surrogate_device="cpu",
+                )
+        finally:
+            record_index.close()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 4)
+        self.assertEqual(calls[0][1], len(costs))
+        self.assertGreater(calls[0][2], 1)
+        self.assertTrue(
+            all(row.profiler_predicted_regret is not None for row in predicted)
+        )
+
+    def test_profiler_model_ignores_metrics_without_auxiliary_signal(self) -> None:
+        """Config-only separability must not masquerade as counter influence."""
+
+        corpus, costs, *_unused, first_catalog = profiler_model_fixture(
+            second_candidate_metric_scale=3.0
+        )
+        _corpus, _costs, *_unused, flat_catalog = profiler_model_fixture(
+            second_candidate_metric_scale=1.0
+        )
+
+        with mock.patch.object(
+            profiler_model,
+            "_fit_profiler_surrogate",
+            side_effect=deterministic_test_profiler_surrogate,
+        ):
+            first = apply_profiler_regret_predictions(
+                costs, corpus, first_catalog, _surrogate_device="cpu"
+            )
+            flat = apply_profiler_regret_predictions(
+                costs, corpus, flat_catalog, _surrogate_device="cpu"
+            )
+        self.assertNotEqual(first_catalog.digest, flat_catalog.digest)
+        self.assertTrue(any(
+            row.profiler_predicted_regret is not None for row in first
+        ))
+        self.assertEqual(
+            [row.profiler_predicted_regret for row in flat],
+            [row.profiler_predicted_regret for row in costs],
+        )
+        self.assertTrue(all(
+            (row.selection_regret < P95_REGRET_BUDGET)
+            == (row.max_surface_regret < P95_REGRET_BUDGET)
+            for row in first
+        ))
+
+    def test_auxiliary_centering_rejects_partial_candidate_metrics(self) -> None:
+        """An unavailable counter must not look like a zero-cost candidate."""
+
+        observations = [
+            dataclasses.replace(
+                cuda_observation(),
+                shape_group_id=f"shape-{shape}",
+                shape_name=f"shape-{shape}",
+                candidate_id=candidate,
+                effective_candidate_id=candidate,
+            )
+            for shape in range(2)
+            for candidate in ("candidate-a", "candidate-b")
+        ]
+        point_members = {
+            (runtime_key(observations[0]), "shape-0"): [0, 1],
+            (runtime_key(observations[2]), "shape-1"): [2, 3],
+        }
+        centered = _center_complete_candidate_relative_auxiliary(
+            [
+                {"stable": 2.0, "partial": 7.0},
+                {"stable": 4.0},
+                {"stable": 10.0},
+                {"stable": 14.0},
+            ],
+            point_members,
+        )
+
+        self.assertEqual(
+            [record["stable"] for record in centered],
+            [-1.0, 1.0, -2.0, 2.0],
+        )
+        self.assertTrue(all("partial" not in record for record in centered))
+
+    def test_profiler_model_digest_ignores_non_model_provenance(self) -> None:
+        """Additive timing identity must not invalidate unchanged fit inputs."""
+
+        _corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        rebound = dataclasses.replace(
+            catalog,
+            corpus_digest="sha256:" + "1" * 64,
+            request_manifest_digest="sha256:" + "2" * 64,
+            evidence_manifest_digest="sha256:" + "3" * 64,
+        )
+
+        self.assertNotEqual(catalog.digest, rebound.digest)
+        self.assertEqual(catalog.model_digest, rebound.model_digest)
+
+    def test_profiler_catalog_whole_catalog_digests_are_memoized(self) -> None:
+        """Per-domain cache lookup must not reserialize immutable evidence."""
+
+        _corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        with mock.patch.object(json, "dumps", wraps=json.dumps) as dumps:
+            first_provenance = catalog.digest
+            second_provenance = catalog.digest
+            first_model = catalog.model_digest
+            second_model = catalog.model_digest
+
+        self.assertEqual(first_provenance, second_provenance)
+        self.assertEqual(first_model, second_model)
+        self.assertEqual(dumps.call_count, 2)
+
+    def test_profiler_model_digest_changes_with_normalized_features(self) -> None:
+        """A descriptor change must still invalidate every dependent model."""
+
+        _corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        key, descriptor = next(iter(catalog.descriptors.items()))
+        changed_features = dict(descriptor.features)
+        changed_features["metric.unit.incremental-cache-probe"] = 1.0
+        changed = dataclasses.replace(
+            catalog,
+            descriptors={
+                **catalog.descriptors,
+                key: dataclasses.replace(
+                    descriptor,
+                    features=changed_features,
+                ),
+            },
+        )
+
+        self.assertNotEqual(catalog.model_digest, changed.model_digest)
+
+    def test_surrogate_retuning_reuses_catalog_and_invalidates_surfaces(
+        self,
+    ) -> None:
+        """Forest tuning must not trigger another raw profiler-evidence parse."""
+
+        source, costs, requests, evidence, *_unused = profiler_model_fixture()
+        point = (
+            costs[0].runtime_key,
+            costs[0].shape_group_id,
+            costs[0].candidate_id,
+        )
+        training_digest = "sha256:" + "7" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_path = root / "requests.json"
+            evidence_path = root / "evidence.json"
+            cache_path = root / "profiler-catalog.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, evidence)
+            original = load_profiler_feature_catalog(
+                source,
+                request_path,
+                evidence_path,
+                source_corpus=source,
+                cache_path=cache_path,
+            )
+            original_model_digest = original.model_digest
+            original_surface_key = PolicyFitCache(root / "fit").profiler_prediction_key(
+                training_pool_digest=training_digest,
+                profiler_model_digest=original_model_digest,
+                held_out_geometries=(),
+                prediction_points=(point,),
+            )
+
+            with mock.patch.object(
+                profiler_model,
+                "PROFILER_SURROGATE_VERSION",
+                profiler_model.PROFILER_SURROGATE_VERSION + "-retuned",
+            ), mock.patch.object(
+                profiler_model,
+                "PROFILER_GPU_HIST_BOOST_ROUNDS",
+                profiler_model.PROFILER_GPU_HIST_BOOST_ROUNDS + 1,
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model."
+                "read_profiler_request_manifest",
+                side_effect=AssertionError("request JSON was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model."
+                "read_profiler_evidence_manifest",
+                side_effect=AssertionError("evidence JSON was reparsed"),
+            ):
+                retuned = load_profiler_feature_catalog(
+                    source,
+                    request_path,
+                    evidence_path,
+                    source_corpus=source,
+                    cache_path=cache_path,
+                )
+                retuned_model_digest = retuned.model_digest
+                retuned_surface_key = PolicyFitCache(
+                    root / "fit"
+                ).profiler_prediction_key(
+                    training_pool_digest=training_digest,
+                    profiler_model_digest=retuned_model_digest,
+                    held_out_geometries=(),
+                    prediction_points=(point,),
+                )
+
+        self.assertEqual(retuned.digest, original.digest)
+        self.assertEqual(retuned.model_input_digest, original.model_input_digest)
+        self.assertNotEqual(retuned_model_digest, original_model_digest)
+        self.assertNotEqual(retuned_surface_key, original_surface_key)
+
+    def test_surrogate_identity_binds_every_fit_hyperparameter(self) -> None:
+        """No prediction-changing GPU learner setting may reuse a surface."""
+
+        baseline = profiler_model._profiler_surrogate_identity()
+        mutations = {
+            "PROFILER_SURROGATE_VERSION": (
+                profiler_model.PROFILER_SURROGATE_VERSION + "-unit"
+            ),
+            "PROFILER_XGBOOST_VERSION": "3.1.4-unit",
+            "PROFILER_GPU_HIST_TARGET_PROJECTIONS": 5,
+            "PROFILER_GPU_HIST_BOOST_ROUNDS": (
+                profiler_model.PROFILER_GPU_HIST_BOOST_ROUNDS + 1
+            ),
+            "PROFILER_GPU_HIST_MAX_DEPTH": (
+                profiler_model.PROFILER_GPU_HIST_MAX_DEPTH + 1
+            ),
+            "PROFILER_GPU_HIST_MIN_CHILD_WEIGHT": 5.0,
+            "PROFILER_GPU_HIST_MAX_BIN": 128,
+            "PROFILER_GPU_HIST_LEARNING_RATE": 0.125,
+            "PROFILER_GPU_HIST_COLSAMPLE_BYNODE": 0.5,
+            "PROFILER_GPU_HIST_RANDOM_STATE": (
+                profiler_model.PROFILER_GPU_HIST_RANDOM_STATE + 1
+            ),
+            "PROFILER_AUXILIARY_TARGET_TOTAL_WEIGHT": 0.75,
+        }
+        for name, value in mutations.items():
+            with self.subTest(name=name), mock.patch.object(
+                profiler_model, name, value
+            ):
+                self.assertNotEqual(
+                    profiler_model._profiler_surrogate_identity(),
+                    baseline,
+                )
+
+    def test_gpu_surrogate_target_mixing_reconstructs_regret(self) -> None:
+        """Every mixed scalar target must retain the original regret signal."""
+
+        targets = np.asarray([
+            [0.75, -0.5, 0.25, 1.0],
+            [-0.125, 0.75, -1.25, 0.5],
+        ], dtype=np.float32)
+        mixed = profiler_model._mixed_profiler_targets(targets)
+
+        self.assertEqual(mixed.shape, (len(targets), 4))
+        np.testing.assert_allclose(
+            np.mean(mixed, axis=1),
+            targets[:, 0],
+            rtol=0.0,
+            atol=2.0e-7,
+        )
+        for auxiliary_column in range(1, targets.shape[1]):
+            without_column = targets.copy()
+            without_column[:, auxiliary_column] = 0.0
+            changed = profiler_model._mixed_profiler_targets(without_column)
+            self.assertFalse(np.array_equal(changed, mixed))
+
+    def test_profiler_pool_digest_ignores_unreachable_descriptors(self) -> None:
+        """A descriptor outside one pool must not evict that pool's CV cache."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        selected = corpus.observations[0]
+        other_key = next(
+            key
+            for key in catalog.descriptors
+            if key.effective_candidate_id != selected.effective_candidate_id
+        )
+        other_descriptor = catalog.descriptors[other_key]
+        changed_features = dict(other_descriptor.features)
+        changed_features["metric.unit.other-pool-probe"] = 2.0
+        changed = dataclasses.replace(
+            catalog,
+            descriptors={
+                **catalog.descriptors,
+                other_key: dataclasses.replace(
+                    other_descriptor,
+                    features=changed_features,
+                ),
+            },
+        )
+
+        self.assertNotEqual(catalog.model_digest, changed.model_digest)
+        self.assertEqual(
+            catalog.model_digest_for((selected,)),
+            changed.model_digest_for((selected,)),
+        )
+
+    def test_complete_profiler_pool_reuses_cached_catalog_digest(self) -> None:
+        """A full transfer pool must not reserialize every descriptor."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        expected = catalog.model_digest
+        # Normalized catalog publication and loading retain this authenticated
+        # value, which is the production condition exercised by a fit replay.
+        catalog.__dict__["model_input_digest"] = catalog.model_input_digest
+        rebound = catalog.rebind(corpus)
+        self.assertEqual(
+            rebound.__dict__["model_input_digest"],
+            catalog.model_input_digest,
+        )
+        with mock.patch.object(
+            profiler_model.ProfilerFeatureCatalog,
+            "model_digest_for_descriptors",
+            side_effect=AssertionError("full catalog was redundantly encoded"),
+        ):
+            actual = rebound.model_digest_for(corpus.observations)
+
+        self.assertEqual(actual, expected)
+
+    def test_profiler_pool_digests_are_identical_across_worker_counts(
+        self,
+    ) -> None:
+        """Forked transfer-pool hashing must preserve exact cache identities."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        rows = corpus.observations
+        pools = {
+            ("unit-pool-even",): rows[::2],
+            ("unit-pool-odd",): rows[1::2],
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = _profiler_model_digests_for_pools(catalog, pools)
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "2"},
+        ):
+            parallel = _profiler_model_digests_for_pools(catalog, pools)
+
+        self.assertEqual(parallel, serial)
+
+    def test_canonical_profiler_cache_hit_skips_legacy_catalog_digest(
+        self,
+    ) -> None:
+        """A current cache hit cannot reserialize all profiler provenance."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            expected = fit_generic_policy(
+                corpus,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                fit_final_rules=False,
+                fit_cache=cache,
+                policy_accelerators=(),
+                profiler_feature_catalog=catalog,
+            )
+            replay_catalog = dataclasses.replace(catalog)
+
+            def reject_legacy_digest(_catalog):
+                raise AssertionError(
+                    "canonical cache hit serialized legacy provenance"
+                )
+
+            with mock.patch.object(
+                type(replay_catalog),
+                "digest",
+                new=property(reject_legacy_digest),
+            ), mock.patch(
+                "native_vnni_dispatch.segmented_policy."
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("cached CV was recomputed"),
+            ):
+                replay = fit_generic_policy(
+                    corpus,
+                    max_leaves=2,
+                    min_shape_groups_per_leaf=1,
+                    fit_final_rules=False,
+                    fit_cache=cache,
+                    policy_accelerators=(),
+                    profiler_feature_catalog=replay_catalog,
+                )
+
+        self.assertEqual(replay, expected)
+
+    def test_model_catalog_excludes_raw_representative_counter_magnitudes(self) -> None:
+        """Admit normalized economics while retaining raw values only in evidence."""
+
+        _corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        descriptor = next(iter(catalog.descriptors.values()))
+        names = set(descriptor.features)
+
+        self.assertEqual(
+            descriptor.features["profile.execution_regime"],
+            "decode",
+        )
+        self.assertIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            names,
+        )
+        self.assertIn(
+            "metric.gpu.compute.registers_per_thread.maximum_log1p",
+            names,
+        )
+        self.assertFalse(any(
+            name.startswith("profile.representative_") for name in names
+        ))
+        self.assertFalse(any(
+            name.startswith("profile.grid_threads.") for name in names
+        ))
+        self.assertNotIn("metric.gpu.duration_ns.mean", names)
+        self.assertNotIn("metric.gpu.duration_ns.sum", names)
+
+    def test_gpu_catalog_separates_compute_reduction_and_preparation(self) -> None:
+        """Preparation noise cannot become CUDA/ROCm candidate economy signal."""
+
+        observation = cuda_observation()
+        corpus = ObservationCorpus((observation,))
+        requests = build_profiler_request_manifest(corpus)
+
+        def catalog(quantize_scale: float):
+            dispatches = (
+                cuda_dispatch(
+                    0,
+                    "quantizeActivationsQ8_blockwise_v4_kernel",
+                    metric_scale=quantize_scale,
+                ),
+                cuda_dispatch(
+                    1,
+                    "nativeVnniGemvKernel",
+                    metric_scale=2.0,
+                ),
+                cuda_dispatch(
+                    2,
+                    "nativeVnniKPartReduceKernel",
+                    metric_scale=3.0,
+                ),
+            )
+            evidence = evidence_manifest(
+                requests,
+                (complete_evidence(requests.requests[0], dispatches),),
+            )
+            return build_profiler_feature_catalog(
+                corpus,
+                profiler_feature_rows(corpus, requests, evidence),
+                request_manifest_digest=requests.digest(),
+                evidence_manifest_digest=evidence.digest(),
+            ).descriptor_for(observation).features
+
+        baseline = catalog(100.0)
+        perturbed = catalog(10_000.0)
+
+        self.assertEqual(baseline, perturbed)
+        self.assertEqual(baseline["profile.dispatch_count"], math.log1p(2.0))
+        self.assertEqual(
+            baseline["profile.compute_dispatch_count"], math.log1p(1.0)
+        )
+        self.assertEqual(
+            baseline["profile.reduction_dispatch_count"], math.log1p(1.0)
+        )
+        self.assertEqual(
+            baseline[
+                "metric.gpu.compute.registers_per_thread.maximum_log1p"
+            ],
+            math.log1p(4.0),
+        )
+        self.assertEqual(
+            baseline[
+                "metric.gpu.reduction.registers_per_thread.maximum_log1p"
+            ],
+            math.log1p(6.0),
+        )
+        self.assertNotIn(
+            "metric.gpu.preparation.registers_per_thread.maximum_log1p",
+            baseline,
+        )
+
+    def test_decode_and_prefill_normalize_profiler_time_by_distinct_work(self) -> None:
+        """Use bytes/second for GEMV and operations/second for GEMM evidence."""
+
+        decode = cuda_observation()
+        metric_values = {
+            metric.metric_id: [float(metric.value)]
+            for metric in complete_metrics(Backend.CUDA)
+            if metric.value is not None
+        }
+        prefill = dataclasses.replace(
+            decode,
+            operation_kind="NativeVNNIPrefillProjection",
+            m=64,
+        )
+
+        decode_features = _normalized_metric_features(decode, metric_values)
+        prefill_features = _normalized_metric_features(prefill, metric_values)
+
+        self.assertIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            decode_features,
+        )
+        self.assertIn(
+            "metric.gpu.decode.effective_gops_log1p",
+            decode_features,
+        )
+        self.assertNotIn(
+            "metric.gpu.prefill.effective_gops_log1p",
+            decode_features,
+        )
+        self.assertIn(
+            "metric.gpu.prefill.effective_gops_log1p",
+            prefill_features,
+        )
+        self.assertNotIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            prefill_features,
+        )
+
+    def test_cpu_and_rocm_features_follow_the_same_regime_contract(self) -> None:
+        """Keep backend-specific counters symmetric around decode/prefill work."""
+
+        decode = cuda_observation()
+        prefill = dataclasses.replace(
+            decode,
+            operation_kind="NativeVNNIPrefillProjection",
+            m=64,
+        )
+
+        def values_for(backend: Backend) -> dict[str, list[float]]:
+            values = {
+                metric.metric_id: [float(metric.value)]
+                for metric in complete_metrics(backend)
+                if metric.value is not None
+            }
+            if backend == Backend.CPU:
+                values["cpu.wall_clock_ns"] = [1_000_000.0]
+                values["cpu.task_clock_ns"] = [20_000_000.0]
+            return values
+
+        cpu_decode_observation = dataclasses.replace(
+            decode,
+            architecture_class="unit-cpu|threads=28",
+        )
+        cpu_prefill_observation = dataclasses.replace(
+            prefill,
+            architecture_class="unit-cpu|threads=28",
+        )
+        cpu_decode = _normalized_metric_features(
+            cpu_decode_observation, values_for(Backend.CPU)
+        )
+        cpu_prefill = _normalized_metric_features(
+            cpu_prefill_observation, values_for(Backend.CPU)
+        )
+        rocm_decode = _normalized_metric_features(
+            decode, values_for(Backend.ROCM)
+        )
+        rocm_prefill = _normalized_metric_features(
+            prefill, values_for(Backend.ROCM)
+        )
+
+        self.assertIn(
+            "metric.cpu.decode.cycles_per_expected_mib_log1p",
+            cpu_decode,
+        )
+        self.assertIn(
+            "metric.cpu.decode.cycles_per_million_macs_log1p",
+            cpu_decode,
+        )
+        self.assertIn(
+            "metric.cpu.prefill.cycles_per_million_macs_log1p",
+            cpu_prefill,
+        )
+        self.assertIn(
+            "metric.gpu.decode.effective_gbytes_per_second_log1p",
+            rocm_decode,
+        )
+        self.assertIn("metric.gpu.fetch_to_expected_byte_ratio", rocm_decode)
+        self.assertIn("metric.gpu.vgpr_count.maximum_log1p", rocm_decode)
+        self.assertIn(
+            "metric.gpu.valu_instructions_per_workitem.mean_log1p",
+            rocm_decode,
+        )
+        self.assertIn(
+            "metric.gpu.flat_vmem_instructions_per_workitem.mean_log1p",
+            rocm_decode,
+        )
+        self.assertIn(
+            "metric.gpu.prefill.effective_gops_log1p",
+            rocm_prefill,
+        )
+
+    def test_short_cpu_profile_masks_duration_sensitive_counter_features(self) -> None:
+        """Control overhead cannot become a learned short-kernel property."""
+
+        observation = dataclasses.replace(
+            cuda_observation(),
+            backend=Backend.CPU,
+            architecture_class="unit-cpu|threads=28",
+            operation_kind="NativeVNNIPrefillProjection",
+            m=64,
+        )
+        values = {
+            metric.metric_id: [float(metric.value)]
+            for metric in complete_metrics(Backend.CPU)
+            if metric.value is not None
+        }
+        values["cpu.wall_clock_ns"] = [100_000.0]
+        values["cpu.task_clock_ns"] = [3_400_000.0]
+        features = _normalized_metric_features(observation, values)
+
+        self.assertEqual(
+            features["profile.cpu.duration_features_reliable"],
+            0.0,
+        )
+        self.assertIn(
+            "metric.cpu.prefill.instructions_per_million_macs_log1p",
+            features,
+        )
+        self.assertIn(
+            "metric.cpu.prefill.l1d_loads_per_million_macs_log1p",
+            features,
+        )
+        self.assertIn(
+            "metric.cpu.prefill.l1d_load_misses_per_million_macs_log1p",
+            features,
+        )
+        self.assertIn(
+            "metric.cpu.prefill.llc_load_misses_per_million_macs_log1p",
+            features,
+        )
+        self.assertIn("metric.cpu.l1d_load_miss_fraction", features)
+        self.assertNotIn("metric.cpu.ipc", features)
+        self.assertNotIn(
+            "metric.cpu.prefill.cycles_per_million_macs_log1p",
+            features,
+        )
+
+        auxiliary = _profiler_auxiliary_target_record(features)
+        self.assertNotIn("profile.cpu.duration_features_reliable", auxiliary)
+        self.assertFalse(any("wall_clock_ns_" in name for name in auxiliary))
+        self.assertFalse(any("task_clock_ns_" in name for name in auxiliary))
+
+    def test_profiler_prediction_preserves_measured_hard_budget_topology(self) -> None:
+        """Bounded shrinkage must never create a synthetic pass or failure."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        passing = next(
+            cost
+            for cost in costs
+            if cost.max_surface_regret < P95_REGRET_BUDGET
+        )
+        failing = next(
+            cost
+            for cost in costs
+            if cost.max_surface_regret >= P95_REGRET_BUDGET
+        )
+
+        passing = dataclasses.replace(
+            passing,
+            profiler_predicted_regret=0.75,
+        )
+        failing = dataclasses.replace(
+            failing,
+            profiler_predicted_regret=0.75,
+        )
+
+        self.assertLess(passing.selection_regret, P95_REGRET_BUDGET)
+        self.assertGreater(failing.selection_regret, P95_REGRET_BUDGET)
+        self.assertEqual(
+            failing.selection_regret,
+            failing.max_surface_regret + P95_REGRET_BUDGET,
+        )
+
+        optimistic_failure = dataclasses.replace(
+            failing,
+            profiler_predicted_regret=0.0,
+        )
+        self.assertGreater(
+            optimistic_failure.selection_regret,
+            P95_REGRET_BUDGET,
+        )
+
+        exact_boundary = dataclasses.replace(
+            passing,
+            max_surface_regret=P95_REGRET_BUDGET,
+            profiler_predicted_regret=0.0,
+        )
+        self.assertGreater(
+            exact_boundary.selection_regret,
+            P95_REGRET_BUDGET,
+        )
+
+    def test_profiler_prediction_can_rank_measured_passing_candidates(self) -> None:
+        """Profiler economics may resolve near-ties without crossing the gate."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        passing = next(
+            cost
+            for cost in costs
+            if cost.max_surface_regret < P95_REGRET_BUDGET
+        )
+        optimistic = dataclasses.replace(
+            passing,
+            profiler_predicted_regret=0.0,
+        )
+        pessimistic = dataclasses.replace(
+            passing,
+            profiler_predicted_regret=0.02,
+        )
+
+        self.assertLess(optimistic.selection_regret, pessimistic.selection_regret)
+        self.assertLessEqual(
+            pessimistic.selection_regret,
+            P95_REGRET_BUDGET,
+        )
+
+    def test_profiler_blend_strength_is_explicit_and_budget_bounded(self) -> None:
+        """CV may trust a useful prior more strongly without forging evidence."""
+
+        _corpus, costs, *_unused = profiler_model_fixture()
+        cost = dataclasses.replace(
+            next(
+                item
+                for item in costs
+                if item.max_surface_regret >= P95_REGRET_BUDGET
+            ),
+            max_surface_regret=0.10,
+        )
+        quarter = dataclasses.replace(
+            cost,
+            profiler_predicted_regret=0.025,
+            profiler_blend_weight=0.25,
+        )
+        half = dataclasses.replace(quarter, profiler_blend_weight=0.5)
+        full = dataclasses.replace(quarter, profiler_blend_weight=1.0)
+
+        self.assertGreater(quarter.selection_regret, half.selection_regret)
+        self.assertGreater(half.selection_regret, full.selection_regret)
+        self.assertGreater(full.selection_regret, P95_REGRET_BUDGET)
+        self.assertGreaterEqual(
+            full.selection_regret,
+            cost.max_surface_regret - P95_REGRET_BUDGET,
+        )
+        with self.assertRaisesRegex(ValueError, "blend weight"):
+            _ = dataclasses.replace(
+                quarter,
+                profiler_blend_weight=1.01,
+            ).selection_regret
+
+    def test_emitted_rule_reports_measured_not_profiler_penalty_regret(self) -> None:
+        """Profiler regularization must not inflate the published timing claim."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        penalized = [
+            dataclasses.replace(cost, profiler_predicted_regret=0.75)
+            for cost in costs
+        ]
+        rules = fit_domain_rules(
+            corpus.generic_domains()[0],
+            penalized,
+            corpus,
+            max_leaves=1,
+            min_shape_groups_per_leaf=1,
+        )
+
+        self.assertEqual(len(rules), 1)
+        selected = rules[0].candidate_id
+        self.assertEqual(
+            rules[0].development_max_regret,
+            max(
+                cost.max_surface_regret
+                for cost in costs
+                if cost.candidate_id == selected
+            ),
+        )
+        self.assertLess(rules[0].development_max_regret, 0.75)
+
+    def test_profiler_fold_fit_never_receives_held_out_timing_rows(self) -> None:
+        """Grouped CV profiler labels are restricted to training shape groups."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        observed_calls = []
+        observed_indices = []
+        observed_model_pools = []
+        original_codebook = costs[0].runtime_key.runtime_codebook_id
+        foreign_codebook = original_codebook + 100
+        foreign_costs = [
+            dataclasses.replace(
+                cost,
+                runtime_key=dataclasses.replace(
+                    cost.runtime_key,
+                    prepared_family_id="NativeVNNI_cuda_CB1",
+                    packing_abi="native-vnni-cuda-cb1-v1",
+                    runtime_codebook_id=foreign_codebook,
+                ),
+            )
+            for cost in costs
+        ]
+        other_m = domain.m * 2
+        cross_m_costs = [
+            dataclasses.replace(
+                cost,
+                runtime_key=dataclasses.replace(cost.runtime_key, m=other_m),
+            )
+            for cost in (*costs, *foreign_costs)
+        ]
+
+        def capture(
+            training_costs,
+            training_corpus,
+            feature_catalog,
+            *,
+            observation_index=None,
+            model_training_costs=None,
+            model_record_index=None,
+            model_training_row_indices=None,
+            prediction_row_indices=None,
+            excluded_profiler_geometries=frozenset(),
+            _surrogate_device=None,
+        ):
+            self.assertIs(feature_catalog, catalog)
+            self.assertEqual(_surrogate_device, "cpu")
+            self.assertIsNotNone(observation_index)
+            self.assertIsNotNone(model_record_index)
+            self.assertEqual(
+                [training_pool[row] for row in model_training_row_indices],
+                list(model_training_costs),
+            )
+            self.assertEqual(
+                [training_pool[row] for row in prediction_row_indices],
+                list(training_costs),
+            )
+            prediction_groups = {
+                row.shape_group_id for row in training_costs
+            }
+            corpus_groups = {row.shape_group_id for row in training_corpus}
+            pool_groups = {
+                row.shape_group_id for row in model_training_costs
+            }
+            self.assertEqual(prediction_groups, corpus_groups)
+            self.assertLess(pool_groups, corpus_groups)
+            prediction_geometries = {
+                (row.runtime_key.aggregate_n, row.runtime_key.k)
+                for row in training_costs
+            }
+            model_geometries = {
+                (row.runtime_key.aggregate_n, row.runtime_key.k)
+                for row in model_training_costs
+            }
+            self.assertLess(model_geometries, prediction_geometries)
+            self.assertEqual(
+                excluded_profiler_geometries,
+                frozenset(prediction_geometries - model_geometries),
+            )
+            self.assertEqual(
+                len(model_training_costs),
+                4 * sum(
+                    row.shape_group_id in pool_groups for row in costs
+                ),
+            )
+            self.assertEqual(
+                {row.runtime_key.runtime_codebook_id for row in model_training_costs},
+                {original_codebook, foreign_codebook},
+            )
+            self.assertEqual(
+                {row.runtime_key.m for row in model_training_costs},
+                {domain.m, other_m},
+            )
+            observed_calls.append(frozenset(pool_groups))
+            observed_indices.append(observation_index)
+            observed_model_pools.append(frozenset(pool_groups))
+            return list(training_costs)
+
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "apply_profiler_regret_predictions",
+            side_effect=capture,
+        ), mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_model_record_index",
+            return_value={"materialized": "once"},
+        ) as build_records:
+            prediction_cache = {}
+            training_pool = tuple((*costs, *foreign_costs, *cross_m_costs))
+            pool_key = _profiler_transfer_key(domain)
+            request_keys = _domain_profiler_prediction_request_keys(
+                domain,
+                costs,
+                seed="profiler-fold-unit",
+            )
+            workers = _populate_profiler_prediction_cache(
+                prediction_cache,
+                request_keys,
+                {pool_key: training_pool},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=1,
+                surrogate_devices=("cpu",),
+            )
+            repeated_workers = _populate_profiler_prediction_cache(
+                prediction_cache,
+                request_keys,
+                {pool_key: training_pool},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=1,
+                surrogate_devices=("cpu",),
+            )
+            tasks, fold_count = _domain_fold_tasks(
+                domain,
+                costs,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                seed="profiler-fold-unit",
+                profiler_training_pool_key=pool_key,
+                profiler_prediction_cache=prediction_cache,
+            )
+            repeated_tasks, repeated_fold_count = _domain_fold_tasks(
+                domain,
+                costs,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                seed="profiler-fold-unit",
+                profiler_training_pool_key=pool_key,
+                profiler_prediction_cache=prediction_cache,
+            )
+
+        all_groups = {row.shape_group_id for row in corpus}
+        self.assertEqual(workers, 1)
+        self.assertEqual(repeated_workers, 0)
+        build_records.assert_called_once()
+        self.assertEqual(len(observed_calls), fold_count)
+        self.assertEqual(repeated_fold_count, fold_count)
+        self.assertEqual(repeated_tasks, tasks)
+        self.assertEqual(
+            {task[5] for task in tasks},
+            {
+                ProfilerInfluence.MEASURED_ONLY,
+                ProfilerInfluence.BOUNDED_PRIOR,
+                ProfilerInfluence.BOUNDED_PRIOR_HALF,
+                ProfilerInfluence.BOUNDED_PRIOR_FULL,
+            },
+        )
+        self.assertTrue(all(
+            index is observed_indices[0] for index in observed_indices
+        ))
+        self.assertEqual(observed_calls, observed_model_pools)
+        self.assertTrue(tasks)
+        self.assertTrue(all(groups < all_groups for groups in observed_calls))
+
+    def test_profiler_prediction_surfaces_are_built_concurrently(self) -> None:
+        """Independent held-out forests use the configured host worker pool."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        base_pool_key = _profiler_transfer_key(domain)
+        pool_keys = tuple(
+            (*base_pool_key, f"unit-pool-{index}")
+            for index in range(4)
+        )
+        request_keys = tuple(
+            (pool_key, ((1000 + index, 2000 + index),))
+            for index, pool_key in enumerate(pool_keys)
+        )
+
+        def capture(*args, **kwargs):
+            time.sleep(0.05)
+            return [
+                dataclasses.replace(
+                    cost,
+                    profiler_predicted_regret=float(os.getpid()),
+                )
+                for cost in args[0]
+            ]
+
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "apply_profiler_regret_predictions",
+            side_effect=capture,
+        ), mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_model_record_index",
+            return_value={"materialized": "once"},
+        ):
+            prediction_cache = {}
+            workers = _populate_profiler_prediction_cache(
+                prediction_cache,
+                request_keys,
+                {pool_key: tuple(costs) for pool_key in pool_keys},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=4,
+                surrogate_devices=("cpu",) * 4,
+            )
+
+        self.assertEqual(workers, 4)
+        self.assertEqual(set(prediction_cache), set(request_keys))
+        worker_pids = {
+            prediction
+            for predictions in prediction_cache.values()
+            for prediction in predictions.values()
+            if prediction is not None
+        }
+        self.assertGreater(len(worker_pids), 1)
+
+    def test_compact_profiler_fold_tasks_match_eager_results(self) -> None:
+        """Lazy scorer-owned label views preserve every eager CV decision."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        prediction_cache = {}
+        for request_key, points in _domain_profiler_prediction_requests(
+            domain,
+            costs,
+            seed="compact-profiler-fold-unit",
+        ).items():
+            prediction_cache[request_key] = {
+                point: (
+                    0.01
+                    + 0.001 * point[0].aggregate_n
+                    + 0.002 * index
+                )
+                for index, point in enumerate(sorted(points))
+            }
+
+        arguments = {
+            "max_leaves": 1,
+            "min_shape_groups_per_leaf": 1,
+            "seed": "compact-profiler-fold-unit",
+            "profiler_training_pool_key": pool_key,
+            "profiler_prediction_cache": prediction_cache,
+        }
+        eager, eager_fold_count = _domain_fold_tasks(
+            domain,
+            costs,
+            **arguments,
+        )
+        compact, compact_fold_count = _domain_fold_tasks(
+            domain,
+            costs,
+            compact=True,
+            **arguments,
+        )
+
+        self.assertEqual(compact_fold_count, eager_fold_count)
+        self.assertEqual(len(compact), len(eager))
+        self.assertTrue(all(
+            isinstance(task, _CompactFoldTask) for task in compact
+        ))
+        self.assertEqual(
+            tuple(_evaluate_placement_fold(task) for task in compact),
+            tuple(_evaluate_placement_fold(task) for task in eager),
+        )
+
+    def _read_only_compact_fold_tasks(self, directory: Path):
+        """Prepare device-free CV tasks against immutable row-aligned surfaces."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        seed = "compact-label-cache-unit"
+        predictions = {}
+        for index, (request, points) in enumerate(
+            _domain_profiler_prediction_requests(domain, costs, seed=seed).items()
+        ):
+            inventory = segmented_policy._profiler_prediction_point_inventory(points)
+            path = directory / f"predictions-{index}.f64"
+            np.asarray([0.01 + 0.002 * row for row in range(len(inventory.points))],
+                       dtype="<f8").tofile(path)
+            predictions[request] = segmented_policy.ProfilerPredictionSurface(inventory, path)
+        tasks, _folds = _domain_fold_tasks(
+            domain, costs, max_leaves=1, min_shape_groups_per_leaf=1, seed=seed,
+            profiler_training_pool_key=_profiler_transfer_key(domain),
+            profiler_prediction_cache=predictions, compact=True,
+            feature_policies=(segmented_policy.FeaturePolicy.CONTINUOUS,
+                              segmented_policy.FeaturePolicy.TILE_32),
+        )
+        return tasks
+
+    def test_compact_label_views_reuse_only_label_invariant_work(self) -> None:
+        """Feature/placement alternatives reuse labels, never held-out decisions."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            expected = tuple(segmented_policy._materialize_compact_fold_costs(task)
+                             for task in tasks)
+            cache = segmented_policy._CompactFoldCostViews()
+            with mock.patch.object(segmented_policy, "_materialize_compact_fold_costs",
+                                   wraps=segmented_policy._materialize_compact_fold_costs) as build:
+                actual = tuple(cache.materialize(task) for task in tasks)
+            self.assertEqual(actual, expected)
+            required_views = {
+                (task.fold_index, task.profiler_influence)
+                for task in tasks if task.profiler_influence != ProfilerInfluence.MEASURED_ONLY
+            }
+            self.assertEqual(build.call_count, len(required_views))
+            self.assertLess(build.call_count, len(tasks))
+            self.assertEqual(
+                tuple(_evaluate_placement_fold(task, compact_cost_views=cache) for task in tasks),
+                tuple(_evaluate_placement_fold(task) for task in tasks),
+            )
+            for task, view in zip(tasks, actual):
+                if task.profiler_influence == ProfilerInfluence.MEASURED_ONLY:
+                    self.assertIs(view, task.costs)
+                self.assertEqual(
+                    {(row.runtime_key, row.shape_group_id, row.candidate_id):
+                     (row.max_surface_regret, row.p95_surface_regret, row.mean_surface_regret)
+                     for row in view},
+                    {(row.runtime_key, row.shape_group_id, row.candidate_id):
+                     (row.max_surface_regret, row.p95_surface_regret, row.mean_surface_regret)
+                     for row in task.costs},
+                )
+
+    def test_compact_label_scope_invalidates_changed_inputs(self) -> None:
+        """New costs, held groups or prediction owners may not reuse stale priors."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            cache = segmented_policy._CompactFoldCostViews()
+            initial = cache.materialize(task)
+            self.assertIs(cache.materialize(dataclasses.replace(
+                task, feature_policy=segmented_policy.FeaturePolicy.TILE_64,
+                max_leaves=task.max_leaves+1)), initial)
+            changed_costs = dataclasses.replace(task, costs=(
+                dataclasses.replace(task.costs[0], max_surface_regret=0.025), *task.costs[1:]))
+            changed_groups = dataclasses.replace(task, held_out_groups=frozenset(
+                cost.shape_group_id for cost in task.costs if cost.shape_group_id not in task.held_out_groups))
+            surface = task.profiler_predictions
+            path = Path(directory) / "different-predictions.f64"
+            (np.asarray(surface.values)+0.01).astype("<f8").tofile(path)
+            changed_predictions = dataclasses.replace(task, profiler_predictions=
+                segmented_policy.ProfilerPredictionSurface(surface.inventory, path))
+            for changed in (changed_costs, changed_groups, changed_predictions):
+                with self.subTest(change=changed):
+                    cache.materialize(task)
+                    view = cache.materialize(changed)
+                    self.assertIsNot(view, initial)
+                    self.assertEqual(view, segmented_policy._materialize_compact_fold_costs(changed))
+                    self.assertEqual(cache.retained_view_count, 1)
+            cache.clear()
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_does_not_retain_mutable_prediction_maps(self) -> None:
+        """Diagnostic mappings remain live inputs rather than cached snapshots."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            values = dict(task.profiler_predictions)
+            mutable = dataclasses.replace(task, profiler_predictions=values)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            self.assertEqual(cache.retained_view_count, 1)
+            first = cache.materialize(mutable)
+            self.assertEqual(cache.retained_view_count, 0)
+            for point in values:
+                values[point] += 0.01
+            second = cache.materialize(mutable)
+            self.assertNotEqual(first, second)
+            self.assertEqual(second, segmented_policy._materialize_compact_fold_costs(mutable))
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_rejects_writable_and_rebound_storage(self) -> None:
+        """A surface object's identity cannot hide a changed backing array."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            cache = segmented_policy._CompactFoldCostViews()
+            first = cache.materialize(task)
+            surface = task.profiler_predictions
+            original = surface.values
+            path = Path(directory) / "rebound.f64"
+            (np.asarray(original) + 0.02).astype("<f8").tofile(path)
+            surface.values = np.memmap(path, mode="r", dtype="<f8")
+            second = cache.materialize(task)
+            self.assertNotEqual(first, second)
+            self.assertEqual(second,
+                             segmented_policy._materialize_compact_fold_costs(task))
+            surface.values = np.array(original)
+            with self.assertRaisesRegex(RuntimeError, "read-only predictions"):
+                cache.materialize(task)
+            self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_keeps_incomplete_teacher_fatal(self) -> None:
+        """A failed view must never be published as a retained partial tuple."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.CROSS_FITTED_TEACHER)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            values = np.array(task.profiler_predictions.values)
+            values[0] = np.nan
+            path = Path(directory) / "incomplete.f64"
+            values.tofile(path)
+            broken = dataclasses.replace(task, profiler_predictions=
+                segmented_policy.ProfilerPredictionSurface(
+                    task.profiler_predictions.inventory, path))
+            for _retry in range(2):
+                with self.assertRaisesRegex(RuntimeError, "teacher surface became incomplete"):
+                    cache.materialize(broken)
+                self.assertEqual(cache.retained_view_count, 0)
+
+    def test_compact_label_cache_clear_releases_source_owner(self) -> None:
+        """Clear retires the strong scope references as well as cached labels."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            surface = weakref.ref(task.profiler_predictions)
+            cache = segmented_policy._CompactFoldCostViews()
+            cache.materialize(task)
+            del task, tasks
+            self.assertIsNotNone(surface())
+            cache.clear()
+            self.assertIsNone(surface())
+
+    def test_accelerated_workers_own_separate_reusable_label_views(self) -> None:
+        """Real worker scheduling reuses each lane's cache and joins before clear."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = self._read_only_compact_fold_tasks(Path(directory))
+            task = next(t for t in tasks
+                        if t.profiler_influence == ProfilerInfluence.BOUNDED_PRIOR)
+            groups = tuple(((2 * i, task), (2 * i + 1, task)) for i in range(4))
+            scorers = [mock.Mock(), mock.Mock()]
+            spec = mock.Mock(label="device-free-label-lanes", lane_count=2)
+            spec.create_scorer.side_effect = scorers
+            connection = mock.Mock()
+            connection.recv.side_effect = [
+                ("task", i) for i in range(4)
+            ] + [("stop",), ("stop",)]
+            caches = {}
+            views = {}
+
+            def evaluate(task, primary_scorer=None, *, compact_cost_views=None):
+                """Exercise host view reuse without creating any GPU session."""
+
+                cache = caches.setdefault(primary_scorer, compact_cost_views)
+                self.assertIs(cache, compact_cost_views)
+                result = cache.materialize(task)
+                self.assertIs(views.setdefault(primary_scorer, result), result)
+                return "independently-evaluated"
+
+            with mock.patch.object(segmented_policy, "arm_policy_worker_parent_death_signal"), \
+                    mock.patch.object(segmented_policy, "_PARALLEL_ACCELERATED_CV_TASK_GROUPS", groups), \
+                    mock.patch.object(segmented_policy, "_evaluate_placement_fold", side_effect=evaluate):
+                segmented_policy._accelerated_worker(spec, "cv", connection, os.getpid())
+
+            messages = [call.args[0] for call in connection.send.call_args_list]
+            self.assertEqual(messages[0], ("ready", 2))
+            self.assertEqual(messages[-1], ("done",))
+            results = [message for message in messages if message[0] == "result"]
+            self.assertEqual(sorted(message[1] for message in results), list(range(4)))
+            self.assertFalse(any(message[0] == "error" for message in messages), messages)
+            self.assertEqual(len(caches), 2)
+            self.assertEqual(len({id(cache) for cache in caches.values()}), 2)
+            self.assertTrue(all(cache.retained_view_count == 0 for cache in caches.values()))
+            for scorer in scorers:
+                scorer.close.assert_called_once_with()
+            connection.close.assert_called_once_with()
+
+    def test_accelerated_worker_retires_partially_created_lanes(self) -> None:
+        """A later scorer-creation failure still releases every earlier owner."""
+
+        scorer = mock.Mock()
+        spec = mock.Mock(label="device-free-partial-lanes", lane_count=2)
+        spec.create_scorer.side_effect = [scorer, RuntimeError("second lane failed")]
+        connection = mock.Mock()
+        with mock.patch.object(segmented_policy, "arm_policy_worker_parent_death_signal"):
+            segmented_policy._accelerated_worker(spec, "cv", connection, os.getpid())
+        scorer.close.assert_called_once_with()
+        message = connection.send.call_args.args[0]
+        self.assertEqual(message[:2], ("error", spec.label))
+        self.assertIn("second lane failed", message[2])
+        connection.close.assert_called_once_with()
+
+    def test_compact_profiler_fold_tasks_share_candidate_storage(self) -> None:
+        """Tournament expansion must retain one candidate tuple per domain."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        prediction_cache = {
+            request_key: {point: 0.0 for point in points}
+            for request_key, points in _domain_profiler_prediction_requests(
+                domain,
+                costs,
+                seed="compact-profiler-storage-unit",
+            ).items()
+        }
+
+        tasks, _fold_count = _domain_fold_tasks(
+            domain,
+            costs,
+            max_leaves=8,
+            min_shape_groups_per_leaf=1,
+            seed="compact-profiler-storage-unit",
+            profiler_training_pool_key=pool_key,
+            profiler_prediction_cache=prediction_cache,
+            compact=True,
+        )
+
+        self.assertGreater(len(tasks), 1)
+        self.assertEqual(len({id(task.costs) for task in tasks}), 1)
+        self.assertEqual(tasks[0].costs, tuple(costs))
+        self.assertTrue(all(
+            task.profiler_predictions is None
+            or any(
+                task.profiler_predictions is surface
+                for surface in prediction_cache.values()
+            )
+            for task in tasks
+        ))
+
+    def test_profiler_fold_surfaces_include_held_teacher_points(self) -> None:
+        """A fold predicts held choices without admitting their timing labels."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        expected_points = frozenset(
+            (
+                cost.runtime_key,
+                cost.shape_group_id,
+                cost.candidate_id,
+            )
+            for cost in costs
+        )
+
+        requests = _domain_profiler_prediction_requests(
+            domain,
+            costs,
+            seed="profiler-teacher-inventory-unit",
+        )
+
+        self.assertTrue(requests)
+        self.assertTrue(all(
+            points == expected_points for points in requests.values()
+        ))
+        self.assertEqual(len({id(points) for points in requests.values()}), 1)
+
+    def test_profiler_teacher_distiller_cv_selects_real_tree_complexity(self) -> None:
+        """Teacher labels must train the runtime tree before held timing scores it."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        candidates = tuple(sorted({cost.candidate_id for cost in costs}))
+        split_n = 2048
+        split_costs = [
+            dataclasses.replace(
+                cost,
+                max_surface_regret=(
+                    0.0
+                    if (
+                        cost.runtime_key.aggregate_n == split_n
+                        or cost.candidate_id
+                        == candidates[cost.runtime_key.aggregate_n > split_n]
+                    )
+                    else 0.20
+                ),
+                p95_surface_regret=(
+                    0.0
+                    if (
+                        cost.runtime_key.aggregate_n == split_n
+                        or cost.candidate_id
+                        == candidates[cost.runtime_key.aggregate_n > split_n]
+                    )
+                    else 0.20
+                ),
+                mean_surface_regret=(
+                    0.0
+                    if (
+                        cost.runtime_key.aggregate_n == split_n
+                        or cost.candidate_id
+                        == candidates[cost.runtime_key.aggregate_n > split_n]
+                    )
+                    else 0.20
+                ),
+            )
+            for cost in costs
+        ]
+        prediction_cache = {}
+        for request_key, points in _domain_profiler_prediction_requests(
+            domain,
+            split_costs,
+            seed="profiler-teacher-choice-unit",
+        ).items():
+            prediction_cache[request_key] = {
+                point: (
+                    0.0
+                    if point[2]
+                    == candidates[point[0].aggregate_n > split_n]
+                    else 1.0
+                )
+                for point in points
+            }
+
+        tasks, fold_count = _domain_fold_tasks(
+            domain,
+            split_costs,
+            max_leaves=3,
+            min_shape_groups_per_leaf=1,
+            seed="profiler-teacher-choice-unit",
+            profiler_training_pool_key=pool_key,
+            profiler_prediction_cache=prediction_cache,
+        )
+        results = tuple(
+            _evaluate_placement_fold(task)
+            for task in tasks
+            if task[3].value == "continuous"
+            and task[5] == ProfilerInfluence.CROSS_FITTED_TEACHER
+        )
+        ranked = _rank_domain_cross_validations(
+            domain,
+            split_costs,
+            fold_count,
+            results,
+            max_leaves=3,
+        )
+
+        self.assertEqual(len(results), 2 * fold_count)
+        self.assertEqual(ranked[0].selected_max_leaves, 2)
+        self.assertEqual(
+            ranked[0].selected_profiler_influence,
+            ProfilerInfluence.CROSS_FITTED_TEACHER,
+        )
+        self.assertEqual(ranked[0].p95_regret, 0.0)
+        self.assertTrue(any(
+            selected.max_surface_regret >= P95_REGRET_BUDGET
+            for result in results
+            for selected, _exact in result.complexities[0].decisions
+        ))
+        self.assertTrue(any(
+            all(
+                selected.max_surface_regret == 0.0
+                for selected, _exact in result.complexities[1].decisions
+            )
+            for result in results
+        ))
+
+    def test_generic_fit_consumes_cross_fitted_teacher_results(self) -> None:
+        """Profiler fitting cannot silently omit teacher-distilled trees."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        ranked_influences = []
+
+        def rank_with_witness(*args, **kwargs):
+            fold_results = tuple(args[3])
+            ranked_influences.append({
+                result.profiler_influence for result in fold_results
+            })
+            return _rank_domain_cross_validations(
+                args[0],
+                args[1],
+                args[2],
+                fold_results,
+                **kwargs,
+            )
+
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "_profiler_teacher_surface_is_complete",
+            wraps=segmented_policy._profiler_teacher_surface_is_complete,
+        ) as teacher_totality, mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "_rank_domain_cross_validations",
+            side_effect=rank_with_witness,
+        ):
+            policy = fit_generic_policy(
+                corpus,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                policy_accelerators=(),
+                profiler_feature_catalog=catalog,
+                fit_final_rules=False,
+            )
+
+        self.assertTrue(policy.cross_validation)
+        self.assertGreater(teacher_totality.call_count, 0)
+        self.assertTrue(ranked_influences)
+        self.assertTrue(all(
+            ProfilerInfluence.CROSS_FITTED_TEACHER in influences
+            for influences in ranked_influences
+        ))
+
+    def test_one_cross_m_pool_parallelizes_independent_surfaces(self) -> None:
+        """One large transfer pool must not collapse fitting to one process."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        request_keys = _domain_profiler_prediction_request_keys(
+            domain,
+            costs,
+            seed="single-pool-parallel-unit",
+        )
+        self.assertGreaterEqual(len(request_keys), 4)
+
+        def capture(*args, **kwargs):
+            time.sleep(0.05)
+            return [
+                dataclasses.replace(
+                    cost,
+                    profiler_predicted_regret=float(os.getpid()),
+                )
+                for cost in args[0]
+            ]
+
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "apply_profiler_regret_predictions",
+            side_effect=capture,
+        ), mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_model_record_index",
+            return_value={"materialized": "once"},
+        ) as build_records:
+            prediction_cache = {}
+            workers = _populate_profiler_prediction_cache(
+                prediction_cache,
+                request_keys,
+                {pool_key: tuple(costs)},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=4,
+                surrogate_devices=("cpu",) * 4,
+            )
+
+        self.assertEqual(workers, 4)
+        build_records.assert_called_once()
+        worker_pids = {
+            prediction
+            for predictions in prediction_cache.values()
+            for prediction in predictions.values()
+            if prediction is not None
+        }
+        self.assertGreater(len(worker_pids), 1)
+
+    def test_parallel_profiler_workers_publish_their_own_cache_surfaces(
+        self,
+    ) -> None:
+        """The coordinator must not serialize every fitted surface itself."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        request_keys = _domain_profiler_prediction_request_keys(
+            domain,
+            costs,
+            seed="parallel-surface-publication-unit",
+        )
+        self.assertGreaterEqual(len(request_keys), 4)
+        parent_pid = os.getpid()
+        original_store = PolicyFitCache.store_profiler_predictions
+
+        def require_worker_publication(cache, *args, **kwargs):
+            if os.getpid() == parent_pid:
+                raise AssertionError(
+                    "profiler prediction surface was published by coordinator"
+                )
+            return original_store(cache, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            PolicyFitCache,
+            "store_profiler_predictions",
+            new=require_worker_publication,
+        ):
+            fit_cache = PolicyFitCache(Path(directory))
+            prediction_cache = {}
+            workers = _populate_profiler_prediction_cache(
+                prediction_cache,
+                request_keys,
+                {pool_key: tuple(costs)},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=4,
+                surrogate_devices=("cpu",) * 4,
+                fit_cache=fit_cache,
+                training_pool_digests={pool_key: "sha256:" + "3" * 64},
+                profiler_model_digests={pool_key: "sha256:" + "4" * 64},
+            )
+            surface_files = tuple(
+                (Path(directory) / "profiler-prediction-surface").glob(
+                    "*.json"
+                )
+            )
+            value_files = tuple(
+                (Path(directory) / "profiler-prediction-surface").glob(
+                    "*.f64"
+                )
+            )
+            for manifest_path in surface_files:
+                manifest = json.loads(manifest_path.read_text())
+                self.assertNotIn("predictions", manifest)
+                self.assertLess(manifest_path.stat().st_size, 4096)
+                values_path = manifest_path.with_suffix(".f64")
+                self.assertEqual(
+                    values_path.stat().st_size,
+                    8 * manifest["prediction_point_count"],
+                )
+
+        self.assertEqual(workers, 4)
+        self.assertEqual(set(prediction_cache), set(request_keys))
+        self.assertEqual(len(surface_files), len(request_keys))
+        self.assertEqual(len(value_files), len(request_keys))
+
+    def test_profiler_transfer_pool_is_generic_across_prefill_m(self) -> None:
+        """M is a learned numeric feature, not a transfer-pool boundary."""
+
+        corpus, _costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        other_m_domain = dataclasses.replace(domain, m=domain.m * 8)
+
+        self.assertEqual(
+            _profiler_transfer_key(other_m_domain),
+            _profiler_transfer_key(domain),
+        )
+        self.assertNotEqual(
+            _profiler_transfer_key(dataclasses.replace(
+                other_m_domain,
+                operation_kind=f"{domain.operation_kind}.other-regime",
+            )),
+            _profiler_transfer_key(domain),
+        )
+
+    def test_profiler_prediction_cache_is_worker_count_invariant(self) -> None:
+        """Worker scheduling cannot change deterministic learner predictions."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        base_pool_key = _profiler_transfer_key(domain)
+        pool_keys = tuple(
+            (*base_pool_key, f"unit-pool-{index}")
+            for index in range(4)
+        )
+        request_keys = tuple((pool_key, ()) for pool_key in pool_keys)
+        pools = {pool_key: tuple(costs) for pool_key in pool_keys}
+        observation_index = build_profiler_observation_index(corpus)
+        serial_cache = {}
+        parallel_cache = {}
+
+        with mock.patch(
+            "native_vnni_dispatch.profiler_model._fit_profiler_surrogate",
+            side_effect=deterministic_test_profiler_surrogate,
+        ):
+            serial_workers = _populate_profiler_prediction_cache(
+                serial_cache,
+                request_keys,
+                pools,
+                corpus,
+                catalog,
+                observation_index,
+                requested_workers=1,
+                surrogate_devices=("cpu",),
+            )
+            parallel_workers = _populate_profiler_prediction_cache(
+                parallel_cache,
+                request_keys,
+                pools,
+                corpus,
+                catalog,
+                observation_index,
+                requested_workers=4,
+                surrogate_devices=("cpu",) * 4,
+            )
+
+        self.assertEqual(serial_workers, 1)
+        self.assertEqual(parallel_workers, 4)
+        self.assertEqual(parallel_cache, serial_cache)
+
+    def test_profiler_prediction_surfaces_persist_compact_point_maps(self) -> None:
+        """A paid forest reloads without fitting or storing unrelated rows."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        request_key = _domain_profiler_prediction_request_keys(
+            domain,
+            costs,
+            seed="persistent-profiler-surface-unit",
+        )[0]
+        requested_points = frozenset({(
+            costs[0].runtime_key,
+            costs[0].shape_group_id,
+            costs[0].candidate_id,
+        )})
+        pool_digest = "sha256:" + "1" * 64
+        model_digest = "sha256:" + "2" * 64
+
+        def capture(prediction_costs, *_args, **_kwargs):
+            self.assertEqual(len(prediction_costs), 1)
+            return [
+                dataclasses.replace(
+                    prediction_costs[0],
+                    profiler_predicted_regret=0.125,
+                )
+            ]
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "apply_profiler_regret_predictions",
+            side_effect=capture,
+        ) as apply_predictions, mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_model_record_index",
+            return_value={"materialized": "once"},
+        ) as build_records:
+            fit_cache = PolicyFitCache(Path(directory))
+            first_cache = {}
+            first_workers = _populate_profiler_prediction_cache(
+                first_cache,
+                (request_key,),
+                {pool_key: tuple(costs)},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=1,
+                surrogate_devices=("cpu",),
+                prediction_points_by_request={
+                    request_key: requested_points,
+                },
+                fit_cache=fit_cache,
+                training_pool_digests={pool_key: pool_digest},
+                profiler_model_digests={pool_key: model_digest},
+            )
+            replay_cache = {}
+            replay_workers = _populate_profiler_prediction_cache(
+                replay_cache,
+                (request_key,),
+                {pool_key: tuple(costs)},
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+                requested_workers=1,
+                surrogate_devices=("cpu",),
+                prediction_points_by_request={
+                    request_key: requested_points,
+                },
+                fit_cache=fit_cache,
+                training_pool_digests={pool_key: pool_digest},
+                profiler_model_digests={pool_key: model_digest},
+            )
+
+            surface_files = tuple(
+                (Path(directory) / "profiler-prediction-surface").glob(
+                    "*.json"
+                )
+            )
+            value_files = tuple(
+                (Path(directory) / "profiler-prediction-surface").glob(
+                    "*.f64"
+                )
+            )
+            manifest = json.loads(surface_files[0].read_text())
+            self.assertNotIn("predictions", manifest)
+            self.assertEqual(manifest["prediction_point_count"], 1)
+            self.assertLess(surface_files[0].stat().st_size, 4096)
+            self.assertEqual(value_files[0].stat().st_size, 8)
+
+        self.assertEqual(first_workers, 1)
+        self.assertEqual(replay_workers, 0)
+        self.assertEqual(replay_cache, first_cache)
+        self.assertEqual(set(first_cache[request_key]), set(requested_points))
+        self.assertEqual(len(surface_files), 1)
+        self.assertEqual(len(value_files), 1)
+        apply_predictions.assert_called_once()
+        build_records.assert_called_once()
+
+    def test_generic_fit_reuses_surfaces_when_only_cv_is_missing(self) -> None:
+        """Incremental CV replay consumes its durable profiler surfaces."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        arguments = {
+            "max_leaves": 2,
+            "min_shape_groups_per_leaf": 1,
+            "policy_accelerators": (),
+            "profiler_feature_catalog": catalog,
+            "fit_final_rules": False,
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1",
+                "LLAMINAR_NATIVE_VNNI_PROFILER_MODEL_WORKERS": "1",
+            },
+        ):
+            fit_cache = PolicyFitCache(Path(directory))
+            baseline = fit_generic_policy(
+                corpus,
+                fit_cache=fit_cache,
+                **arguments,
+            )
+            surface_files = tuple(
+                (Path(directory) / "profiler-prediction-surface").glob(
+                    "*.json"
+                )
+            )
+            validation_files = tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )
+            self.assertTrue(surface_files)
+            self.assertTrue(validation_files)
+            for path in validation_files:
+                path.unlink()
+
+            with mock.patch(
+                "native_vnni_dispatch.segmented_policy."
+                "_fit_profiler_prediction_pool",
+                side_effect=AssertionError("profiler surface was rebuilt"),
+            ):
+                replay = fit_generic_policy(
+                    corpus,
+                    fit_cache=fit_cache,
+                    **arguments,
+                )
+
+        self.assertEqual(replay, baseline)
+
+    def test_profiler_cv_task_assembly_rejects_missing_surface(self) -> None:
+        """A serial hidden model fit cannot return to CV task construction."""
+
+        corpus, costs, *_unused = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        with self.assertRaisesRegex(RuntimeError, "was not completed"):
+            _domain_fold_tasks(
+                domain,
+                costs,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                seed="profiler-fold-unit",
+                profiler_training_pool_key=_profiler_transfer_key(domain),
+                profiler_prediction_cache={},
+            )
+
+    def test_profiler_pool_worker_rejects_foreign_request_key(self) -> None:
+        """A scheduler mismatch cannot train one pool under another identity."""
+
+        corpus, costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        pool_key = _profiler_transfer_key(domain)
+        foreign_key = (*pool_key, "foreign-unit-pool")
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_model_record_index",
+            return_value={},
+        ), self.assertRaisesRegex(ValueError, "different transfer pool"):
+            _fit_profiler_prediction_pool(
+                pool_key,
+                ((foreign_key, ()),),
+                tuple(costs),
+                corpus,
+                catalog,
+                build_profiler_observation_index(corpus),
+            )
+
+    def test_profiler_informed_catalog_drives_complete_generic_fit(self) -> None:
+        """The authenticated sidecar reaches both CV and final tree fitting."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        with mock.patch(
+            "native_vnni_dispatch.segmented_policy."
+            "build_profiler_observation_index",
+            wraps=build_profiler_observation_index,
+        ) as build_index:
+            policy = fit_generic_policy(
+                corpus,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                policy_accelerators=(),
+                profiler_feature_catalog=catalog,
+            )
+
+        build_index.assert_called_once_with(corpus)
+        self.assertTrue(policy.rules)
+        self.assertFalse(policy.unpromoted_domains)
+        self.assertEqual(len(policy.cross_validation), 1)
+        self.assertEqual(
+            policy.cross_validation[0].covered_point_count,
+            policy.cross_validation[0].required_point_count,
+        )
+
+    def test_profiler_cache_identity_ignores_unlaunchable_diagnostics(self) -> None:
+        """Unsupported route rows do not require physical counter evidence."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        exemplar = corpus.observations[0]
+        diagnostic_id = "cuda.nvnni.unit.unsupported-diagnostic"
+        diagnostic = dataclasses.replace(
+            exemplar,
+            candidate_id=diagnostic_id,
+            effective_candidate_id=diagnostic_id,
+            observed_candidate_id=diagnostic_id,
+            candidate_family="unit-unsupported",
+            supported=False,
+            forced_route_ok=False,
+        )
+        expanded = ObservationCorpus((*tuple(corpus), diagnostic))
+        rebound = catalog.rebind(expanded)
+
+        expected = fit_generic_policy(
+            corpus,
+            max_leaves=2,
+            min_shape_groups_per_leaf=1,
+            policy_accelerators=(),
+            profiler_feature_catalog=catalog,
+        )
+        actual = fit_generic_policy(
+            expanded,
+            max_leaves=2,
+            min_shape_groups_per_leaf=1,
+            policy_accelerators=(),
+            profiler_feature_catalog=rebound,
+        )
+
+        self.assertEqual(actual, expected)
+
+    def test_profiler_pool_change_invalidates_every_dependent_cv_domain(self) -> None:
+        """Adding one format retrains every M in its shared prefill pool."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        original_m = corpus.observations[0].m
+        other_m = 31 if original_m != 31 else 15
+        other_m_rows = tuple(
+            dataclasses.replace(
+                row,
+                m=other_m,
+                shape_group_id=f"other-m-{row.shape_group_id}",
+                shape_name=f"other-m-{row.shape_name}",
+            )
+            for row in corpus
+        )
+        baseline = ObservationCorpus((*tuple(corpus), *other_m_rows))
+        baseline_requests = build_profiler_request_manifest(baseline)
+        baseline_evidence = evidence_manifest(
+            baseline_requests,
+            tuple(
+                complete_evidence(
+                    request,
+                    dispatches=(cuda_dispatch(
+                        name=request.effective_candidate_id,
+                        metric_scale=(
+                            1.0
+                            if request.candidate_id.endswith(".cpt1")
+                            else 8.0
+                        ),
+                    ),),
+                )
+                for request in baseline_requests.requests
+            ),
+        )
+        baseline_catalog = build_profiler_feature_catalog(
+            baseline,
+            profiler_feature_rows(
+                baseline,
+                baseline_requests,
+                baseline_evidence,
+            ),
+            request_manifest_digest=baseline_requests.digest(),
+            evidence_manifest_digest=baseline_evidence.digest(),
+        )
+        q5_rows = []
+        for row in corpus:
+            base = cuda_observation(
+                source_format="Q5_0",
+                candidate_id=row.candidate_id,
+            )
+            q5_rows.append(dataclasses.replace(
+                base,
+                projection_n_vector=row.projection_n_vector,
+                aggregate_n=row.aggregate_n,
+                k=row.k,
+                aspect_ratio=row.aspect_ratio,
+                aspect_bucket=row.aspect_bucket,
+                work_items=row.work_items,
+                shape_group_id=f"q5-{row.shape_group_id}",
+                shape_name=f"q5-{row.shape_name}",
+                n_tail_class=row.n_tail_class,
+                k_tail_class=row.k_tail_class,
+                min_us=row.min_us + 1.0,
+                median_us=row.median_us + 1.0,
+                p95_us=row.p95_us + 1.0,
+            ))
+        extended = ObservationCorpus((*tuple(baseline), *q5_rows))
+        q5_corpus = ObservationCorpus(q5_rows)
+        q5_requests = build_profiler_request_manifest(q5_corpus)
+        q5_evidence = evidence_manifest(q5_requests, tuple(
+            complete_evidence(
+                request,
+                dispatches=(cuda_dispatch(
+                    name=request.effective_candidate_id,
+                    metric_scale=(
+                        1.0
+                        if request.candidate_id.endswith(".cpt1")
+                        else 8.0
+                    ),
+                ),),
+            )
+            for request in q5_requests.requests
+        ))
+        q5_feature_rows = profiler_feature_rows(
+            q5_corpus,
+            q5_requests,
+            q5_evidence,
+        )
+        q5_catalog = build_profiler_feature_catalog(
+            q5_corpus,
+            q5_feature_rows,
+            request_manifest_digest=q5_requests.digest(),
+            evidence_manifest_digest=q5_evidence.digest(),
+        )
+        extended_catalog = merge_profiler_feature_catalogs(
+            extended,
+            (baseline_catalog, q5_catalog),
+        )
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            fit_generic_policy(
+                baseline,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                policy_accelerators=(),
+                profiler_feature_catalog=baseline_catalog,
+                fit_final_rules=False,
+                fit_cache=cache,
+            )
+            evaluated = []
+            original = _domain_fold_tasks
+
+            def record_domain(domain, *args, **kwargs):
+                evaluated.append(domain)
+                return original(domain, *args, **kwargs)
+
+            with mock.patch(
+                "native_vnni_dispatch.segmented_policy._domain_fold_tasks",
+                side_effect=record_domain,
+            ):
+                fit_generic_policy(
+                    extended,
+                    max_leaves=2,
+                    min_shape_groups_per_leaf=1,
+                    policy_accelerators=(),
+                    profiler_feature_catalog=extended_catalog,
+                    fit_final_rules=False,
+                    fit_cache=cache,
+                )
+
+        self.assertEqual(
+            {
+                (domain.runtime_codebook_id, domain.m)
+                for domain in evaluated
+            },
+            {(0, original_m), (0, other_m), (6, original_m)},
+        )
+
+    def test_profiler_fit_cache_migrates_legacy_catalog_without_pool_key(self) -> None:
+        """A paid full-catalog CV fit migrates without any model recompute."""
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        domain = corpus.generic_domains()[0]
+        arguments = {
+            "max_leaves": 2,
+            "min_shape_groups_per_leaf": 1,
+            "cross_validation_seed": (
+                "native-vnni-development-cv-v9-cross-fitted-publication"
+            ),
+            "policy_accelerators": (),
+            "profiler_feature_catalog": catalog,
+            "fit_final_rules": False,
+        }
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            cache = PolicyFitCache(Path(directory))
+            baseline = fit_generic_policy(
+                corpus,
+                fit_cache=cache,
+                **arguments,
+            )
+            cost_files = tuple(
+                (Path(directory) / "candidate-costs").glob("*.json")
+            )
+            validation_files = tuple(
+                (Path(directory) / "domain-cross-validation").glob("*.json")
+            )
+            self.assertEqual(len(cost_files), 1)
+            self.assertEqual(len(validation_files), 1)
+
+            cost_key = cost_files[0].stem
+            current_validation_key = validation_files[0].stem
+            legacy_validation_key = cache.validation_key(
+                domain,
+                cost_key,
+                max_leaves=arguments["max_leaves"],
+                min_shape_groups_per_leaf=(
+                    arguments["min_shape_groups_per_leaf"]
+                ),
+                cross_validation_seed=arguments["cross_validation_seed"],
+                profiler_feature_catalog_digest=catalog.digest,
+                fit_final_rules=False,
+                profiler_training_pool_digest=None,
+            )
+            self.assertNotEqual(legacy_validation_key, current_validation_key)
+
+            validation_files[0].unlink()
+            cache.store_validation(
+                legacy_validation_key,
+                domain,
+                baseline.cross_validation[0],
+            )
+
+            with mock.patch.object(
+                PolicyFitCache,
+                "load_costs",
+                side_effect=AssertionError("legacy costs were deserialized"),
+            ), mock.patch(
+                "native_vnni_dispatch.segmented_policy."
+                "_fit_profiler_prediction_pool",
+                side_effect=AssertionError("profiler model was rebuilt"),
+            ), mock.patch(
+                "native_vnni_dispatch.segmented_policy."
+                "_evaluate_placement_fold",
+                side_effect=AssertionError("legacy CV was recomputed"),
+            ):
+                migrated = fit_generic_policy(
+                    corpus,
+                    fit_cache=cache,
+                    **arguments,
+                )
+
+            self.assertEqual(migrated, baseline)
+            self.assertTrue(
+                cache._path(
+                    "domain-cross-validation",
+                    current_validation_key,
+                ).exists()
+            )
+
+    def test_shape_resolved_formula_is_not_mislabeled_as_physical_launch(self) -> None:
+        """Both publication families must profile their physical witnesses."""
+
+        for family in ("kpar_formula", "fused_kpar_formula"):
+            with self.subTest(family=family):
+                self._assert_cuda_formula_is_not_physical(family)
+
+    def _assert_cuda_formula_is_not_physical(self, family: str) -> None:
+        """Reject a nominal recipe even when its other observation fields pass."""
+
+        observation = cuda_observation()
+        formula = next(
+            candidate
+            for candidate in cuda_native_vnni_gemv_registry().entries
+            if candidate.config_json.get("family") == family
+        )
+        projected = dataclasses.replace(
+            observation,
+            candidate_id=formula.candidate_id,
+            effective_candidate_id=formula.effective_candidate_id,
+            candidate_family=formula.candidate_family,
+            config_json=formula.config_json,
+            arithmetic_fingerprint=formula.arithmetic_fingerprint,
+            candidate_policy_hash=formula.candidate_policy_hash(),
+            observed_candidate_id=formula.effective_candidate_id,
+        )
+        projected.validate()
+
+        with self.assertRaisesRegex(ValueError, "not a physical profiler launch"):
+            profiler_request_for_observation(projected)
+
+    def test_cuda_formula_cost_resolves_catalog_without_projected_aliases(
+        self,
+    ) -> None:
+        """A cached formula cost must reproduce its projected profiler record."""
+
+        for family in ("kpar_formula", "fused_kpar_formula"):
+            with self.subTest(family=family):
+                self._assert_cuda_formula_cost_resolves_catalog(family)
+
+    def _assert_cuda_formula_cost_resolves_catalog(self, family: str) -> None:
+        """Projected and lazy joins must authenticate the same physical launch."""
+
+        formula = next(
+            candidate
+            for candidate in cuda_native_vnni_gemv_registry().entries
+            if candidate.config_json.get("family") == family
+        )
+        concrete_id = resolve_cuda_concrete_candidate_id(formula, 2048, 4096)
+        physical = cuda_observation(candidate_id=concrete_id)
+        physical_corpus = ObservationCorpus((physical,))
+        requests = build_profiler_request_manifest(physical_corpus)
+        evidence = evidence_manifest(requests, (
+            complete_evidence(requests.requests[0]),
+        ))
+        catalog = build_profiler_feature_catalog(
+            physical_corpus,
+            profiler_feature_rows(physical_corpus, requests, evidence),
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        projected = project_cuda_shape_resolved_candidates(physical_corpus)
+        formula_observation = next(
+            row for row in projected if row.candidate_id == formula.candidate_id
+        )
+        cost = CandidatePointCost(
+            runtime_key=projected.runtime_key_for(formula_observation),
+            shape_group_id=formula_observation.shape_group_id,
+            candidate_id=formula.candidate_id,
+            max_surface_regret=0.1,
+            p95_surface_regret=0.1,
+            mean_surface_regret=0.1,
+        )
+        observation_index = build_profiler_observation_index(projected)
+        expected = profiler_model._profiler_record_for_cost(
+            cost,
+            observation_index,
+            profiler_model._profiler_exemplar_index(observation_index),
+            catalog,
+        )
+        direct = profiler_model._profiler_record_for_cost(
+            cost,
+            {},
+            {},
+            catalog,
+        )
+
+        self.assertEqual(direct, expected)
+
+    def test_rocm_formula_reuses_clamped_physical_profiler_descriptor(self) -> None:
+        """A requested KB formula must consume its measured clamped launch."""
+
+        formula = rocm_native_vnni_decode_formula_registry().resolve(
+            "rocm.nvnni.decode.fast.clamped_formula.kb64"
+        )
+        concrete_id = resolve_rocm_concrete_candidate_id(formula, 256)
+        self.assertEqual(concrete_id, "rocm.nvnni.decode.fast.kb8")
+        physical = rocm_decode_observation(candidate_id=concrete_id, k=256)
+        physical_corpus = ObservationCorpus((physical,))
+        requests = build_profiler_request_manifest(physical_corpus)
+        evidence = evidence_manifest(requests, (
+            complete_evidence(
+                requests.requests[0],
+                dispatches=(rocm_dispatch(),),
+            ),
+        ))
+        catalog = build_profiler_feature_catalog(
+            physical_corpus,
+            profiler_feature_rows(physical_corpus, requests, evidence),
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+        )
+        projected = project_rocm_shape_resolved_candidates(physical_corpus)
+        formula_observation = next(
+            row for row in projected if row.candidate_id == formula.candidate_id
+        )
+
+        concrete_descriptor = catalog.descriptor_for(physical)
+        formula_descriptor = catalog.rebind(projected).descriptor_for(
+            formula_observation
+        )
+        self.assertIs(formula_descriptor, concrete_descriptor)
+        self.assertEqual(
+            formula_observation.effective_candidate_id,
+            physical.effective_candidate_id,
+        )
+        with self.assertRaisesRegex(ValueError, "not a physical profiler launch"):
+            profiler_request_for_observation(formula_observation)
+
+    def test_request_and_evidence_manifests_authenticate_round_trip(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        record = complete_evidence(requests.requests[0])
+        sidecar = evidence_manifest(requests, (record,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            request_path = Path(directory) / "requests.json"
+            evidence_path = Path(directory) / "evidence.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, sidecar)
+            loaded_requests = read_profiler_request_manifest(request_path)
+            loaded_evidence = read_profiler_evidence_manifest(evidence_path)
+
+        self.assertEqual(loaded_requests.digest(), requests.digest())
+        self.assertEqual(loaded_evidence.digest(), sidecar.digest())
+        report = validate_profiler_evidence_coverage(
+            loaded_requests, loaded_evidence
+        )
+        self.assertTrue(report.complete)
+        self.assertEqual(report.complete_count, 1)
+
+    def test_immutable_v1_evidence_remains_valid_for_offline_refitting(self) -> None:
+        """Collector upgrades must not force hardware-counter recollection."""
+
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        collector_version = "native-vnni-isolated-profiler-v1"
+        record = dataclasses.replace(
+            complete_evidence(requests.requests[0]),
+            collector_version=collector_version,
+        )
+        sidecar = ProfilerEvidenceManifest(
+            request_manifest_digest=requests.digest(),
+            corpus_digest=requests.corpus_digest,
+            candidate_registry_digest=requests.candidate_registry_digest,
+            evidence=(record,),
+            collector_version=collector_version,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-evidence.json"
+            write_profiler_evidence_manifest(path, sidecar)
+            loaded = read_profiler_evidence_manifest(path)
+
+        self.assertEqual(loaded.collector_version, collector_version)
+        self.assertEqual(loaded.digest(), sidecar.digest())
+        self.assertTrue(
+            validate_profiler_evidence_coverage(requests, loaded).complete
+        )
+
+    def test_immutable_v9_request_manifest_survives_v10_refitting(self) -> None:
+        """Reading old counters must preserve their authenticated request hash."""
+
+        current = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        legacy = ProfilerRequestManifest(
+            corpus_digest=current.corpus_digest,
+            candidate_registry_digest=current.candidate_registry_digest,
+            requests=current.requests,
+            schema_version=LEGACY_PROFILER_REQUEST_SCHEMA_VERSION,
+            learner_version="native-vnni-bounded-tree-beam-regret-v9",
+            feature_schema_version=(
+                "execution-mode-n-k-work-aspect-tile-occupancy-tree-v5"
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-requests.json"
+            write_profiler_request_manifest(path, legacy)
+            loaded = read_profiler_request_manifest(path)
+
+        self.assertEqual(loaded.digest(), legacy.digest())
+        self.assertEqual(loaded.learner_version, legacy.learner_version)
+        self.assertEqual(
+            loaded.feature_schema_version,
+            legacy.feature_schema_version,
+        )
+
+    def test_request_manifest_rejects_unreviewed_training_provenance(self) -> None:
+        """Compatible reuse remains an explicit allowlist, not a version bypass."""
+
+        current = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        with self.assertRaisesRegex(ValueError, "learner_version"):
+            dataclasses.replace(current, learner_version="unreviewed-learner")
+        with self.assertRaisesRegex(ValueError, "feature_schema_version"):
+            dataclasses.replace(
+                current,
+                feature_schema_version="unreviewed-feature-schema",
+            )
+
+    def test_profiler_catalog_rebinds_only_after_source_authentication(self) -> None:
+        """Schema projections reuse counters without weakening corpus binding."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        target = ObservationCorpus(tuple(
+            dataclasses.replace(row, corpus_id="sha256:projected-corpus")
+            for row in source
+        ))
+
+        with tempfile.TemporaryDirectory() as directory:
+            request_path = Path(directory) / "requests.json"
+            evidence_path = Path(directory) / "evidence.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, evidence)
+
+            with self.assertRaisesRegex(ValueError, "another timing corpus"):
+                load_profiler_feature_catalog(
+                    target,
+                    request_path,
+                    evidence_path,
+                )
+
+            rebound = load_profiler_feature_catalog(
+                target,
+                request_path,
+                evidence_path,
+                source_corpus=source,
+            )
+            self.assertEqual(rebound.corpus_digest, target.digest())
+            self.assertEqual(
+                len(rebound.descriptors),
+                len(requests.requests),
+            )
+
+            request_digests = {
+                request.observation_digest for request in requests.requests
+            }
+            witnesses = source.subset(
+                lambda row: row.digest() in request_digests
+            )
+            self.assertEqual(witnesses.digest(), source.digest())
+            witness_rebound = load_profiler_feature_catalog(
+                target,
+                request_path,
+                evidence_path,
+                source_corpus=witnesses,
+            )
+            self.assertEqual(witness_rebound.digest, rebound.digest)
+
+            incomplete_witnesses = ObservationCorpus(
+                witnesses.observations[:-1]
+            )
+            with self.assertRaisesRegex(ValueError, "exactly the request"):
+                load_profiler_feature_catalog(
+                    target,
+                    request_path,
+                    evidence_path,
+                    source_corpus=incomplete_witnesses,
+                )
+
+            candidate = cuda_native_vnni_gemv_registry().resolve(
+                "cuda.nvnni.decode.fast_m1.wide.tn256.cpt2"
+            )
+            unknown = dataclasses.replace(
+                next(iter(target)),
+                candidate_id=candidate.candidate_id,
+                effective_candidate_id=candidate.effective_candidate_id,
+                candidate_family=candidate.candidate_family,
+                config_json=candidate.config_json,
+                arithmetic_fingerprint=candidate.arithmetic_fingerprint,
+                candidate_policy_hash=candidate.candidate_policy_hash(),
+                ordered_reduction=candidate.ordered_reduction,
+                uses_atomic_reduction=candidate.uses_atomic_reduction,
+                observed_candidate_id=candidate.effective_candidate_id,
+            )
+            extended = load_profiler_feature_catalog(
+                ObservationCorpus((*target, unknown)),
+                request_path,
+                evidence_path,
+                source_corpus=source,
+            )
+            self.assertNotIn(
+                "profile.dispatch_count",
+                extended.descriptor_for(unknown).features,
+            )
+
+    def test_profiler_catalog_cache_reuses_only_identical_source_artifacts(self) -> None:
+        """Repeat fits bypass giant JSON parsing without weakening provenance."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_path = root / "requests.json"
+            evidence_path = root / "evidence.json"
+            observation_path = root / "observations.csv"
+            cache_path = root / "fit-cache" / "profiler-catalog.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, evidence)
+            write_observation_csv(observation_path, tuple(source))
+
+            first = load_profiler_feature_catalog(
+                source,
+                request_path,
+                evidence_path,
+                source_corpus=source,
+                cache_path=cache_path,
+            )
+            self.assertTrue(cache_path.is_file())
+            with mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_request_manifest",
+                side_effect=AssertionError("request JSON was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_evidence_manifest",
+                side_effect=AssertionError("evidence JSON was reparsed"),
+            ):
+                second = load_profiler_feature_catalog(
+                    source,
+                    request_path,
+                    evidence_path,
+                    source_corpus=source,
+                    cache_path=cache_path,
+                )
+            self.assertEqual(second.digest, first.digest)
+            self.assertEqual(second.model_digest, first.model_digest)
+            self.assertEqual(second.descriptors, first.descriptors)
+            with mock.patch(
+                "native_vnni_dispatch.profiler_model.read_observation_csv",
+                side_effect=AssertionError("observation CSV was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_request_manifest",
+                side_effect=AssertionError("request JSON was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_evidence_manifest",
+                side_effect=AssertionError("evidence JSON was reparsed"),
+            ):
+                lazy = load_profiler_feature_catalog(
+                    source,
+                    request_path,
+                    evidence_path,
+                    source_corpus_path=observation_path,
+                    cache_path=cache_path,
+                )
+            self.assertEqual(lazy.digest, first.digest)
+            self.assertEqual(lazy.descriptors, first.descriptors)
+
+            default_cache = evidence_path.with_name(
+                evidence_path.name + ".normalized-catalog-v2.jsonl"
+            )
+            derived = load_profiler_feature_catalog(
+                source,
+                request_path,
+                evidence_path,
+                source_corpus=source,
+            )
+            self.assertTrue(default_cache.is_file())
+            with mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_request_manifest",
+                side_effect=AssertionError("request JSON was reparsed"),
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_model.read_profiler_evidence_manifest",
+                side_effect=AssertionError("evidence JSON was reparsed"),
+            ):
+                reused_derived = load_profiler_feature_catalog(
+                    source,
+                    request_path,
+                    evidence_path,
+                    source_corpus=source,
+                )
+            self.assertEqual(reused_derived.digest, derived.digest)
+            self.assertEqual(reused_derived.descriptors, derived.descriptors)
+
+    def test_profiler_manifests_parallel_decode_matches_serial_order(self) -> None:
+        """Offline pools must preserve exact request and dispatch inventories."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_path = root / "requests.json"
+            evidence_path = root / "evidence.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, evidence)
+
+            self.assertIsNotNone(
+                profiler_evidence._read_canonical_manifest_document(
+                    request_path,
+                    "requests",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+            self.assertIsNotNone(
+                profiler_evidence._read_canonical_manifest_document(
+                    evidence_path,
+                    "evidence",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+
+            serial_requests = read_profiler_request_manifest(
+                request_path, workers=1, parallel_threshold=1
+            )
+            parallel_requests = read_profiler_request_manifest(
+                request_path, workers=2, parallel_threshold=1
+            )
+            serial_evidence = read_profiler_evidence_manifest(
+                evidence_path, workers=1, parallel_threshold=1
+            )
+            parallel_evidence = read_profiler_evidence_manifest(
+                evidence_path, workers=2, parallel_threshold=1
+            )
+
+        self.assertEqual(parallel_requests, serial_requests)
+        self.assertEqual(parallel_evidence, serial_evidence)
+        self.assertEqual(parallel_requests.digest(), requests.digest())
+        self.assertEqual(parallel_evidence.digest(), evidence.digest())
+
+    def test_legacy_pretty_evidence_parallel_decode_matches_canonical(self) -> None:
+        """Old indented evidence uses physical cores without changing identity."""
+
+        _source, _costs, _requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-evidence.json"
+            path.write_text(
+                json.dumps(
+                    evidence.canonical_mapping(),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertIsNone(
+                profiler_evidence._read_canonical_manifest_document(
+                    path,
+                    "evidence",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+            self.assertIsNotNone(
+                profiler_evidence._read_pretty_manifest_document(
+                    path,
+                    "evidence",
+                    workers=2,
+                    parallel_threshold=1,
+                )
+            )
+            decoded = read_profiler_evidence_manifest(
+                path,
+                workers=2,
+                parallel_threshold=1,
+            )
+
+        self.assertEqual(decoded, evidence)
+        self.assertEqual(decoded.digest(), evidence.digest())
+
+    def test_legacy_pretty_evidence_parallel_decode_rejects_tampering(self) -> None:
+        """Whitespace compatibility cannot weaken semantic authentication."""
+
+        _source, _costs, _requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-evidence.json"
+            encoded = json.dumps(
+                evidence.canonical_mapping(),
+                indent=2,
+                sort_keys=True,
+            ) + "\n"
+            needle = f'"profiler_pass_count": {evidence.evidence[0].profiler_pass_count}'
+            replacement = (
+                f'"profiler_pass_count": '
+                f'{evidence.evidence[0].profiler_pass_count + 1}'
+            )
+            self.assertIn(needle, encoded)
+            path.write_text(encoded.replace(needle, replacement, 1), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "digest does not match"):
+                read_profiler_evidence_manifest(
+                    path,
+                    workers=2,
+                    parallel_threshold=1,
+                )
+
+    def test_compact_witnesses_migrates_authenticated_pretty_evidence(self) -> None:
+        """One legacy decode leaves later fit phases on the mmap fast path."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation_path = root / "observations.csv"
+            request_path = root / "requests.json"
+            evidence_path = root / "legacy-evidence.json"
+            output_path = root / "witnesses.csv"
+            write_observation_csv(observation_path, source.observations)
+            write_profiler_request_manifest(request_path, requests)
+            evidence_path.write_text(
+                json.dumps(
+                    evidence.canonical_mapping(),
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_digest = evidence.digest()
+
+            result = profiler_evidence.main((
+                "compact-witnesses",
+                "--observation",
+                str(observation_path),
+                "--requests",
+                str(request_path),
+                "--evidence",
+                str(evidence_path),
+                "--output",
+                str(output_path),
+            ))
+
+            self.assertEqual(result, 0)
+            self.assertTrue(output_path.is_file())
+            self.assertTrue(evidence_path.read_bytes().startswith(b'{"'))
+            self.assertEqual(
+                read_profiler_evidence_manifest(evidence_path).digest(),
+                original_digest,
+            )
+
+    def test_observation_csv_parallel_parse_matches_serial_order(self) -> None:
+        """CSV byte partitions preserve every validated canonical row."""
+
+        observations = tuple(
+            dataclasses.replace(
+                cuda_observation(),
+                shape_group_id=f"parse-shape-{index}",
+                shape_name=f"parse-shape-{index}",
+            )
+            for index in range(8)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "observations.csv"
+            write_observation_csv(path, observations, workers=1)
+            serial = read_observation_rows(
+                (path,), workers=1, parallel_threshold_bytes=1
+            )
+            parallel = read_observation_rows(
+                (path,), workers=2, parallel_threshold_bytes=1
+            )
+
+        self.assertEqual(parallel, serial)
+        self.assertEqual(parallel, observations)
+
+    def test_profiler_catalog_parallel_normalization_matches_serial(self) -> None:
+        """Descriptor workers must preserve every normalized learner feature."""
+
+        source, _costs, requests, evidence, *_unused = profiler_model_fixture()
+        rows = profiler_feature_rows(source, requests, evidence)
+        serial = build_profiler_feature_catalog(
+            source,
+            rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+            workers=1,
+            parallel_threshold=1,
+        )
+        parallel = build_profiler_feature_catalog(
+            source,
+            rows,
+            request_manifest_digest=requests.digest(),
+            evidence_manifest_digest=evidence.digest(),
+            workers=2,
+            parallel_threshold=1,
+        )
+
+        self.assertEqual(parallel.descriptors, serial.descriptors)
+        self.assertEqual(parallel.digest, serial.digest)
+        self.assertEqual(parallel.model_digest, serial.model_digest)
+
+    def test_request_manifest_rejects_content_tampering(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            write_profiler_request_manifest(path, requests)
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["requests"][0]["k"] += 32
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "digest does not match"):
+                read_profiler_request_manifest(path)
+
+    def test_canonical_parallel_manifest_rejects_byte_tampering(self) -> None:
+        """The fast byte-authentication path cannot bypass the root digest."""
+
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "requests.json"
+            write_profiler_request_manifest(path, requests)
+            encoded = path.read_bytes()
+            needle = f'"k":{requests.requests[0].k}'.encode()
+            replacement = f'"k":{requests.requests[0].k + 1}'.encode()
+            self.assertEqual(len(needle), len(replacement))
+            self.assertIn(needle, encoded)
+            path.write_bytes(encoded.replace(needle, replacement, 1))
+
+            with self.assertRaisesRegex(ValueError, "digest does not match"):
+                read_profiler_request_manifest(
+                    path, workers=2, parallel_threshold=1
+                )
+
+    def test_multi_kernel_candidate_retains_ordered_dispatch_evidence(self) -> None:
+        observations = ObservationCorpus((cuda_observation(),))
+        requests = build_profiler_request_manifest(observations)
+        record = complete_evidence(
+            requests.requests[0],
+            dispatches=(
+                cuda_dispatch(0, "nativeVnniKPartProducer"),
+                cuda_dispatch(1, "nativeVnniOrderedReducer"),
+            ),
+        )
+        report = validate_profiler_evidence_coverage(
+            requests, evidence_manifest(requests, (record,))
+        )
+
+        self.assertTrue(report.complete)
+        self.assertEqual(len(record.dispatches), 2)
+
+        rows = profiler_feature_rows(
+            observations, requests, evidence_manifest(requests, (record,))
+        )
+        self.assertEqual([row.dispatch_index for row in rows], [0, 1])
+        self.assertEqual(rows[0].dispatch_count, 2)
+        self.assertEqual(rows[0].observation.median_us, 11.0)
+        self.assertEqual(rows[1].kernel_name, "nativeVnniOrderedReducer")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "features.csv"
+            write_profiler_feature_csv(
+                path,
+                observations,
+                requests,
+                evidence_manifest(requests, (record,)),
+            )
+            with path.open(newline="", encoding="utf-8") as handle:
+                exported = list(csv.DictReader(handle))
+
+        self.assertEqual(len(exported), 2)
+        self.assertEqual(exported[0]["median_us"], "11.0")
+        self.assertEqual(exported[0]["profiler.dispatch_count"], "2")
+        self.assertEqual(
+            exported[0]["profiler.kernel_name"], "nativeVnniKPartProducer"
+        )
+        self.assertEqual(
+            exported[0]["gpu.duration_ns.availability"], "measured"
+        )
+
+    def test_fused_cuda_profile_retains_one_physical_dispatch(self) -> None:
+        """Ordered arithmetic cannot invent a reducer or inherit another stream.
+
+        The legacy force_two_phase field authenticates arithmetic, not physical
+        launch count. Exercise the complete publication path with global and
+        CTA-local KPAR requests sharing that field and the exact partition tree.
+        """
+
+        for mode in (ExecutionMode.EAGER, ExecutionMode.GRAPH_CAPTURED):
+            for columns, partitions in (
+                (16, 1), (16, 6), (16, 64),
+                (32, 1), (32, 6), (32, 32),
+            ):
+                with self.subTest(mode=mode, columns=columns, partitions=partitions):
+                    global_row = dataclasses.replace(
+                        cuda_observation(candidate_id=(
+                            "cuda.nvnni.decode.fast_m1.kpar."
+                            f"tn32.cpt1.kb{partitions}"
+                        )),
+                        execution_mode=mode,
+                    )
+                    fused_row = dataclasses.replace(
+                        cuda_observation(candidate_id=(
+                            "cuda.nvnni.decode.fast_m1.fused_kpar."
+                            f"tn{columns}.cpt1.kb{partitions}"
+                        )),
+                        execution_mode=mode,
+                    )
+                    observations = ObservationCorpus((global_row, fused_row))
+                    requests = build_profiler_request_manifest(observations)
+                    by_family = {
+                        request.config_json["family"]: request
+                        for request in requests.requests
+                    }
+                    self.assertEqual(set(by_family), {"kpar", "fused_kpar"})
+                    global_request = by_family["kpar"]
+                    fused_request = by_family["fused_kpar"]
+                    self.assertEqual(
+                        global_request.arithmetic_fingerprint,
+                        fused_request.arithmetic_fingerprint,
+                    )
+                    for request in requests.requests:
+                        self.assertEqual(request.config_json["force_two_phase"], 1)
+                    self.assertNotIn(
+                        "ordered_kpart_partials", fused_request.prepared_resources
+                    )
+
+                    # Interleaved report records model independent streams in a
+                    # shared profiler process. Only the global stream owns the
+                    # reduction, irrespective of ordering in the raw report.
+                    fused_dispatch = dataclasses.replace(
+                        cuda_dispatch(1, "nativeVnniGemv_fusedKpar"),
+                        grid=((fused_row.aggregate_n + columns - 1) // columns, 1, 1),
+                        block=(columns, partitions, 1),
+                    )
+                    partitioned = _partition_cuda_batch_dispatches(
+                        (
+                            _NCUDispatchRecord(42, cuda_dispatch(0, "nativeVnniGemv_kpar")),
+                            _NCUDispatchRecord(77, fused_dispatch),
+                            _NCUDispatchRecord(42, cuda_dispatch(2, "nativeVnniGemv_reduce")),
+                        ),
+                        ((global_request.request_id, 42), (fused_request.request_id, 77)),
+                    )
+                    evidence = evidence_manifest(requests, tuple(
+                        complete_evidence(request, partitioned[request.request_id])
+                        for request in requests.requests
+                    ))
+                    self.assertTrue(validate_profiler_evidence_coverage(requests, evidence).complete)
+                    rows = profiler_feature_rows(observations, requests, evidence)
+                    for family, expected_count in (("kpar", 2), ("fused_kpar", 1)):
+                        selected = tuple(
+                            row for row in rows
+                            if row.observation.config_json["family"] == family
+                        )
+                        self.assertEqual(len(selected), expected_count)
+                        self.assertEqual(
+                            [row.dispatch_index for row in selected], list(range(expected_count))
+                        )
+                        self.assertTrue(all(row.dispatch_count == expected_count for row in selected))
+                        self.assertTrue(all(row.observation.median_us == 11.0 for row in selected))
+                        descriptor = profiler_model._profiler_candidate_descriptor(
+                            by_family[family].request_id, selected
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.dispatch_count"], math.log1p(expected_count)
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.compute_dispatch_count"], math.log1p(1)
+                        )
+                        self.assertEqual(
+                            descriptor.features["profile.reduction_dispatch_count"],
+                            math.log1p(expected_count - 1),
+                        )
+                        if family == "fused_kpar":
+                            self.assertEqual(
+                                descriptor.features["profile.block_threads.compute.0"],
+                                math.log1p(columns * partitions),
+                            )
+
+    def test_parallel_feature_export_is_byte_identical_to_serial(self) -> None:
+        """Ordered worker shards cannot change the canonical feature artifact."""
+
+        observations = ObservationCorpus((
+            cuda_observation(source_format="Q4_0"),
+            cuda_observation(source_format="Q5_0"),
+        ))
+        requests = build_profiler_request_manifest(observations)
+        evidence = evidence_manifest(
+            requests,
+            tuple(
+                complete_evidence(
+                    request,
+                    dispatches=(
+                        cuda_dispatch(0, "nativeVnniKPartProducer"),
+                        cuda_dispatch(1, "nativeVnniOrderedReducer"),
+                    ),
+                )
+                for request in requests.requests
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            serial = root / "serial.csv"
+            parallel = root / "parallel.csv"
+            direct = root / "direct.csv"
+            observation_path = root / "observations.csv"
+            request_path = root / "requests.json"
+            evidence_path = root / "evidence.json"
+            write_observation_csv(observation_path, tuple(observations))
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(evidence_path, evidence)
+            write_profiler_feature_csv(
+                serial,
+                observations,
+                requests,
+                evidence,
+                workers=1,
+            )
+            write_profiler_feature_csv(
+                parallel,
+                observations,
+                requests,
+                evidence,
+                workers=2,
+                parallel_threshold=1,
+            )
+            write_profiler_feature_csv_from_files(
+                direct,
+                (observation_path,),
+                request_path,
+                evidence_path,
+                workers=2,
+            )
+
+            self.assertEqual(parallel.read_bytes(), serial.read_bytes())
+            self.assertEqual(direct.read_bytes(), serial.read_bytes())
+
+    def test_parallel_observation_digests_preserve_order_and_worker_cap(self) -> None:
+        """Digest shards retain canonical row order across physical cores."""
+
+        observations = tuple(
+            dataclasses.replace(
+                cuda_observation(),
+                shape_group_id=f"digest-shape-{index}",
+                shape_name=f"digest-shape-{index}",
+            )
+            for index in range(4096)
+        )
+        expected = tuple(observation.digest() for observation in observations)
+        with mock.patch.object(
+            profiler_evidence,
+            "_physical_core_count",
+            return_value=2,
+        ):
+            workers = profiler_evidence._offline_worker_count(
+                len(observations),
+                environment_name="LLAMINAR_NATIVE_VNNI_IO_WORKERS",
+                records_per_worker=1,
+            )
+            actual = profiler_evidence._parallel_export_observation_digests(
+                observations,
+                workers=workers,
+            )
+
+        self.assertEqual(workers, 2)
+        self.assertEqual(actual, expected)
+
+    def test_feature_export_rejects_a_different_timing_corpus(self) -> None:
+        observations = ObservationCorpus((cuda_observation(),))
+        requests = build_profiler_request_manifest(observations)
+        record = complete_evidence(requests.requests[0])
+        changed = ObservationCorpus(
+            (dataclasses.replace(cuda_observation(), median_us=11.5),)
+        )
+
+        with self.assertRaisesRegex(ValueError, "another timing corpus"):
+            profiler_feature_rows(
+                changed, requests, evidence_manifest(requests, (record,))
+            )
+
+    def test_required_metric_cannot_be_silently_unavailable(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        dispatch = cuda_dispatch()
+        metrics = list(dispatch.metrics)
+        definition = next(
+            item for item in metric_definitions(Backend.CUDA) if item.required
+        )
+        index = next(
+            index
+            for index, metric in enumerate(metrics)
+            if metric.metric_id == definition.metric_id
+        )
+        metrics[index] = dataclasses.replace(
+            metrics[index],
+            availability=MetricAvailability.UNSUPPORTED_BY_TOOL,
+            value=None,
+            reason="unit tool omitted a required metric",
+        )
+        bad_dispatch = dataclasses.replace(dispatch, metrics=tuple(metrics))
+        bad_record = complete_evidence(
+            requests.requests[0], dispatches=(bad_dispatch,)
+        )
+
+        with self.assertRaisesRegex(ValueError, "required profiler metric"):
+            validate_profiler_evidence_coverage(
+                requests, evidence_manifest(requests, (bad_record,))
+            )
+
+    def test_optional_metric_unavailability_is_explicit_and_accepted(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        dispatch = cuda_dispatch()
+        metrics = list(dispatch.metrics)
+        definition = next(
+            item for item in metric_definitions(Backend.CUDA) if not item.required
+        )
+        index = next(
+            index
+            for index, metric in enumerate(metrics)
+            if metric.metric_id == definition.metric_id
+        )
+        metrics[index] = dataclasses.replace(
+            metrics[index],
+            availability=MetricAvailability.UNSUPPORTED_BY_TOOL,
+            value=None,
+            reason="counter is unavailable on this architecture",
+        )
+        record = complete_evidence(
+            requests.requests[0],
+            dispatches=(dataclasses.replace(dispatch, metrics=tuple(metrics)),),
+        )
+
+        report = validate_profiler_evidence_coverage(
+            requests, evidence_manifest(requests, (record,))
+        )
+        self.assertTrue(report.complete)
+
+    def test_tool_failure_is_visible_during_incremental_collection(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        request = requests.requests[0]
+        failure = ProfilerEvidence(
+            request_id=request.request_id,
+            observation_digest=request.observation_digest,
+            backend=request.backend,
+            status=ProfilerEvidenceStatus.TOOL_UNAVAILABLE,
+            status_reason="ncu is not installed",
+            profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+            profiler_tool_version="",
+            metric_set_version=PROFILER_METRIC_SET_VERSION,
+            collector_version=PROFILER_COLLECTOR_VERSION,
+            command_digest="",
+            raw_artifact_digest="",
+            profiler_pass_count=0,
+            target_launches_per_profiler_pass=1,
+            dispatches=(),
+        )
+        sidecar = evidence_manifest(requests, (failure,))
+
+        report = validate_profiler_evidence_coverage(
+            requests, sidecar, require_complete=False
+        )
+        self.assertFalse(report.complete)
+        self.assertEqual(report.failed_request_ids, (request.request_id,))
+        with self.assertRaisesRegex(ValueError, "coverage is incomplete"):
+            validate_profiler_evidence_coverage(requests, sidecar)
+
+    def test_unreachable_candidate_has_explicit_non_profile_state(self) -> None:
+        observation = cuda_observation(supported=False, forced_route_ok=False)
+        requests = build_profiler_request_manifest(ObservationCorpus((observation,)))
+        request = requests.requests[0]
+        self.assertFalse(request.profile_required)
+        unsupported = ProfilerEvidence(
+            request_id=request.request_id,
+            observation_digest=request.observation_digest,
+            backend=request.backend,
+            status=ProfilerEvidenceStatus.CANDIDATE_UNSUPPORTED,
+            status_reason="canonical timing row proved the forced route unreachable",
+            profiler_tool=EXPECTED_PROFILER_TOOL[request.backend],
+            profiler_tool_version="",
+            metric_set_version=PROFILER_METRIC_SET_VERSION,
+            collector_version=PROFILER_COLLECTOR_VERSION,
+            command_digest="",
+            raw_artifact_digest="",
+            profiler_pass_count=0,
+            target_launches_per_profiler_pass=1,
+            dispatches=(),
+        )
+
+        report = validate_profiler_evidence_coverage(
+            requests, evidence_manifest(requests, (unsupported,))
+        )
+        self.assertTrue(report.complete)
+        self.assertEqual(report.unsupported_count, 1)
+
+    def test_missing_candidate_evidence_blocks_complete_gate(self) -> None:
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        sidecar = evidence_manifest(requests, ())
+
+        report = validate_profiler_evidence_coverage(
+            requests, sidecar, require_complete=False
+        )
+        self.assertEqual(
+            report.missing_request_ids, (requests.requests[0].request_id,)
+        )
+        with self.assertRaisesRegex(ValueError, "coverage is incomplete"):
+            validate_profiler_evidence_coverage(requests, sidecar)
+
+    def test_profiler_checkpoint_journal_recovers_complete_prefix(self) -> None:
+        """A torn final append cannot discard earlier exact request records."""
+
+        requests = build_profiler_request_manifest(
+            ObservationCorpus((cuda_observation(),))
+        )
+        item = complete_evidence(requests.requests[0])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "evidence.json"
+            _append_checkpoint_journal(output, requests, (item,))
+            journal = Path(str(output) + ".inprogress.jsonl")
+            self.assertFalse(output.exists())
+            with journal.open("ab") as handle:
+                handle.write(b'{"record_type":"evidence"')
+
+            recovered = _load_incremental_evidence(
+                output, requests, resume=True
+            )
+
+            self.assertEqual(recovered[item.request_id], item)
+            self.assertTrue(journal.read_bytes().endswith(b"\n"))
+            manifest = _write_checkpoint(output, requests, recovered)
+            self.assertTrue(output.exists())
+            self.assertFalse(journal.exists())
+            self.assertEqual(manifest.evidence, (item,))
+
+    def test_profiler_checkpoint_parallel_resume_matches_serial(self) -> None:
+        """Line-aligned journal workers preserve deterministic evidence."""
+
+        observations = ObservationCorpus(tuple(
+            cuda_observation(candidate_id=candidate.candidate_id)
+            for candidate in cuda_native_vnni_gemv_registry().entries[:8]
+        ))
+        requests = build_profiler_request_manifest(observations)
+        items = tuple(
+            complete_evidence(request) for request in requests.requests
+        )
+        self.assertGreaterEqual(len(items), 3)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            serial_output = root / "serial.json"
+            parallel_output = root / "parallel.json"
+            _append_checkpoint_journal(serial_output, requests, items)
+            _append_checkpoint_journal(parallel_output, requests, items)
+
+            serial = _load_incremental_evidence(
+                serial_output,
+                requests,
+                resume=True,
+                workers=1,
+                parallel_threshold_bytes=1,
+            )
+            parallel = _load_incremental_evidence(
+                parallel_output,
+                requests,
+                resume=True,
+                workers=2,
+                parallel_threshold_bytes=1,
+            )
+
+        self.assertEqual(
+            {
+                request_id: evidence.canonical_mapping()
+                for request_id, evidence in parallel.items()
+            },
+            {
+                request_id: evidence.canonical_mapping()
+                for request_id, evidence in serial.items()
+            },
+        )
+
+    def test_interrupted_checkpoint_publishes_only_uncovered_terminal_records(
+        self,
+    ) -> None:
+        """Corpus regeneration preserves paid launches without rebinding them."""
+
+        observations = ObservationCorpus((
+            cuda_observation(),
+            cuda_observation(
+                candidate_id="cuda.nvnni.decode.fast_m1.wide.tn128.cpt2"
+            ),
+        ))
+        requests = build_profiler_request_manifest(observations)
+        paid_request = requests.requests[0]
+        paid_evidence = complete_evidence(paid_request)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_observations = root / "source.csv"
+            source_requests = root / "source.requests.json"
+            source_evidence = root / "source.evidence.json"
+            write_observation_csv(
+                source_observations,
+                observations.observations,
+            )
+            write_profiler_request_manifest(source_requests, requests)
+            _append_checkpoint_journal(
+                source_evidence,
+                requests,
+                (paid_evidence,),
+            )
+
+            recovered_observations = root / "recovered.csv"
+            recovered_requests = root / "recovered.requests.json"
+            recovered_evidence = root / "recovered.evidence.json"
+            report = recover_complete_checkpoint(
+                source_observations=source_observations,
+                source_requests=source_requests,
+                source_evidence=source_evidence,
+                covered_requests=(),
+                output_observations=recovered_observations,
+                output_requests=recovered_requests,
+                output_evidence=recovered_evidence,
+            )
+
+            self.assertEqual(report.source_record_count, 1)
+            self.assertEqual(report.terminal_record_count, 1)
+            self.assertEqual(report.covered_record_count, 0)
+            self.assertEqual(report.recovered_record_count, 1)
+            recovered_request_manifest = read_profiler_request_manifest(
+                recovered_requests
+            )
+            recovered_evidence_manifest = read_profiler_evidence_manifest(
+                recovered_evidence
+            )
+            self.assertEqual(
+                recovered_request_manifest.requests,
+                (paid_request,),
+            )
+            self.assertEqual(
+                recovered_evidence_manifest.evidence,
+                (paid_evidence,),
+            )
+            self.assertTrue(validate_profiler_evidence_coverage(
+                recovered_request_manifest,
+                recovered_evidence_manifest,
+            ).complete)
+
+            covered_observation = dataclasses.replace(
+                observations.observations[0],
+                run_id="profile-unit-regenerated-run",
+                corpus_id="sha256:profile-unit-regenerated-corpus",
+            )
+            covered_manifest = build_profiler_request_manifest(
+                ObservationCorpus((covered_observation,))
+            )
+            covered_path = root / "covered.requests.json"
+            write_profiler_request_manifest(covered_path, covered_manifest)
+            omitted = recover_complete_checkpoint(
+                source_observations=source_observations,
+                source_requests=source_requests,
+                source_evidence=source_evidence,
+                covered_requests=(covered_path,),
+                output_observations=root / "omitted.csv",
+                output_requests=root / "omitted.requests.json",
+                output_evidence=root / "omitted.evidence.json",
+            )
+            self.assertEqual(omitted.covered_record_count, 1)
+            self.assertEqual(omitted.recovered_record_count, 0)
+            self.assertFalse((root / "omitted.requests.json").exists())
+
+    def test_cuda_collector_environment_selects_exactly_one_surface(self) -> None:
+        request = profiler_request_for_observation(cuda_observation())
+        environment = _profile_environment(request, Path("/tmp/profile-unit"))
+
+        self.assertEqual(
+            environment["LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID"],
+            request.request_id,
+        )
+        self.assertEqual(
+            environment["LLAMINAR_CUDA_NVNNI_DECODE_CANDIDATES"],
+            request.effective_candidate_id,
+        )
+        self.assertEqual(environment["LLAMINAR_CUDA_NVNNI_DECODE_M"], "1")
+        self.assertEqual(
+            environment["LLAMINAR_CUDA_NVNNI_DECODE_EXECUTION_MODES"],
+            "graph_captured",
+        )
+        self.assertEqual(environment["LLAMINAR_CUDA_NVNNI_DECODE_MAX_CASES"], "1")
+
+    def test_profiler_command_preserves_explicit_noninteractive_sudo_prefix(self) -> None:
+        """Admin-only NVIDIA counters retain privilege in command provenance."""
+
+        options = CollectorOptions(
+            backend=Backend.CUDA,
+            binary=Path("/tmp/trainer"),
+            tool=Path("/usr/local/cuda/bin/ncu"),
+            raw_directory=Path("/tmp/raw"),
+            tool_command_prefix=("sudo", "-n", "-E"),
+        )
+
+        self.assertEqual(
+            _tool_command(options, "--version"),
+            ["sudo", "-n", "-E", "/usr/local/cuda/bin/ncu", "--version"],
+        )
+
+    def test_gpu_profiler_lane_placement_is_backend_specific(self) -> None:
+        """Concurrent CUDA and ROCm workers bind only their own device API."""
+
+        cuda_environment = {}
+        _apply_device_placement(cuda_environment, CollectorOptions(
+            backend=Backend.CUDA,
+            binary=Path("/tmp/cuda-trainer"),
+            tool=Path("/tmp/ncu"),
+            raw_directory=Path("/tmp/cuda-raw"),
+            device_ordinal=1,
+        ))
+        rocm_environment = {}
+        _apply_device_placement(rocm_environment, CollectorOptions(
+            backend=Backend.ROCM,
+            binary=Path("/tmp/rocm-trainer"),
+            tool=Path("/tmp/rocprofv3"),
+            raw_directory=Path("/tmp/rocm-raw"),
+            device_ordinal=3,
+        ))
+
+        self.assertEqual(cuda_environment["CUDA_VISIBLE_DEVICES"], "1")
+        self.assertNotIn("ROCR_VISIBLE_DEVICES", cuda_environment)
+        self.assertEqual(rocm_environment["ROCR_VISIBLE_DEVICES"], "3")
+        self.assertNotIn("CUDA_VISIBLE_DEVICES", rocm_environment)
+
+    def test_cpu_prefill_collector_selects_prefill_not_verifier_surface(self) -> None:
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.CPU,
+            operation_kind="NativeVNNIPrefillProjection",
+            m=64,
+            effective_candidate_id=(
+                "cpu.nvnni.prefill.two_row_tiles.nbc4.full_k"
+            ),
+            threading_or_stream_mode=(
+                "openmp:build=AVX512:requested=AVX512:"
+                "effective=AVX512:threads=28"
+            ),
+        )
+
+        environment = _profile_environment(request, Path("/tmp/profile-unit"))
+
+        self.assertEqual(
+            environment["LLAMINAR_CPU_NVNNI_PREFILL_CANDIDATES"],
+            request.effective_candidate_id,
+        )
+        self.assertEqual(environment["LLAMINAR_CPU_NVNNI_PREFILL_M"], "64")
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS", environment)
+
+    def test_cpu_decode_collector_selects_first_class_m1_surface(self) -> None:
+        """M=1 evidence must not run through the grouped-verifier trainer."""
+
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.CPU,
+            operation_kind="NativeVNNIFastM1Projection",
+            execution_mode=ExecutionMode.EAGER,
+            m=1,
+            effective_candidate_id="cpu.nvnni.decode.n_chunk_grid.nbc4",
+            threading_or_stream_mode=(
+                "openmp:build=AVX512:requested=AVX512:"
+                "effective=AVX512:threads=28"
+            ),
+        )
+
+        environment = _profile_environment(request, Path("/tmp/profile-unit"))
+
+        self.assertEqual(
+            environment["LLAMINAR_CPU_NVNNI_DECODE_CANDIDATES"],
+            request.effective_candidate_id,
+        )
+        self.assertEqual(environment["LLAMINAR_CPU_NVNNI_DECODE_M"], "1")
+        self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS", environment)
+        self.assertEqual(
+            _trainer_arguments(request),
+            ["--gtest_filter=*TrainerCsv_StrongDecode_AllFormats"],
+        )
+
+    def test_cpu_profiler_runs_direct_process_scoped_counter_harness(self) -> None:
+        """The collector never wraps an exact launch in system-wide perf."""
+
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.CPU,
+            effective_candidate_id="cpu.nvnni.verifier.pairwise",
+            threading_or_stream_mode=(
+                "openmp:build=AVX2:requested=AVX2:effective=AVX2:threads=1"
+            ),
+        )
+        rows = {
+            "cycles": 1000,
+            "ref-cycles": 900,
+            "instructions": 2500,
+            "task-clock": 1,
+            "wall-clock": 1,
+            "branches": 200,
+            "branch-misses": 3,
+            "cache-references": 50,
+            "cache-misses": 5,
+            "L1-dcache-loads": 400,
+            "L1-dcache-load-misses": 20,
+            "LLC-loads": 40,
+            "LLC-load-misses": 4,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            raw = Path(directory)
+            options = CollectorOptions(
+                backend=Backend.CPU,
+                binary=Path("/bin/true"),
+                tool=Path("/usr/bin/perf"),
+                raw_directory=raw,
+                cpu_list="0",
+            )
+
+            def run_perf(
+                command: list[str],
+                environment: dict[str, str],
+                *_args: object,
+                **_kwargs: object,
+            ) -> mock.Mock:
+                self.assertEqual(command[:3], ["taskset", "-c", "0"])
+                self.assertNotIn("stat", command)
+                self.assertEqual(
+                    environment["LLAMINAR_NATIVE_VNNI_PERF_STATS_PATH"],
+                    str(raw / "perf-stat.csv"),
+                )
+                (raw / "perf-stat.csv").write_text(
+                    "".join(
+                        f"{value};{'nsec' if event in {'task-clock', 'wall-clock'} else ''};"
+                        f"{event};1;100.00;;\n"
+                        for event, value in rows.items()
+                    ),
+                    encoding="utf-8",
+                )
+                return mock.Mock(returncode=0)
+
+            with mock.patch(
+                "native_vnni_dispatch.profiler_collectors._run_command",
+                side_effect=run_perf,
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_collectors.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout="perf version unit\n"),
+            ):
+                evidence = _collect_cpu(request, options, raw)
+
+            self.assertEqual(evidence.status, ProfilerEvidenceStatus.COMPLETE)
+            self.assertFalse(any(path.is_fifo() for path in raw.iterdir()))
+            self.assertTrue(all(path.is_file() for path in raw.iterdir()))
+
+    def test_cpu_profiler_batch_amortizes_setup_without_merging_points(self) -> None:
+        """Candidate/M members share a process but retain exact TSV outputs."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="batch-request-a",
+            backend=Backend.CPU,
+            operation_kind="NativeVNNIPrefillProjection",
+            execution_mode=ExecutionMode.EAGER,
+            m=64,
+            aggregate_n=2048,
+            projection_n_vector=(2048,),
+            k=512,
+            candidate_id="cpu.nvnni.prefill.row_chunk_grid.full_k",
+            effective_candidate_id=(
+                "cpu.nvnni.prefill.row_chunk_grid.full_k"
+            ),
+            threading_or_stream_mode=(
+                "openmp:build=AVX512:requested=AVX512:"
+                "effective=AVX512:threads=28"
+            ),
+        )
+        second = dataclasses.replace(
+            base,
+            request_id="batch-request-b",
+            observation_digest="sha256:" + "b" * 64,
+            candidate_id="cpu.nvnni.prefill.two_row_pair_grid.nbc4.full_k",
+            effective_candidate_id=(
+                "cpu.nvnni.prefill.two_row_pair_grid.nbc4.full_k"
+            ),
+            candidate_policy_hash="sha256:" + "c" * 64,
+        )
+        third = dataclasses.replace(
+            base,
+            request_id="batch-request-c",
+            observation_digest="sha256:" + "d" * 64,
+            m=256,
+        )
+        different_geometry = dataclasses.replace(
+            base,
+            request_id="batch-request-d",
+            observation_digest="sha256:" + "e" * 64,
+            aggregate_n=4096,
+            projection_n_vector=(4096,),
+        )
+
+        batches = _build_cpu_process_batches(
+            (base, second, third, different_geometry),
+            maximum_size=3,
+        )
+
+        self.assertEqual(sorted(len(batch.requests) for batch in batches), [1, 3])
+        shared = next(batch for batch in batches if len(batch.requests) == 3)
+        self.assertEqual(
+            {request.request_id for request in shared.requests},
+            {"batch-request-a", "batch-request-b", "batch-request-c"},
+        )
+        cell_packed = _build_cpu_process_batches(
+            (base, second, third), maximum_size=2
+        )
+        self.assertEqual(len(cell_packed), 2)
+        self.assertEqual(
+            [request.request_id for request in cell_packed[0].requests],
+            ["batch-request-a", "batch-request-b"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_directories = {}
+            for request in shared.requests:
+                raw = root / request.request_id
+                raw.mkdir()
+                raw_directories[request.request_id] = raw
+            plan = root / "requests.tsv"
+            digest = _write_cpu_batch_plan(plan, shared, raw_directories)
+            environment = _cpu_batch_environment(
+                shared, plan, digest, root / "batch"
+            )
+
+            self.assertEqual(len(plan.read_text(encoding="utf-8").splitlines()), 4)
+            self.assertEqual(
+                environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_DIGEST"],
+                digest,
+            )
+            self.assertNotIn(
+                "LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID", environment
+            )
+            self.assertNotIn(
+                "LLAMINAR_NATIVE_VNNI_PERF_STATS_PATH", environment
+            )
+            self.assertEqual(
+                environment["LLAMINAR_CPU_NVNNI_PREFILL_M"], "64,256"
+            )
+            self.assertEqual(
+                environment["LLAMINAR_CPU_NVNNI_PREFILL_MAX_CASES"], "2"
+            )
+
+    def test_cpu_profiler_default_batch_keeps_one_geometry_together(self) -> None:
+        """The turnkey default avoids a second packed-fixture preparation."""
+
+        args = build_profiler_collector_argument_parser().parse_args([
+            "--requests", "requests.json",
+            "--output", "evidence.json",
+            "--raw-directory", "raw",
+            "--backend", "cpu",
+        ])
+        self.assertEqual(args.cpu_process_batch_size, 1024)
+
+    def test_cuda_profiler_batches_keep_complete_cells_and_formats_separate(
+        self,
+    ) -> None:
+        """CUDA batching amortizes setup without splitting ordinary cells."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="cuda-batch-a",
+            execution_mode=ExecutionMode.EAGER,
+            shape_name="shape-a",
+            shape_group_id="shape-a",
+        )
+        second = dataclasses.replace(
+            base,
+            request_id="cuda-batch-b",
+            observation_digest="sha256:" + "b" * 64,
+            candidate_id="cuda.nvnni.decode.fast_m1.direct.tn64.cpt1",
+            effective_candidate_id=(
+                "cuda.nvnni.decode.fast_m1.direct.tn64.cpt1"
+            ),
+            candidate_policy_hash="sha256:" + "c" * 64,
+        )
+        later_cell = dataclasses.replace(
+            base,
+            request_id="cuda-batch-c",
+            observation_digest="sha256:" + "d" * 64,
+            shape_name="shape-b",
+            shape_group_id="shape-b",
+            aggregate_n=512,
+            projection_n_vector=(512,),
+        )
+        other_format = dataclasses.replace(
+            base,
+            request_id="cuda-batch-d",
+            observation_digest="sha256:" + "e" * 64,
+            source_format="Q8_0",
+            source_codebook_id=8,
+        )
+
+        batches = _build_gpu_process_batches(
+            (base, second, later_cell, other_format), maximum_size=3
+        )
+
+        self.assertEqual(sorted(len(batch.requests) for batch in batches), [1, 3])
+        packed = next(batch for batch in batches if len(batch.requests) == 3)
+        self.assertEqual(
+            {request.request_id for request in packed.requests},
+            {"cuda-batch-a", "cuda-batch-b", "cuda-batch-c"},
+        )
+        split = _build_gpu_process_batches(
+            (base, second, later_cell), maximum_size=2
+        )
+        self.assertEqual(
+            {request.request_id for request in split[0].requests},
+            {"cuda-batch-a", "cuda-batch-b"},
+        )
+
+    def test_cuda_profiler_batch_plan_is_exact_and_non_cartesian(self) -> None:
+        """The shared process environment remains subordinate to exact TSV rows."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="cuda-plan-a",
+            execution_mode=ExecutionMode.EAGER,
+            shape_name="shape-a",
+            shape_group_id="shape-a",
+        )
+        later = dataclasses.replace(
+            base,
+            request_id="cuda-plan-b",
+            observation_digest="sha256:" + "f" * 64,
+            shape_name="shape-b",
+            shape_group_id="shape-b",
+            aggregate_n=512,
+            projection_n_vector=(512,),
+        )
+        batch = _build_gpu_process_batches((base, later), 8)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_directories = {}
+            for request in batch.requests:
+                raw = root / request.request_id
+                raw.mkdir()
+                raw_directories[request.request_id] = raw
+            plan = root / "requests.tsv"
+            digest = _write_gpu_batch_plan(plan, batch, raw_directories)
+            environment = _cuda_batch_environment(
+                batch, plan, digest, root / "batch"
+            )
+            with plan.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+
+        self.assertEqual(
+            environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_DIGEST"], digest
+        )
+        self.assertNotIn(
+            "LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID", environment
+        )
+        self.assertEqual(
+            environment["LLAMINAR_CUDA_NVNNI_DECODE_SHAPES"],
+            "shape-a,shape-b",
+        )
+        self.assertEqual(
+            environment["LLAMINAR_CUDA_NVNNI_DECODE_MAX_CASES"], "2"
+        )
+        self.assertEqual(
+            [(row["request_id"], row["shape_name"]) for row in rows],
+            [("cuda-plan-a", "shape-a"), ("cuda-plan-b", "shape-b")],
+        )
+
+    def test_cuda_profiler_default_batch_amortizes_nsight_reports(self) -> None:
+        args = build_profiler_collector_argument_parser().parse_args([
+            "--requests", "requests.json",
+            "--output", "evidence.json",
+            "--raw-directory", "raw",
+            "--backend", "cuda",
+        ])
+        self.assertIsNone(args.gpu_process_batch_size)
+        self.assertEqual(
+            _resolve_gpu_process_batch_size(
+                Backend.CUDA,
+                args.gpu_process_batch_size,
+            ),
+            512,
+        )
+
+    def test_rocm_profiler_default_resets_before_corrupt_lifetime(self) -> None:
+        """ROCm defaults to the longest process lifetime proven stable."""
+
+        self.assertEqual(
+            _resolve_gpu_process_batch_size(Backend.ROCM, None),
+            256,
+        )
+
+    def test_rocm_profiler_rejects_unvalidated_process_lifetime(self) -> None:
+        """ROCm graph packet state must be reset at a process boundary."""
+
+        _validate_gpu_process_batch_size(Backend.ROCM, 256)
+        _validate_gpu_process_batch_size(Backend.CUDA, 4096)
+        with self.assertRaisesRegex(ValueError, "capped at 256 requests"):
+            _validate_gpu_process_batch_size(Backend.ROCM, 257)
+
+    def test_rocm_graph_only_resume_batches_reset_before_257th_graph(self) -> None:
+        """A graph-only retry cannot inherit the balanced corpus batch size."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.ROCM,
+            execution_mode=ExecutionMode.GRAPH_CAPTURED,
+            source_format="IQ1_M",
+            source_codebook_id=17,
+            runtime_codebook_id=17,
+            prepared_family_id="rocm:native-vnni:IQ1_M",
+            candidate_id="rocm.nvnni.decode.fast.kb1",
+            effective_candidate_id="rocm.nvnni.decode.fast.kb1",
+        )
+        requests = tuple(
+            dataclasses.replace(
+                base,
+                request_id=f"rocm-graph-{index}",
+                observation_digest="sha256:" + f"{index:064x}"[-64:],
+                shape_name=f"shape-{index // 64}",
+                shape_group_id=f"shape-{index // 64}",
+                candidate_id=f"rocm.nvnni.decode.fast.kb{index % 64 + 1}",
+                effective_candidate_id=(
+                    f"rocm.nvnni.decode.fast.kb{index % 64 + 1}"
+                ),
+            )
+            for index in range(300)
+        )
+
+        batches = _build_gpu_process_batches(
+            requests,
+            maximum_size=256,
+            maximum_graph_captured=256,
+        )
+
+        self.assertEqual(sorted(len(batch.requests) for batch in batches), [44, 256])
+        self.assertTrue(all(
+            sum(
+                request.execution_mode == ExecutionMode.GRAPH_CAPTURED
+                for request in batch.requests
+            ) <= 256
+            for batch in batches
+        ))
+
+    def test_cpu_profiler_batch_preserves_completed_members_after_later_failure(
+        self,
+    ) -> None:
+        """A failed later cell cannot erase an already published exact report."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="batch-salvage-a",
+            backend=Backend.CPU,
+            operation_kind="NativeVNNIPrefillProjection",
+            execution_mode=ExecutionMode.EAGER,
+            m=64,
+            aggregate_n=2048,
+            projection_n_vector=(2048,),
+            k=512,
+            candidate_id="cpu.nvnni.prefill.row_chunk_grid.full_k",
+            effective_candidate_id=(
+                "cpu.nvnni.prefill.row_chunk_grid.full_k"
+            ),
+            threading_or_stream_mode=(
+                "openmp:build=AVX2:requested=AVX2:"
+                "effective=AVX2:threads=1"
+            ),
+        )
+        later = dataclasses.replace(
+            base,
+            request_id="batch-salvage-b",
+            observation_digest="sha256:" + "7" * 64,
+            m=256,
+        )
+        batch = _build_cpu_process_batches((base, later), 2)[0]
+        counters = {
+            "cycles": 1000,
+            "ref-cycles": 900,
+            "instructions": 2500,
+            "task-clock": 1000,
+            "wall-clock": 1000,
+            "L1-dcache-loads": 400,
+            "L1-dcache-load-misses": 20,
+            "LLC-load-misses": 4,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            options = CollectorOptions(
+                backend=Backend.CPU,
+                binary=Path("/bin/true"),
+                cpu_avx2_binary=Path("/bin/true"),
+                tool=Path("/usr/bin/perf"),
+                raw_directory=root,
+                cpu_list="0",
+            )
+
+            def partial_batch(
+                _command: list[str],
+                environment: dict[str, str],
+                *_args: object,
+                **_kwargs: object,
+            ) -> mock.Mock:
+                with Path(
+                    environment["LLAMINAR_NATIVE_VNNI_PROFILE_BATCH_PATH"]
+                ).open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle, delimiter="\t"))
+                Path(rows[0]["output_path"]).write_text(
+                    "".join(
+                        f"{value};{'nsec' if event in {'task-clock', 'wall-clock'} else ''};"
+                        f"{event};1;100.0;;\n"
+                        for event, value in counters.items()
+                    ),
+                    encoding="utf-8",
+                )
+                line = (
+                    "[NativeVNNIProfiler][CPU_PREFILL] "
+                    f"request={rows[0]['request_id']} candidate=test "
+                    "format=Q4_K M=64 N=2048 K=512 launches=1\n"
+                )
+                return mock.Mock(returncode=1, stdout="", stderr=line)
+
+            with mock.patch(
+                "native_vnni_dispatch.profiler_collectors._run_command",
+                side_effect=partial_batch,
+            ), mock.patch(
+                "native_vnni_dispatch.profiler_collectors._tool_version",
+                return_value="perf unit",
+            ):
+                evidence = _collect_cpu_batch(batch, options)
+
+        self.assertEqual(
+            evidence["batch-salvage-a"].status,
+            ProfilerEvidenceStatus.COMPLETE,
+        )
+        self.assertEqual(
+            evidence["batch-salvage-b"].status,
+            ProfilerEvidenceStatus.LAUNCH_FAILED,
+        )
+
+    def test_linux_perf_parser_normalizes_one_controlled_region(self) -> None:
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.CPU,
+            effective_candidate_id="cpu.nvnni.verifier.pairwise",
+        )
+        rows = {
+            "cycles": (1000, ""),
+            "ref-cycles": (900, ""),
+            "instructions": (2500, ""),
+            "task-clock": (0.5, "msec"),
+            "wall-clock": (250000, "nsec"),
+            "branches": (200, ""),
+            "branch-misses": (3, ""),
+            "cache-references": (50, ""),
+            "cache-misses": (5, ""),
+            "L1-dcache-loads": (400, ""),
+            "L1-dcache-load-misses": (20, ""),
+            "LLC-loads": (40, ""),
+            "LLC-load-misses": (4, ""),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "perf.csv"
+            path.write_text(
+                "".join(
+                    f"{value};{unit};{event};1;100.00;;\n"
+                    for event, (value, unit) in rows.items()
+                ),
+                encoding="utf-8",
+            )
+            dispatches = parse_perf_stat(path, request)
+
+        metrics = {metric.metric_id: metric for metric in dispatches[0].metrics}
+        self.assertEqual(metrics["cpu.cycles"].value, 1000.0)
+        self.assertEqual(metrics["cpu.ref_cycles"].value, 900.0)
+        self.assertEqual(metrics["cpu.instructions"].value, 2500.0)
+        self.assertEqual(metrics["cpu.task_clock_ns"].value, 500000.0)
+        self.assertEqual(metrics["cpu.wall_clock_ns"].value, 250000.0)
+
+    def test_ncu_parser_retains_pipeline_dispatch_order_and_required_metrics(self) -> None:
+        request = profiler_request_for_observation(cuda_observation())
+        required_rows = (
+            ("gpu__time_duration.sum", "nsecond", "1200"),
+            ("launch__registers_per_thread", "register/thread", "48"),
+            ("launch__shared_mem_per_block_static", "byte/block", "0"),
+            ("launch__shared_mem_per_block_dynamic", "byte/block", "4096"),
+            ("sm__maximum_warps_per_active_cycle_pct", "%", "50"),
+            ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "42"),
+            ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", "71"),
+            ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "%", "36"),
+        )
+        header = (
+            '"ID","Kernel Name","Block Size","Grid Size","Metric Name",'
+            '"Metric Unit","Metric Value"\n'
+        )
+        body = ""
+        for identifier, kernel in ((0, "producer"), (1, "orderedReducer")):
+            for metric_name, unit, value in required_rows:
+                body += (
+                    f'"{identifier}","{kernel}","(128, 1, 1)",'
+                    f'"(16, 1, 1)","{metric_name}","{unit}","{value}"\n'
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ncu.csv"
+            path.write_text("==PROF== unit banner\n" + header + body, encoding="utf-8")
+            dispatches = parse_ncu_csv(path, request)
+
+        self.assertEqual(
+            [dispatch.kernel_name for dispatch in dispatches],
+            ["producer", "orderedReducer"],
+        )
+        self.assertEqual(dispatches[0].block, (128, 1, 1))
+        self.assertEqual(dispatches[0].grid, (16, 1, 1))
+
+    def test_ncu_resource_units_use_decimal_si_not_binary_iec(self) -> None:
+        """The real 0.896 Kbyte allocation is 896 bytes, never 917.504."""
+        for metric in ("gpu.static_shared_memory_bytes", "gpu.dynamic_shared_memory_bytes",
+                       "gpu.local_memory_bytes_per_thread"):
+            for unit, value, expected in (
+                ("Kbyte/block", 0.896, 896), ("Kbyte", 1.024, 1024),
+                ("Mbyte/thread", 0.032768, 32768), ("Gbyte", 1, 1e9),
+                ("byte/block", 896, 896), ("KB", 2, 2000),
+                ("KiB/block", 2, 2048), ("MiB", 1, 1048576),
+                ("GiB", 1, 1073741824),
+            ):
+                with self.subTest(metric=metric, unit=unit):
+                    self.assertEqual(_convert_ncu_value(metric, value, unit), expected)
+        self.assertEqual(_convert_ncu_value("gpu.duration_ns", 1.25, "us"), 1250)
+
+    def test_ncu_reparse_cannot_change_timing_or_dispatch_identity(self) -> None:
+        """Offline correction is limited to byte units, not new measurements."""
+        source = complete_evidence(profiler_request_for_observation(cuda_observation()))
+        original = source.dispatches[0]
+        for change in (dataclasses.replace(original, kernel_name="foreignKernel"),
+                       dataclasses.replace(original, grid=(32, 1, 1)),
+                       dataclasses.replace(original, metrics=tuple(
+                           dataclasses.replace(metric, value=metric.value + 1)
+                           if metric.metric_id == "gpu.duration_ns" else metric
+                           for metric in original.metrics))):
+            with self.subTest(change=change.kernel_name, grid=change.grid):
+                with self.assertRaisesRegex(ValueError, "identity|non-byte"):
+                    _unit_only_record(source, (change,))
+
+    def test_ncu_reparse_authenticated_batch_is_offline_and_source_preserving(self) -> None:
+        """Replay real CSV parsing and stream joining; no GPU/process is allowed."""
+        request = profiler_request_for_observation(cuda_observation())
+        requests = build_profiler_request_manifest(ObservationCorpus((cuda_observation(),)))
+        request = requests.requests[0]
+        old_version = "native-vnni-isolated-profiler-v7-rocm-exact-process-batches"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "raw"
+            member_dir = raw / request.request_id / "attempt-0001"
+            batch_dir = raw / "_cuda_process_batches" / "one" / "attempt-0001"
+            member_dir.mkdir(parents=True); batch_dir.mkdir(parents=True)
+            plan = _write_gpu_batch_plan(batch_dir / "requests.tsv",
+                _build_gpu_process_batches((request,), 8)[0], {request.request_id: member_dir})
+            metric_rows = (
+                ("gpu__time_duration.sum", "us", "1.25"),
+                ("launch__registers_per_thread", "register/thread", "40"),
+                ("launch__shared_mem_per_block_static", "byte/block", "0"),
+                ("launch__shared_mem_per_block_dynamic", "Kbyte/block", "0.896"),
+                ("sm__maximum_warps_per_active_cycle_pct", "%", "50"),
+                ("sm__warps_active.avg.pct_of_peak_sustained_active", "%", "42"),
+                ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", "71"),
+                ("gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed", "%", "36"),
+            )
+            csv_path = batch_dir / "ncu-raw.csv"
+            with csv_path.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(("ID", "Kernel Name", "Block Size", "Grid Size", "Stream",
+                                 "Metric Name", "Metric Unit", "Metric Value"))
+                for name, unit, value in metric_rows:
+                    writer.writerow((0, "nativeVnniUnit", "(128, 1, 1)", "(16, 1, 1)",
+                                     25, name, unit, value))
+            dispatch = parse_ncu_csv(csv_path, request)[0]
+            old_dispatch = dataclasses.replace(dispatch, metrics=tuple(
+                dataclasses.replace(metric, value=0.896 * 1024)
+                if metric.metric_id == "gpu.dynamic_shared_memory_bytes" else metric
+                for metric in dispatch.metrics))
+            (member_dir / "batch-member.json").write_text(json.dumps({
+                "request_id": request.request_id, "batch_plan_digest": plan,
+                "batch_raw_artifact_digest": _sha256_files(batch_dir),
+                "physical_dispatch_count": 1, "target_launches": 1,
+                "request_launch_order": 0, "stream_id": 25,
+            }))
+            record = dataclasses.replace(complete_evidence(request, (old_dispatch,)),
+                collector_version=old_version, raw_artifact_digest=_sha256_files(member_dir))
+            source = dataclasses.replace(evidence_manifest(requests, ()),
+                collector_version=old_version, evidence=(record,))
+            request_path, source_path, output = root/"requests.json", root/"source.json", root/"out.json"
+            write_profiler_request_manifest(request_path, requests)
+            write_profiler_evidence_manifest(source_path, source)
+            before = source_path.read_bytes()
+            with mock.patch("subprocess.run", side_effect=AssertionError("must remain offline")):
+                report = reparse_cuda_evidence(requests_path=request_path, source_path=source_path,
+                    raw_directory=raw, output_path=output, workers=1)
+            self.assertEqual(report.changed_metric_count, 1)
+            self.assertEqual(source_path.read_bytes(), before)
+            result = read_profiler_evidence_manifest(output).evidence[0]
+            self.assertEqual(result.dispatches, (dispatch,))
+            self.assertEqual(result.command_digest, record.command_digest)
+            self.assertEqual(result.raw_artifact_digest, record.raw_artifact_digest)
+            with self.assertRaisesRegex(ValueError, "new output"):
+                reparse_cuda_evidence(requests_path=request_path, source_path=source_path,
+                    raw_directory=raw, output_path=source_path, workers=1)
+            # Atomic promotion is explicit and idempotent; the original bytes
+            # remain available instead of being silently overwritten.
+            promoted = upgrade_cuda_evidence(requests_path=request_path,
+                source_path=source_path, raw_directory=raw, workers=1)
+            self.assertEqual(promoted.changed_metric_count, 1)
+            backup = Path(str(source_path) + ".before-ncu-si-units-v8.json")
+            self.assertEqual(backup.read_bytes(), before)
+            self.assertEqual(read_profiler_evidence_manifest(source_path).evidence[0], result)
+            self.assertIsNone(upgrade_cuda_evidence(requests_path=request_path,
+                source_path=source_path, raw_directory=raw, workers=1))
+            journal = Path(str(source_path) + ".inprogress.jsonl")
+            journal.write_text("live collector state must not be truncated\n")
+            with self.assertRaisesRegex(ValueError, "unfinished profiler journal"):
+                upgrade_cuda_evidence(requests_path=request_path,
+                    source_path=source_path, raw_directory=raw, workers=1)
+            csv_path.write_text(csv_path.read_text().replace('0.896', '0.897'))
+            with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                reparse_cuda_evidence(requests_path=request_path, source_path=backup,
+                    raw_directory=raw, output_path=root/"tampered.json", workers=1)
+
+    def test_ncu_parser_accepts_2025_wide_raw_metric_export(self) -> None:
+        """Nsight Compute 2025.3 emits one metric column per dispatch row."""
+
+        request = profiler_request_for_observation(cuda_observation())
+        metric_columns = (
+            "gpu__time_duration.sum",
+            "launch__registers_per_thread",
+            "launch__shared_mem_per_block_static",
+            "launch__shared_mem_per_block_dynamic",
+            "sm__maximum_warps_per_active_cycle_pct",
+            "sm__warps_active.avg.pct_of_peak_sustained_active",
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+        )
+        columns = (
+            "ID",
+            "Kernel Name",
+            "Block Size",
+            "Grid Size",
+            *metric_columns,
+        )
+        units = (
+            "",
+            "",
+            "",
+            "",
+            "us",
+            "register/thread",
+            "byte/block",
+            "byte/block",
+            "%",
+            "%",
+            "%",
+            "%",
+        )
+        values = ("3", "nativeVnni", "(128, 1, 1)", "(16, 1, 1)",
+                  "1.25", "40", "0", "1024", "50", "42", "71", "36")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ncu-wide.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(columns)
+                writer.writerow(units)
+                writer.writerow(values)
+            dispatches = parse_ncu_csv(path, request)
+
+        metrics = {metric.metric_id: metric for metric in dispatches[0].metrics}
+        self.assertEqual(dispatches[0].kernel_name, "nativeVnni")
+        self.assertEqual(metrics["gpu.duration_ns"].value, 1250.0)
+        self.assertEqual(metrics["gpu.registers_per_thread"].value, 40.0)
+        self.assertEqual(metrics["gpu.dram_throughput_pct_of_peak"].value, 36.0)
+
+    def test_cuda_batch_streams_partition_without_metric_pollution(self) -> None:
+        """Stable stream IDs assign only production kernels to each request."""
+
+        target = lambda index, name: ProfiledDispatch(
+            dispatch_index=index,
+            dispatch_kind=ProfiledDispatchKind.GPU_KERNEL,
+            kernel_name=name,
+            kernel_fingerprint=f"target-{index}",
+            grid=(8, 1, 1),
+            block=(128, 1, 1),
+            metrics=complete_metrics(Backend.CUDA),
+        )
+
+        partitioned = _partition_cuda_batch_dispatches(
+            (
+                _NCUDispatchRecord(42, target(0, "nativeVnniGemv-a")),
+                _NCUDispatchRecord(77, target(1, "nativeVnniGemv-b")),
+                _NCUDispatchRecord(77, target(2, "nativeVnniReduce-b")),
+            ),
+            (("request-a", 42), ("request-b", 77)),
+        )
+
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["request-a"]],
+            ["nativeVnniGemv-a"],
+        )
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["request-b"]],
+            ["nativeVnniGemv-b", "nativeVnniReduce-b"],
+        )
+        self.assertEqual(
+            [item.dispatch_index for item in partitioned["request-b"]],
+            [0, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "unclaimed CUDA stream"):
+            _partition_cuda_batch_dispatches(
+                (_NCUDispatchRecord(99, target(0, "nativeVnniGemv")),),
+                (("request-a", 42),),
+            )
+
+    def test_ncu_one_pass_compute_pipes_derive_peak_utilization(self) -> None:
+        """The bounded CUDA metric set keeps compute signal without replay bloat."""
+
+        request = profiler_request_for_observation(cuda_observation())
+        columns = (
+            "ID",
+            "Kernel Name",
+            "Block Size",
+            "Grid Size",
+            "gpu__time_duration.sum",
+            "launch__registers_per_thread",
+            "launch__shared_mem_per_block_static",
+            "launch__shared_mem_per_block_dynamic",
+            "launch__local_mem_per_thread",
+            "sm__maximum_warps_per_active_cycle_pct",
+            "sm__warps_active.avg.pct_of_peak_sustained_active",
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+            "smsp__inst_executed_pipe_alu.avg.pct_of_peak_sustained_elapsed",
+            "smsp__inst_executed_pipe_fma.avg.pct_of_peak_sustained_elapsed",
+            "smsp__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_elapsed",
+        )
+        units = (
+            "", "", "", "", "us", "register/thread", "byte/block",
+            "byte/block", "byte/thread", "%", "%", "%", "%", "%", "%",
+        )
+        values = (
+            "0", "nativeVnni", "(128, 1, 1)", "(16, 1, 1)",
+            "1.25", "40", "0", "1024", "0", "50", "42", "71",
+            "18", "7", "63",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ncu-one-pass.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(columns)
+                writer.writerow(units)
+                writer.writerow(values)
+            dispatches = parse_ncu_csv(path, request)
+
+        metrics = {metric.metric_id: metric for metric in dispatches[0].metrics}
+        self.assertEqual(
+            metrics["gpu.compute_throughput_pct_of_peak"].value, 63.0
+        )
+        self.assertEqual(metrics["gpu.alu_pipe_utilization_pct"].value, 18.0)
+        self.assertEqual(metrics["gpu.fma_pipe_utilization_pct"].value, 7.0)
+        self.assertEqual(metrics["gpu.tensor_pipe_utilization_pct"].value, 63.0)
+
+    def test_rocprof_parser_normalizes_static_resources_and_dynamic_counters(self) -> None:
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            backend=Backend.ROCM,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rocprof.csv"
+            path.write_text(
+                "KernelName,Index,wgr,arch_vgpr,sgpr,lds,scr,DurationNs,"
+                "GPUBusy,VALUBusy,MemUnitBusy,VALUInsts,FlatVMemInsts\n"
+                "nativeVnni,0,256,64,48,8192,0,2500,92,73,66,287,12.5\n",
+                encoding="utf-8",
+            )
+            dispatches = parse_rocprof_csvs((path,), request)
+
+        metrics = {metric.metric_id: metric for metric in dispatches[0].metrics}
+        self.assertEqual(metrics["gpu.vgpr_count"].value, 64.0)
+        self.assertEqual(metrics["gpu.sgpr_count"].value, 48.0)
+        self.assertEqual(metrics["gpu.gpu_busy_pct"].value, 92.0)
+        self.assertEqual(
+            metrics["gpu.valu_instructions_per_workitem"].value,
+            287.0,
+        )
+        self.assertEqual(
+            metrics["gpu.flat_vmem_instructions_per_workitem"].value,
+            12.5,
+        )
+        self.assertEqual(dispatches[0].block, (256, 1, 1))
+
+    def test_rocprof_counter_ranges_join_to_physical_trace_by_dispatch_order(self) -> None:
+        request = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="rocm-range-unit",
+            backend=Backend.ROCM,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace_dir = root / "trace"
+            counter_dir = root / "counters-0"
+            trace_dir.mkdir()
+            counter_dir.mkdir()
+            (trace_dir / "profile_kernel_trace.csv").write_text(
+                "Kernel_Name,Dispatch_Id,Start_Timestamp,End_Timestamp,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count,"
+                "Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,"
+                "Grid_Size_X,Grid_Size_Y,Grid_Size_Z\n"
+                "physicalQuantize,8,100,140,0,0,8,32,32,1,1,896,1,1\n"
+                "physicalGemm,9,150,250,4096,0,64,48,128,1,1,16,1,1\n",
+                encoding="utf-8",
+            )
+            counter_header = (
+                "Kernel_Name,Dispatch_Id,Counter_Name,Counter_Value,"
+                "Start_Timestamp,End_Timestamp,Workgroup_Size,Grid_Size,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count\n"
+            )
+            counter_rows = []
+            for dispatch_id, values in (
+                (16, {"GPUBusy": 90, "VALUBusy": 40, "MemUnitBusy": 25}),
+                (17, {"GPUBusy": 95, "VALUBusy": 70, "MemUnitBusy": 50}),
+            ):
+                for name, value in values.items():
+                    counter_rows.append(
+                        f"NativeVNNIProfile::rocm-range-unit,{dispatch_id},"
+                        f"{name},{value},100,200,64,896,0,0,20,48\n"
+                    )
+            (counter_dir / "profile_counter_collection.csv").write_text(
+                counter_header + "".join(counter_rows), encoding="utf-8"
+            )
+            dispatches = parse_rocprof_csvs(root.rglob("*.csv"), request)
+
+        self.assertEqual(
+            [dispatch.kernel_name for dispatch in dispatches],
+            ["physicalQuantize", "physicalGemm"],
+        )
+        first = {metric.metric_id: metric for metric in dispatches[0].metrics}
+        second = {metric.metric_id: metric for metric in dispatches[1].metrics}
+        self.assertEqual(first["gpu.gpu_busy_pct"].value, 90.0)
+        self.assertEqual(second["gpu.gpu_busy_pct"].value, 95.0)
+        self.assertEqual(second["gpu.vgpr_count"].value, 64.0)
+
+    def test_rocprof_batch_ranges_partition_every_counter_pass_exactly(self) -> None:
+        """Two differently sized pipelines cannot exchange ROCm counters."""
+
+        base = dataclasses.replace(
+            profiler_request_for_observation(cuda_observation()),
+            request_id="rocm-batch-a",
+            backend=Backend.ROCM,
+        )
+        second = dataclasses.replace(
+            base,
+            request_id="rocm-batch-b",
+            observation_digest="sha256:" + "9" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace_dir = root / "trace"
+            first_pass = root / "counters-0"
+            second_pass = root / "counters-1"
+            trace_dir.mkdir()
+            first_pass.mkdir()
+            second_pass.mkdir()
+            trace_header = (
+                "Kernel_Name,Dispatch_Id,Start_Timestamp,End_Timestamp,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count,"
+                "Workgroup_Size_X,Workgroup_Size_Y,Workgroup_Size_Z,"
+                "Grid_Size_X,Grid_Size_Y,Grid_Size_Z\n"
+            )
+            (trace_dir / "profile_kernel_trace.csv").write_text(
+                trace_header
+                + "physicalQuantizeA,1,100,120,0,0,8,24,64,1,1,32,1,1\n"
+                + "physicalComputeA,2,130,200,2048,0,40,48,256,1,1,8,1,1\n"
+                + "physicalQuantizeB,3,210,230,0,0,8,24,64,1,1,32,1,1\n"
+                + "physicalComputeB,4,240,330,4096,0,60,56,256,1,1,16,1,1\n"
+                + "physicalReduceB,5,340,370,0,0,20,32,128,1,1,4,1,1\n",
+                encoding="utf-8",
+            )
+            counter_header = (
+                "Kernel_Name,Dispatch_Id,Counter_Name,Counter_Value,"
+                "Start_Timestamp,End_Timestamp,Workgroup_Size,Grid_Size,"
+                "LDS_Block_Size,Scratch_Size,VGPR_Count,SGPR_Count\n"
+            )
+
+            def counter_pass(
+                metrics: tuple[tuple[str, tuple[float, ...]], ...]
+            ) -> str:
+                rows = []
+                aliases = (
+                    "rocm-batch-a",
+                    "rocm-batch-a",
+                    "rocm-batch-b",
+                    "rocm-batch-b",
+                    "rocm-batch-b",
+                )
+                for name, values in metrics:
+                    for dispatch_id, (request_id, value) in enumerate(
+                        zip(aliases, values), start=10
+                    ):
+                        rows.append(
+                            f"NativeVNNIProfile::{request_id},{dispatch_id},"
+                            f"{name},{value},100,200,64,896,0,0,20,48\n"
+                        )
+                return counter_header + "".join(rows)
+
+            (first_pass / "profile_counter_collection.csv").write_text(
+                counter_pass((
+                    ("GPUBusy", (11, 12, 21, 22, 23)),
+                    ("VALUBusy", (31, 32, 41, 42, 43)),
+                    ("MemUnitBusy", (51, 52, 61, 62, 63)),
+                )),
+                encoding="utf-8",
+            )
+            (second_pass / "profile_counter_collection.csv").write_text(
+                counter_pass(((
+                    "VALUInsts", (101, 102, 201, 202, 203)
+                ),)),
+                encoding="utf-8",
+            )
+            partitioned = parse_rocprof_batch_csvs(
+                root.rglob("*.csv"), (base, second)
+            )
+
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["rocm-batch-a"]],
+            ["physicalQuantizeA", "physicalComputeA"],
+        )
+        self.assertEqual(
+            [item.kernel_name for item in partitioned["rocm-batch-b"]],
+            ["physicalQuantizeB", "physicalComputeB", "physicalReduceB"],
+        )
+        self.assertEqual(
+            [item.dispatch_index for item in partitioned["rocm-batch-b"]],
+            [0, 1, 2],
+        )
+        first_compute = {
+            metric.metric_id: metric
+            for metric in partitioned["rocm-batch-a"][1].metrics
+        }
+        second_compute = {
+            metric.metric_id: metric
+            for metric in partitioned["rocm-batch-b"][1].metrics
+        }
+        self.assertEqual(first_compute["gpu.gpu_busy_pct"].value, 12.0)
+        self.assertEqual(
+            first_compute["gpu.valu_instructions_per_workitem"].value, 102.0
+        )
+        self.assertEqual(second_compute["gpu.gpu_busy_pct"].value, 22.0)
+        self.assertEqual(
+            second_compute["gpu.valu_instructions_per_workitem"].value, 202.0
+        )
+
+    def test_missing_profiler_tool_is_typed_evidence_not_silent_omission(self) -> None:
+        request = profiler_request_for_observation(cuda_observation())
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "trainer"
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binary.chmod(0o755)
+            result = collect_request(
+                request,
+                CollectorOptions(
+                    backend=Backend.CUDA,
+                    binary=binary,
+                    tool=Path(directory) / "missing-ncu",
+                    raw_directory=Path(directory) / "raw",
+                ),
+            )
+
+        self.assertEqual(result.status, ProfilerEvidenceStatus.TOOL_UNAVAILABLE)
+        self.assertIn("unavailable", result.status_reason or "")
+
+    def test_raw_profile_authenticates_the_actual_trainer_binary(self) -> None:
+        request = profiler_request_for_observation(cuda_observation())
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "trainer"
+            binary.write_bytes(b"unit-profiler-binary")
+            record = Path(directory) / "profiler-binary.json"
+
+            _write_binary_provenance(record, request, binary)
+            payload = json.loads(record.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["timing_build_id"], request.build_id)
+        self.assertEqual(
+            payload["candidate_policy_hash"], request.candidate_policy_hash
+        )
+        self.assertEqual(
+            payload["profiler_binary_digest"],
+            "sha256:c984df6010ad99eefdd2fee14a48d0d649d78029f26a2fddb0b2fbf86dd8f17e",
+        )
+
+
+def _flatten_test_suite(suite: unittest.TestSuite) -> list[unittest.TestCase]:
+    """Return every leaf test in deterministic unittest discovery order."""
+
+    leaves: list[unittest.TestCase] = []
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            leaves.extend(_flatten_test_suite(test))
+        else:
+            leaves.append(test)
+    return leaves
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    """Select one disjoint CTest shard without changing standalone execution.
+
+    The profiler-evidence regression module deliberately covers the complete
+    CPU/CUDA/ROCm evidence contract and therefore contains many focused tests.
+    CTest launches several copies with distinct shard indices so those tests can
+    run concurrently under the normal unit-test timeout. Running this file
+    directly leaves both variables unset and still executes the full suite.
+    """
+
+    del loader, pattern
+    shard_index_text = os.environ.get("LLAMINAR_UNIT_SHARD_INDEX")
+    shard_count_text = os.environ.get("LLAMINAR_UNIT_SHARD_COUNT")
+    if shard_index_text is None and shard_count_text is None:
+        return tests
+    if shard_index_text is None or shard_count_text is None:
+        raise ValueError(
+            "LLAMINAR_UNIT_SHARD_INDEX and LLAMINAR_UNIT_SHARD_COUNT must be set together"
+        )
+
+    try:
+        shard_index = int(shard_index_text)
+        shard_count = int(shard_count_text)
+    except ValueError as error:
+        raise ValueError("unit-test shard values must be integers") from error
+    if shard_count <= 0:
+        raise ValueError("LLAMINAR_UNIT_SHARD_COUNT must be positive")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError(
+            "LLAMINAR_UNIT_SHARD_INDEX must be in [0, LLAMINAR_UNIT_SHARD_COUNT)"
+        )
+
+    # Sorting by the fully qualified test id makes membership independent of
+    # Python dictionary ordering and unittest's internal suite nesting. A
+    # round-robin partition keeps shard cardinalities within one test.
+    leaves = sorted(_flatten_test_suite(tests), key=lambda test: test.id())
+    return unittest.TestSuite(
+        test
+        for ordinal, test in enumerate(leaves)
+        if ordinal % shard_count == shard_index
+    )
+
+
+if __name__ == "__main__":
+    unittest.main()

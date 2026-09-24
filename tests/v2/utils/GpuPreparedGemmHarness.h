@@ -13,11 +13,11 @@
  * (`CUDAQuantisedGemmKernel(weights, id)`) does not set this up correctly and
  * triggers illegal-memory-access faults under the modern workspace contract.
  *
- * This helper mirrors the real production path in `WeightManager.cpp`:
+ * This helper drives the real production path shared with `WeightManager.cpp`:
  *   1. Plan the weight in a per-device `WeightVRAMPool` (via `LoadOrchestrator`).
  *   2. Upload + GPU-repack the raw GGUF blocks into native-VNNI layout.
- *   3. Construct the quantized GEMM kernel from the pool slot device pointers,
- *      retaining the orchestrator as a lifetime owner (keeps the VRAM alive).
+ *   3. Bind the matrix through `KernelFactory::createGemmFromGPUWeightPool`,
+ *      which validates backend/region identity and retains the pool owner.
  *   4. Register the kernel handle in a `PreparedWeightStore` via
  *      `registerPreparedGemmHandle()` (the only un-guarded registration path).
  *
@@ -39,21 +39,90 @@
 
 #include "PreparedWeightTestHarness.h"
 
-#ifdef HAVE_CUDA
-#include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
-#include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
-#endif
-#ifdef HAVE_ROCM
-#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
-#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
-#endif
-
 #include <memory>
 #include <stdexcept>
 #include <string>
 
 namespace llaminar2::test
 {
+    /**
+     * @brief Return the raw GGUF byte count for a quantized tensor or 2D view.
+     *
+     * Some quantized expert views alias a slice of a 3D parent tensor and report
+     * `size_bytes()==0` because they do not own a separate raw buffer.  The
+     * production GPU loaders intentionally recover the byte count from the
+     * matrix geometry and codebook block size before staging those views.  The
+     * test harness must do the same so focused real-weight regressions exercise
+     * production-style GPU upload/repack instead of accidentally rejecting valid
+     * expert views during setup.
+     */
+    inline size_t quantizedRawBytesForGpuPreparedTest(const TensorBase &tensor)
+    {
+        const size_t reported = tensor.size_bytes();
+        if (reported > 0)
+            return reported;
+
+        const auto &shape = tensor.shape();
+        if (shape.size() != 2)
+            return 0;
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        auto bytes_for = [rows, cols](size_t block_size, size_t block_bytes) -> size_t
+        {
+            const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+            return rows * blocks_per_row * block_bytes;
+        };
+
+        switch (tensor.native_type())
+        {
+        case TensorType::IQ4_NL:
+            return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+        case TensorType::IQ4_XS:
+            return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
+        case TensorType::Q8_0:
+            return bytes_for(Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block));
+        case TensorType::Q8_1:
+            return bytes_for(Q8_1Block::BLOCK_SIZE, sizeof(Q8_1Block));
+        case TensorType::Q4_0:
+            return bytes_for(Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block));
+        case TensorType::Q4_1:
+            return bytes_for(Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block));
+        case TensorType::Q5_0:
+            return bytes_for(Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block));
+        case TensorType::Q5_1:
+            return bytes_for(Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block));
+        case TensorType::Q2_K:
+            return bytes_for(Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock));
+        case TensorType::Q3_K:
+            return bytes_for(Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock));
+        case TensorType::Q4_K:
+            return bytes_for(Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock));
+        case TensorType::Q5_K:
+            return bytes_for(Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock));
+        case TensorType::Q6_K:
+            return bytes_for(Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock));
+        case TensorType::Q8_K:
+            return bytes_for(Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock));
+        case TensorType::IQ2_XXS:
+            return bytes_for(IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock));
+        case TensorType::IQ2_XS:
+            return bytes_for(IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock));
+        case TensorType::IQ2_S:
+            return bytes_for(IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock));
+        case TensorType::IQ3_XXS:
+            return bytes_for(IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock));
+        case TensorType::IQ3_S:
+            return bytes_for(IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock));
+        case TensorType::IQ1_S:
+            return bytes_for(IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock));
+        case TensorType::IQ1_M:
+            return bytes_for(IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock));
+        default:
+            return 0;
+        }
+    }
+
     /**
      * @brief Owns all lifetime objects backing a GPU-prepared GEMM kernel.
      *
@@ -93,6 +162,29 @@ namespace llaminar2::test
     };
 
     /**
+     * @brief Own three production-prepared Q/K/V kernels in one model store.
+     *
+     * `FusedQKVGEMMStage` resolves all projections from one
+     * `PreparedWeightStore`; separate single-weight helpers do not represent
+     * that ownership graph. The retained load orchestrators own each VRAM pool
+     * until the stage and its prepared handles are destroyed.
+     */
+    struct GpuPreparedQKVFixture
+    {
+        std::vector<std::shared_ptr<LoadOrchestrator>> orchestrators; ///< VRAM lifetime owners.
+        std::unique_ptr<PreparedWeightStore> store;                   ///< Owns Q/K/V handles.
+        WeightBinding q_binding;
+        WeightBinding k_binding;
+        WeightBinding v_binding;
+        PreparedWeightRef q_ref;
+        PreparedWeightRef k_ref;
+        PreparedWeightRef v_ref;
+        ITensorGemm *q_kernel = nullptr; ///< Borrowed from store.
+        ITensorGemm *k_kernel = nullptr; ///< Borrowed from store.
+        ITensorGemm *v_kernel = nullptr; ///< Borrowed from store.
+    };
+
+    /**
      * @brief Register one quantized GPU GEMM into an existing prepared store.
      *
      * This is the multi-weight equivalent of `makeGpuPreparedGemm()`: it drives
@@ -128,7 +220,9 @@ namespace llaminar2::test
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());
-        const size_t raw_bytes = weights->size_bytes();
+        const size_t raw_bytes = quantizedRawBytesForGpuPreparedTest(*weights);
+        if (raw_bytes == 0)
+            throw std::runtime_error("registerGpuPreparedGemmInStore: could not determine quantized raw byte count");
 
         auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
         if (!repack_fmt)
@@ -141,7 +235,8 @@ namespace llaminar2::test
         if (!backend)
             throw std::runtime_error("registerGpuPreparedGemmInStore: no GPU backend available for device");
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         orchestrator->addDevice(device.ordinal);
         orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
@@ -161,48 +256,11 @@ namespace llaminar2::test
         orchestrator->addWeightJob(device.ordinal, job);
         orchestrator->load();
 
-        WeightVRAMPool *pool = orchestrator->getPool(device.ordinal);
-        if (!pool)
-            throw std::runtime_error("registerGpuPreparedGemmInStore: pool not found after load");
-        auto slot = pool->getSlot(canonical_name);
-        if (!slot)
-            throw std::runtime_error("registerGpuPreparedGemmInStore: weight slot missing after load");
-
-        const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
-        std::unique_ptr<ITensorGemm> kernel;
-        kf::KernelFactory::GemmPreparationKind prep_kind =
-            kf::KernelFactory::GemmPreparationKind::CPU_PACKED;
-
-#ifdef HAVE_CUDA
-        if (device.is_cuda())
-        {
-            kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                N, K, device.ordinal,
-                slot->d_native_vnni_payload,
-                static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                vnni->codebook_id, blocks_per_row,
-                orchestrator);
-            prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
-        }
-#endif
-#ifdef HAVE_ROCM
-        if (device.is_rocm())
-        {
-            kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                N, K, device.ordinal,
-                slot->d_native_vnni_payload,
-                slot->d_native_vnni_scales,
-                slot->d_native_vnni_mins,
-                slot->d_native_vnni_emins,
-                vnni->codebook_id, blocks_per_row,
-                orchestrator);
-            prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
-        }
-#endif
-        if (!kernel)
-            throw std::runtime_error("registerGpuPreparedGemmInStore: failed to construct GPU GEMM kernel");
+        auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(
+            *weights, device, orchestrator, canonical_name);
+        const auto prep_kind = device.is_cuda()
+            ? kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
+            : kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
 
         auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
         auto prepared_weights = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();
@@ -284,6 +342,56 @@ namespace llaminar2::test
     }
 
     /**
+     * @brief Build Q/K/V GPU GEMM refs through the production load pipeline.
+     * @param q Query projection source tensor.
+     * @param k Key projection source tensor.
+     * @param v Value projection source tensor.
+     * @param device Exact CUDA or ROCm endpoint.
+     * @param name_prefix Stable model-weight prefix for the three VRAM slots.
+     * @param model_id Model authority shared by all prepared bindings.
+     * @return One-store fixture suitable for `FusedQKVGEMMStage`.
+     */
+    inline GpuPreparedQKVFixture makeGpuPreparedQKVFixture(
+        TensorBase *q,
+        TensorBase *k,
+        TensorBase *v,
+        DeviceId device,
+        const std::string &name_prefix = "test.gpu_prepared_qkv",
+        ModelContextId model_id = ModelContextId{9900})
+    {
+        GpuPreparedQKVFixture fixture;
+        fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        fixture.q_ref = registerGpuPreparedGemmInStore(
+            q,
+            device,
+            name_prefix + ".q",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.q_binding,
+            &fixture.q_kernel);
+        fixture.k_ref = registerGpuPreparedGemmInStore(
+            k,
+            device,
+            name_prefix + ".k",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.k_binding,
+            &fixture.k_kernel);
+        fixture.v_ref = registerGpuPreparedGemmInStore(
+            v,
+            device,
+            name_prefix + ".v",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.v_binding,
+            &fixture.v_kernel);
+        return fixture;
+    }
+
+    /**
      * @brief Build a real GPU quantized GEMM kernel for @p weights on @p device.
      *
      * Uploads and VNNI-repacks the weight into a dedicated `WeightVRAMPool`, then
@@ -322,7 +430,9 @@ namespace llaminar2::test
 
         const int N = static_cast<int>(weights->rows());
         const int K = static_cast<int>(weights->cols());
-        const size_t raw_bytes = weights->size_bytes();
+        const size_t raw_bytes = quantizedRawBytesForGpuPreparedTest(*weights);
+        if (raw_bytes == 0)
+            throw std::runtime_error("makeGpuPreparedGemm: could not determine quantized raw byte count");
 
         // Resolve the GPU repack-kernel dispatch format from the codebook id.
         auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
@@ -342,7 +452,8 @@ namespace llaminar2::test
         // Step 2: Create the orchestrator + plan the single weight on its device pool.
         // The orchestrator owns the WeightVRAMPool; we retain it as the kernel's
         // lifetime owner so the VRAM payload outlives the kernel's execution.
-        out.orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        out.orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
@@ -364,49 +475,12 @@ namespace llaminar2::test
         out.orchestrator->addWeightJob(device.ordinal, job);
         out.orchestrator->load();
 
-        // Step 4: Fetch the VRAM slot and build the device GEMM kernel from its pointers.
-        WeightVRAMPool *pool = out.orchestrator->getPool(device.ordinal);
-        if (!pool)
-            throw std::runtime_error("makeGpuPreparedGemm: pool not found after load");
-        auto slot = pool->getSlot(canonical_name);
-        if (!slot)
-            throw std::runtime_error("makeGpuPreparedGemm: weight slot missing after load");
-
-        const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
-        std::unique_ptr<ITensorGemm> kernel;
-        kf::KernelFactory::GemmPreparationKind prep_kind =
-            kf::KernelFactory::GemmPreparationKind::CPU_PACKED;
-
-#ifdef HAVE_CUDA
-        if (device.is_cuda())
-        {
-            kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
-                N, K, device.ordinal,
-                slot->d_native_vnni_payload,
-                static_cast<uint16_t *>(slot->d_native_vnni_scales),
-                static_cast<uint16_t *>(slot->d_native_vnni_mins),
-                static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                vnni->codebook_id, blocks_per_row,
-                out.orchestrator); // lifetime owner: keeps VRAM pool alive
-            prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
-        }
-#endif
-#ifdef HAVE_ROCM
-        if (device.is_rocm())
-        {
-            kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
-                N, K, device.ordinal,
-                slot->d_native_vnni_payload,
-                slot->d_native_vnni_scales,
-                slot->d_native_vnni_mins,
-                slot->d_native_vnni_emins,
-                vnni->codebook_id, blocks_per_row,
-                out.orchestrator); // lifetime owner: keeps VRAM pool alive
-            prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
-        }
-#endif
-        if (!kernel)
-            throw std::runtime_error("makeGpuPreparedGemm: failed to construct GPU GEMM kernel");
+        // Step 4: Bind through exactly the same factory used by model loading.
+        auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(
+            *weights, device, out.orchestrator, canonical_name);
+        const auto prep_kind = device.is_cuda()
+            ? kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
+            : kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
 
         // Step 5: Wrap the kernel in a prepared handle and register it in the store.
         auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
@@ -475,7 +549,8 @@ namespace llaminar2::test
             throw std::runtime_error("makeGpuPreparedFloatingPointGemm: no GPU backend available for device");
 
         GpuPreparedGemm out;
-        out.orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        out.orchestrator = std::make_shared<LoadOrchestrator>(
+            backend, kTestOnlyUnadmittedGPUAllocation);
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planRawWeight(device.ordinal, canonical_name, N, K, raw_bytes);
 
@@ -493,40 +568,8 @@ namespace llaminar2::test
         out.orchestrator->addWeightJob(device.ordinal, job);
         out.orchestrator->load();
 
-        WeightVRAMPool *pool = out.orchestrator->getPool(device.ordinal);
-        if (!pool)
-            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: pool not found after load");
-        auto slot = pool->getSlot(canonical_name);
-        if (!slot)
-            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: weight slot missing after load");
-
-        std::unique_ptr<ITensorGemm> kernel;
-#ifdef HAVE_CUDA
-        if (device.is_cuda())
-        {
-            auto precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
-            if (type == TensorType::FP16)
-                precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
-            else if (type == TensorType::BF16)
-                precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
-            kernel = std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
-                slot->d_native_vnni_payload, N, K, device.ordinal, precision, out.orchestrator);
-        }
-#endif
-#ifdef HAVE_ROCM
-        if (device.is_rocm())
-        {
-            auto precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
-            if (type == TensorType::FP16)
-                precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
-            else if (type == TensorType::BF16)
-                precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
-            kernel = std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
-                slot->d_native_vnni_payload, N, K, device.ordinal, precision, out.orchestrator);
-        }
-#endif
-        if (!kernel)
-            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: failed to construct GPU FP GEMM kernel");
+        auto kernel = kf::KernelFactory::createGemmFromGPUWeightPool(
+            *weights, device, out.orchestrator, canonical_name);
 
         auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
         auto prepared_weights = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();

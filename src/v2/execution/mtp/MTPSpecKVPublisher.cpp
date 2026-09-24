@@ -73,10 +73,10 @@ namespace llaminar2
          * policy: once a transaction commits to main logical token count N,
          * depth d must expose N - (d + 1) rows.  Paths that cannot safely
          * publish the first shifted row must repair it before calling the
-         * publisher, or fail hard.  Keeping the host mirror on this same rule
-         * is especially important for device-resident publication, where the
-         * GPU metadata kernel already publishes this target and the host mirror
-         * is adopted later for planning and validation.
+         * publisher, or fail hard. GPU publication writes canonical device
+         * metadata directly; no host mirror is observed or adopted afterward.
+         * Host-side values in this plan describe the transaction being
+         * submitted, never a second authority over live cache state.
          */
         return std::max(0, plan.target_cached_tokens - shift);
     }
@@ -142,13 +142,10 @@ namespace llaminar2
             }
             if (!cache->truncateSequence(seq_idx, shifted_tokens, stream))
             {
-                const int current_tokens =
-                    cache->get_cached_tokens(cache->first_layer_index(), seq_idx);
                 std::ostringstream msg;
                 msg << "MTP spec KV publication failed truncating MTP KV depth "
                     << depth << " to " << shifted_tokens
-                    << " tokens (current=" << current_tokens
-                    << " base=" << plan.base_cached_tokens
+                    << " tokens (base=" << plan.base_cached_tokens
                     << " accepted=" << plan.accepted_count
                     << " target=" << plan.target_cached_tokens
                     << " reuse_initial_shifted_row="

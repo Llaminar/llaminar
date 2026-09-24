@@ -29,6 +29,88 @@ TEST_F(Test__CPURingKVCache, Construction_InitialState)
     EXPECT_EQ(cache.ring_size(0, 0), 0);
 }
 
+/**
+ * @brief Prove that a cache's committed/speculative role cannot drift at runtime.
+ *
+ * Main and shifted-MTP caches can have identical tensor geometry. The role and
+ * depth identity therefore has to be immutable after graph construction rather
+ * than inferred later from shape or whichever reset caller happens to run.
+ */
+TEST_F(Test__CPURingKVCache, StateOwnershipIsValidAndImmutableAfterBinding)
+{
+    CPURingKVCacheFP32 cache(
+        getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());
+
+    EXPECT_EQ(
+        cache.stateOwnership().role,
+        IKVCache::StateRole::Standalone);
+    EXPECT_EQ(cache.stateOwnership().mtp_depth, -1);
+
+    const IKVCache::StateOwnership shifted_owner{
+        .role = IKVCache::StateRole::MTPShiftedSidecar,
+        .mtp_depth = 3,
+    };
+    ASSERT_NO_THROW(cache.bindStateOwnership(shifted_owner));
+    ASSERT_NO_THROW(cache.bindStateOwnership(shifted_owner));
+    EXPECT_EQ(cache.stateOwnership(), shifted_owner);
+
+    EXPECT_THROW(
+        cache.bindStateOwnership({
+            .role = IKVCache::StateRole::CommittedMain,
+            .mtp_depth = -1,
+        }),
+        std::logic_error);
+    EXPECT_THROW(
+        cache.bindStateOwnership({
+            .role = IKVCache::StateRole::CommittedMain,
+            .mtp_depth = 0,
+        }),
+        std::invalid_argument);
+
+    CPURingKVCacheFP32 second_cache(
+        getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());
+    EXPECT_THROW(
+        second_cache.bindStateOwnership({
+            .role = IKVCache::StateRole::MTPShiftedSidecar,
+            .mtp_depth = -1,
+        }),
+        std::invalid_argument);
+}
+
+/**
+ * @brief Lock the CPU side of the reset ordering contract.
+ *
+ * CPU state changes synchronously and therefore reject GPU streams. Every
+ * reset also requires a diagnostic reason so unnamed lifecycle mutations
+ * cannot quietly spread through orchestration code.
+ */
+TEST_F(Test__CPURingKVCache, ResetRequiresNamedCPUOrderingContext)
+{
+    CPURingKVCacheFP32 cache(
+        getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());
+
+    EXPECT_FALSE(cache.resetRequestState({
+        .boundary = IKVCache::StateResetBoundary::RequestBoundary,
+        .execution_stream = nullptr,
+        .reason = nullptr,
+    }));
+    EXPECT_FALSE(cache.resetRequestState({
+        .boundary = IKVCache::StateResetBoundary::RequestBoundary,
+        .execution_stream = reinterpret_cast<void *>(1),
+        .reason = "invalid-cpu-stream",
+    }));
+    EXPECT_FALSE(cache.resetRequestState({
+        .boundary = IKVCache::StateResetBoundary::SequenceRetirement,
+        .execution_stream = nullptr,
+        .reason = "invalid-whole-cache-scope",
+    }));
+    EXPECT_TRUE(cache.resetRequestState({
+        .boundary = IKVCache::StateResetBoundary::RequestBoundary,
+        .execution_stream = nullptr,
+        .reason = "unit-request-boundary",
+    }));
+}
+
 TEST_F(Test__CPURingKVCache, AppendWithinCapacity_TracksRingState)
 {
     CPURingKVCacheFP32 cache(getTestMPIContext(), 1, 1, 4, 1, 2, DeviceId::cpu());
@@ -92,7 +174,7 @@ TEST_F(Test__CPURingKVCache, EvictOldest_AdvancesHead)
     EXPECT_EQ(cache.ring_head(0, 0), 2);
 }
 
-TEST_F(Test__CPURingKVCache, Clear_ResetsState)
+TEST_F(Test__CPURingKVCache, RequestReset_ResetsState)
 {
     CPURingKVCacheFP32 cache(getTestMPIContext(), 2, 2, 4, 1, 2, DeviceId::cpu());
 
@@ -104,7 +186,8 @@ TEST_F(Test__CPURingKVCache, Clear_ResetsState)
     ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 2));
     ASSERT_TRUE(cache.append_kv(1, 1, in_k.get(), in_v.get(), 2));
 
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_head(0, 0), 0);
@@ -303,8 +386,9 @@ TEST_F(Test__CPURingKVCache, WrapThenClear_ResetsFullState)
     ASSERT_TRUE(cache.append_kv(0, 0, in_k.get(), in_v.get(), 3));
     EXPECT_EQ(cache.ring_size(0, 0), 4); // Full, wrapped
 
-    // Clear resets everything including wrap warning state
-    cache.clear();
+    // Request reset covers every entry and the wrap-warning state.
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     EXPECT_EQ(cache.ring_size(0, 0), 0);
     EXPECT_EQ(cache.ring_head(0, 0), 0);
@@ -321,7 +405,7 @@ TEST_F(Test__CPURingKVCache, WrapThenClear_ResetsFullState)
     EXPECT_EQ(cache.ring_size(0, 0), 2);
     EXPECT_EQ(cache.ring_head(0, 0), 0);
 
-    // Verify data integrity after clear+refill
+    // Verify data integrity after request reset and refill.
     auto *k_cache = dynamic_cast<FP32Tensor *>(cache.get_k(0, 0));
     ASSERT_NE(k_cache, nullptr);
     const float *kc = k_cache->data();
@@ -358,8 +442,9 @@ TEST_F(Test__CPURingKVCache, MultipleWrapCycles_DataIntegrity)
         ASSERT_TRUE(cache.append_kv(0, 0, in2_k.get(), in2_v.get(), 2));
         EXPECT_EQ(cache.ring_size(0, 0), 3); // Capped at capacity
 
-        // Clear for next cycle
-        cache.clear();
+        // Cross an explicit fixture-reinitialization boundary for the next cycle.
+        ASSERT_TRUE(cache.resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
         EXPECT_EQ(cache.ring_size(0, 0), 0);
         EXPECT_EQ(cache.ring_head(0, 0), 0);
     }

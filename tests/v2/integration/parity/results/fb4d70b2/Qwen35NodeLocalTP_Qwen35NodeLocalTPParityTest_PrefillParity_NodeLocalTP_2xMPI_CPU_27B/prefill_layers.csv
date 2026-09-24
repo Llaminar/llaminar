@@ -1,0 +1,2 @@
+backend,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed
+NodeLocalTP_2xMPI_CPU_27B,EMBEDDING,0,,,,,,,,false

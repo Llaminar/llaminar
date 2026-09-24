@@ -4424,7 +4424,7 @@ bool rocmGemv_int8_int8_int32_vnni(
             kb = int8_kb_override;
         }
 
-        hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
+        (void)hipMemsetAsync(d_C_int32, 0, N * sizeof(int32_t), static_cast<hipStream_t>(stream));  // NOLINT(clang-diagnostic-unused-result)
 
         if (tn == TN_WIDE)
         {
@@ -4636,7 +4636,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
 
         if (kb_outer > 1 && beta == 0.0f && d_bias == nullptr)
         {
-            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
+            (void)hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
         }
         else if (beta != 0.0f || d_bias != nullptr)
         {
@@ -4808,7 +4808,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
 
         if (kb > 1 && beta == 0.0f && d_bias == nullptr)
         {
-            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
+            (void)hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
         }
         else if (beta != 0.0f || d_bias != nullptr)
         {
@@ -5454,7 +5454,7 @@ bool rocmGemv_fused_fp32_int8_vnni(
 
     // Zero output only if using atomicAdd accumulation across K-blocks
     if (kb > 1)
-        hipMemsetAsync(d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));
+        (void)hipMemsetAsync(d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(gemv_fused_fp32_int8_vnni_kernel_t<TN, CPT>),
@@ -5617,7 +5617,7 @@ bool rocmGemv_fused_scatter_fp32_int8_vnni(
             int k_per_block = (k_groups + kb - 1) / kb;
             int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
 
-            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+            (void)hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
                            static_cast<hipStream_t>(stream));
 
             hipLaunchKernelGGL(
@@ -5756,7 +5756,7 @@ bool rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
         if (grid_n < SELFREDUCE_GRID_N_THRESHOLD && d_counter)
         {
             // Self-reducing path: single kernel, last-to-arrive reduction
-            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+            (void)hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
                            static_cast<hipStream_t>(stream));
 
             hipLaunchKernelGGL(
@@ -5854,7 +5854,7 @@ bool rocmGemv_int8_scatter_vnni_blockwise(
             int act_blocks_per_block = (act_blocks + kb - 1) / kb;
             int valid_kb = (act_blocks + act_blocks_per_block - 1) / act_blocks_per_block;
 
-            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+            (void)hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
                            static_cast<hipStream_t>(stream));
 
             hipLaunchKernelGGL(
@@ -6239,7 +6239,8 @@ bool rocmGemv_repackVNNI_to_rowmajor(
  * @brief Entrypoint for INT8 VNNI prefill GEMM.
  *
  * This function dispatches to tiled INT8-x-INT8 GEMM kernels for M>1 prefill.
- * Returning false instructs the caller to keep using the CK fallback path.
+ * Returning false is terminal for the selected Q8/INT8 prefill path; the
+ * retired CK fallback path must not be revived implicitly.
  *
  * Junior-dev note:
  * - The decode path (M=1) already has specialized GEMV kernels.

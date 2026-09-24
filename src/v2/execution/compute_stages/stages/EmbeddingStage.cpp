@@ -1,11 +1,16 @@
 /**
  * @file EmbeddingStage.cpp
- * @brief Implementation of EmbeddingStage
+ * @brief Participant-local embedding execution and prepared-weight contracts.
+ *
+ * Quantized sources consume model-owned EmbedQ8 handles, while native floating
+ * sources use their raw resident storage. Wrappers are resolved through the
+ * unpacking interface's actual capability, never their C++ inheritance alone.
  */
 
 #include "EmbeddingStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -32,7 +37,7 @@ namespace llaminar2
             return true;
 
         // FP32 weights already resident on GPU do not need prepared embedding data.
-        if (!dynamic_cast<const IINT8Unpackable *>(embed_base))
+        if (!IINT8Unpackable::fromTensor(embed_base))
             return true;
 
         if (!params_.prepared_store || !params_.prepared_ref.has_value())
@@ -103,7 +108,7 @@ namespace llaminar2
 
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        LOG_DEBUG("[EmbeddingStage::getOrCreateKernel] Created "
+        LOG_TRACE("[EmbeddingStage::getOrCreateKernel] Created "
                   << (dev_type == DeviceType::CUDA   ? "CUDA"
                       : dev_type == DeviceType::ROCm ? "ROCm"
                                                      : "CPU")
@@ -124,7 +129,7 @@ namespace llaminar2
 
     bool EmbeddingStage::execute(IDeviceContext *ctx)
     {
-        LOG_DEBUG("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
+        LOG_TRACE("[EmbeddingStage] Execute: num_tokens=" << params_.num_tokens
                                                           << " d_model=" << params_.d_model
                                                           << " vocab_size=" << params_.vocab_size);
 
@@ -268,12 +273,7 @@ namespace llaminar2
         {
             auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
             if (output_base_tb)
-            {
-                output_base_tb->transitionToWithEvent(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                    params_.device_id,
-                    gpuStream());
-            }
+                gpuExecution().publish(output_base_tb);
         }
 
         // DEBUG: Log embedding output for parity debugging (guard expensive fp32_data() call)
@@ -536,12 +536,26 @@ namespace llaminar2
 
         auto contract = StageBufferContract::build()
                             .addOutput(*params_.output_buffer_id);
-        // Embedding table is a model weight, not arena-managed.
-        // On GPU, it is marked HOST_RESIDENT (MemoryResidency::HOST_RESIDENT)
-        // so ensureOnDevice() is a no-op — the kernel reads host data once
-        // to repack into a device workspace (EmbedQ8).
+        // Quantized GPU embeddings consume the PreparedWeightStore-owned
+        // EmbedQ8 allocation. Floating-point and CPU embeddings read the raw
+        // source tensor directly.
         if (params_.embed_table)
-            contract.addWeight(const_cast<ITensor *>(params_.embed_table));
+        {
+            auto *source = const_cast<ITensor *>(params_.embed_table);
+            const auto *base = dynamic_cast<const TensorBase *>(params_.embed_table);
+            if (params_.device_id.is_gpu() &&
+                IINT8Unpackable::fromTensor(base))
+            {
+                contract.addPreparedWeight(
+                    source,
+                    params_.prepared_store,
+                    params_.prepared_ref.value_or(PreparedWeightRef{}));
+            }
+            else
+            {
+                contract.addWeight(source);
+            }
+        }
         return contract;
     }
 

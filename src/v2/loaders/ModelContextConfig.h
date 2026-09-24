@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ModelPayloadAccessPattern.h"
 #include "WeightManager.h"
 #include "../utils/MPIContext.h"
 #include <memory>
@@ -44,8 +45,9 @@ namespace llaminar2
         std::shared_ptr<WeightPlacementMap> placement_map;
         TensorFactory *factory = nullptr;
         bool use_mmap = true;                  ///< Use mmap for file loading (false = ifstream fallback)
-        bool skip_mmap_cache_eviction = false; ///< Skip POSIX_FADV_DONTNEED in NUMA mmap (set when page cache pre-warmed)
-        bool target_is_gpu = false;            ///< Target device is GPU — skip NUMA mmap binding (weights go to VRAM anyway)
+        bool skip_mmap_cache_eviction = false; ///< Skip POSIX_FADV_DONTNEED after an explicit dense prewarm.
+        ModelPayloadAccessPattern payload_access_pattern =
+            ModelPayloadAccessPattern::DenseCpuResident; ///< Payload lifetime and mmap residency contract.
 
         // Factory Helpers
         static ModelContextConfig defaults();

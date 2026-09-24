@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 #include "v2/collective/backends/NCCLBackend.h"
+#include "v2/collective/backends/NCCLNetworkPolicy.h"
 #include "v2/collective/DeviceGroup.h"
 #include "v2/backends/DeviceId.h"
 
@@ -22,6 +23,37 @@
 
 namespace llaminar2::test
 {
+
+    // =========================================================================
+    // Network Policy Tests
+    // =========================================================================
+
+    TEST(Test__NCCLNetworkPolicy, LocalScopeSelectsSocketWithoutDisablingP2P)
+    {
+        const NCCLNetworkModule module =
+            selectNCCLNetworkModule(CollectiveScope::LOCAL);
+
+        EXPECT_EQ(module, NCCLNetworkModule::Socket);
+        EXPECT_EQ(ncclNetworkModuleName(module), "Socket");
+    }
+
+    TEST(Test__NCCLNetworkPolicy, GlobalScopePreservesAutomaticNetworkSelection)
+    {
+        const NCCLNetworkModule module =
+            selectNCCLNetworkModule(CollectiveScope::GLOBAL);
+
+        EXPECT_EQ(module, NCCLNetworkModule::Automatic);
+        EXPECT_TRUE(ncclNetworkModuleName(module).empty());
+    }
+
+    TEST(Test__NCCLNetworkPolicy, HybridScopePreservesAutomaticNetworkSelection)
+    {
+        const NCCLNetworkModule module =
+            selectNCCLNetworkModule(CollectiveScope::HYBRID);
+
+        EXPECT_EQ(module, NCCLNetworkModule::Automatic);
+        EXPECT_TRUE(ncclNetworkModuleName(module).empty());
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Test Fixture

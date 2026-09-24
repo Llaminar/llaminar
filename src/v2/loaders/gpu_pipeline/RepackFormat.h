@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "tensors/NativeVnniFormatInfo.h"
+
 namespace llaminar2 {
 
 /// Format identifiers for GPU repack kernel dispatch.
@@ -36,8 +38,60 @@ enum class RepackFormat : uint8_t {
     IQ1_S   = 16,  ///< IQ 1-bit (256-element super-blocks, 50 bytes)
     IQ1_M   = 17,  ///< IQ 1-bit (256-element super-blocks, 56 bytes)
     Q8_0    = 18,  ///< Symmetric 8-bit (32-element blocks, 34 bytes)
+    Q8_1    = 19,  ///< Symmetric 8-bit plus precomputed sum (32-element blocks, 36 bytes)
+    Q8_K    = 20,  ///< Raw signed 8-bit K-quant (256-element blocks, 288 bytes)
     RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
+
+/**
+ * @brief Return the compact payload bytes emitted for one 32-value block.
+ * @param format Source GGUF repack format.
+ * @return Positive payload width for quantized formats, otherwise zero.
+ *
+ * Persistent ExpertOverlay allocations may be wider than this live payload,
+ * but the repack kernel must still write a tightly packed execution matrix
+ * within each independently recyclable expert group.
+ */
+[[nodiscard]] inline constexpr int repackPayloadBytesPerBlock(
+    RepackFormat format) noexcept
+{
+    switch (format)
+    {
+    case RepackFormat::Q4_0:
+    case RepackFormat::IQ4_NL:
+    case RepackFormat::Q4_1:
+    case RepackFormat::Q4_K:
+    case RepackFormat::IQ4_XS:
+        return 16;
+    case RepackFormat::Q5_0:
+    case RepackFormat::Q5_1:
+    case RepackFormat::Q5_K:
+        return 20;
+    case RepackFormat::Q6_K:
+        return 24;
+    case RepackFormat::Q3_K:
+    case RepackFormat::IQ3_XXS:
+        return 12;
+    case RepackFormat::Q2_K:
+    case RepackFormat::IQ2_XXS:
+        return 8;
+    case RepackFormat::IQ3_S:
+        return 13;
+    case RepackFormat::IQ2_S:
+    case RepackFormat::IQ2_XS:
+        return 9;
+    case RepackFormat::IQ1_S:
+    case RepackFormat::IQ1_M:
+        return 6;
+    case RepackFormat::Q8_0:
+    case RepackFormat::Q8_1:
+    case RepackFormat::Q8_K:
+        return 32;
+    case RepackFormat::RAW_FP:
+        return 0;
+    }
+    return 0;
+}
 
 /// Function pointer types for backend-agnostic repack kernel dispatch.
 /// DeviceLoadPipeline stores these and calls through them without knowing
@@ -51,6 +105,10 @@ struct RepackKernels {
                                   uint16_t* d_mins,
                                   uint32_t* d_emins,
                                   int N, int K,
+                                  int output_N,
+                                  int output_row_offset,
+                                  int packed_group_rows,
+                                  int allocation_payload_bytes_per_block,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;
@@ -70,6 +128,7 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         case 6:  return RepackFormat::Q5_0;
         case 7:  return RepackFormat::Q5_1;
         case 19: return RepackFormat::Q8_0;
+        case 20: return RepackFormat::Q8_1;
         default: return std::nullopt;
         }
     } else {
@@ -87,6 +146,7 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         case 15: return RepackFormat::IQ2_XXS;
         case 16: return RepackFormat::IQ1_S;
         case 17: return RepackFormat::IQ1_M;
+        case 21: return RepackFormat::Q8_K;
         default: return std::nullopt;
         }
     }

@@ -78,6 +78,10 @@ namespace llaminar2::test
         EXPECT_EQ(info.l1_size, cpu_l1_cache_size());
         EXPECT_EQ(info.l2_size, cpu_l2_cache_size());
         EXPECT_EQ(info.l3_size, cpu_l3_cache_size());
+        EXPECT_EQ(info.l2_ways, cpu_l2_cache_associativity());
+        EXPECT_EQ(info.l3_ways, cpu_l3_cache_associativity());
+        EXPECT_GT(info.l2_ways, 0u);
+        EXPECT_GT(info.l3_ways, 0u);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -186,6 +190,22 @@ namespace llaminar2::test
         EXPECT_GT(strlen(summary), 0);
         EXPECT_NE(strstr(summary, "L1"), nullptr) << "Summary should mention L1";
         EXPECT_NE(strstr(summary, "L2"), nullptr) << "Summary should mention L2";
+        EXPECT_NE(strstr(summary, "way"), nullptr)
+            << "Summary should expose detected cache associativity";
+    }
+
+    /**
+     * @brief Keep diagnostic ISA names aligned with runtime dispatch policy.
+     *
+     * The startup banner and benchmark logs consume this helper.  Exercising
+     * explicit enum values avoids dependence on the host ISA and on the
+     * process-cached `LLAMINAR_ISA_LEVEL` override.
+     */
+    TEST_F(Test__CacheInfo, RuntimeISALevelNamesAreExplicit)
+    {
+        EXPECT_STREQ(isaLevelName(ISALevel::Scalar), "Scalar");
+        EXPECT_STREQ(isaLevelName(ISALevel::AVX2), "AVX2");
+        EXPECT_STREQ(isaLevelName(ISALevel::AVX512), "AVX-512");
     }
 
 } // namespace llaminar2::test

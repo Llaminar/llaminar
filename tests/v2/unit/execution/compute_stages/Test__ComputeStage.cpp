@@ -11,8 +11,10 @@
 #include "tensors/Tensors.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <numeric>
+#include <stdexcept>
 
 using namespace llaminar2;
 
@@ -715,6 +717,73 @@ TEST_F(ComputeStageTest, FactoryCreateRoPE)
     auto stage = ComputeStageFactory::createRoPE(params);
     ASSERT_NE(stage, nullptr);
     EXPECT_EQ(stage->type(), ComputeStageType::ROPE);
+}
+
+TEST_F(ComputeStageTest, KeyOnlyRoPEIsByteIdenticalToTheSameQueryRotation)
+{
+    constexpr int seq_len = 3;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int width = n_kv_heads * head_dim;
+    std::vector<float> input(static_cast<size_t>(seq_len) * width);
+    for (size_t i = 0; i < input.size(); ++i)
+        input[i] = std::sin(0.013f * static_cast<float>(i + 1));
+
+    auto reference = makeTensor(seq_len, width, input);
+    RoPEStage reference_stage({
+        .device_id = DeviceId::cpu(),
+        .Q = reference.get(),
+        .n_heads = n_kv_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = 23,
+        .theta_base = 1000000.0f,
+        .seq_len = seq_len,
+    });
+    ASSERT_TRUE(reference_stage.execute(ctx_.get()));
+
+    auto key = makeTensor(seq_len, width, input);
+    auto key_stage = ComputeStageFactory::createKeyOnlyRoPE({
+        .device_id = DeviceId::cpu(),
+        .K = key.get(),
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = 23,
+        .theta_base = 1000000.0f,
+        .seq_len = seq_len,
+        .k_buffer_id = BufferId::K_PROJ,
+    });
+    ASSERT_NE(key_stage, nullptr);
+    ASSERT_TRUE(key_stage->execute(ctx_.get()));
+
+    EXPECT_EQ(
+        std::memcmp(
+            reference->raw_data(),
+            key->raw_data(),
+            reference->numel() * sizeof(float)),
+        0)
+        << "K-only policy must reuse the exact established rotation arithmetic";
+
+    const auto contract = key_stage->bufferContract();
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts.front().id, BufferId::K_PROJ);
+    EXPECT_TRUE(contract.inputs.empty());
+    EXPECT_TRUE(contract.outputs.empty());
+}
+
+TEST_F(ComputeStageTest, KeyOnlyRoPEFactoryRejectsQueryState)
+{
+    auto query = makeTensor(1, 16);
+    auto key = makeTensor(1, 16);
+    EXPECT_THROW(
+        ComputeStageFactory::createKeyOnlyRoPE({
+            .device_id = DeviceId::cpu(),
+            .Q = query.get(),
+            .K = key.get(),
+            .n_kv_heads = 1,
+            .head_dim = 16,
+        }),
+        std::invalid_argument);
 }
 
 TEST_F(ComputeStageTest, RoPEVerifierPrefillMatchesSerialDecodeRows)

@@ -86,7 +86,8 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr,
-            const void *position_ids_device = nullptr) override;
+            const void *position_ids_device = nullptr,
+            const int32_t *sequence_lengths_device = nullptr) override;
     };
 
 } // namespace llaminar2

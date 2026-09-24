@@ -1,10 +1,5 @@
 # Production image certification
 
-This guide describes the production tooling on `develop`. The workflows are
-also registered on `master` so GitHub exposes their manual-run UI. Select
-`develop` when dispatching them; this documentation update does not merge the
-engine or its production test infrastructure into the older `master` source.
-
 `scripts/ci/run_production_pipeline.py` is the explicit local/full-certification
 entry point. By default it independently certifies full CPU/CUDA/ROCm
 **Release** images for both AVX512 and AVX2, not a devcontainer or
@@ -19,9 +14,12 @@ routes local development checks, model diagnostics, and this full image gate.
 `.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
 `scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
 full-backend test-runner/runtime pairs, runs the complete Unit and
-`ProductionParityPreflight` transaction inside each test runner, then publishes
+`ProductionTestPreflight` transaction inside each test runner, then publishes
 only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
-`ghcr.io/llaminar/llaminar:develop-avx2`. It does not run model discovery,
+`ghcr.io/llaminar/llaminar:develop-avx2`. It also publishes source-pinned
+`develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags for
+the same tested bytes. A conflicting existing source-pinned tag is fatal; the
+branch tags are movable. It does not run model discovery,
 generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
 or image certification. Its test runner contains the complete model-free
 Unit/preflight inventory but not diagnostic model-parity matrices needed only
@@ -58,6 +56,14 @@ workspace at the same `/home/runner/_work` spelling in the pod and on the
 host, mount `/var/run/docker.sock`, and declare those paths through
 `LLAMINAR_DOCKER_SHARED_ROOTS`. `docker_paths.py` accepts only those exact
 same-path roots; an undeclared Kubernetes path is a fatal configuration error.
+The scale set is repository-scoped (`https://github.com/Llaminar/llaminar`),
+so its `github_token` needs repository runner administration rather than an
+organization-owner credential.  Workflows target the unique
+`llaminar-xeon-host` scale-set name, not a shared label: an old organization
+scale set can otherwise retain the old `llaminar-bench` label after a control
+plane loss and receive jobs under dead runner identities.  An organization URL
+requires a different GitHub App or org-admin token and will leave this
+repository-scoped scale set unable to create runner pods.
 The scale set also mounts the existing canonical model tmpfs read-only and a
 persistent host ccache root at `/var/cache/llaminar/ccache`. Before applying
 the scale set, prepare the host once:
@@ -166,7 +172,7 @@ untouched for manual retirement, but no live runner consumes it.
 flowchart TD
     S[One immutable source snapshot] --> B[AVX512 and AVX2 test-runner/runtime image pairs]
     B --> U[Complete Unit gate in each ISA image]
-    U --> P[Complete ProductionParityPreflight in each ISA image]
+    U --> P[Complete ProductionTestPreflight in each ISA image]
     P --> G[HTTP token regression: MTP off and dynamic, reviewed 384-token controls]
     G --> E[Both full canonical E2E HTTP needle suites]
     E --> X[Canonical cross-host MPI E2E; Azure lease retired]
@@ -178,6 +184,59 @@ flowchart TD
     C --> O[Explicit full-certification publication: both images and one combined result commit]
 ```
 
+## Master PR certification and release
+
+A same-repository PR from `develop` to `master` triggers
+`.github/workflows/master-pr-certification.yml`. Its first job waits for the
+successful develop push image gate at the PR's **exact head SHA**. It never
+substitutes the mutable `develop` tag. The required E2E check pulls that
+source-pinned AVX512/AVX2 pair, verifies image labels and source tree, and runs
+the full canonical HTTP suite. The required benchmark check then consumes the
+completed E2E pair receipt and runs every tagged benchmark cell on those same
+image digests. Both jobs retain compact per-ISA JSON evidence; benchmarks do
+not run after an E2E failure. A complete red benchmark report still lets the
+other ISA finish, so the PR receives a per-cell red/amber/green table of both
+prefill and decode numbers. A red phase fails the required benchmark check;
+amber is below the prior high-water mark but inside the configured tolerance.
+The branch-policy check admits only `develop`.
+
+`scripts/ci/apply_master_ruleset.py` installs the four required GitHub Actions
+checks on the existing master ruleset with strict up-to-date PR semantics and
+squash-only merge. It also activates the existing develop deletion and
+force-push guard, so GitHub's auto-delete-on-merge setting cannot remove the
+persistent source branch. This guard does not add a PR, status-check, or
+linear-history requirement to develop: the post-squash publisher must record
+the certified master commit as a second parent of its fast-forward evidence
+commit, making the next develop PR up-to-date with master without rewriting
+either branch.
+Run the installer without `--apply` to inspect both proposals; only apply
+after the PR workflow has emitted its checks. A manual-dispatch workflow
+run cannot satisfy a required PR check, so the diagnostic workflows below are
+not substitutes for this gate.
+
+After the certified PR is squash-merged, `.github/workflows/release.yml`
+validates that the resulting **master tree** equals the tested develop image
+tree. Its publisher revalidates both E2E reports, both complete benchmark
+reports, the exact image pair and the successful PR workflow before making any
+registry change. It creates a dated GitHub release such as `2026-09-23.1`,
+then `.2` if another merge releases that UTC day. The first release has concise
+bootstrap notes; later releases list commits since the previous release. The
+release attaches the E2E receipts/reports, benchmark JSON and SVG chart. It
+promotes the certified image digests to the dated tags,
+`master-<full master SHA>` / `master-avx2-<full master SHA>`, and finally the
+movable `master` / `master-avx2` tags. No image is rebuilt on master.
+After release publication, a separate dependent job advances the combined
+upward-only high-water marks and checked-in benchmark result/chart on `develop`
+with a two-parent `[skip ci]` evidence commit. Its first parent is the tested
+develop head; its second parent is the same-tree squash commit just certified
+on master. This must happen **after merge**: putting a
+skip-ci commit on the open PR head would leave required PR checks pending on an
+untested revision. The publication is fast-forward-only and refuses a
+concurrent develop change; a failed high-water job can be rerun independently
+of the successful release job. The evidence-only `[skip ci]` commit is not a
+new release candidate by itself: wait for the next ordinary develop source
+commit and its exact-ref image build before opening another master PR.
+
 ## Manual published-image workflows
 
 Two separate **manual-dispatch-only** workflows consume the branch's existing
@@ -187,13 +246,23 @@ build and do not extend the ordinary develop push gate:
 - **Published images — HTTP E2E** (`production-e2e.yml`) runs every canonical
   E2E-tagged cell through the full HTTP/long-context needle harness, first on
   AVX512, then on AVX2. It retains the image identities, canonical manifest,
-  per-cell evidence and completed pair receipt as an Actions artifact.
+  per-cell evidence and completed pair receipt as an Actions artifact. Ordinary
+  failed or timed-out cells do not stop independent cells or the other ISA:
+  the report records the complete failure map, then the workflow fails. A
+  missing or incomplete report is an infrastructure failure and stops immediately.
 - **Published images — Benchmarks** (`production-benchmarks.yml`) requires that
   completed E2E pair before starting either ISA's production benchmark suite.
   It accepts an E2E run ID, or selects the latest successful manual E2E run on
   the same branch. A newer image tag invalidates the old E2E receipt. It commits
   compact JSON, an SVG chart and the owned README block only after every
   benchmark passes.
+
+HTTP profiles use automatic selection with canonical backend/strategy/count
+constraints. Every cell retains the resolved physical-participant proof and
+streaming/non-streaming tool-call round trips, in addition to all long-context
+checks. Auto still owns GPU ordinals, rank placement and PP layer boundaries.
+Mathematical/saved-token projections keep their declared placement; the HTTP
+constraint projection does not redefine their reviewed control streams.
 
 For `develop`, the images are `ghcr.io/llaminar/llaminar:develop` and
 `:develop-avx2`. Both must exist, be full-backend Release images, and name the
@@ -215,11 +284,20 @@ selected branch owns both the image tags and the published result commit.
 The workflows share the develop gate's accelerator concurrency group and use
 the same host Docker/BuildKit cache. No build cache is uploaded to GitHub.
 
+The stock ARC runner is not a GitHub-hosted tools image. The benchmark workflow
+explicitly installs and verifies GitHub CLI before downloading the authenticated
+E2E artifact; local remote-evidence runs also require `gh` on `PATH` and an
+appropriate login or `GH_TOKEN`. An explicitly supplied local `--e2e-bundle`
+does not require GitHub CLI. These control-plane tools are not dependencies of
+the tested inference image.
+
 Runtime images do not contain model-parity executables. Discovery therefore
 builds a full-matrix **test companion from the tested image's exact committed
 source**, using the existing installed-inventory exporter. One full-backend
 AVX2 companion describes the ISA-independent matrix; it performs metadata
-discovery only. All model inference uses the pulled runtime image IDs. No
+discovery only. Its typed HTTP profiles carry both ISA deadlines; the tested
+runtime's immutable ISA label selects the applicable budget, not the companion's
+compile options. All model inference uses the pulled runtime image IDs. No
 model/topology list is copied into workflow YAML or the new driver.
 
 The ARC pod's model/cache mounts remain read-only. Canonical HTTP and benchmark
@@ -245,7 +323,9 @@ python3 scripts/ci/run_published_image_suite.py benchmarks \
 Use a new output directory for each attempt; partial evidence is retained, not
 silently promoted or overwritten. `--models` and `--model-ramdisk-root` use the
 same model staging authority as the full pipeline. There is no reduced-suite,
-timeout extension or diagnostic bypass in these publishing workflows. For a
+CLI timeout override or diagnostic bypass in these publishing workflows. Whole-cell
+deadlines come from the canonical typed profiles, including explicitly approved
+ISA-specific budgets. For a
 failing cell, use the existing E2E/benchmark runner's explicit diagnostic
 selection, then rerun the complete suite on the corrected published pair.
 Unit/preflight are not rerun per model cell: published develop images already
@@ -254,13 +334,20 @@ passed those gates.
 Local runs do not commit implicitly; `--publish` explicitly enables the same
 branch publication as Actions. Publication uses a private index and a normal
 fast-forward push, retaining concurrent source changes and leaving the user's
-checkout/index untouched. The bookkeeping commit includes `[skip ci]` so a
-chart update does not rebuild the measured images. Full logs stay in Actions
+checkout/index untouched. The bookkeeping commit also receives a develop
+source-pinned image pair through the ordinary CI gate; skipping CI would leave
+the next master PR without an image for its exact head SHA. Full logs stay in Actions
 artifacts; `benchmarks/production/published/results.json` and `benchmarks.svg`
 are the compact checked-in evidence. These workflows do **not** run saved-token
 or remote-MPI regression, mint a full production-image certificate, modify
 runtime layers/tags, or advance the full-certification high-water file. The
 benchmark runner still checks the existing high-water policy for regressions.
+
+The published chart groups cells by model size and normalizes each cell/phase
+to its own AVX512 median (100%). AVX2 bars and percentages use that same local
+reference, including values above 100% when AVX2 is faster. Exact tok/s labels
+remain comparable across cells; normalized bar lengths are not. The renderer
+only changes presentation and never alters samples or high-water marks.
 
 ## Run locally
 
@@ -569,7 +656,8 @@ SSH compression; all original JSON records and collision checks are preserved.
 Plan/apply first runs the public `plan` command and distributes its completed
 document, then starts `serve --config`. Only serving spends the cell's
 server-readiness window; planning and the complete HTTP phase share one
-immutable fifteen-minute frontend budget. Planning failure or cancellation never
+immutable profile-owned frontend budget (fifteen minutes by default), selected
+by the controller runtime ISA. Planning failure or cancellation never
 starts the server, and changing phases cannot reset that budget. Direct
 auto-serve keeps its ordinary in-process planning inside server readiness.
 
@@ -798,5 +886,5 @@ The result commit points back to the tested source SHA; it does not pretend
 that the bookkeeping commit produced another tested binary. A failure leaves
 reports available and never force-pushes or merges untested source.
 
-The source pre-commit hook remains Unit + ProductionParityPreflight only.
+The source pre-commit hook remains Unit + ProductionTestPreflight only.
 Performance is never part of that model-free hook.

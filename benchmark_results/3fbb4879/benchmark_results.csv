@@ -1,0 +1,14 @@
+commit,timestamp,model_name,model_path,device,prefill_tok_s,decode_tok_s,baseline_prefill_tok_s,baseline_decode_tok_s
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cpu,278.43,18.00,334.59,18.12
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cuda:0,4915.22,93.95,4830.25,93.97
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",rocm:0,1182.19,77.28,1183.62,77.33
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",cpu,373.45,25.51,394.34,26.12
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",cuda:0,5910.97,144.74,5884.77,144.96
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",rocm:0,1667.46,102.32,1668.46,102.58
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu,171.68,23.71,192.42,25.26
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu:0,127.91,17.70,134.57,18.56
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",rocm:0,1304.38,80.22,1304.55,80.65
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 27B Dense Q4_K_M","models/Qwen3.5-27B-Q4_K_M.gguf",cpu,69.98,6.71,78.23,6.95
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 27B Dense Q4_K_M","models/Qwen3.5-27B-Q4_K_M.gguf",rocm:0,229.32,28.08,228.92,28.06
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 27B Dense Q4_K_M TP2 ROCm","models/Qwen3.5-27B-Q4_K_M.gguf",tp,352.35,29.43,352.12,27.91
+3fbb4879,2026-05-29T18:02:16Z,"Qwen 3.5 27B Dense Q4_K_M PP2 CUDA+ROCm","models/Qwen3.5-27B-Q4_K_M.gguf",pp,274.21,17.51,274.37,17.45

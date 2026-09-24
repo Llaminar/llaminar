@@ -183,9 +183,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP32_Small)
                         num_tokens * d_model * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
     // Cleanup
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     // Validate
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), num_tokens * d_model));
@@ -240,9 +240,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP32_Large)
     ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output,
                         num_tokens * d_model * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     // Validate
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), num_tokens * d_model));
@@ -300,9 +300,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_BF16_Small)
     ASSERT_EQ(hipMemcpy(rocm_bf16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     // Convert BF16 to FP32 for comparison
     std::vector<float> rocm_output(num_tokens * d_model);
@@ -361,9 +361,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_BF16_Large)
     ASSERT_EQ(hipMemcpy(rocm_bf16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     std::vector<float> rocm_output(num_tokens * d_model);
     for (size_t i = 0; i < rocm_bf16_output.size(); ++i)
@@ -424,9 +424,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP16_Small)
     ASSERT_EQ(hipMemcpy(rocm_fp16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     std::vector<float> rocm_output(num_tokens * d_model);
     for (size_t i = 0; i < rocm_fp16_output.size(); ++i)
@@ -483,9 +483,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_FP16_Large)
     ASSERT_EQ(hipMemcpy(rocm_fp16_output.data(), d_output,
                         num_tokens * d_model * sizeof(uint16_t), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     std::vector<float> rocm_output(num_tokens * d_model);
     for (size_t i = 0; i < rocm_fp16_output.size(); ++i)
@@ -570,9 +570,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_Q8_1_Small)
     ASSERT_EQ(hipMemcpy(rocm_q8_1_output.data(), d_output,
                         num_tokens * blocks_per_row * sizeof(Q8_1Block), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     // Dequantize Q8_1 to FP32 for comparison
     std::vector<float> rocm_output(num_tokens * d_model);
@@ -629,9 +629,9 @@ TEST_F(Test__ROCmEmbeddingParity, Embedding_Q8_1_Large)
     ASSERT_EQ(hipMemcpy(rocm_q8_1_output.data(), d_output,
                         num_tokens * blocks_per_row * sizeof(Q8_1Block), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_embed);
-    hipFree(d_token_ids);
-    hipFree(d_output);
+    (void)hipFree(d_embed);
+    (void)hipFree(d_token_ids);
+    (void)hipFree(d_output);
 
     std::vector<float> rocm_output(num_tokens * d_model);
     dequantize_q8_1(rocm_q8_1_output.data(), rocm_output.data(), num_tokens * blocks_per_row);

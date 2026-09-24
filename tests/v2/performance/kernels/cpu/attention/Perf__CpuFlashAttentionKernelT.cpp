@@ -6,7 +6,7 @@
  * and decode/prefill workloads. Measures:
  *   - Latency (ms) with min/mean/max/stddev
  *   - GFLOP/s throughput
- *   - Per-phase breakdown (QK vs V) via LLAMINAR_PROFILING
+ *   - Per-phase breakdown (QK vs V) via LLAMINAR_PROFILE_KERNELS
  *   - KV-length scaling curves for decode
  *   - Accuracy validation against a reference (online softmax correctness)
  *

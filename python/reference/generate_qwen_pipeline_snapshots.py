@@ -46,6 +46,10 @@ for path_to_add in [str(python_dir), str(workspace_dir)]:
         sys.path.insert(0, path_to_add)
 
 from reference.pipeline_stages import PipelineStage, stage_to_string
+from reference.snapshot_metadata import (
+    build_reference_identity,
+    write_metadata_atomically,
+)
 
 
 def infer_snapshot_output_dir(model_path: str) -> Path:
@@ -112,6 +116,10 @@ class QwenPipelineCapture:
         self.model = None
         self.tokenizer = None
         self.captures = {}
+        self.reference_prompt = ""
+        self.prefill_token_ids: List[int] = []
+        self.reference_decode_steps = 0
+        self.decode_tokens: List[int] = []
         
     def load_model(self):
         """Load PyTorch model from HuggingFace or GGUF file."""
@@ -538,6 +546,10 @@ class QwenPipelineCapture:
         # Tokenize input
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs['input_ids']
+        self.reference_prompt = prompt
+        self.prefill_token_ids = input_ids.tolist()[0]
+        self.reference_decode_steps = 0
+        self.decode_tokens = []
         
         if self.verbose:
             print(f"\nProcessing prompt: '{prompt}'")
@@ -770,6 +782,9 @@ class QwenPipelineCapture:
         inputs = self.tokenizer(prompt, return_tensors="pt")
         prefill_input_ids = inputs['input_ids']
         prefill_seq_len = prefill_input_ids.shape[1]
+        self.reference_prompt = prompt
+        self.prefill_token_ids = prefill_input_ids.tolist()[0]
+        self.reference_decode_steps = num_decode_steps
         
         if self.verbose:
             print(f"\n=== PREFILL ===")
@@ -952,32 +967,44 @@ class QwenPipelineCapture:
         """
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save metadata
-        metadata_path = output_dir / "metadata.txt"
-        with open(metadata_path, 'w') as f:
-            f.write(f"snapshot_version: 2\n")
-            f.write(f"Model: {self.model_path}\n")
-            config = self.model.config
-            arch = getattr(config, 'architectures', [config.__class__.__name__])
-            f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")
-            f.write(f"n_layers: {config.num_hidden_layers}\n")
-            f.write(f"n_heads: {config.num_attention_heads}\n")
-            f.write(f"n_kv_heads: {config.num_key_value_heads}\n")
-            f.write(f"d_model: {config.hidden_size}\n")
-            f.write(f"d_head: {self._get_head_dim(config)}\n")
-            f.write(f"d_ff: {config.intermediate_size}\n")
-            f.write(f"vocab_size: {config.vocab_size}\n")
-            f.write(f"num_snapshots: {len(self.captures)}\n")
-            
-            # Save decode tokens if available
-            if hasattr(self, 'decode_tokens') and self.decode_tokens:
-                f.write(f"decode_tokens: {','.join(map(str, self.decode_tokens))}\n")
-        
         # Save each capture as separate .npy file (cnpy compatible)
         for key, capture in self.captures.items():
             npy_path = output_dir / f"{key}.npy"
             # Save just the data array (cnpy loads this easily)
             np.save(npy_path, capture['data'])
+
+        # metadata.txt is the completeness marker.  Publish it only after all
+        # NPY files exist and bind it to the exact model and inference inputs.
+        identity = build_reference_identity(
+            self.model_path,
+            self.reference_prompt,
+            self.prefill_token_ids,
+            self.reference_decode_steps,
+        )
+        config = self.model.config
+        arch = getattr(config, 'architectures', [config.__class__.__name__])
+        metadata_lines = [
+            "snapshot_version: 4",
+            f"Model: {self.model_path}",
+            f"Architecture: {arch[0] if arch else config.__class__.__name__}",
+            f"n_layers: {config.num_hidden_layers}",
+            f"n_heads: {config.num_attention_heads}",
+            f"n_kv_heads: {config.num_key_value_heads}",
+            f"d_model: {config.hidden_size}",
+            f"d_head: {self._get_head_dim(config)}",
+            f"d_ff: {config.intermediate_size}",
+            f"vocab_size: {config.vocab_size}",
+            f"num_snapshots: {len(self.captures)}",
+            f"prompt: {self.reference_prompt}",
+            f"token_ids: {','.join(map(str, self.prefill_token_ids))}",
+            *identity.metadata_lines(),
+        ]
+        if self.decode_tokens:
+            metadata_lines.append(
+                f"decode_tokens: {','.join(map(str, self.decode_tokens))}"
+            )
+        metadata_path = output_dir / "metadata.txt"
+        write_metadata_atomically(metadata_path, metadata_lines)
         
         if self.verbose:
             print(f"\n✓ Saved {len(self.captures)} snapshots to {output_dir}")

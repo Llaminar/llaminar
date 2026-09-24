@@ -550,7 +550,8 @@ TEST_F(Test__ModelLoaderSplit, MissingSplitPartFails)
         << "Loading should fail when a split part is missing";
 
     // Cleanup
-    system(("rm -rf " + temp_dir).c_str());
+    ret = system(("rm -rf " + temp_dir).c_str());
+    EXPECT_EQ(ret, 0);
 }
 
 /**

@@ -25,6 +25,15 @@
 #include <random>
 #include <vector>
 
+/**
+ * @brief These packed-operand tests select their physical K/V types explicitly.
+ *
+ * They prove the generic ring's lossless copy and the TQ tensor primitives, not
+ * the public compressed-cache policy. Runtime Q8/TQ selectors now use anchored
+ * keys; their factory/append/attention/prefix proofs live in the model-free
+ * CPUAttentionCacheSource integration suite. Do not use convenience policy
+ * aliases here: that would silently change the input codec being tested.
+ */
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
@@ -266,7 +275,7 @@ TEST_F(Test__SplitTQ_Attention_HeadDim128, SplitTQ_CacheRoundTrip_CosineSimilari
     constexpr int MAX_SEQ = 32;
     constexpr int N_TOKENS = 16;
 
-    CPURingKVCacheTQ cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1,
                            MAX_SEQ, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     auto fp32_k = makeRandomFP32(N_TOKENS, KV_DIM, 3000);
@@ -624,7 +633,7 @@ TEST_F(Test__SplitTQ_Attention_HeadDim128, FullPipeline_CacheToAttention_HeadDim
     const int Q_DIM = N_HEADS * HEAD_DIM;
 
     // Create KV cache (split TQ8-K / TQ4-V)
-    CPURingKVCacheTQ cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, /*n_layers=*/1, /*batch_size=*/1,
                            MAX_SEQ, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // Create random Q (decode token) and K/V (context)
@@ -771,7 +780,7 @@ TEST_F(Test__SplitTQ_Attention_HeadDim128, PipelineExact_ForLayer_ComputeDecode_
                    /*causal=*/false);
 
     // ═══ SPLIT TQ PIPELINE (exact pipeline path) ═══
-    CPURingKVCacheTQ cache(mpi_ctx_, /*n_layers=*/8, /*batch_size=*/1,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, /*n_layers=*/8, /*batch_size=*/1,
                            MAX_SEQ, N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     // --- STEP 1: Quantize prefill K/V using DERIVED context (like KVCacheAppendStage) ---
@@ -998,7 +1007,7 @@ TEST_F(Test__SplitTQ_Attention_HeadDim128, PipelineExact_Qwen3_0_6B_Dims)
                    /*causal=*/false);
 
     // Split TQ pipeline: TQ8(K) / TQ4(V) → cache → dequant → attention
-    CPURingKVCacheTQ cache(mpi_ctx_, /*n_layers=*/8, /*batch_size=*/1,
+    CPURingKVCache<ActivationPrecision::TQ8, ActivationPrecision::TQ4> cache(mpi_ctx_, /*n_layers=*/8, /*batch_size=*/1,
                            MAX_SEQ, Q3_N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
 
     const auto &layer_ctx = turboquant_ctx_->for_layer(LAYER_IDX);

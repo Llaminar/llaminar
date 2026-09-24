@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "prompt_unit": " test",
+  "prompt_repetitions": 512,
+  "decode_tokens": 256,
+  "warmup_iterations": 1,
+  "measurement_iterations": 3,
+  "seed": 42,
+  "temperature": 0,
+  "top_k": 1,
+  "top_p": 1
+}

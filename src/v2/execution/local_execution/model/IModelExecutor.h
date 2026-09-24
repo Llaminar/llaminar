@@ -126,29 +126,55 @@ namespace llaminar2
      */
     struct ForwardInput
     {
-        // Token input (one of these must be set)
-        const int *token_ids = nullptr;                         ///< Token IDs [seq_len] (single sequence)
+        // Token input (exactly one execution authority must be set).
+        const int *token_ids = nullptr; ///< Host-owned token IDs [seq_len].
         /**
-         * @brief Optional device-resident INT32 token IDs.
+         * @brief Device-resident INT32 token IDs owned by request admission.
          *
-         * This mirrors the graph-builder forward contract. Device execution can
-         * read tokens from a stable GPU buffer while `token_ids` remains a host
-         * shadow for diagnostics and request bookkeeping.
+         * GPU execution reads this stable arena bank directly. `token_ids` must
+         * remain null for that transaction: retaining a host mirror would create
+         * a second authority and permit stale request state to influence capture
+         * planning. Initial host input is consumed before this contract begins.
          */
         const void *token_ids_device = nullptr;
         const std::vector<std::vector<int>> *batches = nullptr; ///< Batched tokens
 
         // Dimensions
         int batch_size = 1;
-        int seq_len = 0;            ///< Per-sequence length (single) or max length (batched)
+        int seq_len = 0;            ///< Physical rows per sequence captured by the graph
         int *seq_lengths = nullptr; ///< Per-sequence lengths for batched (nullptr = all same)
-        int real_seq_len = 0;       ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
-        int bucket_seq_len = 0;     ///< Fixed bucket length for graph shape (0 = seq_len)
-        int token_offset = 0;       ///< Chunk offset within the original prompt
+        int real_seq_len = 0; ///< Logical rows for fixed-width execution (0 = seq_len).
+        /**
+         * @brief Scheduler-admitted fixed graph width, or zero for raw input.
+         *
+         * A positive value means the prefill scheduler has already selected and
+         * validated this transaction bucket. The execution engine therefore
+         * preserves the bucket for short terminal chunks instead of reapplying
+         * the raw-prompt graph minimum to `real_seq_len`.
+         */
+        int bucket_seq_len = 0;
+        /**
+         * @brief Absolute token offset of the first real token in this prefill range.
+         *
+         * This field owns prefill request boundaries for raw, restored-prefix,
+         * and bucketed graph execution.  Consumers use it to derive position
+         * IDs and replay metadata, so callers resuming after an existing prefix
+         * must set it to the current logical cursor instead of relying on a
+         * default zero offset.
+         */
+        int token_offset = 0;
 
         // Position information (for decode mode)
         int *position_ids = nullptr; ///< Position IDs for RoPE (nullptr = auto)
-        int position_offset = 0;     ///< Offset for decode mode (current position)
+        /**
+         * @brief Decode/RoPE logical position and legacy prefill fallback.
+         *
+         * Decode callers use this as the current position.  Prefill callers
+         * should set @ref token_offset as the first-class request range; graph
+         * helpers may use this value only as a compatibility fallback when
+         * @ref token_offset has not been populated.
+         */
+        int position_offset = 0;
 
         // KV cache state
         IKVCache *kv_cache = nullptr; ///< KV cache (nullptr = no caching)

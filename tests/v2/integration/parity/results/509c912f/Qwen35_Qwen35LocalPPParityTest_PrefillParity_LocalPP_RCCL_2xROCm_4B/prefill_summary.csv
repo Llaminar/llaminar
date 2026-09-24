@@ -1,0 +1,2 @@
+backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed
+LocalPP_RCCL_2xROCm_4B,0.996303,0.00826681,1,0.8,true,7,33,true

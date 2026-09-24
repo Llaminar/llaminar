@@ -48,43 +48,46 @@ namespace llaminar2
         preInitializeRCCLBackend();
     }
 
+    const RankInventory *BackendRouter::localRankInventory() const noexcept
+    {
+        if (cluster_inventory_.ranks.empty())
+            return nullptr;
+
+        const int local_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        const auto exact = std::find_if(
+            cluster_inventory_.ranks.begin(),
+            cluster_inventory_.ranks.end(),
+            [local_rank](const RankInventory &inventory)
+            { return inventory.rank == local_rank; });
+        if (exact != cluster_inventory_.ranks.end())
+            return &*exact;
+
+        /*
+         * A participant-scoped LocalTP inventory has exactly one record. Its
+         * rank metadata can be produced before the final MPI context is
+         * attached, but it is still the only possible local authority.
+         */
+        if (cluster_inventory_.ranks.size() == 1)
+            return &cluster_inventory_.ranks.front();
+        return nullptr;
+    }
+
     void BackendRouter::preInitializeNCCLBackend()
     {
 #ifdef HAVE_NCCL
-        // Check if NCCL backend is available
-        if (!factory_->isAvailable(CollectiveBackendType::NCCL))
-        {
-            LOG_DEBUG("[BackendRouter] NCCL backend not available, skipping pre-initialization");
-            return;
-        }
-
-        // Create NCCL backend if not already created
-        auto *backend = getOrCreateBackend(CollectiveBackendType::NCCL);
-        if (!backend)
-        {
-            LOG_DEBUG("[BackendRouter] Failed to create NCCL backend for pre-initialization");
-            return;
-        }
-
-        // If already initialized, nothing to do
-        if (backend->isInitialized())
-        {
-            LOG_DEBUG("[BackendRouter] NCCL backend already initialized");
-            return;
-        }
-
-        // Get local CUDA devices from cluster inventory
-        // Use rank 0 for single-process, or mpi_ctx_->rank() for multi-process
-        const int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-        const auto &rank_inv = cluster_inventory_.getRank(my_rank);
-
-        // Count CUDA devices in this rank's inventory
+        /*
+         * Inspect the declared participants before constructing NCCL. An
+         * unselected backend must not acquire runtime state merely because it
+         * was compiled into this process.
+         */
+        const RankInventory *rank_inv = localRankInventory();
         std::vector<int> cuda_ordinals;
-        for (const auto &gpu : rank_inv.gpus)
+        if (rank_inv)
         {
-            if (gpu.type == DeviceType::CUDA)
+            for (const auto &gpu : rank_inv->gpus)
             {
-                cuda_ordinals.push_back(gpu.local_device_id);
+                if (gpu.type == DeviceType::CUDA)
+                    cuda_ordinals.push_back(gpu.local_device_id);
             }
         }
 
@@ -94,16 +97,30 @@ namespace llaminar2
             return;
         }
 
-        // NCCL collectives require at least 2 ranks. Single-device configurations
-        // (TP=1, single-GPU tests) cannot benefit from pre-initialization and
-        // would only pay the cost of spawning NCCL proxy threads. Lazy init via
-        // getBackend() will still trigger if a multi-device DeviceGroup is
-        // requested later, so skipping here is purely an optimisation.
+        // A single participant has no collective peer. Keep its backend lazy.
         if (cuda_ordinals.size() < 2)
         {
             LOG_DEBUG("[BackendRouter] Only " << cuda_ordinals.size()
                      << " CUDA device in cluster inventory; skipping NCCL pre-initialization "
                      << "(collectives require >=2 devices, lazy init will run on demand if needed)");
+            return;
+        }
+
+        if (!factory_->isAvailable(CollectiveBackendType::NCCL))
+        {
+            LOG_DEBUG("[BackendRouter] NCCL backend not available, skipping pre-initialization");
+            return;
+        }
+
+        auto *backend = getOrCreateBackend(CollectiveBackendType::NCCL);
+        if (!backend)
+        {
+            LOG_DEBUG("[BackendRouter] Failed to create NCCL backend for pre-initialization");
+            return;
+        }
+        if (backend->isInitialized())
+        {
+            LOG_DEBUG("[BackendRouter] NCCL backend already initialized");
             return;
         }
 
@@ -136,40 +153,15 @@ namespace llaminar2
     void BackendRouter::preInitializeRCCLBackend()
     {
 #ifdef HAVE_RCCL
-        // Check if RCCL backend is available
-        if (!factory_->isAvailable(CollectiveBackendType::RCCL))
-        {
-            LOG_DEBUG("[BackendRouter] RCCL backend not available, skipping pre-initialization");
-            return;
-        }
-
-        // Create RCCL backend if not already created
-        auto *backend = getOrCreateBackend(CollectiveBackendType::RCCL);
-        if (!backend)
-        {
-            LOG_DEBUG("[BackendRouter] Failed to create RCCL backend for pre-initialization");
-            return;
-        }
-
-        // If already initialized, nothing to do
-        if (backend->isInitialized())
-        {
-            LOG_DEBUG("[BackendRouter] RCCL backend already initialized");
-            return;
-        }
-
-        // Get local ROCm devices from cluster inventory
-        // Use rank 0 for single-process, or mpi_ctx_->rank() for multi-process
-        const int my_rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
-        const auto &rank_inv = cluster_inventory_.getRank(my_rank);
-
-        // Count ROCm devices in this rank's inventory
+        // Apply the same no-foreign-backend rule symmetrically for ROCm.
+        const RankInventory *rank_inv = localRankInventory();
         std::vector<int> rocm_ordinals;
-        for (const auto &gpu : rank_inv.gpus)
+        if (rank_inv)
         {
-            if (gpu.type == DeviceType::ROCm)
+            for (const auto &gpu : rank_inv->gpus)
             {
-                rocm_ordinals.push_back(gpu.local_device_id);
+                if (gpu.type == DeviceType::ROCm)
+                    rocm_ordinals.push_back(gpu.local_device_id);
             }
         }
 
@@ -179,18 +171,30 @@ namespace llaminar2
             return;
         }
 
-        // RCCL collectives require at least 2 ranks. Single-device configurations
-        // (TP=1, single-GPU tests, CPU-only tests in ROCm-visible containers)
-        // cannot benefit from pre-initialization and would only pay the cost of
-        // spawning RCCL proxy threads (which has been observed to crash inside
-        // libamdhip64 on some driver/firmware combinations). Lazy init via
-        // getBackend() will still trigger if a multi-device DeviceGroup is
-        // requested later, so skipping here is purely an optimisation.
+        // A single participant has no collective peer. Keep its backend lazy.
         if (rocm_ordinals.size() < 2)
         {
             LOG_DEBUG("[BackendRouter] Only " << rocm_ordinals.size()
                      << " ROCm device in cluster inventory; skipping RCCL pre-initialization "
                      << "(collectives require >=2 devices, lazy init will run on demand if needed)");
+            return;
+        }
+
+        if (!factory_->isAvailable(CollectiveBackendType::RCCL))
+        {
+            LOG_DEBUG("[BackendRouter] RCCL backend not available, skipping pre-initialization");
+            return;
+        }
+
+        auto *backend = getOrCreateBackend(CollectiveBackendType::RCCL);
+        if (!backend)
+        {
+            LOG_DEBUG("[BackendRouter] Failed to create RCCL backend for pre-initialization");
+            return;
+        }
+        if (backend->isInitialized())
+        {
+            LOG_DEBUG("[BackendRouter] RCCL backend already initialized");
             return;
         }
 
@@ -922,6 +926,39 @@ namespace llaminar2
     BackendRouter *GlobalBackendRouter::get()
     {
         return instance_.get();
+    }
+
+    CollectiveRuntimeRetirementReceipt
+    GlobalBackendRouter::retireForExclusiveDeviceRuntimeReset(
+        DeviceId device)
+    {
+        CollectiveRuntimeRetirementReceipt receipt;
+        receipt.device = device;
+        if (!device.is_gpu())
+        {
+            receipt.state =
+                CollectiveRuntimeRetirementState::InvalidDevice;
+            receipt.diagnostic =
+                "collective runtime retirement requires one exact GPU";
+            return receipt;
+        }
+
+        /* The singleton may own a lazily initialized copy communicator that
+         * is not reachable from the already-destroyed model runner. Retire it
+         * before consulting vendor pools so every resulting coordinator is
+         * first parked, then joined while its native context is still valid. */
+        instance_.reset();
+
+#ifdef HAVE_RCCL
+        if (device.is_rocm())
+            return RCCLBackend::retireRuntimeGenerationResources(device);
+#endif
+
+        /* NCCL coordinators are owned directly by their backend and have no
+         * process-retained pool. Destroying the singleton above therefore
+         * completes the process-global CUDA collective edge. */
+        receipt.state = CollectiveRuntimeRetirementState::Complete;
+        return receipt;
     }
 
     void GlobalBackendRouter::shutdown()

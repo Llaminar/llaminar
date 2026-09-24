@@ -107,7 +107,7 @@ namespace llaminar2
         /**
          * @brief Set a log file path to tee all log output to a file
          *
-         * When set, every log message is written to both stdout and the file.
+         * When set, every log message is written to both stderr and the file.
          * Before opening, any existing log file at @p path is rotated through
          * a sliding window of up to 10 previous runs (logrotate-style):
          *
@@ -228,16 +228,16 @@ namespace llaminar2
 
             full_line += location + " " + message;
 
-            {
-                std::lock_guard<std::mutex> lk(buffer_mutex_);
-                recent_.push_back(full_line);
-                if (recent_.size() > max_buffer_)
-                    recent_.pop_front();
-            }
+            std::lock_guard<std::mutex> lk(buffer_mutex_);
+            recent_.push_back(full_line);
+            if (recent_.size() > max_buffer_)
+                recent_.pop_front();
 
-            std::cout << full_line << std::endl;
+            std::cerr << full_line << std::endl;
 
-            // Tee to log file if open
+            // Tee to log file if open. std::ofstream is not safe for
+            // concurrent writes, so this stays under the same mutex that
+            // protects rotation and closeLogFile().
             if (log_file_.is_open())
             {
                 log_file_ << full_line << '\n';
@@ -446,7 +446,7 @@ namespace llaminar2
         }                                                                                                                  \
     } while (0)
 
-// LOG_TRACE: Compiled out in Release/E2ERelease/Integration (NDEBUG) builds.
+// LOG_TRACE: Compiled out in Release/Integration (NDEBUG) builds.
 // Only active in Debug builds. TRACE generates extremely verbose output that
 // can materially slow down even the shouldLog() branch prediction.
 #if defined(NDEBUG)

@@ -311,7 +311,8 @@ namespace llaminar2
             EXPECT_EQ(cache->get_cached_tokens(0, 0), 2);
 
             // Clear
-            cache->clear();
+            ASSERT_TRUE(cache->resetRequestState(
+                IKVCache::StateResetContext::testReinitialization(nullptr)));
 
             // Verify cleared
             EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
@@ -355,7 +356,10 @@ namespace llaminar2
                 kNKVHeads, kLocalKVHeads, 0, kHeadDim, DeviceId::cpu());
 
             ASSERT_NE(cache, nullptr);
-            EXPECT_EQ(cache->precision(), ActivationPrecision::Q8_1);
+            // The public Q8 budget keeps Q8 values; request-relative keys have
+            // their own physical codec, including on a tensor-parallel shard.
+            EXPECT_EQ(cache->k_precision(), ActivationPrecision::AQ8);
+            EXPECT_EQ(cache->v_precision(), ActivationPrecision::Q8_1);
             EXPECT_TRUE(cache->is_sharded());
             EXPECT_EQ(cache->local_kv_dim(), kLocalKVDim);
         }

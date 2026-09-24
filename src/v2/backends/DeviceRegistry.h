@@ -31,6 +31,7 @@
 
 #include "IDeviceRegistry.h"
 #include "IBackend.h"
+#include "ComputeBackend.h"
 #include <mutex>
 #include <unordered_map>
 #include <memory>
@@ -141,6 +142,12 @@ namespace llaminar2
             bool available = true;
         };
         std::unordered_map<std::string, DeviceInfo> device_info_;
+
+        /** Driver-backed directed CUDA peer-access matrix from discovery. */
+        std::optional<P2PMatrix> cuda_p2p_;
+
+        /** Driver-backed directed ROCm peer-access matrix from discovery. */
+        std::optional<P2PMatrix> rocm_p2p_;
 
         // =========================================================================
         // Discovery Helpers

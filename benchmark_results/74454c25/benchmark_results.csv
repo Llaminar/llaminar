@@ -1,0 +1,7 @@
+commit,timestamp,model_name,model_path,device,prefill_tok_s,decode_tok_s,baseline_prefill_tok_s,baseline_decode_tok_s
+74454c25,2026-05-01T23:13:17Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cpu,321.09,19.26,337.99,19.78
+74454c25,2026-05-01T23:13:17Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cuda:0,4840.14,94.76,4894.57,95.16
+74454c25,2026-05-01T23:13:17Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",rocm:0,1181.43,77.75,1214.71,78.94
+74454c25,2026-05-01T23:13:17Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",cpu,443.67,27.51,453.80,28.41
+74454c25,2026-05-01T23:13:17Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu,232.62,27.92,232.76,27.79
+74454c25,2026-05-01T23:13:17Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu:0,154.34,18.42,156.63,18.68

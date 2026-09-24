@@ -172,13 +172,15 @@ namespace llaminar2
     void PPExecutionStrategy::clearCaches(
         std::vector<DeviceGraphOrchestrator *> &runners)
     {
-        LOG_DEBUG("PPExecutionStrategy::clearCaches: Clearing " << runners.size() << " stages");
+        LOG_DEBUG("PPExecutionStrategy::clearCaches: resetting request-owned inference state on "
+                  << runners.size() << " stages");
 
         for (auto *runner : runners)
         {
             if (runner)
             {
-                runner->clear_cache();
+                runner->resetInferenceState(
+                    InferenceStateResetRequest::requestBoundary("pp-execution-strategy"));
             }
         }
     }

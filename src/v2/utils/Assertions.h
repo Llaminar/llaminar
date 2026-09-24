@@ -11,7 +11,6 @@
  *   - Debug:      Assertions ACTIVE (no NDEBUG defined)
  *   - Integration: Assertions ACTIVE (LLAMINAR_ENABLE_ASSERTIONS defined)
  *   - Release:    Assertions COMPILED OUT (NDEBUG, no LLAMINAR_ENABLE_ASSERTIONS)
- *   - E2ERelease: Assertions COMPILED OUT (NDEBUG, no LLAMINAR_ENABLE_ASSERTIONS)
  *
  * ASSERTION MACROS:
  *   - LLAMINAR_ASSERT(cond, msg)         - Basic condition check

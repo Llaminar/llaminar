@@ -46,6 +46,7 @@ namespace llaminar2
             float eps = 1e-6f;         ///< Epsilon for numerical stability
             bool subtract_one = false; ///< gamma_effective = 1.0 + gamma_stored
             int seq_len = 0;           ///< Explicit sequence length
+            int feature_dim = 0;       ///< Active row width when the backing buffer is wider
 
             /// Per-head normalization size. When > 0, normalizes over chunks of
             /// norm_dim elements (e.g., d_v=128 for head-level norm). When 0,

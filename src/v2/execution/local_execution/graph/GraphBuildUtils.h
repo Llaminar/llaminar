@@ -39,7 +39,7 @@ namespace llaminar2
 
             const auto *slice = dynamic_cast<const TensorSlice *>(weight);
             bool result = slice && slice->is_row_parallel();
-            LOG_DEBUG("[isRowParallelSharded] weight=" << weight << " is_slice=" << (slice != nullptr)
+            LOG_TRACE("[isRowParallelSharded] weight=" << weight << " is_slice=" << (slice != nullptr)
                                                        << " name=" << (weight->debugName().empty() ? "(unnamed)" : weight->debugName())
                                                        << " shape0=" << (weight->shape().empty() ? 0 : weight->shape()[0])
                                                        << " shape1=" << (weight->shape().size() > 1 ? weight->shape()[1] : 1)

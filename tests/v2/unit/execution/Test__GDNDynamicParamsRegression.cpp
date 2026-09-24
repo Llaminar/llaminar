@@ -1,6 +1,6 @@
 /**
  * @file Test__GDNDynamicParamsRegression.cpp
- * @brief Regression tests for GDN stage updateDynamicParams / hasDynamicParams
+ * @brief Regression tests for scalar and request-batched GDN dynamic geometry
  *
  * The bug: GDNRecurrenceStage and ShortConv1dStage did not override
  * updateDynamicParams(), so cached graph reuse (via updateCachedGraphParams)
@@ -8,8 +8,10 @@
  * updating to the decode seq_len. This caused execute() to call
  * chunk_forward() (prefill path) instead of recurrent_step() (decode path).
  *
- * The fix: Both stages now override updateDynamicParams() to update
- * params_.seq_len, and hasDynamicParams() returns true.
+ * A later request-batching regression exposed a second length domain: the
+ * execution engine refreshes rows per request, while the backend stage stores
+ * a flattened row count. Both stages therefore update request_seq_len and
+ * reconstruct seq_len as request_count * request_seq_len.
  *
  * Regression for: GDNRecurrenceStage.h / ShortConv1dStage.h
  *                 updateDynamicParams() override addition
@@ -18,6 +20,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
@@ -136,6 +139,82 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ChangesSeqLe
     // After update, seq_len must be 1 (decode)
     EXPECT_EQ(stage.getParams().seq_len, decode_seq_len)
         << "updateDynamicParams must update params_.seq_len for GDNRecurrenceStage";
+}
+
+/**
+ * @brief Preserve flattened row geometry when a request-batched graph is reused.
+ *
+ * Qwen 3.5/3.6 request-batched graphs are built over a flattened [request,row]
+ * tensor. The dynamic update API supplies only the width of one request. Copying
+ * that value directly to `Params::seq_len` turns a valid 2xN graph into an
+ * inconsistent N-row graph before either grouped backend kernel can launch.
+ */
+TEST(Test__GDNDynamicParams, RequestBatchedStagesPreserveFlattenedDynamicRowGeometry)
+{
+    constexpr int request_count = 2;
+    constexpr int initial_rows_per_request = 16;
+    constexpr int replay_rows_per_request = 11;
+
+    ShortConv1dStage::Params conv_params;
+    conv_params.request_count = request_count;
+    conv_params.request_seq_len = initial_rows_per_request;
+    conv_params.seq_len = request_count * initial_rows_per_request;
+    ShortConv1dStage conv_stage(conv_params);
+
+    GDNRecurrenceStage::Params recurrence_params;
+    recurrence_params.request_count = request_count;
+    recurrence_params.request_seq_len = initial_rows_per_request;
+    recurrence_params.seq_len = request_count * initial_rows_per_request;
+    GDNRecurrenceStage recurrence_stage(recurrence_params);
+
+    conv_stage.updateDynamicParams(/*pos_offset=*/0, replay_rows_per_request);
+    recurrence_stage.updateDynamicParams(/*pos_offset=*/0, replay_rows_per_request);
+
+    EXPECT_EQ(conv_stage.getParams().request_seq_len, replay_rows_per_request);
+    EXPECT_EQ(conv_stage.getParams().seq_len,
+              request_count * replay_rows_per_request);
+    EXPECT_EQ(recurrence_stage.getParams().request_seq_len,
+              replay_rows_per_request);
+    EXPECT_EQ(recurrence_stage.getParams().seq_len,
+              request_count * replay_rows_per_request);
+}
+
+/**
+ * @brief Reject request geometry whose flattened row count cannot fit in int.
+ *
+ * Stage parameters use signed integers throughout graph construction.  A
+ * wrapped multiplication could otherwise look positive and let a grouped
+ * kernel index beyond its activation and state allocations.
+ */
+TEST(Test__GDNDynamicParams, RequestBatchedStagesRejectFlattenedRowOverflow)
+{
+    constexpr int request_count = 2;
+    constexpr int overflowing_rows_per_request =
+        (std::numeric_limits<int>::max() / request_count) + 1;
+
+    ShortConv1dStage::Params conv_params;
+    conv_params.request_count = request_count;
+    conv_params.request_seq_len = 1;
+    conv_params.seq_len = request_count;
+    ShortConv1dStage conv_stage(conv_params);
+
+    GDNRecurrenceStage::Params recurrence_params;
+    recurrence_params.request_count = request_count;
+    recurrence_params.request_seq_len = 1;
+    recurrence_params.seq_len = request_count;
+    GDNRecurrenceStage recurrence_stage(recurrence_params);
+
+    conv_stage.updateDynamicParams(/*pos_offset=*/0,
+                                   overflowing_rows_per_request);
+    recurrence_stage.updateDynamicParams(/*pos_offset=*/0,
+                                         overflowing_rows_per_request);
+
+    EXPECT_EQ(conv_stage.getParams().request_seq_len,
+              overflowing_rows_per_request);
+    EXPECT_EQ(conv_stage.getParams().seq_len, 0);
+    EXPECT_EQ(recurrence_stage.getParams().request_seq_len,
+              overflowing_rows_per_request);
+    EXPECT_EQ(recurrence_stage.getParams().seq_len, 0);
 }
 
 TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ExecutesDecodePath)

@@ -9,9 +9,35 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <set>
+#include <utility>
 #include <vector>
 
 using namespace llaminar2;
+
+/** @brief Plan against the histogram's currently published ownership. */
+static SocketRebalanceProposal proposeCurrent(
+    const SocketAwareRebalancer &rebalancer,
+    const DecodeExpertHistogram &histogram)
+{
+    return rebalancer.propose(histogram, histogram.config().ownership);
+}
+
+/** @brief Apply a side-effect-free proposal to a copied ownership plan. */
+static MoELayeredExpertOwnership applyProposal(
+    MoELayeredExpertOwnership ownership,
+    const SocketRebalanceProposal &proposal)
+{
+    for (const auto &swap : proposal.swaps)
+    {
+        EXPECT_EQ(
+            ownership.owner(swap.layer_idx, swap.expert_id),
+            swap.from_socket);
+        ownership.assignOwner(
+            swap.layer_idx, swap.expert_id, swap.to_socket);
+    }
+    return ownership;
+}
 
 // ── Helpers ───────────────────────────────────────────
 
@@ -28,10 +54,12 @@ static DecodeExpertHistogramConfig makeConfig(
     for (int s = 0; s < num_sockets; ++s)
         cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
 
-    // Default: round-robin expert-to-socket
-    cfg.expert_to_socket.resize(num_experts);
+    // Default: repeat one round-robin ownership row across routed layers.
+    std::vector<int> owners(static_cast<size_t>(num_experts));
     for (int e = 0; e < num_experts; ++e)
-        cfg.expert_to_socket[e] = e % num_sockets;
+        owners[static_cast<size_t>(e)] = e % num_sockets;
+    cfg.ownership = MoELayeredExpertOwnership::uniform(
+        num_layers, num_sockets, owners);
 
     return cfg;
 }
@@ -124,9 +152,9 @@ TEST(Test__SocketAwareRebalancer, NoRebalance_BelowThreshold)
     }
 
     SocketAwareRebalancer rebalancer;
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_TRUE(proposal.empty());
-    EXPECT_EQ(proposal.numSwaps(), 0);
+    EXPECT_EQ(proposal.numOwnershipChanges(), 0);
 }
 
 TEST(Test__SocketAwareRebalancer, NoRebalance_InsufficientActivations)
@@ -146,7 +174,7 @@ TEST(Test__SocketAwareRebalancer, NoRebalance_InsufficientActivations)
         recordToken(hist, 0, experts, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_TRUE(proposal.empty());
 }
 
@@ -171,8 +199,9 @@ TEST(Test__SocketAwareRebalancer, NoRebalance_LayerCooldown)
     }
 
     // First propose should work (gen=0)
-    auto proposal1 = rebalancer.propose(hist);
+    auto proposal1 = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal1.empty());
+    rebalancer.recordApplied(proposal1);
 
     // Reset window (gen→1) and recreate same skew
     hist.resetWindow();
@@ -183,7 +212,7 @@ TEST(Test__SocketAwareRebalancer, NoRebalance_LayerCooldown)
     }
 
     // Second propose should be blocked by cooldown (gen=1, last=0, cooldown=3)
-    auto proposal2 = rebalancer.propose(hist);
+    auto proposal2 = proposeCurrent(rebalancer, hist);
     EXPECT_TRUE(proposal2.empty());
 
     // Advance past cooldown (gen=0 + cooldown=3 → need gen≥3)
@@ -196,7 +225,7 @@ TEST(Test__SocketAwareRebalancer, NoRebalance_LayerCooldown)
         recordToken(hist, 0, experts, weights);
     }
 
-    auto proposal3 = rebalancer.propose(hist);
+    auto proposal3 = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal3.empty());
 }
 
@@ -219,9 +248,9 @@ TEST(Test__SocketAwareRebalancer, SingleLayerSwap_SkewedRouting)
     rcfg.min_window_activations = 10;
     SocketAwareRebalancer rebalancer(rcfg);
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal.empty());
-    EXPECT_GT(proposal.numSwaps(), 0);
+    EXPECT_GT(proposal.numOwnershipChanges(), 0);
 
     // All swaps should be for layer 0
     for (const auto& swap : proposal.swaps)
@@ -231,6 +260,53 @@ TEST(Test__SocketAwareRebalancer, SingleLayerSwap_SkewedRouting)
     EXPECT_EQ(proposal.layer_metrics.size(), 1u);
     EXPECT_EQ(proposal.layer_metrics[0].layer_idx, 0);
     EXPECT_GT(proposal.layer_metrics[0].imbalance_before, 1.1f);
+}
+
+TEST(Test__SocketAwareRebalancer, ProposeUsesUpdatedHistogramPlacement)
+{
+    auto cfg = makeConfig(1, 4, 1, 256);
+    DecodeExpertHistogram hist(cfg);
+
+    // Move the hot expert to socket 1 before recording the next window.
+    // Proposals must use this current map, not the construction-time map.
+    const std::vector<int> updated_placement = {1, 1, 0, 0};
+    hist.updateOwnership(MoELayeredExpertOwnership::uniform(
+        1, 2, updated_placement));
+
+    std::vector<float> weights = {1.0f};
+    for (int t = 0; t < 50; ++t)
+        recordToken(hist, 0, {0}, weights);
+    for (int t = 0; t < 35; ++t)
+        recordToken(hist, 0, {1}, weights);
+    for (int t = 0; t < 10; ++t)
+        recordToken(hist, 0, {2}, weights);
+    for (int t = 0; t < 20; ++t)
+        recordToken(hist, 0, {3}, weights);
+
+    SocketRebalanceConfig rcfg;
+    rcfg.imbalance_threshold = 1.1f;
+    rcfg.max_swaps_per_layer = 1;
+    rcfg.min_window_activations = 1;
+    rcfg.min_improvement_ratio = 0.0f;
+    SocketAwareRebalancer rebalancer(rcfg);
+
+    auto proposal = proposeCurrent(rebalancer, hist);
+    ASSERT_FALSE(proposal.empty());
+
+    bool saw_updated_hot_socket_to_cold = false;
+    bool saw_updated_cold_socket_to_hot = false;
+    for (const auto &swap : proposal.swaps)
+    {
+        EXPECT_EQ(swap.from_socket, updated_placement[swap.expert_id]);
+        saw_updated_hot_socket_to_cold =
+            saw_updated_hot_socket_to_cold ||
+            (swap.from_socket == 1 && swap.to_socket == 0);
+        saw_updated_cold_socket_to_hot =
+            saw_updated_cold_socket_to_hot ||
+            (swap.from_socket == 0 && swap.to_socket == 1);
+    }
+    EXPECT_TRUE(saw_updated_hot_socket_to_cold);
+    EXPECT_TRUE(saw_updated_cold_socket_to_hot);
 }
 
 TEST(Test__SocketAwareRebalancer, MultiLayerSwaps)
@@ -257,7 +333,7 @@ TEST(Test__SocketAwareRebalancer, MultiLayerSwaps)
         recordToken(hist, 3, {2, 3}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal.empty());
 
     // Expect swaps for skewed layers (0 and 2) but not balanced ones (1 and 3)
@@ -267,6 +343,68 @@ TEST(Test__SocketAwareRebalancer, MultiLayerSwaps)
 
     EXPECT_TRUE(affected_layers.count(0) > 0);
     EXPECT_TRUE(affected_layers.count(2) > 0);
+}
+
+TEST(Test__SocketAwareRebalancer, SameExpertCanMoveOppositeDirectionsByLayer)
+{
+    DecodeExpertHistogramConfig cfg;
+    cfg.num_layers = 2;
+    cfg.num_experts = 4;
+    cfg.top_k = 1;
+    cfg.window_size = 256;
+    cfg.sockets = {
+        DeviceId(DeviceType::CPU, 0),
+        DeviceId(DeviceType::CPU, 1),
+    };
+    cfg.ownership = MoELayeredExpertOwnership(
+        2,
+        {
+            {0, 0, 1, 1},
+            {1, 1, 0, 0},
+        });
+    DecodeExpertHistogram hist(cfg);
+
+    // Each layer has an 80/20 participant split. Swapping expert zero (40)
+    // with expert three (0) produces a 40/60 split, so the same expert id is
+    // beneficial in opposite directions under the two ownership rows.
+    const uint64_t counts[] = {40, 40, 20, 0};
+    hist.mergeLayerCounts(0, counts, 4);
+    hist.mergeLayerCounts(1, counts, 4);
+
+    SocketRebalanceConfig rebalance_config;
+    rebalance_config.imbalance_threshold = 1.01f;
+    rebalance_config.min_improvement_ratio = 0.0f;
+    rebalance_config.min_window_activations = 1;
+    rebalance_config.max_swaps_per_layer = 1;
+    rebalance_config.max_total_swaps = 4;
+    rebalance_config.layer_cooldown_generations = 0;
+    SocketAwareRebalancer rebalancer(rebalance_config);
+
+    const auto proposal = proposeCurrent(rebalancer, hist);
+    ASSERT_EQ(proposal.numOwnershipChanges(), 4);
+
+    bool layer_zero_hot_move = false;
+    bool layer_one_hot_move = false;
+    for (const auto &swap : proposal.swaps)
+    {
+        if (swap.layer_idx == 0 && swap.expert_id == 0)
+        {
+            layer_zero_hot_move = true;
+            EXPECT_EQ(swap.from_socket, 0);
+            EXPECT_EQ(swap.to_socket, 1);
+        }
+        if (swap.layer_idx == 1 && swap.expert_id == 0)
+        {
+            layer_one_hot_move = true;
+            EXPECT_EQ(swap.from_socket, 1);
+            EXPECT_EQ(swap.to_socket, 0);
+        }
+    }
+    EXPECT_TRUE(layer_zero_hot_move);
+    EXPECT_TRUE(layer_one_hot_move);
+
+    const auto updated = applyProposal(cfg.ownership, proposal);
+    EXPECT_TRUE(updated.hasSameLayerCapacitiesAs(cfg.ownership));
 }
 
 TEST(Test__SocketAwareRebalancer, MaxSwapsPerLayer_Respected)
@@ -288,7 +426,7 @@ TEST(Test__SocketAwareRebalancer, MaxSwapsPerLayer_Respected)
         recordToken(hist, 0, experts, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal.empty());
 
     // Count swaps for layer 0: each swap-pair produces 2 ExpertSwap entries
@@ -324,8 +462,31 @@ TEST(Test__SocketAwareRebalancer, MaxTotalSwaps_Respected)
         }
     }
 
-    auto proposal = rebalancer.propose(hist);
-    EXPECT_LE(proposal.numSwaps(), rcfg.max_total_swaps);
+    auto proposal = proposeCurrent(rebalancer, hist);
+    EXPECT_LE(proposal.numOwnershipChanges(), rcfg.max_total_swaps);
+}
+
+TEST(Test__SocketAwareRebalancer, OddTotalBudgetNeverSplitsCapacityPair)
+{
+    auto cfg = makeConfig(1, 8, 2, 1000);
+    DecodeExpertHistogram hist(cfg);
+    const uint64_t counts[] = {100, 1, 90, 1, 80, 1, 70, 1};
+    hist.mergeLayerCounts(0, counts, 8);
+
+    SocketRebalanceConfig rebalance_config;
+    rebalance_config.imbalance_threshold = 1.01f;
+    rebalance_config.min_improvement_ratio = 0.0f;
+    rebalance_config.min_window_activations = 1;
+    rebalance_config.max_swaps_per_layer = 4;
+    rebalance_config.max_total_swaps = 3;
+    SocketAwareRebalancer rebalancer(rebalance_config);
+
+    const auto proposal = proposeCurrent(rebalancer, hist);
+    EXPECT_EQ(proposal.numOwnershipChanges(), 2);
+    EXPECT_EQ(proposal.numOwnershipChanges() % 2, 0);
+    EXPECT_TRUE(
+        applyProposal(cfg.ownership, proposal)
+            .hasSameLayerCapacitiesAs(cfg.ownership));
 }
 
 TEST(Test__SocketAwareRebalancer, MinImprovementRatio_RejectsMarginalSwaps)
@@ -353,7 +514,7 @@ TEST(Test__SocketAwareRebalancer, MinImprovementRatio_RejectsMarginalSwaps)
         recordToken(hist, 0, {0, 2}, weights); // both socket 0
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     // The imbalance is small and swapping won't achieve 50% improvement
     // This may or may not be empty depending on exact counts, but
     // the key is that marginal swaps are rejected
@@ -378,12 +539,14 @@ TEST(Test__SocketAwareRebalancer, SwapPreservesExpertCount)
         recordToken(hist, 0, {0, 2}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     if (proposal.empty()) return; // can't test if no swaps
 
-    auto original_counts = countExpertsPerSocket(cfg.expert_to_socket, num_sockets);
-    auto new_placement = rebalancer.apply(cfg.expert_to_socket, proposal);
-    auto new_counts = countExpertsPerSocket(new_placement, num_sockets);
+    const auto original_counts = countExpertsPerSocket(
+        cfg.ownership.ownersForLayer(0), num_sockets);
+    const auto new_ownership = applyProposal(cfg.ownership, proposal);
+    const auto new_counts = countExpertsPerSocket(
+        new_ownership.ownersForLayer(0), num_sockets);
 
     // Swaps are paired: each expert moved from A→B has a partner moved B→A
     // So expert counts per socket should be preserved
@@ -407,16 +570,18 @@ TEST(Test__SocketAwareRebalancer, Apply_UpdatesPlacement)
         recordToken(hist, 0, {0, 2}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     if (proposal.empty()) return;
 
-    auto new_placement = rebalancer.apply(cfg.expert_to_socket, proposal);
+    const auto new_ownership = applyProposal(cfg.ownership, proposal);
+    const auto &new_placement = new_ownership.ownersForLayer(0);
     EXPECT_EQ(new_placement.size(), static_cast<size_t>(num_experts));
 
     // Verify at least one expert changed socket
     bool any_changed = false;
     for (int e = 0; e < num_experts; ++e) {
-        if (new_placement[e] != cfg.expert_to_socket[e]) {
+        if (new_placement[static_cast<size_t>(e)] !=
+            cfg.ownership.owner(0, e)) {
             any_changed = true;
             break;
         }
@@ -425,7 +590,9 @@ TEST(Test__SocketAwareRebalancer, Apply_UpdatesPlacement)
 
     // Verify changed experts match the swaps
     for (const auto& swap : proposal.swaps) {
-        EXPECT_EQ(new_placement[swap.expert_id], swap.to_socket);
+        EXPECT_EQ(
+            new_ownership.owner(swap.layer_idx, swap.expert_id),
+            swap.to_socket);
     }
 }
 
@@ -446,7 +613,7 @@ TEST(Test__SocketAwareRebalancer, ProposalSummary_Format)
         recordToken(hist, 0, {0, 2}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     std::string summary = proposal.summary();
     EXPECT_FALSE(summary.empty());
     EXPECT_NE(summary.find("SocketRebalanceProposal"), std::string::npos);
@@ -493,13 +660,15 @@ TEST(Test__SocketAwareRebalancer, LargeScale_256Experts_2Sockets)
     // Layer 3: moderate skew
     recordSkewedTraffic(hist, 3, 1000, top_k, num_experts, {0, 2, 4}, 0.7f);
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     // Should have some swaps for skewed layers
-    EXPECT_LE(proposal.numSwaps(), rcfg.max_total_swaps);
+    EXPECT_LE(proposal.numOwnershipChanges(), rcfg.max_total_swaps);
 
     if (!proposal.empty()) {
-        auto new_placement = rebalancer.apply(cfg.expert_to_socket, proposal);
-        EXPECT_EQ(new_placement.size(), static_cast<size_t>(num_experts));
+        const auto new_ownership = applyProposal(cfg.ownership, proposal);
+        EXPECT_EQ(
+            new_ownership.ownersForLayer(0).size(),
+            static_cast<size_t>(num_experts));
     }
 }
 
@@ -515,7 +684,7 @@ TEST(Test__SocketAwareRebalancer, ConvergesAfterMultipleCycles)
     rcfg.layer_cooldown_generations = 0; // no cooldown for convergence test
     SocketAwareRebalancer rebalancer(rcfg);
 
-    std::vector<int> placement = cfg.expert_to_socket;
+    auto ownership = cfg.ownership;
 
     // Fixed expert activation counts: experts 0,2 are very hot (socket 0),
     // experts 1,3 are cold (socket 1). This creates clear socket imbalance.
@@ -546,21 +715,24 @@ TEST(Test__SocketAwareRebalancer, ConvergesAfterMultipleCycles)
 
         if (cycle == 0) {
             auto counts = hist.layerHistogram(0);
-            initial_imbalance = computeImbalance(counts, placement, 2);
+            initial_imbalance = computeImbalance(
+                counts, ownership.ownersForLayer(0), 2);
         }
 
-        auto proposal = rebalancer.propose(hist);
+        auto proposal = proposeCurrent(rebalancer, hist);
         if (proposal.empty()) break; // converged
 
-        placement = rebalancer.apply(placement, proposal);
-        hist.updatePlacement(placement);
+        ownership = applyProposal(std::move(ownership), proposal);
+        hist.updateOwnership(ownership);
+        rebalancer.recordApplied(proposal);
     }
 
     // After rebalancing, should be more balanced
     hist.resetWindow();
     recordFixedPattern(hist);
     auto final_counts = hist.layerHistogram(0);
-    float final_imbalance = computeImbalance(final_counts, placement, 2);
+    float final_imbalance = computeImbalance(
+        final_counts, ownership.ownersForLayer(0), 2);
     EXPECT_LT(final_imbalance, initial_imbalance);
 }
 
@@ -575,7 +747,8 @@ TEST(Test__SocketAwareRebalancer, AllExpertsOnOneSocket)
     cfg.window_size = 5000;
     cfg.sockets.push_back(DeviceId(DeviceType::CPU, 0));
     cfg.sockets.push_back(DeviceId(DeviceType::CPU, 1));
-    cfg.expert_to_socket.assign(num_experts, 0); // all on socket 0
+    cfg.ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, std::vector<int>(static_cast<size_t>(num_experts), 0));
 
     DecodeExpertHistogram hist(cfg);
 
@@ -591,14 +764,14 @@ TEST(Test__SocketAwareRebalancer, AllExpertsOnOneSocket)
         recordToken(hist, 0, {t % num_experts, (t + 1) % num_experts}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     // Socket 1 has load=0, socket 0 has all load → infinite imbalance
     // But proposeForLayer handles this: we need at least one expert on each socket
     // to do a swap. With all on socket 0, the underloaded socket has no experts.
     // The algorithm should handle this gracefully (no crash, possibly no swaps
     // if under_experts is empty).
     // The key test is that it doesn't crash.
-    EXPECT_NO_FATAL_FAILURE(rebalancer.propose(hist));
+    EXPECT_NO_FATAL_FAILURE(proposeCurrent(rebalancer, hist));
 }
 
 TEST(Test__SocketAwareRebalancer, ThreeSocket_NotJustTwo)
@@ -621,7 +794,7 @@ TEST(Test__SocketAwareRebalancer, ThreeSocket_NotJustTwo)
         recordToken(hist, 0, {0, 3}, weights);
     }
 
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_FALSE(proposal.empty());
 
     // Swaps should move from socket 0 to one of the underloaded sockets
@@ -634,7 +807,8 @@ TEST(Test__SocketAwareRebalancer, ThreeSocket_NotJustTwo)
     }
 
     // Verify placement still has correct socket range
-    auto new_placement = rebalancer.apply(cfg.expert_to_socket, proposal);
+    const auto new_ownership = applyProposal(cfg.ownership, proposal);
+    const auto &new_placement = new_ownership.ownersForLayer(0);
     for (int e = 0; e < num_experts; ++e) {
         EXPECT_GE(new_placement[e], 0);
         EXPECT_LT(new_placement[e], num_sockets);
@@ -648,7 +822,7 @@ TEST(Test__SocketAwareRebalancer, EmptyHistogram_NoSwaps)
 
     // No traffic recorded at all
     SocketAwareRebalancer rebalancer;
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_TRUE(proposal.empty());
 }
 
@@ -663,6 +837,6 @@ TEST(Test__SocketAwareRebalancer, SingleSocket_NoSwaps)
         recordToken(hist, 0, {0, 1}, weights);
 
     SocketAwareRebalancer rebalancer;
-    auto proposal = rebalancer.propose(hist);
+    auto proposal = proposeCurrent(rebalancer, hist);
     EXPECT_TRUE(proposal.empty());
 }

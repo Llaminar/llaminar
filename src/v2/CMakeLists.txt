@@ -1,14 +1,7 @@
 # Llaminar v2 - Clean greenfield implementation
 cmake_minimum_required(VERSION 3.18)
 
-# Define custom build types BEFORE project() so they're recognized
-# Define custom build type: E2ERelease (Release + Snapshots for E2E testing)
-# Usage: cmake -DCMAKE_BUILD_TYPE=E2ERelease
-set(CMAKE_CXX_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_C_FLAGS_E2ERELEASE "-O3 -DNDEBUG" CACHE STRING "Flags for E2E Release builds")
-set(CMAKE_EXE_LINKER_FLAGS_E2ERELEASE "" CACHE STRING "Linker flags for E2E Release builds")
-mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_LINKER_FLAGS_E2ERELEASE)
-
+# Define custom build types BEFORE project() so they're recognized.
 # Define custom build type: Integration (Release + Snapshots + Debug symbols + Assertions)
 # Usage: cmake -DCMAKE_BUILD_TYPE=Integration
 # This enables optimized code with snapshot capture, backtraces for debugging, AND assertions.
@@ -16,11 +9,30 @@ mark_as_advanced(CMAKE_CXX_FLAGS_E2ERELEASE CMAKE_C_FLAGS_E2ERELEASE CMAKE_EXE_L
 # keeps our custom assertions active for integration testing.
 set(CMAKE_CXX_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
 set(CMAKE_C_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "Flags for Integration builds (Release + debug symbols + assertions)")
+if(NOT DEFINED CMAKE_CUDA_FLAGS_INTEGRATION OR CMAKE_CUDA_FLAGS_INTEGRATION STREQUAL "")
+    set(CMAKE_CUDA_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "CUDA flags for Integration builds (Release + debug symbols + assertions)" FORCE)
+endif()
+if(NOT DEFINED CMAKE_HIP_FLAGS_INTEGRATION OR CMAKE_HIP_FLAGS_INTEGRATION STREQUAL "")
+    set(CMAKE_HIP_FLAGS_INTEGRATION "-O3 -g -DNDEBUG -DLLAMINAR_ENABLE_ASSERTIONS" CACHE STRING "HIP flags for Integration builds (Release + debug symbols + assertions)" FORCE)
+endif()
 set(CMAKE_EXE_LINKER_FLAGS_INTEGRATION "" CACHE STRING "Linker flags for Integration builds")
-mark_as_advanced(CMAKE_CXX_FLAGS_INTEGRATION CMAKE_C_FLAGS_INTEGRATION CMAKE_EXE_LINKER_FLAGS_INTEGRATION)
+mark_as_advanced(
+    CMAKE_CXX_FLAGS_INTEGRATION
+    CMAKE_C_FLAGS_INTEGRATION
+    CMAKE_CUDA_FLAGS_INTEGRATION
+    CMAKE_HIP_FLAGS_INTEGRATION
+    CMAKE_EXE_LINKER_FLAGS_INTEGRATION)
 
-# Add custom build types to valid build types
-set(CMAKE_CONFIGURATION_TYPES "Debug;Release;E2ERelease;Integration" CACHE STRING "" FORCE)
+# Keep the supported configuration set closed. In particular, arbitrary
+# single-config names must fail during configuration instead of silently
+# inheriting empty compiler flags.
+set(LLAMINAR_SUPPORTED_BUILD_TYPES Debug Release Integration)
+set(CMAKE_CONFIGURATION_TYPES "${LLAMINAR_SUPPORTED_BUILD_TYPES}" CACHE STRING "" FORCE)
+if(CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE IN_LIST LLAMINAR_SUPPORTED_BUILD_TYPES)
+    message(FATAL_ERROR
+        "Unsupported CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'. "
+        "Choose Debug, Release, or Integration.")
+endif()
 
 # Project declaration - MUST come after custom build type definitions
 # The build type flags are picked up by the compiler setup during project()
@@ -54,8 +66,34 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-# Enable native CPU optimizations (AVX512/AVX2/FMA)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
+# CPU ISA selection. Keep this explicit so the binary can be built for either
+# AVX512-capable hosts or an AVX2-only baseline without inheriting the builder's
+# full native ISA by accident.
+set(LLAMINAR_CPU_ISA "AVX512" CACHE STRING "Maximum x86 SIMD ISA to compile for: AVX512 or AVX2")
+set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2)
+string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
+
+set(LLAMINAR_CPU_AVX2_FLAGS "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
+set(LLAMINAR_CPU_AVX512_FLAGS
+    "${LLAMINAR_CPU_AVX2_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni")
+
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX512_FLAGS}")
+    add_compile_definitions(
+        LLAMINAR_COMPILED_WITH_AVX2=1
+        LLAMINAR_COMPILED_WITH_AVX512=1)
+elseif(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX2")
+    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX2_FLAGS}")
+    add_compile_definitions(
+        LLAMINAR_COMPILED_WITH_AVX2=1
+        LLAMINAR_COMPILED_WITH_AVX512=0)
+else()
+    message(FATAL_ERROR "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2.")
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
+message(STATUS "V2: CPU ISA target: ${LLAMINAR_CPU_ISA_UPPER} (${LLAMINAR_CPU_COMPILE_FLAGS})")
 
 # Backend options (Phase 6: Heterogeneous Multi-GPU)
 # CUDA and ROCm CAN coexist - compiled in separate translation units
@@ -149,7 +187,21 @@ endif()
 # CUDA Backend Configuration
 # =============================================================================
 if(HAVE_CUDA)
+    # CMake initializes CMAKE_CUDA_ARCHITECTURES during enable_language(CUDA)
+    # from CUDAARCHS or the compiler default. Seed our project default first so
+    # a fresh configure targets sm_86 instead of nvcc's older fallback.
+    if((NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+       AND NOT DEFINED ENV{CUDAARCHS})
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures" FORCE)
+    endif()
+
     enable_language(CUDA)
+    # CUDA 13 supports the C++20 device dialect used by the production kernels.
+    # Set the project-wide floor here so standalone benchmarks and tools cannot
+    # silently fall back to CMake's older compiler default.
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS ON)
     find_package(CUDAToolkit REQUIRED)
     
     message(STATUS "V2: CUDA enabled")
@@ -171,10 +223,10 @@ if(HAVE_CUDA)
             
             add_compile_definitions(HAVE_ONNX_RUNTIME)
         else()
-            message(WARNING "V2: ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
-            message(WARNING "V2: Neural network heuristic disabled")
-            message(WARNING "V2: Download from: https://github.com/microsoft/onnxruntime/releases")
-            message(WARNING "V2: Extract to: /opt/onnxruntime")
+            message(STATUS "V2: ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
+            message(STATUS "V2: Neural network heuristic disabled")
+            message(STATUS "V2: Download from: https://github.com/microsoft/onnxruntime/releases")
+            message(STATUS "V2: Extract to: /opt/onnxruntime")
             set(USE_ONNX_HEURISTIC OFF)
         endif()
     endif()
@@ -186,7 +238,7 @@ if(HAVE_CUDA)
     # Honor CMAKE_CUDA_ARCHITECTURES so release images can be built for a
     # specific fleet or a local smoke-test GPU without forcing a broad fatbin.
     if(NOT CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures" FORCE)
     endif()
     set(LLAMINAR_HAS_AMPERE_CUDA_ARCH OFF)
     foreach(LLAMINAR_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -204,8 +256,8 @@ if(HAVE_CUDA)
         message(FATAL_ERROR
             "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
             "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
-            "Reconfigure with -DCMAKE_CUDA_ARCHITECTURES='80;86;89;90' or a local "
-            "SM80+ value such as 86.")
+            "Reconfigure with a local SM80+ value such as "
+            "-DCMAKE_CUDA_ARCHITECTURES=86.")
     endif()
     message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
@@ -219,14 +271,14 @@ if(HAVE_CUDA)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
     
-    # NOTE: CUDA_SEPARABLE_COMPILATION is set per-target (on cuda_backend and
-    # device_benchmarks) rather than globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
+    # NOTE: CUDA_SEPARABLE_COMPILATION is set on cuda_backend rather than
+    # globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
     # this resolves device symbols at library build time. Without this, every downstream
     # executable (580+ test binaries) gets its own nvcc device-link step, adding ~19MB
-    # per executable and massive link time. With per-library resolution, only the 3 GPU
+    # per executable and massive link time. With per-library resolution, only the GPU
     # libraries need device linking — executables link normally.
     #
-    # The nvlink_pool job limit is no longer needed (3 library device links vs 580+
+    # The nvlink_pool job limit is no longer needed (library device links vs 580+
     # executable device links), but we keep a small pool as a safety net.
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
@@ -249,6 +301,12 @@ if(HAVE_ROCM)
     
     # Enable HIP language for ROCm compilation
     enable_language(HIP)
+    # ROCm clang 20 supports C++20 throughout host and device compilation.
+    # Individual targets may opt into C++23, but no HIP translation unit may
+    # inherit the legacy C++17 default.
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    set(CMAKE_HIP_EXTENSIONS ON)
     
     # Find HIP
     list(APPEND CMAKE_PREFIX_PATH ${ROCM_PATH})
@@ -292,10 +350,21 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
         kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
         kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
-        kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
+        # NativeVNNI decode/grouped GEMV is physically sharded by codebook pair.
+        # Eight independent objects expose real Ninja parallelism; the dispatch
+        # TU preserves the single public ABI and contains no device templates.
+        kernels/cuda/gemm/CUDANativeVNNIGemvDispatch.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard0.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard1.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard2.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard3.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard4.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard5.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard6.cu
+        kernels/cuda/gemm/CUDANativeVNNIGemvShard7.cu
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
-        kernels/cuda/gemm/CUDAcuBLASQuantGemm.cu          # cuBLAS FP16 GEMM path for quantized weights (env: LLAMINAR_CUBLAS_GEMM=1)
+        kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
@@ -305,22 +374,40 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
+        kernels/cuda/ops/CUDATPRankOrderedReductionKernels.cu # Batch-invariant rank-ordered TP sums
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
+        kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
+        kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
         kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
+        kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
+        kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
         kernels/cuda/repack/CUDAVnniUnpackKernels.cu   # VNNI reverse repack (GPU separated → raw GGUF)
+        kernels/cuda/repack/CUDAExpertTierWeightKernels.cu # ExpertOverlay GPU/CPU stream conversion
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
+
+    # Prefill still owns hundreds of independent device-template instantiations
+    # in one TU, so ask nvcc to split its internal optimization work. Decode is
+    # physically sharded above: keeping compiler-internal split work there would
+    # oversubscribe eight already independent Ninja jobs.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.3")
+        set_source_files_properties(
+            kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu
+            PROPERTIES COMPILE_OPTIONS "--split-compile=8"
+        )
+    endif()
     
     # NOTE: CUDA kernel ITensorGemm adapters (CUDAFloatingPointGemmKernel.cpp, CUDAQuantisedGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT nvcc)
@@ -340,6 +427,7 @@ if(HAVE_CUDA)
     # Note: NvidiaContextFactory.cu registers the CUDA factory with GPUDeviceContextPool
     # Note: CUDAWorkerImpl.cu provides cuda_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(cuda_backend STATIC 
+        backends/cuda/CUDADriverApi.cpp
         backends/cuda/CUDABackend.cu
         backends/cuda/CUDATensorValidation.cu
         backends/cuda/NvidiaDeviceContext.cu
@@ -360,6 +448,9 @@ if(HAVE_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS ON
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -382,12 +473,15 @@ if(HAVE_CUDA)
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
+    # Driver API symbols are deferred by CUDADriverApi; CPU-only cluster members
+    # load this same full binary without an NVIDIA driver or toolkit stub.
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
         CUDA::cublas
         CUDA::cublasLt
+        ${CMAKE_DL_LIBS}
     )
     
     # Link MPI for NCCLBackend.cpp (which uses MPI_Comm_rank for distributed communication)
@@ -436,7 +530,9 @@ if(HAVE_CUDA)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
-        # CUTLASS requires C++17 minimum, we use C++23 for stacktrace
+        # Host adapters use the project's C++23 dialect. CUDA translation units
+        # use the explicit C++20 device dialect above, which is the common
+        # fully-supported level across the pinned CUDA and ROCm toolchains.
         target_compile_features(cuda_backend PUBLIC cxx_std_23)
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
@@ -454,17 +550,7 @@ if(HAVE_CUDA)
     # =========================================================================
     # NCCL provides optimized multi-GPU and multi-node collective operations.
     # Used by NCCLBackend for AllReduce, AllGather, etc. in tensor parallelism.
-    find_path(NCCL_INCLUDE_DIR nccl.h
-        HINTS
-            ${CUDAToolkit_INCLUDE_DIRS}
-            ${CUDA_TOOLKIT_ROOT_DIR}/include
-        PATHS
-            /usr/include
-            /usr/local/include
-            /opt/nccl/include
-            /usr/local/cuda/include
-    )
-    find_library(NCCL_LIBRARY nccl
+    find_library(LLAMINAR_NCCL_LIBRARY llaminar_nccl
         HINTS
             ${CUDAToolkit_LIBRARY_DIR}
             ${CUDA_TOOLKIT_ROOT_DIR}/lib64
@@ -477,31 +563,27 @@ if(HAVE_CUDA)
             /usr/local/cuda/lib64
     )
     
-    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    if(LLAMINAR_NCCL_LIBRARY)
+        set(NCCL_LIBRARY "${LLAMINAR_NCCL_LIBRARY}")
         set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
         add_compile_definitions(HAVE_NCCL)
         message(STATUS "V2: NCCL found")
-        message(STATUS "V2:   Include: ${NCCL_INCLUDE_DIR}")
         message(STATUS "V2:   Library: ${NCCL_LIBRARY}")
         
         # CRITICAL: NCCL is now loaded dynamically via dlopen() in NCCLDynamicLoader.cpp
         # to avoid symbol conflicts with RCCL, which exports identical symbol names.
-        # We only need the headers for NCCLBackendCUDA.cu (it doesn't actually link NCCL anymore).
-        # NCCLDynamicLoader loads NCCL at runtime with RTLD_LOCAL to isolate symbols.
-        target_include_directories(cuda_backend PUBLIC ${NCCL_INCLUDE_DIR})
+        # NCCLDynamicLoader owns the isolated ABI declarations and loads NCCL
+        # with RTLD_LOCAL. No consumer includes nccl.h; exporting the vendor's
+        # include directory would leak its conflicting global names to RCCL.
         target_compile_definitions(cuda_backend PUBLIC HAVE_NCCL)
         # Link dl for dlopen/dlsym
         target_link_libraries(cuda_backend PUBLIC ${CMAKE_DL_LIBS})
         message(STATUS "V2: NCCL will be loaded dynamically (dlopen) from cuda_backend for symbol isolation")
     else()
-        set(HAVE_NCCL OFF CACHE BOOL "NCCL library not found")
-        message(WARNING "V2: NCCL not found - NCCLBackend will be disabled")
-        if(NOT NCCL_INCLUDE_DIR)
-            message(WARNING "V2:   nccl.h not found in standard paths")
-        endif()
-        if(NOT NCCL_LIBRARY)
-            message(WARNING "V2:   libnccl.so not found in standard paths")
-        endif()
+        message(FATAL_ERROR
+            "V2: CUDA requires the capture-reentry NCCL dependency. "
+            "Run sudo bash scripts/docker/install-nccl.sh, or rebuild the devcontainer. "
+            "System libnccl is not an equivalent capture implementation.")
     endif()
 endif()
 
@@ -517,16 +599,28 @@ endif()
 if(HAVE_ROCM)
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
+        backends/rocm/HIPGraphTimelineKernels.hip            # Retained mapped-timeline system-release nodes
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
-        kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
-        kernels/rocm/gemm/ROCmTinyFP32ProjectionKernels.hip # Tiny graph-capturable FP32 small-M projection kernels
+        # NativeVNNI prefill is physically sharded by codebook pair so LLVM can
+        # optimize all format families concurrently instead of serializing one
+        # multi-minute translation unit.
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard0.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard1.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard2.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard3.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard4.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard5.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard6.hip
+        kernels/rocm/gemm/ROCmNativeVNNIGemmShard7.hip
+        kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
+        kernels/rocm/kvcache/ROCmAttentionKeyQ8Kernels.hip    # Quadratic-companded attention-key cache codec
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip            # TurboQuant KV cache (TQ8-K/TQ4-V split)
         kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)
@@ -539,13 +633,19 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
         kernels/rocm/ops/ROCmFusedOpsKernels.hip              # Fused Residual+RMSNorm, Fused SwiGLU+Quant kernels
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
+        kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
+        kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
+        kernels/rocm/moe/ROCmMoEOverlayEpochKernels.hip       # Captured ExpertOverlay placement-epoch RCU
         # GPU weight loading pipeline repack kernels
         kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
         kernels/rocm/repack/VnniUnpackKernels.hip            # VNNI reverse repack (GPU separated → raw GGUF)
+        kernels/rocm/repack/ROCmExpertTierWeightKernels.hip  # ExpertOverlay GPU/CPU stream conversion
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )
@@ -562,6 +662,7 @@ if(HAVE_ROCM)
     # Note: AMDContextFactory.cpp registers the ROCm factory with GPUDeviceContextPool
     # Note: ROCmWorkerImpl.cpp provides rocm_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(rocm_backend STATIC 
+        backends/rocm/ROCmRuntimeStartup.cpp
         backends/rocm/ROCmBackend.cpp
         backends/rocm/ROCmTensorValidation.cpp
         backends/rocm/AMDDeviceContext.cpp
@@ -575,12 +676,17 @@ if(HAVE_ROCM)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
         collective/coordinators/RCCLCoordinator.cpp          # RCCL collective coordinator
+        kernels/rocm/gemm/ROCmNativeVNNIGemmDispatch.cpp     # Host-only public dispatcher for sharded NativeVNNI GEMM
         ${ROCM_KERNEL_SOURCES}
     )
     # Resolve HIP device symbols at library build time (same rationale as cuda_backend).
     set_target_properties(rocm_backend PROPERTIES
         HIP_RESOLVE_DEVICE_SYMBOLS ON
+        HIP_STANDARD 20
+        HIP_STANDARD_REQUIRED ON
+        HIP_EXTENSIONS ON
     )
+    target_compile_features(rocm_backend PUBLIC cxx_std_23)
     target_include_directories(rocm_backend PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${ROCM_PATH}/include
@@ -670,8 +776,8 @@ if(HAVE_ROCM)
     # =========================================================================
     # RCCL Auto-Clone and Build for ROCm Multi-GPU Support
     # =========================================================================
-    # The Ubuntu-packaged RCCL (rccl 2.27.7.70101-38~24.04) has broken gfx906
-    # (MI50/MI60) kernel binaries. When using multi-GPU on these architectures,
+    # The Ubuntu-packaged RCCL has no usable gfx906 (MI50/MI60) kernel binaries.
+    # When using multi-GPU on these architectures,
     # the library crashes with SIGSEGV in ihipLaunchKernel() because the GPU
     # kernels fail to load (hipErrorNoBinaryForGpu).
     #
@@ -687,14 +793,19 @@ if(HAVE_ROCM)
            "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
            OFF)
 
+    # Discovery must know the local dependency location even when it is
+    # already built and nested dependency compilation is disabled. Runtime
+    # loading now honors this CMake selection exactly.
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
+    set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
+
     if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
         find_package(Git REQUIRED)
     
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
-    set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
+    set(RCCL_GIT_REF "rocm-7.2.4")  # Match our ROCm version
     set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
         "C compiler used for the nested RCCL source build")
     set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH
@@ -771,9 +882,26 @@ if(HAVE_ROCM)
         set(RCCL_COMMIT "${RCCL_GIT_REF}")
         message(STATUS "V2: RCCL source is not a git checkout and has no ref marker; using ${RCCL_COMMIT} for cache validation")
     endif()
+
+    # A pinned upstream ref alone is not a complete runtime identity: the HIP
+    # event-wait capture patch changes the source-built RCCL DSO. Apply it
+    # idempotently and include its contents in the build cache key.
+    set(RCCL_CAPTURE_PATCH_FILE
+        "${REPO_ROOT}/scripts/docker/patches/rccl-hip-capture-event-wait.patch")
+    execute_process(
+        COMMAND bash "${REPO_ROOT}/scripts/docker/apply-rccl-capture-patch.sh"
+            "${RCCL_EXTERNAL_DIR}"
+        RESULT_VARIABLE RCCL_CAPTURE_PATCH_RESULT
+        ERROR_VARIABLE RCCL_CAPTURE_PATCH_ERROR
+    )
+    if(NOT RCCL_CAPTURE_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "V2: RCCL capture patch failed: ${RCCL_CAPTURE_PATCH_ERROR}")
+    endif()
+    file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}")
     
     # Check if RCCL build is up-to-date
-    set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
     
     set(RCCL_BUILD_COMMIT "missing")
@@ -782,8 +910,8 @@ if(HAVE_ROCM)
         string(STRIP "${RCCL_BUILD_COMMIT_RAW}" RCCL_BUILD_COMMIT)
     endif()
     
-    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_COMMIT)
-        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_COMMIT}, rebuilding...")
+    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_BUILD_ID)
+        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_BUILD_ID}, rebuilding...")
         file(REMOVE_RECURSE "${RCCL_BUILD_DIR}")
     endif()
     
@@ -836,7 +964,7 @@ if(HAVE_ROCM)
         endif()
         
         # Write version file for cache validation
-        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_COMMIT}\n")
+        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_BUILD_ID}\n")
         
         message(STATUS "V2: RCCL built successfully in ${RCCL_BUILD_DIR}")
     else()
@@ -879,6 +1007,13 @@ if(HAVE_ROCM)
     if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
         set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
         add_compile_definitions(HAVE_RCCL)
+
+        # Dynamic loading isolates RCCL's NCCL-named symbols, but must not
+        # rediscover a different library at runtime. Compile the exact selected
+        # dependency into only the loader TU; packaged images install it at the
+        # same stable path in both their builder and runtime stages.
+        set_property(SOURCE collective/backends/RCCLDynamicLoader.cpp APPEND
+            PROPERTY COMPILE_DEFINITIONS "LLAMINAR_RCCL_LIBRARY_PATH=\"${RCCL_LIBRARY}\"")
         
         # Check if we're using our local build or system RCCL
         string(FIND "${RCCL_LIBRARY}" "${RCCL_BUILD_DIR}" RCCL_IS_LOCAL)
@@ -902,77 +1037,14 @@ if(HAVE_ROCM)
     endif()
 endif()
 
-# =============================================================================
-# Device Benchmarks (CPU + CUDA + ROCm)
-# =============================================================================
-# Lightweight benchmarks for measuring actual device capabilities:
-# - Memory bandwidth (GB/s)
-# - Compute throughput (GFLOPS/GOPS)
-# - Host-device transfer rates
-# - Peer-to-peer transfer rates (multi-GPU)
-#
-# Results are used by PlacementStrategy to make informed placement decisions
-# based on measured values rather than heuristic estimates.
-
-set(BENCHMARK_SOURCES
-    backends/benchmarks/DeviceBenchmark.cpp
-    backends/benchmarks/CPUBenchmark.cpp
-)
-
-# Add CUDA benchmark if CUDA backend enabled
-if(HAVE_CUDA)
-    list(APPEND BENCHMARK_SOURCES backends/benchmarks/CUDABenchmark.cu)
-endif()
-
-# Add ROCm benchmark if ROCm backend enabled
-if(HAVE_ROCM)
-    list(APPEND BENCHMARK_SOURCES backends/benchmarks/ROCmBenchmark.cpp)
-endif()
-
-
-
-add_library(device_benchmarks STATIC ${BENCHMARK_SOURCES})
-# Resolve device symbols at library build time (same rationale as cuda_backend/rocm_backend).
-if(HAVE_CUDA)
-    set_target_properties(device_benchmarks PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-    )
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
-    endif()
-endif()
-if(HAVE_ROCM)
-    set_target_properties(device_benchmarks PROPERTIES
-        HIP_RESOLVE_DEVICE_SYMBOLS ON
-    )
-endif()
-target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
-
-if(HAVE_CUDA)
-    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart)
-    target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
-endif()
-
-if(HAVE_ROCM)
-    target_link_libraries(device_benchmarks PRIVATE hip::host)
-    target_compile_definitions(device_benchmarks PRIVATE HAVE_ROCM=1)
-    # ROCm files need HIP compilation
+# HostBackendROCm belongs to the live collective backend, not an optional
+# benchmark library. Preserve its HIP compilation when both vendors are built.
+if(HAVE_ROCM AND HAVE_CUDA)
     set_source_files_properties(
-        backends/benchmarks/ROCmBenchmark.cpp
+        collective/backends/HostBackendROCm.cpp
         PROPERTIES LANGUAGE HIP
     )
-    if(HAVE_CUDA)
-        set_source_files_properties(
-            collective/backends/HostBackendROCm.cpp
-            PROPERTIES LANGUAGE HIP
-        )
-    endif()
 endif()
-
-message(STATUS "V2: Device benchmarks library configured")
 
 # =============================================================================
 # OneDNN Configuration for INT8/BF16 GEMM Acceleration
@@ -1062,9 +1134,16 @@ if(USE_ONEDNN)
         message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
     endif()
 
-    # Now check if OneDNN is built for the requested commit
-    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
+    # Keep one installed oneDNN tree per compiled ISA. AVX512 binaries are
+    # intentionally also exercised with AVX2 runtime dispatch by the CPU
+    # NativeVNNI trainer, while AVX2-only release artifacts remain separately
+    # runnable. A shared `build/` directory made configuring either tree erase
+    # and relink the other, invalidating both evidence provenance and Docker's
+    # dual-runtime image build.
+    string(TOLOWER "${LLAMINAR_CPU_ISA_UPPER}" ONEDNN_ISA_SUFFIX)
+    set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")
     set(ONEDNN_VERSION_FILE "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit")
+    set(ONEDNN_CACHE_KEY "${ONEDNN_COMMIT};isa=${LLAMINAR_CPU_ISA_UPPER}")
 
     set(ONEDNN_BUILD_COMMIT "missing")
     if(EXISTS "${ONEDNN_VERSION_FILE}")
@@ -1072,9 +1151,9 @@ if(USE_ONEDNN)
         string(STRIP "${ONEDNN_BUILD_COMMIT_RAW}" ONEDNN_BUILD_COMMIT)
     endif()
 
-    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_COMMIT)
+    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_CACHE_KEY)
         message(STATUS
-            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_COMMIT}, rebuilding...")
+            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_CACHE_KEY}, rebuilding...")
         file(REMOVE_RECURSE "${ONEDNN_BUILD_DIR}")
     endif()
 
@@ -1090,8 +1169,8 @@ if(USE_ONEDNN)
                     -DDNNL_BUILD_TESTS=OFF
                     -DDNNL_BUILD_EXAMPLES=OFF
                     -DDNNL_EXPERIMENTAL_UKERNEL=ON
-                    -DCMAKE_CXX_FLAGS=-march=native
-                    -DCMAKE_C_FLAGS=-march=native
+                    "-DCMAKE_CXX_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
+                    "-DCMAKE_C_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
             RESULT_VARIABLE ONEDNN_CONFIG_RESULT
             OUTPUT_VARIABLE ONEDNN_CONFIG_OUTPUT
             ERROR_VARIABLE ONEDNN_CONFIG_ERROR
@@ -1113,7 +1192,7 @@ if(USE_ONEDNN)
             message(FATAL_ERROR "V2: Failed to build OneDNN: ${ONEDNN_BUILD_ERROR}")
         endif()
 
-        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_COMMIT}\n")
+        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_CACHE_KEY}\n")
 
         message(STATUS "V2: OneDNN built and installed to ${ONEDNN_BUILD_DIR}")
     else()
@@ -1130,6 +1209,11 @@ if(USE_ONEDNN)
     )
     
     set(ONEDNN_FOUND FALSE)
+    # find_library() stores results in the CMake cache. Clear the previous ISA
+    # tree before searching so an existing build directory cannot retain a
+    # link to the mutable legacy external/onednn/build installation.
+    unset(ONEDNN_LIB CACHE)
+    unset(ONEDNN_LIB)
     foreach(SEARCH_PATH ${ONEDNN_SEARCH_PATHS})
         if(EXISTS "${SEARCH_PATH}/include/oneapi/dnnl/dnnl.hpp")
             set(ONEDNN_ROOT "${SEARCH_PATH}")
@@ -1165,6 +1249,12 @@ endif()
 # Find Python3 for code generation scripts
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
+
+# Durable prefix-cache artifacts are content-addressed by the exact model file.
+# OpenSSL EVP provides a maintained streaming SHA-256 implementation without
+# materializing multi-gigabyte GGUF files in host memory.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+message(STATUS "V2: Found OpenSSL Crypto for model content addressing")
 
 # CPU BLAS backend: OneDNN for all GEMM (FP32, BF16, INT8)
 message(STATUS "V2: BLAS backend: OneDNN")
@@ -1217,6 +1307,12 @@ set(FORT_ENABLE_TESTING OFF CACHE BOOL "Disable libfort tests" FORCE)
 FetchContent_MakeAvailable(libfort)
 # Reset policy version
 unset(CMAKE_POLICY_VERSION_MINIMUM)
+if(TARGET fort)
+    target_compile_options(fort PRIVATE
+        $<$<COMPILE_LANG_AND_ID:C,GNU>:-Wno-unused-parameter>
+        $<$<COMPILE_LANG_AND_ID:C,Clang>:-Wno-unused-parameter>
+    )
+endif()
 message(STATUS "V2: libfort v0.4.2 configured for formatted table output")
 
 # Link fort to GPU backends (for CUDAKernelProfiler.h and ROCmKernelProfiler.h table output)
@@ -1239,7 +1335,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
+    backends/HostMemoryCapacity.cpp
     backends/HardwareInventory.cpp
+    backends/CPUCacheInventory.cpp
+    backends/CPUExecutionGeometry.cpp
+    kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
@@ -1270,19 +1370,41 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
-    execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp
+    execution/compute_stages/stages/MoEOverlayTicketPublishStage.cpp
+    execution/compute_stages/stages/MoEOverlayTicketConsumeStage.cpp
+    execution/compute_stages/stages/MoEOverlayActivationPacketStages.cpp
     execution/compute_stages/stages/MoELocalExpertStage.cpp
     execution/compute_stages/stages/MoESparseDispatchStage.cpp
     execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
+    execution/compute_stages/stages/MoERankBatchSparseStages.cpp
+    execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp
+    execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.cpp
+    execution/compute_stages/stages/MoEDeviceDecodeCommitBoundaryStage.cpp
+    execution/compute_stages/stages/MoECPUCurrentBatchLLEPStage.cpp
     execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
+    execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
+    execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
+    execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
+    execution/compute_stages/stages/MoEOverlayEpochBoundaryStage.cpp
+    execution/compute_stages/stages/MoEOverlayDeviceControllerStage.cpp
+    execution/compute_stages/stages/MTPVerifierPreparationStage.cpp
+    execution/compute_stages/stages/PrefillChunkMaterializationStage.cpp
+    execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
+    execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp
+    execution/compute_stages/stages/MTPStochasticTargetDistributionStage.cpp
+    execution/compute_stages/stages/OrdinaryGenerationSamplingStage.cpp
+    execution/compute_stages/stages/DecodePositionSnapshotStage.cpp
+    execution/mtp/DeviceGenerationGraphProgram.cpp
+    execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp
@@ -1291,22 +1413,88 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
-    execution/moe/MoEExpertParallelPlanner.cpp
+    execution/moe/NativeMoEMovementArchive.cpp
+    execution/moe/MoERoutedExpertPlacementPlanner.cpp
+    execution/moe/MoEOverlayEconomyProfileComposer.cpp
+    execution/moe/MoEOverlayEconomyCalibrationPlanner.cpp
+    execution/moe/MoEOverlayCPUServiceMeasurement.cpp
+    execution/moe/MoEOverlayEconomyCalibrationController.cpp
+    execution/moe/MoEOverlayEconomyCertificationController.cpp
+    execution/moe/MoEOverlayEconomyEvidenceExchange.cpp
+    execution/moe/MoEOverlayMPIEconomyEvidenceExchange.cpp
+    execution/moe/MoEOverlayInferenceInterferenceProbe.cpp
+    execution/moe/MoEOverlayMigrationMeasurementLedger.cpp
+    execution/moe/MoEOverlayMigrationMeasurementExchange.cpp
+    execution/moe/MoEOverlayCapacityResolver.cpp
+    execution/moe/MoEOverlayCapacityAdmission.cpp
+    execution/moe/MoEOverlayActivationChannelPlan.cpp
+    execution/moe/MoEOverlayLocalCapacityPlanner.cpp
+    execution/moe/MoEOverlayHostDemandMemoryPlan.cpp
+    execution/moe/MoEExpertOverlayAuthorityPlan.cpp
+    execution/moe/MoEOptimizationMovementTopology.cpp
     execution/moe/MoEExpertOwnerMap.cpp
+    execution/moe/MoEOverlayDevicePlacementPolicy.cpp
+    execution/moe/MoEOverlayDeviceControllerProtocol.cpp
+    execution/moe/MoEOverlayDeviceTransportProtocol.cpp
+    execution/moe/MoEOverlayDevicePhysicalMovement.cpp
+    execution/moe/MoEOverlayDevicePhysicalSlotLedger.cpp
+    execution/moe/MoEOverlayDevicePreparedArrivalInbox.cpp
+    execution/moe/MoEOverlayDeviceControllerTopology.cpp
+    execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.cpp
+    execution/moe/MoEOverlayServiceTelemetryPublication.cpp
+    execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp
+    execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
+    execution/moe/MoEOverlayDeviceControllerGraphService.cpp
+    execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/DeviceMoEOverlayEpochArena.cpp
+    execution/moe/MoEOverlayDeviceEpochProtocol.cpp
+    execution/moe/MoEOverlayDistributedResidencyProtocol.cpp
+    execution/moe/MoEOverlayRemoteProjectionProtocol.cpp
+    execution/moe/MoEOverlayMPIRemoteProjectionTransport.cpp
+    execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.cpp
+    execution/moe/MoEOverlayDistributedResidencyTransport.cpp
+    execution/moe/MoEOverlayMPIResidencyConsensus.cpp
+    execution/moe/MoEOverlayMPIResidencyProposalPublisher.cpp
+    execution/moe/MoEOverlayResidencyMaintenanceService.cpp
+    execution/moe/MoEOverlayTierMigrationTransport.cpp
+    execution/moe/MoEOverlayParticipantMigration.cpp
+    execution/moe/MoEOverlayPhysicalResidencyFabric.cpp
+    execution/moe/CpuExpertSlotPool.cpp
+    execution/moe/MoEOverlayPreparedWeightSource.cpp
+    execution/moe/ExpertTierWeightStream.cpp
+    execution/moe/ExpertTierWeightTransferLane.cpp
+    execution/moe/ExpertTierGpuBlobTransferLane.cpp
+    execution/moe/ExpertTierGpuPeerTransferLane.cpp
+    execution/moe/ExpertTierMigrationOperations.cpp
     execution/moe/MoEExpertTokenRowTransfer.cpp
-    execution/moe/MoEExpertOverlayDenseReduce.cpp
     execution/moe/MoEExpertOverlayExecutionPlan.cpp
     execution/moe/MoEGraphRoleRunner.cpp
+    execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
+    execution/moe/MoEOverlayInferenceTransaction.cpp
+    execution/moe/MoEOverlayInferenceTransactionService.cpp
+    execution/moe/MoEOverlayActivationEpochProtocol.cpp
+    execution/moe/MoEOverlayRetainedActivationTransaction.cpp
+    execution/moe/MoEOverlayRetainedParentComposer.cpp
+    execution/moe/MoEOverlayRankBatchTransport.cpp
+    execution/moe/MoEOverlayNodeLocalRankBatchTransport.cpp
+    execution/moe/MoEOverlayNodeLocalRouteExchange.cpp
     execution/moe/MoEOverlaySparseCollective.cpp
+    execution/moe/MoEOverlayParticipantResidency.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/DeviceMoERebalanceWorkspaceContract.cpp
+    execution/moe/DeviceMoETransferSlotDirectory.cpp
+    execution/moe/GpuExpertSlotPool.cpp
+    execution/moe/GpuExpertTransferStagingPool.cpp
     execution/moe/MoEExpertWeightService.cpp
     execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp
+    execution/moe/GPUExpertTransferCUDA.cpp
+    execution/moe/GPUExpertTransferROCm.cpp
     execution/moe/MoEPipeline.cpp
     execution/prefix_cache/BlockHash.cpp
     execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
@@ -1344,9 +1532,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/ComputeGraph.cpp
+    execution/local_execution/graph/DeviceExecutionTimeline.cpp
     execution/local_execution/graph/StageVerifier.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp
+    execution/local_execution/graph/RetainedParentTicketServiceWorker.cpp
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
@@ -1355,6 +1545,14 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMovement.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp
+    execution/local_execution/orchestrators/DeviceGraphOrchestratorMTPPublication.cpp
+    execution/local_execution/orchestrators/PipelineDeviceGeneration.cpp
+    execution/local_execution/orchestrators/PipelineMTPDeviceGeneration.cpp
+    execution/local_execution/orchestrators/PipelineForwardGraphEdges.cpp
+    execution/local_execution/orchestrators/PipelineActivationExchange.cpp
+    execution/local_execution/orchestrators/PipelineMetadataExchange.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
@@ -1363,11 +1561,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/coherence/CrossDomainTransfer.cpp
     execution/config/HybridPrecisionConfig.cpp
     execution/config/InferenceMode.cpp
-    execution/local_execution/coherence/StageCoherence.cpp
     execution/local_execution/device/DeviceWorkspaceManager.cpp
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/CapturedTransferChannel.cpp
+    transfer/MappedTransferProgressEpoch.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
     # Pipeline parallelism configuration (layer range assignment for PP)
@@ -1389,6 +1588,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
+    config/OrchestrationConfigDocument.cpp
+    config/OrchestrationStartupPolicy.cpp
+    config/OrchestrationPlanningPolicy.cpp
     # Declarative config validation rule framework (device selection conflict detection)
     config/ConfigValidator.cpp
     # ParallelismTree parser (Phase 7 - CLI/YAML parser for ParallelismTree)
@@ -1410,10 +1612,47 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/ClusterInventoryGatherer.cpp
     planning/ModelMemoryProfile.cpp
     planning/WeightMemoryEstimator.cpp
+    planning/WeightShardGeometry.cpp
+    planning/PlanningForwardWeightWork.cpp
+    planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
+    planning/PersistentStateMemoryEstimator.cpp
     planning/ActivationMemoryEstimator.cpp
     planning/WorkspaceMemoryEstimator.cpp
+    planning/PhysicalMemoryAuthority.cpp
     planning/MemoryPlanner.cpp
+    planning/PipelineTransferMemory.cpp
+    planning/RankMemoryPlanInputs.cpp
+    planning/MoEOverlayPlanningInputs.cpp
+    planning/MoEOverlayMemoryPlanInputs.cpp
+    planning/PlanningModelMetadata.cpp
+    planning/PlanningPublication.cpp
+    planning/ResolvedRankOrchestration.cpp
+    planning/AutomaticOrchestrationCandidates.cpp
+    planning/OrchestrationCandidateAdmission.cpp
+    planning/AutomaticOrchestrationPlanner.cpp
+    planning/AutomaticPlanningStartup.cpp
+    planning/OrchestrationPerformanceEvidence.cpp
+    planning/PlanningExecutionMeasurement.cpp
+    planning/PlanningMemoryBandwidthMeasurement.cpp
+    planning/PlanningProjectionMeasurement.cpp
+    planning/PlanningLocalTPMeasurement.cpp
+    planning/PlanningCPUExpertMeasurement.cpp
+    planning/PlanningGPUExpertMeasurement.cpp
+    planning/PlanningModelSample.cpp
+    planning/PlanningExpertSample.cpp
+    planning/PlanningMatrixSample.cpp
+    planning/PlanningKernelServiceCatalog.cpp
+    planning/PlanningCommunicationService.cpp
+    planning/PlanningCommunicationCost.cpp
+    planning/PlanningHostDeviceMeasurement.cpp
+    planning/PlanningWeightServiceModel.cpp
+    planning/PlanningRequestCostModel.cpp
+    kernels/cpu/gemm/CPUWeightPreparationMemory.cpp
+    planning/PlanningMPITransferMeasurement.cpp
+    planning/ExecutionRankMembership.cpp
+    utils/MPIContext.cpp
+    execution/mpi_orchestration/DeviceInventory.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
     execution/mpi_orchestration/ExecutionPlanBuilder.cpp
     # Pipeline parallel graph builder (Phase 3 - PP stage insertion)
@@ -1429,6 +1668,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
     app/MPIShutdown.cpp
+    app/MPIProcessSession.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
     app/commands/CommandMPI.cpp
@@ -1449,6 +1689,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
+    loaders/PreparedOverlaySourceRetirement.cpp
     loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
     loaders/DeviceOrchestrator.cpp
@@ -1518,6 +1759,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # TurboQuant KV cache tensors
     tensors/TQ4Tensor.cpp
     tensors/TQ8Tensor.cpp
+    tensors/AttentionKeyQ8Tensor.cpp
     # KV Cache implementation (moved from tensors/)
     kernels/cpu/CPURingKVCache.cpp
     # Vectorized primitives (ported from V1)
@@ -1542,9 +1784,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
     kernels/IMoEKernel.cpp
+    kernels/cpu/moe/CPUCanonicalRouteReducer.cpp
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    kernels/KernelFactoryGPUWeights.cpp
     kernels/HybridKVCacheConfig.cpp
     kernels/common/PreparedEmbeddingWeights.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
@@ -1560,6 +1804,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp
+    utils/Sha256.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
     utils/ToolCallParser.cpp
@@ -1568,6 +1813,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
     collective/BackendRouter.cpp
+    collective/LocalTPCollectiveInventory.cpp
     collective/backends/HostBackend.cpp
     collective/backends/MPIBackend.cpp
     collective/backends/HeterogeneousBackend.cpp
@@ -1605,8 +1851,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/global/DomainCommunicatorRegistry.cpp
     # StageRunnerFactory (Phase 3: per-domain stage runner construction)
     execution/global/StageRunnerFactory.cpp
-    # GlobalOrchestratorRunner (Phase 4: IOrchestrationRunner adapter)
-    execution/global/GlobalOrchestratorRunner.cpp
     # Parallelism tree (recursive PP/TP composition)
     execution/parallelism_tree/ParallelismTree.cpp
     execution/parallelism_tree/TransferSpec.cpp
@@ -1615,9 +1859,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/parallelism_tree/PipelineRunner.cpp
     execution/parallelism_tree/TreeToRunnerCompiler.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
+    execution/runner/RankInitializationLifecycle.cpp
+    execution/runner/ModelContextRetirement.cpp
     execution/runner/OrchestrationRunner.cpp
+    execution/runner/MTPStochasticVerificationOwner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
-    execution/runner/NamedDomainGlobalRunner.cpp
+    execution/global/NamedDomainGraphBuilder.cpp
     # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
@@ -1703,15 +1950,11 @@ target_include_directories(llaminar2_core PRIVATE
 
 # Enable pipeline snapshot capture (for parity testing and debugging)
 # - Debug builds: Always enabled (development/debugging)
-# - E2ERelease builds: Always enabled (optimized E2E parity testing)
 # - Integration builds: Always enabled (Release + debug symbols + snapshots)
 # - Release builds: Disabled by default (performance), enable with -DENABLE_SNAPSHOTS=ON
 if(CMAKE_BUILD_TYPE MATCHES "Debug")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Debug build)")
-elseif(CMAKE_BUILD_TYPE MATCHES "E2ERelease")
-    target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
-    message(STATUS "V2: Pipeline snapshot capture enabled (E2ERelease build - optimized with snapshots for E2E testing)")
 elseif(CMAKE_BUILD_TYPE MATCHES "Integration")
     target_compile_definitions(llaminar2_core PUBLIC ENABLE_PIPELINE_SNAPSHOTS)
     message(STATUS "V2: Pipeline snapshot capture enabled (Integration build - optimized with debug symbols and snapshots)")
@@ -1762,6 +2005,7 @@ target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    OpenSSL::Crypto
     ${NUMA_LIBRARY}
     ftxui::screen
     ftxui::dom
@@ -1818,7 +2062,7 @@ if(HAVE_ROCM)
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
     target_sources(llaminar2_core PRIVATE
-        kernels/rocm/ROCmWeightPacker.cpp               # Weight packing utilities (native-VNNI + INT8 conversion)
+        kernels/rocm/gemm/ROCmWeightPacker.cpp               # Weight packing utilities (native-VNNI + INT8 conversion)
         kernels/rocm/gemm/ROCmFloatingPointGemmKernel.cpp
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp  # INT8 GEMM adapter (uses CK via extern "C")
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)
@@ -1846,16 +2090,6 @@ if(HAVE_ROCM)
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
 endif()
 
-# Link device benchmarks library
-if(LLAMINAR_SHARED_CORE)
-    target_link_libraries(llaminar2_core PRIVATE
-        -Wl,--whole-archive device_benchmarks -Wl,--no-whole-archive
-    )
-else()
-    target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
-endif()
-message(STATUS "V2: Linked device benchmarks library")
-
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
     if(LLAMINAR_HAVE_CUTLASS)
@@ -1870,15 +2104,8 @@ if(HAVE_CUDA)
     )
     message(STATUS "V2: Linked CUDA runtime, cuBLAS, and cuBLASLt")
     
-    # NOTE: NCCL is linked to cuda_backend (not llaminar2_core) to isolate symbols
-    # from RCCL. Both export identical symbols and would conflict if in same library.
-    # If HAVE_NCCL is set, cuda_backend already has NCCL linked via HAVE_NCCL check above
-    if(HAVE_NCCL)
-        # Only include headers for compilation - the library is linked via cuda_backend
-        target_include_directories(llaminar2_core PUBLIC ${NCCL_INCLUDE_DIR})
-        # DO NOT link NCCL library here - it comes via cuda_backend to prevent symbol conflicts
-        message(STATUS "V2: NCCL headers available (library linked via cuda_backend)")
-    endif()
+    # NCCL is exclusively dlopened by cuda_backend; neither its global headers
+    # nor a link dependency belong on llaminar2_core's public interface.
 endif()
 
 # =============================================================================

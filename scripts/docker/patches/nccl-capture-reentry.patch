@@ -1,0 +1,29 @@
+diff --git a/src/misc/strongstream.cc b/src/misc/strongstream.cc
+--- a/src/misc/strongstream.cc
++++ b/src/misc/strongstream.cc
+@@ -188,14 +188,22 @@ ncclResult_t ncclStrongStreamAcquire(
+       struct ncclStrongStreamCapture* spare = nullptr;
+       while (*pcap != nullptr) {
+         cap = *pcap;
+-        if (cap->graphId == graph.graphId) { // Capture node already exists.
++        // BeginCaptureToGraph preserves graphId across recording sessions, but
++        // EndCapture ends capture on the internal stream. Identity alone is
++        // therefore not a membership proof: rejoin an ended stream below.
++        cudaStreamCaptureStatus status;
++        CUDACHECKGOTO(cudaStreamIsCapturing(cap->captureStream, &status), ret, do_unlock);
++        if (status == cudaStreamCaptureStatusInvalidated) {
++          WARN("Strong stream capture was invalidated");
++          ret = ncclUnhandledCudaError;
++          goto do_unlock;
++        }
++        if (cap->graphId == graph.graphId && status == cudaStreamCaptureStatusActive) {
+           *workStream = cap->captureStream;
+           cap->acquiredBy = localThreadId();
+           if (concurrent) pthread_mutex_unlock(&ss->lock);
+           return ncclSuccess;
+         } else {
+-          cudaStreamCaptureStatus status;
+-          CUDACHECKGOTO(cudaStreamIsCapturing(cap->captureStream, &status), ret, do_unlock);
+           if (status == cudaStreamCaptureStatusActive) {
+             pcap = &cap->next; // Active capture doesn't match, on to next.
+           } else { // Capture no longer active

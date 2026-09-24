@@ -1,13 +1,23 @@
 /**
  * @file WeightSlicer.cpp
- * @brief Stateless weight slicing computations - implementation
+ * @brief Authoritative, I/O-free tensor-parallel weight-slice geometry.
  *
- * Extracted from WeightManager.cpp. Pure computation — no I/O, no caching.
+ * This translation unit owns the arithmetic that maps a typed
+ * DeviceShardingAssignment onto source tensor intervals.  WeightManager uses
+ * these results to materialize native-format slices; graph construction uses
+ * the same assignment to size participant-local buffers.  Keeping the
+ * geometry here prevents loaders from quietly reverting to equal byte splits
+ * when a valid TP plan contains uneven head counts (for example TP=3).
+ *
+ * No method performs allocation, transfer, caching, or backend work.  A slice
+ * that cannot preserve a model semantic boundary fails before any weight is
+ * loaded.
  *
  * @author David Sanftenberg
  */
 
 #include "WeightSlicer.h"
+#include "../config/GDNHeadAssignment.h"
 #include "../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -70,12 +80,39 @@ namespace llaminar2
     bool WeightSlicer::determineFusedQKVSubBlockSizes(
         size_t total_rows,
         size_t &q_rows, size_t &k_rows, size_t &v_rows,
-        bool &replicate_qk) const
+        bool &modulo_linked_gdn) const
     {
-        replicate_qk = false;
+        modulo_linked_gdn = false;
 
         if (dimensions_.isValid())
         {
+            /*
+             * Prefer the exact GDN geometry when it matches. Equal-head GDN
+             * tensors are also divisible into three blocks, but their typed
+             * ownership still matters to the value-associated companion
+             * weights and must not be mistaken for ordinary attention QKV.
+             */
+            if (dimensions_.hasGDN())
+            {
+                const size_t gdn_key_dim =
+                    static_cast<size_t>(dimensions_.gdn_n_k_heads) *
+                    dimensions_.gdn_d_state;
+                const size_t gdn_value_dim =
+                    static_cast<size_t>(dimensions_.gdn_n_v_heads) *
+                    dimensions_.gdn_d_state;
+                const size_t expected_gdn_qkv =
+                    2 * gdn_key_dim + gdn_value_dim;
+
+                if (total_rows == expected_gdn_qkv)
+                {
+                    q_rows = gdn_key_dim;
+                    k_rows = gdn_key_dim;
+                    v_rows = gdn_value_dim;
+                    modulo_linked_gdn = true;
+                    return true;
+                }
+            }
+
             const size_t expected_q = static_cast<size_t>(dimensions_.n_heads) * dimensions_.head_dim;
             const size_t expected_kv = static_cast<size_t>(dimensions_.n_kv_heads) * dimensions_.head_dim;
             const size_t expected_qkv = expected_q + 2 * expected_kv;
@@ -96,24 +133,6 @@ namespace llaminar2
                 v_rows = total_rows / 3;
                 return true;
             }
-            else if (dimensions_.hasGDN())
-            {
-                // GDN layout: [Q(n_k*d) | K(n_k*d) | V(n_v*d)]
-                const size_t gdn_key_dim = static_cast<size_t>(dimensions_.gdn_n_k_heads) * dimensions_.gdn_d_state;
-                const size_t gdn_value_dim = static_cast<size_t>(dimensions_.gdn_n_v_heads) * dimensions_.gdn_d_state;
-                const size_t expected_gdn_qkv = 2 * gdn_key_dim + gdn_value_dim;
-
-                if (total_rows == expected_gdn_qkv)
-                {
-                    q_rows = gdn_key_dim;
-                    k_rows = gdn_key_dim;
-                    v_rows = gdn_value_dim;
-
-                    // GDN modular repeat: replicate Q and K, only shard V
-                    replicate_qk = (dimensions_.gdn_n_v_heads > dimensions_.gdn_n_k_heads);
-                    return true;
-                }
-            }
             // Falls through to simple equal row split (return false)
         }
         else
@@ -132,13 +151,8 @@ namespace llaminar2
     }
 
     SliceSpec WeightSlicer::computeSubBlockSlice(
-        size_t block_rows, int rank, int world_size, bool replicate)
+        size_t block_rows, int rank, int world_size)
     {
-        if (replicate)
-        {
-            return {0, block_rows}; // Full sub-block (replicated)
-        }
-
         size_t rows_per_rank = block_rows / world_size;
         size_t start = rows_per_rank * rank;
         size_t count = (rank == world_size - 1)
@@ -195,18 +209,47 @@ namespace llaminar2
         const std::string &name, size_t total_rows,
         int rank, int world_size) const
     {
-        // Check if this weight is tagged as FusedQKVHeads
-        if (sharding_config_.getDimensionType(name) != WeightDimensionType::FusedQKVHeads)
+        const WeightDimensionType dimension = sharding_config_.getDimensionType(name);
+        if (dimension != WeightDimensionType::FusedQKVHeads)
         {
             return std::nullopt;
         }
 
         size_t q_rows = 0, k_rows = 0, v_rows = 0;
-        bool replicate_qk = false;
+        bool modulo_linked_gdn = false;
 
-        if (!determineFusedQKVSubBlockSizes(total_rows, q_rows, k_rows, v_rows, replicate_qk))
+        if (!determineFusedQKVSubBlockSizes(
+                total_rows, q_rows, k_rows, v_rows, modulo_linked_gdn))
         {
             return std::nullopt; // Fall through to simple equal row split
+        }
+
+        if (modulo_linked_gdn)
+        {
+            const GDNHeadAssignment assignment = GDNHeadAssignment::forEqualRank(
+                dimensions_.gdn_n_k_heads,
+                dimensions_.gdn_n_v_heads,
+                rank,
+                world_size);
+            const GDNHeadSpan key_span =
+                assignment.keyElementSpan(dimensions_.gdn_d_state);
+
+            FusedQKVSliceResult result;
+            result.q_total = q_rows;
+            result.k_total = k_rows;
+            result.v_total = v_rows;
+            result.modulo_linked_gdn = true;
+            result.q = {.start = static_cast<size_t>(key_span.start),
+                        .count = static_cast<size_t>(key_span.count)};
+            result.k = result.q;
+            for (const GDNHeadSpan span :
+                 assignment.valueElementSpans(dimensions_.gdn_d_state))
+            {
+                result.v.push_back(
+                    {.start = static_cast<size_t>(span.start),
+                     .count = static_cast<size_t>(span.count)});
+            }
+            return result;
         }
 
         const size_t sub_block_sizes[3] = {q_rows, k_rows, v_rows};
@@ -215,9 +258,6 @@ namespace llaminar2
         static constexpr const char *sub_names[3] = {"Q", "K", "V"};
         for (size_t s = 0; s < 3; s++)
         {
-            if (replicate_qk && s < 2)
-                continue;
-
             if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
             {
                 std::ostringstream err;
@@ -244,11 +284,11 @@ namespace llaminar2
         result.q_total = q_rows;
         result.k_total = k_rows;
         result.v_total = v_rows;
-        result.replicate_qk = replicate_qk;
+        result.modulo_linked_gdn = false;
 
-        result.q = computeSubBlockSlice(q_rows, rank, world_size, replicate_qk);
-        result.k = computeSubBlockSlice(k_rows, rank, world_size, replicate_qk);
-        result.v = computeSubBlockSlice(v_rows, rank, world_size, false /* V always sharded */);
+        result.q = computeSubBlockSlice(q_rows, rank, world_size);
+        result.k = computeSubBlockSlice(k_rows, rank, world_size);
+        result.v.push_back(computeSubBlockSlice(v_rows, rank, world_size));
 
         return result;
     }
@@ -262,16 +302,17 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        // Check if this weight is tagged as FusedQKVHeads
-        if (sharding_config_.getDimensionType(name) != WeightDimensionType::FusedQKVHeads)
+        const WeightDimensionType dimension = sharding_config_.getDimensionType(name);
+        if (dimension != WeightDimensionType::FusedQKVHeads)
         {
             return std::nullopt;
         }
 
         size_t q_rows = 0, k_rows = 0, v_rows = 0;
-        bool replicate_qk = false;
+        bool modulo_linked_gdn = false;
 
-        if (!determineFusedQKVSubBlockSizes(total_rows, q_rows, k_rows, v_rows, replicate_qk))
+        if (!determineFusedQKVSubBlockSizes(
+                total_rows, q_rows, k_rows, v_rows, modulo_linked_gdn))
         {
             return std::nullopt;
         }
@@ -279,35 +320,175 @@ namespace llaminar2
         int world_size = tp_config_->worldSize();
         int rank = assignment.local_rank;
 
-        const size_t sub_block_sizes[3] = {q_rows, k_rows, v_rows};
-
-        // Validate divisibility
-        static constexpr const char *sub_names[3] = {"Q", "K", "V"};
-        for (size_t s = 0; s < 3; s++)
+        if (modulo_linked_gdn)
         {
-            if (replicate_qk && s < 2)
-                continue;
+            const GDNHeadAssignment head_assignment =
+                GDNHeadAssignment::fromPartition(
+                    dimensions_.gdn_n_k_heads,
+                    dimensions_.gdn_n_v_heads,
+                    assignment.head_start,
+                    assignment.head_count,
+                    tp_config_->totalHeads());
+            const GDNHeadSpan key_span =
+                head_assignment.keyElementSpan(dimensions_.gdn_d_state);
 
-            if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
+            FusedQKVSliceResult result;
+            result.q_total = q_rows;
+            result.k_total = k_rows;
+            result.v_total = v_rows;
+            result.modulo_linked_gdn = true;
+            result.q = {.start = static_cast<size_t>(key_span.start),
+                        .count = static_cast<size_t>(key_span.count)};
+            result.k = result.q;
+            for (const GDNHeadSpan span :
+                 head_assignment.valueElementSpans(dimensions_.gdn_d_state))
             {
-                std::ostringstream err;
-                err << "[WeightSlicer] Cannot shard FusedQKV weight '" << name
-                    << "': sub-block " << sub_names[s]
-                    << " has " << sub_block_sizes[s]
-                    << " rows, not divisible by TP degree " << world_size;
-                throw std::invalid_argument(err.str());
+                result.v.push_back(
+                    {.start = static_cast<size_t>(span.start),
+                     .count = static_cast<size_t>(span.count)});
             }
+            return result;
         }
 
         FusedQKVSliceResult result;
         result.q_total = q_rows;
         result.k_total = k_rows;
         result.v_total = v_rows;
-        result.replicate_qk = replicate_qk;
+        result.modulo_linked_gdn = false;
 
-        result.q = computeSubBlockSlice(q_rows, rank, world_size, replicate_qk);
-        result.k = computeSubBlockSlice(k_rows, rank, world_size, replicate_qk);
-        result.v = computeSubBlockSlice(v_rows, rank, world_size, false);
+        const auto checked_head_slice = [&name](
+                                            int head_start,
+                                            int head_count,
+                                            int global_heads,
+                                            int elements_per_head,
+                                            size_t block_rows,
+                                            const char *sub_block)
+        {
+            if (global_heads <= 0 || elements_per_head <= 0 ||
+                head_start < 0 || head_count <= 0 ||
+                head_start > global_heads - head_count ||
+                block_rows !=
+                    static_cast<size_t>(global_heads) *
+                        static_cast<size_t>(elements_per_head))
+            {
+                std::ostringstream err;
+                err << "[WeightSlicer] FusedQKV " << sub_block
+                    << " assignment is incompatible with weight '" << name
+                    << "': heads=[" << head_start << ","
+                    << (head_start + head_count) << ")/" << global_heads
+                    << " elements_per_head=" << elements_per_head
+                    << " block_rows=" << block_rows;
+                throw std::invalid_argument(err.str());
+            }
+            return SliceSpec{
+                .start = static_cast<size_t>(head_start) *
+                         static_cast<size_t>(elements_per_head),
+                .count = static_cast<size_t>(head_count) *
+                         static_cast<size_t>(elements_per_head),
+            };
+        };
+
+        const size_t expected_attention_q =
+            dimensions_.isValid()
+                ? static_cast<size_t>(dimensions_.n_heads) *
+                      static_cast<size_t>(dimensions_.head_dim)
+                : 0u;
+        const size_t expected_attention_kv =
+            dimensions_.isValid() && dimensions_.n_kv_heads > 0
+                ? static_cast<size_t>(dimensions_.n_kv_heads) *
+                      static_cast<size_t>(dimensions_.head_dim)
+                : 0u;
+        const bool exact_attention_layout =
+            expected_attention_q > 0u && expected_attention_kv > 0u &&
+            q_rows == expected_attention_q &&
+            k_rows == expected_attention_kv &&
+            v_rows == expected_attention_kv;
+        const bool full_head_equal_layout =
+            expected_attention_q > 0u && q_rows == expected_attention_q &&
+            k_rows == expected_attention_q &&
+            v_rows == expected_attention_q;
+
+        if (exact_attention_layout)
+        {
+            /* Q follows the query-head assignment.  K/V follow the typed KV
+             * assignment, which naturally represents both sharded KV and the
+             * n_kv_heads < TP-degree replicated-KV production policy. */
+            result.q = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                q_rows,
+                "Q");
+            result.k = checked_head_slice(
+                assignment.kv_head_start,
+                assignment.kv_head_count,
+                dimensions_.n_kv_heads,
+                dimensions_.head_dim,
+                k_rows,
+                "K");
+            result.v.push_back(checked_head_slice(
+                assignment.kv_head_start,
+                assignment.kv_head_count,
+                dimensions_.n_kv_heads,
+                dimensions_.head_dim,
+                v_rows,
+                "V"));
+            return result;
+        }
+
+        if (full_head_equal_layout)
+        {
+            /* Some attention exporters store full-width K/V blocks.  They
+             * share the query-head ownership rather than the GQA KV range. */
+            result.q = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                q_rows,
+                "Q");
+            result.k = checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                k_rows,
+                "K");
+            result.v.push_back(checked_head_slice(
+                assignment.head_start,
+                assignment.head_count,
+                dimensions_.n_heads,
+                dimensions_.head_dim,
+                v_rows,
+                "V"));
+            return result;
+        }
+
+        /* Without authenticated head geometry there is no safe place to put a
+         * remainder: it might split a head.  Retain the strict equal-row rule
+         * for this legacy/unknown layout while assignment-aware model layouts
+         * above admit uneven participant widths explicitly. */
+        const size_t sub_block_sizes[3] = {q_rows, k_rows, v_rows};
+        static constexpr const char *sub_names[3] = {"Q", "K", "V"};
+        for (size_t sub_block = 0; sub_block < 3; ++sub_block)
+        {
+            if (sub_block_sizes[sub_block] %
+                    static_cast<size_t>(world_size) !=
+                0u)
+            {
+                std::ostringstream err;
+                err << "[WeightSlicer] Cannot shard unknown-layout FusedQKV weight '"
+                    << name << "': sub-block " << sub_names[sub_block]
+                    << " has " << sub_block_sizes[sub_block]
+                    << " rows, not divisible by TP degree " << world_size;
+                throw std::invalid_argument(err.str());
+            }
+        }
+
+        result.q = computeSubBlockSlice(q_rows, rank, world_size);
+        result.k = computeSubBlockSlice(k_rows, rank, world_size);
+        result.v.push_back(computeSubBlockSlice(v_rows, rank, world_size));
 
         return result;
     }

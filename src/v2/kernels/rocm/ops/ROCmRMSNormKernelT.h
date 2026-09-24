@@ -66,7 +66,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP32; }
             static const char *precision_name() { return "FP32"; }
@@ -96,7 +96,8 @@ namespace llaminar2
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // Typed API for direct device pointer access
             bool apply_typed(
@@ -146,7 +147,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::BF16; }
             static const char *precision_name() { return "BF16"; }
@@ -185,7 +186,8 @@ namespace llaminar2
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // Typed API for direct device pointer access
             bool apply_typed(
@@ -235,7 +237,7 @@ namespace llaminar2
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const { return requireExplicitGPUStreamBinding(gpu_stream_, "GPU tensor kernel"); }
 
             static constexpr ActivationPrecision precision() { return ActivationPrecision::FP16; }
             static const char *precision_name() { return "FP16"; }
@@ -274,7 +276,8 @@ namespace llaminar2
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
             // GPU stream for graph capture support
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
 
             // Typed API for direct device pointer access
             bool apply_typed(

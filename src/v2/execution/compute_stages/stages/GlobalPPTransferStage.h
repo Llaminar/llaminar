@@ -110,7 +110,7 @@ namespace llaminar2
          *
          * For SEND: Calls tensor->data() to ensure GPU→host sync, then MPI_Send.
          * For RECV: Calls tensor->mutable_data() to get host buffer, then MPI_Recv,
-         *           then calls tensor->mark_host_dirty() to invalidate GPU copy.
+         *           then publishes the host write through TransferEngine.
          *
          * @param ctx Device context (not used — MPI operations are host-side)
          * @return true on success, false on error
@@ -153,7 +153,7 @@ namespace llaminar2
          *
          * Global PP stages handle their own host/device coherence:
          * - SEND: data() triggers GPU→host sync
-         * - RECV: mark_host_dirty() after receiving
+         * - RECV: TransferEngine::publishHostWrite() after receiving
          *
          * @return CoherencePolicy::NONE
          */

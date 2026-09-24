@@ -211,8 +211,11 @@ def dequantize_q8_0(data: bytes, n_elements: int) -> np.ndarray:
     # immediately astype to FP32 (which already produces a fresh array).
     quant_signed = data_blocks[:, 2:].view(np.int8)
 
-    # Apply scales (broadcast over block elements)
-    dequantized = quant_signed.astype(np.float32) * scales[:, np.newaxis]
+    # Apply scales in place. Expert tensors can contain ~800M values on the
+    # 122B MoE model; an out-of-place multiply retained both a 3 GiB float
+    # conversion and a second 3 GiB result per worker during reference loading.
+    dequantized = quant_signed.astype(np.float32)
+    dequantized *= scales[:, np.newaxis]
 
     # Reshape (no copy) instead of flatten (always copies). Since `dequantized`
     # is C-contiguous from the multiplication above, reshape returns a view.

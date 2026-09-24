@@ -8,6 +8,7 @@
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/StageVerifier.h"
+#include "tensors/TensorVerification.h"
 #include "utils/DebugEnv.h"
 
 #include <cstdlib>
@@ -99,7 +100,7 @@ TEST(Test__StageVerifier, SparseOddNonzeroOutputDoesNotFailAllZeroValidation)
         std::make_unique<RawFP32OutputStage>(std::move(router_logits)),
         DeviceId::cpu());
 
-    EXPECT_TRUE(validateStageOutputs(node));
+    EXPECT_NO_THROW(verifyStageExit(node, 40));
 }
 
 TEST(Test__StageVerifier, TrulyAllZeroOutputStillFailsValidation)
@@ -114,7 +115,7 @@ TEST(Test__StageVerifier, TrulyAllZeroOutputStillFailsValidation)
         std::make_unique<RawFP32OutputStage>(std::move(output)),
         DeviceId::cpu());
 
-    EXPECT_FALSE(validateStageOutputs(node));
+    EXPECT_THROW(verifyStageExit(node, 0), verification::VerificationFailure);
 }
 
 #endif // LLAMINAR_ASSERTIONS_ACTIVE

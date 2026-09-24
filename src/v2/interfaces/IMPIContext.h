@@ -19,12 +19,14 @@
 #include <utility>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 namespace llaminar2
 {
 
     // Forward declarations
     class IMPITopology;
+    struct ClusterInventory;
     struct Q8_1Block;
     struct Q16_1Block;
     struct Q16_1Block_64;
@@ -36,7 +38,10 @@ namespace llaminar2
      * This interface abstracts MPI communication primitives to enable:
      * - Unit testing of distributed logic without real MPI runtime
      * - Multi-rank simulation in a single process for deterministic testing
-     * - Mocking of collective operations for failure injection
+ * - Mocking of collective operations for failure injection
+ *
+ * Production contexts also own immutable admission-time cluster discovery.
+ * This does not expose mutable execution state or replace physical admission.
      *
      * Implementations:
      * - MPIContext: Real MPI-backed implementation
@@ -92,6 +97,21 @@ namespace llaminar2
          * @return MPI_Comm handle
          */
         virtual MPI_Comm communicator() const = 0;
+
+        /**
+         * @brief Obtain this exact communicator's immutable startup observation.
+         * @return Shared snapshot owned by the context, not a live capacity ledger.
+         * @throws std::logic_error when a test context has no discovery authority.
+         *
+         * Production contexts discover collectively once during admission. Later
+         * readers, including rank-zero diagnostics, perform no collective. A
+         * failed publication remains failed; readers cannot retry half a protocol.
+         * Different communicators do not share unqualified rank identities.
+         */
+        virtual std::shared_ptr<const ClusterInventory> clusterInventory() const
+        {
+            throw std::logic_error("MPI context has no cluster discovery authority");
+        }
 
         // =========================================================================
         // Topology Access
@@ -312,6 +332,22 @@ namespace llaminar2
          * @param status Optional status object
          */
         virtual void wait(MPI_Request *request, MPI_Status *status = nullptr) const = 0;
+
+        /**
+         * @brief Progress one non-blocking operation without blocking the caller.
+         *
+         * The request remains live when this returns false and is set to
+         * `MPI_REQUEST_NULL` by MPI when it returns true. Transport owners use
+         * this operation to retain fixed buffers until their exact request has
+         * completed instead of issuing an immediate `wait()` after `isend()`.
+         *
+         * @param request Non-null request handle owned by the caller.
+         * @param status Optional completion status.
+         * @return True only when the request completed during this call.
+         */
+        virtual bool test(
+            MPI_Request *request,
+            MPI_Status *status = nullptr) const = 0;
 
         /**
          * @brief Wait for all non-blocking operations to complete

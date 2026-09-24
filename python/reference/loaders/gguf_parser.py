@@ -19,6 +19,7 @@ Author: David Sanftenberg
 
 import struct
 import mmap
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, Union
 from enum import IntEnum
@@ -74,11 +75,23 @@ class GGUFTensorType(IntEnum):
 class GGUFTensorInfo:
     """Information about a tensor in the GGUF file"""
     
-    def __init__(self, name: str, dimensions: List[int], tensor_type: GGUFTensorType, offset: int):
+    def __init__(
+        self,
+        name: str,
+        dimensions: List[int],
+        tensor_type: GGUFTensorType,
+        offset: int,
+        source_parser: Optional["GGUFParser"] = None,
+    ):
         self.name = name
         self.dimensions = dimensions
         self.type = tensor_type
         self.offset = offset
+        # Split GGUF offsets are relative to the data section of the shard
+        # that declares the tensor. Keep that ownership on the descriptor so
+        # callers can iterate one aggregate inventory without knowing which
+        # mmap supplies each byte range.
+        self._source_parser = source_parser
         
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -145,6 +158,11 @@ class GGUFParser:
         self.metadata: Dict[str, Any] = {}
         self.tensors: List[GGUFTensorInfo] = []
         self.data_offset: Optional[int] = None
+
+        # A split-set root owns every sibling parser for exactly as long as it
+        # owns the aggregate tensor inventory. Child parsers never recurse into
+        # split discovery themselves.
+        self._split_parsers: List["GGUFParser"] = []
         
         # Current file position during parsing
         self._offset = 0
@@ -170,6 +188,9 @@ class GGUFParser:
         
     def close(self):
         """Close the GGUF file"""
+        for parser in self._split_parsers:
+            parser.close()
+        self._split_parsers.clear()
         if self.mmap is not None:
             self.mmap.close()
             self.mmap = None
@@ -190,13 +211,121 @@ class GGUFParser:
         Raises:
             ValueError: If file format is invalid
         """
+        # Re-parsing the same object must not retain stale sibling mmaps.
+        for parser in self._split_parsers:
+            parser.close()
+        self._split_parsers.clear()
+        self._parse_single_file()
+        self._parse_split_siblings()
+
+    def _parse_single_file(self):
+        """Parse only ``self.file_path`` without discovering split siblings."""
         if self.mmap is None:
             self.open()
-            
+        self._offset = 0
         self._parse_header()
         self._parse_metadata()
         self._parse_tensor_info()
         self._calculate_data_offset()
+
+    def _parse_split_siblings(self):
+        """Merge every declared GGUF shard into one tensor inventory.
+
+        GGUF tensor offsets are shard-local. Sibling parsers therefore retain
+        their own mmap and data-section offset, while ``self.tensors`` exposes
+        the complete deterministic shard-order manifest to the loader.
+        """
+        split_count = int(self.metadata.get("split.count", 1) or 1)
+        if split_count <= 1:
+            return
+
+        match = re.fullmatch(
+            r"(?P<prefix>.*)-(?P<ordinal>\d{5})-of-(?P<count>\d{5})\.gguf",
+            self.file_path.name,
+        )
+        if match is None:
+            raise ValueError(
+                "GGUF declares split.count > 1 but its filename does not use "
+                "the -00001-of-000NN.gguf split convention: "
+                f"{self.file_path}"
+            )
+
+        filename_count = int(match.group("count"))
+        if filename_count != split_count:
+            raise ValueError(
+                f"GGUF split count mismatch: metadata={split_count}, "
+                f"filename={filename_count}"
+            )
+
+        current_split = int(self.metadata.get("split.no", -1))
+        filename_split = int(match.group("ordinal")) - 1
+        if current_split != filename_split:
+            raise ValueError(
+                f"GGUF split ordinal mismatch for {self.file_path}: "
+                f"metadata={current_split}, filename={filename_split}"
+            )
+
+        parsers_by_split = {current_split: self}
+        prefix = match.group("prefix")
+        for split_no in range(split_count):
+            if split_no == current_split:
+                continue
+            sibling_path = self.file_path.with_name(
+                f"{prefix}-{split_no + 1:05d}-of-{split_count:05d}.gguf"
+            )
+            if not sibling_path.is_file():
+                raise FileNotFoundError(
+                    f"GGUF split set is incomplete; missing shard: {sibling_path}"
+                )
+            sibling = GGUFParser(sibling_path)
+            try:
+                sibling._parse_single_file()
+                sibling_count = int(
+                    sibling.metadata.get("split.count", 1) or 1
+                )
+                sibling_no = int(sibling.metadata.get("split.no", -1))
+                if sibling_count != split_count or sibling_no != split_no:
+                    raise ValueError(
+                        f"GGUF sibling identity mismatch for {sibling_path}: "
+                        f"split.no={sibling_no}, split.count={sibling_count}"
+                    )
+                sibling_architecture = sibling.metadata.get("general.architecture")
+                if (
+                    sibling_architecture is not None
+                    and sibling_architecture
+                    != self.metadata.get("general.architecture")
+                ):
+                    raise ValueError(
+                        f"GGUF sibling architecture mismatch: {sibling_path}"
+                    )
+            except Exception:
+                sibling.close()
+                raise
+            self._split_parsers.append(sibling)
+            parsers_by_split[split_no] = sibling
+
+        aggregate = []
+        seen_names = set()
+        for split_no in range(split_count):
+            for tensor in parsers_by_split[split_no].tensors:
+                if tensor.name in seen_names:
+                    raise ValueError(
+                        f"GGUF split set declares duplicate tensor: {tensor.name}"
+                    )
+                seen_names.add(tensor.name)
+                aggregate.append(tensor)
+
+        expected_total = int(
+            self.metadata.get("split.tensors.count", len(aggregate))
+            or len(aggregate)
+        )
+        if len(aggregate) != expected_total:
+            raise ValueError(
+                f"GGUF split tensor-count mismatch: expected {expected_total}, "
+                f"found {len(aggregate)}"
+            )
+        self.tensors = aggregate
+        self.tensor_count = len(aggregate)
         
     def _read(self, fmt: str) -> Tuple:
         """Read struct-formatted data from current offset"""
@@ -312,7 +441,9 @@ class GGUFParser:
             # Read offset (uint64)
             offset = self._read('<Q')[0]
             
-            tensor_info = GGUFTensorInfo(name, dimensions, tensor_type, offset)
+            tensor_info = GGUFTensorInfo(
+                name, dimensions, tensor_type, offset, source_parser=self
+            )
             self.tensors.append(tensor_info)
             
         print(f"Parsed {len(self.tensors)} tensor infos")
@@ -350,6 +481,10 @@ class GGUFParser:
         Returns:
             Read-only memoryview of the raw tensor data.
         """
+        source_parser = tensor_info._source_parser
+        if source_parser is not None and source_parser is not self:
+            return source_parser.read_tensor_data(tensor_info)
+
         if self.data_offset is None:
             raise ValueError("Must call parse() before reading tensor data")
 

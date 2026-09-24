@@ -152,6 +152,8 @@ std::string ModelContextConfig::toString() const {
         << ", emb=" << (has_embedding ? "true" : "false")
         << ", lm=" << (has_lm_head ? "true" : "false")
         << ", shard=" << shard_index << "/" << total_shards
+        << ", payload_access="
+        << llaminar2::toString(payload_access_pattern)
         << "}";
     return oss.str();
 }

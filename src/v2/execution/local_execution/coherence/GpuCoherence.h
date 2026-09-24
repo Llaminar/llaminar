@@ -1,38 +1,37 @@
 /**
  * @file GpuCoherence.h
- * @brief RAII utilities for GPU tensor coherence management
+ * @brief Explicit-stream coherence helper for direct GPU kernel tests
  *
- * This header provides intuitive, self-documenting patterns for managing
- * GPU tensor coherence when calling kernels directly (outside DeviceGraphExecutor).
+ * Production GPU execution must express tensor movement and write publication
+ * through graph stages and TransferEngine. This header exists only for focused
+ * integration tests that invoke a kernel directly, outside DeviceGraphExecutor,
+ * and therefore need one small utility that performs the same explicit-stream
+ * setup and publication protocol.
  *
  * ## Why This Exists
  *
- * When using DeviceGraphExecutor, coherence is handled automatically at stage boundaries.
- * However, when calling kernels directly (in tests, utilities, or custom pipelines),
- * you must manually:
- * 1. Call `ensureOnDevice()` on inputs before the kernel runs
- * 2. Call `transitionTo(DEVICE_AUTHORITATIVE)` on outputs after the kernel completes
+ * When using DeviceGraphExecutor, coherence is handled automatically at stage
+ * boundaries. A direct-kernel integration test must:
+ * 1. make every input and output allocation available on the kernel stream;
+ * 2. launch the kernel on that exact stream; and
+ * 3. publish successful writes with that same producer stream.
  *
- * These utilities make that pattern RAII-based and self-documenting.
+ * `with_gpu_coherence()` keeps those three operations adjacent and rejects a
+ * null stream. It deliberately is not an RAII object: publication must be an
+ * explicit consequence of successful kernel execution, never a destructor side
+ * effect whose ordering is hidden from the caller.
  *
  * ## Usage Patterns
  *
- * ### Simple Case: Single Output
- * ```cpp
- * {
- *     auto output = gpu_output(output_tensor.get(), gpu_device);
- *     kernel->multiply_tensor(input.get(), output, M, N, K, ...);
- * } // ← output automatically marked dirty when scope exits
- * ```
- *
- * ### Complex Case: Multiple Inputs/Outputs
  * ```cpp
  * bool ok = with_gpu_coherence(
  *     gpu_device,
  *     {input.get()},                              // inputs to cohere
  *     {out_q.get(), out_k.get(), out_v.get()},    // outputs to cohere + mark dirty
+ *     producer_stream,
  *     [&] {
- *         return kernel->multiply_fused_tensor(input.get(), projections, M, K, nullptr);
+ *         return kernel->multiply_fused_tensor(
+ *             input.get(), projections, M, K, producer_stream);
  *     }
  * );
  * ```
@@ -45,232 +44,33 @@
 
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 
 #include <initializer_list>
-#include <vector>
+#include <stdexcept>
 #include <type_traits>
-#include <concepts>
+#include <utility>
 
 namespace llaminar2
 {
 
-    // Forward declarations
+    // Forward declaration
     class TensorBase;
 
-    // =========================================================================
-    // Concepts
-    // =========================================================================
-
     /**
-     * @brief Concept for tensors that support GPU coherence operations
-     */
-    template <typename T>
-    concept CoherableTensor = requires(T *t, DeviceId d) {
-        { t->ensureOnDevice(d) } -> std::same_as<bool>;
-        { t->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) };
-    };
-
-    // =========================================================================
-    // GpuOutput - RAII Proxy Wrapper
-    // =========================================================================
-
-    /**
-     * @brief RAII wrapper that ensures a tensor is on GPU and marks it dirty on destruction
-     *
-     * Use this for simple single-output cases. The wrapper:
-     * 1. Calls ensureOnDevice() on construction
-     * 2. Calls transitionTo(DEVICE_AUTHORITATIVE) on destruction
-     *
-     * The implicit conversion to T* allows passing directly to kernel functions.
-     *
-     * @tparam T Tensor type (must satisfy CoherableTensor concept)
-     *
-     * @example
-     * ```cpp
-     * {
-     *     auto output = gpu_output(output_cuda.get(), gpu_device_);
-     *     kernel->multiply_tensor(input.get(), output, M, N, K, ...);
-     * } // output automatically marked dirty
-     * ```
-     */
-    template <CoherableTensor T>
-    class GpuOutput
-    {
-        T *tensor_;
-        bool valid_ = false;
-
-    public:
-        /**
-         * @brief Construct and ensure tensor is on specified device
-         * @param tensor The tensor to wrap
-         * @param device Target GPU device
-         */
-        explicit GpuOutput(T *tensor, DeviceId device)
-            : tensor_(tensor)
-        {
-            if (tensor_)
-            {
-                valid_ = tensor_->ensureOnDevice(device);
-                if (!valid_)
-                {
-                    LOG_ERROR("[GpuOutput] Failed to ensure tensor on device " << device.toString());
-                }
-            }
-        }
-
-        /**
-         * @brief Destructor marks output as device-dirty if valid
-         */
-        ~GpuOutput()
-        {
-            if (tensor_ && valid_)
-            {
-                tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            }
-        }
-
-        // Non-copyable, moveable
-        GpuOutput(const GpuOutput &) = delete;
-        GpuOutput &operator=(const GpuOutput &) = delete;
-
-        GpuOutput(GpuOutput &&other) noexcept
-            : tensor_(other.tensor_), valid_(other.valid_)
-        {
-            other.tensor_ = nullptr;
-            other.valid_ = false;
-        }
-
-        GpuOutput &operator=(GpuOutput &&other) noexcept
-        {
-            if (this != &other)
-            {
-                // Mark current dirty before taking over
-                if (tensor_ && valid_)
-                {
-                    tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                }
-                tensor_ = other.tensor_;
-                valid_ = other.valid_;
-                other.tensor_ = nullptr;
-                other.valid_ = false;
-            }
-            return *this;
-        }
-
-        // Accessors
-        T *get() const { return tensor_; }
-        T *operator->() const { return tensor_; }
-        T &operator*() const { return *tensor_; }
-
-        /**
-         * @brief Implicit conversion to T* for seamless kernel calls
-         */
-        operator T *() const { return tensor_; }
-
-        /**
-         * @brief Check if the tensor was successfully placed on device
-         */
-        bool is_valid() const { return valid_; }
-
-        /**
-         * @brief Explicit bool conversion for validity check
-         */
-        explicit operator bool() const { return valid_; }
-    };
-
-    /**
-     * @brief Factory function to create GpuOutput with type deduction
-     *
-     * @param tensor The tensor to wrap
-     * @param device Target GPU device
-     * @return GpuOutput wrapper
-     *
-     * @example
-     * ```cpp
-     * auto output = gpu_output(my_tensor.get(), gpu_device);
-     * kernel->compute(input, output);  // implicit conversion to TensorBase*
-     * ```
-     */
-    template <CoherableTensor T>
-    [[nodiscard]] auto gpu_output(T *tensor, DeviceId device)
-    {
-        return GpuOutput<T>(tensor, device);
-    }
-
-    // =========================================================================
-    // GpuInput - RAII Input Coherence (read-only)
-    // =========================================================================
-
-    /**
-     * @brief RAII wrapper that ensures a tensor is on GPU (read-only, no dirty marking)
-     *
-     * Use this for inputs that need to be on GPU but won't be modified.
-     *
-     * @tparam T Tensor type (must satisfy CoherableTensor concept)
-     */
-    template <CoherableTensor T>
-    class GpuInput
-    {
-        T *tensor_;
-        bool valid_ = false;
-
-    public:
-        explicit GpuInput(T *tensor, DeviceId device)
-            : tensor_(tensor)
-        {
-            if (tensor_)
-            {
-                valid_ = tensor_->ensureOnDevice(device);
-                if (!valid_)
-                {
-                    LOG_ERROR("[GpuInput] Failed to ensure tensor on device " << device.toString());
-                }
-            }
-        }
-
-        // Destructor does NOT mark dirty (inputs are read-only)
-        ~GpuInput() = default;
-
-        // Non-copyable, moveable
-        GpuInput(const GpuInput &) = delete;
-        GpuInput &operator=(const GpuInput &) = delete;
-        GpuInput(GpuInput &&) noexcept = default;
-        GpuInput &operator=(GpuInput &&) noexcept = default;
-
-        T *get() const { return tensor_; }
-        T *operator->() const { return tensor_; }
-        T &operator*() const { return *tensor_; }
-        operator T *() const { return tensor_; }
-        bool is_valid() const { return valid_; }
-        explicit operator bool() const { return valid_; }
-    };
-
-    /**
-     * @brief Factory function to create GpuInput with type deduction
-     */
-    template <CoherableTensor T>
-    [[nodiscard]] auto gpu_input(T *tensor, DeviceId device)
-    {
-        return GpuInput<T>(tensor, device);
-    }
-
-    // =========================================================================
-    // with_gpu_coherence - Lambda Wrapper for Complex Cases
-    // =========================================================================
-
-    /**
-     * @brief Execute a kernel with automatic input/output coherence management
+     * @brief Execute one direct test kernel with explicit-stream coherence
      *
      * This function:
-     * 1. Calls ensureOnDevice() on all inputs
-     * 2. Calls ensureOnDevice() on all outputs (to allocate GPU memory)
+     * 1. Prepares all inputs through TransferEngine on the consumer stream
+     * 2. Prepares output-only storage without uploading stale host bytes
      * 3. Executes the kernel function
-     * 4. If successful, calls transitionTo(DEVICE_AUTHORITATIVE) on all outputs
+     * 4. If successful, publishes all output writes through TransferEngine
      *
      * @param device Target GPU device
      * @param inputs List of input tensors to cohere (read-only)
      * @param outputs List of output tensors to cohere and mark dirty
+     * @param producer_stream Exact non-null stream used by @p kernel_fn
      * @param kernel_fn Lambda/function that executes the kernel, returns bool
      * @return true if all coherence operations and kernel execution succeeded
      *
@@ -280,8 +80,10 @@ namespace llaminar2
      *     gpu_device_,
      *     {input.get()},                              // inputs
      *     {out_q.get(), out_k.get(), out_v.get()},    // outputs
+     *     producer_stream,
      *     [&] {
-     *         return kernel->multiply_fused_tensor(input.get(), projections, M, K, nullptr);
+     *         return kernel->multiply_fused_tensor(
+     *             input.get(), projections, M, K, producer_stream);
      *     }
      * );
      * ```
@@ -292,28 +94,29 @@ namespace llaminar2
         DeviceId device,
         std::initializer_list<TensorBase *> inputs,
         std::initializer_list<TensorBase *> outputs,
+        void *producer_stream,
         F &&kernel_fn)
     {
-        // Cohere inputs (ensure on device)
-        for (auto *tensor : inputs)
+        if (!producer_stream)
         {
-            if (tensor && !tensor->ensureOnDevice(device))
-            {
-                LOG_ERROR("[with_gpu_coherence] Failed to cohere input tensor to device "
-                          << device.toString());
-                return false;
-            }
+            throw std::invalid_argument(
+                "with_gpu_coherence requires the exact non-null producer stream");
         }
 
-        // Cohere outputs (ensure on device - allocates GPU memory)
+        // Join every input producer to the exact consumer stream.
+        for (auto *tensor : inputs)
+        {
+            if (tensor)
+                TransferEngine::prepareDeviceInput(
+                    tensor, device, producer_stream);
+        }
+
+        // Allocate output-only storage without importing stale host contents.
         for (auto *tensor : outputs)
         {
-            if (tensor && !tensor->ensureOnDevice(device))
-            {
-                LOG_ERROR("[with_gpu_coherence] Failed to cohere output tensor to device "
-                          << device.toString());
-                return false;
-            }
+            if (tensor)
+                TransferEngine::prepareDeviceOutput(
+                    tensor, device, producer_stream);
         }
 
         // Execute kernel
@@ -326,7 +129,8 @@ namespace llaminar2
             {
                 if (tensor)
                 {
-                    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        tensor, device, producer_stream);
                 }
             }
         }
@@ -335,38 +139,40 @@ namespace llaminar2
     }
 
     /**
-     * @brief Overload for kernels that don't return bool (void or other)
+     * @brief Execute a void direct test kernel with explicit-stream coherence
      *
      * Always marks outputs dirty after execution completes.
      */
     template <typename F>
-        requires(!std::is_invocable_r_v<bool, F>)
+        requires std::is_invocable_v<F> &&
+                 std::is_void_v<std::invoke_result_t<F>>
     bool with_gpu_coherence(
         DeviceId device,
         std::initializer_list<TensorBase *> inputs,
         std::initializer_list<TensorBase *> outputs,
+        void *producer_stream,
         F &&kernel_fn)
     {
-        // Cohere inputs
-        for (auto *tensor : inputs)
+        if (!producer_stream)
         {
-            if (tensor && !tensor->ensureOnDevice(device))
-            {
-                LOG_ERROR("[with_gpu_coherence] Failed to cohere input tensor to device "
-                          << device.toString());
-                return false;
-            }
+            throw std::invalid_argument(
+                "with_gpu_coherence requires the exact non-null producer stream");
         }
 
-        // Cohere outputs
+        // Join every input producer to the exact consumer stream.
+        for (auto *tensor : inputs)
+        {
+            if (tensor)
+                TransferEngine::prepareDeviceInput(
+                    tensor, device, producer_stream);
+        }
+
+        // Allocate output-only storage without importing stale host contents.
         for (auto *tensor : outputs)
         {
-            if (tensor && !tensor->ensureOnDevice(device))
-            {
-                LOG_ERROR("[with_gpu_coherence] Failed to cohere output tensor to device "
-                          << device.toString());
-                return false;
-            }
+            if (tensor)
+                TransferEngine::prepareDeviceOutput(
+                    tensor, device, producer_stream);
         }
 
         // Execute kernel (no return value)
@@ -377,126 +183,11 @@ namespace llaminar2
         {
             if (tensor)
             {
-                tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                TransferEngine::publishDeviceWrite(
+                    tensor, device, producer_stream);
             }
         }
 
         return true;
     }
-
-    // =========================================================================
-    // GpuCoherenceScope - Multi-tensor RAII Scope
-    // =========================================================================
-
-    /**
-     * @brief RAII scope that manages coherence for multiple inputs/outputs
-     *
-     * Alternative to with_gpu_coherence when you need more control over
-     * the kernel execution flow.
-     *
-     * @example
-     * ```cpp
-     * {
-     *     GpuCoherenceScope scope(gpu_device_);
-     *     scope.add_input(input.get());
-     *     scope.add_output(out_q.get());
-     *     scope.add_output(out_k.get());
-     *
-     *     if (!scope.cohere()) {
-     *         return false;  // coherence failed
-     *     }
-     *
-     *     kernel->multiply_fused_tensor(...);
-     *     scope.mark_success();  // enables dirty marking on destruction
-     * }
-     * ```
-     */
-    class GpuCoherenceScope
-    {
-        DeviceId device_;
-        std::vector<TensorBase *> inputs_;
-        std::vector<TensorBase *> outputs_;
-        bool cohered_ = false;
-        bool success_ = false;
-
-    public:
-        explicit GpuCoherenceScope(DeviceId device) : device_(device) {}
-
-        ~GpuCoherenceScope()
-        {
-            if (cohered_ && success_)
-            {
-                for (auto *tensor : outputs_)
-                {
-                    if (tensor)
-                    {
-                        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-                    }
-                }
-            }
-        }
-
-        // Non-copyable
-        GpuCoherenceScope(const GpuCoherenceScope &) = delete;
-        GpuCoherenceScope &operator=(const GpuCoherenceScope &) = delete;
-
-        /**
-         * @brief Add an input tensor (will be cohered, not marked dirty)
-         */
-        GpuCoherenceScope &add_input(TensorBase *tensor)
-        {
-            if (tensor)
-                inputs_.push_back(tensor);
-            return *this;
-        }
-
-        /**
-         * @brief Add an output tensor (will be cohered AND marked dirty on success)
-         */
-        GpuCoherenceScope &add_output(TensorBase *tensor)
-        {
-            if (tensor)
-                outputs_.push_back(tensor);
-            return *this;
-        }
-
-        /**
-         * @brief Perform coherence on all added tensors
-         * @return true if all tensors successfully cohered to device
-         */
-        bool cohere()
-        {
-            for (auto *tensor : inputs_)
-            {
-                if (!tensor->ensureOnDevice(device_))
-                {
-                    LOG_ERROR("[GpuCoherenceScope] Failed to cohere input to device "
-                              << device_.toString());
-                    return false;
-                }
-            }
-            for (auto *tensor : outputs_)
-            {
-                if (!tensor->ensureOnDevice(device_))
-                {
-                    LOG_ERROR("[GpuCoherenceScope] Failed to cohere output to device "
-                              << device_.toString());
-                    return false;
-                }
-            }
-            cohered_ = true;
-            return true;
-        }
-
-        /**
-         * @brief Mark kernel execution as successful (enables dirty marking)
-         */
-        void mark_success() { success_ = true; }
-
-        /**
-         * @brief Get coherence status
-         */
-        bool is_cohered() const { return cohered_; }
-    };
-
 } // namespace llaminar2

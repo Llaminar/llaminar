@@ -22,16 +22,24 @@
  * - getDumpInfo() returns non-empty info when buffers are set
  * - Scalar parameters are captured correctly
  * - Input/output buffers are referenced correctly
+ * - Fused GEMM operands retain their reduction width even when output N differs
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
+#include <atomic>
 #include <cmath>
 #include <random>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "execution/debug/AsyncStageDumper.h"
 
+#include "backends/BackendManager.h"
 #include "utils/MPIContext.h"
+#include "../../../mocks/MockBackend.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -111,9 +119,158 @@ protected:
     std::mt19937 rng_{42};
 };
 
+namespace
+{
+    class CountingDumpInfoStage final : public IComputeStage
+    {
+    public:
+        CountingDumpInfoStage() : IComputeStage(DeviceId::cpu()) {}
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+
+        int buildCount() const { return build_count_.load(std::memory_order_relaxed); }
+
+    protected:
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            const int build = build_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            StageDumpInfo info;
+            info.addScalarInt("build", build);
+            return info;
+        }
+
+    private:
+        mutable std::atomic<int> build_count_{0};
+    };
+}
+
+TEST_F(StageDumpInfoTest, DumpInfoSnapshotRemainsStableAcrossRefresh)
+{
+    CountingDumpInfoStage stage;
+
+    StageDumpInfo first = stage.getDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(first, "build"), 1);
+
+    StageDumpInfo second = stage.refreshDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(first, "build"), 1);
+    EXPECT_EQ(getScalarInt(second, "build"), 2);
+
+    StageDumpInfo third = stage.getDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(third, "build"), 2);
+}
+
+TEST_F(StageDumpInfoTest, DumpInfoCacheAllowsConcurrentSnapshotsAndInvalidation)
+{
+    CountingDumpInfoStage stage;
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < 6; ++t)
+    {
+        threads.emplace_back([&]()
+                             {
+                                 while (!start.load(std::memory_order_acquire))
+                                 {
+                                 }
+                                 for (int i = 0; i < 1000; ++i)
+                                 {
+                                     StageDumpInfo info = stage.getDumpInfoSnapshot();
+                                     if (info.scalars.empty() || std::string(info.scalars.front().name) != "build")
+                                     {
+                                         failures.fetch_add(1, std::memory_order_relaxed);
+                                     }
+                                 } });
+    }
+
+    for (int t = 0; t < 2; ++t)
+    {
+        threads.emplace_back([&]()
+                             {
+                                 while (!start.load(std::memory_order_acquire))
+                                 {
+                                 }
+                                 for (int i = 0; i < 1000; ++i)
+                                 {
+                                     stage.invalidateDumpInfoCache();
+                                 } });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads)
+    {
+        thread.join();
+    }
+
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+    EXPECT_GT(stage.buildCount(), 0);
+}
+
+TEST_F(StageDumpInfoTest, EnsureOutputsOnHostRejectsGpuOutputWithoutExplicitStream)
+{
+    MockBackend backend(DeviceType::CUDA);
+    auto output = TestTensorFactory::createFP32({2, 2});
+    output->setBackendForTesting(&backend);
+
+    const DeviceId device = DeviceId::cuda(0);
+    void *producer_stream = reinterpret_cast<void *>(0xD00F0001);
+    ASSERT_TRUE(output->allocateOnDevice(device, producer_stream));
+    TransferEngine::publishGraphOwnedDeviceWrite(output, device);
+
+    StageDumpInfo info;
+    info.addOutput("gpu_output", output.get(), 2, 2);
+
+    EXPECT_THROW(info.ensureOutputsOnHost(), std::runtime_error);
+}
+
 // =============================================================================
 // GEMMStage Tests
 // =============================================================================
+
+/**
+ * @brief A declined dump must not resolve any input or output host address.
+ *
+ * Model capture leaves this mock tensor device-owned without a terminal copy
+ * event. Output publication would throw and input publication would attempt a
+ * copy. Exhausted dump admission must return before coherence, allocation,
+ * queueing or filesystem access instead.
+ */
+TEST_F(StageDumpInfoTest, DeclinedAsyncDumpDoesNotObserveDeviceStorage)
+{
+    MockBackend backend(DeviceType::CUDA);
+    auto tensor = TestTensorFactory::createFP32({2, 2});
+    tensor->setBackendForTesting(&backend);
+    const auto device = DeviceId::cuda(0);
+    void *stream = reinterpret_cast<void *>(0xD00F0002);
+    ASSERT_TRUE(tensor->allocateOnDevice(device, stream));
+    TransferEngine::publishGraphOwnedDeviceWrite(tensor, device);
+
+    StageDumpInfo info;
+    info.addInput("input", tensor.get(), 2, 2);
+    info.addOutput("output", tensor.get(), 2, 2);
+    const StageDumpContext declined;
+    ASSERT_LT(declined.dump_id, 0);
+    const auto previous_d2h = backend.getD2HCount();
+    const auto previous_syncs = backend.getSyncCount();
+    EXPECT_NO_THROW(AsyncStageDumper::enqueueInputs(declined, info));
+    EXPECT_NO_THROW(AsyncStageDumper::enqueueOutputs(declined, info));
+    EXPECT_EQ(backend.getD2HCount(), previous_d2h);
+    EXPECT_EQ(backend.getSyncCount(), previous_syncs);
+    EXPECT_EQ(AsyncStageDumper::pendingTasks(), 0u);
+}
+
+/** @brief An admitted ID without its directory is malformed, not a skipped dump. */
+TEST_F(StageDumpInfoTest, MalformedAsyncDumpAdmissionFailsBeforeSnapshot)
+{
+    StageDumpContext malformed;
+    malformed.dump_id = 0;
+    const StageDumpInfo empty;
+    EXPECT_THROW(AsyncStageDumper::enqueueInputs(malformed, empty), std::invalid_argument);
+    EXPECT_THROW(AsyncStageDumper::enqueueOutputs(malformed, empty), std::invalid_argument);
+    EXPECT_EQ(AsyncStageDumper::pendingTasks(), 0u);
+}
 
 TEST_F(StageDumpInfoTest, GEMMStage_GetDumpInfo)
 {
@@ -144,11 +301,55 @@ TEST_F(StageDumpInfoTest, GEMMStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "C"));
+    EXPECT_TRUE(hasWeight(info, "B"));
 }
 
 // =============================================================================
 // FusedQKVGEMMStage Tests
 // =============================================================================
+
+/**
+ * @brief Fused down-projection evidence must include every gate input element.
+ *
+ * SwiGLU consumes gate[M,K] and up[M,K] before projecting to output[M,N].
+ * Using N for the gate dump silently truncates real down-projection evidence
+ * when K>N and advertises out-of-bounds reads when N>K. Exercise both directions
+ * without running kernels or allocating a model.
+ */
+TEST_F(StageDumpInfoTest, FusedGEMMGateDumpUsesReductionWidth)
+{
+    constexpr size_t m = 3;
+    for (const auto &[n, k] : std::vector<std::pair<size_t, size_t>>{{32, 128}, {128, 32}})
+    {
+        SCOPED_TRACE(::testing::Message() << "m=" << m << " n=" << n << " k=" << k);
+        auto up = TestTensorFactory::createFP32({m, k});
+        auto gate = TestTensorFactory::createFP32({m, k});
+        auto weight = TestTensorFactory::createFP32({n, k});
+        auto output = TestTensorFactory::createFP32({m, n});
+        GEMMStage::Params params;
+        params.A = up.get();
+        params.B = weight.get();
+        params.C = output.get();
+        params.gate_input = gate.get();
+        params.do_swiglu = true;
+        params.m = m;
+        params.n = n;
+        params.k = k;
+        GEMMStage stage(params);
+        const auto dump = stage.getDumpInfoSnapshot();
+        bool found_gate = false;
+        for (const auto &input : dump.inputs)
+        {
+            if (std::string(input.name) != "gate_input")
+                continue;
+            found_gate = true;
+            EXPECT_EQ(input.rows, m);
+            EXPECT_EQ(input.cols, k);
+            EXPECT_EQ(input.byte_size, m * k * sizeof(float));
+        }
+        EXPECT_TRUE(found_gate);
+    }
+}
 
 TEST_F(StageDumpInfoTest, FusedQKVGEMMStage_GetDumpInfo)
 {
@@ -264,6 +465,66 @@ TEST_F(StageDumpInfoTest, RMSNormStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "output"));
+    EXPECT_TRUE(hasWeight(info, "gamma"));
+    EXPECT_FALSE(hasInput(info, "gamma"));
+}
+
+TEST_F(StageDumpInfoTest,
+       RMSNormStage_MTPTerminalHiddenDiagnosticIsTypedAndOptIn)
+{
+    constexpr int seq_len = 1;
+    constexpr int hidden_size = 64;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {seq_len, hidden_size});
+    auto output = TestTensorFactory::createFP32(
+        {seq_len, hidden_size});
+    auto gamma = TestTensorFactory::createFP32Ones({hidden_size});
+
+    RMSNormStage stage({
+        .input = input.get(),
+        .output = output.get(),
+        .gamma = gamma.get(),
+        .seq_len = seq_len,
+        .diagnostic_input_publication =
+            RMSNormStage::DiagnosticInputPublication::MTPTerminalHidden,
+    });
+    const StageDumpInfo info = stage.getDumpInfo();
+
+    EXPECT_TRUE(hasOutput(info, "output"));
+    EXPECT_TRUE(hasOutput(info, "mtp_terminal_hidden_input"));
+    ASSERT_EQ(info.outputs.size(), 2u);
+    EXPECT_EQ(info.outputs[1].tensor, input.get());
+}
+
+TEST_F(StageDumpInfoTest, GatedRMSNormStage_DumpInfoUsesFeatureDim)
+{
+    int seq_len = 4;
+    int active_width = 128;
+    int backing_width = 256;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(backing_width)});
+    auto gate = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(active_width)});
+    auto gamma = TestTensorFactory::createFP32Ones({static_cast<size_t>(active_width)});
+
+    GatedRMSNormStage::Params params;
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = input.get();
+    params.gamma = gamma.get();
+    params.seq_len = seq_len;
+    params.feature_dim = active_width;
+    params.norm_dim = 64;
+
+    GatedRMSNormStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    ASSERT_EQ(info.outputs.size(), 1u);
+    EXPECT_STREQ(info.outputs[0].name, "output");
+    EXPECT_EQ(info.outputs[0].rows, static_cast<size_t>(seq_len));
+    EXPECT_EQ(info.outputs[0].cols, static_cast<size_t>(active_width));
 }
 
 // =============================================================================

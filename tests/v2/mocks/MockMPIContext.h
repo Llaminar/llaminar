@@ -23,6 +23,12 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define LLAMINAR_TEST_NOINLINE __attribute__((noinline))
+#else
+#define LLAMINAR_TEST_NOINLINE
+#endif
+
 namespace llaminar2::test
 {
 
@@ -285,7 +291,7 @@ namespace llaminar2::test
             }
         }
 
-        void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const override
+        LLAMINAR_TEST_NOINLINE void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const override
         {
             if (config_.track_calls)
             {
@@ -382,6 +388,17 @@ namespace llaminar2::test
             {
                 *request = MPI_REQUEST_NULL;
             }
+        }
+
+        bool test(MPI_Request *request, MPI_Status * /*status*/) const override
+        {
+            if (config_.track_calls)
+            {
+                test_calls_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (request)
+                *request = MPI_REQUEST_NULL;
+            return request != nullptr;
         }
 
         void waitAll(std::vector<MPI_Request> &requests) const override
@@ -593,6 +610,7 @@ namespace llaminar2::test
             isend_calls_.store(0, std::memory_order_relaxed);
             irecv_calls_.store(0, std::memory_order_relaxed);
             wait_calls_.store(0, std::memory_order_relaxed);
+            test_calls_.store(0, std::memory_order_relaxed);
             waitall_calls_.store(0, std::memory_order_relaxed);
             probe_calls_.store(0, std::memory_order_relaxed);
             iprobe_calls_.store(0, std::memory_order_relaxed);
@@ -642,6 +660,12 @@ namespace llaminar2::test
             return wait_calls_.load(std::memory_order_relaxed);
         }
 
+        /** @brief Get the number of non-blocking request progress calls. */
+        size_t test_call_count() const
+        {
+            return test_calls_.load(std::memory_order_relaxed);
+        }
+
         /**
          * @brief Get the number of waitAll() calls
          */
@@ -673,7 +697,8 @@ namespace llaminar2::test
         {
             return send_call_count() + recv_call_count() +
                    isend_call_count() + irecv_call_count() +
-                   wait_call_count() + waitall_call_count() +
+                   wait_call_count() + test_call_count() +
+                   waitall_call_count() +
                    probe_call_count() + iprobe_call_count();
         }
 
@@ -755,6 +780,7 @@ namespace llaminar2::test
         mutable std::atomic<size_t> isend_calls_{0};
         mutable std::atomic<size_t> irecv_calls_{0};
         mutable std::atomic<size_t> wait_calls_{0};
+        mutable std::atomic<size_t> test_calls_{0};
         mutable std::atomic<size_t> waitall_calls_{0};
 
         mutable std::mutex broadcast_int32_mutex_;
@@ -764,3 +790,5 @@ namespace llaminar2::test
     };
 
 } // namespace llaminar2::test
+
+#undef LLAMINAR_TEST_NOINLINE

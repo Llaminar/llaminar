@@ -3,7 +3,8 @@
  * @brief Singleton pool managing all GPU device contexts
  *
  * Provides lazy initialization and thread-safe access to GPU device contexts.
- * Contexts are created on first access and persist for the lifetime of the process.
+ * Contexts are created on first access and persist until an explicit exclusive
+ * generation retirement, pool shutdown, or process exit.
  *
  * This class is DECOUPLED from CUDA/HIP dependencies - it only knows about
  * IWorkerGPUContext (the abstract interface). Concrete context creation is
@@ -24,14 +25,89 @@
 
 #include "DeviceId.h"
 #include "IWorkerGPUContext.h"
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <functional>
+#include <unordered_set>
 
 namespace llaminar2
 {
+    class GPUDeviceContextPool;
+
+    /**
+     * @brief Proof that one process-local GPU context generation was retired.
+     *
+     * A zero generation means that the device had no materialized worker
+     * context. This is valid when model setup failed before graph construction;
+     * a live generation that cannot be retired raises instead of returning a
+     * partial receipt.
+     */
+    struct GPUDeviceContextGenerationRetirementReceipt
+    {
+        DeviceId device = DeviceId::invalid(); ///< Exact physical GPU endpoint.
+        std::uint64_t retired_generation = 0u; ///< Non-zero retired generation.
+
+        /** @return Whether a materialized worker context was destroyed. */
+        [[nodiscard]] bool retiredLiveContext() const noexcept
+        {
+            return retired_generation != 0u;
+        }
+    };
+
+    /**
+     * @brief RAII exclusion scope spanning worker destruction and runtime reset.
+     *
+     * While this object is alive the context pool rejects acquisition of the
+     * named device. TransferEngine keeps the scope alive across the backend's
+     * native runtime-generation reset, closing the race where a fresh worker
+     * could otherwise materialize between stream destruction and device reset.
+     */
+    class ExclusiveGPUDeviceGenerationRetirement final
+    {
+    public:
+        /** @brief Release acquisition exclusion after the reset transaction. */
+        ~ExclusiveGPUDeviceGenerationRetirement();
+
+        ExclusiveGPUDeviceGenerationRetirement(
+            const ExclusiveGPUDeviceGenerationRetirement &) = delete;
+        ExclusiveGPUDeviceGenerationRetirement &operator=(
+            const ExclusiveGPUDeviceGenerationRetirement &) = delete;
+
+        /** @brief Transfer ownership of the live exclusion scope. */
+        ExclusiveGPUDeviceGenerationRetirement(
+            ExclusiveGPUDeviceGenerationRetirement &&other) noexcept;
+
+        /** @brief Release any current scope and take @p other's exclusion. */
+        ExclusiveGPUDeviceGenerationRetirement &operator=(
+            ExclusiveGPUDeviceGenerationRetirement &&other) noexcept;
+
+        /** @return Proof naming the process-local context generation removed. */
+        [[nodiscard]] const GPUDeviceContextGenerationRetirementReceipt &
+        receipt() const noexcept
+        {
+            return receipt_;
+        }
+
+    private:
+        friend class GPUDeviceContextPool;
+
+        /** @brief Construct only after the pool installed its retiring marker. */
+        ExclusiveGPUDeviceGenerationRetirement(
+            GPUDeviceContextPool *pool,
+            GPUDeviceContextGenerationRetirementReceipt receipt) noexcept
+            : pool_(pool), receipt_(std::move(receipt))
+        {
+        }
+
+        /** @brief Drop the exact marker once, terminating on lost invariants. */
+        void release() noexcept;
+
+        GPUDeviceContextPool *pool_ = nullptr; ///< Pool owning the marker.
+        GPUDeviceContextGenerationRetirementReceipt receipt_; ///< Retired worker.
+    };
 
     /**
      * @brief Factory function type for creating GPU device contexts
@@ -48,7 +124,8 @@ namespace llaminar2
      * @brief Singleton pool managing all GPU device contexts
      *
      * Provides lazy initialization and thread-safe access to device contexts.
-     * Contexts are created on first access and persist for the lifetime of the process.
+     * Contexts are created on first access and persist until an explicit
+     * exclusive generation retirement, pool shutdown, or process exit.
      *
      * ## Backend Decoupling
      *
@@ -70,8 +147,9 @@ namespace llaminar2
      *
      * ## Lifetime
      *
-     * The pool is a process-global singleton. Contexts persist until shutdown()
-     * is called or the process exits. The destructor calls shutdown() automatically.
+     * The pool is a process-global singleton. Contexts persist until
+     * retireExclusiveGeneration(), shutdown(), or process exit. The destructor
+     * calls shutdown() automatically.
      */
     class GPUDeviceContextPool
     {
@@ -229,12 +307,58 @@ namespace llaminar2
          *
          * @thread_safety Thread-safe, but callers must ensure no other threads
          *                are using contexts during shutdown
+         * @throws std::logic_error when an exclusive generation-retirement
+         *         transaction is still in progress.
          */
         void shutdown();
 
+        /**
+         * @brief Retire one completed model's process-local context generation.
+         *
+         * TransferEngine calls this only after an exclusive model-retirement
+         * ticket proves that every graph, event consumer, and runner using
+         * @p device is gone. The method moves the context owner out of the
+         * pool, rejects concurrent acquisition during destruction, and
+         * destroys streams, events, and BLAS handles outside the pool mutex. A
+         * later caller receives a newly numbered generation through lazy access.
+         *
+         * Destroying the completed stream generation is required on HIP direct
+         * dispatch: asynchronous signal handlers may retain memory objects
+         * after `hipFree` until their owning streams are destroyed. This method
+         * does not reset the physical GPU or invalidate backend allocations.
+         *
+         * @param device Exact CUDA or ROCm endpoint whose model is retired.
+         * @return Typed receipt naming the destroyed generation, or generation
+         *         zero when no context had been materialized.
+         * @throws std::invalid_argument for a non-GPU endpoint.
+         * @throws std::logic_error for a concurrent lifecycle transition.
+         * @thread_safety Thread-safe; callers still require exclusive model use.
+         */
+        [[nodiscard]] GPUDeviceContextGenerationRetirementReceipt
+        retireExclusiveGeneration(DeviceId device);
+
+        /**
+         * @brief Begin an exclusion scope that remains live across runtime reset.
+         *
+         * Unlike @ref retireExclusiveGeneration, this API does not release the
+         * acquisition marker when worker destruction finishes. The returned
+         * RAII scope must span every backend operation that invalidates the
+         * corresponding CUDA/HIP primary-context generation.
+         *
+         * @param device Exact CUDA or ROCm endpoint.
+         * @return Movable scope holding the device's acquisition exclusion.
+         */
+        [[nodiscard]] ExclusiveGPUDeviceGenerationRetirement
+        beginExclusiveGenerationRetirement(DeviceId device);
+
     private:
+        friend class ExclusiveGPUDeviceGenerationRetirement;
+
         GPUDeviceContextPool() = default;
         ~GPUDeviceContextPool();
+
+        /** @brief Release one marker held by an RAII retirement scope. */
+        void finishExclusiveGenerationRetirement(DeviceId device) noexcept;
 
         // Mutex protecting all mutable state
         mutable std::mutex mutex_;
@@ -243,6 +367,15 @@ namespace llaminar2
         // Using IWorkerGPUContext for full type erasure (no CUDA/HIP deps in header)
         std::unordered_map<int, std::unique_ptr<IWorkerGPUContext>> nvidia_contexts_;
         std::unordered_map<int, std::unique_ptr<IWorkerGPUContext>> amd_contexts_;
+
+        // Generation IDs distinguish a fresh context from address reuse.
+        std::unordered_map<int, std::uint64_t> nvidia_generations_;
+        std::unordered_map<int, std::uint64_t> amd_generations_;
+        std::uint64_t next_generation_ = 1u;
+
+        // Acquisition fails while cleanup runs outside mutex_.
+        std::unordered_set<int> retiring_nvidia_contexts_;
+        std::unordered_set<int> retiring_amd_contexts_;
 
         // Factory functions registered by cuda_backend / rocm_backend
         GPUContextFactory nvidia_factory_;

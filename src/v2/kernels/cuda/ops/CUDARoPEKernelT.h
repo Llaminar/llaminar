@@ -26,9 +26,13 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h" // For FP32Tensor, BF16Tensor, FP16Tensor
 #include "../../../tensors/BlockStructures.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
+#include "../../rope/RoPEInvariantPublication.h"
 #include "../../rope/RoPEDeviceParams.h"
+#include "../../rope/RoPEWorkspaceContract.h"
 #include <cstdint>
+#include <memory>
 
 namespace llaminar2
 {
@@ -59,12 +63,11 @@ namespace llaminar2
             using StorageType = float;
 
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
-            static constexpr int MAX_HALF_DIM = 128;
+            static constexpr int MAX_HALF_DIM = rope::kMaxInverseFrequencyValues;
 
             explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
-                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
-            ~CUDARoPEKernelT() override;
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
+            ~CUDARoPEKernelT() override = default;
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
@@ -73,25 +76,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Device params buffer for graph capture
-                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                        sizeof(rope::RoPEDeviceParams), 256, true});
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
@@ -100,7 +85,8 @@ namespace llaminar2
                 // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
                 if (workspace_ != workspace)
                 {
-                    inv_freq_initialized_ = false;
+                    inv_freq_publication_.reset();
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
@@ -111,36 +97,46 @@ namespace llaminar2
             DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                inv_freq_adoption_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
+            }
+
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
             /// Bind explicit position IDs that already live on the device.
             void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
+            /** @copydoc ITensorRoPE::prepareInvariantDeviceState */
+            bool prepareInvariantDeviceState(
+                int rotary_dim,
+                float rope_theta) override;
+
             void resetDynamicState() override
             {
-                inv_freq_initialized_ = false;
-                inv_freq_head_dim_ = 0;
-                inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             // ===== ITensorRoPE interface =====
@@ -176,7 +172,7 @@ namespace llaminar2
             {
                 (void)mpi_ctx;
 
-                LOG_DEBUG("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
+                LOG_TRACE("[CUDARoPEKernelT<FP32>] apply_tensor called: seq_len=" << seq_len
                                                                                   << " n_heads=" << n_heads << " device_idx=" << device_idx
                                                                                   << " pos_offset=" << pos_offset
                                                                                   << " rotary_dim=" << rotary_dim);
@@ -232,10 +228,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_fp32,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_fp32)
                     {
-                        k_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_fp32,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -252,13 +254,11 @@ namespace llaminar2
             IWorkerGPUContext *device_ctx_ = nullptr;
             void *gpu_stream_ = nullptr;
 
-            // Inverse frequency cache state (for workspace-based allocation)
-            mutable bool inv_freq_initialized_;
-            mutable int inv_freq_head_dim_;
-            mutable float inv_freq_theta_;
+            // Immutable model/graph-family state; request reset must retain it.
+            std::shared_ptr<rope::RoPEInvariantWorkspacePublication>
+                inv_freq_publication_;
+            void *inv_freq_adoption_stream_ = nullptr;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -277,11 +277,10 @@ namespace llaminar2
             using StorageType = uint16_t;
 
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
-            static constexpr int MAX_HALF_DIM = 128;
+            static constexpr int MAX_HALF_DIM = rope::kMaxInverseFrequencyValues;
 
             explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
-                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -289,8 +288,7 @@ namespace llaminar2
              * @param rope_theta RoPE theta parameter
              */
             explicit CUDARoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
-                : rope_theta_(rope_theta), workspace_(nullptr),
-                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr)
             {
                 if (!ctx)
                     throw std::runtime_error("CUDARoPEKernelT<BF16>: Device context is null");
@@ -300,45 +298,58 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override;
+            ~CUDARoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const
+            {
+                return requireExplicitGPUStreamBinding(gpu_stream_, "CUDARoPEKernelT<BF16>");
+            }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                inv_freq_adoption_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
+            }
+
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
             /// Bind explicit position IDs that already live on the device.
             void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
+            /** @copydoc ITensorRoPE::prepareInvariantDeviceState */
+            bool prepareInvariantDeviceState(
+                int rotary_dim,
+                float rope_theta) override;
+
             void resetDynamicState() override
             {
-                inv_freq_initialized_ = false;
-                inv_freq_head_dim_ = 0;
-                inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -348,25 +359,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Device params buffer for graph capture
-                reqs.buffers.push_back({RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                                        sizeof(rope::RoPEDeviceParams), 256, true});
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
@@ -375,7 +368,8 @@ namespace llaminar2
                 // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
                 if (workspace_ != workspace)
                 {
-                    inv_freq_initialized_ = false;
+                    inv_freq_publication_.reset();
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
@@ -469,10 +463,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_bf16,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_bf16)
                     {
-                        k_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_bf16,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -489,13 +489,11 @@ namespace llaminar2
             IWorkerGPUContext *device_ctx_ = nullptr;
             void *gpu_stream_ = nullptr;
 
-            // Inverse frequency cache state (for workspace-based allocation)
-            mutable bool inv_freq_initialized_;
-            mutable int inv_freq_head_dim_;
-            mutable float inv_freq_theta_;
+            // Immutable model/graph-family state; request reset must retain it.
+            std::shared_ptr<rope::RoPEInvariantWorkspacePublication>
+                inv_freq_publication_;
+            void *inv_freq_adoption_stream_ = nullptr;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;
@@ -514,11 +512,10 @@ namespace llaminar2
             using StorageType = uint16_t;
 
             /// Maximum head_dim/2 for worst-case workspace allocation (covers head_dim up to 256)
-            static constexpr int MAX_HALF_DIM = 128;
+            static constexpr int MAX_HALF_DIM = rope::kMaxInverseFrequencyValues;
 
             explicit CUDARoPEKernelT(int device_idx = -1, float rope_theta = 10000.0f)
-                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr),
-                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f) {}
+                : device_idx_(device_idx), rope_theta_(rope_theta), workspace_(nullptr) {}
 
             /**
              * @brief Construct with device context (Phase 4 pattern)
@@ -526,8 +523,7 @@ namespace llaminar2
              * @param rope_theta RoPE theta parameter
              */
             explicit CUDARoPEKernelT(IWorkerGPUContext *ctx, float rope_theta = 10000.0f)
-                : rope_theta_(rope_theta), workspace_(nullptr),
-                  inv_freq_initialized_(false), inv_freq_head_dim_(0), inv_freq_theta_(0.0f)
+                : rope_theta_(rope_theta), workspace_(nullptr)
             {
                 if (!ctx)
                     throw std::runtime_error("CUDARoPEKernelT<FP16>: Device context is null");
@@ -537,45 +533,58 @@ namespace llaminar2
                 device_idx_ = ctx->deviceOrdinal();
             }
 
-            ~CUDARoPEKernelT() override;
+            ~CUDARoPEKernelT() override = default;
 
             // ===== Device Context Support (Phase 4) =====
             void setDeviceContext(IWorkerGPUContext *ctx) { device_ctx_ = ctx; }
             IWorkerGPUContext *deviceContext() const { return device_ctx_; }
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
-            void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
+            void *getStream() const
+            {
+                return requireExplicitGPUStreamBinding(gpu_stream_, "CUDARoPEKernelT<FP16>");
+            }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override
+            void bindGPUStream(ExplicitGPUStream stream) override
             {
-                if (gpu_stream_ != stream)
+                if (gpu_stream_ != stream.get())
                 {
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
                 }
-                gpu_stream_ = stream;
+                gpu_stream_ = stream.get();
             }
 
-            /// Pre-upload pos_offset device params for graph replay
+            void clearGPUStreamBinding() override
+            {
+                gpu_stream_ = nullptr;
+                inv_freq_adoption_stream_ = nullptr;
+                dynamic_pos_device_valid_ = false;
+                dynamic_position_ids_device_valid_ = false;
+                dynamic_position_ids_device_ptr_ = nullptr;
+            }
+
+            /// Publish pos_offset into graph-stable device params.
             void setDynamicPosOffset(int pos_offset) override;
             /// Pre-upload explicit position IDs for graph-captured replay.
             void setDynamicPositionIds(const int *position_ids, int seq_len) override;
             /// Bind explicit position IDs that already live on the device.
             void setDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override;
 
+            /** @copydoc ITensorRoPE::prepareInvariantDeviceState */
+            bool prepareInvariantDeviceState(
+                int rotary_dim,
+                float rope_theta) override;
+
             void resetDynamicState() override
             {
-                inv_freq_initialized_ = false;
-                inv_freq_head_dim_ = 0;
-                inv_freq_theta_ = 0.0f;
                 dynamic_pos_device_valid_ = false;
                 dynamic_pos_offset_ = 0;
                 dynamic_position_ids_device_valid_ = false;
                 dynamic_position_ids_seq_len_ = 0;
                 dynamic_position_ids_device_ptr_ = nullptr;
-                if (h_device_params_)
-                    h_device_params_->pos_offset = 0;
             }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
@@ -585,29 +594,7 @@ namespace llaminar2
             {
                 (void)n;
                 (void)k;
-                WorkspaceRequirements reqs;
-                // Position IDs buffer - m is max sequence length
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::POSITION_IDS,
-                    static_cast<size_t>(m) * sizeof(int),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Inverse frequency table - allocated for worst-case head_dim
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::INV_FREQ,
-                    static_cast<size_t>(MAX_HALF_DIM) * sizeof(float),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                // Device params for graph-captured RoPE kernels
-                reqs.buffers.push_back({
-                    RoPEWorkspaceBuffers::DEVICE_PARAMS,
-                    sizeof(rope::RoPEDeviceParams),
-                    256, // CUDA alignment
-                    true // Required
-                });
-                return reqs;
+                return rope_workspace::requirements({.graph_rows = m});
             }
 
             void bindWorkspace(DeviceWorkspaceManager *workspace) override
@@ -616,7 +603,8 @@ namespace llaminar2
                 // See ROCmRoPEKernelT<FP32>::bindWorkspace() for full rationale.
                 if (workspace_ != workspace)
                 {
-                    inv_freq_initialized_ = false;
+                    inv_freq_publication_.reset();
+                    inv_freq_adoption_stream_ = nullptr;
                     dynamic_pos_device_valid_ = false;
                     dynamic_position_ids_device_valid_ = false;
                     dynamic_position_ids_device_ptr_ = nullptr;
@@ -710,10 +698,16 @@ namespace llaminar2
                 // Mark tensors as modified on GPU
                 if (success)
                 {
-                    q_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                    TransferEngine::publishDeviceWrite(
+                        q_fp16,
+                        DeviceId::cuda(device_idx),
+                        gpu_stream_);
                     if (k_fp16)
                     {
-                        k_fp16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                        TransferEngine::publishDeviceWrite(
+                            k_fp16,
+                            DeviceId::cuda(device_idx),
+                            gpu_stream_);
                     }
                 }
 
@@ -730,13 +724,11 @@ namespace llaminar2
             IWorkerGPUContext *device_ctx_ = nullptr;
             void *gpu_stream_ = nullptr;
 
-            // Inverse frequency cache state (for workspace-based allocation)
-            mutable bool inv_freq_initialized_;
-            mutable int inv_freq_head_dim_;
-            mutable float inv_freq_theta_;
+            // Immutable model/graph-family state; request reset must retain it.
+            std::shared_ptr<rope::RoPEInvariantWorkspacePublication>
+                inv_freq_publication_;
+            void *inv_freq_adoption_stream_ = nullptr;
 
-            /// Pinned host staging for pre-capture device-param uploads
-            rope::RoPEDeviceParams *h_device_params_ = nullptr;
             bool dynamic_pos_device_valid_ = false;
             int dynamic_pos_offset_ = 0;
             bool dynamic_position_ids_device_valid_ = false;

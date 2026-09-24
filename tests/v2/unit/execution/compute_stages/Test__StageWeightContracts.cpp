@@ -3,15 +3,15 @@
  * @brief Unit tests verifying all weight-bearing stages declare weights in bufferContract()
  *
  * These tests lock in the paradigm established during the executor coherence migration:
- * every stage that holds model weights MUST declare them via bufferContract().addWeight().
- * The executor's weight coherence loop ONLY processes contract.weight_tensors — any weight
- * not declared there will never be uploaded to device, causing illegal memory access.
+ * every stage that holds model weights MUST declare either the raw tensor it reads
+ * or the exact PreparedWeightStore entry it consumes. The executor coheres raw
+ * weights and validates prepared entries as separate resource classes.
  *
  * Tests cover:
- * 1. Each weight-bearing stage declares non-empty weight_tensors in its contract
- * 2. Weight pointers in the contract match the pointers passed via Params
+ * 1. Each weight-bearing stage declares non-empty weight resources in its contract
+ * 2. Raw and prepared source pointers match the pointers passed via Params
  * 3. Stages without BufferIds return empty contracts (graceful fallback)
- * 4. Null weight pointers are NOT added to the contract
+ * 4. Prepared contracts retain exact store, binding, and device identity
  */
 
 #include <gtest/gtest.h>
@@ -22,10 +22,15 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
+#include "loaders/PreparedWeightStore.h"
 #include "utils/TestTensorFactory.h"
 #include "memory/BufferId.h"
 #include "memory/StageBufferContract.h"
 #include "backends/DeviceId.h"
+
+#include <algorithm>
+#include <string_view>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -47,7 +52,12 @@ protected:
         return TestTensorFactory::createQ8_0Random({rows, cols});
     }
 
-    // Helper: check that a specific ITensor* appears in contract.weight_tensors
+    static size_t contractWeightCount(const StageBufferContract &contract)
+    {
+        return contract.weight_tensors.size() + contract.prepared_weights.size();
+    }
+
+    // A source tensor may be read raw or identify store-owned prepared bytes.
     static bool contractContainsWeight(const StageBufferContract &contract, const ITensor *expected)
     {
         for (const auto *w : contract.weight_tensors)
@@ -55,7 +65,64 @@ protected:
             if (w == expected)
                 return true;
         }
+        for (const auto &binding : contract.prepared_weights)
+        {
+            if (binding.source_tensor == expected)
+                return true;
+        }
         return false;
+    }
+
+    static bool contractHasInput(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.inputs)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
+    static bool contractHasOutput(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.outputs)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
+    static bool contractHasInOut(const StageBufferContract &contract, BufferId id)
+    {
+        for (const auto &binding : contract.inouts)
+        {
+            if (binding.id == id)
+                return true;
+        }
+        return false;
+    }
+
+    /** @brief Report whether dump metadata classifies @p name as an activation input. */
+    static bool dumpHasInput(const StageDumpInfo &dump, const char *name)
+    {
+        return std::any_of(
+            dump.inputs.begin(), dump.inputs.end(),
+            [name](const StageDumpInfo::InputBuffer &input)
+            {
+                return input.name && std::string_view(input.name) == name;
+            });
+    }
+
+    /** @brief Report whether dump metadata classifies @p name as immutable model state. */
+    static bool dumpHasWeight(const StageDumpInfo &dump, const char *name)
+    {
+        return std::any_of(
+            dump.weights.begin(), dump.weights.end(),
+            [name](const StageDumpInfo::WeightBuffer &weight)
+            {
+                return weight.name && std::string_view(weight.name) == name;
+            });
     }
 
     // Typical model dimensions (Qwen2.5-0.5B-like)
@@ -92,8 +159,51 @@ TEST_F(Test__StageWeightContracts, GEMMStage_DeclaresWeightB)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_GE(contract.weight_tensors.size(), 1u);
+    EXPECT_GE(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, B.get()));
+}
+
+TEST_F(Test__StageWeightContracts, GEMMStage_DeclaresExactPreparedBinding)
+{
+    auto A = makeFP32(SEQ_LEN, D_MODEL);
+    auto B = makeQ8_0(D_FF, D_MODEL);
+    auto C = makeFP32(SEQ_LEN, D_FF);
+    PreparedWeightStore store(ModelContextId{99});
+    WeightBinding binding;
+    binding.binding_id = 41;
+    binding.identity = makeSourceWeightIdentity(
+        "blk.0.ffn_gate.weight", ModelContextId{99}, binding.binding_id);
+    binding.tensor = B.get();
+    binding.residency.home_device = DeviceId::cuda(1);
+    binding.residency.resident_device = DeviceId::cuda(1);
+    binding.immutable = true;
+    const auto ref = store.registerPreparedForTest(
+        binding, PreparedWeightKind::CudaInt8PackedGemm, DeviceId::cuda(1));
+
+    GEMMStage::Params params{};
+    params.A = A.get();
+    params.B = B.get();
+    params.C = C.get();
+    params.m = SEQ_LEN;
+    params.n = D_FF;
+    params.k = D_MODEL;
+    params.device_id = DeviceId::cuda(1);
+    params.prepared_store = &store;
+    params.prepared_ref = ref;
+    params.a_buffer_id = BufferId::HIDDEN_STATE;
+    params.c_buffer_id = BufferId::FFN_OUTPUT;
+
+    GEMMStage stage(params);
+    const auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contract.weight_tensors.empty());
+    ASSERT_EQ(contract.prepared_weights.size(), 1u);
+    EXPECT_EQ(contract.prepared_weights[0].source_tensor, B.get());
+    EXPECT_EQ(contract.prepared_weights[0].store, &store);
+    EXPECT_EQ(contract.prepared_weights[0].ref.model_id, ref.model_id);
+    EXPECT_EQ(contract.prepared_weights[0].ref.binding_id, ref.binding_id);
+    EXPECT_EQ(contract.prepared_weights[0].ref.kind, ref.kind);
+    EXPECT_EQ(contract.prepared_weights[0].ref.device, ref.device);
 }
 
 TEST_F(Test__StageWeightContracts, GEMMStage_DeclaresWeightBAndBias)
@@ -117,9 +227,12 @@ TEST_F(Test__StageWeightContracts, GEMMStage_DeclaresWeightBAndBias)
     GEMMStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_EQ(contract.weight_tensors.size(), 2u);
+    EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, B.get()));
     EXPECT_TRUE(contractContainsWeight(contract, bias.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "bias"));
+    EXPECT_FALSE(dumpHasInput(dump, "bias"));
 }
 
 TEST_F(Test__StageWeightContracts, GEMMStage_NullB_EmptyWeights)
@@ -140,7 +253,7 @@ TEST_F(Test__StageWeightContracts, GEMMStage_NullB_EmptyWeights)
     GEMMStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_TRUE(contract.weight_tensors.empty());
+    EXPECT_EQ(contractWeightCount(contract), 0u);
 }
 
 TEST_F(Test__StageWeightContracts, GEMMStage_NoBufferIds_EmptyContract)
@@ -188,8 +301,54 @@ TEST_F(Test__StageWeightContracts, EmbeddingStage_DeclaresEmbedTable)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, embed.get()));
+}
+
+TEST_F(Test__StageWeightContracts, QuantizedGpuEmbedding_DeclaresExactPreparedBinding)
+{
+    auto embed = makeQ8_0(VOCAB_SIZE, D_MODEL);
+    auto output = makeFP32(SEQ_LEN, D_MODEL);
+    int token_ids[] = {1, 2, 3, 4};
+    PreparedWeightStore store(ModelContextId{99});
+    WeightBinding binding;
+    binding.binding_id = 42;
+    binding.identity = makeSourceWeightIdentity(
+        "token_embd.weight", ModelContextId{99}, binding.binding_id);
+    binding.identity.role = WeightRole::Embedding;
+    binding.tensor = embed.get();
+    binding.residency.home_device = DeviceId::cuda(1);
+    binding.residency.resident_device = DeviceId::cuda(1);
+    binding.immutable = true;
+    PreparedEmbeddingHandle handle;
+    handle.tensor = embed.get();
+    handle.device_id = DeviceId::cuda(1);
+    handle.weights = std::make_shared<PreparedEmbeddingWeights>();
+    handle.weights->device_id = DeviceId::cuda(1);
+    const auto ref = store.registerPreparedEmbeddingFromPipeline(
+        binding, DeviceId::cuda(1), &handle);
+
+    EmbeddingStage::Params params{};
+    params.embed_table = embed.get();
+    params.token_ids = token_ids;
+    params.output = output.get();
+    params.num_tokens = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.vocab_size = VOCAB_SIZE;
+    params.device_id = DeviceId::cuda(1);
+    params.prepared_store = &store;
+    params.prepared_ref = ref;
+    params.output_buffer_id = BufferId::HIDDEN_STATE;
+
+    EmbeddingStage stage(params);
+    const auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contract.weight_tensors.empty());
+    ASSERT_EQ(contract.prepared_weights.size(), 1u);
+    EXPECT_EQ(contract.prepared_weights[0].source_tensor, embed.get());
+    EXPECT_EQ(contract.prepared_weights[0].store, &store);
+    EXPECT_EQ(contract.prepared_weights[0].ref.binding_id, ref.binding_id);
+    EXPECT_EQ(contract.prepared_weights[0].ref.device, DeviceId::cuda(1));
 }
 
 TEST_F(Test__StageWeightContracts, EmbeddingStage_NoOutputBufferId_EmptyContract)
@@ -235,8 +394,11 @@ TEST_F(Test__StageWeightContracts, RMSNormStage_DeclaresGamma)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 TEST_F(Test__StageWeightContracts, RMSNormStage_InPlace_HasInOutBinding)
@@ -262,6 +424,33 @@ TEST_F(Test__StageWeightContracts, RMSNormStage_InPlace_HasInOutBinding)
     EXPECT_EQ(contract.inouts[0].id, BufferId::HIDDEN_STATE);
 }
 
+TEST_F(Test__StageWeightContracts, TPAllreduceStage_UsesPreallocatedInOutBinding)
+{
+    auto tensor = makeFP32(SEQ_LEN, D_MODEL);
+
+    TPAllreduceStage::Params params{};
+    params.tensor = tensor.get();
+    params.tensor_buffer_id = BufferId::HIDDEN_STATE;
+
+    TPAllreduceStage stage(std::move(params));
+    auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contract.inputs.empty());
+    EXPECT_TRUE(contract.outputs.empty());
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts[0].id, BufferId::HIDDEN_STATE);
+    EXPECT_FALSE(contract.inouts[0].prepare_write_storage)
+        << "TP allreduce consumes the producer's existing device buffer and must not "
+           "run prepareForWrite(), which can migrate a shared multi-device tensor before NCCL/RCCL reads it.";
+
+    auto write_preps = contract.writesRequiringPrepare();
+    EXPECT_TRUE(write_preps.empty());
+
+    auto writes = contract.allWrites();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].id, BufferId::HIDDEN_STATE);
+}
+
 // =============================================================================
 // LMHeadStage
 // =============================================================================
@@ -285,7 +474,7 @@ TEST_F(Test__StageWeightContracts, LMHeadStage_DeclaresWeight)
     LMHeadStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_GE(contract.weight_tensors.size(), 1u);
+    EXPECT_GE(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, weight.get()));
 }
 
@@ -310,7 +499,7 @@ TEST_F(Test__StageWeightContracts, LMHeadStage_WithBias_DeclaresBoth)
     LMHeadStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_EQ(contract.weight_tensors.size(), 2u);
+    EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, weight.get()));
     EXPECT_TRUE(contractContainsWeight(contract, bias.get()));
 }
@@ -352,7 +541,7 @@ TEST_F(Test__StageWeightContracts, FusedQKVGEMMStage_DeclaresAllWeights)
 
     EXPECT_FALSE(contract.empty());
     // 3 weight matrices (no biases)
-    EXPECT_EQ(contract.weight_tensors.size(), 3u);
+    EXPECT_EQ(contractWeightCount(contract), 3u);
     EXPECT_TRUE(contractContainsWeight(contract, wq.get()));
     EXPECT_TRUE(contractContainsWeight(contract, wk.get()));
     EXPECT_TRUE(contractContainsWeight(contract, wv.get()));
@@ -396,7 +585,7 @@ TEST_F(Test__StageWeightContracts, FusedQKVGEMMStage_WithBiases_DeclaresAll)
     auto contract = stage.bufferContract();
 
     // 3 weights + 3 biases = 6
-    EXPECT_EQ(contract.weight_tensors.size(), 6u);
+    EXPECT_EQ(contractWeightCount(contract), 6u);
     EXPECT_TRUE(contractContainsWeight(contract, wq.get()));
     EXPECT_TRUE(contractContainsWeight(contract, wk.get()));
     EXPECT_TRUE(contractContainsWeight(contract, wv.get()));
@@ -434,7 +623,7 @@ TEST_F(Test__StageWeightContracts, FusedGateUpGEMMStage_DeclaresGateAndUp)
     FusedGateUpGEMMStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_EQ(contract.weight_tensors.size(), 2u);
+    EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, w_gate.get()));
     EXPECT_TRUE(contractContainsWeight(contract, w_up.get()));
 }
@@ -468,7 +657,7 @@ TEST_F(Test__StageWeightContracts, FusedGateUpGEMMStage_WithBiases_DeclaresFour)
     FusedGateUpGEMMStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_EQ(contract.weight_tensors.size(), 4u);
+    EXPECT_EQ(contractWeightCount(contract), 4u);
     EXPECT_TRUE(contractContainsWeight(contract, w_gate.get()));
     EXPECT_TRUE(contractContainsWeight(contract, w_up.get()));
     EXPECT_TRUE(contractContainsWeight(contract, b_gate.get()));
@@ -501,8 +690,11 @@ TEST_F(Test__StageWeightContracts, FusedResidualNormStage_DeclaresGamma)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 // =============================================================================
@@ -529,8 +721,11 @@ TEST_F(Test__StageWeightContracts, QKNormStage_DeclaresGamma)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+    const StageDumpInfo dump = stage.getDumpInfo();
+    EXPECT_TRUE(dumpHasWeight(dump, "gamma"));
+    EXPECT_FALSE(dumpHasInput(dump, "gamma"));
 }
 
 // =============================================================================
@@ -575,7 +770,7 @@ TEST_F(Test__StageWeightContracts, GDNProjectionStage_DeclaresFourWeights)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 4u);
+    EXPECT_EQ(contractWeightCount(contract), 4u);
     EXPECT_TRUE(contractContainsWeight(contract, w_qkv.get()));
     EXPECT_TRUE(contractContainsWeight(contract, w_z.get()));
     EXPECT_TRUE(contractContainsWeight(contract, w_a.get()));
@@ -616,7 +811,7 @@ TEST_F(Test__StageWeightContracts, GDNRecurrenceStage_DeclaresALogAndDtBias)
 
     EXPECT_FALSE(contract.empty());
     // A_log and dt_bias are model weights
-    EXPECT_EQ(contract.weight_tensors.size(), 2u);
+    EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, A_log.get()));
     EXPECT_TRUE(contractContainsWeight(contract, dt_bias.get()));
 }
@@ -642,7 +837,33 @@ TEST_F(Test__StageWeightContracts, GatedRMSNormStage_DeclaresGamma)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
+    EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
+}
+
+TEST_F(Test__StageWeightContracts, GatedRMSNormStage_InPlace_HasInOutBinding)
+{
+    auto input = makeFP32(SEQ_LEN, D_MODEL);
+    auto gate = makeFP32(SEQ_LEN, D_MODEL);
+    auto gamma = makeFP32(1, D_MODEL);
+
+    GatedRMSNormStage::Params params{};
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = input.get();
+    params.gamma = gamma.get();
+    params.eps = 1e-6f;
+    params.input_buffer_id = BufferId::ATTN_OUTPUT;
+    params.gate_buffer_id = BufferId::GDN_Z;
+    params.output_buffer_id = BufferId::ATTN_OUTPUT;
+
+    GatedRMSNormStage stage(params);
+    auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contractHasInOut(contract, BufferId::ATTN_OUTPUT));
+    EXPECT_TRUE(contractHasInput(contract, BufferId::GDN_Z));
+    EXPECT_FALSE(contractHasInput(contract, BufferId::ATTN_OUTPUT));
+    EXPECT_FALSE(contractHasOutput(contract, BufferId::ATTN_OUTPUT));
     EXPECT_TRUE(contractContainsWeight(contract, gamma.get()));
 }
 
@@ -666,7 +887,7 @@ TEST_F(Test__StageWeightContracts, ShortConv1dStage_DeclaresWeightAndBias)
     auto contract = stage.bufferContract();
 
     EXPECT_FALSE(contract.empty());
-    EXPECT_EQ(contract.weight_tensors.size(), 2u);
+    EXPECT_EQ(contractWeightCount(contract), 2u);
     EXPECT_TRUE(contractContainsWeight(contract, weight.get()));
     EXPECT_TRUE(contractContainsWeight(contract, bias.get()));
 }
@@ -689,7 +910,7 @@ TEST_F(Test__StageWeightContracts, ShortConv1dStage_NoBias_DeclaresWeightOnly)
     ShortConv1dStage stage(params);
     auto contract = stage.bufferContract();
 
-    EXPECT_EQ(contract.weight_tensors.size(), 1u);
+    EXPECT_EQ(contractWeightCount(contract), 1u);
     EXPECT_TRUE(contractContainsWeight(contract, weight.get()));
 }
 
@@ -723,6 +944,11 @@ TEST_F(Test__StageWeightContracts, AllContracts_WeightPointersAreNonNull)
     {
         EXPECT_NE(weight, nullptr) << "Weight tensor in contract must not be null";
     }
+    for (const auto &weight : contract.prepared_weights)
+    {
+        EXPECT_NE(weight.source_tensor, nullptr)
+            << "Prepared weight source tensor in contract must not be null";
+    }
 }
 
 TEST_F(Test__StageWeightContracts, AllContracts_WeightsAreSeparateFromArenaBindings)
@@ -746,7 +972,7 @@ TEST_F(Test__StageWeightContracts, AllContracts_WeightsAreSeparateFromArenaBindi
 
     // Weights are separate from arena bindings
     EXPECT_FALSE(contract.inputs.empty() || contract.outputs.empty());
-    EXPECT_FALSE(contract.weight_tensors.empty());
+    EXPECT_GT(contractWeightCount(contract), 0u);
 
     // No overlap between weight tensors and arena buffer IDs
     // (This is a structural invariant — weights use ITensor*, arena uses BufferId)

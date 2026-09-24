@@ -39,8 +39,16 @@ namespace
         desc.num_experts = num_experts;
         desc.local_expert_start = local_start;
         desc.local_expert_count = (local_count < 0) ? num_experts : local_count;
-        desc.rows_per_expert = 2048;
-        desc.cols_per_expert = 896;
+        if (role == WeightRole::MoEExpertDown)
+        {
+            desc.rows_per_expert = 896;
+            desc.cols_per_expert = 2048;
+        }
+        else
+        {
+            desc.rows_per_expert = 2048;
+            desc.cols_per_expert = 896;
+        }
         return desc;
     }
 
@@ -180,7 +188,10 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_ReusesExistingCPUSlabs)
         nullptr,
         std::nullopt,
         std::nullopt,
-        std::nullopt};
+        std::nullopt,
+        true,
+        nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()};
 
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
 
@@ -252,7 +263,10 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_IncompleteExistingSlabs
         nullptr,
         std::nullopt,
         std::nullopt,
-        std::nullopt};
+        std::nullopt,
+        true,
+        nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()};
 
     EXPECT_FALSE(MoEExpertWeightService::prepareGemmEngines(ctx));
     EXPECT_EQ(store.expertSlabCount(), 3u);

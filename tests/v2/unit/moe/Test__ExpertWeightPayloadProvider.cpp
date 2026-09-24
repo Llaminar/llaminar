@@ -18,9 +18,9 @@ using namespace llaminar2;
 static ExpertWeightBlobs makeTestBlobs(size_t n_bytes = 64)
 {
     ExpertWeightBlobs blobs;
-    blobs.gate = std::vector<uint8_t>(n_bytes, 0xAB);
-    blobs.up = std::vector<uint8_t>(n_bytes, 0xCD);
-    blobs.down = std::vector<uint8_t>(n_bytes, 0xEF);
+    blobs.gate = ExpertTransferBuffer(n_bytes, 0xAB);
+    blobs.up = ExpertTransferBuffer(n_bytes, 0xCD);
+    blobs.down = ExpertTransferBuffer(n_bytes, 0xEF);
     return blobs;
 }
 
@@ -32,7 +32,6 @@ TEST(Test__ExpertWeightPayloadProvider, EmptyProviderHasNoPayloads)
     EXPECT_EQ(provider.totalPayloadCount(), 0u);
     EXPECT_EQ(provider.totalPayloadBytes(), 0u);
     EXPECT_FALSE(provider.hasPayload(0, 0));
-    EXPECT_EQ(provider.payloadPtr(0, 0), nullptr);
     EXPECT_FALSE(provider.payloadFor(0, 0).has_value());
 }
 
@@ -78,19 +77,6 @@ TEST(Test__ExpertWeightPayloadProvider, RegisterBatchPayloads)
     EXPECT_TRUE(provider.hasPayload(5, 1));
     EXPECT_TRUE(provider.hasPayload(5, 2));
     EXPECT_FALSE(provider.hasPayload(5, 3));
-}
-
-TEST(Test__ExpertWeightPayloadProvider, PayloadPtrReturnsValidPointer)
-{
-    ExpertWeightPayloadProvider provider;
-    provider.registerPayload(2, 7, makeTestBlobs(100));
-
-    const ExpertWeightBlobs *ptr = provider.payloadPtr(2, 7);
-    ASSERT_NE(ptr, nullptr);
-    EXPECT_FALSE(ptr->empty());
-    EXPECT_EQ(ptr->gate.size(), 100u);
-
-    EXPECT_EQ(provider.payloadPtr(2, 8), nullptr);
 }
 
 TEST(Test__ExpertWeightPayloadProvider, PayloadsForLayerReturnsAll)

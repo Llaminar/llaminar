@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "execution/moe/MoEExpertParallelPlanner.h"
+#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "integration/moe/MoEGraphNativeRoutedTierTestUtils.h"
 #include "mocks/MockComputeStage.h"
 
@@ -26,33 +26,33 @@ namespace llaminar2::test
         constexpr uint64_t kStep = 1;
         constexpr int kParticipantCount = 2;
 
-        ExpertComputeDomain cudaTierDomain()
+        RoutedExpertDomain cudaTierDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "orchid_cuda_domain";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertComputeDomain rocmTierDomain()
+        RoutedExpertDomain rocmTierDomain()
         {
-            ExpertComputeDomain domain;
+            RoutedExpertDomain domain;
             domain.name = "saffron_rocm_domain";
-            domain.kind = ExpertDomainKind::SingleDevice;
+            domain.scope = ExecutionDomainScope::SINGLE;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        ExpertRoutedTier routedTier(const std::string &name, const std::string &domain, int priority, int capacity)
+        RoutedExpertTier routedTier(const std::string &name, const std::string &domain, int priority, int capacity)
         {
-            ExpertRoutedTier tier;
+            RoutedExpertTier tier;
             tier.name = name;
             tier.domain = domain;
             tier.priority = priority;
@@ -60,9 +60,9 @@ namespace llaminar2::test
             return tier;
         }
 
-        MoEExpertModelMetadata metadata()
+        MoERoutedExpertModelMetadata metadata()
         {
-            MoEExpertModelMetadata model;
+            MoERoutedExpertModelMetadata model;
             model.num_layers = 1;
             model.num_experts = kNumExperts;
             model.d_model = kDModel;
@@ -72,23 +72,23 @@ namespace llaminar2::test
             return model;
         }
 
-        MoEExpertParallelPlan makeGpuOnlyPlan()
+        MoERoutedExpertPlacementPlan makeGpuOnlyPlan()
         {
-            MoEExpertParallelPlan plan;
+            MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
-            plan.execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
             plan.continuation_domain = "orchid_cuda_domain";
             plan.shared_expert_domain = "orchid_cuda_domain";
-            plan.residency_policy = ExpertResidencyPolicy::StaticById;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
             plan.domains = {cudaTierDomain(), rocmTierDomain()};
             plan.routed_tiers = {
                 routedTier("orchid_user_tier", "orchid_cuda_domain", 1, 2),
                 routedTier("saffron_user_tier", "saffron_rocm_domain", 0, 2),
             };
-            return MoEExpertParallelPlanner::plan(plan, metadata()).planned_plan;
+            return MoERoutedExpertPlacementPlanner::plan(plan, metadata()).planned_plan;
         }
 
-        void expectOwnerMapHasGpuOnlyCanonicalOwners(const MoEExpertParallelPlan &plan,
+        void expectOwnerMapHasGpuOnlyCanonicalOwners(const MoERoutedExpertPlacementPlan &plan,
                                                      const MoEExpertOwnerMap &owner_map)
         {
             ASSERT_EQ(plan.routed_tiers.size(), 2u);
@@ -122,7 +122,7 @@ namespace llaminar2::test
 
         const auto plan = makeGpuOnlyPlan();
         EXPECT_EQ(plan.placements.front().routed_expert_tier, (std::vector<int>{1, 1, 0, 0}));
-        EXPECT_TRUE(validateMoEExpertParallelPlan(
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(
                         plan,
                         {.layer_count = 1, .routed_expert_count = kNumExperts})
                         .ok());

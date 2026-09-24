@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Build the Llaminar release runtime container from the repo Dockerfile.
+# @file build-runtime-image.sh
+# @brief Build the Llaminar release runtime container from the repo Dockerfile.
 #
 # This is the local/CI entry point for packaging a Release `llaminar2` binary
 # into the slim runtime image. The Dockerfile still owns the actual dependency
 # install and binary copy; this script keeps the docker build invocation shared.
+# Dry-run command planning requires neither a Docker client nor a daemon. Full
+# production certification/publication is owned by run_production_pipeline.py.
 set -euo pipefail
 
 usage() {
@@ -26,6 +29,8 @@ Options:
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
       --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
                            Default: full.
+      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512 or AVX2.
+                           Dockerfile default if unset.
       --cpu-only           Alias for --variant cpu.
       --cuda-only          Alias for --variant cuda.
       --rocm-only          Alias for --variant rocm.
@@ -73,7 +78,7 @@ Environment:
   LLAMINAR_IMAGE_TAGS      Newline- or comma-separated image tags.
   LLAMINAR_IMAGE_LABELS    Newline-separated image labels.
   VERSION, VCS_REF, BUILD_DATE, LLAMINAR_BUILD_TYPE, LLAMINAR_IMAGE_VARIANT,
-  LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
+  LLAMINAR_CPU_ISA, LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
   LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
   RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
   RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK,
@@ -121,7 +126,9 @@ append_split_labels() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 
-default_rccl_only_funcs='AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8'
+# Shared with direct Docker builds. MIN/MAX must not disappear from packaged
+# runtimes merely because ordinary model allreduces most often use SUM.
+default_rccl_only_funcs="$(<"${repo_root}/scripts/docker/rccl-functions.txt")"
 
 tags=()
 labels=()
@@ -138,6 +145,7 @@ version="${VERSION:-}"
 vcs_ref="${VCS_REF:-}"
 build_date="${BUILD_DATE:-}"
 build_type="${LLAMINAR_BUILD_TYPE:-Release}"
+cpu_isa="${LLAMINAR_CPU_ISA:-}"
 image_variant="${LLAMINAR_IMAGE_VARIANT:-full}"
 enable_cuda="${LLAMINAR_ENABLE_CUDA:-}"
 enable_rocm="${LLAMINAR_ENABLE_ROCM:-}"
@@ -214,6 +222,11 @@ while (($#)); do
         --variant)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             image_variant="$2"
+            shift 2
+            ;;
+        --cpu-isa)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            cpu_isa="$2"
             shift 2
             ;;
         --cpu-only)
@@ -345,6 +358,13 @@ case "${image_variant}" in
     full|cpu|cuda|rocm) ;;
     *) die "unsupported --variant '${image_variant}' (expected full, cpu, cuda, or rocm)" ;;
 esac
+if [[ -n "${cpu_isa}" ]]; then
+    cpu_isa="${cpu_isa^^}"
+    case "${cpu_isa}" in
+        AVX512|AVX2) ;;
+        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512 or AVX2)" ;;
+    esac
+fi
 
 normalize_bool_arg() {
     case "${1}" in
@@ -415,9 +435,6 @@ case "${verify_mode}" in
         ;;
 esac
 
-command -v docker >/dev/null 2>&1 || die "docker CLI is not available"
-docker buildx version >/dev/null 2>&1 || die "docker buildx is not available"
-
 cmd=(
     docker buildx build
     --file "${repo_root}/Dockerfile"
@@ -433,6 +450,9 @@ cmd=(
     --build-arg "RCCL_ENABLE_MSCCL_KERNEL=${rccl_enable_msccl_kernel}"
 )
 
+if [[ -n "${cpu_isa}" ]]; then
+    cmd+=(--build-arg "LLAMINAR_CPU_ISA=${cpu_isa}")
+fi
 if [[ -n "${cuda_archs}" ]]; then
     cmd+=(--build-arg "LLAMINAR_CUDA_ARCHS=${cuda_archs}")
 fi
@@ -445,9 +465,9 @@ fi
 if [[ -n "${rocm_runtime_gpu_targets}" ]]; then
     cmd+=(--build-arg "ROCM_RUNTIME_GPU_TARGETS=${rocm_runtime_gpu_targets}")
 fi
-if [[ -n "${rccl_only_funcs}" ]]; then
-    cmd+=(--build-arg "RCCL_ONLY_FUNCS=${rccl_only_funcs}")
-fi
+# Passing an explicit empty value preserves --full-rccl-funcs now that the
+# Dockerfile's default also selects the canonical inference support set.
+cmd+=(--build-arg "RCCL_ONLY_FUNCS=${rccl_only_funcs}")
 if [[ -n "${platform}" ]]; then
     cmd+=(--platform "${platform}")
 fi
@@ -492,6 +512,11 @@ if [[ "${dry_run}" == "true" ]]; then
     exit 0
 fi
 
+# A dry run validates and prints the build contract without requiring an
+# installed Docker client or daemon. Execution alone needs those dependencies.
+command -v docker >/dev/null 2>&1 || die "docker CLI is not available"
+docker buildx version >/dev/null 2>&1 || die "docker buildx is not available"
+
 "${cmd[@]}"
 
 if [[ "${verify}" == "true" ]]; then
@@ -500,4 +525,4 @@ if [[ "${verify}" == "true" ]]; then
         --help >/dev/null
 fi
 
-echo "[build-runtime-image] built ${tags[*]} (variant=${image_variant}, cuda=${enable_cuda}, rocm=${enable_rocm})"
+echo "[build-runtime-image] built ${tags[*]} (variant=${image_variant}, cpu_isa=${cpu_isa:-Dockerfile default}, cuda=${enable_cuda}, rocm=${enable_rocm})"

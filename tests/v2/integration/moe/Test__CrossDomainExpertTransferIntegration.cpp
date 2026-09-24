@@ -3,11 +3,10 @@
  * @brief Integration tests for cross-domain MoE expert weight transfer paths.
  *
  * Validates the three primary transfer mechanisms:
- *   1. GPU↔GPU P2P (peer DMA) via GPUExpertTransfer — data integrity + device context
- *   2. GPU↔GPU host-staged fallback — data integrity when P2P unavailable
- *   3. CPU→GPU cross-domain via CrossDomainTransfer — activation transfer for PP transitions
- *   4. computeGpuCacheExpertMasks — GPU preference placement logic
- *   5. Full rebalance cycle: mask change → release departed → register new experts
+ *   1. Same-backend GPU↔GPU transfer via GPUExpertTransfer — data integrity + device context
+ *   2. CPU→GPU cross-domain via CrossDomainTransfer — activation transfer for PP transitions
+ *   3. computeGpuCacheExpertMasks — GPU preference placement logic
+ *   4. Full rebalance cycle: mask change → release departed → register new experts
  *
  * Requires: HAVE_ROCM and at least 1 GPU. Multi-GPU tests require 2+ GPUs.
  */
@@ -73,12 +72,12 @@ protected:
 };
 
 // ===========================================================================
-// 1. GPU↔GPU P2P transfer — large payload integrity
+// 1. GPU↔GPU same-backend transfer — large payload integrity
 // ===========================================================================
 
 #ifdef HAVE_ROCM
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_LargePayload_DataIntegrity)
 {
     // Simulate a realistic expert transfer: ~2.8MB VNNI + ~88KB scales
     // Matches Qwen3.5 expert gate: N=2560, K=2048, Q4_0 packed
@@ -121,11 +120,14 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     dst_ptrs.d_scales = d_dst_scales;
     dst_ptrs.d_mins = d_dst_mins;
 
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(0),
-        vnni_bytes, scales_bytes, mins_bytes, 0, nullptr);
+        vnni_bytes, scales_bytes, mins_bytes, 0, stream);
     ASSERT_TRUE(ok);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Verify all three arrays
     std::vector<uint8_t> result_vnni(vnni_bytes);
@@ -136,16 +138,17 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     ASSERT_EQ(hipMemcpy(result_scales.data(), d_dst_scales, scales_bytes, hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipMemcpy(result_mins.data(), d_dst_mins, mins_bytes, hipMemcpyDeviceToHost), hipSuccess);
 
-    EXPECT_EQ(pattern_vnni, result_vnni) << "VNNI payload corrupted during P2P transfer";
-    EXPECT_EQ(pattern_scales, result_scales) << "Scales corrupted during P2P transfer";
-    EXPECT_EQ(pattern_mins, result_mins) << "Mins corrupted during P2P transfer";
+    EXPECT_EQ(pattern_vnni, result_vnni) << "VNNI payload corrupted during GPU transfer";
+    EXPECT_EQ(pattern_scales, result_scales) << "Scales corrupted during GPU transfer";
+    EXPECT_EQ(pattern_mins, result_mins) << "Mins corrupted during GPU transfer";
 
+    hipStreamDestroy(stream);
     hipFree(d_src_vnni); hipFree(d_dst_vnni);
     hipFree(d_src_scales); hipFree(d_dst_scales);
     hipFree(d_src_mins); hipFree(d_dst_mins);
 }
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_CrossDevice_DataIntegrity)
 {
     if (gpu_count_ < 2) {
         GTEST_SKIP() << "Need 2+ GPUs for cross-device transfer test";
@@ -173,6 +176,8 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     uint8_t *d_dst_vnni = nullptr, *d_dst_scales = nullptr;
     ASSERT_EQ(hipMalloc(&d_dst_vnni, vnni_bytes), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_dst_scales, scales_bytes), hipSuccess);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
     // Restore to device 0 to verify context preservation
     hipSetDevice(0);
@@ -186,13 +191,14 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(1),
-        vnni_bytes, scales_bytes, 0, 0, nullptr);
+        vnni_bytes, scales_bytes, 0, 0, stream);
     ASSERT_TRUE(ok);
 
     // Verify device context preserved
     int current = -1;
     ASSERT_EQ(hipGetDevice(&current), hipSuccess);
     EXPECT_EQ(current, 0) << "Caller device context must be preserved";
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Read back from device 1
     hipSetDevice(1);
@@ -205,7 +211,7 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     EXPECT_EQ(pattern_scales, result_scales) << "Cross-device scales corrupted";
 
     hipSetDevice(0); hipFree(d_src_vnni); hipFree(d_src_scales);
-    hipSetDevice(1); hipFree(d_dst_vnni); hipFree(d_dst_scales);
+    hipSetDevice(1); hipStreamDestroy(stream); hipFree(d_dst_vnni); hipFree(d_dst_scales);
 }
 
 // ===========================================================================
@@ -288,7 +294,10 @@ TEST_F(Test__CrossDomainExpertTransfer, GpuCacheMasks_HotExpertsOnGPU)
     cfg.top_k = 2;
     cfg.window_size = 64;
     cfg.sockets = {DeviceId::rocm(0), DeviceId::cpu()};
-    cfg.initial_expert_to_socket.assign(num_experts, 0); // Start all on GPU
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        num_layers,
+        2,
+        std::vector<int>(static_cast<size_t>(num_experts), 0));
 
     MoERebalanceController controller(cfg);
 
@@ -356,9 +365,9 @@ TEST_F(Test__CrossDomainExpertTransfer, GpuCacheMasks_HotExpertsOnGPU)
     }
 }
 
-TEST_F(Test__CrossDomainExpertTransfer, GpuCacheMasks_FallbackWithoutMixedTopology)
+TEST_F(Test__CrossDomainExpertTransfer, GpuCacheMasksPreserveOwnershipWithoutMixedTopology)
 {
-    // When all sockets are same type (all GPU), should fall back to uniform masks
+    // A homogeneous topology preserves the explicitly installed ownership.
     const int num_experts = 4;
     const int num_layers = 2;
 
@@ -369,15 +378,15 @@ TEST_F(Test__CrossDomainExpertTransfer, GpuCacheMasks_FallbackWithoutMixedTopolo
     cfg.top_k = 2;
     cfg.window_size = 32;
     cfg.sockets = {DeviceId::rocm(0), DeviceId::rocm(1)}; // Both GPU
-    cfg.initial_expert_to_socket = {0, 0, 1, 1};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        num_layers, 2, {0, 0, 1, 1});
 
     MoERebalanceController controller(cfg);
 
     auto masks = controller.computeGpuCacheExpertMasks(2);
     ASSERT_EQ(masks.size(), 2u);
 
-    // Should fall back to computeExpertMasks (contiguous partition)
-    // Socket 0 gets experts 0,1; socket 1 gets experts 2,3
+    // Socket 0 owns experts 0,1; socket 1 owns experts 2,3.
     for (int l = 0; l < num_layers; ++l) {
         EXPECT_TRUE(masks[0][l][0]);
         EXPECT_TRUE(masks[0][l][1]);
@@ -444,7 +453,11 @@ TEST_F(Test__CrossDomainExpertTransfer, CPURebalanceCycle_ReleaseAndRegister)
         gate_3d.get(), up_3d.get(), down_3d.get(),
         gate_views, up_views, down_views,
         gate_gemm, up_gemm, down_gemm,
-        owned_kernels, gate_lt, up_lt, down_lt
+        owned_kernels, gate_lt, up_lt, down_lt,
+        nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt,
+        true, nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()
     };
 
     // Extract views and prepare engines for initial experts
@@ -467,9 +480,9 @@ TEST_F(Test__CrossDomainExpertTransfer, CPURebalanceCycle_ReleaseAndRegister)
     auto released = MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
     (void)released; // May or may not have tensors to release
 
-    // Phase 2: Register expert 2 with transferred blobs
-    // Serialize from the original 3D data for expert 2 (simulating received from another rank)
-    // For CPU path: we pass blobs from serializeExpert of a source that has expert 2
+    // Phase 2: Register expert 2 with a direct prepared CPU arrival. The test
+    // models MPI having already written native sections into their final packed
+    // allocations; CPU production never reconstructs this arrival from a blob.
     std::vector<bool> all_active = {true, true, true, true};
     std::vector<std::shared_ptr<TensorBase>> src_gate_v, src_up_v, src_down_v;
     std::vector<ITensorGemm*> src_gate_g, src_up_g, src_down_g;
@@ -482,17 +495,31 @@ TEST_F(Test__CrossDomainExpertTransfer, CPURebalanceCycle_ReleaseAndRegister)
         gate_3d.get(), up_3d.get(), down_3d.get(),
         src_gate_v, src_up_v, src_down_v,
         src_gate_g, src_up_g, src_down_g,
-        src_owned, src_glt, src_ult, src_dlt
+        src_owned, src_glt, src_ult, src_dlt,
+        nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt,
+        true, nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()
     };
     ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(src_ctx));
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(src_ctx));
-    auto blobs_for_2 = MoEExpertWeightService::serializeExpert(src_ctx, 2);
-    ASSERT_FALSE(blobs_for_2.empty()) << "Source must serialize expert 2";
+    auto packed_for_2 = MoEExpertWeightService::clonePreparedExpert(src_ctx, 2);
+    ASSERT_TRUE(packed_for_2.complete()) << "Source must clone expert 2";
+    PreparedExpertEngines prepared_for_2;
+    prepared_for_2.packed_bytes = packed_for_2.totalBytes();
+    prepared_for_2.gate = KF::createExpertGemmFromPackedWeights(
+        std::move(packed_for_2.gate));
+    prepared_for_2.up = KF::createExpertGemmFromPackedWeights(
+        std::move(packed_for_2.up));
+    prepared_for_2.down = KF::createExpertGemmFromPackedWeights(
+        std::move(packed_for_2.down));
+    ASSERT_TRUE(prepared_for_2.complete());
 
-    std::unordered_map<int, ExpertWeightBlobs> received;
-    received[2] = std::move(blobs_for_2);
+    std::unordered_map<int, PreparedExpertEngines> received_prepared;
+    received_prepared.emplace(2, std::move(prepared_for_2));
 
-    bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, &received);
+    bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(
+        ctx, new_mask, nullptr, &received_prepared);
     EXPECT_TRUE(ok) << "registerAndPrepareNewExperts must succeed for CPU path";
 
     // Verify final state: expert 0 (kept), expert 2 (new) have engines; expert 1 gone
@@ -505,7 +532,7 @@ TEST_F(Test__CrossDomainExpertTransfer, CPURebalanceCycle_ReleaseAndRegister)
 // 5. GPU↔GPU transfer with stream synchronization
 // ===========================================================================
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_StreamAsync_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_StreamAsync_DataIntegrity)
 {
     // Test with an explicit stream to validate async transfer + sync
     const size_t bytes = 512 * 1024; // 512KB

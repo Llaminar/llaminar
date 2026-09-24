@@ -3,8 +3,8 @@
  * @brief Lightweight tensor view for external GPU memory
  *
  * This class provides an ITensor interface around existing GPU memory,
- * without owning or managing the memory lifetime. Used primarily by
- * CUDA KV cache to return tensor pointers for attention computation.
+ * without owning or managing the memory lifetime. It is used by CUDA and
+ * ROCm cache adapters to expose persistent device storage to graph stages.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -21,6 +21,7 @@
 
 namespace llaminar2
 {
+    class KVCacheAppendStage;
 
     /**
      * @brief Tensor view wrapping external GPU memory
@@ -35,19 +36,44 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Construct a GPU tensor view
+         * @brief Construct a backend-qualified pure-device tensor view.
          *
-         * @param gpu_ptr Pointer to GPU memory (must remain valid!)
-         * @param rows Number of rows (e.g., seq_len for KV cache)
-         * @param cols Number of columns (e.g., kv_dim for KV cache)
-         * @param tensor_type Data type (TensorType::FP32, TensorType::FP16, TensorType::BF16)
-         * @param device_id CUDA device ID where the memory resides
+         * A bare integer ordinal is deliberately not accepted. CUDA and ROCm
+         * ordinals overlap, so accepting an integer lets a valid HIP pointer be
+         * mislabeled as CUDA memory. Requiring DeviceId makes backend ownership
+         * part of the view's type-level construction contract.
+         *
+         * @param gpu_ptr Pointer to persistent GPU memory owned by the caller.
+         * @param rows Number of logical rows exposed by the view.
+         * @param cols Number of logical columns exposed by the view.
+         * @param tensor_type Tensor element or block type.
+         * @param device Backend-qualified device that owns @p gpu_ptr.
          */
         GpuTensorView(void *gpu_ptr, size_t rows, size_t cols,
-                      TensorType tensor_type, int device_id = 0)
-            : gpu_ptr_(gpu_ptr), rows_(rows), cols_(cols), tensor_type_(tensor_type), device_id_(device_id), shape_({rows, cols})
+                      TensorType tensor_type, DeviceId device)
+            : gpu_ptr_(gpu_ptr),
+              rows_(rows),
+              cols_(cols),
+              tensor_type_(tensor_type),
+              device_(device),
+              shape_({rows, cols})
         {
+            if (!gpu_ptr || !device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    "GpuTensorView requires non-null device storage and an "
+                    "explicit CUDA or ROCm DeviceId");
+            }
         }
+
+        /**
+         * @brief Reject backend-ambiguous device ordinals at compile time.
+         *
+         * Callers must spell DeviceId::cuda(ordinal) or
+         * DeviceId::rocm(ordinal), making it impossible to silently attach the
+         * wrong backend identity to otherwise valid device storage.
+         */
+        GpuTensorView(void *, size_t, size_t, TensorType, int) = delete;
 
         ~GpuTensorView() override = default;
 
@@ -85,7 +111,8 @@ namespace llaminar2
         size_t size_bytes() const override { return numel() * element_size_for_type(tensor_type_); }
 
         // Device
-        DeviceId home_device() const override { return DeviceId::cuda(device_id_); }
+        DeviceId home_device() const override { return device_; }
+        std::optional<DeviceId> current_device() const override { return device_; }
         bool is_on_cpu() const override { return false; }
         bool is_on_gpu() const override { return true; }
 
@@ -121,7 +148,7 @@ namespace llaminar2
         size_t rows_;
         size_t cols_;
         TensorType tensor_type_;
-        int device_id_;
+        DeviceId device_;
         std::vector<size_t> shape_;
 
         static size_t element_size_for_type(TensorType t)
@@ -134,12 +161,74 @@ namespace llaminar2
                 return 2;
             case TensorType::BF16:
                 return 2;
+            case TensorType::INT32:
+                return sizeof(int32_t);
             case TensorType::Q8_1:
                 return sizeof(Q8_1Block);
+            case TensorType::AQ8:
+                // AQ8 uses one variable-width block per attention head. The
+                // view is metadata-only; cache publication owns exact row bytes.
+                return 1;
             default:
                 return 4; // Fallback
             }
         }
+    };
+
+    /**
+     * @brief Non-owning view whose producer has already been joined to one stream.
+     *
+     * This type exists for the narrow case where a compute stage first orders a
+     * coherence-aware parent tensor on its executor stream and then passes a
+     * pointer-offset slice to a device kernel. The slice itself cannot own a
+     * second coherence record, so it carries the exact backend-qualified device
+     * and stream on which the parent was prepared.
+     *
+     * Only KVCacheAppendStage may construct this view. Cache adapters must call
+     * isPreparedFor() before consuming it and must never route it back through
+     * TransferEngine as though the non-owning wrapper were a TensorBase owner.
+     * Ordinary GpuTensorView instances do not carry this authority.
+     */
+    class PreparedGpuTensorView final : public GpuTensorView
+    {
+    public:
+        /**
+         * @brief Verify the consumer is the exact producer-ordered boundary.
+         *
+         * @param device Backend-qualified device that will consume the slice.
+         * @param stream Exact consumer stream used by the preparing stage.
+         */
+        bool isPreparedFor(DeviceId device, void *stream) const noexcept
+        {
+            return device == prepared_device_ &&
+                   stream != nullptr &&
+                   stream == prepared_stream_;
+        }
+
+    private:
+        friend class KVCacheAppendStage;
+
+        PreparedGpuTensorView(
+            void *gpu_ptr,
+            size_t rows,
+            size_t cols,
+            TensorType tensor_type,
+            DeviceId device,
+            void *prepared_stream)
+            : GpuTensorView(gpu_ptr, rows, cols, tensor_type, device),
+              prepared_device_(device),
+              prepared_stream_(prepared_stream)
+        {
+            if (!gpu_ptr || !device.is_gpu() || !prepared_stream)
+            {
+                throw std::invalid_argument(
+                    "PreparedGpuTensorView requires device storage, a GPU device, "
+                    "and the exact non-null producer stream");
+            }
+        }
+
+        DeviceId prepared_device_;
+        void *prepared_stream_ = nullptr;
     };
 
 } // namespace llaminar2

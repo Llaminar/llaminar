@@ -8,9 +8,13 @@
  *
  * Flow:
  * 1. During graph capture: kernel launch with device_params pointer is recorded
- * 2. Before capture/replay: updateDynamicParams() uploads the new value on the
- *    explicit graph stream
+ * 2. Before capture/replay: prepareGraphLaunch() enqueues a launch-by-value
+ *    device publication on the explicit graph stream
  * 3. During capture/replay: the graph records and launches RoPE kernels only
+ *
+ * A device publication kernel is intentional here. Reusing mutable pinned host
+ * staging for asynchronous H2D copies permits a later request to overwrite an
+ * earlier request's source before DMA consumes it.
  */
 
 #pragma once

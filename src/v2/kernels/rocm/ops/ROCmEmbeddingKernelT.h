@@ -2,7 +2,9 @@
  * @file ROCmEmbeddingKernelT.h
  * @brief ROCm implementation of ITensorEmbedding interface
  *
- * Provides FP32, BF16, FP16, and Q8_1 embedding lookup on AMD GPUs.
+ * Provides device-owned embedding lookup on AMD GPUs. Quantized tables use a
+ * model-owned PreparedEmbeddingWeights allocation; FP32 tables must already be
+ * resident on the target device.
  */
 
 #pragma once
@@ -69,7 +71,8 @@ namespace llaminar2
             return device_idx >= 0; // ROCm supports any valid device index
         }
 
-        void setGPUStream(void *stream) override;
+        void bindGPUStream(ExplicitGPUStream stream) override;
+        void clearGPUStreamBinding() override;
         void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
         {
             prepared_embedding_handle_ = handle;
@@ -166,17 +169,14 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements for embedding lookup
          *
-         * Returns buffers needed for embedding:
-         * - embed_token_ids [max_seq_len]: INT32 token IDs on GPU
-         * - embed_table_temp [vocab_size × d_model]: FP32 temp buffer for non-GPU embed tables
+         * Returns the stable INT32 token-ID buffer used by prefill and by graph
+         * replay when a device sampler has not supplied token IDs directly.
+         * Embedding weights are persistent model state and never workspace.
          *
          * @param m Maximum sequence length (num_tokens)
          * @param n Not used (pass 0)
-         * @param k d_model dimension (embedding dimension)
+         * @param k Unused (embedding weights are prepared separately)
          * @return WorkspaceRequirements describing all needed buffers
-         *
-         * @note For embed_table_temp, vocab_size is estimated as 151936 (Qwen2 vocab).
-         *       Actual vocab size may be smaller; the buffer will be sufficient.
          */
         WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const override;
@@ -201,19 +201,6 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getWorkspace() const override;
 
-        /**
-         * @brief Clear the cached embedding table pointer for this workspace
-         *
-         * Call this if the model changes or the workspace is reset.
-         * The next apply_tensor() call will re-upload the embedding table.
-         */
-        void clearEmbeddingCache()
-        {
-            std::lock_guard<std::mutex> lock(embed_cache_mutex_);
-            cached_embed_table_ = nullptr;
-            cached_embed_table_by_device_.clear();
-        }
-
     private:
         int device_idx_;
         IWorkerGPUContext *device_ctx_ = nullptr;
@@ -227,24 +214,6 @@ namespace llaminar2
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
         mutable std::mutex workspace_mutex_;
         std::unordered_map<int, DeviceWorkspaceManager *> workspace_by_device_;
-
-        // Embedding table caching state (instance-owned).
-        mutable std::mutex serialize_embedding_mutex_;
-        mutable std::mutex embed_cache_mutex_;
-        const TensorBase *cached_embed_table_ = nullptr;
-        std::unordered_map<int, const TensorBase *> cached_embed_table_by_device_;
-
-        struct DebugCanaryBuffer
-        {
-            void *base = nullptr;
-            float *payload = nullptr;
-            size_t guard_bytes = 0;
-            size_t payload_bytes = 0;
-            size_t total_bytes = 0;
-        };
-
-        mutable std::mutex canary_mutex_;
-        std::unordered_map<int, DebugCanaryBuffer> canary_by_device_;
 
         int *h_token_ids_ = nullptr;
         int max_token_ids_ = 0;

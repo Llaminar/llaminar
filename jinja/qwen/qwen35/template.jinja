@@ -122,7 +122,11 @@
             {%- endif %}
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
-        {%- if loop.index0 > ns.last_query_index and reasoning_content %}
+        {#- The active assistant must retain the generation header even when its
+            reasoning is empty. Dropping that header rewrites the earlier prompt
+            tokens and prevents prefix reuse when the assistant is continued.
+            Historical turns before a later user query still omit reasoning. -#}
+        {%- if loop.index0 > ns.last_query_index %}
             {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
         {%- else %}
             {{- '<|im_start|>' + message.role + '\n' + content }}
@@ -185,4 +189,3 @@
         {{- '<think>\n' }}
     {%- endif %}
 {%- endif %}
-

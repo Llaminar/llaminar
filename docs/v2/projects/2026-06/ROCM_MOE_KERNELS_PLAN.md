@@ -1177,7 +1177,7 @@ bool MoEExpertWeightService::registerTransferredExpert(
 | `src/v2/execution/moe/MoEExpertWeightService.h` | Add `asyncTransferExperts()`, cross-device serialize/register |
 | `src/v2/execution/moe/MoEExpertWeightService.cpp` | Implement dispatch by source/target device type |
 | `src/v2/kernels/PackedWeightsSerialization.h` | Add `GPU_BATCH_VNNI` format, `detectFormat()` |
-| `src/v2/kernels/rocm/ROCmWeightPacker.h` | Add `uploadToDeviceAsync()`, per-expert upload |
+| `src/v2/kernels/rocm/gemm/ROCmWeightPacker.h` | Add `uploadToDeviceAsync()`, per-expert upload |
 | `src/v2/kernels/cuda/CUDAWeightPacker.h` | Add `uploadToDeviceAsync()`, per-expert upload |
 | `src/v2/execution/moe/ExpertWeightTransfer.h` | Extend blob format metadata, target device hint |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp` | Use async transfer path |
@@ -1267,7 +1267,7 @@ bool MoEExpertWeightService::registerTransferredExpert(
 | `src/v2/execution/moe/MoEExpertWeightService.h` | 4 | `asyncTransferExperts()`, cross-device serialize/register |
 | `src/v2/execution/moe/MoEExpertWeightService.cpp` | 4 | Dispatch by source/target device type |
 | `src/v2/kernels/PackedWeightsSerialization.h` | 4 | `GPU_BATCH_VNNI` format, `detectFormat()` |
-| `src/v2/kernels/rocm/ROCmWeightPacker.h` | 4 | `uploadToDeviceAsync()`, per-expert upload |
+| `src/v2/kernels/rocm/gemm/ROCmWeightPacker.h` | 4 | `uploadToDeviceAsync()`, per-expert upload |
 | `src/v2/kernels/cuda/CUDAWeightPacker.h` | 4 | `uploadToDeviceAsync()`, per-expert upload |
 | `src/v2/execution/moe/ExpertWeightTransfer.h` | 4 | Extend blob format metadata, target device hint |
 | `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp` | 4 | Async transfer path |

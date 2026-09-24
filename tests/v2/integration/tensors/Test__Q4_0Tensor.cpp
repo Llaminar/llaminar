@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../utils/CPUProjectionTestWorkspace.h"
 #include "../../../../src/v2/tensors/Tensors.h"
 #include "../../../../src/v2/utils/DebugEnv.h"
 #include <vector>
@@ -22,7 +23,7 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 namespace llaminar2
 {
@@ -326,10 +327,11 @@ namespace llaminar2
 
             // Run quantized GEMM (INT8 path)
             auto quantized_gemm = q4_0_tensor->createGemm();
+            llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {quantized_gemm.get()}));
             ASSERT_TRUE(quantized_gemm->multiply_tensor(
                 input.get(),
                 output_quantized.get(),
-                m, n, k));
+                m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
             // Run FP32 GEMM (OneDNN reference)
             gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());

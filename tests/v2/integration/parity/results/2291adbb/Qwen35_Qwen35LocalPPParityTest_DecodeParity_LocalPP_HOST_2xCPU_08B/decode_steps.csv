@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+LocalPP_HOST_2xCPU_08B,0,0.997105,0.00760823,1,1,198,198,true,true,true,true
+LocalPP_HOST_2xCPU_08B,1,0.994492,0.0513899,1,0.6,760,760,true,true,true,true
+LocalPP_HOST_2xCPU_08B,2,0.995767,0.362691,1,0.6,3841,3841,true,true,true,true
+LocalPP_HOST_2xCPU_08B,3,0.985923,0.00709997,1,1,13477,13477,true,true,true,true
+LocalPP_HOST_2xCPU_08B,4,0.994061,0.028845,1,0.8,37550,37550,true,true,true,true

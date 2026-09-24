@@ -5,11 +5,18 @@ set -e
 
 echo "🔧 Configuring ccache..."
 
-# Configure ccache settings
-ccache --max-size=20G
+# Keep enough expensive CUDA/HIP objects resident to reuse them across the
+# Debug, Integration, and Release trees. Developers can override the project
+# default without editing this script.
+CCACHE_MAX_SIZE="${LLAMINAR_CCACHE_MAXSIZE:-50G}"
+export CCACHE_MAXSIZE="$CCACHE_MAX_SIZE"
+export CCACHE_BASEDIR="/workspaces/llaminar"
+export CCACHE_NOHASHDIR=1
+
+# Configure ccache settings.
 ccache --set-config=compression=true
 ccache --set-config=compression_level=6
-ccache --set-config=max_size=20G
+ccache --set-config=max_size="$CCACHE_MAX_SIZE"
 ccache --set-config=cache_dir=$HOME/.ccache
 
 # Set up CMake to use ccache
@@ -29,15 +36,27 @@ if [ ! -L "$HOME/.local/bin/c++" ]; then
     ln -sf /usr/bin/ccache "$HOME/.local/bin/c++"
 fi
 
-# Add ccache environment variables to bashrc if not already present
-if ! grep -q "CCACHE" "$HOME/.bashrc"; then
+# Keep the login-shell environment current when this script is rerun in an
+# existing development container.
+if grep -q "^# ccache configuration$" "$HOME/.bashrc"; then
+    sed -i \
+        's|^export CCACHE_MAXSIZE=.*$|export CCACHE_MAXSIZE="${LLAMINAR_CCACHE_MAXSIZE:-50G}"|' \
+        "$HOME/.bashrc"
+    if ! grep -q "^export CCACHE_BASEDIR=" "$HOME/.bashrc"; then
+        sed -i \
+            '/^export CCACHE_MAXSIZE=/a export CCACHE_BASEDIR="/workspaces/llaminar"\nexport CCACHE_NOHASHDIR=1' \
+            "$HOME/.bashrc"
+    fi
+else
     cat >> "$HOME/.bashrc" << 'EOF'
 
 # ccache configuration
 export CCACHE_DIR="$HOME/.ccache"
 export CCACHE_COMPRESS=1
 export CCACHE_COMPRESSLEVEL=6
-export CCACHE_MAXSIZE=20G
+export CCACHE_MAXSIZE="${LLAMINAR_CCACHE_MAXSIZE:-50G}"
+export CCACHE_BASEDIR="/workspaces/llaminar"
+export CCACHE_NOHASHDIR=1
 export PATH="$HOME/.local/bin:$PATH"
 
 # Alias to check ccache stats
@@ -52,7 +71,7 @@ ccache -s
 
 echo "✅ ccache configured successfully!"
 echo "   Cache location: $HOME/.ccache"
-echo "   Max size: 20GB"
+echo "   Max size: $CCACHE_MAX_SIZE"
 echo "   Compression: enabled (level 6)"
 echo ""
 echo "Useful commands:"

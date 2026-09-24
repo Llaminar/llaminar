@@ -98,6 +98,7 @@
 
 #include <memory>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -182,6 +183,7 @@ namespace llaminar2
             std::vector<uint32_t> native_vnni_emins;  ///< [blocks_per_row × N] packed {lo,hi} emins (Q2_K only)
             uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL/IQ4_XS, 5=Q4_1/Q4_K, 6=Q5_0, 7=Q5_1/Q5_K, 8=Q6_K, 9=Q3_K, 10=Q2_K, 11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS, 16=IQ1_S, 17=IQ1_M
             uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32
+            NativeVnniSourceIdentity native_source_identity;
 
             int K = 0; ///< Input features (rows in CK B matrix)
             int N = 0; ///< Output features (cols in CK B matrix)
@@ -224,6 +226,7 @@ namespace llaminar2
                     native_vnni_emins = std::move(other.native_vnni_emins);
                     native_vnni_codebook_id = other.native_vnni_codebook_id;
                     native_vnni_blocks_per_row = other.native_vnni_blocks_per_row;
+                    native_source_identity = other.native_source_identity;
                     K = other.K;
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
@@ -244,6 +247,7 @@ namespace llaminar2
                     other.d_native_vnni_emins = nullptr;
                     other.native_vnni_codebook_id = 0;
                     other.native_vnni_blocks_per_row = 0;
+                    other.native_source_identity = {};
                     other.rocm_device_id = -1;
                     other.uploaded = false;
                     other.K = 0;
@@ -384,13 +388,18 @@ namespace llaminar2
              * @param codebook_id NativeVNNI codebook identifier
              * @param blocks_per_row Number of 32-element blocks per row (K/32)
              * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             * @param source_identity Exact GGUF arithmetic provenance
+             * @param allocation_format Optional reusable-slot capacity; zero
+             *        payload identifies an ordinary immutable allocation
              */
             ROCmQuantisedGemmKernel(
                 int N, int K, int rocm_device_id,
                 uint8_t *d_native_vnni, void *d_native_scales,
                 void *d_native_mins, void *d_native_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
-                std::shared_ptr<void> lifetime_owner);
+                std::shared_ptr<void> lifetime_owner,
+                NativeVnniSourceIdentity source_identity,
+                NativeVnniReusableDeviceAllocationFormat allocation_format = {});
 
             ~ROCmQuantisedGemmKernel() override;
 
@@ -406,7 +415,19 @@ namespace llaminar2
             // ITensorGemm interface - Primary entry points
             // =========================================================================
 
-            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope(
+                std::optional<DeviceRowRange> rows = std::nullopt) override;
+            std::unique_ptr<OutputPartitionEquivalenceScope>
+            beginOutputPartitionEquivalenceScope(
+                int actual_output_columns,
+                int serial_partition_columns) override;
+
+            bool canReleaseSourceWeightTensor() const override
+            {
+                return packed_ != nullptr ||
+                       lifetime_owner_ != nullptr ||
+                       (weights_converted_ && d_weights_int8_ && d_scales_B_);
+            }
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -491,6 +512,15 @@ namespace llaminar2
             bool supports_fused_projection() const override { return true; }
 
             /**
+             * @brief Create the shared HIP projection stream/event pool before capture.
+             *
+             * The pool is device-scoped and persistent. Calling this method is
+             * idempotent; entering it during an active graph capture is rejected.
+             */
+            bool prepareFusedProjectionGraphCapture(
+                size_t projection_count) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
              * ROCmQuantisedGemmKernel is for weight projections only.
@@ -543,7 +573,30 @@ namespace llaminar2
 
             bool supports_device(int device_idx) const override;
 
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void bindGPUStream(ExplicitGPUStream stream) override { gpu_stream_ = stream.get(); }
+            void clearGPUStreamBinding() override { gpu_stream_ = nullptr; }
+
+            /**
+             * @brief Return the exact non-null stream owned by this kernel.
+             *
+             * Kernel harnesses use this accessor when publishing an output so
+             * launch and coherence publication cannot name different streams.
+             * A kernel without an explicitly bound stream is not launchable
+             * under the device-owned execution contract.
+             *
+             * @return Opaque HIP stream previously supplied to setGPUStream().
+             * @throws std::runtime_error when no stream has been bound.
+             */
+            [[nodiscard]] void *requireGPUStream() const
+            {
+                if (!gpu_stream_)
+                {
+                    throw std::runtime_error(
+                        "ROCmQuantisedGemmKernel requires an explicit "
+                        "non-null producer stream");
+                }
+                return gpu_stream_;
+            }
 
             // =========================================================================
             // IKernelSnapshotCapable interface
@@ -574,6 +627,25 @@ namespace llaminar2
              */
             WorkspaceRequirements getWorkspaceRequirements(
                 int m, int n = 0, int k = 0) const override;
+
+            /**
+             * @brief Add the exact simultaneous split-K arena for a fused bundle.
+             *
+             * ROCm's grouped small-M and concurrent decode paths keep one
+             * partial slice per active side stream.  This declaration derives
+             * those slices from the actual projection widths instead of
+             * multiplying the largest unrelated kernel width by a fixed fanout.
+             *
+             * @param requirements Stage-owned aggregate to extend.
+             * @param m Maximum rows represented by the fused capture.
+             * @param projection_columns Ordered output widths in the bundle.
+             * @param k Shared input width; retained for the common contract.
+             */
+            void appendFusedProjectionWorkspaceRequirements(
+                WorkspaceRequirements &requirements,
+                int m,
+                std::span<const int> projection_columns,
+                int k) const override;
 
             /**
              * @brief Bind workspace manager for managed mode
@@ -633,6 +705,8 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const override;
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+            bool exportNativeVNNISourceIdentity(
+                NativeVnniSourceIdentity &out) const override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)

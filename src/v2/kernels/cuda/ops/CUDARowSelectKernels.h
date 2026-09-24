@@ -1,22 +1,42 @@
 /**
  * @file CUDARowSelectKernels.h
- * @brief CUDA host wrappers for graph-capturable hidden-state row selection.
+ * @brief CUDA launch contracts for graph-capturable row and prefill selection.
  *
- * Provides the tiny CUDA runtime surface used by HiddenStateRowSelectStage:
- * pinned host/device scalar allocation, scalar upload, and one fixed-grid row
- * copy kernel. The captured graph records the scalar upload and kernel launch;
- * later replays read the current value from the same pinned host address.
- *
- * Lifecycle: allocation/free are owned by the stage. Kernel launches run on the
- * stream supplied by the graph executor or on the default stream when null.
+ * Hidden-state helpers retain their explicitly bounded pre-capture parameter
+ * storage, while long-context prefill consumes only device-owned request banks,
+ * device geometry, and canonical KV progress. Allocation belongs to stage or
+ * arena setup. Every launch and transfer requires the exact non-null stream
+ * supplied by its producer; null never aliases CUDA's default stream.
  */
 
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace llaminar2::cuda
 {
+
+    /**
+     * @brief Materialize one graph-stable prefill chunk from a resident request bank.
+     *
+     * The kernel reads canonical KV progress and admitted request geometry on
+     * device. It performs no allocation, transfer, callback, or synchronization.
+     * See IBackend::enqueuePreparePrefillChunkView() for the full contract.
+     */
+    bool launchPreparePrefillChunkView(
+        const int32_t *request_token_ids,
+        const int32_t *request_position_ids,
+        const int32_t *request_total_rows,
+        const int32_t *cached_tokens,
+        int request_row_capacity,
+        int bucket_seq_len,
+        int32_t pad_token_id,
+        int32_t *out_token_ids,
+        int32_t *out_position_ids,
+        int32_t *out_real_rows,
+        int32_t *out_row_stride,
+        void *stream);
 
     /**
      * @brief Allocate pinned host scalar storage for selected row.
@@ -45,31 +65,6 @@ namespace llaminar2::cuda
     void freeRowSelectHostParam(
         int device_ordinal,
         int *host_selected_row);
-
-    /**
-     * @brief Allocate pinned host and device scalar storage for selected row.
-     *
-     * @param device_ordinal CUDA device ordinal that owns the device scalar.
-     * @param host_selected_row Receives pinned host int pointer.
-     * @param device_selected_row Receives device int pointer.
-     * @return true when both allocations succeeded.
-     */
-    bool allocateRowSelectParam(
-        int device_ordinal,
-        int **host_selected_row,
-        int **device_selected_row);
-
-    /**
-     * @brief Free scalar storage allocated by allocateRowSelectParam().
-     *
-     * @param device_ordinal CUDA device ordinal that owns the device scalar.
-     * @param host_selected_row Pinned host int pointer, may be null.
-     * @param device_selected_row Device int pointer, may be null.
-     */
-    void freeRowSelectParam(
-        int device_ordinal,
-        int *host_selected_row,
-        int *device_selected_row);
 
     /**
      * @brief Upload selected-row scalar to its stable device address.
@@ -119,6 +114,56 @@ namespace llaminar2::cuda
         void *stream);
 
     /**
+     * @brief Copy one graph-immutable FP32 source row without replay metadata.
+     *
+     * The selected row is encoded in the captured kernel arguments. This path
+     * is intended for graph-native diagnostic checkpoints whose row cannot
+     * change without rebuilding the graph itself.
+     *
+     * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
+     * @param output Device pointer to [1, d_model] FP32 checkpoint storage.
+     * @param selected_row Immutable row index encoded in the captured D2D source address.
+     * @param seq_len Number of source rows, used for validation.
+     * @param d_model Number of columns copied.
+     * @param stream Explicit CUDA stream.
+     * @return true when the contiguous device-to-device copy was accepted.
+     */
+    bool launchFixedRowSelectFP32(
+        const float *input,
+        float *output,
+        int selected_row,
+        int seq_len,
+        int d_model,
+        void *stream);
+
+    /**
+     * @brief Copy one graph-immutable contiguous FP32 row range.
+     *
+     * This is the multi-row counterpart of launchFixedRowSelectFP32(). The
+     * source offset and byte count are capture-time geometry, so no row-index
+     * array, pinned host parameter, or H2D metadata upload participates in the
+     * launch. It is used by MTP catchup graphs whose verifier suffix is known to
+     * be contiguous by construction.
+     *
+     * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
+     * @param output Device pointer to [selected_row_count, d_model] FP32 rows.
+     * @param first_selected_row First immutable source row.
+     * @param selected_row_count Number of contiguous rows copied.
+     * @param seq_len Number of source rows, used for validation.
+     * @param d_model Number of columns per row.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the contiguous D2D copy was accepted.
+     */
+    bool launchFixedRowsSelectFP32(
+        const float *input,
+        float *output,
+        int first_selected_row,
+        int selected_row_count,
+        int seq_len,
+        int d_model,
+        void *stream);
+
+    /**
      * @brief Launch FP32 multi-row select: output[row, :] = input[selected_rows[row], :].
      *
      * @param input Device pointer to [seq_len, d_model] FP32 hidden states.
@@ -137,6 +182,148 @@ namespace llaminar2::cuda
         int seq_len,
         int d_model,
         int selected_row_count,
+        void *stream);
+
+    /**
+     * @brief Pack one terminal hidden row per padded request from resident lengths.
+     *
+     * For request `r`, the source row is
+     * `r * request_row_stride + request_sequence_lengths[r] - 1`. The lengths
+     * pointer is read by the CUDA kernel itself, so graph replay observes the
+     * current device-owned request geometry without an H2D row-index update.
+     *
+     * @param input Device pointer to flattened [requests * stride, d_model] rows.
+     * @param output Device pointer to compact [request_count, d_model] rows.
+     * @param request_sequence_lengths Device INT32 array with one real length per request.
+     * @param seq_len Total number of flattened source rows.
+     * @param request_row_stride Padded number of rows reserved for each request.
+     * @param d_model Number of FP32 columns in each hidden row.
+     * @param request_count Number of terminal rows to pack.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the graph-capturable kernel launch succeeds.
+     */
+    bool launchRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        int seq_len,
+        int request_row_stride,
+        int d_model,
+        int request_count,
+        void *stream);
+
+    /**
+     * @brief Pack request-terminal rows using a device-owned padded stride.
+     *
+     * This launch is the reusable-graph counterpart of
+     * launchRequestTerminalRowsSelectFP32(). Both real lengths and the padded
+     * stride are read on device from one event-published request geometry
+     * record, so the captured launch remains valid for every prompt width up
+     * to @p seq_capacity.
+     *
+     * @param input Device pointer to the maximum-capacity flattened hidden rows.
+     * @param output Device pointer to compact [request_count, d_model] rows.
+     * @param request_sequence_lengths Device INT32 real-length array.
+     * @param request_row_stride Device INT32 scalar containing current padded width.
+     * @param seq_capacity Maximum flattened source rows available at input.
+     * @param d_model Number of FP32 columns in each hidden row.
+     * @param request_count Fixed captured request count.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the graph-capturable kernel launch succeeds.
+     */
+    bool launchDeviceGeometryRequestTerminalRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int seq_capacity,
+        int d_model,
+        int request_count,
+        void *stream);
+
+    /**
+     * @brief Pack the next shifted-prefill hidden range from canonical KV progress.
+     *
+     * The captured kernel derives the current segment-relative row as
+     * `shifted_count - (main_count - admitted_length)`. Request index and row
+     * count are immutable graph geometry; all progress values remain resident
+     * at stable device addresses across replay.
+     *
+     * @param input Maximum-capacity flattened hidden-state rows.
+     * @param output Compact contiguous hidden rows consumed by the MTP sidecar.
+     * @param main_cached_tokens Canonical main-cache count for @p request_index.
+     * @param shifted_cached_tokens Canonical shifted-MTP count for the request.
+     * @param request_sequence_lengths Resident current-segment lengths.
+     * @param request_row_stride Resident padded request stride.
+     * @param request_index Immutable request row owned by this graph.
+     * @param seq_capacity Flattened hidden-state capacity.
+     * @param d_model FP32 columns per hidden row.
+     * @param selected_row_count Number of consecutive rows to pack.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the graph-capturable launch succeeds.
+     */
+    bool launchDeviceKVProgressRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride,
+        int request_index,
+        int seq_capacity,
+        int d_model,
+        int selected_row_count,
+        void *stream);
+
+    /**
+     * @brief Prepare one request's complete shifted-MTP prefill payload.
+     *
+     * The kernel derives whether the current segment starts a request or bridges
+     * an earlier segment from canonical main/shifted KV counts. It packs hidden
+     * rows, shifted condition tokens, positions, and the real append count into
+     * persistent graph-owned buffers. Invalid progress executes a device trap;
+     * malformed state can never be clamped into a plausible payload.
+     *
+     * @param input_hidden Main-forward hidden rows for the complete padded batch.
+     * @param terminal_hidden_archive Read/write terminal row archive. A bridge
+     *        consumes the prior row before the same thread publishes the
+     *        current segment's terminal row.
+     * @param packed_hidden_out Request-major hidden rows consumed by MTP depth zero.
+     * @param input_token_ids Admitted request tokens.
+     * @param input_position_ids Admitted absolute request positions.
+     * @param shifted_token_ids_out Prepared shifted condition-token rows.
+     * @param shifted_position_ids_out Prepared shifted position rows.
+     * @param append_lengths_out One real shifted append width per request.
+     * @param main_cached_tokens Canonical main-KV count for @p request_index.
+     * @param shifted_cached_tokens Canonical shifted-KV count for @p request_index.
+     * @param request_sequence_lengths Resident admitted request lengths.
+     * @param request_row_stride_device Resident padded request width.
+     * @param request_index Immutable request index owned by this launch.
+     * @param request_count Number of request rows in the captured graph.
+     * @param captured_row_stride Fixed row width represented by graph topology.
+     * @param seq_capacity Flattened main-hidden row capacity visible to the graph.
+     * @param d_model Hidden-state width.
+     * @param stream Explicit non-null CUDA stream.
+     * @return true when the graph-capturable launch was submitted successfully.
+     */
+    bool launchShiftedMTPPrefillPrepareFP32(
+        const float *input_hidden,
+        float *terminal_hidden_archive,
+        float *packed_hidden_out,
+        const int32_t *input_token_ids,
+        const int32_t *input_position_ids,
+        int32_t *shifted_token_ids_out,
+        int32_t *shifted_position_ids_out,
+        int32_t *append_lengths_out,
+        const int32_t *main_cached_tokens,
+        const int32_t *shifted_cached_tokens,
+        const int32_t *request_sequence_lengths,
+        const int32_t *request_row_stride_device,
+        int request_index,
+        int request_count,
+        int captured_row_stride,
+        int seq_capacity,
+        int d_model,
         void *stream);
 
     /**

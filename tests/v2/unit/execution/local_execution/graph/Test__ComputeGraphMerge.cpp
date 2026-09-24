@@ -26,19 +26,26 @@ using namespace llaminar2;
 class NoOpStage : public IComputeStage
 {
 public:
-    explicit NoOpStage(std::string name, DeviceId device = DeviceId::cpu())
-        : IComputeStage(device), name_(std::move(name)) {}
+    explicit NoOpStage(
+        std::string name,
+        DeviceId device = DeviceId::cpu(),
+        bool collective = false)
+        : IComputeStage(device),
+          name_(std::move(name)),
+          collective_(collective) {}
 
     bool execute(IDeviceContext *) override { return true; }
     std::string name() const override { return name_; }
     size_t estimatedFlops() const override { return 0; }
     StageBufferRequirements getBufferRequirements() const override { return {}; }
     ComputeStageType type() const override { return ComputeStageType::COPY; }
+    bool isCollectiveStage() const override { return collective_; }
     bool supportsBackend(ComputeBackendType) const override { return true; }
     StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
 private:
     std::string name_;
+    bool collective_ = false;
 };
 
 // =============================================================================
@@ -86,6 +93,36 @@ TEST_F(Test__ComputeGraphMerge, GetRootNodes_EmptyGraph)
     ComputeGraph graph;
     auto roots = graph.getRootNodes();
     EXPECT_TRUE(roots.empty());
+}
+
+/**
+ * @brief Proves graph-owned discovery honors composite stage instances.
+ *
+ * Both stages deliberately share the non-collective COPY enum. Only one
+ * concrete instance publishes a collective contract, matching composite MoE
+ * maintenance stages whose phase determines whether NCCL/RCCL is launched.
+ */
+TEST_F(Test__ComputeGraphMerge, CollectiveNodeNamesUsesConcreteStageContract)
+{
+    ComputeGraph graph;
+    graph.addNode(
+        "local_phase",
+        std::make_unique<NoOpStage>(
+            "local_phase",
+            DeviceId::cpu(),
+            /*collective=*/false));
+    graph.addNode(
+        "collective_phase",
+        std::make_unique<NoOpStage>(
+            "collective_phase",
+            DeviceId::cpu(),
+            /*collective=*/true));
+    graph.addDependency("collective_phase", "local_phase");
+
+    const auto collective_nodes = graph.collectiveNodeNames();
+    ASSERT_EQ(collective_nodes.size(), 1u);
+    EXPECT_EQ(collective_nodes.count("collective_phase"), 1u);
+    EXPECT_EQ(collective_nodes.count("local_phase"), 0u);
 }
 
 TEST_F(Test__ComputeGraphMerge, GetRootNodes_SingleNode)

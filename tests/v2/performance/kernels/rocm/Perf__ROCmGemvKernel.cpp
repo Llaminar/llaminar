@@ -285,9 +285,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
             }
 #endif
@@ -457,18 +457,18 @@ namespace
 
             const int blocks_per_row = (K + 31) / 32;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
-            hipMalloc(&d_C_int32, N * sizeof(int32_t));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_C_int32, N * sizeof(int32_t));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // --- Warmup (blockwise INT8 VNNI pipeline) ---
             for (int i = 0; i < warmup_runs; ++i)
@@ -478,7 +478,7 @@ namespace
                     d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // --- Timed runs ---
             std::vector<double> total_times;
@@ -495,19 +495,19 @@ namespace
             hipEvent_t quant_start, quant_stop;
             hipEvent_t gemv_start, gemv_stop;
             hipEvent_t scale_start, scale_stop;
-            hipEventCreate(&total_start);
-            hipEventCreate(&total_stop);
-            hipEventCreate(&quant_start);
-            hipEventCreate(&quant_stop);
-            hipEventCreate(&gemv_start);
-            hipEventCreate(&gemv_stop);
-            hipEventCreate(&scale_start);
-            hipEventCreate(&scale_stop);
+            (void)hipEventCreate(&total_start);
+            (void)hipEventCreate(&total_stop);
+            (void)hipEventCreate(&quant_start);
+            (void)hipEventCreate(&quant_stop);
+            (void)hipEventCreate(&gemv_start);
+            (void)hipEventCreate(&gemv_stop);
+            (void)hipEventCreate(&scale_start);
+            (void)hipEventCreate(&scale_stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(total_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(total_start, 0);
 
                 bool ok = true;
                 float quant_ms = 0.0f;
@@ -516,41 +516,41 @@ namespace
                 bool fused_scale = false;
 
                 // Step 1: Quantize activations FP32 → INT8 (blockwise)
-                hipEventRecord(quant_start, 0);
+                (void)hipEventRecord(quant_start, 0);
                 ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
-                hipEventRecord(quant_stop, 0);
-                hipEventSynchronize(quant_stop);
-                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+                (void)hipEventRecord(quant_stop, 0);
+                (void)hipEventSynchronize(quant_stop);
+                (void)hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
                 // Step 2: INT8 VNNI GEMV (blockwise — always fuses scaling)
                 if (ok)
                 {
-                    hipEventRecord(gemv_start, 0);
+                    (void)hipEventRecord(gemv_start, 0);
                     fused_scale = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                         d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                         N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
                     ok = fused_scale;
-                    hipEventRecord(gemv_stop, 0);
-                    hipEventSynchronize(gemv_stop);
-                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                    (void)hipEventRecord(gemv_stop, 0);
+                    (void)hipEventSynchronize(gemv_stop);
+                    (void)hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
                 // Step 3: No longer needed — blockwise always fuses scaling
 
-                hipEventRecord(total_stop, 0);
-                hipEventSynchronize(total_stop);
+                (void)hipEventRecord(total_stop, 0);
+                (void)hipEventSynchronize(total_stop);
                 float total_ms = 0.0f;
-                hipEventElapsedTime(&total_ms, total_start, total_stop);
+                (void)hipEventElapsedTime(&total_ms, total_start, total_stop);
 
                 if (!ok)
                 {
-                    hipFree(d_A);
-                    hipFree(d_scale);
-                    hipFree(d_C);
-                    hipFree(d_A_int8);
-                    hipFree(d_scale_A_bw);
-                    hipFree(d_C_int32);
-                    hipFree(d_B_vnni);
+                    (void)hipFree(d_A);
+                    (void)hipFree(d_scale);
+                    (void)hipFree(d_C);
+                    (void)hipFree(d_A_int8);
+                    (void)hipFree(d_scale_A_bw);
+                    (void)hipFree(d_C_int32);
+                    (void)hipFree(d_B_vnni);
                     return result;
                 }
 
@@ -560,22 +560,22 @@ namespace
                 scale_times.push_back(static_cast<double>(scale_ms));
             }
 
-            hipEventDestroy(total_start);
-            hipEventDestroy(total_stop);
-            hipEventDestroy(quant_start);
-            hipEventDestroy(quant_stop);
-            hipEventDestroy(gemv_start);
-            hipEventDestroy(gemv_stop);
-            hipEventDestroy(scale_start);
-            hipEventDestroy(scale_stop);
+            (void)hipEventDestroy(total_start);
+            (void)hipEventDestroy(total_stop);
+            (void)hipEventDestroy(quant_start);
+            (void)hipEventDestroy(quant_stop);
+            (void)hipEventDestroy(gemv_start);
+            (void)hipEventDestroy(gemv_stop);
+            (void)hipEventDestroy(scale_start);
+            (void)hipEventDestroy(scale_stop);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_bw);
-            hipFree(d_C_int32);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_bw);
+            (void)hipFree(d_C_int32);
 
             // --- Statistics ---
             computeStats(total_times, result.total.mean_ms, result.total.min_ms,
@@ -645,18 +645,18 @@ namespace
             const int blocks_per_row = K / 32;
             constexpr int MAX_KB = 64;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             for (int i = 0; i < warmup_runs; ++i)
             {
@@ -671,7 +671,7 @@ namespace
                         d_partial, N, K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<double> total_times;
             std::vector<double> quant_times;
@@ -684,31 +684,31 @@ namespace
             hipEvent_t total_start, total_stop;
             hipEvent_t quant_start, quant_stop;
             hipEvent_t gemv_start, gemv_stop;
-            hipEventCreate(&total_start);
-            hipEventCreate(&total_stop);
-            hipEventCreate(&quant_start);
-            hipEventCreate(&quant_stop);
-            hipEventCreate(&gemv_start);
-            hipEventCreate(&gemv_stop);
+            (void)hipEventCreate(&total_start);
+            (void)hipEventCreate(&total_stop);
+            (void)hipEventCreate(&quant_start);
+            (void)hipEventCreate(&quant_stop);
+            (void)hipEventCreate(&gemv_start);
+            (void)hipEventCreate(&gemv_stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(total_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(total_start, 0);
 
                 float quant_ms = 0.0f;
                 float gemv_ms = 0.0f;
 
-                hipEventRecord(quant_start, 0);
+                (void)hipEventRecord(quant_start, 0);
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(
                     d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
-                hipEventRecord(quant_stop, 0);
-                hipEventSynchronize(quant_stop);
-                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+                (void)hipEventRecord(quant_stop, 0);
+                (void)hipEventSynchronize(quant_stop);
+                (void)hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
                 if (ok)
                 {
-                    hipEventRecord(gemv_start, 0);
+                    (void)hipEventRecord(gemv_start, 0);
                     ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                         d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale,
                         N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
@@ -718,25 +718,25 @@ namespace
                             d_A_int8, d_B_vnni, d_C, d_scale_A_blockwise, d_scale, nullptr,
                             d_partial, N, K, 1.0f, 0.0f, nullptr, device_id_, nullptr);
                     }
-                    hipEventRecord(gemv_stop, 0);
-                    hipEventSynchronize(gemv_stop);
-                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                    (void)hipEventRecord(gemv_stop, 0);
+                    (void)hipEventSynchronize(gemv_stop);
+                    (void)hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
-                hipEventRecord(total_stop, 0);
-                hipEventSynchronize(total_stop);
+                (void)hipEventRecord(total_stop, 0);
+                (void)hipEventSynchronize(total_stop);
                 float total_ms = 0.0f;
-                hipEventElapsedTime(&total_ms, total_start, total_stop);
+                (void)hipEventElapsedTime(&total_ms, total_start, total_stop);
 
                 if (!ok)
                 {
-                    hipFree(d_A);
-                    hipFree(d_scale);
-                    hipFree(d_C);
-                    hipFree(d_B_vnni);
-                    hipFree(d_A_int8);
-                    hipFree(d_scale_A_blockwise);
-                    hipFree(d_partial);
+                    (void)hipFree(d_A);
+                    (void)hipFree(d_scale);
+                    (void)hipFree(d_C);
+                    (void)hipFree(d_B_vnni);
+                    (void)hipFree(d_A_int8);
+                    (void)hipFree(d_scale_A_blockwise);
+                    (void)hipFree(d_partial);
                     return result;
                 }
 
@@ -745,20 +745,20 @@ namespace
                 gemv_times.push_back(static_cast<double>(gemv_ms));
             }
 
-            hipEventDestroy(total_start);
-            hipEventDestroy(total_stop);
-            hipEventDestroy(quant_start);
-            hipEventDestroy(quant_stop);
-            hipEventDestroy(gemv_start);
-            hipEventDestroy(gemv_stop);
+            (void)hipEventDestroy(total_start);
+            (void)hipEventDestroy(total_stop);
+            (void)hipEventDestroy(quant_start);
+            (void)hipEventDestroy(quant_stop);
+            (void)hipEventDestroy(gemv_start);
+            (void)hipEventDestroy(gemv_stop);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_blockwise);
-            hipFree(d_partial);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_blockwise);
+            (void)hipFree(d_partial);
 
             computeStats(total_times, result.total.mean_ms, result.total.min_ms,
                          result.total.max_ms, result.total.stddev_ms);
@@ -814,11 +814,11 @@ namespace
             const int blocks_per_row = K / 32;
             constexpr int MAX_KB = 64;
             const int max_n = *std::max_element(Ns.begin(), Ns.end());
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
 
             std::vector<int8_t *> d_B_vnni(Ns.size(), nullptr);
             std::vector<float *> d_scale(Ns.size(), nullptr);
@@ -835,14 +835,14 @@ namespace
                     v = dist_s(rng);
 
                 packVnniWeights(h_B, Ns[i], K, h_B_vnni[i]);
-                hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
-                hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
-                hipMalloc(&d_C[i], Ns[i] * sizeof(float));
-                hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
-                hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
+                (void)hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
+                (void)hipMalloc(&d_C[i], Ns[i] * sizeof(float));
+                (void)hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
             }
 
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             for (int i = 0; i < warmup_runs; ++i)
             {
@@ -865,7 +865,7 @@ namespace
                     }
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<double> total_times;
             std::vector<double> quant_times;
@@ -877,29 +877,29 @@ namespace
             hipEvent_t total_start, total_stop;
             hipEvent_t quant_start, quant_stop;
             hipEvent_t gemv_start, gemv_stop;
-            hipEventCreate(&total_start);
-            hipEventCreate(&total_stop);
-            hipEventCreate(&quant_start);
-            hipEventCreate(&quant_stop);
-            hipEventCreate(&gemv_start);
-            hipEventCreate(&gemv_stop);
+            (void)hipEventCreate(&total_start);
+            (void)hipEventCreate(&total_stop);
+            (void)hipEventCreate(&quant_start);
+            (void)hipEventCreate(&quant_stop);
+            (void)hipEventCreate(&gemv_start);
+            (void)hipEventCreate(&gemv_stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(total_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(total_start, 0);
 
-                hipEventRecord(quant_start, 0);
+                (void)hipEventRecord(quant_start, 0);
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
-                hipEventRecord(quant_stop, 0);
-                hipEventSynchronize(quant_stop);
+                (void)hipEventRecord(quant_stop, 0);
+                (void)hipEventSynchronize(quant_stop);
                 float quant_ms = 0.0f;
-                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+                (void)hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
                 float gemv_ms = 0.0f;
                 if (ok)
                 {
-                    hipEventRecord(gemv_start, 0);
+                    (void)hipEventRecord(gemv_start, 0);
                     for (size_t proj = 0; proj < Ns.size(); ++proj)
                     {
                         ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
@@ -914,15 +914,15 @@ namespace
                         if (!ok)
                             break;
                     }
-                    hipEventRecord(gemv_stop, 0);
-                    hipEventSynchronize(gemv_stop);
-                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                    (void)hipEventRecord(gemv_stop, 0);
+                    (void)hipEventSynchronize(gemv_stop);
+                    (void)hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
-                hipEventRecord(total_stop, 0);
-                hipEventSynchronize(total_stop);
+                (void)hipEventRecord(total_stop, 0);
+                (void)hipEventSynchronize(total_stop);
                 float total_ms = 0.0f;
-                hipEventElapsedTime(&total_ms, total_start, total_stop);
+                (void)hipEventElapsedTime(&total_ms, total_start, total_stop);
 
                 if (!ok)
                 {
@@ -935,22 +935,22 @@ namespace
                 gemv_times.push_back(static_cast<double>(gemv_ms));
             }
 
-            hipEventDestroy(total_start);
-            hipEventDestroy(total_stop);
-            hipEventDestroy(quant_start);
-            hipEventDestroy(quant_stop);
-            hipEventDestroy(gemv_start);
-            hipEventDestroy(gemv_stop);
+            (void)hipEventDestroy(total_start);
+            (void)hipEventDestroy(total_stop);
+            (void)hipEventDestroy(quant_start);
+            (void)hipEventDestroy(quant_stop);
+            (void)hipEventDestroy(gemv_start);
+            (void)hipEventDestroy(gemv_stop);
 
-            hipFree(d_A);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_blockwise);
-            hipFree(d_partial);
+            (void)hipFree(d_A);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_blockwise);
+            (void)hipFree(d_partial);
             for (size_t i = 0; i < Ns.size(); ++i)
             {
-                hipFree(d_B_vnni[i]);
-                hipFree(d_scale[i]);
-                hipFree(d_C[i]);
+                (void)hipFree(d_B_vnni[i]);
+                (void)hipFree(d_scale[i]);
+                (void)hipFree(d_C[i]);
             }
 
             computeStats(total_times, result.total.mean_ms, result.total.min_ms,
@@ -1008,11 +1008,11 @@ namespace
             const int blocks_per_row = K / 32;
             constexpr int MAX_KB = 64;
             const int max_n = *std::max_element(Ns.begin(), Ns.end());
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * max_n * sizeof(float));
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
 
             std::vector<int8_t *> d_B_vnni(Ns.size(), nullptr);
             std::vector<float *> d_scale(Ns.size(), nullptr);
@@ -1029,11 +1029,11 @@ namespace
                     v = dist_s(rng);
 
                 packVnniWeights(h_B, Ns[i], K, h_B_vnni[i]);
-                hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
-                hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
-                hipMalloc(&d_C[i], Ns[i] * sizeof(float));
-                hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
-                hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMalloc(&d_B_vnni[i], h_B_vnni[i].size() * sizeof(int8_t));
+                (void)hipMalloc(&d_scale[i], Ns[i] * sizeof(float));
+                (void)hipMalloc(&d_C[i], Ns[i] * sizeof(float));
+                (void)hipMemcpy(d_B_vnni[i], h_B_vnni[i].data(), h_B_vnni[i].size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_scale[i], h_scale.data(), Ns[i] * sizeof(float), hipMemcpyHostToDevice);
             }
 
             std::vector<const int8_t *> d_B_ptrs(Ns.size());
@@ -1047,7 +1047,7 @@ namespace
                 d_scale_ptrs[i] = d_scale[i];
             }
 
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             for (int i = 0; i < warmup_runs; ++i)
             {
@@ -1069,7 +1069,7 @@ namespace
                     return result;
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<double> total_times;
             std::vector<double> quant_times;
@@ -1081,29 +1081,29 @@ namespace
             hipEvent_t total_start, total_stop;
             hipEvent_t quant_start, quant_stop;
             hipEvent_t gemv_start, gemv_stop;
-            hipEventCreate(&total_start);
-            hipEventCreate(&total_stop);
-            hipEventCreate(&quant_start);
-            hipEventCreate(&quant_stop);
-            hipEventCreate(&gemv_start);
-            hipEventCreate(&gemv_stop);
+            (void)hipEventCreate(&total_start);
+            (void)hipEventCreate(&total_stop);
+            (void)hipEventCreate(&quant_start);
+            (void)hipEventCreate(&quant_stop);
+            (void)hipEventCreate(&gemv_start);
+            (void)hipEventCreate(&gemv_stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(total_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(total_start, 0);
 
-                hipEventRecord(quant_start, 0);
+                (void)hipEventRecord(quant_start, 0);
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
-                hipEventRecord(quant_stop, 0);
-                hipEventSynchronize(quant_stop);
+                (void)hipEventRecord(quant_stop, 0);
+                (void)hipEventSynchronize(quant_stop);
                 float quant_ms = 0.0f;
-                hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
+                (void)hipEventElapsedTime(&quant_ms, quant_start, quant_stop);
 
                 float gemv_ms = 0.0f;
                 if (ok)
                 {
-                    hipEventRecord(gemv_start, 0);
+                    (void)hipEventRecord(gemv_start, 0);
                     ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
                         d_A_int8, d_scale_A_blockwise, static_cast<int>(Ns.size()),
                         d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
@@ -1115,15 +1115,15 @@ namespace
                             d_B_ptrs.data(), d_C_ptrs.data(), d_scale_ptrs.data(), d_bias_ptrs.data(), Ns.data(),
                             K, 1.0f, 0.0f, device_id_, nullptr);
                     }
-                    hipEventRecord(gemv_stop, 0);
-                    hipEventSynchronize(gemv_stop);
-                    hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
+                    (void)hipEventRecord(gemv_stop, 0);
+                    (void)hipEventSynchronize(gemv_stop);
+                    (void)hipEventElapsedTime(&gemv_ms, gemv_start, gemv_stop);
                 }
 
-                hipEventRecord(total_stop, 0);
-                hipEventSynchronize(total_stop);
+                (void)hipEventRecord(total_stop, 0);
+                (void)hipEventSynchronize(total_stop);
                 float total_ms = 0.0f;
-                hipEventElapsedTime(&total_ms, total_start, total_stop);
+                (void)hipEventElapsedTime(&total_ms, total_start, total_stop);
 
                 if (!ok)
                 {
@@ -1136,22 +1136,22 @@ namespace
                 gemv_times.push_back(static_cast<double>(gemv_ms));
             }
 
-            hipEventDestroy(total_start);
-            hipEventDestroy(total_stop);
-            hipEventDestroy(quant_start);
-            hipEventDestroy(quant_stop);
-            hipEventDestroy(gemv_start);
-            hipEventDestroy(gemv_stop);
+            (void)hipEventDestroy(total_start);
+            (void)hipEventDestroy(total_stop);
+            (void)hipEventDestroy(quant_start);
+            (void)hipEventDestroy(quant_stop);
+            (void)hipEventDestroy(gemv_start);
+            (void)hipEventDestroy(gemv_stop);
 
-            hipFree(d_A);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_blockwise);
-            hipFree(d_partial);
+            (void)hipFree(d_A);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_blockwise);
+            (void)hipFree(d_partial);
             for (size_t i = 0; i < Ns.size(); ++i)
             {
-                hipFree(d_B_vnni[i]);
-                hipFree(d_scale[i]);
-                hipFree(d_C[i]);
+                (void)hipFree(d_B_vnni[i]);
+                (void)hipFree(d_scale[i]);
+                (void)hipFree(d_C[i]);
             }
 
             computeStats(total_times, result.total.mean_ms, result.total.min_ms,
@@ -1212,19 +1212,19 @@ namespace
             int8_t *d_B_vnni = nullptr;
             float *d_partial = nullptr;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
             // Allocate partial buffer: max KB is ~56, but 64 covers all shapes safely
             constexpr int MAX_KB = 64;
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Warmup
             for (int i = 0; i < warmup_runs; ++i)
@@ -1234,40 +1234,40 @@ namespace
                     d_partial, N, K, 1.0f, 0.0f, nullptr,
                     device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Timed runs
             std::vector<double> times;
             times.reserve(bench_runs);
 
             hipEvent_t start, stop;
-            hipEventCreate(&start);
-            hipEventCreate(&stop);
+            (void)hipEventCreate(&start);
+            (void)hipEventCreate(&stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(start, 0);
 
                 rocmGemv_fused_scatter_fp32_int8_vnni(
                     d_A, d_B_vnni, d_C, d_scale, nullptr,
                     d_partial, N, K, 1.0f, 0.0f, nullptr,
                     device_id_, nullptr);
 
-                hipEventRecord(stop, 0);
-                hipEventSynchronize(stop);
+                (void)hipEventRecord(stop, 0);
+                (void)hipEventSynchronize(stop);
                 float ms = 0.0f;
-                hipEventElapsedTime(&ms, start, stop);
+                (void)hipEventElapsedTime(&ms, start, stop);
                 times.push_back(static_cast<double>(ms));
             }
 
-            hipEventDestroy(start);
-            hipEventDestroy(stop);
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_partial);
+            (void)hipEventDestroy(start);
+            (void)hipEventDestroy(stop);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_partial);
 
             computeStats(times, result.mean_ms, result.min_ms,
                          result.max_ms, result.stddev_ms);
@@ -1312,20 +1312,20 @@ namespace
             float *d_partial = nullptr;
             int *d_counter = nullptr;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
             constexpr int MAX_KB = 64;
             const int grid_n = (N + 127) / 128;
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
-            hipMalloc(&d_counter, grid_n * sizeof(int));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_counter, grid_n * sizeof(int));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Warmup
             for (int i = 0; i < warmup_runs; ++i)
@@ -1335,41 +1335,41 @@ namespace
                     d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
                     device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Timed runs
             std::vector<double> times;
             times.reserve(bench_runs);
 
             hipEvent_t start, stop;
-            hipEventCreate(&start);
-            hipEventCreate(&stop);
+            (void)hipEventCreate(&start);
+            (void)hipEventCreate(&stop);
 
             for (int i = 0; i < bench_runs; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(start, 0);
 
                 rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
                     d_A, d_B_vnni, d_C, d_scale, nullptr,
                     d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
                     device_id_, nullptr);
 
-                hipEventRecord(stop, 0);
-                hipEventSynchronize(stop);
+                (void)hipEventRecord(stop, 0);
+                (void)hipEventSynchronize(stop);
                 float ms = 0.0f;
-                hipEventElapsedTime(&ms, start, stop);
+                (void)hipEventElapsedTime(&ms, start, stop);
                 times.push_back(static_cast<double>(ms));
             }
 
-            hipEventDestroy(start);
-            hipEventDestroy(stop);
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_partial);
-            hipFree(d_counter);
+            (void)hipEventDestroy(start);
+            (void)hipEventDestroy(stop);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_partial);
+            (void)hipFree(d_counter);
 
             computeStats(times, result.mean_ms, result.min_ms,
                          result.max_ms, result.stddev_ms);
@@ -1428,33 +1428,33 @@ namespace
             float *d_scale_A_bw = nullptr;
 
             const int blocks_per_row = (K + 31) / 32;
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
             rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                 d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                 N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
-            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_bw);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_bw);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1505,36 +1505,36 @@ namespace
             float *d_scale_A_bw = nullptr;
 
             const int blocks_per_row = (K + 31) / 32;
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_bias, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_bias, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_bias, h_bias.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_bias, h_bias.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
             rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                 d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale,
                 N, K, 1.0f, 0.0f, nullptr, d_bias, device_id_, nullptr);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
-            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_bias);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_bw);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_bias);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_bw);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1575,33 +1575,33 @@ namespace
             int8_t *d_B_vnni = nullptr;
             float *d_partial = nullptr;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
             constexpr int MAX_KB = 64;
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             rocmGemv_fused_scatter_fp32_int8_vnni(
                 d_A, d_B_vnni, d_C, d_scale, nullptr,
                 d_partial, N, K, 1.0f, 0.0f, nullptr,
                 device_id_, nullptr);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
-            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_partial);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_partial);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1644,36 +1644,36 @@ namespace
             float *d_partial = nullptr;
             int *d_counter = nullptr;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
             constexpr int MAX_KB = 64;
             const int grid_n = (N + 127) / 128;
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
-            hipMalloc(&d_counter, grid_n * sizeof(int));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_counter, grid_n * sizeof(int));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
                 d_A, d_B_vnni, d_C, d_scale, nullptr,
                 d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
                 device_id_, nullptr);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<float> gpu_out(N);
-            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
 
-            hipFree(d_A);
-            hipFree(d_scale);
-            hipFree(d_C);
-            hipFree(d_B_vnni);
-            hipFree(d_partial);
-            hipFree(d_counter);
+            (void)hipFree(d_A);
+            (void)hipFree(d_scale);
+            (void)hipFree(d_C);
+            (void)hipFree(d_B_vnni);
+            (void)hipFree(d_partial);
+            (void)hipFree(d_counter);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -2304,14 +2304,14 @@ namespace
             int32_t *d_C_int32 = nullptr;
 
             const int blocks_per_row = (K + 31) / 32;
-            hipMalloc(&d_A, M_padded * K * sizeof(float));
-            hipMalloc(&d_A_int8, M_padded * K * sizeof(int8_t));
-            hipMalloc(&d_scales_A, M_padded * sizeof(float));
-            hipMalloc(&d_scales_A_bw, M_padded * blocks_per_row * sizeof(float));
-            hipMalloc(&d_B_int8, static_cast<size_t>(K) * N * sizeof(int8_t));
-            hipMalloc(&d_scales_B, N * sizeof(float));
-            hipMalloc(&d_C, M_padded * N * sizeof(float));
-            hipMalloc(&d_C_int32, M_padded * N * sizeof(int32_t));
+            (void)hipMalloc(&d_A, M_padded * K * sizeof(float));
+            (void)hipMalloc(&d_A_int8, M_padded * K * sizeof(int8_t));
+            (void)hipMalloc(&d_scales_A, M_padded * sizeof(float));
+            (void)hipMalloc(&d_scales_A_bw, M_padded * blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_B_int8, static_cast<size_t>(K) * N * sizeof(int8_t));
+            (void)hipMalloc(&d_scales_B, N * sizeof(float));
+            (void)hipMalloc(&d_C, M_padded * N * sizeof(float));
+            (void)hipMalloc(&d_C_int32, M_padded * N * sizeof(int32_t));
 
             // Fill with random data
             std::vector<float> h_A(M_padded * K);
@@ -2325,13 +2325,13 @@ namespace
             for (auto &v : h_s)
                 v = 0.01f + static_cast<float>(rng()) / rng.max() * 0.09f;
 
-            hipMemcpy(d_A, h_A.data(), M_padded * K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_int8, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scales_B, h_s.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_A, h_A.data(), M_padded * K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_int8, h_B.data(), static_cast<size_t>(K) * N * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scales_B, h_s.data(), N * sizeof(float), hipMemcpyHostToDevice);
             // CK executeTwoKernel_cached requires per-row scales; fill with 1.0 for throughput benchmark
             std::vector<float> h_unit_scales(M_padded, 1.0f);
-            hipMemcpy(d_scales_A, h_unit_scales.data(), M_padded * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_scales_A, h_unit_scales.data(), M_padded * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Warmup CK
             for (int i = 0; i < 3; ++i)
@@ -2340,30 +2340,30 @@ namespace
                 rocmQuantGemm_executeTwoKernel_cached(d_A_int8, d_B_int8, d_C, d_scales_A, d_scales_B,
                                                       d_C_int32, M_padded, N, K, device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Timed CK runs
             std::vector<double> ck_times;
             for (int i = 0; i < 20; ++i)
             {
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
                 auto t0 = std::chrono::high_resolution_clock::now();
                 rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scales_A_bw, M_padded, K, device_id_, nullptr, 32);
                 rocmQuantGemm_executeTwoKernel_cached(d_A_int8, d_B_int8, d_C, d_scales_A, d_scales_B,
                                                       d_C_int32, M_padded, N, K, device_id_, nullptr);
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
                 auto t1 = std::chrono::high_resolution_clock::now();
                 ck_times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
 
-            hipFree(d_A);
-            hipFree(d_A_int8);
-            hipFree(d_scales_A);
-            hipFree(d_scales_A_bw);
-            hipFree(d_B_int8);
-            hipFree(d_scales_B);
-            hipFree(d_C);
-            hipFree(d_C_int32);
+            (void)hipFree(d_A);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scales_A);
+            (void)hipFree(d_scales_A_bw);
+            (void)hipFree(d_B_int8);
+            (void)hipFree(d_scales_B);
+            (void)hipFree(d_C);
+            (void)hipFree(d_C_int32);
 
             double ck_min = *std::min_element(ck_times.begin(), ck_times.end());
             double speedup = ck_min / r_gemv.min_ms;
@@ -3526,11 +3526,11 @@ namespace
                 for (auto &v : p.h_scale)
                     v = dist_s(rng);
                 packVnniWeights(h_B, proj_N, K, p.h_B_vnni);
-                hipMalloc(&p.d_B, p.h_B_vnni.size() * sizeof(int8_t));
-                hipMalloc(&p.d_scale, proj_N * sizeof(float));
-                hipMalloc(&p.d_C, proj_N * sizeof(float));
-                hipMemcpy(p.d_B, p.h_B_vnni.data(), p.h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-                hipMemcpy(p.d_scale, p.h_scale.data(), proj_N * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMalloc(&p.d_B, p.h_B_vnni.size() * sizeof(int8_t));
+                (void)hipMalloc(&p.d_scale, proj_N * sizeof(float));
+                (void)hipMalloc(&p.d_C, proj_N * sizeof(float));
+                (void)hipMemcpy(p.d_B, p.h_B_vnni.data(), p.h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+                (void)hipMemcpy(p.d_scale, p.h_scale.data(), proj_N * sizeof(float), hipMemcpyHostToDevice);
                 return p;
             };
 
@@ -3542,23 +3542,23 @@ namespace
             float *d_scale_A_bw = nullptr;
             const int blocks_per_row = K / 32;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Quantize activations once
             rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, 32);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Create HIP events and second stream
             hipEvent_t ev_start, ev_stop, ev_mid;
-            hipEventCreate(&ev_start);
-            hipEventCreate(&ev_stop);
-            hipEventCreate(&ev_mid);
+            (void)hipEventCreate(&ev_start);
+            (void)hipEventCreate(&ev_stop);
+            (void)hipEventCreate(&ev_mid);
             hipStream_t stream2 = nullptr;
-            hipStreamCreate(&stream2);
+            (void)hipStreamCreate(&stream2);
 
             // Batched API arrays
             const int8_t *d_B_ptrs[2] = {proj_k.d_B, proj_v.d_B};
@@ -3577,25 +3577,25 @@ namespace
                     d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // ===== Approach 1: 2× serial on default stream =====
             std::vector<double> serial_times;
             serial_times.reserve(BENCH);
             for (int i = 0; i < BENCH; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(ev_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
-                hipEventRecord(ev_stop, 0);
-                hipEventSynchronize(ev_stop);
+                (void)hipEventRecord(ev_stop, 0);
+                (void)hipEventSynchronize(ev_stop);
                 float ms = 0;
-                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                 serial_times.push_back(ms);
             }
 
@@ -3604,16 +3604,16 @@ namespace
             batched_split_times.reserve(BENCH);
             for (int i = 0; i < BENCH; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(ev_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
                     d_A_int8, d_scale_A_bw, 2,
                     d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
                     K, 1.0f, 0.0f, device_id_, nullptr);
-                hipEventRecord(ev_stop, 0);
-                hipEventSynchronize(ev_stop);
+                (void)hipEventRecord(ev_stop, 0);
+                (void)hipEventSynchronize(ev_stop);
                 float ms = 0;
-                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                 batched_split_times.push_back(ms);
             }
 
@@ -3640,22 +3640,22 @@ namespace
                         d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
                         K, 1.0f, 0.0f, device_id_, nullptr);
                 }
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
 
                 std::vector<double> times;
                 times.reserve(BENCH);
                 for (int i = 0; i < BENCH; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, 0);
+                    (void)hipDeviceSynchronize();
+                    (void)hipEventRecord(ev_start, 0);
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
                         d_A_int8, d_scale_A_bw, 2,
                         d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
                         K, 1.0f, 0.0f, device_id_, nullptr);
-                    hipEventRecord(ev_stop, 0);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, 0);
+                    (void)hipEventSynchronize(ev_stop);
                     float ms = 0;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times.push_back(ms);
                 }
                 std::sort(times.begin(), times.end());
@@ -3674,25 +3674,25 @@ namespace
                     d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, stream2);
             }
-            hipStreamSynchronize(stream2);
+            (void)hipStreamSynchronize(stream2);
 
             std::vector<double> concurrent_times;
             concurrent_times.reserve(BENCH);
             for (int i = 0; i < BENCH; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(ev_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, stream2);
-                hipStreamSynchronize(stream2);
-                hipEventRecord(ev_stop, 0);
-                hipEventSynchronize(ev_stop);
+                (void)hipStreamSynchronize(stream2);
+                (void)hipEventRecord(ev_stop, 0);
+                (void)hipEventSynchronize(ev_stop);
                 float ms = 0;
-                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                 concurrent_times.push_back(ms);
             }
 
@@ -3707,24 +3707,24 @@ namespace
                     proj_k.d_scale, proj_v.d_scale,
                     N, N, K, 1.0f, device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             std::vector<double> lds_pair_times;
             lds_pair_times.reserve(BENCH);
             for (int i = 0; i < BENCH; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(ev_start, 0);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
                     d_A_int8, d_scale_A_bw,
                     proj_k.d_B, proj_v.d_B,
                     proj_k.d_C, proj_v.d_C,
                     proj_k.d_scale, proj_v.d_scale,
                     N, N, K, 1.0f, device_id_, nullptr);
-                hipEventRecord(ev_stop, 0);
-                hipEventSynchronize(ev_stop);
+                (void)hipEventRecord(ev_stop, 0);
+                (void)hipEventSynchronize(ev_stop);
                 float ms = 0;
-                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                 lds_pair_times.push_back(ms);
             }
 
@@ -3750,24 +3750,24 @@ namespace
                         proj_k.d_scale, proj_v.d_scale,
                         N, N, K, 1.0f, device_id_, nullptr);
                 }
-                hipDeviceSynchronize();
+                (void)hipDeviceSynchronize();
 
                 std::vector<double> times;
                 times.reserve(BENCH);
                 for (int i = 0; i < BENCH; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, 0);
+                    (void)hipDeviceSynchronize();
+                    (void)hipEventRecord(ev_start, 0);
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
                         d_A_int8, d_scale_A_bw,
                         proj_k.d_B, proj_v.d_B,
                         proj_k.d_C, proj_v.d_C,
                         proj_k.d_scale, proj_v.d_scale,
                         N, N, K, 1.0f, device_id_, nullptr);
-                    hipEventRecord(ev_stop, 0);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, 0);
+                    (void)hipEventSynchronize(ev_stop);
                     float ms = 0;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times.push_back(ms);
                 }
                 std::sort(times.begin(), times.end());
@@ -3869,19 +3869,19 @@ namespace
             }
 
             // Cleanup
-            hipStreamDestroy(stream2);
-            hipEventDestroy(ev_start);
-            hipEventDestroy(ev_stop);
-            hipEventDestroy(ev_mid);
-            hipFree(d_A);
-            hipFree(d_A_int8);
-            hipFree(d_scale_A_bw);
-            hipFree(proj_k.d_B);
-            hipFree(proj_k.d_scale);
-            hipFree(proj_k.d_C);
-            hipFree(proj_v.d_B);
-            hipFree(proj_v.d_scale);
-            hipFree(proj_v.d_C);
+            (void)hipStreamDestroy(stream2);
+            (void)hipEventDestroy(ev_start);
+            (void)hipEventDestroy(ev_stop);
+            (void)hipEventDestroy(ev_mid);
+            (void)hipFree(d_A);
+            (void)hipFree(d_A_int8);
+            (void)hipFree(d_scale_A_bw);
+            (void)hipFree(proj_k.d_B);
+            (void)hipFree(proj_k.d_scale);
+            (void)hipFree(proj_k.d_C);
+            (void)hipFree(proj_v.d_B);
+            (void)hipFree(proj_v.d_scale);
+            (void)hipFree(proj_v.d_C);
         }
 #endif
     }

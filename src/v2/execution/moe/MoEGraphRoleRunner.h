@@ -71,6 +71,8 @@ namespace llaminar2
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
+        /** @copydoc IInferenceRunner::purgePrefixCache */
+        bool purgePrefixCache() override;
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;

@@ -232,6 +232,28 @@ namespace
 class Test__ROCmRoPEParity : public ::testing::Test
 {
 protected:
+    void SetUp() override
+    {
+#ifdef HAVE_ROCM
+        if (!hasROCm())
+            return;
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), hipSuccess);
+#endif
+    }
+
+    void TearDown() override
+    {
+#ifdef HAVE_ROCM
+        if (stream_)
+        {
+            EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+            EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+            stream_ = nullptr;
+        }
+#endif
+    }
+
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
 
@@ -244,6 +266,10 @@ protected:
         }
         return vec;
     }
+
+#ifdef HAVE_ROCM
+    hipStream_t stream_ = nullptr;
+#endif
 };
 
 // ============================================================================
@@ -286,29 +312,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Small)
 
     // ROCm kernel with workspace
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    hipMalloc(&d_q, total * sizeof(float));
-    hipMalloc(&d_k, total_k * sizeof(float));
+    (void)hipMalloc(&d_q, total * sizeof(float));
+    (void)hipMalloc(&d_k, total_k * sizeof(float));
 
-    hipMemcpy(d_q, rocm_q.data(), total * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     // Validate Q
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total)) << "ROCm Q output contains NaN/Inf";
@@ -358,29 +385,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    hipMalloc(&d_q, total_q * sizeof(float));
-    hipMalloc(&d_k, total_k * sizeof(float));
+    (void)hipMalloc(&d_q, total_q * sizeof(float));
+    (void)hipMalloc(&d_k, total_k * sizeof(float));
 
-    hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q)) << "ROCm Q output contains NaN/Inf";
     double cosine_q = cosineSimilarity(rocm_q.data(), cpu_q.data(), total_q);
@@ -428,28 +456,29 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
                                        rope_theta, -1, rotary_dim));
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     float *d_q, *d_k;
-    hipMalloc(&d_q, total_q * sizeof(float));
-    hipMalloc(&d_k, total_k * sizeof(float));
+    (void)hipMalloc(&d_q, total_q * sizeof(float));
+    (void)hipMalloc(&d_k, total_k * sizeof(float));
 
-    hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len,
                                         n_heads, n_kv_heads, head_dim,
                                         rope_theta, 0, rotary_dim));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q));
     ASSERT_FALSE(hasNaNOrInf(rocm_k.data(), total_k));
@@ -528,29 +557,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    hipMalloc(&d_q, total * sizeof(uint16_t));
-    hipMalloc(&d_k, total_k * sizeof(uint16_t));
+    (void)hipMalloc(&d_q, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_k, total_k * sizeof(uint16_t));
 
-    hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     // Dequantize for comparison
     std::vector<float> cpu_q_fp32(total), rocm_q_fp32(total);
@@ -611,6 +641,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Qwen35LongPartialRotary)
                                        rope_theta, -1, rotary_dim));
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -629,8 +660,8 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Qwen35LongPartialRotary)
 
     ASSERT_EQ(hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q)) << "ROCm Q output contains NaN/Inf";
     ASSERT_FALSE(hasNaNOrInf(rocm_k.data(), total_k)) << "ROCm K output contains NaN/Inf";
@@ -722,6 +753,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_RealQwen2Layer3ProjectionInputs)
                            seq_len, n_heads, n_kv_heads, head_dim, rope_theta, -1);
 
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
@@ -736,7 +768,7 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_RealQwen2Layer3ProjectionInputs)
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_EQ(hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
@@ -794,29 +826,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Large)
     std::vector<uint16_t> rocm_q = q_bf16;
     std::vector<uint16_t> rocm_k = k_bf16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::BF16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    hipMalloc(&d_q, total_q * sizeof(uint16_t));
-    hipMalloc(&d_k, total_k * sizeof(uint16_t));
+    (void)hipMalloc(&d_q, total_q * sizeof(uint16_t));
+    (void)hipMalloc(&d_k, total_k * sizeof(uint16_t));
 
-    hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(uint16_t), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     std::vector<float> cpu_q_fp32(total_q), rocm_q_fp32(total_q);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);
@@ -879,29 +912,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Small)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    hipMalloc(&d_q, total * sizeof(uint16_t));
-    hipMalloc(&d_k, total_k * sizeof(uint16_t));
+    (void)hipMalloc(&d_q, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_k, total_k * sizeof(uint16_t));
 
-    hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     std::vector<float> cpu_q_fp32(total), rocm_q_fp32(total);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);
@@ -960,29 +994,30 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP16_Large)
     std::vector<uint16_t> rocm_q = q_fp16;
     std::vector<uint16_t> rocm_k = k_fp16;
     rocm::ROCmRoPEKernelT<ActivationPrecision::FP16> rocm_kernel;
+    rocm_kernel.setGPUStream(stream_);
     DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
     auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
     ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
     rocm_kernel.bindWorkspace(&workspace);
 
     uint16_t *d_q, *d_k;
-    hipMalloc(&d_q, total_q * sizeof(uint16_t));
-    hipMalloc(&d_k, total_k * sizeof(uint16_t));
+    (void)hipMalloc(&d_q, total_q * sizeof(uint16_t));
+    (void)hipMalloc(&d_k, total_k * sizeof(uint16_t));
 
-    hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     // position_ids must be a HOST pointer - apply_typed handles H2D copy internally
     // via the workspace POSITION_IDS buffer
     ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
                                         head_dim, rope_theta, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(uint16_t), hipMemcpyDeviceToHost);
-    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_q);
-    hipFree(d_k);
+    (void)hipFree(d_q);
+    (void)hipFree(d_k);
 
     std::vector<float> cpu_q_fp32(total_q), rocm_q_fp32(total_q);
     std::vector<float> cpu_k_fp32(total_k), rocm_k_fp32(total_k);

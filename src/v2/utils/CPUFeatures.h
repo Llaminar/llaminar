@@ -17,6 +17,22 @@
 namespace llaminar2
 {
 
+#ifndef LLAMINAR_COMPILED_WITH_AVX2
+#if defined(__AVX2__)
+#define LLAMINAR_COMPILED_WITH_AVX2 1
+#else
+#define LLAMINAR_COMPILED_WITH_AVX2 0
+#endif
+#endif
+
+#ifndef LLAMINAR_COMPILED_WITH_AVX512
+#if defined(__AVX512F__)
+#define LLAMINAR_COMPILED_WITH_AVX512 1
+#else
+#define LLAMINAR_COMPILED_WITH_AVX512 0
+#endif
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
     /**
@@ -80,11 +96,14 @@ namespace llaminar2
          * @param[out] out_size Cache size in bytes
          * @param[out] out_max_cores_in_pkg If non-null and Intel leaf 0x04 was used,
          *        set to EAX[31:26]+1 (max addressable core IDs in package)
+         * @param[out] out_associativity If non-null, receives the detected
+         *        number of cache ways for the selected level.
          * @return true if cache level was found, false if not detected
          */
         inline bool detect_cache_by_level(int target_level, bool data_only,
                                           uint32_t &out_size,
-                                          uint32_t *out_max_cores_in_pkg = nullptr)
+                                          uint32_t *out_max_cores_in_pkg = nullptr,
+                                          uint32_t *out_associativity = nullptr)
         {
             // Ordered: try Intel 0x04 first (more fields), then AMD 0x8000001D
             struct LeafInfo
@@ -138,6 +157,9 @@ namespace llaminar2
                         uint32_t sets = regs[2] + 1;
 
                         out_size = ways * partitions * line_size * sets;
+
+                        if (out_associativity)
+                            *out_associativity = ways;
 
                         // EAX[31:26] = max cores in package (Intel leaf 0x04 only)
                         if (out_max_cores_in_pkg && !li.is_extended)
@@ -282,8 +304,12 @@ namespace llaminar2
      */
     inline bool cpu_supports_avx512()
     {
+#if LLAMINAR_COMPILED_WITH_AVX512
         static const bool result = detail::detect_avx512();
         return result;
+#else
+        return false;
+#endif
     }
 
     // =========================================================================
@@ -302,6 +328,31 @@ namespace llaminar2
         AVX2 = 1,
         AVX512 = 2
     };
+
+    /**
+     * @brief Return the stable display name for one runtime SIMD level.
+     *
+     * This helper deliberately accepts an explicit value rather than reading
+     * the process singleton.  Callers that report the active execution policy
+     * pass `activeISALevel()`, while device-free tests can prove every enum
+     * spelling without mutating the process environment or cached dispatch.
+     *
+     * @param level Runtime SIMD level selected by dispatch.
+     * @return Static human-readable name suitable for logs and diagnostics.
+     */
+    inline constexpr const char *isaLevelName(ISALevel level)
+    {
+        switch (level)
+        {
+        case ISALevel::Scalar:
+            return "Scalar";
+        case ISALevel::AVX2:
+            return "AVX2";
+        case ISALevel::AVX512:
+            return "AVX-512";
+        }
+        return "Unknown";
+    }
 
     // Forward declarations for activeISALevel()
     inline bool cpu_supports_avx2();
@@ -336,9 +387,13 @@ namespace llaminar2
                 if (eq(env, "scalar"))
                     return ISALevel::Scalar;
                 if (eq(env, "avx2"))
-                    return ISALevel::AVX2;
+                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
                 if (eq(env, "avx512"))
-                    return ISALevel::AVX512;
+                {
+                    if (cpu_supports_avx512())
+                        return ISALevel::AVX512;
+                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
+                }
             }
             if (cpu_supports_avx512())
                 return ISALevel::AVX512;
@@ -357,10 +412,12 @@ namespace llaminar2
 //   float result; ISA_DISPATCH_RET(result, activation_row_max_abs, row, len);
 //   double val = ISA_DISPATCH_RETVAL(compute_sumsq, data, count);
 //
-// The _avx2 and _avx512 variants MUST be compiled (possibly as unreachable
-// stubs) regardless of the host ISA so the switch is always complete.
+// The compiled binary controls the maximum ISA that may be referenced. AVX2
+// builds intentionally avoid naming _avx512 variants so those translation units
+// can omit AVX512 stubs entirely.
 // ---------------------------------------------------------------------------
 
+#if LLAMINAR_COMPILED_WITH_AVX512
 /// Dispatch a void-returning function: name##_scalar / _avx2 / _avx512
 #define ISA_DISPATCH_VOID(name, ...)           \
     do                                         \
@@ -411,14 +468,63 @@ namespace llaminar2
             return name##_scalar(__VA_ARGS__);                   \
         } }()
 
+#else
+
+/// Dispatch a void-returning function: name##_scalar / _avx2
+#define ISA_DISPATCH_VOID(name, ...)           \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            name##_avx2(__VA_ARGS__);          \
+            break;                             \
+        default:                               \
+            name##_scalar(__VA_ARGS__);        \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and assign: lhs = name##_{scalar|avx2}(...)
+#define ISA_DISPATCH_RET(lhs, name, ...)       \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            lhs = name##_avx2(__VA_ARGS__);    \
+            break;                             \
+        default:                               \
+            lhs = name##_scalar(__VA_ARGS__);  \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and return the value directly for AVX2-only builds.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
+        switch (::llaminar2::activeISALevel())                   \
+        {                                                        \
+        case ::llaminar2::ISALevel::AVX2:                        \
+            return name##_avx2(__VA_ARGS__);                     \
+        default:                                                 \
+            return name##_scalar(__VA_ARGS__);                   \
+        } }()
+
+#endif
+
     /**
      * @brief Check if CPU supports AVX2
      * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_avx2()
     {
+#if LLAMINAR_COMPILED_WITH_AVX2
         static const bool result = detail::detect_avx2();
         return result;
+#else
+        return false;
+#endif
     }
 
     /**
@@ -505,7 +611,8 @@ namespace llaminar2
                 return false;
 
             // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
-            uint32_t xcr0_lo, xcr0_hi;
+            uint32_t xcr0_lo;
+            [[maybe_unused]] uint32_t xcr0_hi;
 #if defined(_MSC_VER)
             uint64_t xcr0_full = _xgetbv(0);
             xcr0_lo = static_cast<uint32_t>(xcr0_full);
@@ -515,7 +622,6 @@ namespace llaminar2
 #else
             return false;
 #endif
-            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             // AMX requires bits 17 (XTILECFG) and 18 (XTILEDATA)
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
@@ -545,7 +651,8 @@ namespace llaminar2
                 return false;
 
             // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
-            uint32_t xcr0_lo, xcr0_hi;
+            uint32_t xcr0_lo;
+            [[maybe_unused]] uint32_t xcr0_hi;
 #if defined(_MSC_VER)
             uint64_t xcr0_full = _xgetbv(0);
             xcr0_lo = static_cast<uint32_t>(xcr0_full);
@@ -555,7 +662,6 @@ namespace llaminar2
 #else
             return false;
 #endif
-            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
                 return false;
@@ -662,6 +768,27 @@ namespace llaminar2
     }
 
     /**
+     * @brief Get the associativity of the private L2 cache.
+     * @return Number of L2 ways, or one when topology detection is unavailable.
+     */
+    inline uint32_t cpu_l2_cache_associativity()
+    {
+        static const uint32_t cached_ways = []
+        {
+            uint32_t size = 0;
+            uint32_t ways = 0;
+            if (detail::detect_cache_by_level(
+                    2, /*data_only=*/false, size, nullptr, &ways) &&
+                ways > 0)
+            {
+                return ways;
+            }
+            return 1u;
+        }();
+        return cached_ways;
+    }
+
+    /**
      * @brief Get L3 cache size in bytes (shared across all cores)
      * @return L3 cache size in bytes, or 8MB if unknown
      *
@@ -684,6 +811,27 @@ namespace llaminar2
             return static_cast<uint32_t>(8 * 1024 * 1024); // Fallback: 8MB
         }();
         return cached_size;
+    }
+
+    /**
+     * @brief Get the associativity of the shared last-level cache.
+     * @return Number of L3 ways, or one when topology detection is unavailable.
+     */
+    inline uint32_t cpu_l3_cache_associativity()
+    {
+        static const uint32_t cached_ways = []
+        {
+            uint32_t size = 0;
+            uint32_t ways = 0;
+            if (detail::detect_cache_by_level(
+                    3, /*data_only=*/false, size, nullptr, &ways) &&
+                ways > 0)
+            {
+                return ways;
+            }
+            return 1u;
+        }();
+        return cached_ways;
     }
 
     /**
@@ -726,6 +874,8 @@ namespace llaminar2
     inline uint32_t cpu_l1_cache_size() { return 32 * 1024; }        // Conservative 32KB
     inline uint32_t cpu_l2_cache_size() { return 256 * 1024; }       // Conservative 256KB
     inline uint32_t cpu_l3_cache_size() { return 8 * 1024 * 1024; }  // Conservative 8MB
+    inline uint32_t cpu_l2_cache_associativity() { return 1; }
+    inline uint32_t cpu_l3_cache_associativity() { return 1; }
     inline uint32_t cpu_l2_cache_total() { return 8 * 1024 * 1024; } // Conservative 8MB
 #endif
 
@@ -747,12 +897,20 @@ namespace llaminar2
         uint32_t l3_size;    ///< L3 cache size in bytes (shared)
         uint32_t l2_total;   ///< Total L2 across all cores
         uint32_t cache_line; ///< Cache line size in bytes (typically 64)
+        uint32_t l2_ways;    ///< Associativity of the private L2 cache
+        uint32_t l3_ways;    ///< Associativity of the shared last-level cache
 
         /**
          * @brief Construct CacheInfo with detected values
          */
         CacheInfo()
-            : l1_size(cpu_l1_cache_size()), l2_size(cpu_l2_cache_size()), l3_size(cpu_l3_cache_size()), l2_total(cpu_l2_cache_total()), cache_line(64) // Standard x86 cache line
+            : l1_size(cpu_l1_cache_size()),
+              l2_size(cpu_l2_cache_size()),
+              l3_size(cpu_l3_cache_size()),
+              l2_total(cpu_l2_cache_total()),
+              cache_line(64), // Standard x86 cache line
+              l2_ways(cpu_l2_cache_associativity()),
+              l3_ways(cpu_l3_cache_associativity())
         {
         }
 
@@ -873,10 +1031,13 @@ namespace llaminar2
         {
             static char buf[256];
             snprintf(buf, sizeof(buf),
-                     "L1=%uKB L2=%uKB L3=%uMB (L2_total=%uMB)",
+                     "L1=%uKB L2=%uKB/%u-way L3=%uMB/%u-way "
+                     "(L2_total=%uMB)",
                      l1_size / 1024,
                      l2_size / 1024,
+                     l2_ways,
                      l3_size / (1024 * 1024),
+                     l3_ways,
                      l2_total / (1024 * 1024));
             return buf;
         }

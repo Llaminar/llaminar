@@ -129,7 +129,8 @@ TEST_F(KVCachePerformanceTest, SingleTokenAppend)
             cache.append_kv(layer, K.get(), V.get());
         }
     }
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     // Benchmark
     auto start = std::chrono::high_resolution_clock::now();
@@ -188,7 +189,8 @@ TEST_F(KVCachePerformanceTest, BatchPrefill)
         {
             cache.append_kv(layer, K.get(), V.get());
         }
-        cache.clear();
+        ASSERT_TRUE(cache.resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
 
         // Benchmark
         const int iterations = 10;
@@ -200,7 +202,8 @@ TEST_F(KVCachePerformanceTest, BatchPrefill)
             {
                 cache.append_kv(layer, K.get(), V.get());
             }
-            cache.clear();
+            ASSERT_TRUE(cache.resetRequestState(
+                IKVCache::StateResetContext::testReinitialization(nullptr)));
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -299,7 +302,8 @@ TEST_F(KVCachePerformanceTest, LargeModelScale)
     {
         cache.append_kv(layer, K.get(), V.get());
     }
-    cache.clear();
+    ASSERT_TRUE(cache.resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(nullptr)));
 
     // Benchmark prefill
     const int iterations = 10;
@@ -311,7 +315,8 @@ TEST_F(KVCachePerformanceTest, LargeModelScale)
         {
             cache.append_kv(layer, K.get(), V.get());
         }
-        cache.clear();
+        ASSERT_TRUE(cache.resetRequestState(
+            IKVCache::StateResetContext::testReinitialization(nullptr)));
     }
 
     auto end = std::chrono::high_resolution_clock::now();

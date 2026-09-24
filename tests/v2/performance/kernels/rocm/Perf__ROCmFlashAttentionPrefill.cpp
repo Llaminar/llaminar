@@ -8,7 +8,7 @@
  * **Tuning Vectors**:
  * - KV type: FP32, FP16, Q8_1
  * - n_heads: TP-sliced head counts
- * - seq_len: 128, 256, 512, 1024 (typical prefill lengths)
+ * - seq_len: 128, 256, 425, 512, 1024 (typical and production prefill lengths)
  *
  * **Key insight**: Unlike decode (split-K), the prefill kernel has NO KV splitting.
  * Grid = (n_heads, num_q_tiles, batch). Occupancy comes from q-tiles × heads.
@@ -44,7 +44,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     int hipFlashAttn_prefill_fa2_fp16(
         const float *Q, const void *K, const void *V, float *O,
@@ -53,7 +54,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     int hipFlashAttn_prefill_fa2_q8_1(
         const float *Q, const void *K, const void *V, float *O,
@@ -62,7 +64,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const void *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 }
 
 namespace
@@ -96,6 +99,7 @@ namespace
     static constexpr ModelConfig kQwen7B = {"Qwen2.5-7B", 28, 4, 128};
     static constexpr ModelConfig kQwen14B = {"Qwen2.5-14B", 40, 8, 128};
     static constexpr ModelConfig kQwen32B = {"Qwen2.5-32B", 40, 8, 128};
+    static constexpr ModelConfig kQwen36MoE = {"Qwen3.6-35B-A3B", 16, 2, 256};
 
     static constexpr ModelConfig kAllModels[] = {
         kQwen05B, kQwen3B, kQwen7B, kQwen14B, kQwen32B};
@@ -187,9 +191,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
                 num_cus_ = props.multiProcessorCount;
             }
@@ -239,11 +243,13 @@ namespace
             // Allocate device memory
             float *d_Q = nullptr, *d_O = nullptr;
             void *d_K = nullptr, *d_V = nullptr;
+            hipStream_t stream = nullptr;
 
-            hipMalloc(&d_Q, q_size * sizeof(float));
-            hipMalloc(&d_K, k_bytes);
-            hipMalloc(&d_V, v_bytes);
-            hipMalloc(&d_O, out_size * sizeof(float));
+            (void)hipMalloc(&d_Q, q_size * sizeof(float));
+            (void)hipMalloc(&d_K, k_bytes);
+            (void)hipMalloc(&d_V, v_bytes);
+            (void)hipMalloc(&d_O, out_size * sizeof(float));
+            (void)hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
 
             // Initialize Q with random data
             {
@@ -252,7 +258,7 @@ namespace
                 std::normal_distribution<float> dist(0.0f, 0.1f);
                 for (auto &v : h_Q)
                     v = dist(rng);
-                hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
             }
 
             // Initialize KV with random data (appropriate format)
@@ -263,10 +269,10 @@ namespace
                 std::normal_distribution<float> dist(0.0f, 0.1f);
                 for (auto &v : h_KV)
                     v = dist(rng);
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 for (auto &v : h_KV)
                     v = dist(rng);
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
             else if (kv_type == KVType::FP16)
             {
@@ -282,7 +288,7 @@ namespace
                     int mantissa = rng() & 0x3FF;
                     v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
                 }
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 for (auto &v : h_KV)
                 {
                     int sign = rng() & 1;
@@ -290,7 +296,7 @@ namespace
                     int mantissa = rng() & 0x3FF;
                     v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
                 }
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
             else
             {
@@ -299,13 +305,13 @@ namespace
                 std::mt19937 rng(123);
                 for (auto &v : h_KV)
                     v = static_cast<uint8_t>(rng() & 0xFF);
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 h_KV.resize(v_bytes);
                 for (auto &v : h_KV)
                     v = static_cast<uint8_t>(rng() & 0xFF);
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
-            hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Lambda to dispatch based on KV type
             auto launch = [&]() -> int
@@ -318,21 +324,24 @@ namespace
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 case KVType::FP16:
                     return hipFlashAttn_prefill_fa2_fp16(
                         d_Q, d_K, d_V, d_O,
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 case KVType::Q8_1:
                     return hipFlashAttn_prefill_fa2_q8_1(
                         d_Q, d_K, d_V, d_O,
                         batch_size, seq_len, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
-                        nullptr, nullptr, nullptr);
+                        nullptr, nullptr, stream,
+                        /*head_start=*/0, /*gqa_n_rep=*/0);
                 }
                 return -1;
             };
@@ -347,21 +356,20 @@ namespace
                     goto cleanup;
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipStreamSynchronize(stream);
 
             // Benchmark with HIP events
             {
                 hipEvent_t ev_start, ev_stop;
-                hipEventCreate(&ev_start);
-                hipEventCreate(&ev_stop);
+                (void)hipEventCreate(&ev_start);
+                (void)hipEventCreate(&ev_stop);
 
                 std::vector<double> times_us;
                 times_us.reserve(BENCH_ITERS);
 
                 for (int i = 0; i < BENCH_ITERS; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, nullptr);
+                    (void)hipEventRecord(ev_start, stream);
 
                     int rc = launch();
                     if (rc != 0)
@@ -372,16 +380,16 @@ namespace
                         goto cleanup;
                     }
 
-                    hipEventRecord(ev_stop, nullptr);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, stream);
+                    (void)hipEventSynchronize(ev_stop);
 
                     float ms = 0.0f;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times_us.push_back(static_cast<double>(ms) * 1000.0);
                 }
 
-                hipEventDestroy(ev_start);
-                hipEventDestroy(ev_stop);
+                (void)hipEventDestroy(ev_start);
+                (void)hipEventDestroy(ev_stop);
 
                 std::sort(times_us.begin(), times_us.end());
                 result.min_us = times_us.front();
@@ -395,6 +403,7 @@ namespace
             (void)hipFree(d_K);
             (void)hipFree(d_V);
             (void)hipFree(d_O);
+            (void)hipStreamDestroy(stream);
 
             return result;
 #endif
@@ -649,6 +658,24 @@ namespace
             /*seq_lengths=*/{128, 256, 512, 1024},
             /*tp_degrees=*/{1, 2, 4},
             {KVType::FP32, KVType::FP16, KVType::Q8_1});
+    }
+
+    /**
+     * @brief Measure the exact ROCm single-device attention geometry used by
+     *        the Qwen3.6-35B-A3B production prefill benchmark.
+     *
+     * The 425-row point is the deterministic dashboard prompt length.  It is
+     * deliberately isolated from the broad model sweep so ISA/resource tuning
+     * can iterate in seconds and rocprof can attach to one unambiguous kernel
+     * specialization.
+     */
+    TEST_F(ROCmFlashAttentionPrefillPerf, Qwen36MoE_Production425_FP16)
+    {
+        runKVTypeSweep(
+            kQwen36MoE,
+            /*seq_lengths=*/{425},
+            /*tp_degrees=*/{1},
+            {KVType::FP16});
     }
 
     // ---------------------------------------------------------------------------

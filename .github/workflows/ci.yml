@@ -1,397 +1,85 @@
 name: CI
 
+# The develop branch publishes only freshly built, model-free-gated runtime
+# images. Full generation, HTTP E2E, remote MPI, benchmarks and certification
+# remain explicit production-pipeline work; this workflow must not grow a
+# second copy of that heavier policy.
 on:
-  pull_request:
-    branches: [develop, master]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'changelog/**'
-      - '.devcontainer/**'
-      - '.vscode/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '**/*.md'
-      - '**/.gitkeep'
   push:
     branches: [develop]
-    paths-ignore:
-      - 'README.md'
-      - 'LICENSE'
-      - 'docs/**'
-      - 'changelog/**'
-      - '.devcontainer/**'
-      - '.vscode/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - '.editorconfig'
-      - '**/*.md'
-      - '**/.gitkeep'
-  workflow_call:
-    inputs:
-      image-tag:
-        description: "Deprecated; runtime image tags are derived from branch, SHA, CUDA, and ROCm versions."
-        required: false
-        type: string
-        default: ""
-    outputs:
-      image-ref:
-        description: "Published runtime image references."
-        value: ${{ jobs.runtime-image-refs.outputs.image-refs }}
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  MODELS_DIR: /opt/llaminar-models
-  BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
-  CUDA_VERSION: "13.0"
-  ROCM_VERSION: "7.1.1"
-  LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE: "256GB"
-  RCCL_ONLY_FUNCS: >-
-    AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8
+concurrency:
+  group: llaminar-develop-image-gate
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build builder image and unit tests
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 120
-    outputs:
-      builder-image: ${{ steps.builder-image.outputs.ref }}
+  develop-images:
+    # Manual dispatches from another branch must not mutate the develop tag.
+    if: github.ref == 'refs/heads/develop'
+    name: Build → Unit → Preflight → Publish develop images
+    runs-on: [llaminar-xeon-host]
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
-
-      - name: Record builder image ref
-        id: builder-image
-        shell: bash
-        run: |
-          echo "ref=${BUILDER_IMAGE}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
         with:
-          driver: docker
-
-      - name: Build builder image
-        uses: docker/build-push-action@v7
+          submodules: false
+          lfs: false
+      - uses: docker/setup-buildx-action@v4
         with:
-          context: .
-          file: Dockerfile
-          target: builder
-          network: host
-          load: true
-          tags: ${{ env.BUILDER_IMAGE }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
-            LLAMINAR_CUDA_ARCHS=86
-            RCCL_ONLY_FUNCS=${{ env.RCCL_ONLY_FUNCS }}
-
-      - name: Stage runner host state
-        run: |
-          if [ ! -d "${MODELS_DIR}" ]; then
-            echo "::error::Models directory ${MODELS_DIR} not found on runner."
-            exit 1
-          fi
-
-      - name: Preflight - clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-
-      - name: Run unit tests
-        run: |
-          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
-            --probe-image "${BUILDER_IMAGE}" \
-            --required)
-          docker run --rm \
-            "${nvidia_args[@]}" \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --ulimit core=-1 \
-            --shm-size=16g \
-            -e MODELS_DIR="${MODELS_DIR}" \
-            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ env.BUILDER_IMAGE }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Unit_' \
-                  --output-on-failure \
-                  --parallel
-
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
+          # The host-mounted OCI cache needs Buildx's local cache backend,
+          # which the Docker driver cannot export.  This is one named BuildKit
+          # worker *inside the host Docker daemon*, not a DIND graph store.
+          # Retaining its state preserves Dockerfile ccache mounts when ARC
+          # replaces the ephemeral GitHub runner pod.
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          # The runner's persistent host storage is the only build cache.
+          # Do not send even Buildx's own helper binary through Actions cache.
+          cache-binary: false
+      - uses: docker/login-action@v4
         with:
-          name: cores-unit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Remove builder image tag
-        if: always()
-        run: docker image rm "${{ env.BUILDER_IMAGE }}" || true
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  runtime-containers:
-    name: Runtime ${{ matrix.variant }} image
-    needs: build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      # Keep the DAG split for visibility while still protecting the shared
-      # self-hosted runner from concurrent GPU-heavy E2E segments.
-      max-parallel: 1
-      matrix:
-        include:
-          - variant: cpu
-            e2e_variant: cpu
-            port: 20100
-          - variant: cuda
-            e2e_variant: cuda
-            port: 20200
-          - variant: rocm
-            e2e_variant: rocm
-            port: 20300
-          - variant: full
-            e2e_variant: hybrid
-            port: 20400
-    # Serialize release-container E2E segments across workflow runs so the
-    # self-hosted GPU runner never oversubscribes NVIDIA/AMD VRAM.
-    concurrency:
-      group: llaminar-runtime-container-e2e
-      cancel-in-progress: false
-    env:
-      # The self-hosted ARC runner invokes Docker builds from inside
-      # Kubernetes. Host networking avoids TLS stalls to codeload.github.com
-      # seen from BuildKit RUN layers while preserving exact dependency refs.
-      LLAMINAR_DOCKER_BUILD_NETWORK: host
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-        with:
-          driver: docker
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Preflight - clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-
-      - name: Resolve runtime image tags
-        id: runtime-tags
+      - name: Build, gate and publish both develop runtime images
         shell: bash
         run: |
           set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --format refs)
-          ((${#refs[@]} > 0))
-          {
-            echo "primary_ref=${refs[0]}"
-            echo "refs<<EOF"
-            printf '%s\n' "${refs[@]}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Runtime ${{ matrix.variant }} image tags"
-            echo ""
-            for ref in "${refs[@]}"; do
-              echo "- \`${ref}\`"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build runtime image
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --output parity-results/develop-image-gate \
+            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
+            --publish
+      - name: Bound node-local BuildKit cache
+        # A canceled build is still retiring its Buildx child. Pruning that
+        # same worker during cancellation can wait on its active build lock.
+        if: ${{ !cancelled() }}
         shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --format refs)
-          build_args=(scripts/docker/build-runtime-image.sh --variant "${{ matrix.variant }}" --load --no-verify)
-          for ref in "${refs[@]}"; do
-            build_args+=(--tag "$ref")
-          done
-          "${build_args[@]}"
-
-      - name: Prepare host NUMA memory for E2E
-        run: bash scripts/ci/prepare_numa_e2e_host.sh
-
-      - name: E2E test runtime image
-        env:
-          LLAMINAR_E2E_DOCKER_NETWORK: bridge
-        run: |
-          scripts/ci/run_release_container_e2e.sh \
-            --variant "${{ matrix.e2e_variant }}" \
-            --image "${{ steps.runtime-tags.outputs.primary_ref }}" \
-            --port "${{ matrix.port }}" \
-            --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container"
-
-      - name: Push tested SHA image
-        if: github.event_name != 'pull_request'
-        run: docker push "${{ steps.runtime-tags.outputs.primary_ref }}"
-
-      - name: Upload E2E logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
+        run: bash scripts/ci/prune_docker_build_cache.sh
+      - name: Retain develop-image build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: runtime-e2e-logs-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # This is compact diagnostic evidence, never a Docker or compiler
+          # cache. The host-owned BuildKit/ccache stores remain local.
+          name: develop-image-gate-${{ github.run_id }}
+          # The per-ISA source snapshot is a Buildx input, not evidence. Its
+          # identity is sealed in develop-image-gate.json and it can contain
+          # hundreds of MiB of tracked diagnostic CSVs which Docker itself
+          # excludes. Upload logs, receipts and CTest/JUnit proof only.
           path: |
-            /tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-runtime-containers-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Remove runtime image tags
-        if: always()
-        shell: bash
-        run: |
-          image="${REGISTRY}/${IMAGE_NAME}"
-          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-            --variant "${{ matrix.variant }}" \
-            --image "$image" \
-            --branch "${GITHUB_REF_NAME}" \
-            --sha "${GITHUB_SHA}" \
-            --format refs)
-          for ref in "${refs[@]}"; do
-            [[ -n "$ref" ]] && docker image rm "$ref" >/dev/null 2>&1 || true
-          done
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  publish-runtime-aliases:
-    name: Publish runtime latest aliases
-    needs: runtime-containers
-    if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish latest aliases from tested SHA images
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          variants=(cpu cuda rocm full)
-          for variant in "${variants[@]}"; do
-            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-              --variant "$variant" \
-              --image "$image" \
-              --branch "${GITHUB_REF_NAME}" \
-              --sha "${GITHUB_SHA}" \
-              --format refs)
-            ((${#refs[@]} > 0))
-            primary="${refs[0]}"
-            docker pull "$primary"
-            for ref in "${refs[@]:1}"; do
-              docker tag "$primary" "$ref"
-              docker push "$ref"
-            done
-            docker image rm "${refs[@]}" >/dev/null 2>&1 || true
-          done
-
-      - name: Bound Docker build cache
-        if: always()
-        run: bash scripts/ci/prune_docker_build_cache.sh
-
-  runtime-image-refs:
-    name: Runtime image refs
-    needs: [runtime-containers, publish-runtime-aliases]
-    if: always()
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    outputs:
-      image-refs: ${{ steps.refs.outputs.image_refs }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Resolve published runtime image refs
-        id: refs
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="${REGISTRY}/${IMAGE_NAME}"
-          variants=(cpu cuda rocm full)
-          all_refs=()
-          for variant in "${variants[@]}"; do
-            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-              --variant "$variant" \
-              --image "$image" \
-              --branch "${GITHUB_REF_NAME}" \
-              --sha "${GITHUB_SHA}" \
-              --format refs)
-            all_refs+=("${refs[@]}")
-          done
-          {
-            echo "image_refs<<EOF"
-            printf '%s\n' "${all_refs[@]}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "## Runtime image refs"
-            echo ""
-            for ref in "${all_refs[@]}"; do
-              echo "- \`${ref}\`"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+            parity-results/develop-image-gate/develop-image-gate.json
+            parity-results/develop-image-gate/**/build-*.log
+            parity-results/develop-image-gate/**/build-timeline.jsonl
+            parity-results/develop-image-gate/**/prerequisites.log
+            parity-results/develop-image-gate/**/prerequisites.process.log
+            parity-results/develop-image-gate/**/prerequisites/**
+          if-no-files-found: error
+          retention-days: 30

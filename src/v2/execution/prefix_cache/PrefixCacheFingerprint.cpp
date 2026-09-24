@@ -1,7 +1,16 @@
+/**
+ * @file PrefixCacheFingerprint.cpp
+ * @brief Stable prefix compatibility hashing and placement-bound admission.
+ *
+ * Fields are sorted before hashing so construction order cannot change a key.
+ * The movement epoch enters through one typed argument and is returned with
+ * the key; independently sampled epochs must never relabel cached state.
+ */
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include <algorithm>
 #include <array>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -10,6 +19,7 @@ namespace llaminar2
         constexpr uint64_t kFnvOffset = 14695981039346656037ull;
         constexpr uint64_t kFnvPrime = 1099511628211ull;
 
+        /** @brief Fold one byte into the stable FNV-1a accumulator. */
         uint64_t fnvUpdate(uint64_t hash, unsigned char byte)
         {
             hash ^= static_cast<uint64_t>(byte);
@@ -17,6 +27,7 @@ namespace llaminar2
             return hash;
         }
 
+        /** @brief Hash string bytes and a delimiter to distinguish field boundaries. */
         uint64_t fnvUpdateString(uint64_t hash, const std::string &value)
         {
             for (unsigned char byte : value)
@@ -26,6 +37,7 @@ namespace llaminar2
             return fnvUpdate(hash, 0xffu);
         }
 
+        /** @brief Hash a 64-bit value in fixed byte order on every CPU ISA. */
         uint64_t fnvUpdateU64(uint64_t hash, uint64_t value)
         {
             for (int i = 0; i < 8; ++i)
@@ -76,7 +88,11 @@ namespace llaminar2
     uint64_t combinePrefixFingerprintParts(const PrefixFingerprintParts &parts)
     {
         uint64_t hash = kFnvOffset;
-        hash = fnvUpdateString(hash, "prefix-cache-v1");
+        // Arithmetic is part of restart compatibility, not just physical layout.
+        // V1 could persist chunk-mean AQ8 bases (and downstream states), which
+        // cannot certify the request-partition-invariant first-input contract.
+        // Retain old archives on disk, but never admit them under the new key.
+        hash = fnvUpdateString(hash, "prefix-cache-v2");
 
         const std::array<std::pair<const char *, uint64_t>, 7> ordered_parts{{
             {"model", parts.model},
@@ -97,11 +113,13 @@ namespace llaminar2
     }
 
     PrefixCacheFingerprintResult buildPrefixCacheFingerprint(
-        const PrefixFingerprintMaterial &material,
+        PrefixFingerprintMaterial material,
         bool model_is_moe,
-        PrefixCacheMoEPolicy moe_policy)
+        PrefixCacheMoEPolicy moe_policy,
+        uint64_t placement_epoch)
     {
         PrefixCacheFingerprintResult result;
+        result.placement_epoch = placement_epoch;
         if (model_is_moe && moe_policy == PrefixCacheMoEPolicy::Disabled)
         {
             result.bypass = true;
@@ -109,6 +127,20 @@ namespace llaminar2
             return result;
         }
 
+        // Own this field centrally: a second stringly supplied epoch could
+        // disagree with the immutable provenance returned alongside the key.
+        if (std::any_of(material.moe.begin(), material.moe.end(),
+                        [](const PrefixFingerprintField &field)
+                        { return field.name == "runtime_movement_epoch"; }))
+        {
+            throw std::invalid_argument(
+                "Prefix fingerprint movement epoch must use the typed argument");
+        }
+        if (model_is_moe && moe_policy == PrefixCacheMoEPolicy::InvalidateOnRebalance)
+        {
+            material.moe.push_back(
+                {"runtime_movement_epoch", std::to_string(placement_epoch)});
+        }
         result.parts = buildPrefixFingerprintParts(material);
         result.key = combinePrefixFingerprintParts(result.parts);
         return result;
@@ -126,6 +158,12 @@ namespace llaminar2
         fields.push_back({scope + ".layer_count", std::to_string(layer_count)});
         for (int layer = 0; layer < layer_count; ++layer)
         {
+            if (table.decodeRuntimePublicationRequired(layer))
+            {
+                throw std::logic_error(
+                    "[PrefixCacheFingerprint] cannot fingerprint unpublished MoE runtime layer " +
+                    std::to_string(layer));
+            }
             const auto &state = table.hostLayerState(layer);
             const std::string layer_prefix = scope + ".layer." + std::to_string(layer);
             const uint32_t active_bank = state.active_bank <= 1 ? state.active_bank : 0;

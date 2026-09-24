@@ -1,223 +1,94 @@
 /**
  * @file NodeDetection.cpp
- * @brief Canonical hostname-based MPI node detection (implementation)
+ * @brief Physical MPI node identity from shared-memory communicator membership.
+ *
+ * Hostnames are diagnostic labels, not physical identities: localhost, short
+ * names, FQDNs and container aliases must not create ghost nodes. MPI supplies
+ * shared-memory groups; their lowest communicator rank gives a stable label
+ * which the pure validator converts to compact node IDs on every participant.
  */
-
 #include "NodeDetection.h"
-#include "Logger.h"
-#include <cstring>
-#include <fstream>
-#include <sstream>
+#include <algorithm>
+#include <map>
+#include <stdexcept>
 
 namespace llaminar2
 {
-
-    NodeDetectionResult NodeDetection::detect(MPI_Comm comm,
-                                              const std::string &hostfile_path)
+    namespace
     {
-        if (comm == MPI_COMM_NULL)
+        /** @brief Fail a collective initialization phase on an MPI API error. */
+        void requireMPI(int result, const char *operation)
         {
-            return {};
+            if (result != MPI_SUCCESS)
+                throw std::runtime_error(std::string("Physical node discovery failed: ") + operation);
         }
+    }
 
-        int comm_size = 0;
-        int comm_rank = 0;
-        MPI_Comm_size(comm, &comm_size);
-        MPI_Comm_rank(comm, &comm_rank);
+    NodeDetectionResult NodeDetection::detect(MPI_Comm comm, const std::string &hostfile_path)
+    {
+        // Kept as a source-compatible launch input, never interpreted as a
+        // physical topology. The MPI launcher has already consumed its slots.
+        (void)hostfile_path;
+        if (comm == MPI_COMM_NULL) return {};
+        int size = 0, rank = 0;
+        requireMPI(MPI_Comm_size(comm, &size), "communicator size");
+        requireMPI(MPI_Comm_rank(comm, &rank), "communicator rank");
+        MPI_Comm local = MPI_COMM_NULL;
+        requireMPI(MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &local), "shared-memory split");
+        int leader = rank;
+        const int reduced = MPI_Allreduce(MPI_IN_PLACE, &leader, 1, MPI_INT, MPI_MIN, local);
+        requireMPI(MPI_Comm_free(&local), "shared-memory communicator release");
+        requireMPI(reduced, "shared-memory leader");
+        std::vector<int> leaders(static_cast<std::size_t>(size));
+        requireMPI(MPI_Allgather(&leader, 1, MPI_INT, leaders.data(), 1, MPI_INT, comm), "shared-memory membership");
 
-        if (comm_size <= 0)
+        char hostname[MPI_MAX_PROCESSOR_NAME] = {};
+        int length = 0;
+        requireMPI(MPI_Get_processor_name(hostname, &length), "processor label");
+        std::vector<char> labels(static_cast<std::size_t>(size) * MPI_MAX_PROCESSOR_NAME);
+        requireMPI(MPI_Allgather(hostname, MPI_MAX_PROCESSOR_NAME, MPI_CHAR,
+                                labels.data(), MPI_MAX_PROCESSOR_NAME, MPI_CHAR, comm), "processor labels");
+        auto result = fromSharedNodeLeaders(leaders);
+        for (int peer = 0; peer < size; ++peer)
         {
-            return {};
+            const char *begin = labels.data() + static_cast<std::size_t>(peer) * MPI_MAX_PROCESSOR_NAME;
+            result.hostnames.emplace_back(begin, std::find(begin, begin + MPI_MAX_PROCESSOR_NAME, '\0'));
         }
-
-        // Get this rank's hostname via the canonical MPI call
-        constexpr int kMaxHostnameLen = 256;
-        char my_hostname[kMaxHostnameLen];
-        std::memset(my_hostname, 0, kMaxHostnameLen);
-
-        int name_len = 0;
-        MPI_Get_processor_name(my_hostname, &name_len);
-
-        // AllGather hostnames across all ranks in the communicator
-        std::vector<char> all_hostnames(
-            static_cast<size_t>(comm_size) * kMaxHostnameLen, '\0');
-        MPI_Allgather(my_hostname, kMaxHostnameLen, MPI_CHAR,
-                      all_hostnames.data(), kMaxHostnameLen, MPI_CHAR,
-                      comm);
-
-        // Extract hostname strings
-        std::vector<std::string> hostnames;
-        hostnames.reserve(static_cast<size_t>(comm_size));
-        for (int i = 0; i < comm_size; ++i)
-        {
-            const char *h = all_hostnames.data() +
-                            static_cast<size_t>(i) * kMaxHostnameLen;
-            hostnames.emplace_back(h);
-        }
-
-        // If a hostfile is provided, use it to determine node ID ordering
-        NodeDetectionResult result;
-        if (!hostfile_path.empty())
-        {
-            auto hostfile_nodes = parseHostfile(hostfile_path);
-            if (!hostfile_nodes.empty())
-            {
-                result = fromHostnamesWithNodeMap(hostnames, hostfile_nodes);
-                LOG_DEBUG("[NodeDetection] detect (hostfile): " << result.node_count
-                                                                << " node(s) across " << comm_size << " ranks"
-                                                                << " (hostfile=" << hostfile_path
-                                                                << ", this rank hostname=\"" << hostnames[comm_rank] << "\")");
-                return result;
-            }
-            // Hostfile parse failed or empty, fall through to auto-detect
-            LOG_WARN("[NodeDetection] Hostfile '" << hostfile_path
-                                                  << "' produced no entries, falling back to auto-detection");
-        }
-
-        // Delegate to the shared assignment logic
-        result = fromHostnames(hostnames);
-
-        LOG_DEBUG("[NodeDetection] detect: " << result.node_count
-                                             << " unique node(s) across " << comm_size
-                                             << " ranks (this rank hostname=\""
-                                             << hostnames[comm_rank] << "\")");
-
         return result;
     }
 
-    NodeDetectionResult NodeDetection::fromHostnames(
-        const std::vector<std::string> &hostnames)
-    {
-        // No hostfile node map — assign by first appearance
-        return fromHostnamesWithNodeMap(hostnames, {});
-    }
-
-    NodeDetectionResult NodeDetection::fromHostnames(
-        const std::vector<std::string> &hostnames,
-        const std::string &hostfile_path)
-    {
-        if (hostfile_path.empty())
-        {
-            return fromHostnames(hostnames);
-        }
-
-        auto hostfile_nodes = parseHostfile(hostfile_path);
-        if (hostfile_nodes.empty())
-        {
-            LOG_WARN("[NodeDetection] Hostfile '" << hostfile_path
-                                                  << "' produced no entries, falling back to first-appearance ordering");
-            return fromHostnames(hostnames);
-        }
-
-        return fromHostnamesWithNodeMap(hostnames, hostfile_nodes);
-    }
-
-    NodeDetectionResult NodeDetection::fromHostnamesWithNodeMap(
-        const std::vector<std::string> &hostnames,
-        const std::vector<std::pair<std::string, int>> &hostfile_nodes)
+    NodeDetectionResult NodeDetection::fromSharedNodeLeaders(const std::vector<int> &leaders)
     {
         NodeDetectionResult result;
-        const int n = static_cast<int>(hostnames.size());
-        result.node_ids.resize(static_cast<size_t>(n));
+        std::map<int, int> nodes;
+        for (std::size_t rank = 0; rank < leaders.size(); ++rank)
+        {
+            const int leader = leaders[rank];
+            if (leader < 0 || static_cast<std::size_t>(leader) > rank ||
+                leaders[static_cast<std::size_t>(leader)] != leader)
+                throw std::invalid_argument("Invalid shared-memory node leader for communicator rank " + std::to_string(rank));
+            const auto [node, inserted] = nodes.try_emplace(leader, static_cast<int>(nodes.size()));
+            (void)inserted;
+            result.node_ids.push_back(node->second);
+        }
+        result.node_count = static_cast<int>(nodes.size());
+        return result;
+    }
+
+    NodeDetectionResult NodeDetection::fromHostnames(const std::vector<std::string> &hostnames)
+    {
+        // This pure helper is for synthetic topology fixtures. Real MPI callers
+        // must use detect(): equal labels do not prove shared address space.
+        NodeDetectionResult result;
         result.hostnames = hostnames;
-
-        // Build hostname→node_id lookup from hostfile if available
-        // Hostfile entries define the authoritative node ID ordering
-        int next_node_id = 0;
-        std::vector<std::pair<std::string, int>> seen;
-
-        if (!hostfile_nodes.empty())
+        std::map<std::string, int> nodes;
+        for (const auto &hostname : hostnames)
         {
-            // Seed with hostfile entries (they define the ordering)
-            seen = hostfile_nodes;
-            for (const auto &[name, nid] : seen)
-            {
-                if (nid >= next_node_id)
-                {
-                    next_node_id = nid + 1;
-                }
-            }
+            const auto [node, inserted] = nodes.try_emplace(hostname, static_cast<int>(nodes.size()));
+            (void)inserted;
+            result.node_ids.push_back(node->second);
         }
-
-        // Assign node IDs — hostfile entries take priority, then first-appearance
-        for (int i = 0; i < n; ++i)
-        {
-            int assigned_id = -1;
-            for (const auto &[name, nid] : seen)
-            {
-                if (name == hostnames[i])
-                {
-                    assigned_id = nid;
-                    break;
-                }
-            }
-            if (assigned_id < 0)
-            {
-                assigned_id = next_node_id++;
-                seen.emplace_back(hostnames[i], assigned_id);
-            }
-            result.node_ids[i] = assigned_id;
-        }
-
-        result.node_count = next_node_id;
+        result.node_count = static_cast<int>(nodes.size());
         return result;
     }
-
-    std::vector<std::pair<std::string, int>> NodeDetection::parseHostfile(
-        const std::string &hostfile_path)
-    {
-        std::vector<std::pair<std::string, int>> nodes;
-
-        std::ifstream file(hostfile_path);
-        if (!file.is_open())
-        {
-            LOG_WARN("[NodeDetection] Cannot open hostfile: " << hostfile_path);
-            return nodes;
-        }
-
-        // Parse OpenMPI-style hostfile: one hostname per line, optional "slots=N"
-        // Each unique hostname gets a sequential node ID in file order
-        int next_node_id = 0;
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Skip empty lines and comments
-            size_t start = line.find_first_not_of(" \t");
-            if (start == std::string::npos || line[start] == '#')
-            {
-                continue;
-            }
-
-            // Extract hostname (first token)
-            std::istringstream iss(line.substr(start));
-            std::string hostname;
-            iss >> hostname;
-
-            if (hostname.empty())
-            {
-                continue;
-            }
-
-            // Check if we've already seen this hostname
-            bool found = false;
-            for (const auto &[name, nid] : nodes)
-            {
-                if (name == hostname)
-                {
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found)
-            {
-                nodes.emplace_back(hostname, next_node_id++);
-            }
-        }
-
-        LOG_DEBUG("[NodeDetection] parseHostfile: " << nodes.size()
-                                                    << " unique node(s) from " << hostfile_path);
-        return nodes;
-    }
-
 } // namespace llaminar2

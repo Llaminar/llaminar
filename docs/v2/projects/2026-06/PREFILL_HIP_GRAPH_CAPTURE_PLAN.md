@@ -146,7 +146,7 @@ Files:
 Required work:
 - Add a prefill helper such as `isFixedTopologyPrefillGraphCapturable()` and make `isGraphCapturable()` return true for either the existing safe decode path or this new prefill path.
 - Keep the existing release-only/snapshot-off guard. In practice, this means returning false under `ENABLE_PIPELINE_SNAPSHOTS` and false outside `HAVE_ROCM`.
-- Require `params_.seq_len > 1`, a ROCm device, `debugEnv().rocm.moe_grouped_prefill`, a valid `moe_runtime_table`, valid `routing_indices`/`routing_weights`, and a supported `top_k`.
+- Require `params_.seq_len > 1`, a supported GPU device, `debugEnv().gpu_moe.grouped_prefill`, a valid `moe_runtime_table`, valid `routing_indices`/`routing_weights`, and a supported `top_k`.
 - Ensure the prefill routing execution path is device-only during capture. The current prefill `execute()` path eventually calls `routeWithTensors()` and may populate host-side routing data for CPU expert dispatch/snapshots. That cannot happen inside graph capture. If the ROCm implementation still performs D2H/sync for this call, add a separate device-only route method or a capture-safe flag that writes only the routing tensors and runtime table.
 - Ensure `DecodeExpertHistogram`, snapshot stash logic, and any cached host routing side effects are skipped for prefill graph capture.
 - Preserve current false results for CPU, snapshots, missing runtime table, masks/replicas/overlay routing, and unsupported top-k.
@@ -173,7 +173,7 @@ Required work:
 - The prefill graph-capturable predicate must require:
     - release/non-snapshot build
     - ROCm device and `params_.seq_len > 1`
-    - `debugEnv().rocm.moe_grouped_prefill`
+    - `debugEnv().gpu_moe.grouped_prefill`
     - full local expert ownership
     - no expert masks, no replicas, and no graph-native sparse overlay path
     - valid `moe_runtime_table`

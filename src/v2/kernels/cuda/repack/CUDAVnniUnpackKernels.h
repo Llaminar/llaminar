@@ -10,10 +10,10 @@
  *
  * ## Reversibility
  *
- * Only **per-block formats** (32-element blocks) are fully reversible because
- * their scales are stored as-is in FP16.  Superblock formats (Q4_K, Q5_K, etc.)
- * decompose the superblock scale structure into per-sub-block FP16 values during
- * forward repack — this is lossy and cannot be inverted.
+ * Formats are reversible when every source field is either retained directly or
+ * derivable from the retained payload.  Most scale-compressed superblock formats
+ * are lossy after decomposition.  Q8_K is the exception: its payload is already
+ * raw INT8 and its block sums can be reconstructed exactly.
  *
  * | Format  | Reversible | Notes                                    |
  * |---------|------------|------------------------------------------|
@@ -23,6 +23,8 @@
  * | Q5_0    | ✅         | 20 B payload + FP16 scale                |
  * | Q5_1    | ✅         | 20 B payload + FP16 scale + FP16 min     |
  * | Q8_0    | ✅         | 32 B payload + FP16 scale                |
+ * | Q8_1    | ✅         | Sum reconstructed from payload           |
+ * | Q8_K    | ✅         | Partial sums reconstructed from payload   |
  * | Q4_K    | ❌         | Superblock scale decomposition is lossy  |
  * | Q5_K    | ❌         | Superblock scale decomposition is lossy  |
  * | Q6_K    | ❌         | Superblock scale decomposition is lossy  |
@@ -49,6 +51,8 @@ inline bool isReversibleFormat(RepackFormat format)
     case RepackFormat::Q5_0:
     case RepackFormat::Q5_1:
     case RepackFormat::Q8_0:
+    case RepackFormat::Q8_1:
+    case RepackFormat::Q8_K:
         return true;
     default:
         return false;
@@ -58,8 +62,9 @@ inline bool isReversibleFormat(RepackFormat format)
 /**
  * @brief Launch CUDA kernel to reverse-repack GPU separated VNNI → raw GGUF blocks.
  *
- * Only supports per-block formats (Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1, Q8_0).
- * Returns false for unsupported (lossy) formats.
+ * Supports every losslessly reversible source format listed above.  Returns
+ * false for scale-compressed superblock formats whose original metadata cannot
+ * be reconstructed from the prepared representation.
  *
  * @param format       Quantization format
  * @param d_payload    GPU separated payload [blocks_per_row * N * payload_bytes]

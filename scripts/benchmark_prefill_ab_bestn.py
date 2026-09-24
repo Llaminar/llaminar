@@ -195,7 +195,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--parity-binary",
-        default="/workspaces/llaminar/build_v2_integration/tests/v2/v2_integration_parity_qwen2_single_device",
+        default="/workspaces/llaminar/build_v2_integration/tests/v2/v2_integration_parity_qwen2_single_device_matrix",
         help="Path to single-device parity test binary.",
     )
 

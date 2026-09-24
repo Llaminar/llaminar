@@ -1,5 +1,6 @@
 #include "Qwen36DenseParityTestBase.h"
 
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
@@ -29,8 +30,22 @@ int main(int argc, char **argv)
 {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    /*
+     * This test runner bypasses the application RuntimeInitPhase, so it must
+     * establish the aggregate CPU allocation domain before graph workspaces
+     * are planned. Production MPI ranks initialize the same backend with their
+     * rank-local NUMA node.
+     */
+    initCPUBackend(-1);
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
+
+    std::string retirement_error;
+    if (!releaseDenseMTPModelContextCampaignCache(&retirement_error))
+    {
+        std::cerr << retirement_error << '\n';
+        result = 1;
+    }
 
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();

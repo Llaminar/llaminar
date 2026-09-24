@@ -1,4 +1,13 @@
+/**
+ * @file Test__Q2_KTensor.cpp
+ * @brief Native Q2_K tensor arithmetic using explicitly owned CPU workspace.
+ *
+ * Direct GEMM calls borrow the same admitted workspace contract as production
+ * stages. The fixture owns scratch until computation completes; prepared weights
+ * never retain or allocate an implicit activation bank.
+ */
 #include <gtest/gtest.h>
+#include "../../utils/CPUProjectionTestWorkspace.h"
 #include <vector>
 #include <memory>
 #include <cmath>
@@ -9,7 +18,7 @@
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -71,7 +80,8 @@ TEST_F(Test__Q2_KTensor, GemmCorrectness_SingleBlock_Zero)
     output_data[0] = 123.0f; // Garbage
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {gemm.get()}));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     EXPECT_NEAR(output_data[0], 0.0f, 1e-5f);
 }
@@ -112,7 +122,8 @@ TEST_F(Test__Q2_KTensor, GemmCorrectness_SingleBlock_Ones)
     output_data[0] = 0.0f;
 
     auto gemm = weights->createGemm();
-    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k));
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {gemm.get()}));
+    ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     // Expected: 256 elements * 1.0 * 1.0 = 256.0
     // Tolerance: Re-quantization to INT8 introduces error.
@@ -202,7 +213,8 @@ TEST_F(Test__Q2_KTensor, QuantizedVsFP32Parity)
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
     cpu::native_vnni::CPUNativeVNNIGemmKernel quant_kernel(B_q2k.get());
-    quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true);
+    llaminar2::test::CPUProjectionTestWorkspace workspace(m, k, llaminar2::test::cpuProjectionTestRequirements(m, {&quant_kernel}));
+    quant_kernel.multiply_tensor(A_fp32.get(), C_quant.get(), m, n, k, true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get());
 
     // === Compare results ===
     float rel_l2 = compute_relative_l2_error(C_ref->data(), C_quant->data(), m * n);

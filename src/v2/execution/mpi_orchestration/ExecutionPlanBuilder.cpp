@@ -7,15 +7,20 @@
  * Two modes of operation:
  * 1. Named domains: Uses --define-domain and --pp-stage for complex configs
  * 2. Simple TP/PP: Uses --tp, --pp, --device for straightforward cases
+ * Physical CPU locality comes only from the gathered observation, never from
+ * communicator rank order or a presumed contiguous NUMA numbering scheme.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "ExecutionPlanBuilder.h"
+#include "planning/RankHardwareOwnership.h"
+#include "../moe/MoERoutedExpertPlacementPlan.h"
 #include "../../utils/Logger.h"
 #include "../../backends/ComputeBackend.h"
 #include <algorithm>
+#include <cctype>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -23,6 +28,82 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Classify only card identities with measured MTP defaults.
+         * @param device Startup inventory, never a hot-path backend query.
+         * @return Portable for CPU, unknown cards, or ambiguous marketing names.
+         */
+        MTPDepthDefaultsProfile mtpProfileForCard(const DeviceInfo &device)
+        {
+            std::string name = device.name;
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return std::toupper(c); });
+            if (device.type == DeviceType::CUDA && name.ends_with("RTX 3090"))
+                return MTPDepthDefaultsProfile::CUDARTX3090;
+            // HIP reports "AMD Instinct MI60 / MI50" on the measured MI50.
+            // Its 60-CU inventory disambiguates that shared marketing string;
+            // the MI60 and other gfx906 cards must not inherit this result.
+            if (device.type == DeviceType::ROCm &&
+                name.find("MI50") != std::string::npos && device.compute_units == 60)
+                return MTPDepthDefaultsProfile::ROCmMI50;
+            return MTPDepthDefaultsProfile::Portable;
+        }
+
+        /**
+         * @brief Resolve a profile only when every domain participant agrees.
+         * @param devices Complete continuation membership, including remote GPUs.
+         * @param ranks Aligned inventory owners, or empty for address-only lookup.
+         * @param inventory Canonical gathered hardware inventory.
+         * @return One measured card profile, or Portable for uncharacterized mixes.
+         * @throws std::invalid_argument for malformed participant/owner geometry.
+         *
+         * Never classify from the first GPU or include unrelated expert tiers.
+         * Missing identity is uncharacterized hardware, not evidence that the
+         * rest of a domain is homogeneous. Placement validation separately owns
+         * missing-device rejection.
+         */
+        MTPDepthDefaultsProfile mtpProfileForDomain(
+            const std::vector<GlobalDeviceAddress> &devices,
+            const std::vector<int> &ranks,
+            const ClusterInventory &inventory)
+        {
+            if (!ranks.empty() && ranks.size() != devices.size())
+                throw std::invalid_argument("MTP default domain has mismatched device/rank membership");
+            std::optional<MTPDepthDefaultsProfile> common;
+            for (std::size_t index = 0; index < devices.size(); ++index)
+            {
+                const auto &address = devices[index];
+                if (!address.isGPU())
+                    return MTPDepthDefaultsProfile::Portable;
+                bool found = false;
+                for (const auto &rank : inventory.ranks)
+                {
+                    if ((!ranks.empty() && ranks[index] != rank.rank) ||
+                        (!address.isLocal() && address.hostname != rank.hostname))
+                        continue;
+                    for (const auto &device : rank.gpus)
+                    {
+                        if (device.type != address.device_type ||
+                            device.local_device_id != address.device_ordinal ||
+                            (device.numa_node >= 0 && address.numa_node >= 0 &&
+                             device.numa_node != address.numa_node))
+                            continue;
+                        const auto profile = mtpProfileForCard(device);
+                        if (profile == MTPDepthDefaultsProfile::Portable ||
+                            (common && *common != profile))
+                            return MTPDepthDefaultsProfile::Portable;
+                        common = profile;
+                        found = true;
+                    }
+                }
+                if (!found)
+                    return MTPDepthDefaultsProfile::Portable;
+            }
+            return common.value_or(MTPDepthDefaultsProfile::Portable);
+        }
+    }
 
     // =========================================================================
     // Factory Function
@@ -59,6 +140,38 @@ namespace llaminar2
                 plans.push_back(buildPlanWithDomains(
                     rank, config, model_config, cluster_inventory, domains, pp_stages));
             }
+
+            // One immutable profile follows the continuation authority even on
+            // ranks that host only sparse expert endpoints of another vendor.
+            const ResolvedDomain *continuation = nullptr;
+            if (config.moe_routed_expert_plan && config.moe_routed_expert_plan->enabled)
+            {
+                const auto &name = config.moe_routed_expert_plan->continuation_domain;
+                const auto found = std::find_if(domains.begin(), domains.end(),
+                    [&](const ResolvedDomain &domain) { return domain.name == name; });
+                if (found == domains.end())
+                    throw std::invalid_argument("MTP defaults cannot resolve the overlay continuation domain");
+                continuation = &*found;
+            }
+            else if (!pp_stages.empty() && std::all_of(
+                         pp_stages.begin(), pp_stages.end(),
+                         [&](const ResolvedPPStage &stage)
+                         { return stage.domain_name == pp_stages.front().domain_name; }))
+            {
+                // Unused declarations are not model participants. A single
+                // execution domain may coexist with other named definitions.
+                const auto found = std::find_if(domains.begin(), domains.end(),
+                    [&](const ResolvedDomain &domain)
+                    { return domain.name == pp_stages.front().domain_name; });
+                if (found != domains.end())
+                    continuation = &*found;
+            }
+            const auto profile = continuation
+                ? mtpProfileForDomain(continuation->devices,
+                                      continuation->device_ranks, cluster_inventory)
+                : MTPDepthDefaultsProfile::Portable;
+            for (auto &plan : plans)
+                plan.runtime.mtp.depth_defaults_profile = profile;
         }
         else
         {
@@ -67,6 +180,16 @@ namespace llaminar2
             {
                 plans.push_back(buildSimplePlan(
                     rank, config, model_config, cluster_inventory));
+                auto &plan = plans.back();
+                plan.runtime.mtp.depth_defaults_profile = MTPDepthDefaultsProfile::Portable;
+                if (!plan.usesPipelineParallel() && !plan.usesLocalPP() && !plan.usesGlobalTP())
+                {
+                    const auto devices = plan.local_tp_devices.empty()
+                        ? std::vector<GlobalDeviceAddress>{plan.primary_device}
+                        : plan.local_tp_devices;
+                    plan.runtime.mtp.depth_defaults_profile = mtpProfileForDomain(
+                        devices, std::vector<int>(devices.size(), rank), cluster_inventory);
+                }
             }
         }
 
@@ -196,16 +319,43 @@ namespace llaminar2
             domain.devices = canonical.participants;
             domain.weights = canonical.weights;
             domain.backend = canonical.backend;
+            domain.scope = canonical.scope;
 
             // Find ranks for each device
             std::set<int> rank_set;
             std::vector<std::string> missing_devices;
-            for (const auto &device : domain.devices)
+            if (!canonical.ranks.empty() && canonical.ranks.size() != domain.devices.size())
+                throw std::invalid_argument("Execution domain '" + domain.name + "' needs one owner rank per participant");
+            for (std::size_t index = 0; index < domain.devices.size(); ++index)
             {
-                int rank = findRankForDevice(device, cluster_inventory);
+                auto &device = domain.devices[index];
+                // Local ordinals may repeat on different MPI ranks. An explicit
+                // owner is authoritative, not a hint to the discovery heuristic.
+                const int required_rank = canonical.ranks.empty()
+                    ? canonical.owner_rank.value_or(-1) : canonical.ranks[index];
+                int rank = findRankForDevice(device, cluster_inventory, required_rank);
+                domain.device_ranks.push_back(rank);
                 if (rank >= 0)
                 {
                     rank_set.insert(rank);
+                    const auto &owner = cluster_inventory.ranks.at(rank);
+                    if (device.isLocal()) device.hostname = owner.hostname;
+                    if (device.numa_node < 0)
+                    {
+                        if (device.isCPU())
+                        {
+                            if (owner.cpu.numa_node < 0)
+                                throw std::invalid_argument("CPU domain endpoint on a whole-host rank requires an explicit NUMA node");
+                            device.numa_node = owner.cpu.numa_node;
+                        }
+                        else
+                        {
+                            const auto gpu = std::find_if(owner.gpus.begin(), owner.gpus.end(), [&](const auto &observed) {
+                                return observed.type == device.device_type && observed.local_device_id == device.device_ordinal;
+                            });
+                            if (gpu != owner.gpus.end()) device.numa_node = gpu->numa_node;
+                        }
+                    }
                 }
                 else
                 {
@@ -234,6 +384,25 @@ namespace llaminar2
             }
             domain.ranks.assign(rank_set.begin(), rank_set.end());
 
+            // Domain indices and shard indices use parent-rank order. Move
+            // device/owner/work-share tuples together, retaining declaration
+            // order within a rank-local group. Sorting ranks alone misbinds a
+            // reversed cross-rank declaration to another participant's CPU.
+            std::vector<size_t> order(domain.devices.size());
+            std::iota(order.begin(), order.end(), size_t{0});
+            std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+                return domain.device_ranks[left] < domain.device_ranks[right];
+            });
+            const auto devices = domain.devices;
+            const auto owners = domain.device_ranks;
+            const auto weights = domain.weights;
+            for (size_t index = 0; index < order.size(); ++index)
+            {
+                domain.devices[index] = devices[order[index]];
+                domain.device_ranks[index] = owners[order[index]];
+                if (!weights.empty()) domain.weights[index] = weights.at(order[index]);
+            }
+
             // Build rank-to-index mapping
             int idx = 0;
             for (int rank : domain.ranks)
@@ -259,6 +428,21 @@ namespace llaminar2
         domain.id = 0;
         domain.name = "default";
         domain.backend = config.default_backend;
+        switch (config.tp_scope)
+        {
+        case TPScope::RANK_LOCAL:
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            break;
+        case TPScope::NODE_LOCAL:
+            domain.scope = ExecutionDomainScope::NODE_LOCAL;
+            break;
+        case TPScope::GLOBAL:
+            domain.scope = ExecutionDomainScope::GLOBAL;
+            break;
+        default:
+            domain.scope = ExecutionDomainScope::AUTO;
+            break;
+        }
 
         // Use explicit TP devices if provided
         if (!config.tp_devices.empty())
@@ -286,7 +470,7 @@ namespace llaminar2
                 for (const auto &rank_inv : cluster_inventory.ranks)
                 {
                     domain.devices.push_back(GlobalDeviceAddress::cpu(
-                        rank_inv.numa_nodes > 0 ? 0 : rank_inv.local_rank,
+                        rank_inv.cpu.numa_node,
                         rank_inv.hostname));
                 }
             }
@@ -297,6 +481,7 @@ namespace llaminar2
         for (const auto &device : domain.devices)
         {
             int rank = findRankForDevice(device, cluster_inventory);
+            domain.device_ranks.push_back(rank);
             if (rank >= 0)
             {
                 rank_set.insert(rank);
@@ -316,10 +501,13 @@ namespace llaminar2
 
     int ExecutionPlanBuilder::findRankForDevice(
         const GlobalDeviceAddress &device,
-        const ClusterInventory &cluster_inventory)
+        const ClusterInventory &cluster_inventory,
+        int required_rank)
     {
         for (const auto &rank_inv : cluster_inventory.ranks)
         {
+            if (required_rank >= 0 && rank_inv.rank != required_rank)
+                continue;
             // Match hostname
             if (!device.isLocal() && rank_inv.hostname != device.hostname)
             {
@@ -329,12 +517,10 @@ namespace llaminar2
             // For CPU devices, match by NUMA node
             if (device.isCPU())
             {
-                // CPU device is typically on the rank's NUMA node
-                // Simple heuristic: rank N owns CPU on NUMA node rank % numa_nodes
-                if (device.numa_node == rank_inv.local_rank % std::max(1, rank_inv.numa_nodes))
-                {
+                // A one-process invocation can be bound too. Only a genuine
+                // whole-host observation permits all explicitly observed nodes.
+                if (rankOwnsCPUNode(rank_inv, device.numa_node))
                     return rank_inv.rank;
-                }
             }
             else
             {
@@ -546,7 +732,7 @@ namespace llaminar2
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
             plan.hostname = rank_inv.hostname;
-            plan.numa_node = rank_inv.local_rank; // Approximate
+            plan.numa_node = rank_inv.cpu.numa_node;
         }
 
         // Collect ALL PP stages this rank participates in (sorted by stage_id)
@@ -682,22 +868,22 @@ namespace llaminar2
 
         if (primary_domain && !has_tp_in_pp)
         {
-            // Collect devices on this rank's host
-            for (const auto &device : primary_domain->devices)
+            /*
+             * A named domain already resolved one exact owner rank for every
+             * participant. Hostname-only selection is insufficient on a
+             * multi-socket node: it made cpu:0 and cpu:1 appear local to both
+             * ranks and accidentally composed LOCAL TP inside NODE_LOCAL TP.
+             * Preserve the aligned device-to-rank mapping as the authority.
+             */
+            for (size_t device_index = 0;
+                 device_index < primary_domain->devices.size();
+                 ++device_index)
             {
-                bool on_this_rank = false;
-                if (rank < static_cast<int>(cluster_inventory.ranks.size()))
-                {
-                    const auto &rank_inv = cluster_inventory.ranks[rank];
-                    if (device.isLocal() || device.hostname == rank_inv.hostname)
-                    {
-                        on_this_rank = true;
-                    }
-                }
-                if (on_this_rank)
-                {
-                    plan.local_tp_devices.push_back(device);
-                }
+                if (device_index >= primary_domain->device_ranks.size() ||
+                    primary_domain->device_ranks[device_index] != rank)
+                    continue;
+                plan.local_tp_devices.push_back(
+                    primary_domain->devices[device_index]);
             }
 
             plan.local_tp_backend = selectLocalTPBackend(
@@ -727,7 +913,7 @@ namespace llaminar2
             }
             else
             {
-                plan.primary_device = GlobalDeviceAddress::cpu(0, rank_inv.hostname);
+                plan.primary_device = GlobalDeviceAddress::cpu(rank_inv.cpu.numa_node, rank_inv.hostname);
             }
         }
 
@@ -750,11 +936,16 @@ namespace llaminar2
         }
         else if (plan.usesGlobalTP())
         {
-            plan.tp_scope = TPScope::GLOBAL;
+            plan.tp_scope =
+                primary_domain &&
+                        primary_domain->scope ==
+                            ExecutionDomainScope::NODE_LOCAL
+                    ? TPScope::NODE_LOCAL
+                    : TPScope::GLOBAL;
         }
         else if (plan.usesLocalTP())
         {
-            plan.tp_scope = TPScope::LOCAL;
+            plan.tp_scope = TPScope::RANK_LOCAL;
         }
         else
         {
@@ -771,11 +962,15 @@ namespace llaminar2
             config.activation_precision,
             config.kv_cache_precision,
             config.fused_attention_backend,
-            config.moe_expert_mode,
+            config.routed_expert_compute_policy,
             config.moe_hot_expert_cache,
+            config.moe_routed_prefill,
             config.moe_rebalance,
             config.prefix_cache,
-            config.mtp);
+            config.mtp,
+            config.tp_allreduce_precision_override);
+        plan.runtime.routed_expert_owner_order =
+            config.routed_expert_owner_order;
 
         return plan;
     }
@@ -794,7 +989,7 @@ namespace llaminar2
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
             plan.hostname = rank_inv.hostname;
-            plan.numa_node = rank_inv.local_rank;
+            plan.numa_node = rank_inv.cpu.numa_node;
         }
 
         // PP configuration
@@ -839,7 +1034,7 @@ namespace llaminar2
         // IMPORTANT: Do not implicitly enable LOCAL TP in pure GLOBAL mode.
         // Mixed local/global TP should only happen when tp_scope=HYBRID or explicit local configuration.
         const bool allows_local_tp =
-            config.tp_scope == TPScope::LOCAL ||
+            config.tp_scope == TPScope::RANK_LOCAL ||
             config.tp_scope == TPScope::HYBRID ||
             config.tp_scope == TPScope::AUTO;
 
@@ -902,7 +1097,6 @@ namespace llaminar2
         else if (mapped_device_for_rank.has_value())
         {
             plan.primary_device = *mapped_device_for_rank;
-            plan.primary_device_numa_explicit = mapped_device_numa_explicit;
 
             // For ambiguous short-form GPU specs from --device-map (e.g., "rocm:0"),
             // pick first matching device across NUMA nodes, preferring lower NUMA IDs.
@@ -938,7 +1132,6 @@ namespace llaminar2
         {
             const auto &requested = *config.device_for_this_rank;
             plan.primary_device = requested;
-            plan.primary_device_numa_explicit = config.device_for_this_rank_numa_explicit;
 
             // For ambiguous short-form GPU specs (e.g., "rocm:0"), pick the first
             // matching device across NUMA nodes, preferring lower NUMA IDs.
@@ -983,7 +1176,7 @@ namespace llaminar2
             }
             else
             {
-                plan.primary_device = GlobalDeviceAddress::cpu(0, rank_inv.hostname);
+                plan.primary_device = GlobalDeviceAddress::cpu(rank_inv.cpu.numa_node, rank_inv.hostname);
             }
         }
 
@@ -993,7 +1186,7 @@ namespace llaminar2
         {
             if (plan.usesLocalTP())
             {
-                plan.tp_scope = TPScope::LOCAL;
+                plan.tp_scope = TPScope::RANK_LOCAL;
             }
             else if (cluster_inventory.world_size > 1 && config.tp_degree > 1)
             {
@@ -1045,11 +1238,15 @@ namespace llaminar2
             config.activation_precision,
             config.kv_cache_precision,
             config.fused_attention_backend,
-            config.moe_expert_mode,
+            config.routed_expert_compute_policy,
             config.moe_hot_expert_cache,
+            config.moe_routed_prefill,
             config.moe_rebalance,
             config.prefix_cache,
-            config.mtp);
+            config.mtp,
+            config.tp_allreduce_precision_override);
+        plan.runtime.routed_expert_owner_order =
+            config.routed_expert_owner_order;
 
         return plan;
     }
@@ -1250,7 +1447,7 @@ namespace llaminar2
             TPScope effective_scope = dom_def ? dom_def->scope : TPScope::AUTO;
 
             bool is_local;
-            if (effective_scope == TPScope::LOCAL)
+            if (effective_scope == TPScope::RANK_LOCAL)
             {
                 is_local = true;
             }
@@ -1302,49 +1499,15 @@ namespace llaminar2
             {
                 spec.is_global_tp = true;
 
-                // Participating ranks
-                if (dom_def && !dom_def->explicit_ranks.empty())
-                {
-                    spec.participating_ranks = dom_def->explicit_ranks;
-                }
-                else if (resolved && !resolved->ranks.empty())
-                {
-                    spec.participating_ranks = resolved->ranks;
-                }
-                else
-                {
-                    // Fallback: all ranks
-                    for (int r = 0; r < cluster_inventory.world_size; ++r)
-                    {
-                        spec.participating_ranks.push_back(r);
-                    }
-                }
-                std::sort(spec.participating_ranks.begin(), spec.participating_ranks.end());
-                spec.participating_ranks.erase(
-                    std::unique(spec.participating_ranks.begin(), spec.participating_ranks.end()),
-                    spec.participating_ranks.end());
-
-                // Per-rank device: use first device from the domain if available
-                if (dom_def && !dom_def->devices.empty())
-                {
-                    spec.per_rank_device = dom_def->devices.front();
-                    if (dom_def->devices.size() == spec.participating_ranks.size())
-                    {
-                        spec.per_rank_devices = dom_def->devices;
-                    }
-                }
-                else if (resolved && !resolved->devices.empty())
-                {
-                    spec.per_rank_device = resolved->devices.front();
-                    if (resolved->devices.size() == spec.participating_ranks.size())
-                    {
-                        spec.per_rank_devices = resolved->devices;
-                    }
-                }
-                else
-                {
-                    spec.per_rank_device = GlobalDeviceAddress::cpu();
-                }
+                // The domain compiler owns aligned rank/device membership.
+                // Re-reading requested declarations here loses normalized
+                // physical endpoints and can independently reorder TP shards.
+                if (!resolved || resolved->ranks.empty() ||
+                    resolved->devices.size() != resolved->ranks.size())
+                    throw std::invalid_argument("Global TP stage requires one resolved endpoint per rank");
+                spec.participating_ranks = resolved->ranks;
+                spec.per_rank_devices = resolved->devices;
+                spec.per_rank_device = resolved->devices.front();
             }
 
             specs.push_back(std::move(spec));
@@ -1365,7 +1528,7 @@ namespace llaminar2
             specs.push_back(std::move(single));
         }
 
-        return GlobalPPTopology::build(std::move(specs), model_config.n_layers, cluster_inventory.world_size);
+        return GlobalPPTopology::build(std::move(specs), model_config.n_layers, cluster_inventory);
     }
 
     // =========================================================================

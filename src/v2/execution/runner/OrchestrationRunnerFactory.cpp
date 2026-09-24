@@ -1,24 +1,40 @@
 /**
  * @file OrchestrationRunnerFactory.cpp
- * @brief Implementation of OrchestrationRunnerFactory
+ * @brief Typed construction boundary for production orchestration runners.
  *
- * @author David Sanftenberg
- * @date January 2026
+ * The factory normalizes declarative topology and selects the concrete global
+ * or rank-local runner. A reusable prepared-model authority crosses this file
+ * as one indivisible ModelContextReuseContract: splitting that contract into
+ * parallel arguments can silently discard a newly added ownership field and
+ * turn the next process-campaign cell into a second device allocation.
+ * Parsed but unimplemented topology-tree lowering is rejected before MPI or
+ * model admission; it must never select an unrelated default runner.
+ * Automatic search belongs to frontend discovery and must publish its exact
+ * selected rank set before this apply-only factory receives a configuration.
  */
 
 #include "IOrchestrationRunnerFactory.h"
 #include "OrchestrationRunner.h"
-#include "NamedDomainGlobalRunner.h"
+#include "../global/NamedDomainGraphBuilder.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/ParallelismTreeParser.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
-#include "../parallelism_tree/TreeToRunnerCompiler.h"
 #include "../../utils/Logger.h"
 #include "../../utils/MPIContext.h"
+#include <algorithm>
 #include <fstream>
+#include <cmath>
+#include <limits>
 
 namespace llaminar2
 {
+    RunnerModelAuthorityScope resolveRunnerModelAuthorityScope(
+        const OrchestrationConfig &config)
+    {
+        if (config.topology_tree || requiresNamedDomainGlobalGraph(config))
+            return RunnerModelAuthorityScope::MultiRankSet;
+        return RunnerModelAuthorityScope::RankLocal;
+    }
 
     /**
      * @brief Concrete implementation of IOrchestrationRunnerFactory
@@ -32,6 +48,15 @@ namespace llaminar2
         OrchestrationRunnerFactory()
             : config_parser_(createOrchestrationConfigParser()), plan_builder_(createExecutionPlanBuilder())
         {
+        }
+
+        /** @brief Retain selected membership before constructing any dependent runner. */
+        explicit OrchestrationRunnerFactory(std::shared_ptr<IMPIContext> execution_context)
+            : OrchestrationRunnerFactory()
+        {
+            if (!execution_context)
+                throw std::invalid_argument("Runner factory requires non-null admitted execution membership");
+            execution_context_ = std::move(execution_context);
         }
 
         /**
@@ -137,7 +162,115 @@ namespace llaminar2
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
             OrchestrationConfig config) override
         {
-            auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                nullptr,
+                std::nullopt);
+        }
+
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
+            OrchestrationConfig config,
+            std::shared_ptr<ModelContext> model_context) override
+        {
+            if (!model_context)
+            {
+                LOG_ERROR(
+                    "Preloaded ModelContext runner construction requires a "
+                    "non-null model authority");
+                return nullptr;
+            }
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                std::move(model_context),
+                std::nullopt);
+        }
+
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
+            OrchestrationConfig config,
+            ModelContextReuseContract reuse_contract) override
+        {
+            if (!reuse_contract.context)
+            {
+                LOG_ERROR(
+                    "Retained ModelContext runner construction requires a "
+                    "non-null model authority");
+                return nullptr;
+            }
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                nullptr,
+                std::move(reuse_contract));
+        }
+
+    private:
+        /**
+         * @brief Normalize configuration and construct the selected runner.
+         *
+         * A retained ModelContext is a rank-local OrchestrationRunner contract.
+         * Legacy cross-rank TP/PP still constructs one such runner per MPI rank;
+         * named-domain and topology-tree runners compose multiple rank-specific
+         * authorities and reject this overload until their builders accept a
+         * typed context set.
+         *
+         * @param config Declarative production topology and runtime policy.
+         * @param model_context Optional metadata-only preloaded context.
+         * @param reuse_contract Optional complete prepared-model ownership
+         *        contract. It is never decomposed or reconstructed here.
+         * @return Selected runner, or null when normalization/topology rejects
+         *         the requested ownership form.
+         */
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfigImpl(
+            OrchestrationConfig config,
+            std::shared_ptr<ModelContext> model_context,
+            std::optional<ModelContextReuseContract> reuse_contract)
+        {
+            // A factory cannot narrow its caller's communicator. Frontends
+            // must publish the selected apply document and admit its exact
+            // ranks before construction; searching here would be too late.
+            try
+            {
+                if (std::holds_alternative<AutomaticOrchestrationRequest>(
+                        resolveOrchestrationIntent(config)))
+                {
+                    LOG_ERROR("Automatic orchestration requires frontend plan publication and rank admission before runner construction");
+                    return nullptr;
+                }
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("Invalid runner orchestration intent: " << error.what());
+                return nullptr;
+            }
+            if (config.execution_rank_selection && !execution_context_)
+            {
+                // Only the frontend's collective admission may interpret a
+                // saved discovery selection. A default factory must not turn
+                // that already compact configuration into a WORLD runner.
+                LOG_ERROR("Saved execution selection requires an explicitly admitted MPI context");
+                return nullptr;
+            }
+            if (model_context && reuse_contract)
+            {
+                LOG_ERROR(
+                    "Runner construction cannot combine a metadata-only "
+                    "ModelContext with a prepared-model reuse contract");
+                return nullptr;
+            }
+            const bool has_model_context =
+                static_cast<bool>(model_context) ||
+                (reuse_contract &&
+                 static_cast<bool>(reuse_contract->context));
+
+            if (execution_context_ && has_model_context)
+            {
+                // Retained models are certified against a rank namespace. Until
+                // their reuse contract carries that selected namespace, reject
+                // it rather than manufacture a WORLD-owned replacement runner.
+                LOG_ERROR("Selected execution membership does not yet accept retained model-context reuse");
+                return nullptr;
+            }
+
+            auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             if (!normalize_errors.empty())
             {
                 LOG_ERROR("MoE expert overlay domain normalization failed:");
@@ -148,56 +281,30 @@ namespace llaminar2
                 return nullptr;
             }
 
-            // ================================================================
-            // Handle topology tree if present (Phase 8: Global PP integration)
-            // ================================================================
-            if (config.topology_tree)
+            if (has_model_context &&
+                resolveRunnerModelAuthorityScope(config) ==
+                    RunnerModelAuthorityScope::MultiRankSet)
             {
-                LOG_DEBUG("Using ParallelismTree topology for runner creation");
-                
-                // Get MPI context for world size and rank
-                auto mpi_ctx = MPIContextFactory::global();
-                
-                // Build compile context
-                TreeToRunnerCompiler::CompileContext compile_ctx;
-                compile_ctx.my_rank = mpi_ctx->rank();
-                compile_ctx.world_size = mpi_ctx->world_size();
-                compile_ctx.max_seq_len = static_cast<size_t>(config.max_seq_len);
-                compile_ctx.batch_size = config.batch_size;
-                // Note: hidden_dim and vocab_size will be set from model once loaded
-                compile_ctx.hidden_dim = 896;  // Qwen2.5 default
-                compile_ctx.vocab_size = 151936;  // Qwen2.5 default
-                
-                // For now, log tree structure and fall back to standard path
-                // Full tree-to-runner compilation requires model loading first
-                LOG_DEBUG("Topology tree structure:\n" << config.topology_tree->toString());
-                LOG_DEBUG("Note: Full tree compilation requires loaded model context");
-                LOG_DEBUG("Falling back to standard OrchestrationRunner path");
-                
-                // The actual tree compilation would be:
-                // auto runner = TreeToRunnerCompiler::compile(*config.topology_tree, compile_ctx);
-                // But we need model context first, so fall through to standard path
+                LOG_ERROR(
+                    "A rank-local ModelContext cannot construct a runner that "
+                    "owns a multi-rank model-authority set");
+                return nullptr;
             }
 
-            // ================================================================
-            // Phase 5: Named-domain global pipeline runner
-            // ================================================================
-            // When the config has named domains with PP stages that span
-            // multiple MPI ranks, use NamedDomainGlobalRunner.  This supports
-            // scope=node_local, scope=global, and AUTO domains whose device
-            // list spans multiple hostnames.
-            if (NamedDomainGlobalRunner::shouldUse(config))
+            // A parsed tree is not an executable admission plan. Never ignore
+            // its topology and construct an unrelated ordinary runner.
+            if (config.topology_tree)
             {
-                LOG_DEBUG("Named-domain global PP configuration detected — using NamedDomainGlobalRunner");
-                auto runner_plan_builder = createExecutionPlanBuilder();
-                return std::make_unique<NamedDomainGlobalRunner>(
-                    std::move(config),
-                    std::move(runner_plan_builder));
+                LOG_ERROR("Topology-tree runtime lowering is not implemented; use an explicit named-domain plan");
+                return nullptr;
             }
+
+            // Named domains share the ordinary initialization/admission owner.
+            // Their explicit global graph is lowered at its build-graph phase.
 
             // Global orchestration detection (legacy path — simple --pp-degree mode)
             {
-                auto mpi_ctx = MPIContextFactory::global();
+                auto mpi_ctx = execution_context_ ? execution_context_ : MPIContextFactory::global();
                 int world_size = mpi_ctx->world_size();
                 bool needs_global = (world_size > 1 && config.pp_degree > 1) ||
                                     config.tp_scope == TPScope::GLOBAL ||
@@ -209,8 +316,16 @@ namespace llaminar2
                              << "world_size=" << world_size
                              << ", pp_degree=" << config.pp_degree
                              << ", tp_scope=" << tpScopeToString(config.tp_scope) << ")");
-                    LOG_DEBUG("Note: Non-named-domain global orchestration is not yet supported. "
-                             "Use --define-domain + --pp-stage with scope=node_local or scope=global.");
+                    LOG_DEBUG(
+                        "Selecting one ordinary OrchestrationRunner per MPI "
+                        "rank; its RankExecutionPlan owns the cross-rank "
+                        "collective edges");
+                    if (has_model_context)
+                    {
+                        LOG_DEBUG(
+                            "Using the calling MPI rank's ModelContext in the "
+                            "rank-local OrchestrationRunner");
+                    }
                 }
             }
 
@@ -219,12 +334,32 @@ namespace llaminar2
             // (each runner needs its own instance)
             auto runner_plan_builder = createExecutionPlanBuilder();
 
-            auto runner = std::make_unique<OrchestrationRunner>(
+            if (execution_context_)
+            {
+                return std::make_unique<OrchestrationRunner>(
+                    execution_context_, std::move(config), std::move(runner_plan_builder));
+            }
+
+            if (reuse_contract)
+            {
+                return std::make_unique<OrchestrationRunner>(
+                    std::move(config),
+                    std::move(runner_plan_builder),
+                    std::move(*reuse_contract));
+            }
+            if (model_context)
+            {
+                return std::make_unique<OrchestrationRunner>(
+                    std::move(config),
+                    std::move(runner_plan_builder),
+                    std::move(model_context));
+            }
+            return std::make_unique<OrchestrationRunner>(
                 std::move(config),
                 std::move(runner_plan_builder));
-
-            return runner;
         }
+
+    public:
 
         std::unique_ptr<IOrchestrationRunner> createSimple(
             const std::string &model_path,
@@ -251,6 +386,7 @@ namespace llaminar2
         }
 
     private:
+        std::shared_ptr<IMPIContext> execution_context_; ///< Exact admitted namespace, not a discovery hint.
         std::unique_ptr<IOrchestrationConfigParser> config_parser_;
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
     };
@@ -262,6 +398,12 @@ namespace llaminar2
     std::unique_ptr<IOrchestrationRunnerFactory> createOrchestrationRunnerFactory()
     {
         return std::make_unique<OrchestrationRunnerFactory>();
+    }
+
+    std::unique_ptr<IOrchestrationRunnerFactory> createOrchestrationRunnerFactory(
+        std::shared_ptr<IMPIContext> execution_context)
+    {
+        return std::make_unique<OrchestrationRunnerFactory>(std::move(execution_context));
     }
 
     std::unique_ptr<IOrchestrationRunnerFactory> createOrchestrationRunnerFactory(

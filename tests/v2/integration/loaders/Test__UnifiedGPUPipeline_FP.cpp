@@ -38,6 +38,7 @@
 #include "../../src/v2/execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../src/v2/execution/local_execution/coherence/GpuCoherence.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -109,7 +110,7 @@ protected:
         factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
         loader_ = std::make_unique<ModelLoader>(factory_.get());
 
-        if (!tryLoadModel(*loader_, BF16_MODEL_PATH))
+        if (!tryLoadModelForDevice(*loader_, BF16_MODEL_PATH, device_))
         {
             GTEST_SKIP() << "Failed to load model: " << BF16_MODEL_PATH;
         }
@@ -357,10 +358,13 @@ TEST_F(UnifiedGPUPipeline_FP_Test, BF16_ExpertGemmCorrectness)
     std::memset(output->mutable_data(), 0, M * N * sizeof(float));
 
     // Execute GEMM with proper coherence
+    ScopedGPUStream producer_stream(device_);
+    gate->setGPUStream(producer_stream.get());
     ASSERT_TRUE(with_gpu_coherence(
         device_,
         {input.get()},
         {output.get()},
+        producer_stream.get(),
         [&]
         {
             return gate->multiply_tensor(

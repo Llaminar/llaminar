@@ -16,11 +16,178 @@
 #include "../../../config/TPDomain.h"
 #include "../../../tensors/ITensor.h"
 #include "../../../tensors/TensorClasses.h" // For TensorBase (MPIStager compatibility)
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/MPIStager.h" // For GPU↔Host staging with MPI backend
+#include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Validate that a collective tensor really resides on its declared device.
+         *
+         * CollectiveContext historically accepted a separate tensor device as a
+         * routing hint. That allowed a CPU pointer to be submitted to a GPU
+         * backend and then published as though the GPU storage had been written.
+         * Treating the argument as an enforced storage identity makes that
+         * incoherent state unrepresentable at the backend boundary.
+         *
+         * @param tensor Tensor consumed or produced by the collective.
+         * @param device Exact storage device the caller declares.
+         * @param role Human-readable tensor role for diagnostics.
+         * @param operation Human-readable operation name for diagnostics.
+         * @throws std::invalid_argument for a null tensor or storage mismatch.
+         */
+        void validateCollectiveTensorStorage(
+            const ITensor *tensor,
+            DeviceId device,
+            const char *role,
+            const char *operation)
+        {
+            if (!tensor)
+            {
+                throw std::invalid_argument(
+                    std::string("CollectiveContext: ") + operation +
+                    " received a null " + role + " tensor");
+            }
+
+            if (device.is_gpu())
+            {
+                if (const auto *base = dynamic_cast<const TensorBase *>(tensor))
+                {
+                    const auto current_device = base->current_device();
+                    if (!current_device.has_value() ||
+                        *current_device != device ||
+                        !base->is_on_device(device))
+                    {
+                        throw std::invalid_argument(
+                            std::string("CollectiveContext: ") + operation +
+                            " declared " + role + " storage on " +
+                            device.toString() +
+                            ", but that tensor has no valid storage there");
+                    }
+                }
+                else if (!tensor->is_on_gpu() ||
+                         tensor->home_device() != device ||
+                         tensor->active_data_ptr() == nullptr)
+                {
+                    throw std::invalid_argument(
+                        std::string("CollectiveContext: ") + operation +
+                        " declared " + role + " storage on " +
+                        device.toString() +
+                        ", but the GPU-only tensor view belongs to " +
+                        tensor->home_device().toString());
+                }
+                return;
+            }
+
+            if (const auto *base = dynamic_cast<const TensorBase *>(tensor))
+            {
+                if (!base->is_on_device(DeviceId::cpu()))
+                {
+                    throw std::invalid_argument(
+                        std::string("CollectiveContext: ") + operation +
+                        " declared CPU " + role +
+                        " storage, but the host copy is stale");
+                }
+            }
+            else if (!tensor->is_on_cpu() || tensor->raw_data() == nullptr)
+            {
+                throw std::invalid_argument(
+                    std::string("CollectiveContext: ") + operation +
+                    " declared CPU " + role +
+                    " storage for a device-only tensor");
+            }
+        }
+
+        /**
+         * @brief Obtain the exact read pointer for a validated collective device.
+         */
+        const void *collectiveReadPointer(
+            ITensor *tensor,
+            DeviceId device,
+            const char *role,
+            const char *operation)
+        {
+            validateCollectiveTensorStorage(tensor, device, role, operation);
+            return device.is_gpu()
+                       ? tensor->active_data_ptr()
+                       : tensor->raw_data();
+        }
+
+        /**
+         * @brief Obtain the exact write pointer for a validated collective device.
+         */
+        void *collectiveWritePointer(
+            ITensor *tensor,
+            DeviceId device,
+            const char *role,
+            const char *operation)
+        {
+            validateCollectiveTensorStorage(tensor, device, role, operation);
+            return device.is_gpu()
+                       ? tensor->active_mutable_data_ptr()
+                       : tensor->raw_mutable_data();
+        }
+
+        /**
+         * @brief Publish one successful direct GPU collective output.
+         *
+         * The collective backend is the sole owner of its submission stream,
+         * so the context must obtain the stream from that backend immediately
+         * after submission. Centralizing this handoff prevents ordinary and
+         * domain-aware collective entry points from drifting into different
+         * coherence behavior.
+         *
+         * @param backend Backend that submitted the collective.
+         * @param output Tensor whose device storage the collective wrote.
+         * @param device Device containing @p output.
+         * @param operation Human-readable operation name for fatal diagnostics.
+         * @throws std::runtime_error when a successful GPU submission does not
+         *         expose an explicit completion contract.
+         */
+        void publishDirectCollectiveOutput(
+            ICollectiveBackend *backend,
+            ITensor *output,
+            DeviceId device,
+            const char *operation)
+        {
+            if (!device.is_gpu())
+                return;
+
+            const CollectiveSubmissionReceipt receipt =
+                backend->singleBufferSubmissionReceipt(device);
+            switch (receipt.kind)
+            {
+            case CollectiveSubmissionReceipt::Kind::AlreadyComplete:
+                TransferEngine::publishCompletedDeviceWrite(output, device);
+                return;
+            case CollectiveSubmissionReceipt::Kind::DeviceStream:
+                if (!receipt.producer_stream)
+                {
+                    throw std::runtime_error(
+                        std::string("CollectiveContext: successful GPU ") +
+                        operation +
+                        " reported DeviceStream completion with a null stream");
+                }
+                TransferEngine::publishDeviceWrite(
+                    output,
+                    device,
+                    receipt.producer_stream);
+                return;
+            case CollectiveSubmissionReceipt::Kind::Unknown:
+                throw std::runtime_error(
+                    std::string("CollectiveContext: successful GPU ") +
+                    operation +
+                    " did not declare its completion contract");
+            }
+
+            throw std::runtime_error(
+                "CollectiveContext: invalid collective completion receipt");
+        }
+    }
 
     // =========================================================================
     // Helper: Convert TensorType to CollectiveDataType
@@ -127,6 +294,9 @@ namespace llaminar2
         DeviceId tensor_device,
         CollectiveOp op)
     {
+        validateCollectiveTensorStorage(
+            buffer, tensor_device, "in-place buffer", "allreduce");
+
         // Single-device: AllReduce is a no-op (nothing to reduce across)
         if (!requiresCollectives())
         {
@@ -164,7 +334,8 @@ namespace llaminar2
         // 2. MPI_Allreduce on host buffer
         // 3. Stage Host→GPU
         // =========================================================================
-        if (backend->type() == CollectiveBackendType::MPI && buffer->is_on_gpu())
+        if (backend->type() == CollectiveBackendType::MPI &&
+            tensor_device.is_gpu())
         {
             LOG_DEBUG("CollectiveContext: MPI+GPU staging for allreduce (count=" << actual_count << ")");
 
@@ -175,9 +346,6 @@ namespace llaminar2
                 LOG_ERROR("CollectiveContext: Buffer is not TensorBase, cannot stage for MPI");
                 return false;
             }
-
-            // Ensure GPU kernels complete before staging
-            MPIStager::synchronizeDevice(tensor_base->home_device().gpu_ordinal());
 
             // Stage GPU→Host
             std::vector<float> host_buffer = MPIStager::toHost(tensor_base);
@@ -201,9 +369,15 @@ namespace llaminar2
         // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
         // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
         // re-uploads on subsequent operations that need this tensor on GPU.
-        void *data_ptr = buffer->active_mutable_data_ptr();
+        void *data_ptr = collectiveWritePointer(
+            buffer, tensor_device, "in-place buffer", "allreduce");
 
-        return backend->allreduce(data_ptr, actual_count, dtype, op);
+        if (!backend->allreduce(data_ptr, actual_count, dtype, op))
+            return false;
+
+        publishDirectCollectiveOutput(
+            backend, buffer, tensor_device, "allreduce");
+        return true;
     }
 
     bool CollectiveContext::executeAllgather(
@@ -212,6 +386,11 @@ namespace llaminar2
         size_t actual_seq_len,
         DeviceId tensor_device)
     {
+        validateCollectiveTensorStorage(
+            local_input, tensor_device, "input", "allgather");
+        validateCollectiveTensorStorage(
+            full_output, tensor_device, "output", "allgather");
+
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available");
@@ -236,8 +415,8 @@ namespace llaminar2
         // =========================================================================
         // MPI Backend with GPU Buffers: Requires Host Staging
         // =========================================================================
-        bool input_on_gpu = local_input->is_on_gpu();
-        bool output_on_gpu = full_output->is_on_gpu();
+        const bool input_on_gpu = tensor_device.is_gpu();
+        const bool output_on_gpu = tensor_device.is_gpu();
 
         if (backend->type() == CollectiveBackendType::MPI && (input_on_gpu || output_on_gpu))
         {
@@ -250,12 +429,6 @@ namespace llaminar2
             {
                 LOG_ERROR("CollectiveContext: Buffers are not TensorBase, cannot stage for MPI");
                 return false;
-            }
-
-            // Sync input device if on GPU
-            if (input_on_gpu)
-            {
-                MPIStager::synchronizeDevice(input_base->home_device().gpu_ordinal());
             }
 
             // Stage input GPU→Host
@@ -291,10 +464,16 @@ namespace llaminar2
         // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
-        const void *send_buf = local_input->active_data_ptr();
-        void *recv_buf = full_output->active_mutable_data_ptr();
+        const void *send_buf = collectiveReadPointer(
+            local_input, tensor_device, "input", "allgather");
+        void *recv_buf = collectiveWritePointer(
+            full_output, tensor_device, "output", "allgather");
 
-        return backend->allgather(send_buf, recv_buf, send_count, dtype);
+        if (!backend->allgather(send_buf, recv_buf, send_count, dtype))
+            return false;
+        publishDirectCollectiveOutput(
+            backend, full_output, tensor_device, "allgather");
+        return true;
     }
 
     bool CollectiveContext::executeStridedAllgather(
@@ -312,6 +491,11 @@ namespace llaminar2
         LOG_ERROR("CollectiveContext: stridedAllgather requires CUDA support");
         return false;
 #else
+        validateCollectiveTensorStorage(
+            local_input, tensor_device, "input", "strided allgather");
+        validateCollectiveTensorStorage(
+            full_output, tensor_device, "output", "strided allgather");
+
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available for stridedAllgather");
@@ -370,8 +554,10 @@ namespace llaminar2
         size_t local_dim = local_shape[1];
 
         // Use active_data_ptr for GPU memory access
-        const void *send_buf = local_input->active_data_ptr();
-        void *recv_buf = full_output->active_mutable_data_ptr();
+        const void *send_buf = collectiveReadPointer(
+            local_input, tensor_device, "input", "strided allgather");
+        void *recv_buf = collectiveWritePointer(
+            full_output, tensor_device, "output", "strided allgather");
 
         bool success = nccl_backend->stridedAllgather(
             send_buf,
@@ -402,6 +588,11 @@ namespace llaminar2
         size_t actual_seq_len,
         DeviceId tensor_device)
     {
+        validateCollectiveTensorStorage(
+            local_input, tensor_device, "input", "allgatherv");
+        validateCollectiveTensorStorage(
+            full_output, tensor_device, "output", "allgatherv");
+
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available for allgatherv");
@@ -443,8 +634,8 @@ namespace llaminar2
         // =========================================================================
         // MPI Backend with GPU Buffers: Requires Host Staging
         // =========================================================================
-        bool input_on_gpu = local_input->is_on_gpu();
-        bool output_on_gpu = full_output->is_on_gpu();
+        const bool input_on_gpu = tensor_device.is_gpu();
+        const bool output_on_gpu = tensor_device.is_gpu();
 
         if (backend->type() == CollectiveBackendType::MPI && (input_on_gpu || output_on_gpu))
         {
@@ -457,12 +648,6 @@ namespace llaminar2
             {
                 LOG_ERROR("CollectiveContext: Buffers are not TensorBase, cannot stage for MPI");
                 return false;
-            }
-
-            // Sync input device if on GPU
-            if (input_on_gpu)
-            {
-                MPIStager::synchronizeDevice(input_base->home_device().gpu_ordinal());
             }
 
             // Stage input GPU→Host
@@ -503,12 +688,20 @@ namespace llaminar2
         // =========================================================================
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
-        const void *send_buf = local_input->active_data_ptr();
-        void *recv_buf = full_output->active_mutable_data_ptr();
+        const void *send_buf = collectiveReadPointer(
+            local_input, tensor_device, "input", "allgatherv");
+        void *recv_buf = collectiveWritePointer(
+            full_output, tensor_device, "output", "allgatherv");
 
-        return backend->allgatherv(send_buf, send_count, recv_buf,
-                                   scaled_recv_counts, scaled_displacements,
-                                   dtype);
+        if (!backend->allgatherv(
+                send_buf, send_count, recv_buf,
+                scaled_recv_counts, scaled_displacements, dtype))
+        {
+            return false;
+        }
+        publishDirectCollectiveOutput(
+            backend, full_output, tensor_device, "allgatherv");
+        return true;
     }
 
     bool CollectiveContext::executeBroadcast(
@@ -517,6 +710,9 @@ namespace llaminar2
         int root_rank,
         DeviceId tensor_device)
     {
+        validateCollectiveTensorStorage(
+            buffer, tensor_device, "in-place buffer", "broadcast");
+
         if (!router_)
         {
             LOG_ERROR("CollectiveContext: No router available");
@@ -541,7 +737,8 @@ namespace llaminar2
         // =========================================================================
         // MPI Backend with GPU Buffer: Requires Host Staging
         // =========================================================================
-        if (backend->type() == CollectiveBackendType::MPI && buffer->is_on_gpu())
+        if (backend->type() == CollectiveBackendType::MPI &&
+            tensor_device.is_gpu())
         {
             LOG_DEBUG("CollectiveContext: MPI+GPU staging for broadcast (count=" << actual_count << ")");
 
@@ -552,9 +749,6 @@ namespace llaminar2
                 LOG_ERROR("CollectiveContext: Buffer is not TensorBase, cannot stage for MPI");
                 return false;
             }
-
-            // Ensure GPU kernels complete before staging
-            MPIStager::synchronizeDevice(tensor_base->home_device().gpu_ordinal());
 
             // Stage GPU→Host (root has data, others will receive)
             std::vector<float> host_buffer = MPIStager::toHost(tensor_base);
@@ -576,9 +770,14 @@ namespace llaminar2
         // Standard Path: Direct backend call (NCCL, RCCL, HOST, or MPI+CPU)
         // =========================================================================
         // Use active_mutable_data_ptr() to get GPU pointer without invalidating GPU data
-        void *data_ptr = buffer->active_mutable_data_ptr();
+        void *data_ptr = collectiveWritePointer(
+            buffer, tensor_device, "in-place buffer", "broadcast");
 
-        return backend->broadcast(data_ptr, actual_count, dtype, root_rank);
+        if (!backend->broadcast(data_ptr, actual_count, dtype, root_rank))
+            return false;
+        publishDirectCollectiveOutput(
+            backend, buffer, tensor_device, "broadcast");
+        return true;
     }
 
     bool CollectiveContext::requiresCollectives() const
@@ -689,6 +888,9 @@ namespace llaminar2
         CollectiveOp op,
         const TPDomain *domain)
     {
+        validateCollectiveTensorStorage(
+            buffer, tensor_device, "in-place buffer", "domain allreduce");
+
         // Fallback to legacy path when domain is nullptr
         if (!domain)
         {
@@ -735,10 +937,15 @@ namespace llaminar2
         // CRITICAL: Use active_mutable_data_ptr() to get GPU pointer without invalidating
         // GPU data. Using mutable_data() would mark device_valid_=false, causing expensive
         // re-uploads on subsequent operations that need this tensor on GPU.
-        void *data_ptr = buffer->active_mutable_data_ptr();
+        void *data_ptr = collectiveWritePointer(
+            buffer, tensor_device, "in-place buffer", "domain allreduce");
         size_t actual_count = count > 0 ? count : buffer->numel();
 
-        return backend->allreduce(data_ptr, actual_count, dtype, op);
+        if (!backend->allreduce(data_ptr, actual_count, dtype, op))
+            return false;
+        publishDirectCollectiveOutput(
+            backend, buffer, tensor_device, "domain allreduce");
+        return true;
     }
 
     bool CollectiveContext::executeAllgatherInDomain(
@@ -748,6 +955,11 @@ namespace llaminar2
         DeviceId tensor_device,
         const TPDomain *domain)
     {
+        validateCollectiveTensorStorage(
+            local_input, tensor_device, "input", "domain allgather");
+        validateCollectiveTensorStorage(
+            full_output, tensor_device, "output", "domain allgather");
+
         // Fallback to legacy path when domain is nullptr
         if (!domain)
         {
@@ -789,11 +1001,17 @@ namespace llaminar2
         // Execute collective
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
-        const void *send_buf = local_input->active_data_ptr();
-        void *recv_buf = full_output->active_mutable_data_ptr();
+        const void *send_buf = collectiveReadPointer(
+            local_input, tensor_device, "input", "domain allgather");
+        void *recv_buf = collectiveWritePointer(
+            full_output, tensor_device, "output", "domain allgather");
         size_t send_count = actual_seq_len > 0 ? actual_seq_len : local_input->numel();
 
-        return backend->allgather(send_buf, recv_buf, send_count, dtype);
+        if (!backend->allgather(send_buf, recv_buf, send_count, dtype))
+            return false;
+        publishDirectCollectiveOutput(
+            backend, full_output, tensor_device, "domain allgather");
+        return true;
     }
 
     bool CollectiveContext::executeAllgathervInDomain(
@@ -805,6 +1023,11 @@ namespace llaminar2
         DeviceId tensor_device,
         const TPDomain *domain)
     {
+        validateCollectiveTensorStorage(
+            local_input, tensor_device, "input", "domain allgatherv");
+        validateCollectiveTensorStorage(
+            full_output, tensor_device, "output", "domain allgatherv");
+
         // Fallback to legacy path when domain is nullptr
         if (!domain)
         {
@@ -865,12 +1088,20 @@ namespace llaminar2
         // Execute collective
         // Use active_data_ptr() for send and active_mutable_data_ptr() for receive
         // to avoid invalidating GPU data on tensors that should remain on device
-        const void *send_buf = local_input->active_data_ptr();
-        void *recv_buf = full_output->active_mutable_data_ptr();
+        const void *send_buf = collectiveReadPointer(
+            local_input, tensor_device, "input", "domain allgatherv");
+        void *recv_buf = collectiveWritePointer(
+            full_output, tensor_device, "output", "domain allgatherv");
 
-        return backend->allgatherv(send_buf, send_count, recv_buf,
-                                   scaled_recv_counts, scaled_displacements,
-                                   dtype);
+        if (!backend->allgatherv(
+                send_buf, send_count, recv_buf,
+                scaled_recv_counts, scaled_displacements, dtype))
+        {
+            return false;
+        }
+        publishDirectCollectiveOutput(
+            backend, full_output, tensor_device, "domain allgatherv");
+        return true;
     }
 
     // =========================================================================

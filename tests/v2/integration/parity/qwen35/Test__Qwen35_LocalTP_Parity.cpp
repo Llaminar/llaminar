@@ -28,9 +28,16 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen35ModelParityDefinitions.h"
 #include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -66,145 +73,104 @@ static const std::vector<std::string> kTPExcludedStages = {
 // Test Configuration Definitions — Qwen3.5-0.8B (Q4_0)
 // =============================================================================
 
-static const auto kQwen35_08B_TP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.90f,
-    .decode_cosine_threshold = 0.90f,
-    .early_layers_count = 6,
-    .min_early_layers_passed = 4,
-    .kl_threshold = 0.06f, // Was 0.35 = very over-relaxed; no GPU results yet, conservative estimate
-    .excluded_stages = kTPExcludedStages,
-};
+/** @return Numerical contract for one dense Qwen3.5 local-TP topology. */
+static BackendThresholds qwen35LocalTPThresholds()
+{
+    return BackendThresholds{
+        .cosine_threshold = 0.90f,
+        .decode_cosine_threshold = 0.90f,
+        .early_layers_count = 6,
+        .min_early_layers_passed = 4,
+        .kl_threshold = 0.06f,
+        .excluded_stages = kTPExcludedStages,
+    };
+}
 
-static const auto kQwen35_4B_TP_Thresholds = BackendThresholds{
-    .cosine_threshold = 0.90f,
-    .decode_cosine_threshold = 0.90f,
-    .early_layers_count = 6,
-    .min_early_layers_passed = 4,
-    .kl_threshold = 0.06f, // Was 0.35 = very over-relaxed; no GPU results yet, conservative estimate
-    .excluded_stages = kTPExcludedStages,
-};
+/** @return One typed rank-local TP definition. */
+static ModelParityDefinition makeQwen35LocalTPDefinition(
+    ModelParityModelDefinition model,
+    std::string topology_id,
+    std::vector<ModelParityParticipant> participants,
+    Collective collective)
+{
+    return qwen35ParityDefinition(
+        std::move(model),
+        ModelParityTopologyDefinition{
+            .test_id = std::move(topology_id),
+            .kind = ModelParityTopologyKind::RankLocalTensorParallel,
+            .participants = std::move(participants),
+            .collective = collective,
+            .mpi_ranks = 1,
+        },
+        qwen35LocalTPThresholds());
+}
 
-static const std::vector<TestConfig> kLocalTPConfigs = {
-    // =========================================================================
-    // Qwen3.5-0.8B (Q4_0) — GPU configs (skipped: no GPU kernels yet)
-    // =========================================================================
+/** @return Canonically expanded dense Qwen3.5 local-TP cases. */
+static const std::vector<ModelParityCase> &qwen35LocalTPCases()
+{
+    static const auto cases = []
     {
-        .name = "LocalTP_NCCL_2xCUDA_08B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::NCCL,
-        .thresholds = kQwen35_08B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalTP_RCCL_2xROCm_08B",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::RCCL,
-        .thresholds = kQwen35_08B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm_08B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::HETEROGENEOUS,
-        .thresholds = kQwen35_08B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    // =========================================================================
-    // Qwen3.5-4B (Q8_0) — GPU configs (skipped: no GPU kernels yet)
-    // =========================================================================
-    {
-        .name = "LocalTP_NCCL_2xCUDA_4B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::NCCL,
-        .thresholds = kQwen35_4B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalTP_RCCL_2xROCm_4B",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::RCCL,
-        .thresholds = kQwen35_4B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm_4B",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::HETEROGENEOUS,
-        .thresholds = kQwen35_4B_TP_Thresholds,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-};
+        const std::array definitions = {
+            makeQwen35LocalTPDefinition(
+                qwen35_08B_Q40ParityModel(), "LocalTP_NCCL_2xCUDA",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::cuda(1), 0}},
+                Collective::NCCL),
+            makeQwen35LocalTPDefinition(
+                qwen35_08B_Q40ParityModel(), "LocalTP_RCCL_2xROCm",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0}},
+                Collective::RCCL),
+            makeQwen35LocalTPDefinition(
+                qwen35_08B_Q40ParityModel(), "LocalTP_Heterogeneous_CUDA_ROCm",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::rocm(0), 0}},
+                Collective::HETEROGENEOUS),
+            makeQwen35LocalTPDefinition(
+                qwen35_4B_Q80ParityModel(), "LocalTP_NCCL_2xCUDA",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::cuda(1), 0}},
+                Collective::NCCL),
+            makeQwen35LocalTPDefinition(
+                qwen35_4B_Q80ParityModel(), "LocalTP_RCCL_2xROCm",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0}},
+                Collective::RCCL),
+            makeQwen35LocalTPDefinition(
+                qwen35_4B_Q80ParityModel(), "LocalTP_Heterogeneous_CUDA_ROCm",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::rocm(0), 0}},
+                Collective::HETEROGENEOUS),
+        };
+        std::vector<ModelParityCase> expanded;
+        for (const auto &definition : definitions)
+        {
+            auto definition_cases = expandModelParityDefinition(definition);
+            expanded.insert(
+                expanded.end(),
+                std::make_move_iterator(definition_cases.begin()),
+                std::make_move_iterator(definition_cases.end()));
+        }
+        return expanded;
+    }();
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen35LocalTPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35LocalTPParityTest>,
-                                public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                                public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen35LocalTPParityTest, PrefillParity)
+TEST_P(Qwen35LocalTPParityTest, ProductionParity)
 {
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runTPPrefillParity();
-    assertTPParity(summary);
-}
-
-TEST_P(Qwen35LocalTPParityTest, DecodeParity)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runTPDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen35LocalTPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+    runProductionParityCampaign();
 }
 
 // =============================================================================
@@ -214,10 +180,10 @@ TEST_P(Qwen35LocalTPParityTest, SnapshotInfrastructure)
 INSTANTIATE_TEST_SUITE_P(
     Qwen35,
     Qwen35LocalTPParityTest,
-    ::testing::ValuesIn(kLocalTPConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen35LocalTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

@@ -1,0 +1,16 @@
+diff --git a/src/misc/strongstream.cc b/src/misc/strongstream.cc
+--- a/src/misc/strongstream.cc
++++ b/src/misc/strongstream.cc
+@@ -339,4 +339,12 @@
+ ncclResult_t ncclStreamAdvanceToEvent(struct ncclCudaGraph g, cudaStream_t s, cudaEvent_t e) {
++#ifdef __HIP_PLATFORM_AMD__
++  // HIP records this wait as a graph dependency. The temporary-stream and
++  // capture-dependency rewrite below takes tens of milliseconds per collective
++  // on large HIP graphs, while the direct wait preserves the same event edge.
++  // Keep the upstream CUDA fast-forward path intact for CUDA builds.
++  CUDACHECK(cudaStreamWaitEvent(s, e, 0));
++  return ncclSuccess;
++#endif
+   if (g.graphId == ULLONG_MAX) {
+     CUDACHECK(cudaStreamWaitEvent(s, e, 0));
+   } else {

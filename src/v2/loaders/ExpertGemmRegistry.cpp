@@ -1,8 +1,16 @@
+/**
+ * @file ExpertGemmRegistry.cpp
+ * @brief Implements scoped prepared MoE GEMM registration and lifetime lookup.
+ */
+
 #include "ExpertGemmRegistry.h"
 
+#include <algorithm>
 #include <functional>
+#include <set>
 #include <mutex>
 #include <shared_mutex>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -103,6 +111,52 @@ namespace llaminar2
         if (it == engines_.end())
             return nullptr;
         return it->second.engine;
+    }
+
+    std::shared_ptr<ITensorGemm> ExpertGemmRegistry::getEngineLifetime(
+        DeviceId device,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        return getEngineLifetimeForParticipant(
+            {}, device, -1, -1, layer, expert, role);
+    }
+
+    std::shared_ptr<ITensorGemm>
+    ExpertGemmRegistry::getEngineLifetimeForDomain(
+        const std::string &domain_name,
+        DeviceId device,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        return getEngineLifetimeForParticipant(
+            domain_name, device, -1, -1, layer, expert, role);
+    }
+
+    std::shared_ptr<ITensorGemm>
+    ExpertGemmRegistry::getEngineLifetimeForParticipant(
+        const std::string &domain_name,
+        DeviceId device,
+        int participant_world_rank,
+        int participant_index,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        std::shared_lock lock(mutex_);
+        Key key{domain_name, device, layer, expert, role};
+        key.participant_world_rank = participant_world_rank;
+        key.participant_index = participant_index;
+        const auto found = engines_.find(key);
+        if (found == engines_.end() || !found->second.engine ||
+            !found->second.ownership ||
+            found->second.ownership.get() != found->second.engine)
+        {
+            return nullptr;
+        }
+        return found->second.ownership;
     }
 
     bool ExpertGemmRegistry::hasCompleteRole(DeviceId device, int layer, int num_experts, WeightRole role) const
@@ -236,6 +290,22 @@ namespace llaminar2
         return count;
     }
 
+    size_t ExpertGemmRegistry::countOwnedEnginesForDeviceAcrossScopes(
+        DeviceId device) const
+    {
+        std::shared_lock lock(mutex_);
+        size_t count = 0;
+        for (const auto &[key, entry] : engines_)
+        {
+            if (key.device == device && entry.engine != nullptr &&
+                entry.ownership)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     size_t ExpertGemmRegistry::countEnginesForLayer(DeviceId device, int layer) const
     {
         return countEnginesForLayerInDomain({}, device, layer);
@@ -323,6 +393,180 @@ namespace llaminar2
         }
 
         return complete;
+    }
+
+    bool ExpertGemmRegistry::replaceParticipantResidency(
+        std::span<const ParticipantLayerScope> scopes,
+        std::span<const ParticipantExpertBinding> bindings,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        try
+        {
+            using ScopeIdentity =
+                std::tuple<std::string, std::string, int, int, int>;
+            const auto scope_identity = [](const ParticipantLayerScope &scope)
+            {
+                return ScopeIdentity{
+                    scope.domain_name,
+                    scope.device.to_string(),
+                    scope.participant_world_rank,
+                    scope.participant_index,
+                    scope.layer,
+                };
+            };
+
+            std::set<ScopeIdentity> declared_scopes;
+            for (const auto &scope : scopes)
+            {
+                if (scope.domain_name.empty() || !scope.device.is_valid() ||
+                    scope.participant_world_rank < -1 ||
+                    scope.participant_index < 0 || scope.layer < 0 ||
+                    !declared_scopes.emplace(scope_identity(scope)).second)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay registry replacement contains an invalid or duplicate participant/layer scope";
+                    }
+                    return false;
+                }
+            }
+            if (declared_scopes.empty())
+            {
+                if (error)
+                    *error = "ExpertOverlay registry replacement has no scopes";
+                return false;
+            }
+
+            std::unordered_map<Key, Entry, KeyHash> participant_entries;
+            std::unordered_map<Key, Entry, KeyHash> domain_entries;
+            participant_entries.reserve(bindings.size() * 3u);
+            domain_entries.reserve(bindings.size() * 3u);
+            for (const auto &binding : bindings)
+            {
+                if (binding.expert < 0 || !binding.complete() ||
+                    declared_scopes.count(
+                        scope_identity(binding.scope)) == 0u)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay registry replacement has an incomplete or out-of-scope expert binding";
+                    }
+                    return false;
+                }
+
+                const auto add_role = [&](WeightRole role,
+                                          const std::shared_ptr<ITensorGemm> &engine)
+                {
+                    Key participant_key{
+                        binding.scope.domain_name,
+                        binding.scope.device,
+                        binding.scope.layer,
+                        binding.expert,
+                        role,
+                    };
+                    participant_key.participant_world_rank =
+                        binding.scope.participant_world_rank;
+                    participant_key.participant_index =
+                        binding.scope.participant_index;
+                    const Entry entry{engine.get(), engine};
+                    if (!participant_entries.emplace(
+                            participant_key, entry).second)
+                    {
+                        return false;
+                    }
+
+                    Key domain_key{
+                        binding.scope.domain_name,
+                        binding.scope.device,
+                        binding.scope.layer,
+                        binding.expert,
+                        role,
+                    };
+                    const auto [found, inserted] =
+                        domain_entries.emplace(domain_key, entry);
+                    return inserted ||
+                           (found->second.engine == entry.engine &&
+                            found->second.ownership.get() ==
+                                entry.ownership.get());
+                };
+
+                if (!add_role(WeightRole::GATE, binding.gate) ||
+                    !add_role(WeightRole::UP, binding.up) ||
+                    !add_role(WeightRole::DOWN, binding.down))
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay registry replacement repeats a participant expert or gives one domain alias conflicting engines";
+                    }
+                    return false;
+                }
+            }
+
+            std::unique_lock lock(mutex_);
+            auto replacement = engines_;
+            for (auto entry = replacement.begin();
+                 entry != replacement.end();)
+            {
+                const auto &key = entry->first;
+                const bool participant_match = std::any_of(
+                    scopes.begin(),
+                    scopes.end(),
+                    [&](const auto &scope)
+                    {
+                        return key.domain_name == scope.domain_name &&
+                               key.device == scope.device &&
+                               key.layer == scope.layer &&
+                               key.participant_world_rank ==
+                                   scope.participant_world_rank &&
+                               key.participant_index ==
+                                   scope.participant_index;
+                    });
+                const bool domain_match =
+                    key.participant_world_rank == -1 &&
+                    key.participant_index == -1 &&
+                    std::any_of(
+                        scopes.begin(),
+                        scopes.end(),
+                        [&](const auto &scope)
+                        {
+                            return key.domain_name == scope.domain_name &&
+                                   key.device == scope.device &&
+                                   key.layer == scope.layer;
+                        });
+                if (participant_match || domain_match)
+                    entry = replacement.erase(entry);
+                else
+                    ++entry;
+            }
+            replacement.insert(
+                participant_entries.begin(), participant_entries.end());
+            replacement.insert(domain_entries.begin(), domain_entries.end());
+            engines_.swap(replacement);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay registry replacement failed before publication: " +
+                    std::string(exception.what());
+            }
+        }
+        catch (...)
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay registry replacement failed before publication with a non-standard exception";
+            }
+        }
+        return false;
     }
 
     void ExpertGemmRegistry::replaceEngine(DeviceId device, int layer, int expert, WeightRole role,

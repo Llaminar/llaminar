@@ -53,6 +53,12 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPRestor
     runDenseMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), true);
 }
 
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPPartialTerminalRestore)
+{
+    runDenseMTPPartialTerminalPrefixRestoreParity(
+        QWEN36_DENSE_PREFIX_MTP_CASE());
+}
+
 QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPDynamicDepthRestore)
 {
     runDenseDynamicMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), true);
@@ -111,9 +117,27 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPEnabledForwardOnl
     runDenseMTPEnabledForwardOnlyMatchesNoMTP(QWEN36_DENSE_PREFIX_MTP_CASE());
 }
 
-QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticSamplingVerifierRuns)
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticDepth1VerifierRuns)
 {
-    runDenseStochasticMTPVerifierParity(QWEN36_DENSE_PREFIX_MTP_CASE());
+    runDenseStochasticMTPVerifierParity(QWEN36_DENSE_PREFIX_MTP_CASE(), 1);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticDepth2VerifierRuns)
+{
+    runDenseStochasticMTPVerifierParity(QWEN36_DENSE_PREFIX_MTP_CASE(), 2);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticDepth3VerifierRuns)
+{
+    runDenseStochasticMTPVerifierParity(QWEN36_DENSE_PREFIX_MTP_CASE(), 3);
+}
+
+QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPStochasticDynamicDepthVerifierRuns)
+{
+    runDenseStochasticMTPVerifierParity(
+        QWEN36_DENSE_PREFIX_MTP_CASE(),
+        3,
+        qwen36DenseStochasticDynamicDepthPolicy(3));
 }
 
 QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, VerifierRowsDecodeEquivalentM1)

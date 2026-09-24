@@ -16,33 +16,47 @@
 #include "stages/ResidualAddStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/TPKVCacheStateAllGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/EmbeddingStage.h"
 #include "stages/HiddenStateRowSelectStage.h"
 #include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/AllreduceStage.h"
+#include "stages/TPAllreduceStage.h"
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEExpertComputeStage.h"
+#include "stages/MoEOverlayTicketPublishStage.h"
+#include "stages/MoEOverlayTicketConsumeStage.h"
+#include "stages/MoEOverlayActivationPacketStages.h"
+#include "stages/MoEOverlayDeviceControllerStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoERankBatchSparseStages.h"
+#include "stages/MoEDeviceRebalanceStage.h"
+#include "stages/MoEGPUCurrentBatchLLEPStage.h"
+#include "stages/MoEDeviceDecodeCommitBoundaryStage.h"
+#include "stages/MoECPUCurrentBatchLLEPStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
 #include "stages/GDNProjectionStage.h"
 #include "stages/ShortConv1dStage.h"
 #include "stages/GDNRecurrenceStage.h"
+#include "stages/GDNLiveStateAllGatherStage.h"
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
 #include "stages/QGateSplitStage.h"
 #include "stages/FusedAddAllreduceStage.h"
 #include "stages/MTPConcatStage.h"
+#include "stages/MTPVerifierPreparationStage.h"
+#include "stages/MTPVerifierOutcomeStage.h"
+#include "stages/PrefillChunkMaterializationStage.h"
 
 namespace llaminar2
 {
@@ -80,6 +94,20 @@ namespace llaminar2
             const FusedQKVGEMMStage::Params &params);
 
         /**
+         * @brief Create an explicit fused K/V-only projection stage.
+         *
+         * The factory owns the projection policy so graph builders cannot
+         * accidentally retain query weights or outputs while claiming to build
+         * a K/V cache-publication transaction.
+         *
+         * @param params K/V projection parameters with every Q field unset.
+         * @return Stage that quantizes the shared activation once and projects K/V.
+         * @throws std::invalid_argument when any query field is populated.
+         */
+        static std::unique_ptr<IComputeStage> createFusedKVGEMM(
+            FusedQKVGEMMStage::Params params);
+
+        /**
          * @brief Create a fused Gate/Up GEMM stage for FFN
          *
          * This stage quantizes input once and runs gate + up projections using a
@@ -109,6 +137,22 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createRoPE(
             const RoPEStage::Params &params);
+
+        /**
+         * @brief Create an in-place K-only RoPE cache-publication stage.
+         *
+         * This typed constructor rejects query and separate-output state. It is
+         * used only when the graph stores post-RoPE K; RoPE-on-read graphs omit
+         * the stage entirely.
+         *
+         * @param params K operand, positive KV-head count, geometry, positions,
+         *               and K buffer ownership.
+         * @return A stage whose sole tensor transaction is K in/out.
+         * @throws std::invalid_argument if query, output, skip, or ambiguous
+         *         head-count state is supplied.
+         */
+        static std::unique_ptr<IComputeStage> createKeyOnlyRoPE(
+            RoPEStage::Params params);
 
         // =====================================================================
         // FFN and Residual
@@ -159,6 +203,12 @@ namespace llaminar2
             const KVCacheGatherStage::Params &params);
 
         /**
+         * @brief Create a LocalTP K/V state allgather handoff stage
+         */
+        static std::unique_ptr<IComputeStage> createTPKVCacheStateAllGather(
+            const TPKVCacheStateAllGatherStage::Params &params);
+
+        /**
          * @brief Create a pure attention compute stage using KernelFactory
          *
          * This is the new architecture for attention that:
@@ -191,31 +241,104 @@ namespace llaminar2
          * @brief Create a MoE routing stage (softmax top-k expert selection)
          *
          * Extracted from MoEExpertComputeStage. Outputs raw routing results (indices as float,
-         * normalized weights) without EP masking.
+         * normalized weights) without expert-ID ownership masking.
          */
         static std::unique_ptr<IComputeStage> createMoERouting(
             const MoERoutingStage::Params &params);
 
+        /** @brief Create a captured fixed-capacity heterogeneous MoE ticket publisher. */
+        static std::unique_ptr<IComputeStage> createMoEOverlayTicketPublish(
+            const MoEOverlayTicketPublishStage::Params &params);
+
+        /** @brief Create a captured fixed-capacity heterogeneous MoE return ingress. */
+        static std::unique_ptr<IComputeStage> createMoEOverlayTicketConsume(
+            const MoEOverlayTicketConsumeStage::Params &params);
+
+        /** @brief Create planner-bound continuation dispatch packet capture. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationDispatchPack(
+            const MoEOverlayActivationDispatchPackStage::Params &params);
+
+        /** @brief Create topology-sized direct-mapped decode dispatch capture. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationDispatchPackBatch(
+            const MoEOverlayActivationDispatchPackBatchStage::Params &params);
+
+        /** @brief Create planner-bound follower dispatch packet capture. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationDispatchConsume(
+            const MoEOverlayActivationDispatchConsumeStage::Params &params);
+
+        /** @brief Create planner-bound follower return packet capture. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationReturnPack(
+            const MoEOverlayActivationReturnPackStage::Params &params);
+
+        /** @brief Create planner-bound continuation return packet capture. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationReturnConsume(
+            const MoEOverlayActivationReturnConsumeStage::Params &params);
+
+        /** @brief Create parallel decode return gather and canonical fold. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayActivationReturnConsumeBatch(
+            const MoEOverlayActivationReturnConsumeBatchStage::Params &params);
+
+        /** @brief Create one captured mapped-controller transition. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayDeviceController(
+            const MoEOverlayDeviceControllerStage::Params &params);
+
         /**
-         * @brief Create a host-side MoE expert-parallel dispatch descriptor stage
+         * @brief Create a host-side routed-row dispatch descriptor stage
          */
         static std::unique_ptr<IComputeStage> createMoEExpertDispatch(
             const MoEExpertDispatchStage::Params &params);
 
-        /**
-         * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers
-         */
-        static std::unique_ptr<IComputeStage> createMoEExpertParallelReduce(
-            const MoEExpertParallelReduceStage::Params &params);
-
         static std::unique_ptr<IComputeStage> createMoESparseDispatch(
             const MoESparseDispatchStage::Params &params);
+
+        /** @brief Create one direct rank-batched sparse dispatch boundary. */
+        static std::unique_ptr<IComputeStage> createMoERankBatchDispatch(
+            const MoERankBatchDispatchStage::Params &params);
 
         static std::unique_ptr<IComputeStage> createMoELocalExpert(
             const MoELocalExpertStage::Params &params);
 
+        /** @brief Create the exact completion node paired with one deferred local expert stage. */
+        static std::unique_ptr<IComputeStage> createMoELocalExpertCompletion(
+            const MoELocalExpertCompletionStage::Params &params);
+
         static std::unique_ptr<IComputeStage> createMoESparseReturnReduce(
             const MoESparseReturnReduceStage::Params &params);
+
+        /** @brief Create one direct rank-batched sparse return boundary. */
+        static std::unique_ptr<IComputeStage> createMoERankBatchReturnReduce(
+            const MoERankBatchReturnReduceStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoEDeviceRebalance(
+            const MoEDeviceRebalanceStage::Params &params);
+
+        /**
+         * @brief Create one local phase of a sidebanded GPU current-batch LLEP transaction.
+         * @param params Exact runtime-table, payload-lane, and phase bindings.
+         * @return Graph-capturable local stage; it never owns a collective.
+         */
+        static std::unique_ptr<IComputeStage> createMoEGPUCurrentBatchLLEP(
+            const MoEGPUCurrentBatchLLEPStage::Params &params);
+
+        /**
+         * @brief Create the captured HIP serial-decode MoE cadence boundary.
+         * @param params Exact ROCm backend and shared controller-workspace binding.
+         * @return A graph-capturable publish/acknowledge stage.
+         */
+        static std::unique_ptr<IComputeStage>
+        createMoEDeviceDecodeCommitBoundary(
+            const MoEDeviceDecodeCommitBoundaryStage::Params &params);
+
+        /** @brief Create an explicit CPU LLEP begin or restore transaction stage. */
+        static std::unique_ptr<IComputeStage> createMoECPUCurrentBatchLLEP(
+            const MoECPUCurrentBatchLLEPStage::Params &params);
 
         /**
          * @brief Create a shared expert FFN stage (always-active dense SwiGLU)
@@ -228,6 +351,29 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createSharedExpertGate(
             const SharedExpertGateStage::Params &params);
+
+        /** @brief Create the device-only router-ordered LocalTP MoE reducer. */
+        static std::unique_ptr<IComputeStage> createMoECanonicalRouteReduce(
+            const MoECanonicalRouteReduceStage::Params &params);
+
+        /** @brief Create the rooted packed CPU canonical-route gather. */
+        static std::unique_ptr<IComputeStage> createMoECanonicalRouteGather(
+            const MoECanonicalRouteGatherStage::Params &params);
+
+        /** @brief Create the compact rooted CPU canonical-output broadcast. */
+        static std::unique_ptr<IComputeStage>
+        createMoECanonicalOutputBroadcast(
+            const MoECanonicalOutputBroadcastStage::Params &params);
+
+        /** @brief Create the canonical shared-partial rank-bank publisher. */
+        static std::unique_ptr<IComputeStage>
+        createMoESharedExpertRankBankPublish(
+            const MoESharedExpertRankBankPublishStage::Params &params);
+
+        /** @brief Create the root-only fixed-order MoE publication finalizer. */
+        static std::unique_ptr<IComputeStage>
+        createMoECanonicalPublicationFinalize(
+            const MoECanonicalPublicationFinalizeStage::Params &params);
 
         // =====================================================================
         // GDN (Gated Delta Net) Stages
@@ -250,6 +396,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createGDNRecurrence(
             const GDNRecurrenceStage::Params &params);
+
+        /**
+         * @brief Create a LocalTP GDN live-state allgather handoff stage
+         */
+        static std::unique_ptr<IComputeStage> createGDNLiveStateAllGather(
+            const GDNLiveStateAllGatherStage::Params &params);
 
         /**
          * @brief Create a gated RMSNorm stage: RMSNorm(x) * SiLU(gate)
@@ -275,9 +427,34 @@ namespace llaminar2
         static std::unique_ptr<IComputeStage> createMTPConcat(
             const MTPConcatStage::Params &params);
 
+        /**
+         * @brief Create the graph-owned compact MTP verifier outcome stage.
+         */
+        static std::unique_ptr<IComputeStage> createMTPVerifierOutcome(
+            const MTPVerifierOutcomeStage::Params &params);
+
+        /**
+         * @brief Create the captured device-owned MTP verifier prelude.
+         */
+        static std::unique_ptr<IComputeStage> createMTPVerifierPreparation(
+            const MTPVerifierPreparationStage::Params &params);
+
+        /** @brief Create the captured device-owned long-prefill chunk publisher. */
+        static std::unique_ptr<IComputeStage> createPrefillChunkMaterialization(
+            const PrefillChunkMaterializationStage::Params &params);
+
         // =====================================================================
         // MPI Communication Stages
         // =====================================================================
+
+        /**
+         * @brief Create one native graph-capturable LocalTP rooted collective.
+         *
+         * The resulting stage always uses the graph-selected explicit stream
+         * and rejects transport emulation or host rendezvous.
+         */
+        static std::unique_ptr<IComputeStage> createTPLocalRootedCollective(
+            const TPLocalRootedCollectiveStage::Params &params);
 
         /**
          * @brief Create an Allreduce stage for MPI collective sum

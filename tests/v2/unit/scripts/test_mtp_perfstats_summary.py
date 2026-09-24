@@ -87,52 +87,6 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "mtp",
-                    "name": "verifier_economy_capability",
-                    "phase": "decode",
-                    "device": "cuda:0",
-                    "count": 1,
-                    "value": 4,
-                    "tags": {
-                        "lane": "dense",
-                        "perf_gate_status": "correct_serial_fallback_not_economical",
-                        "max_rows": "4",
-                        "serial_decode_equivalent_fallback": "true",
-                        "grouped_decode_equivalent": "false",
-                        "row_indexed_lm_head": "false",
-                        "device_resident_input": "false",
-                        "device_resident_outcome": "false",
-                        "device_resident_publication": "false",
-                        "host_bridge_free_hot_path": "false",
-                        "graph_capturable": "false",
-                        "greedy": "true",
-                        "stochastic": "true",
-                    },
-                },
-                {
-                    "domain": "mtp",
-                    "name": "verifier_economy_capability",
-                    "phase": "decode",
-                    "device": "cuda:0",
-                    "count": 1,
-                    "value": 3,
-                    "tags": {
-                        "lane": "moe",
-                        "perf_gate_status": "grouped_promoted",
-                        "max_rows": "3",
-                        "serial_decode_equivalent_fallback": "false",
-                        "grouped_decode_equivalent": "true",
-                        "row_indexed_lm_head": "true",
-                        "device_resident_input": "true",
-                        "device_resident_outcome": "true",
-                        "device_resident_publication": "true",
-                        "host_bridge_free_hot_path": "true",
-                        "graph_capturable": "true",
-                        "greedy": "true",
-                        "stochastic": "true",
-                    },
-                },
-                {
-                    "domain": "mtp",
                     "name": "condition_forward",
                     "phase": "decode",
                     "count": 2,
@@ -707,49 +661,49 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 6,
                     "tags": {"context": "main_decode", "phase": "warmup"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 2,
                     "tags": {"context": "main_decode", "phase": "capture"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 9,
                     "tags": {"context": "main_decode", "phase": "replay"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 4,
                     "tags": {"context": "main_verifier", "phase": "warmup"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 1,
                     "tags": {"context": "main_verifier", "phase": "capture"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 5,
                     "tags": {"context": "main_verifier", "phase": "replay"},
                 },
                 {
                     "domain": "forward_graph",
-                    "name": "decode_segmented_phase",
+                    "name": "decode_graph_phase",
                     "phase": "decode",
                     "count": 99,
                     "tags": {"context": "other_decode", "phase": "replay"},
@@ -813,14 +767,6 @@ class MTPPerfStatsSummaryTest(unittest.TestCase):
         self.assertEqual(summary["stochastic_semantic_verify_rows"], 7.0)
         self.assertEqual(summary["stochastic_post_reject_rows"], 2.0)
         self.assertEqual(summary["stochastic_seeded_device_threshold_rows"], 5.0)
-        self.assertEqual(
-            summary["verifier_economy_dense"],
-            "status=correct_serial_fallback_not_economical;rows=4;serial=true;grouped=false;row_lm=false;resident=false/false/false;bridge_free=false;graph=false;greedy=true;stochastic=true",
-        )
-        self.assertEqual(
-            summary["verifier_economy_moe"],
-            "status=grouped_promoted;rows=3;serial=false;grouped=true;row_lm=true;resident=true/true/true;bridge_free=true;graph=true;greedy=true;stochastic=true",
-        )
         self.assertEqual(summary["condition_ms"], 9.75)
         self.assertEqual(summary["condition_count"], 2)
         self.assertEqual(summary["condition_skipped_ready"], 5)

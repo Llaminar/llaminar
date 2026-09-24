@@ -11,6 +11,7 @@
 #include "../../tensors/Tensors.h"
 #include "../../utils/Logger.h"
 #include "../../utils/Assertions.h"
+#include "../../utils/PrefillGraphBucketDefaults.h"
 
 #include <algorithm>
 
@@ -95,16 +96,18 @@ namespace llaminar2
     /**
      * @brief Add CUDA decode side-stream GEMV partials for fused projection stages.
      *
-     * CUDA NativeVNNI decode and verifier rows can launch several M=1..4
-     * projections from one fused stage on separate streams. Slot 0 uses the
-     * normal `GEMV_KPAR_PARTIALS` buffer; the remaining projections need one
-     * disjoint side-stream slot each. Single-output GEMV stages such as LM head
-     * cannot consume these slots, so the declaration belongs at the fused-stage
-     * layer where the projection fan-out is known.
+     * CUDA NativeVNNI M=1 decode can launch several projections from one fused
+     * stage on separate streams. Slot 0 uses the normal
+     * `GEMV_KPAR_PARTIALS` buffer; the remaining projections need one disjoint
+     * side-stream slot each. Grouped verifier projections reuse the same
+     * primary arena in-order on their graph stream and never allocate side
+     * slots. Single-output GEMV stages such as LM head cannot consume these
+     * slots either; the declaration belongs at the fused-stage layer where
+     * M=1 projection fan-out is known.
      *
      * @param reqs Merged per-projection workspace requirements to augment.
      * @param device Stage device; only CUDA receives this CUDA-specific buffer.
-     * @param m Declared row count. Decode/verifier M=1..4 need side-stream slots.
+     * @param m Declared row count. Only M=1 decode needs side-stream slots.
      * @param projection_count Number of fused projections the stage may launch.
      * @param max_concurrent_streams Maximum active projection streams used by
      *                               the backend's fused decode pool.
@@ -116,7 +119,8 @@ namespace llaminar2
         size_t projection_count,
         size_t max_concurrent_streams = 8)
     {
-        if (!device.is_cuda() || m < 1 || m > 4 || projection_count <= 1 || max_concurrent_streams <= 1)
+        if (!device.is_cuda() || m != 1 ||
+            projection_count <= 1 || max_concurrent_streams <= 1)
             return;
 
         const WorkspaceDescriptor *serial =
@@ -138,7 +142,8 @@ namespace llaminar2
             GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS,
             (active_streams - 1) * serial->size_bytes,
             serial->alignment,
-            true});
+            true,
+            WorkspaceExecutionRegime::CompactDecodeOnly});
         reqs.merge(extra);
     }
 

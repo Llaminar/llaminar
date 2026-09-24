@@ -467,9 +467,10 @@ namespace llaminar2
             return allgather;
         }
 
-        case TPMode::ExpertParallel:
+        case TPMode::RoutedExpertTensorSharded:
         {
-            // Expert-parallel projection: allreduce the partial expert outputs
+            // Within-expert tensor sharding produces one partial routed output
+            // per participant, so the graph combines those partials in place.
             ResolvedStage allreduce;
             allreduce.name = resolved.name + "_allreduce";
             allreduce.type = StageType::Allreduce;
@@ -490,7 +491,7 @@ namespace llaminar2
             allreduce.int_params["count"] = static_cast<int>(count);
 
             LOG_TRACE("[GraphResolver] Inserting allreduce after " << resolved.name
-                      << " (ExpertParallel)");
+                      << " (RoutedExpertTensorSharded)");
             return allreduce;
         }
 
@@ -1104,7 +1105,18 @@ namespace llaminar2
             auto it = config.custom_formulas.find(formula);
             if (it != config.custom_formulas.end())
                 return it->second;
-            return 4;
+            throw std::invalid_argument(
+                "GraphResolver requires an explicit mtp_target_query_rows capacity; "
+                "MTP graph shape must come from runtime policy rather than a fixed small-M default");
+        }
+        if (formula == "mtp_vocab")
+        {
+            auto it = config.custom_formulas.find(formula);
+            if (it != config.custom_formulas.end())
+                return it->second;
+            return static_cast<size_t>(config.local_vocab > 0
+                                           ? config.local_vocab
+                                           : config.vocab_size);
         }
 
         // Model-provided custom formulas (e.g., GDN dimensions)

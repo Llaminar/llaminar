@@ -5,7 +5,10 @@
 # the configured budget, BuildKit keeps it and the next run can reuse layers.
 set -euo pipefail
 
-limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-256GB}"
+# The self-hosted runner owns this cache.  Dependency layers are substantially
+# larger than compiler objects, so BuildKit has its own intentionally looser
+# soft budget.  CCACHE_MAXSIZE remains the separate hard compiler-cache cap.
+limit="${LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE:-200GB}"
 enabled="${LLAMINAR_DOCKER_BUILD_CACHE_GC:-1}"
 
 if [[ "$enabled" == "0" ]]; then
@@ -14,7 +17,9 @@ if [[ "$enabled" == "0" ]]; then
 fi
 
 if ! docker buildx version >/dev/null 2>&1; then
-    echo "[docker-cache] docker buildx is unavailable; skipping bounded cache GC"
+    # CCACHE_MAXSIZE remains the hard compiler-cache cap. Losing optional
+    # post-job layer pruning must not turn a successful product gate red.
+    echo "[docker-cache] warning: docker buildx is unavailable; skipping best-effort ${limit} layer-cache prune" >&2
     exit 0
 fi
 
@@ -25,11 +30,11 @@ if grep -q -- "--max-used-space" <<<"$help"; then
 elif grep -q -- "--keep-storage" <<<"$help"; then
     cmd+=(--keep-storage "$limit")
 else
-    echo "[docker-cache] this docker buildx does not support size-bounded prune; skipping"
+    echo "[docker-cache] warning: this docker buildx cannot size-bound the layer cache; skipping best-effort prune" >&2
     exit 0
 fi
 
 echo "[docker-cache] bounding local BuildKit cache to ${limit}; reusable layers remain when under budget"
 if ! "${cmd[@]}"; then
-    echo "[docker-cache] warning: bounded BuildKit cache GC failed; continuing"
+    echo "[docker-cache] warning: best-effort ${limit} layer-cache prune failed; retaining reusable cache" >&2
 fi

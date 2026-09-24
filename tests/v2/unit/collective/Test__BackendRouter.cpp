@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 #include "v2/collective/BackendRouter.h"
+#include "v2/collective/LocalTPCollectiveInventory.h"
 #include "v2/collective/test/CollectiveTestMocks.h"
 #include "v2/collective/backends/UPIBackend.h"
 #include "v2/config/TPDomain.h"
@@ -16,6 +17,89 @@
 
 namespace llaminar2::test
 {
+
+    TEST(Test__LocalTPCollectiveInventory, ProjectsOnlyDeclaredROCmAndCPUParticipants)
+    {
+        const ClusterInventory inventory = buildLocalTPCollectiveInventory(
+            {
+                GlobalDeviceAddress::rocm(3, 1),
+                GlobalDeviceAddress::cpu(0),
+                GlobalDeviceAddress::rocm(1, 0),
+            },
+            1,
+            2);
+
+        ASSERT_EQ(inventory.ranks.size(), 1u);
+        EXPECT_EQ(inventory.world_size, 2);
+        EXPECT_EQ(inventory.total_gpus, 2);
+        EXPECT_EQ(inventory.ranks.front().rank, 1);
+        ASSERT_EQ(inventory.ranks.front().gpus.size(), 2u);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].type, DeviceType::ROCm);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].local_device_id, 3);
+        EXPECT_EQ(inventory.ranks.front().gpus[1].type, DeviceType::ROCm);
+        EXPECT_EQ(inventory.ranks.front().gpus[1].local_device_id, 1);
+        EXPECT_EQ(inventory.ranks.front().cpu.numa_node, 0);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].memory_bytes, 0u)
+            << "Collective projection must not query device capacity";
+    }
+
+    TEST(Test__LocalTPCollectiveInventory, ProjectsOnlyDeclaredCUDAAndCPUParticipants)
+    {
+        const ClusterInventory inventory = buildLocalTPCollectiveInventory(
+            {
+                GlobalDeviceAddress::cuda(1, 0),
+                GlobalDeviceAddress::cpu(1),
+                GlobalDeviceAddress::cuda(0, 1),
+            },
+            0,
+            1);
+
+        ASSERT_EQ(inventory.ranks.size(), 1u);
+        ASSERT_EQ(inventory.ranks.front().gpus.size(), 2u);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].type, DeviceType::CUDA);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].local_device_id, 1);
+        EXPECT_EQ(inventory.ranks.front().gpus[1].type, DeviceType::CUDA);
+        EXPECT_EQ(inventory.ranks.front().gpus[1].local_device_id, 0);
+        EXPECT_EQ(inventory.ranks.front().cpu.numa_node, 1);
+    }
+
+    TEST(Test__LocalTPCollectiveInventory, PreservesDeclaredMixedVendorOrder)
+    {
+        const ClusterInventory inventory = buildLocalTPCollectiveInventory(
+            {
+                GlobalDeviceAddress::rocm(2),
+                GlobalDeviceAddress::cuda(0),
+                GlobalDeviceAddress::rocm(0),
+            },
+            0,
+            1);
+
+        ASSERT_EQ(inventory.ranks.front().gpus.size(), 3u);
+        EXPECT_EQ(inventory.ranks.front().gpus[0].type, DeviceType::ROCm);
+        EXPECT_EQ(inventory.ranks.front().gpus[1].type, DeviceType::CUDA);
+        EXPECT_EQ(inventory.ranks.front().gpus[2].type, DeviceType::ROCm);
+    }
+
+    TEST(Test__LocalTPCollectiveInventory, RejectsDuplicateLocalIdentity)
+    {
+        EXPECT_THROW(
+            (void)buildLocalTPCollectiveInventory(
+                {
+                    GlobalDeviceAddress::cuda(0, 0),
+                    GlobalDeviceAddress::cuda(0, 1),
+                },
+                0,
+                1),
+            std::invalid_argument);
+    }
+
+    TEST(Test__LocalTPCollectiveInventory, RejectsInvalidMPIIdentity)
+    {
+        EXPECT_THROW(
+            (void)buildLocalTPCollectiveInventory(
+                {GlobalDeviceAddress::cpu()}, 2, 2),
+            std::invalid_argument);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Test Fixture
@@ -1199,6 +1283,7 @@ namespace llaminar2::test
         cluster_inventory_.total_gpus = 1;
 
         auto factory = std::make_unique<MockBackendFactory>();
+        auto *factory_observer = factory.get();
         factory->setAvailable(CollectiveBackendType::NCCL, true);
         auto *mock_nccl = factory->addMockBackend(CollectiveBackendType::NCCL);
         mock_nccl->setAvailable(true);
@@ -1209,6 +1294,9 @@ namespace llaminar2::test
         // Verify NCCL initialize() was NOT called (no CUDA devices)
         EXPECT_FALSE(mock_nccl->wasInitialized())
             << "NCCL should NOT be initialized when only ROCm devices in inventory";
+        EXPECT_EQ(
+            factory_observer->createCallCount(CollectiveBackendType::NCCL), 0)
+            << "A ROCm-only topology must not even construct the NCCL backend";
     }
 
     TEST_F(Test__BackendRouter, PreInitRCCLOnlyInitializesROCmNotCUDA)
@@ -1234,6 +1322,7 @@ namespace llaminar2::test
         cluster_inventory_.total_gpus = 1;
 
         auto factory = std::make_unique<MockBackendFactory>();
+        auto *factory_observer = factory.get();
         factory->setAvailable(CollectiveBackendType::RCCL, true);
         auto *mock_rccl = factory->addMockBackend(CollectiveBackendType::RCCL);
         mock_rccl->setAvailable(true);
@@ -1244,6 +1333,9 @@ namespace llaminar2::test
         // Verify RCCL initialize() was NOT called (no ROCm devices)
         EXPECT_FALSE(mock_rccl->wasInitialized())
             << "RCCL should NOT be initialized when only CUDA devices in inventory";
+        EXPECT_EQ(
+            factory_observer->createCallCount(CollectiveBackendType::RCCL), 0)
+            << "A CUDA-only topology must not even construct the RCCL backend";
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

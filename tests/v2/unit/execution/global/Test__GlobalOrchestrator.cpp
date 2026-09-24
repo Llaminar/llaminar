@@ -61,6 +61,22 @@ namespace llaminar2::test
             return set_all_position_ok_;
         }
 
+        bool configureMTPRequestStopTokens(
+            const std::vector<int32_t> &stop_tokens) override
+        {
+            ++configure_stop_tokens_calls_;
+            configured_stop_tokens_ = stop_tokens;
+            return configure_stop_tokens_ok_;
+        }
+
+        bool configureMTPRequestPenaltyPolicy(
+            const MTPRequestPenaltyPolicy &policy) override
+        {
+            ++configure_penalty_policy_calls_;
+            configured_penalty_policy_ = policy;
+            return configure_penalty_policy_ok_;
+        }
+
         const float *getAllPositionLogits() const override
         {
             return all_position_logits_.data();
@@ -80,13 +96,13 @@ namespace llaminar2::test
             return snapshot;
         }
 
-        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        PrefixStateSnapshot captureLivePrefixCheckpoint(
+            const PrefixCheckpointCaptureRequest &request) const override
         {
-            (void)seq_idx;
             PrefixStateSnapshot snapshot;
-            snapshot.valid = capture_ok_;
+            snapshot.valid = capture_ok_ && request.valid();
             snapshot.logical_checkpoint = true;
-            snapshot.cached_tokens = get_position();
+            snapshot.cached_tokens = request.logical_cached_tokens;
             return snapshot;
         }
 
@@ -118,6 +134,22 @@ namespace llaminar2::test
         bool all_position_enabled() const { return all_position_enabled_; }
         int restore_live_calls() const { return restore_live_calls_; }
         int truncate_live_calls() const { return truncate_live_calls_; }
+        int configure_stop_tokens_calls() const
+        {
+            return configure_stop_tokens_calls_;
+        }
+        int configure_penalty_policy_calls() const
+        {
+            return configure_penalty_policy_calls_;
+        }
+        const std::vector<int32_t> &configured_stop_tokens() const
+        {
+            return configured_stop_tokens_;
+        }
+        const MTPRequestPenaltyPolicy &configured_penalty_policy() const
+        {
+            return configured_penalty_policy_;
+        }
 
         void set_mtp_unsupported_reason(std::string reason)
         {
@@ -129,6 +161,11 @@ namespace llaminar2::test
             moe_placement_epoch_ = epoch;
         }
 
+        void set_configure_stop_tokens_ok(bool ok)
+        {
+            configure_stop_tokens_ok_ = ok;
+        }
+
     private:
         std::vector<float> mtp_logits_;
         std::vector<float> all_position_logits_;
@@ -136,6 +173,8 @@ namespace llaminar2::test
         int set_all_position_calls_ = 0;
         int restore_live_calls_ = 0;
         int truncate_live_calls_ = 0;
+        int configure_stop_tokens_calls_ = 0;
+        int configure_penalty_policy_calls_ = 0;
         int last_mtp_condition_token_ = -1;
         bool forward_mtp_ok_ = true;
         bool set_all_position_ok_ = true;
@@ -143,8 +182,12 @@ namespace llaminar2::test
         bool capture_ok_ = true;
         bool restore_ok_ = true;
         bool truncate_ok_ = true;
+        bool configure_stop_tokens_ok_ = true;
+        bool configure_penalty_policy_ok_ = true;
         uint64_t moe_placement_epoch_ = 0;
         std::string mtp_unsupported_reason_;
+        std::vector<int32_t> configured_stop_tokens_;
+        MTPRequestPenaltyPolicy configured_penalty_policy_{};
     };
 
     class ScriptedBroadcastMPIContext : public MockMPIContext
@@ -268,7 +311,15 @@ namespace llaminar2::test
             config.rank = rank;
             config.world_size = world_size;
             config.mpi_ctx = mpi_ctx;
-            config.rank_runner = std::move(runner);
+            if (runner)
+            {
+                const auto rank_plan = GlobalPPRankPlanBuilder::build(config.topology, rank);
+                const auto stages = rank_plan.executeStages();
+                if (stages.size() != 1u)
+                    throw std::invalid_argument("Single-runner fixture requires exactly one local stage");
+                config.stage_runners.push_back(makeStageRunnerEntry(
+                    config.topology, rank, stages.front()->stage_id, std::move(runner)));
+            }
             config.vocab_size = VOCAB_SIZE;
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
@@ -550,6 +601,42 @@ namespace llaminar2::test
     // Construction Tests
     // =========================================================================
 
+    /** Global TP at the tail elects its topology leader, not the final MPI rank. */
+    TEST_F(Test__GlobalOrchestrator, RequestAuthorityIsTheVocabularyDomainLeader)
+    {
+        for (int rank = 0; rank != 4; ++rank)
+        {
+            MockMPIContext mpi(rank, 4);
+            auto topology = buildTwoStageTwoWayTPTopo();
+            auto runner = std::make_unique<MockDeviceRunner>();
+            GlobalOrchestrator orch(makeConfig(
+                std::move(topology), rank, 4, &mpi, std::move(runner)));
+            EXPECT_EQ(orch.requestAuthorityRank(), 2);
+            SamplingParams params;
+            params.temperature = 0.0f;
+            EXPECT_TRUE(orch.requiresMPICoordinatedDecodeSampling(params));
+            params.temperature = 0.7f;
+            EXPECT_FALSE(orch.requiresMPICoordinatedDecodeSampling(params));
+        }
+    }
+
+    /** Missing or duplicated terminal ownership must not select an arbitrary rank. */
+    TEST_F(Test__GlobalOrchestrator, RequestAuthorityRequiresExactlyOneVocabularyStage)
+    {
+        MockMPIContext mpi(0, 2);
+        for (const bool duplicate : {false, true})
+        {
+            auto topology = buildTwoStagePPTopo();
+            topology.stages[0].has_lm_head = duplicate;
+            topology.stages[1].has_lm_head = duplicate;
+            auto config = makeConfig(std::move(topology), 0, 2, &mpi,
+                                     std::make_unique<MockDeviceRunner>());
+            EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+        }
+        MockDeviceRunner local;
+        EXPECT_FALSE(local.requestAuthorityRank().has_value());
+    }
+
     TEST_F(Test__GlobalOrchestrator, ConstructsSingleRankSingleStage)
     {
         MockMPIContext mpi(0, 1);
@@ -609,6 +696,51 @@ namespace llaminar2::test
     // Validation Tests
     // =========================================================================
 
+    /** @brief A remote endpoint must never resolve to a different local layer scope. */
+    TEST_F(Test__GlobalOrchestrator, RegistryHasNoStandInForRemoteEndpoints)
+    {
+        const auto topology = buildTwoStagePPTopo();
+        for (int rank : {0, 1})
+        {
+            StageRunnerRegistry registry;
+            auto runner = std::make_unique<MockDeviceRunner>();
+            const auto *local = runner.get();
+            registry.add(makeStageRunnerEntry(topology, rank, rank, std::move(runner)));
+            const auto &read_only = registry;
+            EXPECT_EQ(registry.pipelineHeadRunner(), rank == 0 ? local : nullptr);
+            EXPECT_EQ(registry.pipelineTailRunner(), rank == 1 ? local : nullptr);
+            EXPECT_EQ(read_only.pipelineHeadRunner(), rank == 0 ? local : nullptr);
+            EXPECT_EQ(read_only.pipelineTailRunner(), rank == 1 ? local : nullptr);
+            EXPECT_EQ(registry.runnerForStage(1 - rank), nullptr);
+            EXPECT_EQ(read_only.runnerForStage(1 - rank), nullptr);
+            EXPECT_FALSE(registry.hasRunnerForStage(1 - rank));
+            EXPECT_EQ(registry.size(), 1u);
+        }
+    }
+
+    /** @brief Endpoint authority and layer scopes are authenticated before any execution. */
+    TEST_F(Test__GlobalOrchestrator, RejectsForeignStageAndChangedEndpointOrScope)
+    {
+        MockMPIContext mpi(0, 2);
+        for (int corruption = 0; corruption < 5; ++corruption)
+        {
+            auto config = makeConfig(buildTwoStagePPTopo(), 0, 2, &mpi,
+                                     std::make_unique<MockDeviceRunner>());
+            auto &entry = config.stage_runners.front();
+            if (corruption == 0)
+                entry.action.has_lm_head = true;
+            else if (corruption == 1)
+                ++entry.action.last_layer;
+            else if (corruption == 2)
+                ++entry.pp_stage_config->first_layer;
+            else if (corruption == 3)
+                entry.stage_id = entry.action.stage_id = 1;
+            else
+                entry.domain_name = "foreign-domain";
+            EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
+        }
+    }
+
     TEST_F(Test__GlobalOrchestrator, ThrowsOnNullMPIContext)
     {
         auto topo = buildSingleStageTopo(1);
@@ -619,7 +751,8 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = nullptr;
-        config.rank_runner = std::move(runner);
+        config.stage_runners.push_back(makeStageRunnerEntry(
+            config.topology, 0, 0, std::move(runner)));
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -636,7 +769,6 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = &mpi;
-        config.rank_runner = nullptr;
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -653,7 +785,7 @@ namespace llaminar2::test
         config.rank = 0;
         config.world_size = 1;
         config.mpi_ctx = &mpi;
-        config.rank_runner = std::move(runner);
+        // The malformed topology must fail before considering runner ownership.
         config.vocab_size = VOCAB_SIZE;
         config.d_model = D_MODEL;
 
@@ -666,7 +798,8 @@ namespace llaminar2::test
         auto topo = buildSingleStageTopo(1);
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        auto config = makeConfig(std::move(topo), 5, 1, &mpi, std::move(runner));
+        auto config = makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner));
+        config.rank = 5;
         EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
@@ -698,7 +831,8 @@ namespace llaminar2::test
         auto topo = buildSingleStageTopo(1);
         auto runner = std::make_unique<MockDeviceRunner>();
 
-        auto config = makeConfig(std::move(topo), -1, 1, &mpi, std::move(runner));
+        auto config = makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner));
+        config.rank = -1;
         EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
@@ -850,7 +984,7 @@ namespace llaminar2::test
         EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
-    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceFallsBackToGreedyWhenRunnerReturnsNegative)
+    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceReturnsNegativeWhenRunnerReturnsNegative)
     {
         MockMPIContext mpi(0, 1);
         auto topo = buildSingleStageTopo(1);
@@ -859,7 +993,7 @@ namespace llaminar2::test
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.mock_logits = std::vector<float>(VOCAB_SIZE, 0.0f);
         runner_config.mock_logits[3] = 99.0f; // Token 3 wins argmax
-        // sample_on_device_token = -1 (default) → triggers greedy fallback
+        // sample_on_device_token = -1 (default) → surfaces unsupported sampling.
         auto runner = std::make_unique<MockDeviceRunner>(runner_config);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
@@ -872,10 +1006,8 @@ namespace llaminar2::test
         size_t broadcast_before = mpi.broadcast_call_count();
         int token = orch.sampleOnDevice(params);
 
-        // Fell back to greedy (CPU argmax) → token 3
-        EXPECT_EQ(token, 3);
-        // Greedy fallback internally broadcasts once
-        EXPECT_GE(mpi.broadcast_call_count(), broadcast_before + 1);
+        EXPECT_EQ(token, -1);
+        EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
     TEST_F(Test__GlobalOrchestrator, SampleOnDeviceSuccessPathBroadcasts)
@@ -953,6 +1085,64 @@ namespace llaminar2::test
         EXPECT_TRUE(orch.truncateLivePrefixState(5));
         EXPECT_EQ(runner_raw->truncate_live_calls(), 1);
         EXPECT_EQ(runner_raw->get_position(), 5);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, NamedDomainRequestPolicyAdmissionReachesEveryGraphOwner)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildNamedDomainHybridTopo(/*gpu_owner_rank=*/0);
+
+        auto first = std::make_unique<MTPMockDeviceRunner>();
+        auto *first_raw = first.get();
+        auto second = std::make_unique<MTPMockDeviceRunner>();
+        auto *second_raw = second.get();
+
+        GlobalOrchestrator::Config config;
+        config.topology = topo;
+        config.rank = 0;
+        config.world_size = 2;
+        config.mpi_ctx = &mpi;
+        config.stage_runners.push_back(
+            makeStageRunnerEntry(topo, 0, 0, std::move(first)));
+        config.stage_runners.push_back(
+            makeStageRunnerEntry(topo, 0, 1, std::move(second)));
+        config.vocab_size = VOCAB_SIZE;
+        config.d_model = D_MODEL;
+        config.architecture_name = "test_qwen35moe";
+
+        GlobalOrchestrator orch(std::move(config));
+        const std::vector<int32_t> stop_tokens = {151643, 151645};
+        const MTPRequestPenaltyPolicy penalty_policy{
+            .presence_penalty = 0.75f,
+            .frequency_penalty = 0.25f,
+        };
+
+        EXPECT_TRUE(orch.configureMTPRequestStopTokens(stop_tokens));
+        EXPECT_TRUE(orch.configureMTPRequestPenaltyPolicy(penalty_policy));
+
+        for (const MTPMockDeviceRunner *runner : {first_raw, second_raw})
+        {
+            EXPECT_EQ(runner->configure_stop_tokens_calls(), 1);
+            EXPECT_EQ(runner->configured_stop_tokens(), stop_tokens);
+            EXPECT_EQ(runner->configure_penalty_policy_calls(), 1);
+            EXPECT_EQ(runner->configured_penalty_policy(), penalty_policy);
+        }
+    }
+
+    TEST_F(Test__GlobalOrchestrator, RequestPolicyAdmissionFailsAtRejectingGraphOwner)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildSingleStageTopo(2);
+        auto runner = std::make_unique<MTPMockDeviceRunner>();
+        runner->set_configure_stop_tokens_ok(false);
+
+        GlobalOrchestrator orch(
+            makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        EXPECT_THROW(
+            static_cast<void>(
+                orch.configureMTPRequestStopTokens({151643, 151645})),
+            std::runtime_error);
     }
 
     TEST_F(Test__GlobalOrchestrator, GlobalTPMTPDraftSamplingUsesBroadcastRootTokenOnNonRootRank)
@@ -2132,9 +2322,11 @@ namespace llaminar2::test
         {
             MockMPIContext mpi(rank, 2);
             auto topo = buildTwoStageSameTPTopo();
-            auto runner = std::make_unique<MockDeviceRunner>();
-
-            GlobalOrchestrator orch(makeConfig(std::move(topo), rank, 2, &mpi, std::move(runner)));
+            auto config = makeConfig(std::move(topo), rank, 2, &mpi, nullptr);
+            for (int stage : {0, 1})
+                config.stage_runners.push_back(makeStageRunnerEntry(
+                    config.topology, rank, stage, std::make_unique<MockDeviceRunner>()));
+            GlobalOrchestrator orch(std::move(config));
 
             const auto &plan = orch.rankPlan();
             auto transfers = plan.transferActions();
@@ -2146,7 +2338,7 @@ namespace llaminar2::test
         }
     }
 
-    TEST_F(Test__GlobalOrchestrator, SameTPTopo_Rank0_ForwardExecutesLocalHandoffCompatibilityRunner)
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_RejectsOneRunnerMasqueradingAsTwoStages)
     {
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStageSameTPTopo();
@@ -2155,17 +2347,10 @@ namespace llaminar2::test
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.has_hidden_state = true;
         runner_config.hidden_state_dim = D_MODEL;
-        auto runner_raw = new MockDeviceRunner(runner_config);
-        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
-
-        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
-
-        std::vector<int> tokens = {1, 2, 3};
-        EXPECT_TRUE(orch.forward(tokens.data(), 3));
-        EXPECT_EQ(mpi.send_call_count(), 0u);
-        EXPECT_EQ(mpi.recv_call_count(), 0u);
-        EXPECT_EQ(runner_raw->forward_call_count(), 2u);
-        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+        auto config = makeConfig(std::move(topo), 0, 2, &mpi, nullptr);
+        config.stage_runners.push_back(makeStageRunnerEntry(
+            config.topology, 0, 0, std::make_unique<MockDeviceRunner>(runner_config)));
+        EXPECT_THROW(GlobalOrchestrator(std::move(config)), std::invalid_argument);
     }
 
     TEST_F(Test__GlobalOrchestrator, SameTPTopo_AnyRankExecutesTwoStageRunnersInOrder)
@@ -2289,10 +2474,11 @@ namespace llaminar2::test
         MockMPIContext mpi(1, 3);
         auto topo = buildPartialOverlapTPTopo();
 
-        auto runner_raw = new MockDeviceRunner();
-        auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
-
-        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 3, &mpi, std::move(runner)));
+        auto config = makeConfig(std::move(topo), 1, 3, &mpi, nullptr);
+        for (int stage : {0, 1})
+            config.stage_runners.push_back(makeStageRunnerEntry(
+                config.topology, 1, stage, std::make_unique<MockDeviceRunner>()));
+        GlobalOrchestrator orch(std::move(config));
 
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();

@@ -1,9 +1,24 @@
 /**
  * @file ChatCompletionHandler.cpp
- * @brief Implementation of ChatCompletionHandler
+ * @brief Production HTTP/SSE inference and shared incremental output parsing.
+ *
+ * Both response modes consume the same typed reasoning/answer lifecycle.
+ * Budget-injected and model-generated close markers have identical framing
+ * semantics. Field framing never owns generation termination: only runner/EOS,
+ * request token limits, cancellation, and failure can end a response.
+ * Parsing retains only a possible marker suffix, avoiding repeated scans of
+ * the complete generated transcript during long requests.
+ * Opt-in terminal token IDs retain already published runner output, including
+ * stop tokens and forced thinking continuations. They never probe live state,
+ * re-tokenize generated text, change decode batching, or enable snapshots.
+ * Opt-in runtime summaries project the runner's already completed outcome;
+ * JSON and logs share one snapshot, without querying GPUs or optional PerfStats.
+ * Only opt-in JSON also exports one passive model-lifetime movement ledger;
+ * ordinary logs do not copy the growing journal or advance maintenance.
  */
 
 #include "app/modes/ChatCompletionHandler.h"
+#include "app/modes/MoEMovementLedgerJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
 #include "utils/DebugEnv.h"
@@ -82,84 +97,9 @@ namespace llaminar2
             return value ? "true" : "false";
         }
 
-        bool hasPrefixCacheSummary(const PrefixRuntimeStateSnapshot &snapshot)
-        {
-            return snapshot.prefix_cache_config_enabled ||
-                   snapshot.prefix_cache_ready ||
-                   snapshot.prefix_cache_bypassed ||
-                   snapshot.prefix_cache_lookups != 0 ||
-                   snapshot.prefix_cache_hits != 0 ||
-                   snapshot.prefix_cache_partial_hits != 0 ||
-                   snapshot.prefix_cache_misses != 0 ||
-                   snapshot.prefix_cache_matched_tokens != 0 ||
-                   snapshot.prefix_cache_stores != 0 ||
-                   snapshot.prefix_cache_bypasses != 0 ||
-                   snapshot.prefix_request.enabled ||
-                   snapshot.prefix_request.bypassed ||
-                   snapshot.prefix_request.requested_tokens != 0 ||
-                   snapshot.prefix_request.matched_tokens != 0;
-        }
-
-        bool hasMTPSummary(const PrefixRuntimeStateSnapshot &snapshot)
-        {
-            return snapshot.mtp_config_enabled ||
-                   snapshot.mtp_bypassed ||
-                   snapshot.mtp_draft_steps != 0 ||
-                   snapshot.mtp_accepted_tokens != 0 ||
-                   snapshot.mtp_rejected_tokens != 0 ||
-                   snapshot.mtp_rollbacks != 0 ||
-                   snapshot.mtp_bypasses != 0 ||
-                   snapshot.mtp_verifier_runs != 0 ||
-                   snapshot.mtp_verifier_token_count != 0 ||
-                   snapshot.mtp_depth_policy_updates != 0 ||
-                   snapshot.mtp_request.enabled ||
-                   snapshot.mtp_request.bypassed ||
-                   snapshot.mtp_request.adaptive_depth_enabled ||
-                   snapshot.mtp_request.draft_steps != 0 ||
-                   snapshot.mtp_request.accepted_tokens != 0 ||
-                   snapshot.mtp_request.rejected_tokens != 0 ||
-                   snapshot.mtp_request.rollbacks != 0 ||
-                   snapshot.mtp_request.stochastic_accept_tests != 0 ||
-                   snapshot.mtp_request.stochastic_residual_samples != 0 ||
-                   snapshot.mtp_request.stochastic_terminal_samples != 0;
-        }
-
         bool traceGeneratedTokensEnabled()
         {
             return debugEnv().runtime_debug.trace_generated_tokens;
-        }
-
-        /**
-         * @brief Remove duplicate thinking end tags from an accumulated raw
-         *        assistant transcript.
-         *
-         * The first end tag is the legitimate transition from reasoning to
-         * answer content.  Any later end tag is a structural marker leaking
-         * into answer text, and Qwen thinking models can loop on
-         * "answer </think> answer" after a forced thinking-budget close.  We
-         * truncate at that second marker and let the already-generated answer
-         * stand.
-         *
-         * @return true if a duplicate marker was removed and generation should
-         *         stop.
-         */
-        bool truncateAtDuplicateThinkingEndTag(
-            std::string &generated_text,
-            const std::string &end_tag)
-        {
-            if (end_tag.empty())
-                return false;
-
-            const size_t first = generated_text.find(end_tag);
-            if (first == std::string::npos)
-                return false;
-
-            const size_t second = generated_text.find(end_tag, first + end_tag.size());
-            if (second == std::string::npos)
-                return false;
-
-            generated_text.erase(second);
-            return true;
         }
 
         /**
@@ -234,115 +174,197 @@ namespace llaminar2
             return oss.str();
         }
 
-        void logRuntimeStateSummary(IOrchestrationRunner &runner, const char *mode)
+        /**
+         * @brief Log completed observations without reading live inference state.
+         * @param summary Request authority's validated terminal observations.
+         * @param mode HTTP response mode used only as a diagnostic label.
+         *
+         * The deep prefix probe may synchronize whole devices. It must never
+         * be used for routine logging, even at INFO; filtering after probing
+         * still performs that work when the message itself is suppressed.
+         */
+        void logRuntimeStateSummary(const RequestRuntimeSummary &summary, const char *mode)
         {
-            const PrefixRuntimeStateSnapshot snapshot = runner.prefixStateProbe();
-
-            if (hasPrefixCacheSummary(snapshot))
+            if (!Logger::getInstance().shouldLog(LogLevel::INFO))
+                return;
+            const auto &prefix = summary.prefix_request;
+            if (prefix.enabled || prefix.bypassed)
             {
-                const auto &request = snapshot.prefix_request;
-                const bool bypassed = request.bypassed || snapshot.prefix_cache_bypassed;
-                const std::string &bypass_reason =
-                    !request.bypass_reason.empty() ? request.bypass_reason
-                                                   : snapshot.prefix_cache_bypass_reason;
-
-                std::ostringstream prefix;
-                prefix << "enabled=" << boolString(request.enabled || snapshot.prefix_cache_config_enabled)
-                       << " ready=" << boolString(snapshot.prefix_cache_ready)
-                       << " hit=" << boolString(request.hit)
-                       << " partial_hit=" << boolString(request.partial_hit)
-                       << " requested_tokens=" << request.requested_tokens
-                       << " matched_tokens=" << request.matched_tokens
-                       << " matched_blocks=" << request.matched_blocks
-                       << " tier=" << request.storage_tier
-                       << " lookups=" << snapshot.prefix_cache_lookups
-                       << " hits=" << snapshot.prefix_cache_hits
-                       << " partial_hits=" << snapshot.prefix_cache_partial_hits
-                       << " misses=" << snapshot.prefix_cache_misses;
-                if (bypassed)
-                {
-                    prefix << " bypassed=true";
-                    if (!bypass_reason.empty())
-                        prefix << " bypass_reason=" << bypass_reason;
-                }
-
                 LOG_INFO("[ChatCompletion] Prefix cache summary (" << mode << "): "
-                                                                   << prefix.str());
+                         << "enabled=" << boolString(prefix.enabled)
+                         << " hit=" << boolString(prefix.hit)
+                         << " partial_hit=" << boolString(prefix.partial_hit)
+                         << " requested_tokens=" << prefix.requested_tokens
+                         << " matched_tokens=" << prefix.matched_tokens
+                         << " matched_blocks=" << prefix.matched_blocks
+                         << " tier=" << prefix.storage_tier
+                         << " bypassed=" << boolString(prefix.bypassed)
+                         << " bypass_reason=" << prefix.bypass_reason);
             }
-
-            if (hasMTPSummary(snapshot))
+            const auto &mtp = summary.mtp_request;
+            if (mtp.enabled || mtp.bypassed || mtp.draft_steps != 0u)
             {
-                const auto &request = snapshot.mtp_request;
-                const uint64_t accepted = request.accepted_tokens != 0
-                                              ? request.accepted_tokens
-                                              : snapshot.mtp_accepted_tokens;
-                const uint64_t rejected = request.rejected_tokens != 0
-                                              ? request.rejected_tokens
-                                              : snapshot.mtp_rejected_tokens;
-                const uint64_t attempted = accepted + rejected;
-                const double acceptance_rate = attempted != 0
-                                                   ? static_cast<double>(accepted) /
-                                                         static_cast<double>(attempted)
-                                                   : request.acceptance_rate;
-                const int current_depth = request.current_depth != 0
-                                              ? request.current_depth
-                                              : snapshot.mtp_current_depth;
-                const int min_depth = request.min_depth != 0
-                                          ? request.min_depth
-                                          : snapshot.mtp_min_depth;
-                const int max_depth = request.max_depth != 0
-                                          ? request.max_depth
-                                          : snapshot.mtp_max_depth;
-                const uint64_t depth_updates = request.depth_policy_updates != 0
-                                                   ? request.depth_policy_updates
-                                                   : snapshot.mtp_depth_policy_updates;
-                const bool bypassed = request.bypassed || snapshot.mtp_bypassed;
-                const std::string &bypass_reason =
-                    !request.bypass_reason.empty() ? request.bypass_reason
-                                                   : snapshot.mtp_bypass_reason;
-
-                std::ostringstream mtp;
-                mtp << "enabled=" << boolString(request.enabled || snapshot.mtp_config_enabled)
-                    << " draft_steps=" << (request.draft_steps != 0
-                                               ? request.draft_steps
-                                               : snapshot.mtp_draft_steps)
-                    << " accepted_tokens=" << accepted
-                    << " rejected_tokens=" << rejected
-                    << " rollbacks=" << (request.rollbacks != 0
-                                             ? request.rollbacks
-                                             : snapshot.mtp_rollbacks)
-                    << " acceptance=" << std::fixed << std::setprecision(2)
-                    << (acceptance_rate * 100.0) << "%"
-                    << " verifier_runs=" << snapshot.mtp_verifier_runs
-                    << " verifier_tokens=" << snapshot.mtp_verifier_token_count
-                    << " verify_mode=" << request.verify_mode
-                    << " depth_policy=" << request.depth_policy_mode
-                    << " depth=" << current_depth
-                    << " [" << min_depth << "," << max_depth << "]"
-                    << " depth_updates=" << depth_updates;
-                if (!request.last_depth_policy_reason.empty())
-                    mtp << " last_depth_reason=" << request.last_depth_policy_reason;
-                if (request.stochastic_accept_tests != 0 ||
-                    request.stochastic_residual_samples != 0 ||
-                    request.stochastic_terminal_samples != 0)
-                {
-                    mtp << " stochastic_accept_tests=" << request.stochastic_accept_tests
-                        << " stochastic_acceptance=" << std::fixed << std::setprecision(2)
-                        << (request.stochastic_acceptance_rate * 100.0) << "%"
-                        << " stochastic_residual_samples="
-                        << request.stochastic_residual_samples
-                        << " stochastic_terminal_samples="
-                        << request.stochastic_terminal_samples;
-                }
-                if (bypassed)
-                {
-                    mtp << " bypassed=true";
-                    if (!bypass_reason.empty())
-                        mtp << " bypass_reason=" << bypass_reason;
-                }
-
-                LOG_INFO("[ChatCompletion] MTP summary (" << mode << "): " << mtp.str());
+                LOG_INFO("[ChatCompletion] MTP summary (" << mode << "): "
+                         << "enabled=" << boolString(mtp.enabled)
+                         << " draft_steps=" << mtp.draft_steps
+                         << " accepted_tokens=" << mtp.accepted_tokens
+                         << " rejected_tokens=" << mtp.rejected_tokens
+                         << " rollbacks=" << mtp.rollbacks
+                         << " acceptance=" << std::fixed << std::setprecision(2)
+                         << (mtp.acceptance_rate * 100.0) << "%"
+                         << " verifier_runs=" << summary.mtp_verifier_runs
+                         << " verifier_tokens=" << summary.mtp_verifier_token_count
+                         << " verify_mode=" << mtp.verify_mode
+                         << " depth_policy=" << mtp.depth_policy_mode
+                         << " depth=" << mtp.current_depth
+                         << " [" << mtp.min_depth << "," << mtp.max_depth << "]"
+                         << " depth_updates=" << mtp.depth_policy_updates
+                         << " last_depth_reason=" << mtp.last_depth_policy_reason
+                         << " stochastic_accept_tests=" << mtp.stochastic_accept_tests
+                         << " stochastic_acceptance=" << (mtp.stochastic_acceptance_rate * 100.0) << "%"
+                         << " stochastic_residual_samples=" << mtp.stochastic_residual_samples
+                         << " stochastic_terminal_samples=" << mtp.stochastic_terminal_samples
+                         << " bypassed=" << boolString(mtp.bypassed)
+                         << " bypass_reason=" << mtp.bypass_reason);
             }
+        }
+
+        /**
+         * @brief Serialize one immutable terminal observation without recomputing facts.
+         * @param summary Runner-owned outcome sampled after the request completed.
+         * @return Versioned, optional HTTP extension; no cache contents or live state.
+         *
+         * Prefix admission epochs explain legitimate movement invalidation. They
+         * come from the prefix authority, not inferred from profiling counters.
+         */
+        json runtimeSummaryJson(const RequestRuntimeSummary &summary)
+        {
+            const auto &prefix = summary.prefix_request;
+            const auto &mtp = summary.mtp_request;
+            return {{"schema", 1}, {"prefix_cache", {
+                {"enabled", prefix.enabled}, {"bypassed", prefix.bypassed},
+                {"bypass_reason", prefix.bypass_reason}, {"hit", prefix.hit},
+                {"partial_hit", prefix.partial_hit}, {"requested_tokens", prefix.requested_tokens},
+                {"matched_tokens", prefix.matched_tokens}, {"matched_blocks", prefix.matched_blocks},
+                {"terminal_logits_restored", prefix.terminal_logits_restored},
+                {"terminal_hidden_restored", prefix.terminal_hidden_restored},
+                {"mtp_state_restored", prefix.mtp_state_restored},
+                {"hybrid_state_restored", prefix.hybrid_state_restored},
+                {"storage_tier", prefix.storage_tier},
+                {"admission_epoch_earliest", prefix.admission_placement_epochs.earliest()},
+                {"admission_epoch_latest", prefix.admission_placement_epochs.latest()},
+                {"completion_movement_epoch", prefix.completion_movement_epoch}}},
+                {"mtp", {{"enabled", mtp.enabled}, {"bypassed", mtp.bypassed},
+                {"bypass_reason", mtp.bypass_reason}, {"verify_mode", mtp.verify_mode},
+                {"stochastic_verify", mtp.stochastic_verify},
+                {"adaptive_depth_enabled", mtp.adaptive_depth_enabled},
+                {"depth_policy_mode", mtp.depth_policy_mode}, {"current_depth", mtp.current_depth},
+                {"min_depth", mtp.min_depth}, {"max_depth", mtp.max_depth},
+                {"depth_policy_updates", mtp.depth_policy_updates},
+                {"last_depth_policy_reason", mtp.last_depth_policy_reason},
+                {"draft_steps", mtp.draft_steps}, {"accepted_tokens", mtp.accepted_tokens},
+                {"rejected_tokens", mtp.rejected_tokens}, {"rollbacks", mtp.rollbacks},
+                {"acceptance_rate", mtp.acceptance_rate},
+                {"verifier_runs", summary.mtp_verifier_runs},
+                {"verifier_token_count", summary.mtp_verifier_token_count},
+                {"stochastic_accept_tests", mtp.stochastic_accept_tests},
+                {"stochastic_accepts", mtp.stochastic_accepts},
+                {"stochastic_residual_samples", mtp.stochastic_residual_samples},
+                {"stochastic_terminal_samples", mtp.stochastic_terminal_samples},
+                {"stochastic_acceptance_rate", mtp.stochastic_acceptance_rate}}}};
+        }
+
+        bool runChatMoERebalanceMaintenance(
+            IOrchestrationRunner &runner,
+            uint64_t committed_tokens)
+        {
+            return runner.maybeApplyMoERebalance(committed_tokens);
+        }
+
+        /** @brief Validate the OpenAI function-name grammar before prompt insertion. */
+        bool isValidToolFunctionName(const std::string &name)
+        {
+            if (name.empty() || name.size() > 64)
+                return false;
+            return std::all_of(
+                name.begin(), name.end(),
+                [](const unsigned char ch)
+                {
+                    return std::isalnum(ch) || ch == '_' || ch == '-';
+                });
+        }
+
+        /** @brief Return the tool definitions admitted by the typed choice policy. */
+        json admittedToolDefinitions(const ChatCompletionRequest &request)
+        {
+            if (!request.tool_choice.permitsCalls() ||
+                !request.tools.is_array())
+            {
+                return json::array();
+            }
+            if (request.tool_choice.mode != ToolChoiceMode::SpecificFunction)
+                return request.tools;
+
+            json selected = json::array();
+            for (const auto &tool : request.tools)
+            {
+                if (tool["function"]["name"].get<std::string>() ==
+                    request.tool_choice.function_name)
+                {
+                    selected.push_back(tool);
+                    break;
+                }
+            }
+            return selected;
+        }
+
+        /**
+         * @brief Materialize the model-visible tool requirement once.
+         *
+         * The OpenAI policy is request state, not a sampling hint.  Templates
+         * already incorporate the available tool schema; this explicit system
+         * clause supplies the required/specific choice semantics without
+         * teaching the HTTP loop about any model-native output grammar.
+         */
+        std::vector<ChatMessage> toolPolicyMessages(
+            const ChatCompletionRequest &request)
+        {
+            std::vector<ChatMessage> messages = request.messages;
+            if (!request.tool_choice.requiresCall())
+                return messages;
+
+            std::string directive;
+            if (request.tool_choice.mode == ToolChoiceMode::SpecificFunction)
+            {
+                directive = "For this response, you MUST call the function '" +
+                            request.tool_choice.function_name +
+                            "'. Do not answer without that function call.";
+            }
+            else
+            {
+                directive = "For this response, you MUST call one of the available "
+                            "functions. Do not answer without a function call.";
+            }
+
+            if (!messages.empty() &&
+                (messages.front().role == "system" ||
+                 messages.front().role == "developer"))
+            {
+                messages.front().content += "\n\n" + directive;
+            }
+            else
+            {
+                messages.insert(messages.begin(), ChatMessage{"system", directive});
+            }
+            return messages;
+        }
+
+        /** @brief Whether this request may turn native markers into executable calls. */
+        bool toolCallParsingEnabled(const ChatCompletionRequest &request)
+        {
+            return request.tool_choice.permitsCalls() &&
+                   request.tools.is_array() &&
+                   !request.tools.empty();
         }
     }
 
@@ -351,151 +373,93 @@ namespace llaminar2
     // =========================================================================
 
     StreamingThinkSplitter::StreamingThinkSplitter(const std::string &end_tag)
-        : end_tag_(end_tag), in_thinking_(!end_tag.empty())
+        : end_tag_(end_tag), phase_(end_tag.empty() ? Phase::Content : Phase::Reasoning)
     {
     }
 
     StreamingThinkSplitter::StreamingThinkSplitter()
-        : end_tag_(), in_thinking_(false)
+        : end_tag_(), phase_(Phase::Content)
     {
     }
 
     StreamingThinkSplitter::SplitResult StreamingThinkSplitter::process(const std::string &token_text)
     {
-        if (!in_thinking_ || end_tag_.empty())
-        {
-            if (end_tag_.empty())
-            {
-                // Not a thinking model: everything is user-visible content.
-                return {"content", token_text};
-            }
-
-            /*
-             * Once the first </think> has closed reasoning, a later </think>
-             * is not valid answer content.  Keep a tiny suffix buffer so tags
-             * split across tokenizer pieces are suppressed before emission.
-             */
-            buffer_ += token_text;
-            const auto pos = buffer_.find(end_tag_);
-            if (pos != std::string::npos)
-            {
-                std::string content = buffer_.substr(0, pos);
-                buffer_.clear();
-                return {"content", content, true};
-            }
-
-            const size_t match_len = partialMarkerSuffixLength(buffer_, end_tag_);
-            if (buffer_.size() > match_len)
-            {
-                std::string safe = buffer_.substr(0, buffer_.size() - match_len);
-                buffer_ = buffer_.substr(buffer_.size() - match_len);
-                return {"content", safe};
-            }
-
-            return {"content", ""};
-        }
-
-        // We're in thinking mode. Check if this token contains the end tag.
+        if (end_tag_.empty())
+            return {"content", token_text};
         buffer_ += token_text;
+        if (phase_ != Phase::Reasoning)
+            return drainContent(/*terminal=*/false);
 
-        // Check if the buffer contains the end tag
-        auto pos = buffer_.find(end_tag_);
+        const auto pos = buffer_.find(end_tag_);
         if (pos != std::string::npos)
         {
-            // Found the end tag. Everything before it is reasoning, everything after is content.
-            in_thinking_ = false;
+            // A single result cannot emit both fields. Retain the answer tail
+            // for the next piece/flush, which uses the same marker validation.
             std::string reasoning_part = buffer_.substr(0, pos);
-            std::string content_part = buffer_.substr(pos + end_tag_.size());
-
-            // Trim leading whitespace from content (the model often puts \n\n after </think>)
-            size_t start = content_part.find_first_not_of(" \t\n\r");
-            if (start != std::string::npos)
-                content_part = content_part.substr(start);
-            else
-                content_part.clear();
-
-            buffer_.clear();
-
-            // If we have both reasoning and content, we need two chunks.
-            // We return reasoning here and buffer the content for the next call.
-            if (!content_part.empty())
-                buffer_ = content_part; // Will be returned on next process() or flush()
-
+            buffer_.erase(0, pos + end_tag_.size());
+            phase_ = Phase::AwaitingAnswer;
             if (!reasoning_part.empty())
                 return {"reasoning_content", reasoning_part};
-
-            // End tag found but no reasoning text before it — check buffered content
-            if (!buffer_.empty())
-            {
-                std::string c = buffer_;
-                buffer_.clear();
-                return {"content", c};
-            }
-            return {"content", ""};
+            return drainContent(/*terminal=*/false);
         }
 
-        // Check if the buffer could be a partial match for the end tag
-        // (the end of the buffer matches a prefix of the end tag)
-        bool could_be_partial = false;
-        for (size_t len = 1; len < end_tag_.size() && len <= buffer_.size(); ++len)
+        const size_t held = partialMarkerSuffixLength(buffer_, end_tag_);
+        std::string safe = buffer_.substr(0, buffer_.size() - held);
+        buffer_.erase(0, buffer_.size() - held);
+        return {"reasoning_content", safe};
+    }
+
+    StreamingThinkSplitter::SplitResult StreamingThinkSplitter::drainContent(bool terminal)
+    {
+        // A model can continue reasoning after the forced budget close before
+        // emitting its natural close and final answer. Neither close is EOS.
+        // Scan forward once, suppressing delimiters while preserving every
+        // ordinary byte; erasing only the consumed prefix also bounds copying.
+        std::string content;
+        size_t cursor = 0;
+        while (cursor < buffer_.size())
         {
-            if (buffer_.substr(buffer_.size() - len) == end_tag_.substr(0, len))
+            if (phase_ == Phase::AwaitingAnswer)
             {
-                could_be_partial = true;
-                break;
+                const size_t first = buffer_.find_first_not_of(" \t\n\r", cursor);
+                cursor = first == std::string::npos ? buffer_.size() : first;
             }
+            const size_t marker = buffer_.find(end_tag_, cursor);
+            if (marker != std::string::npos)
+            {
+                if (marker > cursor)
+                {
+                    content.append(buffer_, cursor, marker - cursor);
+                    phase_ = Phase::Content;
+                }
+                cursor = marker + end_tag_.size();
+                continue;
+            }
+
+            // Retain only a possible delimiter prefix across tokenizer pieces.
+            // End-of-input flush preserves an incomplete literal fragment.
+            const size_t held = terminal ? 0u : std::min(
+                buffer_.size() - cursor, partialMarkerSuffixLength(buffer_, end_tag_));
+            const size_t end = buffer_.size() - held;
+            if (end > cursor)
+            {
+                content.append(buffer_, cursor, end - cursor);
+                phase_ = Phase::Content;
+            }
+            cursor = end;
+            break;
         }
-
-        if (could_be_partial)
-        {
-            // Keep buffering — the end tag might span this and the next token
-            // But emit any safe prefix that can't be part of the end tag
-            // Find the longest suffix that matches a prefix of end_tag_
-            size_t match_len = 0;
-            for (size_t len = 1; len < end_tag_.size() && len <= buffer_.size(); ++len)
-            {
-                if (buffer_.substr(buffer_.size() - len) == end_tag_.substr(0, len))
-                    match_len = len;
-            }
-
-            if (buffer_.size() > match_len)
-            {
-                std::string safe = buffer_.substr(0, buffer_.size() - match_len);
-                buffer_ = buffer_.substr(buffer_.size() - match_len);
-                return {"reasoning_content", safe};
-            }
-            // Entire buffer is a partial match — keep buffering
-            return {"reasoning_content", ""};
-        }
-
-        // No partial match — emit everything as reasoning
-        std::string result = buffer_;
-        buffer_.clear();
-        return {"reasoning_content", result};
+        buffer_.erase(0, cursor);
+        return {"content", content};
     }
 
     StreamingThinkSplitter::SplitResult StreamingThinkSplitter::flush()
     {
-        if (buffer_.empty())
-            return {in_thinking_ ? "reasoning_content" : "content", ""};
-
-        if (!in_thinking_ && !end_tag_.empty())
-        {
-            const auto pos = buffer_.find(end_tag_);
-            if (pos != std::string::npos)
-            {
-                std::string content = buffer_.substr(0, pos);
-                buffer_.clear();
-                return {"content", content, true};
-            }
-        }
-
-        std::string result = buffer_;
+        if (phase_ != Phase::Reasoning && !end_tag_.empty())
+            return drainContent(/*terminal=*/true);
+        std::string result = std::move(buffer_);
         buffer_.clear();
-
-        if (in_thinking_)
-            return {"reasoning_content", result};
-        return {"content", result};
+        return {inThinking() ? "reasoning_content" : "content", result};
     }
 
     // =========================================================================
@@ -636,6 +600,52 @@ namespace llaminar2
         if (body.contains("enable_thinking"))
             request.enable_thinking = body["enable_thinking"].get<bool>();
 
+        if (body.contains("return_token_ids"))
+        {
+            if (!body["return_token_ids"].is_boolean())
+            {
+                error_out.ok = false;
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "return_token_ids must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            request.token_output = body["return_token_ids"].get<bool>()
+                ? CompletionTokenOutput::TextAndIds : CompletionTokenOutput::TextOnly;
+        }
+        if (request.stream && request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            error_out.ok = false;
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_token_ids is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+
+        if (body.contains("return_runtime_summary"))
+        {
+            if (!body["return_runtime_summary"].is_boolean())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "return_runtime_summary must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            request.runtime_output = body["return_runtime_summary"].get<bool>()
+                ? CompletionRuntimeOutput::Include : CompletionRuntimeOutput::Omit;
+        }
+        if (request.stream && request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_runtime_summary is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+
         // Model identifier (optional, echoed back in response)
         if (body.contains("model"))
             request.model = body["model"].get<std::string>();
@@ -707,13 +717,119 @@ namespace llaminar2
         if (body.contains("thinking_budget_tokens"))
             request.thinking_budget_tokens = body["thinking_budget_tokens"].get<int>();
 
-        // Tool calling parameters
-        if (body.contains("tools") && body["tools"].is_array())
+        // Tool calling parameters. Validate the JSON union once and publish a
+        // typed policy consumed identically by prompt construction and output
+        // parsing; silently ignoring an invalid choice would execute a
+        // different agent policy than the client requested.
+        if (body.contains("tools"))
+        {
+            if (!body["tools"].is_array())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tools must be an array"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
             request.tools = body["tools"];
+            for (const auto &tool : request.tools)
+            {
+                if (!tool.is_object() || tool.value("type", "") != "function" ||
+                    !tool.contains("function") || !tool["function"].is_object() ||
+                    !tool["function"].contains("name") ||
+                    !tool["function"]["name"].is_string() ||
+                    !isValidToolFunctionName(
+                        tool["function"]["name"].get<std::string>()))
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", "each tool must be a named function definition"},
+                        {"type", "invalid_request_error"}}}});
+                    return std::nullopt;
+                }
+            }
+        }
         if (body.contains("tool_choice"))
-            request.tool_choice = body["tool_choice"];
+        {
+            const auto &choice = body["tool_choice"];
+            if (choice.is_string())
+            {
+                const std::string value = choice.get<std::string>();
+                if (value == "auto")
+                    request.tool_choice.mode = ToolChoiceMode::Auto;
+                else if (value == "none")
+                    request.tool_choice.mode = ToolChoiceMode::None;
+                else if (value == "required")
+                    request.tool_choice.mode = ToolChoiceMode::Required;
+                else
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", "tool_choice must be auto, none, required, or a named function"},
+                        {"type", "invalid_request_error"}}}});
+                    return std::nullopt;
+                }
+            }
+            else if (choice.is_object() &&
+                     choice.value("type", "") == "function" &&
+                     choice.contains("function") &&
+                     choice["function"].is_object() &&
+                     choice["function"].contains("name") &&
+                     choice["function"]["name"].is_string())
+            {
+                request.tool_choice.mode = ToolChoiceMode::SpecificFunction;
+                request.tool_choice.function_name =
+                    choice["function"]["name"].get<std::string>();
+            }
+            else
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tool_choice must be auto, none, required, or a named function"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
         if (body.contains("parallel_tool_calls"))
+        {
+            if (!body["parallel_tool_calls"].is_boolean())
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "parallel_tool_calls must be a boolean"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
             request.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+        }
+
+        if (request.tool_choice.requiresCall() &&
+            (!request.tools.is_array() || request.tools.empty()))
+        {
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "tool_choice requires at least one tool definition"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
+        if (request.tool_choice.mode == ToolChoiceMode::SpecificFunction)
+        {
+            const bool found = std::any_of(
+                request.tools.begin(), request.tools.end(),
+                [&](const json &tool)
+                {
+                    return tool["function"]["name"].get<std::string>() ==
+                           request.tool_choice.function_name;
+                });
+            if (!found)
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "tool_choice names a function absent from tools"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+        }
 
         // Build conversation with full tool-calling support
         for (const auto &msg : body["messages"])
@@ -797,12 +913,24 @@ namespace llaminar2
                   << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
 
         runner_.setSamplingParams(effective);
+        /*
+         * Stop policy is part of request admission, just like sampling policy.
+         * In particular, a captured MTP verifier must see ChatML terminators on
+         * device before prefill publishes the first decode boundary.  The HTTP
+         * response loop may still recognize the terminal token after the final
+         * result is materialized, but it is not allowed to become an alternate
+         * authority that clips a transaction after later verifier rows have
+         * already mutated KV or recurrent state.
+         */
+        runner_.setStopTokens(tokenizer_.stop_tokens());
 
         // Encode with chat template (pass tools for tool-aware templates)
-        std::string tools_json;
-        if (request.tools.is_array() && !request.tools.empty())
-            tools_json = request.tools.dump();
-        auto token_ids = tokenizer_.encodeChat(request.messages, /*add_generation_prompt=*/true,
+        const json admitted_tools = admittedToolDefinitions(request);
+        const std::string tools_json = admitted_tools.empty()
+                                           ? std::string{}
+                                           : admitted_tools.dump();
+        const auto prompt_messages = toolPolicyMessages(request);
+        auto token_ids = tokenizer_.encodeChat(prompt_messages, /*add_generation_prompt=*/true,
                                                tools_json, request.enable_thinking);
 
         if (token_ids.empty())
@@ -885,7 +1013,14 @@ namespace llaminar2
                                        : std::max(1, max_context - prompt_tokens);
 
         // Decode loop
-        std::string generated_text;
+        std::string content;
+        std::string reasoning_content;
+        // Allocate only for an explicitly requested terminal observation. The
+        // runner already publishes these IDs for ordinary text output; keeping
+        // them requires no extra device transfer or speculative-state access.
+        std::vector<int32_t> completion_token_ids;
+        // Grow with actual output, not an untrusted max_tokens reservation:
+        // requests can ask for more tokens than are available before EOS.
         int completion_tokens = 0;
         std::string finish_reason = "length";
         std::string thinking_end_tag;
@@ -895,6 +1030,11 @@ namespace llaminar2
             if (chat_template.isThinkingModel())
                 thinking_end_tag = chat_template.thinkingEndTag();
         }
+        StreamingThinkSplitter splitter(thinking_end_tag);
+        const auto append_output = [&](const StreamingThinkSplitter::SplitResult &part)
+        {
+            (part.field == "reasoning_content" ? reasoning_content : content) += part.text;
+        };
 
         // Thinking budget state
         int thinking_tokens = 0;
@@ -1017,6 +1157,8 @@ namespace llaminar2
                  ++token_idx)
             {
                 int32_t next_token = step_tokens[token_idx];
+                if (request.token_output == CompletionTokenOutput::TextAndIds)
+                    completion_token_ids.push_back(next_token);
                 const bool is_final_returned_token = token_idx + 1 == step_tokens.size();
                 if (tokenizer_.is_stop_token(next_token) ||
                     (step_complete && is_final_returned_token))
@@ -1062,41 +1204,49 @@ namespace llaminar2
                                     token_text,
                                     step_forced);
                 completion_tokens++;
-                generated_text += token_text;
-                if (truncateAtDuplicateThinkingEndTag(generated_text, thinking_end_tag))
+                const auto part = splitter.process(token_text);
+                append_output(part);
+                if (thinking_budget_active && !thinking_end_tag.empty() &&
+                    !splitter.inThinking())
                 {
-                    finish_reason = "stop";
-                    stop_generation = true;
-                    break;
+                    // The reasoning budget owns only the reasoning phase.
+                    // Once a model-declared close marker is complete, restore
+                    // the normal captured answer window instead of leaving the
+                    // whole response on one-token device transactions. A
+                    // template-free caller has no delimiter evidence, so its
+                    // explicit budget must remain authoritative until the
+                    // forced stop sequence has been committed.
+                    thinking_budget_active = false;
                 }
             }
 
-            if (!stop_generation && !runner_.maybeApplyMoERebalance())
-                return rebalance_error();
+            if (!step_tokens.empty())
+            {
+                if (!runChatMoERebalanceMaintenance(
+                        runner_, step_tokens.size()))
+                    return rebalance_error();
+            }
         }
 
         runner_.flushStageTimeline();
-        logRuntimeStateSummary(runner_, "non-streaming");
-
-        // Post-process output: use ChatParser to extract thinking content
-        std::string reasoning_content;
-        std::string content = generated_text;
-        if (request.enable_thinking && tokenizer_.hasChatTemplate())
+        // Read once after the terminal result, before RAII request cleanup.
+        // Logging and the opt-in response see the same immutable outcome.
+        std::optional<RequestRuntimeSummary> runtime_summary;
+        if (request.runtime_output == CompletionRuntimeOutput::Include ||
+            Logger::getInstance().shouldLog(LogLevel::INFO))
         {
-            const auto &chat_template = tokenizer_.getChatTemplate();
-            ChatParser parser(chat_template);
-            if (parser.expectsThinking())
-            {
-                auto parsed = parser.parse(generated_text);
-                content = parsed.content;
-                reasoning_content = parsed.reasoning_content;
-            }
+            runtime_summary = runner_.requestRuntimeSummary();
+            logRuntimeStateSummary(*runtime_summary, "non-streaming");
         }
+
+        // HTTP and SSE share marker decisions, including token-split closes;
+        // non-streaming only accumulates the same safe fields into one response.
+        append_output(splitter.flush());
 
         // Parse tool calls from model output (if tools were requested)
         ToolCallParseResult tool_result;
         bool has_tool_calls = false;
-        if (request.tools.is_array() && !request.tools.empty())
+        if (toolCallParsingEnabled(request))
         {
             ToolCallFormat format = runner_.getToolCallFormat();
             tool_result = parseToolCalls(content, format);
@@ -1144,6 +1294,29 @@ namespace llaminar2
                                           {"finish_reason", finish_reason}}})},
             {"usage", {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens}, {"total_tokens", prompt_tokens + completion_tokens}, {"context_window", max_context}, {"context_used", prompt_tokens + completion_tokens}}}};
 
+        if (request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            // Preserve the tokenizer's actual prompt and the runner's ordered
+            // completion, including EOS. Text framing may hide either, so
+            // re-encoding the displayed answer would not be equivalent.
+            json_response["token_ids"] = {
+                {"prompt", input_ids}, {"completion", completion_token_ids}};
+        }
+
+        if (request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            json_response["runtime_summary"] = runtimeSummaryJson(*runtime_summary);
+            json_response["runtime_summary"]["expert_optimization"] =
+                moeOptimizationStatusJson(runner_.moeOptimizationStatus());
+            // This is an immutable, already-published ledger, not a request
+            // reset or maintenance join. Keep it out of routine INFO logging:
+            // only an explicit terminal representation pays the copy cost.
+            json_response["runtime_summary"]["expert_movement"] =
+                moeMovementLedgerJson(runner_.moeOptimizationMovementLedger());
+            json_response["runtime_summary"]["expert_movement_topology"] =
+                moeMovementTopologyJson(runner_.moeOptimizationMovementTopology());
+        }
+
         response.ok = true;
         response.http_status = 200;
         response.json_body = dumpJsonForHttp(json_response);
@@ -1168,6 +1341,25 @@ namespace llaminar2
     try
     {
         ChatCompletionResponse response;
+        if (request.runtime_output == CompletionRuntimeOutput::Include)
+        {
+            // Typed callers share JSON admission; reject before touching state.
+            response.http_status = 400;
+            response.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_runtime_summary is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return response;
+        }
+        if (request.token_output == CompletionTokenOutput::TextAndIds)
+        {
+            // Direct typed callers must obey the same admission contract as
+            // JSON callers, before any request reset or GPU work is submitted.
+            response.http_status = 400;
+            response.json_body = dumpJsonForHttp({{"error", {
+                {"message", "return_token_ids is implemented for non-streaming responses only"},
+                {"type", "invalid_request_error"}}}});
+            return response;
+        }
         RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
@@ -1236,9 +1428,77 @@ namespace llaminar2
         int completion_tokens = 0;
         std::string finish_reason = "length";
 
-        // Tool call state: when tools are provided, accumulate output for post-processing
-        bool has_tools = request.tools.is_array() && !request.tools.empty();
-        std::string accumulated_text; // Always accumulate for tool call detection
+        // Tool-call framing is incremental. Reasoning bypasses this splitter;
+        // only answer content can become an executable model-native call.
+        const bool has_tools = toolCallParsingEnabled(request);
+        const ToolCallFormat tool_format = has_tools
+            ? runner_.getToolCallFormat()
+            : ToolCallFormat::NONE;
+        StreamingToolCallSplitter tool_splitter(tool_format);
+        size_t streamed_tool_call_index = 0;
+        bool emitted_tool_call = false;
+        bool client_connected = true;
+
+        const auto emit_tool_events = [&](
+            std::vector<StreamingToolCallSplitter::Event> events) -> bool
+        {
+            for (auto &event : events)
+            {
+                json delta;
+                if (event.kind ==
+                    StreamingToolCallSplitter::Event::Kind::Content)
+                {
+                    if (event.content.empty())
+                        continue;
+                    delta["content"] = std::move(event.content);
+                }
+                else
+                {
+                    const auto &call = event.tool_call;
+                    json call_delta = {
+                        {"index", static_cast<int>(streamed_tool_call_index++)},
+                        {"id", call.id},
+                        {"type", "function"},
+                        {"function", {
+                            {"name", call.name},
+                            {"arguments", call.arguments}}}};
+                    delta["tool_calls"] = json::array({std::move(call_delta)});
+                    emitted_tool_call = true;
+                }
+                if (!emit_chunk(delta, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const auto emit_split_output = [&](
+            StreamingThinkSplitter::SplitResult part) -> bool
+        {
+            if (part.text.empty())
+                return true;
+            if (part.field == "reasoning_content")
+            {
+                if (!emit_chunk({{"reasoning_content", std::move(part.text)}}, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+                return true;
+            }
+            if (!has_tools)
+            {
+                if (!emit_chunk({{"content", std::move(part.text)}}, nullptr))
+                {
+                    client_connected = false;
+                    return false;
+                }
+                return true;
+            }
+            return emit_tool_events(tool_splitter.process(part.text));
+        };
 
         // Thinking budget state
         int thinking_tokens = 0;
@@ -1329,7 +1589,16 @@ namespace llaminar2
             else
             {
                 const int remaining = effective_max_tokens - completion_tokens;
-                const int step_budget = thinking_budget_active ? 1 : remaining;
+                // Bound time-to-publication without falling back to eager or
+                // serial-row execution. The device controller remains the
+                // inference/state authority for each complete retained-graph
+                // window, and its resident continuation joins adjacent windows.
+                const int step_budget = thinking_budget_active
+                    ? 1
+                    : std::min(
+                          remaining,
+                          ChatCompletionHandler::
+                              kStreamingPublicationWindowTokens);
                 const auto decode_start = SteadyClock::now();
                 GenerationResult result = decodeStepWithBudget(runner_, step_budget);
                 if (traceGeneratedTokensEnabled())
@@ -1364,7 +1633,10 @@ namespace llaminar2
                 step_complete = result.is_complete;
             }
 
-            bool rebalance_applied = false;
+            if (!runChatMoERebalanceMaintenance(
+                    runner_, step_tokens.size()))
+                return emit_rebalance_error();
+
             for (size_t token_idx = 0;
                  token_idx < step_tokens.size() && completion_tokens < effective_max_tokens;
                  ++token_idx)
@@ -1382,13 +1654,6 @@ namespace llaminar2
                     break;
                 }
 
-                if (!rebalance_applied)
-                {
-                    if (!runner_.maybeApplyMoERebalance())
-                        return emit_rebalance_error();
-                    rebalance_applied = true;
-                }
-
                 std::string token_text = tokenizer_.decode_token(next_token);
                 traceGeneratedToken("stream",
                                     completion_tokens - 1,
@@ -1396,83 +1661,65 @@ namespace llaminar2
                                     token_text,
                                     step_forced);
 
-                // Check thinking budget (before emitting)
-                if (thinking_budget_active && use_think_split && splitter.inThinking() &&
-                    !injecting_stop_thinking)
-                {
-                    thinking_tokens++;
-                    if (thinking_tokens >= request.thinking_budget_tokens &&
-                        !stop_thinking_tokens.empty())
-                    {
-                        LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
-                                  << thinking_tokens << " tokens), injecting stop-thinking prompt");
-                        injecting_stop_thinking = true;
-                        stop_thinking_idx = 0;
-                    }
-                }
-
                 if (use_think_split)
                 {
                     auto split = splitter.process(token_text);
+                    // Interpret closure before counting budget work. Forced
+                    // control tokens are not sampled reasoning, including the
+                    // last injected piece that has already ended injection.
+                    if (thinking_budget_active && !step_forced && splitter.inThinking())
+                    {
+                        ++thinking_tokens;
+                        if (thinking_tokens >= request.thinking_budget_tokens &&
+                            !stop_thinking_tokens.empty())
+                        {
+                            LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
+                                      << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                            injecting_stop_thinking = true;
+                            stop_thinking_idx = 0;
+                        }
+                    }
+                    if (thinking_budget_active && !splitter.inThinking())
+                    {
+                        // The explicit budget governs only the reasoning
+                        // phase. Once the closing marker is complete, restore
+                        // the normal captured publication window for answer
+                        // content instead of imposing one-token transactions
+                        // for the remainder of the response.
+                        thinking_budget_active = false;
+                    }
                     if (!split.text.empty())
                     {
-                        accumulated_text += split.text;
-                        if (!has_tools)
+                        if (!emit_split_output(std::move(split)))
                         {
-                            json delta;
-                            delta[split.field] = split.text;
-                            if (!emit_chunk(delta, nullptr))
+                            stop_generation = true;
+                            break;
+                        }
+                    }
+
+                    // Drain a buffered answer tail without declaring end-of-input.
+                    // A terminal flush here would expose a split closing marker
+                    // before its next tokenizer piece can complete the match.
+                    if (!splitter.inThinking())
+                    {
+                        auto flushed = splitter.process("");
+                        if (!flushed.text.empty())
+                        {
+                            if (!emit_split_output(std::move(flushed)))
                             {
                                 stop_generation = true;
                                 break;
                             }
                         }
                     }
-                    if (split.stop_generation)
-                    {
-                        finish_reason = "stop";
-                        stop_generation = true;
-                        break;
-                    }
-
-                    // Check if the splitter transitioned and has buffered content
-                    if (!splitter.inThinking())
-                    {
-                        auto flushed = splitter.flush();
-                        if (!flushed.text.empty())
-                        {
-                            accumulated_text += flushed.text;
-                            if (!has_tools)
-                            {
-                                json delta;
-                                delta[flushed.field] = flushed.text;
-                                if (!emit_chunk(delta, nullptr))
-                                {
-                                    stop_generation = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (flushed.stop_generation)
-                        {
-                            finish_reason = "stop";
-                            stop_generation = true;
-                            break;
-                        }
-                    }
                 }
                 else
                 {
-                    accumulated_text += token_text;
-                    if (!has_tools)
+                    if (!emit_split_output(
+                            {"content", std::move(token_text)}))
                     {
-                        json delta;
-                        delta["content"] = token_text;
-                        if (!emit_chunk(delta, nullptr))
-                        {
-                            stop_generation = true;
-                            break;
-                        }
+                        stop_generation = true;
+                        break;
                     }
                 }
             }
@@ -1482,52 +1729,25 @@ namespace llaminar2
         if (use_think_split)
         {
             auto flushed = splitter.flush();
-            if (!flushed.text.empty())
-            {
-                accumulated_text += flushed.text;
-                if (!has_tools)
-                {
-                    json delta;
-                    delta[flushed.field] = flushed.text;
-                    emit_chunk(delta, nullptr);
-                }
-            }
+            if (!flushed.text.empty() && client_connected)
+                emit_split_output(std::move(flushed));
         }
+
+        if (has_tools && client_connected)
+            emit_tool_events(tool_splitter.flush());
 
         runner_.flushStageTimeline();
-        logRuntimeStateSummary(runner_, "streaming");
+        if (Logger::getInstance().shouldLog(LogLevel::INFO))
+            logRuntimeStateSummary(runner_.requestRuntimeSummary(), "streaming");
 
-        // Post-generation: if tools were provided, parse for tool calls and emit
-        if (has_tools)
+        if (!client_connected)
         {
-            ToolCallFormat format = runner_.getToolCallFormat();
-            auto tool_result = parseToolCalls(accumulated_text, format);
-            if (tool_result.hasToolCalls())
-            {
-                // Emit tool_calls deltas
-                for (size_t ti = 0; ti < tool_result.tool_calls.size(); ++ti)
-                {
-                    const auto &tc = tool_result.tool_calls[ti];
-                    json tc_delta = {
-                        {"index", static_cast<int>(ti)},
-                        {"id", tc.id},
-                        {"type", "function"},
-                        {"function", {{"name", tc.name}, {"arguments", tc.arguments}}}};
-                    json delta = {{"tool_calls", json::array({tc_delta})}};
-                    emit_chunk(delta, nullptr);
-                }
-                finish_reason = "tool_calls";
-            }
-            else
-            {
-                // No tool calls found — emit buffered content as single chunk
-                if (!accumulated_text.empty())
-                {
-                    json delta = {{"content", accumulated_text}};
-                    emit_chunk(delta, nullptr);
-                }
-            }
+            response.ok = true;
+            response.http_status = 200;
+            return response;
         }
+        if (emitted_tool_call)
+            finish_reason = "tool_calls";
 
         // Final chunk with finish_reason
         emit_chunk(json::object(), finish_reason.c_str());

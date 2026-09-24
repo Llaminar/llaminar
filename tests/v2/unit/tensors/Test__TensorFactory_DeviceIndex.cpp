@@ -246,3 +246,99 @@ TEST_F(Test__TensorFactory_DeviceIndex, RegressionTest_MultipleAllocations_Consi
             << "Allocation " << i << " has wrong device";
     }
 }
+
+/**
+ * @brief Prove that every native weight codebook can adopt a caller-owned byte buffer.
+ *
+ * Expert-selection loading already has the exact packed bytes in a temporary
+ * vector. Pointer identity is the observable contract that the factory moves
+ * that allocation into the tensor instead of copying tens of gigabytes of
+ * model data a second time.
+ */
+TEST_F(Test__TensorFactory_DeviceIndex, AllNativeWeightCodebooksAdoptRvalueStorage)
+{
+    struct QuantizedCase
+    {
+        TensorType type;
+        size_t elements;
+        size_t bytes;
+    };
+
+    const std::vector<QuantizedCase> cases = {
+        {TensorType::IQ4_NL, IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock)},
+        {TensorType::Q8_0, Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block)},
+        {TensorType::Q4_0, Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block)},
+        {TensorType::Q4_1, Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block)},
+        {TensorType::Q5_0, Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block)},
+        {TensorType::Q5_1, Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block)},
+        {TensorType::Q6_K, Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock)},
+        {TensorType::Q2_K, Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock)},
+        {TensorType::Q5_K, Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock)},
+        {TensorType::Q3_K, Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock)},
+        {TensorType::Q4_K, Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock)},
+        {TensorType::Q8_K, Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock)},
+        {TensorType::IQ4_XS, IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock)},
+        {TensorType::IQ2_XXS, IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock)},
+        {TensorType::IQ2_XS, IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock)},
+        {TensorType::IQ3_XXS, IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock)},
+        {TensorType::IQ2_S, IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock)},
+        {TensorType::IQ3_S, IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock)},
+        {TensorType::IQ1_S, IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock)},
+        {TensorType::IQ1_M, IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock)},
+    };
+
+    for (const QuantizedCase &quantized : cases)
+    {
+        SCOPED_TRACE(static_cast<int>(quantized.type));
+        AlignedVector<uint8_t> source;
+        source.resize_uninitialized(quantized.bytes);
+        std::fill(source.begin(), source.end(), uint8_t{0x5a});
+        const uint8_t *const allocation = source.data();
+
+        std::unique_ptr<TensorBase> tensor = factory_->createQuantizedOwned(
+            quantized.type,
+            {1u, quantized.elements},
+            std::move(source));
+
+        ASSERT_NE(tensor, nullptr);
+        EXPECT_EQ(tensor->native_type(), quantized.type);
+        EXPECT_EQ(tensor->raw_data(), allocation);
+        EXPECT_EQ(tensor->size_bytes(), quantized.bytes);
+    }
+}
+
+/**
+ * @brief Prove that native floating-point weight storage is adopted in place.
+ */
+TEST_F(Test__TensorFactory_DeviceIndex, FloatingPointWeightsAdoptAlignedStorage)
+{
+    AlignedVector<float> fp32_data;
+    fp32_data.resize_uninitialized(32u);
+    std::fill(fp32_data.begin(), fp32_data.end(), 1.25f);
+    const float *const fp32_allocation = fp32_data.data();
+    std::unique_ptr<FP32Tensor> fp32 = factory_->createFP32Owned(
+        {32u}, std::move(fp32_data));
+    ASSERT_NE(fp32, nullptr);
+    EXPECT_EQ(fp32->raw_data(), fp32_allocation);
+    EXPECT_EQ(fp32->size_bytes(), 32u * sizeof(float));
+
+    AlignedVector<uint16_t> fp16_data;
+    fp16_data.resize_uninitialized(32u);
+    std::fill(fp16_data.begin(), fp16_data.end(), uint16_t{0x3c00});
+    const uint16_t *const fp16_allocation = fp16_data.data();
+    std::unique_ptr<FP16Tensor> fp16 = factory_->createFP16Owned(
+        {32u}, std::move(fp16_data));
+    ASSERT_NE(fp16, nullptr);
+    EXPECT_EQ(fp16->raw_data(), fp16_allocation);
+    EXPECT_EQ(fp16->size_bytes(), 32u * sizeof(uint16_t));
+
+    AlignedVector<uint16_t> bf16_data;
+    bf16_data.resize_uninitialized(32u);
+    std::fill(bf16_data.begin(), bf16_data.end(), uint16_t{0x3f80});
+    const uint16_t *const bf16_allocation = bf16_data.data();
+    std::unique_ptr<BF16Tensor> bf16 = factory_->createBF16Owned(
+        {32u}, std::move(bf16_data));
+    ASSERT_NE(bf16, nullptr);
+    EXPECT_EQ(bf16->raw_data(), bf16_allocation);
+    EXPECT_EQ(bf16->size_bytes(), 32u * sizeof(uint16_t));
+}

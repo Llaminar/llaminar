@@ -105,7 +105,37 @@ namespace
         }
 
         void *opaque() const { return static_cast<void *>(stream); }
+
+        void synchronize() const
+        {
+            ASSERT_NE(stream, nullptr);
+            ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        }
     };
+
+    /**
+     * @brief Appends test payload on an owned explicit stream and waits for completion.
+     *
+     * @tparam CacheHandle Pointer-like cache handle exposing the typed GPU append API.
+     * @tparam KPointer Device pointer type for the K payload.
+     * @tparam VPointer Device pointer type for the V payload.
+     * @return true when both publication and stream completion succeed.
+     */
+    template <typename CacheHandle, typename KPointer, typename VPointer>
+    bool appendAndSynchronize(
+        const CacheHandle &cache,
+        int layer,
+        int seq_idx,
+        KPointer k,
+        VPointer v,
+        int token_count)
+    {
+        ScopedCudaStream stream;
+        const bool appended = cache->append(
+            layer, seq_idx, k, v, token_count, stream.stream);
+        stream.synchronize();
+        return appended;
+    }
 
 } // namespace
 
@@ -196,7 +226,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, SingleToken_AppendAndRetrieve)
     auto h_V = generateRandomFP32(kv_dim, 43);
     CudaBuffer d_K(h_K), d_V(h_V);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, 1, 0));
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 1));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 1);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
 
@@ -230,7 +260,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_Zero_NoOp)
     auto h_V = generateRandomFP32(10 * kv_dim);
     CudaBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 10, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 10));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     cache->evict_oldest(0, 0, 0);
@@ -250,13 +280,13 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_ClampedToSize)
     auto h_V = generateRandomFP32(5 * kv_dim);
     CudaBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 5, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 5));
     cache->evict_oldest(0, 0, 100); // Evict more than available
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
-TEST(Test__CUDARingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperations)
+TEST(Test__CUDARingKVCache_Comprehensive, Evict_SequenceCountTracksAcrossOperations)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
@@ -269,17 +299,14 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperatio
     auto h_V = generateRandomFP32(20 * kv_dim);
     CudaBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 20, 0);
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 20));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 20);
 
     cache->evict_oldest(0, 0, 5);
-    EXPECT_EQ(cache->get_total_evicted(), 5);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 15);
 
     cache->evict_oldest(0, 0, 3);
-    EXPECT_EQ(cache->get_total_evicted(), 8);
-
-    cache->reset_eviction_counter();
-    EXPECT_EQ(cache->get_total_evicted(), 0);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 12);
 }
 
 TEST(Test__CUDARingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
@@ -296,7 +323,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 100);
     auto h_V1 = generateRandomFP32(10 * kv_dim, 200);
     CudaBuffer d_K1(h_K1), d_V1(h_V1);
-    cache->append(0, 0, d_K1.ptr, d_V1.ptr, 10, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K1.ptr, d_V1.ptr, 10));
 
     // Evict 5
     cache->evict_oldest(0, 0, 5);
@@ -306,7 +333,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
     auto h_K2 = generateRandomFP32(3 * kv_dim, 300);
     auto h_V2 = generateRandomFP32(3 * kv_dim, 400);
     CudaBuffer d_K2(h_K2), d_V2(h_V2);
-    cache->append(0, 0, d_K2.ptr, d_V2.ptr, 3, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K2.ptr, d_V2.ptr, 3));
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
 
@@ -362,10 +389,17 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiSeq_ClearOne_OtherUnaffected)
     // Fill all layers and sequences
     for (int layer = 0; layer < n_layers; ++layer)
         for (int seq = 0; seq < batch_size; ++seq)
-            cache->append(layer, seq, d_K.ptr, d_V.ptr, 10, 0);
+            ASSERT_TRUE(appendAndSynchronize(
+                cache, layer, seq, d_K.ptr, d_V.ptr, 10));
 
-    // Clear sequence 1 in layer 0
-    cache->clear_sequence(0, 1);
+    ScopedCudaStream reset_stream;
+
+    // Reset sequence 1 in layer 0.
+    ASSERT_TRUE(cache->resetLayerSequenceState(
+        0,
+        1,
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 1), 0);
 
     // Other sequences in same layer unaffected
@@ -396,13 +430,13 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiSeq_IndependentWrapping)
     auto h_K0 = generateRandomFP32(5 * kv_dim, 100);
     auto h_V0 = generateRandomFP32(5 * kv_dim, 200);
     CudaBuffer d_K0(h_K0), d_V0(h_V0);
-    cache->append(0, 0, d_K0.ptr, d_V0.ptr, 5, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K0.ptr, d_V0.ptr, 5));
 
     // Seq 1: fill 10 tokens (wraps)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 300);
     auto h_V1 = generateRandomFP32(10 * kv_dim, 400);
     CudaBuffer d_K1(h_K1), d_V1(h_V1);
-    cache->append(0, 1, d_K1.ptr, d_V1.ptr, 10, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 1, d_K1.ptr, d_V1.ptr, 10));
 
     // Seq 0: not wrapped, seq 1: wrapped
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
@@ -447,7 +481,7 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiWrap_StressTest)
         cudaMemcpy(d_K.ptr, h_K.data(), 4 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V.ptr, h_V.data(), 4 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-        cache->append(0, 0, d_K.ptr, d_V.ptr, 4, 0);
+        ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 4));
 
         if (batch == 9)
             last_batch_K = h_K;
@@ -523,8 +557,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     ASSERT_EQ(cudaStreamSynchronize(stream.stream), cudaSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
-    // Clear via IKVCache
-    cache->clear();
+    // Reset via IKVCache on the same explicit stream as the append.
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }
 
@@ -549,16 +584,16 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiLayer_IndependentWrapping)
     auto h_K0 = generateRandomFP32(5 * kv_dim, 100);
     cudaMemcpy(d_K.ptr, h_K0.data(), 5 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V.ptr, h_K0.data(), 5 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 5, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 5));
 
     // Layer 1: 10 tokens (wraps once)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 200);
     cudaMemcpy(d_K.ptr, h_K1.data(), 8 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V.ptr, h_K1.data(), 8 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cache->append(1, 0, d_K.ptr, d_V.ptr, 8, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 1, 0, d_K.ptr, d_V.ptr, 8));
     cudaMemcpy(d_K.ptr, h_K1.data() + 8 * kv_dim, 2 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V.ptr, h_K1.data() + 8 * kv_dim, 2 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cache->append(1, 0, d_K.ptr, d_V.ptr, 2, 0);
+    ASSERT_TRUE(appendAndSynchronize(cache, 1, 0, d_K.ptr, d_V.ptr, 2));
 
     // Layer 2: empty
     // (no append)
@@ -589,7 +624,8 @@ TEST(Test__CUDARingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
     // Fill partially (not wrapped)
     auto h_data = generateRandomFP32((max_seq - 1) * kv_dim);
     CudaBuffer d_K(h_data), d_V(h_data);
-    cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq - 1, 0);
+    ASSERT_TRUE(appendAndSynchronize(
+        cache, 0, 0, d_K.ptr, d_V.ptr, max_seq - 1));
     EXPECT_FALSE(cache->is_wrapped(0, 0));
 
     const void *dk, *dv;
@@ -600,7 +636,8 @@ TEST(Test__CUDARingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
     // Add 2 more tokens to force wrap
     auto h_extra = generateRandomFP32(2 * kv_dim, 999);
     CudaBuffer d_extra(h_extra);
-    cache->append(0, 0, d_extra.ptr, d_extra.ptr, 2, 0);
+    ASSERT_TRUE(appendAndSynchronize(
+        cache, 0, 0, d_extra.ptr, d_extra.ptr, 2));
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
     cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
@@ -629,12 +666,11 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     auto h_V = generateRandomFP32(max_seq * kv_dim, 43);
     CudaBuffer d_K(h_K), d_V(h_V);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq, 0));
+    ASSERT_TRUE(appendAndSynchronize(
+        cache, 0, 0, d_K.ptr, d_V.ptr, max_seq));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq);
     // Note: filling to exact capacity wraps the head pointer to position 0,
     // so is_wrapped() returns true. This is by design in the ring buffer.
-    EXPECT_EQ(cache->get_total_evicted(), 0);
-
     // Retrieve and verify data integrity despite head-pointer wrap
     const void *dk, *dv;
     int len;
@@ -647,10 +683,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
 }
 
 // =============================================================================
-// 12. Clear All Resets Eviction and Linearization Counters
+// 12. Clear All Resets Canonical Ring State
 // =============================================================================
 
-TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCounters)
+TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCanonicalRingState)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
@@ -662,15 +698,17 @@ TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCounters)
     auto h_data = generateRandomFP32(10 * kv_dim);
     CudaBuffer d_K(h_data), d_V(h_data);
 
-    // Cause some evictions and linearizations
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 10, 0);
-    EXPECT_GT(cache->get_total_evicted(), 0);
+    // Fill beyond capacity and force a scalar linearization before reset.
+    ASSERT_TRUE(appendAndSynchronize(cache, 0, 0, d_K.ptr, d_V.ptr, 10));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
 
     const void *dk, *dv;
     int len;
     cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
 
-    // Clear should reset
-    cache->clear();
+    ScopedCudaStream reset_stream;
+    ASSERT_TRUE(cache->resetRequestState(
+        IKVCache::StateResetContext::testReinitialization(
+            reset_stream.opaque())));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }

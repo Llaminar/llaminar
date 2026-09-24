@@ -11,6 +11,12 @@ using namespace llaminar2;
 
 TEST(Perf__Q3K_Unpack, Benchmark)
 {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (!cpu_supports_avx512())
+    {
+        GTEST_SKIP() << "AVX512 not supported";
+    }
+
     // Setup data
     const int num_blocks = 10000;
     std::vector<Q3_KBlock> blocks(num_blocks);
@@ -57,4 +63,7 @@ TEST(Perf__Q3K_Unpack, Benchmark)
     std::cout << "Q3_K Unpack Performance:" << std::endl;
     std::cout << "  Time: " << duration_sec << " s" << std::endl;
     std::cout << "  Throughput: " << gb_per_sec << " GB/s (output)" << std::endl;
+#else
+    GTEST_SKIP() << "AVX512 unpacker not compiled";
+#endif
 }

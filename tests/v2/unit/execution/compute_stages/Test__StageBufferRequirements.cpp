@@ -215,6 +215,30 @@ TEST_F(Test__StageBufferRequirements, RoPEStage_OnlyQ_SingleBuffer)
     EXPECT_EQ(findBuffer(reqs, "K"), nullptr);
 }
 
+TEST_F(Test__StageBufferRequirements, RoPEStage_OnlyQ_PreservesArenaContract)
+{
+    const size_t q_dim = N_HEADS * HEAD_DIM;
+    auto Q = createFP32Tensor(SEQ_LEN, q_dim);
+
+    RoPEStage::Params params{
+        .Q = Q.get(),
+        .K = nullptr,
+        .n_heads = N_HEADS,
+        .n_kv_heads = 0,
+        .head_dim = HEAD_DIM,
+        .q_buffer_id = BufferId::Q_PROJ,
+    };
+    RoPEStage stage(params);
+
+    const StageBufferContract contract = stage.bufferContract();
+
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts.front().id, BufferId::Q_PROJ);
+    EXPECT_EQ(contract.inouts.front().access, BufferAccess::READWRITE);
+    EXPECT_TRUE(contract.inputs.empty());
+    EXPECT_TRUE(contract.outputs.empty());
+}
+
 // =============================================================================
 // GEMMStage Tests
 // =============================================================================

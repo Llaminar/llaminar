@@ -212,7 +212,7 @@ namespace
             {
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, 0);
+                (void)hipGetDeviceProperties(&props, 0);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
             }
 #else
@@ -250,15 +250,15 @@ namespace
                 hipMalloc(&d_scales, scale_bytes) != hipSuccess)
             {
                 if (d_fp32)
-                    hipFree(d_fp32);
+                    (void)hipFree(d_fp32);
                 if (d_int8)
-                    hipFree(d_int8);
+                    (void)hipFree(d_int8);
                 if (d_scales)
-                    hipFree(d_scales);
+                    (void)hipFree(d_scales);
                 return result;
             }
 
-            hipMemcpy(d_fp32, h_fp32, fp32_bytes, hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_fp32, h_fp32, fp32_bytes, hipMemcpyHostToDevice);
 
             // Set variant via environment
             ScopedEnvOverride env_override("LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT",
@@ -266,8 +266,8 @@ namespace
 
             // Correctness check: run once, download results
             {
-                hipMemset(d_int8, 0, int8_bytes);
-                hipMemset(d_scales, 0, scale_bytes);
+                (void)hipMemset(d_int8, 0, int8_bytes);
+                (void)hipMemset(d_scales, 0, scale_bytes);
 
                 bool ok = rocmQuantGemm_quantizeActivationsBlockwise(
                     d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
@@ -275,16 +275,16 @@ namespace
 
                 if (!ok)
                 {
-                    hipFree(d_fp32);
-                    hipFree(d_int8);
-                    hipFree(d_scales);
+                    (void)hipFree(d_fp32);
+                    (void)hipFree(d_int8);
+                    (void)hipFree(d_scales);
                     return result;
                 }
 
                 std::vector<int8_t> h_int8(static_cast<size_t>(M) * shape.K);
                 std::vector<float> h_scales(static_cast<size_t>(M) * blocks_per_row);
-                hipMemcpy(h_int8.data(), d_int8, int8_bytes, hipMemcpyDeviceToHost);
-                hipMemcpy(h_scales.data(), d_scales, scale_bytes, hipMemcpyDeviceToHost);
+                (void)hipMemcpy(h_int8.data(), d_int8, int8_bytes, hipMemcpyDeviceToHost);
+                (void)hipMemcpy(h_scales.data(), d_scales, scale_bytes, hipMemcpyDeviceToHost);
 
                 // Compare against CPU reference
                 int mismatches = 0;
@@ -320,8 +320,8 @@ namespace
 
             // Timed runs
             hipEvent_t start = nullptr, stop = nullptr;
-            hipEventCreate(&start);
-            hipEventCreate(&stop);
+            (void)hipEventCreate(&start);
+            (void)hipEventCreate(&stop);
 
             std::vector<double> times_us;
             times_us.reserve(BENCH_RUNS);
@@ -329,19 +329,19 @@ namespace
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
                 (void)hipDeviceSynchronize();
-                hipEventRecord(start);
+                (void)hipEventRecord(start);
                 rocmQuantGemm_quantizeActivationsBlockwise(
                     d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
-                hipEventRecord(stop);
-                hipEventSynchronize(stop);
+                (void)hipEventRecord(stop);
+                (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
-                hipEventElapsedTime(&ms, start, stop);
+                (void)hipEventElapsedTime(&ms, start, stop);
                 times_us.push_back(static_cast<double>(ms) * 1000.0);
             }
 
-            hipEventDestroy(start);
-            hipEventDestroy(stop);
+            (void)hipEventDestroy(start);
+            (void)hipEventDestroy(stop);
 
             std::sort(times_us.begin(), times_us.end());
             result.min_us = times_us.front();
@@ -354,9 +354,9 @@ namespace
                                         ? total_bytes / (result.min_us * 1e-6) / 1e9
                                         : 0.0;
 
-            hipFree(d_fp32);
-            hipFree(d_int8);
-            hipFree(d_scales);
+            (void)hipFree(d_fp32);
+            (void)hipFree(d_int8);
+            (void)hipFree(d_scales);
             return result;
         }
 
@@ -383,15 +383,15 @@ namespace
                 hipMalloc(&d_scales, scale_bytes) != hipSuccess)
             {
                 if (d_fp32)
-                    hipFree(d_fp32);
+                    (void)hipFree(d_fp32);
                 if (d_int8)
-                    hipFree(d_int8);
+                    (void)hipFree(d_int8);
                 if (d_scales)
-                    hipFree(d_scales);
+                    (void)hipFree(d_scales);
                 return result;
             }
 
-            hipMemcpy(d_fp32, h_fp32, fp32_bytes, hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_fp32, h_fp32, fp32_bytes, hipMemcpyHostToDevice);
             result.correctness_pass = true; // Blockwise baseline is the reference path
 
             // Warmup
@@ -404,8 +404,8 @@ namespace
 
             // Timed runs
             hipEvent_t start = nullptr, stop = nullptr;
-            hipEventCreate(&start);
-            hipEventCreate(&stop);
+            (void)hipEventCreate(&start);
+            (void)hipEventCreate(&stop);
 
             std::vector<double> times_us;
             times_us.reserve(BENCH_RUNS);
@@ -413,19 +413,19 @@ namespace
             for (int i = 0; i < BENCH_RUNS; ++i)
             {
                 (void)hipDeviceSynchronize();
-                hipEventRecord(start);
+                (void)hipEventRecord(start);
                 rocmQuantGemm_quantizeActivationsBlockwise(
                     d_fp32, d_int8, d_scales, M, shape.K, 0, nullptr, 32);
-                hipEventRecord(stop);
-                hipEventSynchronize(stop);
+                (void)hipEventRecord(stop);
+                (void)hipEventSynchronize(stop);
 
                 float ms = 0.0f;
-                hipEventElapsedTime(&ms, start, stop);
+                (void)hipEventElapsedTime(&ms, start, stop);
                 times_us.push_back(static_cast<double>(ms) * 1000.0);
             }
 
-            hipEventDestroy(start);
-            hipEventDestroy(stop);
+            (void)hipEventDestroy(start);
+            (void)hipEventDestroy(stop);
 
             std::sort(times_us.begin(), times_us.end());
             result.min_us = times_us.front();
@@ -437,9 +437,9 @@ namespace
                                         ? total_bytes / (result.min_us * 1e-6) / 1e9
                                         : 0.0;
 
-            hipFree(d_fp32);
-            hipFree(d_int8);
-            hipFree(d_scales);
+            (void)hipFree(d_fp32);
+            (void)hipFree(d_int8);
+            (void)hipFree(d_scales);
             return result;
         }
 #endif

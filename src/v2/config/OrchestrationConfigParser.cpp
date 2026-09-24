@@ -2,19 +2,37 @@
  * @file OrchestrationConfigParser.cpp
  * @brief Implementation of OrchestrationConfigParser
  *
+ * Converts CLI and YAML requests into orchestration configuration. Unsupported
+ * model activation modes fail at input admission through the same production
+ * policy used by configuration validation and parity-matrix discovery.
+ * CLI environment publications also refresh the canonical startup snapshot:
+ * early logging must not give direct launches different kernel policy from
+ * self-launched MPI children that inherit the same options through environ.
+ * NUMA intent comes from the parsed address, not its textual width: serialized
+ * unknown locality remains unresolved across CLI, YAML and rank-map surfaces.
+ * Automatic planning options preserve hard restrictions separately from hints.
+ * Both command frontends consume this configuration rather than owning another
+ * backend/strategy parser with different accepted values or defaults.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationConfigParser.h"
+#include "OrchestrationConfigDocument.h"
+#include "OrchestrationStartupPolicy.h"
+#include "config/ActivationPrecisionPolicy.h"
+#include "config/ExpertTierDefinition.h"
 #include "ParallelismTreeParser.h"          // For --topology parsing
 #include "execution/config/RuntimeConfig.h" // For parseFusedAttentionBackend
 #include "utils/Logger.h"
+#include "utils/DebugEnv.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 #include <stdexcept>
 #include <set>
 #include <limits>
@@ -88,6 +106,28 @@ namespace llaminar2
             return count;
         }
 
+        /** @brief Parse the explicit action; the default remains infer-from-placement. */
+        OrchestrationPlanningMode parsePlanningMode(const std::string &value)
+        {
+            if (value == "auto") return OrchestrationPlanningMode::Automatic;
+            if (value == "apply") return OrchestrationPlanningMode::Apply;
+            throw std::invalid_argument("planning.mode must be auto or apply");
+        }
+
+        /** @brief Apply the shared planning section without accepting misspelled hard filters. */
+        void applyPlanningYamlKey(OrchestrationConfig &config, const std::string &key, const std::string &value)
+        {
+            if (key == "mode") config.planning_mode = parsePlanningMode(value);
+            else if (key == "only_backends") config.automatic_planning.only_backends = parseOrchestrationBackendList(value);
+            else if (key == "only_strategies") config.automatic_planning.only_strategies = parseOrchestrationStrategyList(value);
+            else if (key == "device_counts") config.automatic_planning.device_counts = parseAutomaticDeviceCounts(value);
+            else if (key == "hosts") config.automatic_planning.host_participation = parseAutomaticHostParticipation(value);
+            else if (key == "workload") config.automatic_planning.workload = parseOrchestrationPlanningWorkload(value);
+            else if (key == "prefer_backend") config.automatic_planning.prefer_backend = parseOrchestrationComputeBackend(value);
+            else if (key == "prefer_strategy") config.automatic_planning.prefer_strategy = parseOrchestrationStrategy(value);
+            else throw std::invalid_argument("Unknown planning option: " + key);
+        }
+
         std::string stripOuterQuotes(std::string value)
         {
             value = trim(value);
@@ -140,6 +180,98 @@ namespace llaminar2
             return static_cast<size_t>(parsed);
         }
 
+        uint64_t parseNonNegativeUint64Value(const std::string &value, const std::string &option_name)
+        {
+            const std::string trimmed_value = trim(value);
+            if (trimmed_value.empty() || trimmed_value.front() == '-')
+            {
+                throw std::invalid_argument(option_name + " must be a non-negative integer");
+            }
+
+            size_t parsed_chars = 0;
+            unsigned long long parsed = 0;
+            try
+            {
+                parsed = std::stoull(trimmed_value, &parsed_chars);
+            }
+            catch (const std::exception &)
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+            if (parsed_chars != trimmed_value.size())
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+            return static_cast<uint64_t>(parsed);
+        }
+
+        /** @brief Parse a strictly positive unsigned 64-bit policy value. */
+        uint64_t parsePositiveUint64Value(
+            const std::string &value,
+            const std::string &option_name)
+        {
+            const uint64_t parsed =
+                parseNonNegativeUint64Value(value, option_name);
+            if (parsed == 0u)
+            {
+                throw std::invalid_argument(
+                    option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
+        uint32_t parseNonNegativeUint32Value(const std::string &value, const std::string &option_name)
+        {
+            const uint64_t parsed = parseNonNegativeUint64Value(value, option_name);
+            if (parsed > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return static_cast<uint32_t>(parsed);
+        }
+
+        uint32_t parsePositiveUint32Value(const std::string &value, const std::string &option_name)
+        {
+            const uint32_t parsed = parseNonNegativeUint32Value(value, option_name);
+            if (parsed == 0u)
+            {
+                throw std::invalid_argument(option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
+        /**
+         * @brief Parse a non-negative signed integer without accepting truncation.
+         * @param value User-provided decimal value.
+         * @param option_name Human-readable option name used in diagnostics.
+         * @return Parsed value in the range `[0, INT_MAX]`.
+         * @throws std::invalid_argument If the value is negative, malformed, or
+         *         cannot be represented by `int`.
+         */
+        int parseNonNegativeIntValue(const std::string &value, const std::string &option_name)
+        {
+            const uint64_t parsed = parseNonNegativeUint64Value(value, option_name);
+            if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return static_cast<int>(parsed);
+        }
+
+        /** @brief Parse a strictly positive signed integer policy value. */
+        int parsePositiveIntValue(
+            const std::string &value,
+            const std::string &option_name)
+        {
+            const int parsed = parseNonNegativeIntValue(value, option_name);
+            if (parsed == 0)
+            {
+                throw std::invalid_argument(
+                    option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
         size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
         {
             constexpr size_t MiB = 1024ull * 1024ull;
@@ -151,14 +283,52 @@ namespace llaminar2
             return megabytes * MiB;
         }
 
-        MoEExpertMode parseMoEExpertModeValue(const std::string &value)
+        RoutedExpertComputePolicy parseRoutedExpertComputePolicyValue(const std::string &value)
         {
-            auto parsed = parseMoEExpertMode(value);
+            auto parsed = parseRoutedExpertComputePolicy(value);
             if (!parsed)
             {
                 throw std::invalid_argument(
-                    "Invalid MoE expert mode: '" + value +
-                    "' (valid: expert-parallel, tensor-parallel, replicated)");
+                    "Invalid routed-expert compute policy: '" + value +
+                    "' (valid: replicated, apportioned, tensor-sharded)");
+            }
+            return *parsed;
+        }
+
+        RoutedExpertOwnerOrder parseRoutedExpertOwnerOrderValue(
+            const std::string &value)
+        {
+            auto parsed = parseRoutedExpertOwnerOrder(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid routed-expert owner order: '" + value +
+                    "' (valid: ordinal, random)");
+            }
+            return *parsed;
+        }
+
+        void applyRoutedExpertOwnerOrder(
+            OrchestrationConfig &config,
+            const std::string &value)
+        {
+            config.routed_expert_owner_order =
+                parseRoutedExpertOwnerOrderValue(value);
+            if (config.moe_routed_expert_plan)
+            {
+                config.moe_routed_expert_plan->owner_order =
+                    config.routed_expert_owner_order;
+            }
+        }
+
+        DenseParallelPolicy parseDenseParallelPolicyValue(const std::string &value)
+        {
+            auto parsed = parseDenseParallelPolicy(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid MoE dense parallel policy: '" + value +
+                    "' (valid: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, prefill-tensor-parallel-decode-replicated)");
             }
             return *parsed;
         }
@@ -169,8 +339,8 @@ namespace llaminar2
             if (!parsed)
             {
                 throw std::invalid_argument(
-                    "Invalid MoE rebalance mode: '" + value +
-                    "' (valid: off, observe, dynamic)");
+                    "Invalid routed-expert residency maintenance mode: '" +
+                    value + "' (valid: off, observe, dynamic)");
             }
             return *parsed;
         }
@@ -233,27 +403,206 @@ namespace llaminar2
             const std::string normalized_key = normalizeToken(key);
             if (normalized_key == "expert_mode")
             {
-                config.moe_expert_mode = parseMoEExpertModeValue(value);
+                throw std::invalid_argument(
+                    "Obsolete MoE YAML key 'expert_mode'; use "
+                    "'routed_expert_compute_policy' with replicated, "
+                    "apportioned, or tensor-sharded");
+            }
+            if (normalized_key == "routed_expert_compute_policy")
+            {
+                config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
+            }
+            else if (normalized_key == "routed_expert_owner_order")
+            {
+                applyRoutedExpertOwnerOrder(config, value);
             }
             else if (normalized_key == "hot_expert_cache")
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
             }
-            else if (normalized_key == "rebalance")
+            else if (normalized_key == "residency_maintenance")
             {
                 config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
             }
-            else if (normalized_key == "rebalance_window")
+            else if (normalized_key == "residency_maintenance_window")
             {
                 config.moe_rebalance.window_size = std::stoi(value);
             }
-            else if (normalized_key == "rebalance_max_window")
+            else if (normalized_key == "residency_maintenance_max_window")
             {
                 config.moe_rebalance.max_window_size = std::stoi(value);
             }
-            else if (normalized_key == "rebalance_window_growth")
+            else if (normalized_key == "residency_maintenance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "migration_payoff_horizon_tokens")
+            {
+                config.moe_rebalance.migration_payoff_horizon_tokens =
+                    parsePositiveUint64Value(
+                        value,
+                        "moe.migration_payoff_horizon_tokens");
+            }
+            else if (normalized_key == "migration_transfer_slots")
+            {
+                config.moe_rebalance.migration_transfer_slots =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_transfer_slots");
+            }
+            else if (normalized_key == "migration_execution_streams")
+            {
+                config.moe_rebalance.migration_execution_streams =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_execution_streams");
+            }
+            else if (normalized_key == "migration_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_cycles_per_wave");
+            }
+            else if (normalized_key ==
+                     "routed_prefill_assignment_window_tokens")
+            {
+                config.moe_routed_prefill.assignment_window_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key == "overlay_prefill_segment_rows")
+            {
+                config.moe_routed_prefill.overlay_segment_rows =
+                    parsePositiveIntValue(
+                        value,
+                        "moe.overlay_prefill_segment_rows");
+            }
+            else if (normalized_key ==
+                     "routed_prefill_least_loaded_min_routed_rows")
+            {
+                config.moe_routed_prefill.least_loaded_min_routed_rows =
+                    parseNonNegativeUint64Value(
+                        value,
+                        "moe.routed_prefill_least_loaded_min_routed_rows");
+            }
+            else if (normalized_key == "routed_prefill_llep_alpha_numerator")
+            {
+                config.moe_routed_prefill.llep_alpha_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_alpha_numerator");
+            }
+            else if (normalized_key == "routed_prefill_llep_alpha_denominator")
+            {
+                config.moe_routed_prefill.llep_alpha_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_alpha_denominator");
+            }
+            else if (normalized_key == "routed_prefill_llep_lambda_numerator")
+            {
+                config.moe_routed_prefill.llep_lambda_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_lambda_numerator");
+            }
+            else if (normalized_key == "routed_prefill_llep_lambda_denominator")
+            {
+                config.moe_routed_prefill.llep_lambda_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.routed_prefill_llep_lambda_denominator");
+            }
+            else if (normalized_key == "routed_prefill_llep_enable_balanced_skip")
+            {
+                config.moe_routed_prefill.llep_enable_balanced_skip =
+                    parseBoolValue(value);
+            }
+            else if (normalized_key == "dynamic_imbalance_threshold_permille")
+            {
+                config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_imbalance_threshold_permille");
+            }
+            else if (normalized_key == "dynamic_min_improvement_permille")
+            {
+                config.moe_rebalance.dynamic_min_improvement_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_min_improvement_permille");
+            }
+            else if (normalized_key == "dynamic_max_swaps_per_layer")
+            {
+                config.moe_rebalance.dynamic_max_swaps_per_layer =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_max_swaps_per_layer");
+            }
+            else if (normalized_key == "dynamic_max_plan_entries_per_wave")
+            {
+                config.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_max_plan_entries_per_wave");
+            }
+            else if (normalized_key == "dynamic_min_window_activations")
+            {
+                config.moe_rebalance.dynamic_min_window_activations =
+                    parseNonNegativeUint64Value(value, "moe.dynamic_min_window_activations");
+            }
+            else if (normalized_key == "device_rebalance_maintenance_slack_tokens")
+            {
+                config.moe_rebalance.device_maintenance_slack_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_maintenance_slack_tokens");
+            }
+            else if (normalized_key == "device_rebalance_min_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_min_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_min_maintenance_period_tokens");
+            }
+            else if (normalized_key == "device_rebalance_initial_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_initial_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe.device_rebalance_initial_maintenance_period_tokens");
+            }
+            else if (normalized_key == "device_min_load_spread_improvement")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement =
+                    parseNonNegativeUint32Value(value, "moe.device_min_load_spread_improvement");
+            }
+            else if (normalized_key == "device_min_load_spread_improvement_divisor")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement_divisor =
+                    parseNonNegativeUint32Value(value, "moe.device_min_load_spread_improvement_divisor");
+            }
+            else if (normalized_key == "device_min_wave_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_wave_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key ==
+                     "device_min_foreign_rows_per_critical_path_payload_slot")
+            {
+                config.moe_rebalance
+                    .device_min_foreign_rows_per_critical_path_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_foreign_rows_per_critical_path_payload_slot");
+            }
+            else if (normalized_key == "device_min_router_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_router_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "device_max_post_wave_load_spread_permille")
+            {
+                config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.device_max_post_wave_load_spread_permille");
             }
             else if (normalized_key == "release_raw_expert_weights")
             {
@@ -328,6 +677,15 @@ namespace llaminar2
                 if (config.mtp.draft_tokens <= 0)
                     throw std::invalid_argument("mtp draft_tokens must be > 0");
             }
+            else if (key == "graph_capacity_draft_tokens")
+            {
+                config.mtp.graph_capacity_draft_tokens = std::stoi(value);
+                if (config.mtp.graph_capacity_draft_tokens < 0)
+                {
+                    throw std::invalid_argument(
+                        "mtp graph_capacity_draft_tokens must be >= 0");
+                }
+            }
             else if (key == "max_request_batch")
             {
                 config.mtp.max_request_batch = std::stoi(value);
@@ -340,6 +698,17 @@ namespace llaminar2
                 if (!parsed)
                     throw std::invalid_argument("Invalid mtp verify_mode: '" + value + "'");
                 config.mtp.verify_mode = *parsed;
+            }
+            else if (key == "terminal_head_policy")
+            {
+                auto parsed = parseMTPTerminalHeadPolicy(value);
+                if (!parsed)
+                {
+                    throw std::invalid_argument(
+                        "Invalid mtp terminal_head_policy: '" + value +
+                        "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                }
+                config.mtp.terminal_head_policy = *parsed;
             }
             else if (key == "require_terminal_hidden_for_full_hit")
             {
@@ -404,164 +773,113 @@ namespace llaminar2
             }
             else if (key == "depth_demote_zero_accept")
             {
-                config.mtp.depth_policy.demote_zero_accept_rate = std::stod(value);
+                config.mtp.depth_policy.demote_zero_accept_rate = parseMTPZeroAcceptDemotionRate(value);
             }
             else if (key == "depth_demote_acceptance")
             {
                 config.mtp.depth_policy.demote_acceptance_rate = std::stod(value);
             }
-        }
-
-        std::shared_ptr<MoEExpertParallelPlan> ensureMoEExpertParallelPlan(OrchestrationConfig &config)
-        {
-            if (!config.moe_expert_parallel_plan)
+            else
             {
-                config.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
+                throw std::invalid_argument("Unknown mtp option: '" + key + "'");
             }
-            return config.moe_expert_parallel_plan;
         }
 
-        MoEExpertExecutionKind parseMoEExpertExecutionKind(const std::string &value, bool &enabled)
+        std::shared_ptr<MoERoutedExpertPlacementPlan> ensureMoERoutedExpertPlacementPlan(OrchestrationConfig &config)
+        {
+            if (!config.moe_routed_expert_plan)
+            {
+                config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+                config.moe_routed_expert_plan->owner_order =
+                    config.routed_expert_owner_order;
+            }
+            return config.moe_routed_expert_plan;
+        }
+
+        RoutedExpertPlacementTopology parseRoutedExpertPlacementTopologyValue(
+            const std::string &value,
+            bool &enabled)
         {
             const std::string normalized = normalizeToken(value);
             if (normalized == "off" || normalized == "disabled" || normalized == "false")
             {
                 enabled = false;
-                return MoEExpertExecutionKind::TieredExpertOverlay;
+                return RoutedExpertPlacementTopology::TieredOverlay;
             }
-            if (normalized == "tiered" || normalized == "tiered_expert_overlay")
+            if (normalized == "tiered_overlay")
             {
                 enabled = true;
-                return MoEExpertExecutionKind::TieredExpertOverlay;
+                return RoutedExpertPlacementTopology::TieredOverlay;
             }
-            if (normalized == "single_domain" || normalized == "single_domain_expert_sharded")
+            if (normalized == "single_domain")
             {
                 enabled = true;
-                return MoEExpertExecutionKind::SingleDomainExpertSharded;
+                return RoutedExpertPlacementTopology::SingleDomain;
             }
-            throw std::invalid_argument("Invalid MoE expert overlay kind: '" + value + "' (valid: off, single-domain, tiered)");
+            throw std::invalid_argument(
+                "Invalid routed-expert placement topology: '" + value +
+                "' (valid: off, single-domain, tiered-overlay)");
         }
 
-        void applyMoEExpertOverlayKind(OrchestrationConfig &config, const std::string &value)
+        void applyRoutedExpertPlacementTopology(
+            OrchestrationConfig &config,
+            const std::string &value)
         {
             bool enabled = false;
-            const auto kind = parseMoEExpertExecutionKind(value, enabled);
-            auto plan = ensureMoEExpertParallelPlan(config);
+            const auto topology = parseRoutedExpertPlacementTopologyValue(value, enabled);
+            auto plan = ensureMoERoutedExpertPlacementPlan(config);
             plan->enabled = enabled;
             if (enabled)
             {
-                plan->execution_kind = kind;
+                plan->topology = topology;
             }
         }
 
-        ExpertResidencyPolicy parseExpertResidencyPolicyValue(const std::string &value)
+        RoutedExpertResidencyPolicy parseRoutedExpertResidencyPolicyValue(const std::string &value)
         {
             const std::string normalized = normalizeToken(value);
             if (normalized == "disabled" || normalized == "off" || normalized == "none")
-                return ExpertResidencyPolicy::Disabled;
+                return RoutedExpertResidencyPolicy::Disabled;
             if (normalized == "static_by_id")
-                return ExpertResidencyPolicy::StaticById;
+                return RoutedExpertResidencyPolicy::StaticById;
             if (normalized == "histogram" || normalized == "histogram_tiered_cache")
-                return ExpertResidencyPolicy::HistogramTieredCache;
+                return RoutedExpertResidencyPolicy::HistogramTieredCache;
             if (normalized == "explicit_masks")
-                return ExpertResidencyPolicy::ExplicitMasks;
+                return RoutedExpertResidencyPolicy::ExplicitMasks;
             if (normalized == "rebalanced" || normalized == "routed_tier_rebalanced" || normalized == "routed_tier_rebalance")
-                return ExpertResidencyPolicy::RoutedTierRebalanced;
-            throw std::invalid_argument("Invalid MoE expert overlay residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
+                return RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            throw std::invalid_argument("Invalid routed-expert residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
         }
 
-        ExpertComputeDomain parseMoEExpertOverlayDomainSpec(const std::string &spec)
+        /** @brief Adapt expanded declarations through the compact typed grammar. */
+        RoutedExpertDomain parseMoERoutedExpertDomainSpec(const std::string &spec)
         {
-            ExecutionDomainParseOptions options;
-            options.context = "MoE expert overlay domain";
-            options.require_scope = true;
-            options.allow_global_scope = false;
-            options.require_compute = true;
-            return ExpertComputeDomain::fromExecutionDomainDefinition(
-                ExecutionDomainDefinition::parse(spec, options));
+            return ExpertTierDefinition::parseDomain(spec);
         }
 
-        ExpertRoutedTier parseMoEExpertOverlayTierSpec(const std::string &spec)
+        /** @brief Share capacity validation between expanded and compact tiers. */
+        RoutedExpertTier parseMoERoutedExpertTierSpec(const std::string &spec)
         {
-            const auto sections = split(spec, ';');
-            if (sections.empty())
-            {
-                throw std::invalid_argument("MoE expert overlay tier spec is empty");
-            }
-
-            const auto at_pos = sections[0].find('@');
-            if (at_pos == std::string::npos)
-            {
-                throw std::invalid_argument("Invalid MoE expert overlay tier spec: '" + spec + "' (expected name@domain;priority=N)");
-            }
-
-            ExpertRoutedTier tier;
-            tier.name = trim(sections[0].substr(0, at_pos));
-            tier.domain = trim(sections[0].substr(at_pos + 1));
-            if (tier.name.empty() || tier.domain.empty())
-            {
-                throw std::invalid_argument("MoE expert overlay tier must include non-empty name and domain");
-            }
-
-            bool saw_priority = false;
-            for (size_t i = 1; i < sections.size(); ++i)
-            {
-                const auto eq_pos = sections[i].find('=');
-                if (eq_pos == std::string::npos)
-                {
-                    throw std::invalid_argument("Invalid MoE expert overlay tier option: '" + sections[i] + "'");
-                }
-
-                const std::string key = normalizeToken(sections[i].substr(0, eq_pos));
-                const std::string value = trim(sections[i].substr(eq_pos + 1));
-
-                if (key == "priority")
-                {
-                    tier.priority = std::stoi(value);
-                    saw_priority = true;
-                }
-                else if (key == "max_experts_per_layer")
-                {
-                    tier.max_experts_per_layer = std::stoi(value);
-                    if (tier.max_experts_per_layer < 0)
-                    {
-                        throw std::invalid_argument("MoE expert overlay tier max-experts-per-layer must be >= 0");
-                    }
-                }
-                else if (key == "memory_mb")
-                {
-                    if (normalizeToken(value) == "auto")
-                    {
-                        tier.memory_budget_bytes = 0;
-                    }
-                    else
-                    {
-                        const auto mb = std::stoull(value);
-                        tier.memory_budget_bytes = mb * 1024ULL * 1024ULL;
-                    }
-                }
-                else if (key == "fallback")
-                {
-                    tier.fallback = parseBoolValue(value);
-                }
-                else
-                {
-                    throw std::invalid_argument("Unknown MoE expert overlay tier option: '" + key + "'");
-                }
-            }
-
-            if (!saw_priority)
-            {
-                throw std::invalid_argument("MoE expert overlay tier '" + tier.name + "' is missing priority=<n>");
-            }
-
-            return tier;
+            return ExpertTierDefinition::parsePlacement(spec);
         }
 
-        std::string formatMoEOverlayValidationErrors(const std::vector<std::string> &errors)
+        /** @brief Append one compact declaration to the existing overlay authority. */
+        void appendExpertTier(OrchestrationConfig &config, const std::string &spec)
+        {
+            auto definition = ExpertTierDefinition::parse(spec);
+            auto plan = ensureMoERoutedExpertPlacementPlan(config);
+            plan->enabled = true;
+            if (plan->continuation_dense_policy_intent != MoEContinuationDensePolicyIntent::Explicit)
+                plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Automatic;
+            plan->domains.push_back(std::move(definition.domain));
+            plan->routed_tiers.push_back(std::move(definition.tier));
+        }
+
+        std::string formatMoERoutedExpertPlacementValidationErrors(
+            const std::vector<std::string> &errors)
         {
             std::ostringstream message;
-            message << "Invalid MoE expert overlay configuration:";
+            message << "Invalid MoE routed-expert placement configuration:";
             for (const auto &error : errors)
             {
                 message << "\n - " << error;
@@ -569,7 +887,7 @@ namespace llaminar2
             return message.str();
         }
 
-        void parseMoEExpertParallelYamlBlock(const std::string &yaml, OrchestrationConfig &config)
+        void parseMoERoutedExpertPlacementYamlBlock(const std::string &yaml, OrchestrationConfig &config)
         {
             std::istringstream stream(yaml);
             std::string line;
@@ -585,13 +903,19 @@ namespace llaminar2
                 }
 
                 const size_t indent = leadingWhitespace(line);
+                if (indent == 0 && trimmed == "moe_expert_parallel:")
+                {
+                    throw std::invalid_argument(
+                        "Obsolete YAML block 'moe_expert_parallel'; use "
+                        "'moe_routed_expert_placement'");
+                }
                 if (!in_moe_block)
                 {
-                    if (indent == 0 && trimmed == "moe_expert_parallel:")
+                    if (indent == 0 && trimmed == "moe_routed_expert_placement:")
                     {
                         in_moe_block = true;
                         current_moe_section.clear();
-                        ensureMoEExpertParallelPlan(config);
+                        ensureMoERoutedExpertPlacementPlan(config);
                     }
                     continue;
                 }
@@ -600,26 +924,26 @@ namespace llaminar2
                 {
                     in_moe_block = false;
                     current_moe_section.clear();
-                    if (trimmed == "moe_expert_parallel:")
+                    if (trimmed == "moe_routed_expert_placement:")
                     {
                         in_moe_block = true;
-                        ensureMoEExpertParallelPlan(config);
+                        ensureMoERoutedExpertPlacementPlan(config);
                     }
                     continue;
                 }
 
-                auto plan = ensureMoEExpertParallelPlan(config);
+                auto plan = ensureMoERoutedExpertPlacementPlan(config);
 
                 if (trimmed.rfind("-", 0) == 0)
                 {
                     const std::string item = stripOuterQuotes(trim(trimmed.substr(1)));
                     if (current_moe_section == "domains")
                     {
-                        plan->domains.push_back(parseMoEExpertOverlayDomainSpec(item));
+                        plan->domains.push_back(parseMoERoutedExpertDomainSpec(item));
                     }
                     else if (current_moe_section == "routed_tiers")
                     {
-                        plan->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(item));
+                        plan->routed_tiers.push_back(parseMoERoutedExpertTierSpec(item));
                     }
                     continue;
                 }
@@ -641,7 +965,7 @@ namespace llaminar2
 
                 if (current_moe_section == "residency" && key == "mode")
                 {
-                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                    plan->residency_policy = parseRoutedExpertResidencyPolicyValue(value);
                     continue;
                 }
 
@@ -649,9 +973,9 @@ namespace llaminar2
                 {
                     plan->enabled = parseBoolValue(value);
                 }
-                else if (key == "execution_kind" || key == "kind")
+                else if (key == "topology")
                 {
-                    applyMoEExpertOverlayKind(config, value);
+                    applyRoutedExpertPlacementTopology(config, value);
                 }
                 else if (key == "continuation_domain")
                 {
@@ -665,9 +989,18 @@ namespace llaminar2
                 {
                     plan->shared_expert_domain = value;
                 }
+                else if (key == "dense_policy")
+                {
+                    plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(value));
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
+                }
                 else if (key == "residency_mode")
                 {
-                    plan->residency_policy = parseExpertResidencyPolicyValue(value);
+                    plan->residency_policy = parseRoutedExpertResidencyPolicyValue(value);
+                }
+                else if (key == "owner_order")
+                {
+                    applyRoutedExpertOwnerOrder(config, value);
                 }
             }
         }
@@ -781,6 +1114,11 @@ namespace llaminar2
 
     namespace
     {
+        /**
+         * @brief Preserve parsed locality intent for each explicit rank mapping.
+         * @param spec Already validated rank=device declarations.
+         * @return Rank-local NUMA intent; bare CPU retains automatic placement.
+         */
         std::vector<std::pair<int, bool>> parseDeviceMapNumaExplicit(const std::string &spec)
         {
             std::vector<std::pair<int, bool>> explicitness;
@@ -808,15 +1146,11 @@ namespace llaminar2
                 const std::string device_spec = part.substr(eq_pos + 1);
                 const std::string lower = toLower(device_spec);
 
-                if (lower.rfind("cpu:", 0) == 0)
-                {
-                    explicitness.emplace_back(rank, true);
-                }
-                else
-                {
-                    const size_t colon_count = static_cast<size_t>(std::count(device_spec.begin(), device_spec.end(), ':'));
-                    explicitness.emplace_back(rank, colon_count >= 2);
-                }
+                // Punctuation describes serialization, not resolved locality.
+                // In particular localhost:-1:<backend>:0 is still unresolved.
+                explicitness.emplace_back(
+                    rank, lower != "cpu" &&
+                              GlobalDeviceAddress::parse(device_spec).hasValidNuma());
             }
 
             return explicitness;
@@ -877,6 +1211,7 @@ namespace llaminar2
             .addCategory("Server Configuration")
             .addCategory("Fused Attention")
             .addCategory("MPI Bootstrap")
+            .addCategory("Automatic Planning")
             .addCategory("Device Assignment")
             .addCategory("Tensor Parallelism")
             .addCategory("Pipeline Parallelism")
@@ -890,6 +1225,91 @@ namespace llaminar2
             .addCategory("MTP")
             .addCategory("Heterogeneous Mode")
             .addCategory("Verbosity");
+
+        // One option authority for both `plan` and `serve`. Filters replace a
+        // previous YAML set rather than unexpectedly widening it by union.
+        spec.add({
+            .long_name = "--auto",
+            .category = "Automatic Planning",
+            .description = "Choose an execution plan (default without explicit placement); conflicts with declared topology",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &) {
+                c.planning_mode = OrchestrationPlanningMode::Automatic;
+            }),
+        });
+        spec.add({
+            .long_name = "--planning-mode",
+            .category = "Automatic Planning",
+            .value_label = "<auto|apply>",
+            .description = "Choose automatically, or apply declared placement without re-optimization",
+            .valid_values = {"auto", "apply"},
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.planning_mode = parsePlanningMode(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--only-backends",
+            .category = "Automatic Planning",
+            .value_label = "<cpu,cuda,rocm>",
+            .description = "Hard compute-backend restriction for auto; does not exclude host control/storage",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.only_backends = parseOrchestrationBackendList(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--only-strategies",
+            .category = "Automatic Planning",
+            .value_label = "<single,tp,pp,expert-overlay>",
+            .description = "Hard execution-strategy restriction for auto (comma-separated)",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.only_strategies = parseOrchestrationStrategyList(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--auto-device-counts",
+            .category = "Automatic Planning",
+            .value_label = "<backend=count,...>",
+            .description = "Require exact physical compute-device counts in auto selection (e.g. cuda=2,cpu=2); identities and placement remain automatic",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.device_counts = parseAutomaticDeviceCounts(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--prefer-backend",
+            .category = "Automatic Planning",
+            .value_label = "<cpu|cuda|rocm>",
+            .description = "Soft backend preference; cannot override a hard filter or admission",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.prefer_backend = parseOrchestrationComputeBackend(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--plan-workload",
+            .category = "Automatic Planning",
+            .value_label = "<prefill,generation>",
+            .description = "Expected token counts for auto ranking; must fit context, does not limit inference",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.workload = parseOrchestrationPlanningWorkload(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--auto-hosts",
+            .category = "Automatic Planning",
+            .value_label = "<best-subset|all>",
+            .description = "Choose a host subset (default), or require compute on every discovered physical host",
+            .valid_values = {"best-subset", "all"},
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.host_participation = parseAutomaticHostParticipation(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--prefer-strategy",
+            .category = "Automatic Planning",
+            .value_label = "<single|tp|pp|expert-overlay>",
+            .description = "Soft strategy preference; never changes an applied plan",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.prefer_strategy = parseOrchestrationStrategy(v);
+            }),
+        });
 
         // --- Model Configuration ---------------------------------------------
         spec.add({
@@ -907,6 +1327,20 @@ namespace llaminar2
             .value_label = "<n>",
             .description = "Maximum context/sequence length (default: 4096)",
             .setter = setters::parseInt(&OrchestrationConfig::max_seq_len, "--context-length"),
+        });
+        spec.add({
+            .long_name = "--prefill-max-bucket-size",
+            .category = "Model Configuration",
+            .value_label = "<rows>",
+            .description = "Maximum rows per captured prefill chunk (default: " +
+                std::to_string(kDefaultPrefillGraphMaxBucketSize) +
+                "); preserves context length; replaces LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.prefill_max_bucket_size =
+                        parsePositiveIntValue(value, "--prefill-max-bucket-size");
+                }),
         });
         spec.add({
             .long_name = "--mmap",
@@ -928,7 +1362,11 @@ namespace llaminar2
             .category = "Inference Configuration",
             .value_label = "<text>",
             .description = "Input prompt text",
-            .setter = setters::assignString(&OrchestrationConfig::prompt),
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.prompt = value;
+                config.prompt_was_explicitly_provided = true;
+            },
         });
         spec.add({
             .short_name = "-n",
@@ -994,7 +1432,6 @@ namespace llaminar2
                 {
                     c.deterministic = true;
                     c.temperature = 0.0f;
-                    setenv("LLAMINAR_DETERMINISTIC", "1", 1);
                 }),
         });
 
@@ -1042,6 +1479,17 @@ namespace llaminar2
             .description = "Write machine-readable benchmark JSON to a file",
             .setter = setters::assignString(&OrchestrationConfig::benchmark_json_output_path),
         });
+        spec.add({
+            .long_name = "--prompt-file",
+            .category = "Benchmark Configuration",
+            .value_label = "<path>",
+            .description = "Read the exact benchmark prompt bytes from a text file",
+            .setter = [](OrchestrationConfig &config, const std::string &value)
+            {
+                config.benchmark_prompt_file_path = value;
+                config.benchmark_prompt_file_was_provided = true;
+            },
+        });
 
         // --- Server Configuration --------------------------------------------
         spec.add({
@@ -1088,9 +1536,10 @@ namespace llaminar2
         });
         spec.add({
             .long_name = "--mpi-hostfile",
+            .aliases = {"--hostfile"},
             .category = "MPI Bootstrap",
             .value_label = "<path>",
-            .description = "MPI hostfile path (also used for node detection)",
+            .description = "Cluster hostfile for MPI launch and inventory (alias: --hostfile)",
             .setter = setters::assignString(&OrchestrationConfig::hostfile),
         });
         spec.add({
@@ -1170,9 +1619,7 @@ namespace llaminar2
                         throw std::invalid_argument(
                             "Invalid device specification: '" + value + "'");
                     c.device_for_this_rank = *addr;
-                    size_t colon_count = static_cast<size_t>(
-                        std::count(value.begin(), value.end(), ':'));
-                    c.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                    c.device_for_this_rank_numa_explicit = addr->hasValidNuma();
                     c.cpu_global_tp_all_local = false;
                 }),
         });
@@ -1214,10 +1661,10 @@ namespace llaminar2
             .long_name = "--tp-scope",
             .category = "Tensor Parallelism",
             .value_label = "<scope>",
-            .description = "Scope: auto, local, node_local, global, hybrid",
+            .description = "Scope: auto, rank_local, node_local, global, hybrid",
             .setter = enumSetter(&OrchestrationConfig::tp_scope,
                                  parseTpScope, "--tp-scope",
-                                 "auto, local, node_local, global, hybrid"),
+                                 "auto, rank_local, node_local, global, hybrid"),
         });
         spec.add({
             .long_name = "--tp-devices",
@@ -1267,7 +1714,7 @@ namespace llaminar2
             .long_name = "--define-domain",
             .category = "Named Domains (advanced)",
             .value_label = "<spec>",
-            .description = "Define domain: \"name=dev1,dev2[;weights=w1,w2][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]\"",
+            .description = "Define domain: \"name=dev1,dev2[;weights=w1,w2][;backend=type][;scope=rank_local|node_local|global][;owner=N][;ranks=0,1,...]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1343,7 +1790,7 @@ namespace llaminar2
             .long_name = "--config",
             .category = "Config File",
             .value_label = "<path>",
-            .description = "Load base configuration from YAML; subsequent CLI flags override it",
+            .description = "Load authored YAML or a versioned JSON configuration; CLI flags override it",
             .setter = setters::assignString(&OrchestrationConfig::config_file_path),
         });
 
@@ -1373,22 +1820,34 @@ namespace llaminar2
             .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
         spec.add({
-            .long_name = "--moe-expert-mode",
+            .long_name = "--moe-routed-expert-compute",
             .category = "MoE Configuration",
-            .value_label = "<mode>",
-            .description = "Routed expert execution: expert-parallel (default), tensor-parallel, replicated",
-            .valid_values = {"expert-parallel", "tensor-parallel", "replicated"},
+            .value_label = "<policy>",
+            .description = "Routed-expert compute distribution: apportioned (default), replicated, tensor-sharded",
+            .valid_values = {"apportioned", "replicated", "tensor-sharded"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.moe_expert_mode = parseMoEExpertModeValue(v);
+                    c.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-expert-owner-order",
+            .category = "MoE Configuration",
+            .value_label = "<order>",
+            .description = "Static whole-expert ownership order: ordinal (default), random",
+            .valid_values = {"ordinal", "random"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    applyRoutedExpertOwnerOrder(c, v);
                 }),
         });
         spec.add({
             .long_name = "--moe-hot-expert-cache",
             .category = "MoE Configuration",
             .value_label = "<count|percent|off>",
-            .description = "Remote hot expert replica cap per rank/device (default: 10%)",
+            .description = "Remote hot expert replica upper bound per layer/device (default: off); explicit positive values use native GPU admission after complete model coverage",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1396,10 +1855,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance",
+            .long_name = "--moe-residency-maintenance",
             .category = "MoE Configuration",
             .value_label = "<mode>",
-            .description = "MoE decode rebalance mode: off, observe, dynamic (default)",
+            .description = "Durable routed-expert residency maintenance: off, observe, dynamic (default); independent of current-batch LLEP",
             .valid_values = {"off", "observe", "dynamic"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
@@ -1408,10 +1867,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-window",
+            .long_name = "--moe-residency-maintenance-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Decode histogram window size for MoE rebalance (default: 256)",
+            .description = "Decode histogram window size for durable expert residency maintenance (default: 256)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1419,10 +1878,10 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-max-window",
+            .long_name = "--moe-residency-maintenance-max-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
-            .description = "Maximum adaptive MoE rebalance window (default: 4096; 0 disables growth)",
+            .description = "Maximum adaptive expert residency maintenance window (default: 4096; 0 disables growth)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1430,14 +1889,392 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-rebalance-window-growth",
+            .long_name = "--moe-residency-maintenance-window-growth",
             .category = "MoE Configuration",
             .value_label = "<factor>",
-            .description = "Adaptive MoE rebalance window growth factor (default: 1.5)",
+            .description = "Adaptive expert residency maintenance window growth factor (default: 1.5)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
                     c.moe_rebalance.window_growth_factor = std::stof(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-payoff-horizon-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description =
+                std::string(
+                    "Expected routed-token residency lifetime used to amortize measured expert migration cost (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens) +
+                ")",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_payoff_horizon_tokens =
+                        parsePositiveUint64Value(
+                            v,
+                            "--moe-migration-payoff-horizon-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-transfer-slots",
+            .category = "MoE Configuration",
+            .value_label = "<slots>",
+            .description =
+                std::string(
+                    "Preallocated expert-migration staging/event/command slots (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationTransferSlots) +
+                ")",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_transfer_slots =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-transfer-slots");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-execution-streams",
+            .category = "MoE Configuration",
+            .value_label = "<streams>",
+            .description =
+                std::string(
+                    "Physical background GPU streams shared by migration slots; defaults to min(slot count, ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultMigrationExecutionStreams) +
+                ")",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_execution_streams =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-execution-streams");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-cycles-per-wave",
+            .category = "MoE Configuration",
+            .value_label = "<cycles>",
+            .description = "Active economical migration cycles admitted per wave; defaults to the physical transfer-slot count",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_cycles_per_wave =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-cycles-per-wave");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-assignment-window",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Fixed request-local current-batch routed-prefill assignment window; 0 keeps one ordinary prefill transaction unless prefix cache supplies a block boundary",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.assignment_window_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-routed-prefill-assignment-window");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-overlay-prefill-segment-rows",
+            .category = "MoE Configuration",
+            .value_label = "<rows>",
+            .description =
+                "Maximum live token rows in one captured ExpertOverlay prefill "
+                "segment (default: " +
+                std::to_string(kDefaultExpertOverlayPrefillSegmentRows) +
+                "; derived from the serving bucket cap and retained graph-cache budget)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.overlay_segment_rows =
+                        parsePositiveIntValue(
+                            v,
+                            "--moe-overlay-prefill-segment-rows");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-least-loaded-min-routed-rows",
+            .category = "MoE Configuration",
+            .value_label = "<rows>",
+            .description = "Minimum M*top-k routed rows for transfer-backed least-loaded ordinary prefill (default: 8192; 0 forces every ordinary prefill)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.least_loaded_min_routed_rows =
+                        parseNonNegativeUint64Value(
+                            v,
+                            "--moe-routed-prefill-least-loaded-min-routed-rows");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-alpha-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP capacity alpha numerator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_alpha_numerator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-alpha-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-alpha-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP capacity alpha denominator (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_alpha_denominator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-alpha-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-lambda-numerator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP balanced-skip lambda numerator (default: 13)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_lambda_numerator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-lambda-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-lambda-denominator",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Current-batch LLEP balanced-skip lambda denominator (default: 10)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.llep_lambda_denominator =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-routed-prefill-llep-lambda-denominator");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-prefill-llep-disable-balanced-skip",
+            .category = "MoE Configuration",
+            .description = "Require current-batch LLEP planning even when static-owner EP is balanced",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.moe_routed_prefill.llep_enable_balanced_skip = false;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-imbalance-threshold-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic rebalance imbalance trigger in permille max/min load (default: 1300 = 1.3x)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-imbalance-threshold-permille");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-min-improvement-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic rebalance minimum ratio improvement in permille (default: 50 = 5%)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_min_improvement_per_mille =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-min-improvement-permille");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-max-swaps-per-layer",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description =
+                std::string(
+                    "Shared Dynamic paired ownership swaps per layer (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer) +
+                "; one accepted swap moves two experts)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_max_swaps_per_layer =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-max-swaps-per-layer");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-max-plan-entries-per-wave",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description =
+                std::string(
+                    "Shared Dynamic expert movement command entries per rebalance wave/cycle (default: ") +
+                std::to_string(
+                    moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave) +
+                ")",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-max-plan-entries-per-wave");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-min-window-activations",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic minimum routed activations in a window before considering movement (default: 64)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_min_window_activations =
+                        parseNonNegativeUint64Value(v, "--moe-dynamic-min-window-activations");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-maintenance-slack-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Tokens beyond a full routing window before device-owned maintenance is due",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_maintenance_slack_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-maintenance-slack-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-maintenance-period-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Recurring device-owned maintenance cadence floor; 0 uses window plus slack",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_maintenance_period_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-min-maintenance-period-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-initial-maintenance-period-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "First device-owned maintenance cadence; 0 uses the recurring period",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_initial_maintenance_period_tokens =
+                        parseNonNegativeIntValue(
+                            v,
+                            "--moe-device-rebalance-initial-maintenance-period-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-load-spread-improvement",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side rebalance absolute load-spread improvement floor before moving experts (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_load_spread_improvement =
+                        parseNonNegativeUint32Value(v, "--moe-device-rebalance-min-load-spread-improvement");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-load-spread-improvement-divisor",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side rebalance relative floor: required improvement >= total routed load / n; 0 disables (default: 15)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_load_spread_improvement_divisor =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-load-spread-improvement-divisor");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave value floor per requested payload slot (default: 256)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded device rebalance useful-work floor in foreign routed rows per serialized critical-path payload slot; 0 disables (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance
+                        .device_min_foreign_rows_per_critical_path_payload_slot =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave realized-router-benefit floor per requested payload slot (default: 128)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-max-post-wave-load-spread-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave post-apply max/min load-spread ceiling in permille; 0 disables (default: 100)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-max-post-wave-load-spread-permille");
                 }),
         });
         spec.add({
@@ -1451,83 +2288,135 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay",
+            .long_name = "--moe-routed-expert-placement",
             .category = "MoE Configuration",
-            .value_label = "<kind>",
-            .description = "Same-layer MoE expert overlay: off, single-domain, tiered",
-            .valid_values = {"off", "single-domain", "tiered"},
+            .value_label = "<topology>",
+            .description = "Same-layer routed-expert placement topology: off, single-domain, tiered-overlay",
+            .valid_values = {"off", "single-domain", "tiered-overlay"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    applyMoEExpertOverlayKind(c, v);
+                    applyRoutedExpertPlacementTopology(c, v);
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-continuation",
-            .category = "MoE Configuration",
-            .value_label = "<domain>",
-            .description = "MoE overlay domain that receives the final reduced output",
-            .setter = setters::custom<OrchestrationConfig>(
-                [](OrchestrationConfig &c, const std::string &v)
-                {
-                    ensureMoEExpertParallelPlan(c)->continuation_domain = v;
-                }),
-        });
-        spec.add({
-            .long_name = "--moe-expert-overlay-base-domain",
-            .aliases = {"--base-model-domain"},
+            .long_name = "--moe-routed-expert-continuation-domain",
             .category = "MoE Configuration",
             .value_label = "<domain>",
-            .description = "MoE overlay domain for dense/non-expert model placement (defaults to continuation)",
+            .description = "Continuation domain that receives the final routed-expert reduction",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->base_model_domain = v;
+                    ensureMoERoutedExpertPlacementPlan(c)->continuation_domain = v;
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-shared-domain",
+            .long_name = "--moe-routed-expert-base-model-domain",
             .category = "MoE Configuration",
             .value_label = "<domain>",
-            .description = "MoE overlay domain where shared experts execute",
+            .description = "Dense/non-expert base-model domain (defaults to the continuation domain)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->shared_expert_domain = v;
+                    ensureMoERoutedExpertPlacementPlan(c)->base_model_domain = v;
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-residency",
+            .long_name = "--moe-routed-expert-shared-domain",
+            .category = "MoE Configuration",
+            .value_label = "<domain>",
+            .description = "Domain where shared experts execute",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoERoutedExpertPlacementPlan(c)->shared_expert_domain = v;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-continuation-dense-tp",
+            .category = "MoE Configuration",
+            .value_label = "<bool>",
+            .description = "Enable dense/non-expert tensor parallelism inside the continuation domain",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
+                    plan->continuation_domain_spec.dense_tp_enabled = parseBoolValue(v);
+                    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-continuation-dense-decode-replicated",
+            .category = "MoE Configuration",
+            .value_label = "<bool>",
+            .description = "Use replicated full dense weights for decode while retaining dense TP for prefill",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
+                    plan->continuation_domain_spec.dense_decode_replicated = parseBoolValue(v);
+                    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-continuation-dense-policy",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "MoE overlay residency: static-by-id, histogram, explicit-masks",
-            .valid_values = {"static-by-id", "histogram", "explicit-masks"},
+            .description = "Dense/shared continuation policy: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, prefill-tensor-parallel-decode-replicated",
+            .valid_values = {
+                "replicated",
+                "tensor-parallel",
+                "tensor-parallel-decode-mirrored-embedding",
+                "prefill-tensor-parallel-decode-replicated"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->residency_policy = parseExpertResidencyPolicyValue(v);
+                    auto plan = ensureMoERoutedExpertPlacementPlan(c);
+                    plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(v));
+                    plan->continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Explicit;
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-domain",
+            .long_name = "--moe-routed-expert-residency",
             .category = "MoE Configuration",
-            .value_label = "<spec>",
-            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|expert_id_sharded|tensor_parallel_experts[;owner=N][;ranks=0,1]\"",
+            .value_label = "<policy>",
+            .description = "Routed-expert residency policy: static-by-id, histogram, explicit-masks, rebalanced (default: rebalanced; static-by-id when residency maintenance is off)",
+            .valid_values = {"static-by-id", "histogram", "explicit-masks", "rebalanced"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->domains.push_back(parseMoEExpertOverlayDomainSpec(v));
+                    ensureMoERoutedExpertPlacementPlan(c)->residency_policy = parseRoutedExpertResidencyPolicyValue(v);
                 }),
         });
         spec.add({
-            .long_name = "--moe-expert-overlay-tier",
+            .long_name = "--expert-tier",
+            .category = "MoE Configuration",
+            .value_label = "<declaration>",
+            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically; domain policy overrides remain available.",
+            .setter = setters::custom<OrchestrationConfig>(appendExpertTier),
+        });
+        spec.add({
+            .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define MoE overlay routed tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto][;fallback=true]\"",
+            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=apportioned|replicated|tensor-sharded][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, apportioned experts and static row assignment. Prefer --expert-tier to also declare priority.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    ensureMoEExpertParallelPlan(c)->routed_tiers.push_back(parseMoEExpertOverlayTierSpec(v));
+                    ensureMoERoutedExpertPlacementPlan(c)->domains.push_back(parseMoERoutedExpertDomainSpec(v));
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-routed-expert-tier",
+            .category = "MoE Configuration",
+            .value_label = "<spec>",
+            .description = "Define a routed-expert placement tier: \"name@domain;priority=N[;max-experts-per-layer=N][;memory-mb=N|auto]\"; the greatest numeric priority is the automatic final-coverage tier",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    ensureMoERoutedExpertPlacementPlan(c)->routed_tiers.push_back(parseMoERoutedExpertTierSpec(v));
                 }),
         });
 
@@ -1537,9 +2426,13 @@ namespace llaminar2
             .aliases = {"--activation-prec", "--act-prec"},
             .category = "Precision",
             .value_label = "<type>",
-            .description = "Activation precision: fp32, bf16, fp16, q8_1",
-            .valid_values = {"fp32", "bf16", "fp16", "q8_1"},
-            .setter = setters::assignString(&OrchestrationConfig::activation_precision),
+            .description = "Model activation precision: fp32 only (other modes are unimplemented)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    requireImplementedActivationPrecision(v);
+                    c.activation_precision = "fp32";
+                }),
         });
         // --kv-cache-precision accepts many short aliases; normalise to
         // lowercase and validate against the full alias list.
@@ -1568,16 +2461,51 @@ namespace llaminar2
                     c.kv_cache_precision = lower;
                 }),
         });
+        spec.add({
+            .long_name = "--tp-allreduce-precision",
+            .aliases = {"--allreduce-precision"},
+            .category = "Precision",
+            .value_label = "<type>",
+            .description = "TP allreduce transport precision override: auto/schema (default), fp32, fp16, bf16",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                {
+                    std::string lower = toLower(value);
+                    static const std::set<std::string> valid_precisions = {
+                        "auto", "schema", "default", "off", "fp32", "f32", "fp16", "f16", "bf16"};
+                    if (valid_precisions.find(lower) == valid_precisions.end())
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --tp-allreduce-precision: '" + value +
+                            "' (valid: auto, schema, fp32, fp16, bf16)");
+                    }
+                    if (lower == "f32")
+                        lower = "fp32";
+                    else if (lower == "f16")
+                        lower = "fp16";
+                    c.tp_allreduce_precision_override = lower;
+                }),
+        });
 
         // --- Prefix Cache ----------------------------------------------------
         spec.add({
             .long_name = "--prefix-cache",
             .category = "Prefix Cache",
-            .description = "Enable cross-request prefix-state caching",
+            .description = "Enable cross-request prefix-state caching (default)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &)
                 {
                     c.prefix_cache.enabled = true;
+                }),
+        });
+        spec.add({
+            .long_name = "--no-prefix-cache",
+            .category = "Prefix Cache",
+            .description = "Disable cross-request prefix-state caching",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.prefix_cache.enabled = false;
                 }),
         });
         spec.add({
@@ -1640,7 +2568,7 @@ namespace llaminar2
             .long_name = "--prefix-cache-disk-budget-mb",
             .category = "Prefix Cache",
             .value_label = "<mb>",
-            .description = "Prefix cache disk budget in MiB (default: 0)",
+            .description = "Prefix cache disk budget in MiB (default: 32768)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1651,7 +2579,7 @@ namespace llaminar2
             .long_name = "--prefix-cache-disk-dir",
             .category = "Prefix Cache",
             .value_label = "<path>",
-            .description = "Prefix cache disk backing directory",
+            .description = "Prefix cache disk directory (default: $HOME/.llaminar/kvcache)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1724,6 +2652,22 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--mtp-graph-capacity-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Retained MTP graph/arena draft capacity; 0 derives from the execution-policy maximum",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.graph_capacity_draft_tokens = std::stoi(v);
+                    if (c.mtp.graph_capacity_draft_tokens < 0)
+                    {
+                        throw std::invalid_argument(
+                            "--mtp-graph-capacity-draft-tokens must be >= 0");
+                    }
+                }),
+        });
+        spec.add({
             .long_name = "--mtp-max-request-batch",
             .category = "MTP",
             .value_label = "<n>",
@@ -1755,6 +2699,25 @@ namespace llaminar2
                             "' (valid: greedy, speculative-sampling)");
                     }
                     c.mtp.verify_mode = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-terminal-head-policy",
+            .category = "MTP",
+            .value_label = "<policy>",
+            .description = "MTP final norm/LM-head placement: vocabulary-sharded or mirrored-full-vocabulary",
+            .valid_values = {"vocabulary-sharded", "mirrored-full-vocabulary"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parseMTPTerminalHeadPolicy(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --mtp-terminal-head-policy: '" + v +
+                            "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                    }
+                    c.mtp.terminal_head_policy = *parsed;
                 }),
         });
         spec.add({
@@ -1810,7 +2773,7 @@ namespace llaminar2
             .long_name = "--mtp-max-draft-tokens",
             .category = "MTP",
             .value_label = "<n>",
-            .description = "Maximum MTP draft depth for observe/dynamic depth policy",
+            .description = "Maximum MTP draft depth for observe/dynamic policy (default: full supported range, 15)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1900,17 +2863,12 @@ namespace llaminar2
         spec.add({
             .long_name = "--mtp-depth-demote-zero-accept",
             .category = "MTP",
-            .value_label = "<f>",
-            .description = "Zero-accept-rate threshold for adaptive MTP depth demotion",
+            .value_label = "<auto|f>",
+            .description = "Zero-accept demotion threshold (default auto: continuation-card profile; explicit [0,1] overrides)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.mtp.depth_policy.demote_zero_accept_rate = std::stod(v);
-                    if (c.mtp.depth_policy.demote_zero_accept_rate < 0.0 ||
-                        c.mtp.depth_policy.demote_zero_accept_rate > 1.0)
-                    {
-                        throw std::invalid_argument("--mtp-depth-demote-zero-accept must be in [0, 1]");
-                    }
+                    c.mtp.depth_policy.demote_zero_accept_rate = parseMTPZeroAcceptDemotionRate(v);
                 }),
         });
         spec.add({
@@ -2140,6 +3098,17 @@ namespace llaminar2
 
     OrchestrationConfig OrchestrationConfigParser::parseArgs(int argc, char **argv)
     {
+        return parseCommandArgs(argc, argv, {});
+    }
+
+    OrchestrationConfig OrchestrationConfigParser::parseCommandArgs(
+        int argc, char **argv, const CliSpec<OrchestrationConfig> &options)
+    {
+        // One table owns all runtime semantics. Command extensions may add
+        // output controls, never replace an existing name or its setter.
+        static const CliSpec<OrchestrationConfig> shared_spec = buildSpec();
+        auto spec = shared_spec;
+        spec.extend(options);
         // Convert argc/argv into a vector for ergonomic iteration.
         std::vector<std::string> args;
         args.reserve(static_cast<size_t>(std::max(0, argc - 1)));
@@ -2150,9 +3119,9 @@ namespace llaminar2
         // the base config. The second pass (full CLI parse) will override any
         // individual fields specified on the command line.
         OrchestrationConfig config;
-        for (size_t i = 0; i + 1 < args.size(); ++i)
+        for (size_t i = 0; i < args.size(); ++i)
         {
-            if (args[i] == "--config")
+            if (args[i] == "--config" && i + 1 < args.size())
             {
                 config = parseYamlFile(args[i + 1]);
                 config.config_file_path = args[i + 1];
@@ -2173,7 +3142,6 @@ namespace llaminar2
         }
 
         // Second pass: apply every flag through the structured spec.
-        static const CliSpec<OrchestrationConfig> spec = buildSpec();
         spec.parse(args, config);
 
         // Cross-flag validation that doesn't fit cleanly into per-option setters.
@@ -2183,18 +3151,19 @@ namespace llaminar2
                 "Cannot use --heterogeneous with both --no-gpu-tp and --no-cpu-tp");
         }
 
-        auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+        auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
         if (!normalize_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(normalize_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
-        auto overlay_errors = validateMoEExpertOverlayConfig(config);
+        auto overlay_errors = validateMoERoutedExpertPlacementConfig(config);
         if (!overlay_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(overlay_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(overlay_errors));
         }
 
+        publishOrchestrationStartupPolicy(config);
         return config;
     }
 
@@ -2221,9 +3190,22 @@ namespace llaminar2
 
     OrchestrationConfig OrchestrationConfigParser::parseYamlString(const std::string &yaml)
     {
+        // Generated documents share the same public --config entry point as
+        // authored YAML. A malformed document must never be retried as YAML.
+        const auto first = yaml.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos && yaml[first] == '{')
+        {
+            auto config = deserializeOrchestrationConfig(yaml);
+            requireImplementedActivationPrecision(config.activation_precision);
+            const auto errors = normalizeMoERoutedExpertPlacementDomains(config);
+            if (!errors.empty())
+                throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(errors));
+            publishOrchestrationStartupPolicy(config);
+            return config;
+        }
         OrchestrationConfig config;
 
-        parseMoEExpertParallelYamlBlock(yaml, config);
+        parseMoERoutedExpertPlacementYamlBlock(yaml, config);
 
         // Simple line-by-line YAML parser (sufficient for our flat structure)
         // For production, consider using a proper YAML library like yaml-cpp
@@ -2253,7 +3235,12 @@ namespace llaminar2
                 skipping_moe_block = false;
             }
 
-            if (indent == 0 && trimmed == "moe_expert_parallel:")
+            // A top-level scalar ends the previous YAML section. Without this
+            // edge, `model_path` after `mtp:` is misread as an MTP option.
+            if (indent == 0)
+                current_section.clear();
+
+            if (indent == 0 && trimmed == "moe_routed_expert_placement:")
             {
                 skipping_moe_block = true;
                 current_section.clear();
@@ -2262,11 +3249,13 @@ namespace llaminar2
 
             // Minimal YAML list support for named-domain configs:
             // domains:
-            //   - "gpu=0:cuda:0;scope=local;owner=0"
+            //   - "gpu=0:cuda:0;scope=rank_local;owner=0"
             // pp_stages:
             //   - "0=gpu:0-11"
             if (trimmed.rfind("-", 0) == 0)
             {
+                if (current_section == "planning")
+                    throw std::invalid_argument("Planning filters use named comma-separated scalar values, not anonymous list items");
                 std::string item = trim(trimmed.substr(1));
                 if (item.size() >= 2 &&
                     ((item.front() == '"' && item.back() == '"') ||
@@ -2284,6 +3273,11 @@ namespace llaminar2
                     }
                     continue;
                 }
+                if (current_section == "expert_tiers")
+                {
+                    appendExpertTier(config, item);
+                    continue;
+                }
                 if (current_section == "pp_stages")
                 {
                     auto stage = PPStageDefinition::tryParse(item);
@@ -2298,6 +3292,8 @@ namespace llaminar2
             // Check for section headers
             if (trimmed.back() == ':' && trimmed.find(':') == trimmed.size() - 1)
             {
+                if (current_section == "planning" && indent > 0)
+                    throw std::invalid_argument("Planning options require a nonempty scalar value: " + trimmed);
                 current_section = trimmed.substr(0, trimmed.size() - 1);
                 continue;
             }
@@ -2322,6 +3318,11 @@ namespace llaminar2
 
             const std::string normalized_section = normalizeToken(current_section);
             const std::string normalized_key = normalizeToken(key);
+            if (normalized_section == "planning")
+            {
+                applyPlanningYamlKey(config, normalized_key, value);
+                continue;
+            }
             if (normalized_section == "moe")
             {
                 applyMoEYamlKey(config, normalized_key, value);
@@ -2339,7 +3340,36 @@ namespace llaminar2
             }
 
             // Map YAML keys to config fields
-            if (key == "dry_run")
+            if (key == "model_path" || key == "model")
+            {
+                config.model_path = value;
+            }
+            else if (key == "max_seq_len" || key == "context_length")
+            {
+                config.max_seq_len = parsePositiveIntValue(value, key);
+            }
+            else if (normalized_key == "prefill_max_bucket_size")
+            {
+                config.prefill_max_bucket_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "deterministic")
+            {
+                config.deterministic = parseBoolValue(value);
+                if (config.deterministic) config.temperature = 0.0f;
+            }
+            else if (key == "batch_size")
+            {
+                config.batch_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "hostfile" || key == "mpi_hostfile")
+            {
+                config.hostfile = value;
+            }
+            else if (key == "mpi_procs")
+            {
+                config.mpi_procs = parseNonNegativeIntValue(value, key);
+            }
+            else if (key == "dry_run")
             {
                 config.dry_run = (toLower(value) == "true" || value == "1");
             }
@@ -2397,8 +3427,7 @@ namespace llaminar2
                     if (addr)
                     {
                         config.device_for_this_rank = *addr;
-                        size_t colon_count = static_cast<size_t>(std::count(value.begin(), value.end(), ':'));
-                        config.device_for_this_rank_numa_explicit = (colon_count >= 2);
+                        config.device_for_this_rank_numa_explicit = addr->hasValidNuma();
                         config.cpu_global_tp_all_local = false;
                     }
                 }
@@ -2474,11 +3503,23 @@ namespace llaminar2
             }
             else if (key == "activation_precision")
             {
-                config.activation_precision = value;
+                requireImplementedActivationPrecision(value);
+                config.activation_precision = "fp32";
             }
             else if (key == "kv_cache_precision")
             {
                 config.kv_cache_precision = value;
+            }
+            else if (key == "tp_allreduce_precision" ||
+                     key == "tp_allreduce_precision_override" ||
+                     key == "allreduce_precision")
+            {
+                std::string lower = toLower(value);
+                if (lower == "f32")
+                    lower = "fp32";
+                else if (lower == "f16")
+                    lower = "fp16";
+                config.tp_allreduce_precision_override = lower;
             }
             else if (normalized_key == "prefix_cache")
             {
@@ -2496,29 +3537,217 @@ namespace llaminar2
             {
                 applyMTPYamlKey(config, normalized_key.substr(std::string("mtp_").size()), value);
             }
-            else if (normalized_key == "moe_expert_mode")
+            else if (normalized_key == "expert_mode" ||
+                     normalized_key == "moe_expert_mode")
             {
-                config.moe_expert_mode = parseMoEExpertModeValue(value);
+                throw std::invalid_argument(
+                    "Obsolete MoE YAML key '" + key + "'; use "
+                    "'routed_expert_compute_policy'");
+            }
+            else if (normalized_key == "routed_expert_compute_policy")
+            {
+                config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
+            }
+            else if (normalized_key == "routed_expert_owner_order" ||
+                     normalized_key == "moe_routed_expert_owner_order")
+            {
+                applyRoutedExpertOwnerOrder(config, value);
             }
             else if (normalized_key == "moe_hot_expert_cache")
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
             }
-            else if (normalized_key == "moe_rebalance")
+            else if (normalized_key == "moe_residency_maintenance")
             {
                 config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
             }
-            else if (normalized_key == "moe_rebalance_window")
+            else if (normalized_key == "moe_residency_maintenance_window")
             {
                 config.moe_rebalance.window_size = std::stoi(value);
             }
-            else if (normalized_key == "moe_rebalance_max_window")
+            else if (normalized_key == "moe_residency_maintenance_max_window")
             {
                 config.moe_rebalance.max_window_size = std::stoi(value);
             }
-            else if (normalized_key == "moe_rebalance_window_growth")
+            else if (normalized_key == "moe_residency_maintenance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "moe_migration_payoff_horizon_tokens")
+            {
+                config.moe_rebalance.migration_payoff_horizon_tokens =
+                    parsePositiveUint64Value(
+                        value,
+                        "moe_migration_payoff_horizon_tokens");
+            }
+            else if (normalized_key ==
+                     "moe_migration_transfer_slots")
+            {
+                config.moe_rebalance.migration_transfer_slots =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_transfer_slots");
+            }
+            else if (normalized_key ==
+                     "moe_migration_execution_streams")
+            {
+                config.moe_rebalance.migration_execution_streams =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_execution_streams");
+            }
+            else if (normalized_key ==
+                     "moe_migration_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_cycles_per_wave");
+            }
+            else if (normalized_key ==
+                     "moe_routed_prefill_assignment_window_tokens")
+            {
+                config.moe_routed_prefill.assignment_window_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key ==
+                     "moe_overlay_prefill_segment_rows")
+            {
+                config.moe_routed_prefill.overlay_segment_rows =
+                    parsePositiveIntValue(
+                        value,
+                        "moe_overlay_prefill_segment_rows");
+            }
+            else if (normalized_key ==
+                     "moe_routed_prefill_least_loaded_min_routed_rows")
+            {
+                config.moe_routed_prefill.least_loaded_min_routed_rows =
+                    parseNonNegativeUint64Value(
+                        value,
+                        "moe_routed_prefill_least_loaded_min_routed_rows");
+            }
+            else if (normalized_key == "moe_dynamic_imbalance_threshold_permille")
+            {
+                config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_imbalance_threshold_permille");
+            }
+            else if (normalized_key == "moe_dynamic_min_improvement_permille")
+            {
+                config.moe_rebalance.dynamic_min_improvement_per_mille =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_min_improvement_permille");
+            }
+            else if (normalized_key == "moe_dynamic_max_swaps_per_layer")
+            {
+                config.moe_rebalance.dynamic_max_swaps_per_layer =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_max_swaps_per_layer");
+            }
+            else if (normalized_key == "moe_dynamic_max_plan_entries_per_wave")
+            {
+                config.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_max_plan_entries_per_wave");
+            }
+            else if (normalized_key == "moe_dynamic_min_window_activations")
+            {
+                config.moe_rebalance.dynamic_min_window_activations =
+                    parseNonNegativeUint64Value(value, "moe_dynamic_min_window_activations");
+            }
+            else if (normalized_key == "moe_device_rebalance_maintenance_slack_tokens")
+            {
+                config.moe_rebalance.device_maintenance_slack_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_maintenance_slack_tokens");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_min_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_min_maintenance_period_tokens");
+            }
+            else if (normalized_key == "moe_device_rebalance_initial_maintenance_period_tokens")
+            {
+                config.moe_rebalance.device_initial_maintenance_period_tokens =
+                    parseNonNegativeIntValue(
+                        value,
+                        "moe_device_rebalance_initial_maintenance_period_tokens");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_load_spread_improvement")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement =
+                    parseNonNegativeUint32Value(value, "moe_device_rebalance_min_load_spread_improvement");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_load_spread_improvement_divisor")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement_divisor =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_load_spread_improvement_divisor");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key ==
+                     "moe_device_rebalance_min_foreign_rows_per_critical_path_payload_slot")
+            {
+                config.moe_rebalance
+                    .device_min_foreign_rows_per_critical_path_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_foreign_rows_per_critical_path_payload_slot");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_router_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_router_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "moe_device_rebalance_max_post_wave_load_spread_permille")
+            {
+                config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_max_post_wave_load_spread_permille");
+            }
+            else if (normalized_key == "moe_routed_prefill_llep_alpha_numerator")
+            {
+                config.moe_routed_prefill.llep_alpha_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_alpha_numerator");
+            }
+            else if (normalized_key == "moe_routed_prefill_llep_alpha_denominator")
+            {
+                config.moe_routed_prefill.llep_alpha_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_alpha_denominator");
+            }
+            else if (normalized_key == "moe_routed_prefill_llep_lambda_numerator")
+            {
+                config.moe_routed_prefill.llep_lambda_numerator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_lambda_numerator");
+            }
+            else if (normalized_key == "moe_routed_prefill_llep_lambda_denominator")
+            {
+                config.moe_routed_prefill.llep_lambda_denominator =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_routed_prefill_llep_lambda_denominator");
+            }
+            else if (normalized_key == "moe_routed_prefill_llep_enable_balanced_skip")
+            {
+                config.moe_routed_prefill.llep_enable_balanced_skip =
+                    parseBoolValue(value);
             }
             else if (normalized_key == "moe_release_raw_expert_weights")
             {
@@ -2534,12 +3763,13 @@ namespace llaminar2
             }
         }
 
-        auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
+        auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
         if (!normalize_errors.empty())
         {
-            throw std::invalid_argument(formatMoEOverlayValidationErrors(normalize_errors));
+            throw std::invalid_argument(formatMoERoutedExpertPlacementValidationErrors(normalize_errors));
         }
 
+        publishOrchestrationStartupPolicy(config);
         return config;
     }
 
@@ -2566,6 +3796,14 @@ namespace llaminar2
             "  llaminar2 -m model.gguf -d cuda:0 --fused-attention-backend jit\n";
 
         return spec.getHelpText(header, footer);
+    }
+
+    std::string OrchestrationConfigParser::getCommandHelpText(
+        const CliSpec<OrchestrationConfig> &options, const std::string &header)
+    {
+        auto spec = buildSpec();
+        spec.extend(options);
+        return spec.getHelpText(header);
     }
 
 } // namespace llaminar2

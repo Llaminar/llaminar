@@ -4,6 +4,8 @@
  *
  * Provides centralized creation of tensor parallelism contexts based on
  * configuration from RankExecutionPlan, TPDomainParticipation, or explicit parameters.
+ * Resolved execution scope is mandatory when projecting a domain. Device
+ * hostnames and collective backend names cannot establish process membership.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -18,6 +20,7 @@
 #include "../config/OrchestrationConfig.h"
 #include <memory>
 #include <vector>
+#include <optional>
 #include <mpi.h>
 
 namespace llaminar2
@@ -33,8 +36,8 @@ namespace llaminar2
      * Usage patterns:
      * 1. From RankExecutionPlan: TPContextFactory::create(plan, comm)
      * 2. Explicit local: TPContextFactory::createLocal(devices, weights, backend)
-     * 3. Explicit global: TPContextFactory::createGlobal(comm, domain_id, color, key)
-     * 4. From domain participation: TPContextFactory::createFromDomain(domain, comm)
+     * 3. Explicit global: createGlobal(comm, domain_id, color, key, resolved_cpu)
+     * 4. From resolved participation: TPContextFactory::createFromDomain(domain, scope, comm)
      *
      * The factory automatically determines LOCAL vs GLOBAL based on configuration.
      */
@@ -62,21 +65,26 @@ namespace llaminar2
          */
         static std::unique_ptr<ITPContext> create(
             const RankExecutionPlan &plan,
-            MPI_Comm base_comm = MPI_COMM_WORLD);
+            MPI_Comm base_comm);
 
         /**
          * @brief Create from TPDomainParticipation
          *
-         * Analyzes domain to determine if it's local (all devices same rank)
-         * or global (devices span multiple ranks).
+         * Consumes the canonical resolved scope: rank-local execution creates
+         * LocalTPContext; node-local/cross-node rank execution creates
+         * GlobalTPContext. Physical node membership inside that communicator
+         * still comes from MPI inventory, never the selected transport name.
          *
          * @param domain Domain participation info
+         * @param resolved_scope Canonical resolved scope; AUTO is not executable.
          * @param base_comm Base MPI communicator
          * @return Appropriate ITPContext for the domain
+         * @throws std::invalid_argument for unresolved or inconsistent scope.
          */
         static std::unique_ptr<ITPContext> createFromDomain(
             const TPDomainParticipation &domain,
-            MPI_Comm base_comm = MPI_COMM_WORLD);
+            ExecutionDomainScope resolved_scope,
+            MPI_Comm base_comm);
 
         // =========================================================================
         // Explicit Local TP Creation
@@ -115,6 +123,7 @@ namespace llaminar2
          * @param domain_id Domain identifier
          * @param color MPI_Comm_split color (ranks with same color form domain)
          * @param key MPI_Comm_split key (determines ordering)
+         * @param local_device Exact resolved CPU endpoint, absent only when excluded.
          * @return GlobalTPContext instance
          */
         static std::unique_ptr<IGlobalTPContext> createGlobal(
@@ -122,6 +131,7 @@ namespace llaminar2
             int domain_id,
             int color,
             int key,
+            std::optional<GlobalDeviceAddress> local_device,
             const std::string &hostfile_path = "",
             CollectiveBackendType backend = CollectiveBackendType::UPI);
 
@@ -137,7 +147,7 @@ namespace llaminar2
          */
         static std::unique_ptr<IGlobalTPContext> createGlobalFromPlan(
             const RankExecutionPlan &plan,
-            MPI_Comm base_comm = MPI_COMM_WORLD,
+            MPI_Comm base_comm,
             const std::string &hostfile_path = "");
 
     private:

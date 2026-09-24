@@ -46,6 +46,39 @@ namespace llaminar2
         }
     }
 
+    PrefixTerminalHarvestDisposition
+    PrefixLookupResult::terminalHarvestDisposition(
+        const PrefixCacheKey &terminal_key,
+        int prompt_token_count) const
+    {
+        if (!supported || !cache_enabled || prompt_token_count <= 0 ||
+            cached_tokens != prompt_token_count || blocks.empty() ||
+            fingerprint_key != terminal_key.fingerprint)
+        {
+            return PrefixTerminalHarvestDisposition::ArchiveLiveState;
+        }
+
+        const PrefixBlockHandle &terminal = blocks.back();
+        const bool exact_terminal =
+            terminal.valid() && terminal.key == terminal_key &&
+            terminal.key.token_start + terminal.key.token_count ==
+                prompt_token_count;
+        const bool terminal_logits_complete =
+            !requires_terminal_logits ||
+            (has_terminal_logits && terminal.has_terminal_logits);
+        const bool terminal_hidden_complete =
+            !requires_terminal_hidden ||
+            (has_terminal_hidden && terminal.has_terminal_hidden);
+        const bool hybrid_state_complete =
+            !terminal.layout.includes_hybrid_state ||
+            terminal.has_hybrid_state;
+
+        return exact_terminal && terminal_logits_complete &&
+                       terminal_hidden_complete && hybrid_state_complete
+                   ? PrefixTerminalHarvestDisposition::ReuseAdmittedArchive
+                   : PrefixTerminalHarvestDisposition::ArchiveLiveState;
+    }
+
     PrefixLookupResult PrefixLookupResult::clampedTo(int token_count) const
     {
         PrefixLookupResult result = *this;

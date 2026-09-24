@@ -10,6 +10,7 @@ using namespace llaminar2::simd;
 
 TEST(Test__Q3K_Bug, VerifyUnpackCorrectness)
 {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
     if (!cpu_supports_avx512())
     {
         GTEST_SKIP() << "AVX512 not supported";
@@ -56,4 +57,7 @@ TEST(Test__Q3K_Bug, VerifyUnpackCorrectness)
     {
         EXPECT_EQ((int)output_avx[i], (int)output_ref[i]) << "Mismatch at index " << i;
     }
+#else
+    GTEST_SKIP() << "AVX512 unpacker not compiled";
+#endif
 }

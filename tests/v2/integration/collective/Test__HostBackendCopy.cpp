@@ -25,6 +25,7 @@
 #include "backends/IBackend.h"
 #include "backends/DeviceId.h"
 #include "utils/Logger.h"
+#include "../../utils/ScopedGPUStream.h"
 
 using namespace llaminar2;
 
@@ -116,7 +117,9 @@ protected:
         IBackend *be = getBackendFor(dev);
         if (!be)
             return false;
-        return be->hostToDevice(gpu_ptr, host_ptr, bytes, dev.ordinal);
+        test::ScopedGPUStream stream(dev);
+        return be->hostToDevice(
+            gpu_ptr, host_ptr, bytes, dev.ordinal, stream.get());
     }
 
     /// Download GPU data to host
@@ -125,7 +128,9 @@ protected:
         IBackend *be = getBackendFor(dev);
         if (!be)
             return false;
-        return be->deviceToHost(host_ptr, gpu_ptr, bytes, dev.ordinal);
+        test::ScopedGPUStream stream(dev);
+        return be->deviceToHost(
+            host_ptr, gpu_ptr, bytes, dev.ordinal, stream.get());
     }
 
     /// Sync a device

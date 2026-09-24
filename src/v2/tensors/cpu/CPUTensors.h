@@ -1329,7 +1329,7 @@ namespace llaminar2
         void *mapped_host_ptr_ = nullptr;   // Host-visible pointer for mapped memory
 
         // For mapped memory: tracks whether GPU has written since last sync.
-        // Set to true by transitionTo(MAPPED/DEVICE_AUTHORITATIVE), cleared by ensureOnHost() after sync.
+        // Set by mapped device-write publication, cleared by ensureOnHost() after sync.
         // This avoids redundant hipDeviceSynchronize() calls.
         bool mapped_needs_sync_ = false;
 

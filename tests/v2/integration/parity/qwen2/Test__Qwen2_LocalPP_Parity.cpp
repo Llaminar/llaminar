@@ -19,9 +19,16 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen2ModelParityDefinitions.h"
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -31,105 +38,88 @@ using namespace llaminar2::test::parity::qwen2;
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kLocalPPConfigs = {
-    // PP splits layers across devices (unlike TP which shards weights).
-    // Each stage processes a subset of layers and transfers activations.
-    {
-        .name = "LocalPP_RCCL_2xROCm",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = {
-            .cosine_threshold = 0.97f,        // Observed: 0.998 prefill cosine
-            .decode_cosine_threshold = 0.97f, // Observed: 0.999 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f, // Observed: 0.003 prefill KL (was 0.20 = 67x over-relaxed)
+/** @return Numerical contract for one pure pipeline topology. */
+static BackendThresholds localPPThresholds(float kl_threshold)
+{
+    return BackendThresholds{
+        .cosine_threshold = 0.97f,
+        .decode_cosine_threshold = 0.97f,
+        .early_layers_count = 6,
+        .min_early_layers_passed = 4,
+        .kl_threshold = kl_threshold,
+    };
+}
+
+/** @return One typed two-stage rank-local pipeline definition. */
+static ModelParityDefinition makeLocalPPDefinition(
+    std::string topology_id,
+    GlobalDeviceAddress first,
+    GlobalDeviceAddress second,
+    float kl_threshold)
+{
+    return qwen2Q40ParityDefinition(
+        ModelParityTopologyDefinition{
+            .test_id = std::move(topology_id),
+            .kind = ModelParityTopologyKind::RankLocalPipelineParallel,
+            .participants = {{std::move(first), 0}, {std::move(second), 0}},
+            .mpi_ranks = 1,
+            .pipeline_stage_sizes = {1, 1},
         },
-    },
+        localPPThresholds(kl_threshold));
+}
+
+/** @return Canonically expanded Qwen2 pure-pipeline cases. */
+static const std::vector<ModelParityCase> &qwen2LocalPPCases()
+{
+    static const auto cases = []
     {
-        .name = "LocalPP_NCCL_2xCUDA",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = {
-            .cosine_threshold = 0.97f, // Observed: 0.999 prefill cosine (NCCL, no results yet — matching RCCL)
-            .decode_cosine_threshold = 0.97f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f, // Was 0.20 = over-relaxed, tightened to match RCCL
-        },
-    },
-    {
-        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = {
-            .cosine_threshold = 0.97f,        // Observed: 0.999 prefill cosine
-            .decode_cosine_threshold = 0.97f, // Observed: 0.999 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.025f, // Observed: 0.006 prefill KL (was 0.30 = 54x over-relaxed)
-        },
-    },
-    {
-        .name = "LocalPP_HOST_CUDA_CPU",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CPU},
-        .parallelism = Parallelism::LocalPP,
-        .thresholds = {
-            .cosine_threshold = 0.97f,        // Observed: 0.999 prefill cosine
-            .decode_cosine_threshold = 0.97f, // Observed: 0.999 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f, // Observed: 0.004 prefill KL (was 0.20 = 54x over-relaxed)
-        },
-    },
-};
+        const std::array definitions = {
+            makeLocalPPDefinition(
+                "LocalPP_RCCL_2xROCm",
+                GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1), 0.015f),
+            makeLocalPPDefinition(
+                "LocalPP_NCCL_2xCUDA",
+                GlobalDeviceAddress::cuda(0),
+                GlobalDeviceAddress::cuda(1), 0.015f),
+            makeLocalPPDefinition(
+                "LocalPP_Heterogeneous_CUDA_ROCm",
+                GlobalDeviceAddress::cuda(0),
+                GlobalDeviceAddress::rocm(0), 0.025f),
+            makeLocalPPDefinition(
+                "LocalPP_Heterogeneous_CUDA_CPU",
+                GlobalDeviceAddress::cuda(0),
+                GlobalDeviceAddress::cpu(), 0.015f),
+        };
+        std::vector<ModelParityCase> expanded;
+        for (const auto &definition : definitions)
+        {
+            auto definition_cases = expandModelParityDefinition(definition);
+            expanded.insert(
+                expanded.end(),
+                std::make_move_iterator(definition_cases.begin()),
+                std::make_move_iterator(definition_cases.end()));
+        }
+        return expanded;
+    }();
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen2LocalPPParityTest : public ConfigDrivenParityTest<Qwen2LocalPPParityTest>,
-                               public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                               public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen2LocalPPParityTest, PrefillParity)
+TEST_P(Qwen2LocalPPParityTest, ProductionParity)
 {
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen2LocalPPParityTest, DecodeParity)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen2LocalPPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+    runProductionParityCampaign();
 }
 
 // =============================================================================
@@ -139,10 +129,10 @@ TEST_P(Qwen2LocalPPParityTest, SnapshotInfrastructure)
 INSTANTIATE_TEST_SUITE_P(
     Qwen2,
     Qwen2LocalPPParityTest,
-    ::testing::ValuesIn(kLocalPPConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen2LocalPPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

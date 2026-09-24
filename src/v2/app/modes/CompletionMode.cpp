@@ -1,11 +1,15 @@
 /**
  * @file CompletionMode.cpp
  * @brief Standard one-shot completion mode (default, -p "...")
+ *
+ * Request termination belongs to this mode; process finalization belongs to
+ * the caller's MPIProcessSession. Returning first retires mode-local adapters
+ * and handlers before the runner, contexts and outer session are destroyed.
  */
 
 #include "app/modes/CompletionMode.h"
 #include "app/AppContext.h"
-#include "app/MPIShutdown.h"
+#include "app/modes/ConsoleOutput.h"
 #include "utils/Logger.h"
 #include "utils/Sampler.h"
 #include <iostream>
@@ -17,13 +21,24 @@ namespace llaminar2
 {
     namespace
     {
-        int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
+        /**
+         * @brief Terminate the request channel while retaining outer MPI ownership.
+         * @param ctx Active caller-owned application resources.
+         * @param mode_name Diagnostic name of this request frontend.
+         * @param detail Failure shared with followers before runner retirement.
+         * @return Nonzero command exit; the caller's scope finalizes MPI later.
+         */
+        int shutdownAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR(mode_name << " failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -32,7 +47,6 @@ namespace llaminar2
                     ctx.runner->abortMPIWorkers(detail);
                 ctx.runner->shutdown();
             }
-            mpiShutdown();
             return 1;
         }
     } // namespace
@@ -52,14 +66,16 @@ namespace llaminar2
         auto &tokenizer = ctx.tokenizer;
 
         const bool mpi_coordinated = mpi_ctx->world_size() > 1;
-        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        const bool is_authority =
+            ctx.coordinatedRequestRole() ==
+            CoordinatedRequestRole::Authority;
+        if (mpi_coordinated && !is_authority)
         {
             LOG_DEBUG("Rank " << mpi_ctx->rank()
                              << " entering MPI worker loop for completion inference");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
-            mpiShutdown();
             return 0;
         }
 
@@ -68,14 +84,13 @@ namespace llaminar2
             runner->setMPICoordinatedMode(true);
         }
 
-        auto shutdownAndFinalize = [&](int exit_code) -> int
+        auto shutdownAndReturn = [&](int exit_code) -> int
         {
             if (mpi_coordinated)
             {
                 runner->shutdownMPIWorkers();
             }
             runner->shutdown();
-            mpiShutdown();
             return exit_code;
         };
 
@@ -88,35 +103,26 @@ namespace llaminar2
 
             if (tokens.empty())
             {
-                if (mpi_ctx->rank() == 0)
-                {
-                    LOG_ERROR("Tokenization resulted in empty token sequence");
-                }
-                return shutdownAndFinalize(1);
+                LOG_ERROR("Tokenization resulted in empty token sequence");
+                return shutdownAndReturn(1);
             }
 
-            if (mpi_ctx->rank() == 0)
+            LOG_DEBUG("Tokenized prompt: " << tokens.size() << " tokens");
+            std::ostringstream token_ids_str;
+            token_ids_str << "Token IDs: [";
+            for (size_t i = 0; i < tokens.size(); ++i)
             {
-                LOG_DEBUG("Tokenized prompt: " << tokens.size() << " tokens");
-                std::ostringstream token_ids_str;
-                token_ids_str << "Token IDs: [";
-                for (size_t i = 0; i < tokens.size(); ++i)
-                {
-                    token_ids_str << tokens[i];
-                    if (i < tokens.size() - 1)
-                        token_ids_str << ", ";
-                }
-                token_ids_str << "]";
-                LOG_DEBUG(token_ids_str.str());
+                token_ids_str << tokens[i];
+                if (i < tokens.size() - 1)
+                    token_ids_str << ", ";
             }
+            token_ids_str << "]";
+            LOG_DEBUG(token_ids_str.str());
         }
         catch (const std::exception &e)
         {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Error tokenizing prompt: " << e.what());
-            }
-            return shutdownAndFinalize(1);
+            LOG_ERROR("Error tokenizing prompt: " << e.what());
+            return shutdownAndReturn(1);
         }
 
         // Set up sampling parameters
@@ -126,44 +132,41 @@ namespace llaminar2
         sampling_params.top_p = config.top_p;
         sampling_params.seed = config.seed;
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_DEBUG("Sampling parameters:");
-            LOG_DEBUG("  temperature: " << sampling_params.temperature);
-            LOG_DEBUG("  top_k: " << sampling_params.top_k);
-            LOG_DEBUG("  top_p: " << sampling_params.top_p);
-            LOG_DEBUG("  seed: " << sampling_params.seed);
-        }
+        LOG_DEBUG("Sampling parameters:");
+        LOG_DEBUG("  temperature: " << sampling_params.temperature);
+        LOG_DEBUG("  top_k: " << sampling_params.top_k);
+        LOG_DEBUG("  top_p: " << sampling_params.top_p);
+        LOG_DEBUG("  seed: " << sampling_params.seed);
+
+        /*
+         * Prefill seals immutable request policy into the resident GPU request
+         * state.  Install sampling and tokenizer stop policy before that
+         * boundary so grouped generation cannot observe stale defaults or rely
+         * on the host output loop to discover an EOS after speculative state was
+         * already committed.
+         */
+        runner->setSamplingParams(sampling_params);
+        runner->setStopTokens(tokenizer->stop_tokens());
 
         // Run prefill
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
-        }
+        LOG_INFO("Running prefill (" << tokens.size() << " tokens)...");
 
         if (!runner->prefill(tokens))
         {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
-            }
-            return shutdownAndFinalize(1);
+            LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
+            return shutdownAndReturn(1);
         }
 
-        if (mpi_ctx->rank() == 0)
+        if (config.n_predict == -1)
         {
-            if (config.n_predict == -1)
-            {
-                LOG_DEBUG("Prefill complete. Generating tokens until EOS...\n");
-            }
-            else
-            {
-                LOG_DEBUG("Prefill complete. Generating " << config.n_predict << " tokens...\n");
-            }
+            LOG_DEBUG("Prefill complete. Generating tokens until EOS...\n");
+        }
+        else
+        {
+            LOG_DEBUG("Prefill complete. Generating " << config.n_predict << " tokens...\n");
         }
 
-        // Configure GPU-side sampling
-        runner->setSamplingParams(sampling_params);
+        console_output::printPromptAndResponseHeader(config.prompt);
 
         // Generate tokens autoregressively. decodeStep() may return more than
         // one token when MTP accepts a draft, so count output tokens rather
@@ -183,12 +186,9 @@ namespace llaminar2
 
             if (!result.success())
             {
-                if (mpi_ctx->rank() == 0)
-                {
-                    LOG_ERROR("\nError: Decode step failed at token "
-                              << (generated_tokens + 1) << ": " << result.error);
-                }
-                return shutdownAndFinalize(1);
+                LOG_ERROR("\nError: Decode step failed at token "
+                          << (generated_tokens + 1) << ": " << result.error);
+                return shutdownAndReturn(1);
             }
 
             if (result.tokens.empty())
@@ -209,7 +209,7 @@ namespace llaminar2
 
                 ++generated_tokens;
 
-                if (mpi_ctx->rank() == 0 && !is_stop)
+                if (!is_stop)
                 {
                     std::string token_text = tokenizer->decode_token(next_token);
                     std::cout << token_text << std::flush;
@@ -217,7 +217,7 @@ namespace llaminar2
 
                 if (is_stop)
                 {
-                    if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+                    if (config.verbose_level > 0)
                     {
                         LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
                     }
@@ -227,25 +227,24 @@ namespace llaminar2
             }
         }
 
+        std::cout << "\n"
+                  << std::flush;
+
         // Flush accumulated GPU stage timeline for decode phase
         runner->flushStageTimeline();
 
-        if (mpi_ctx->rank() == 0)
-        {
-            std::cout << "\n"
-                      << std::endl;
-            LOG_DEBUG("Generation complete.");
-        }
+        std::cout << std::endl;
+        LOG_DEBUG("Generation complete.");
 
-        return shutdownAndFinalize(0);
+        return shutdownAndReturn(0);
     }
     catch (const std::exception &e)
     {
-        return finalizeAfterUnhandledException(ctx, "Completion mode", e.what());
+        return shutdownAfterUnhandledException(ctx, "Completion mode", e.what());
     }
     catch (...)
     {
-        return finalizeAfterUnhandledException(ctx, "Completion mode", "unknown non-std exception");
+        return shutdownAfterUnhandledException(ctx, "Completion mode", "unknown non-std exception");
     }
 
 } // namespace llaminar2

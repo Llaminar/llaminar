@@ -40,8 +40,10 @@ namespace llaminar2
     /**
      * @brief Verify stage outputs after execution (EXIT validation)
      *
-     * Checks all OUTPUT buffers for null, NaN, Inf, or all-zero data.
-     * Also validates buffer layouts if the stage declares LayoutExpectation.
+     * Checks floating-point OUTPUT buffers for null, NaN, Inf, or all-zero
+     * data and validates declared layouts. CPU outputs are inspected directly;
+     * GPU outputs are reduced on the exact stage producer stream and only the
+     * compact diagnostic record is materialized on the host.
      *
      * Can be disabled at runtime with LLAMINAR_VALIDATE_BUFFERS=0.
      * Throws VerificationFailure on validation failure with full context.
@@ -51,21 +53,6 @@ namespace llaminar2
      * @throws verification::VerificationFailure if validation fails
      */
     void verifyStageExit(const ComputeNode &node, int layer_idx);
-
-    /**
-     * @brief Validate stage outputs for zero/NaN tensors (legacy)
-     *
-     * Checks all OUTPUT buffers for uninitialized (zero) or corrupted (NaN/Inf) data.
-     * Uses GPU-side validation when available, falls back to host-side.
-     *
-     * Can be disabled at runtime with LLAMINAR_VALIDATE_BUFFERS=0.
-     *
-     * @param node The node whose outputs should be validated
-     * @return true if validation passes, false if errors detected
-     *
-     * @deprecated Use verifyStageExit() instead for exception-based validation
-     */
-    bool validateStageOutputs(const ComputeNode &node);
 
 } // namespace llaminar2
 

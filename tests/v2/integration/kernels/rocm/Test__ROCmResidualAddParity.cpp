@@ -18,6 +18,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
@@ -119,48 +120,62 @@ namespace
         void SetUp() override
         {
             SKIP_IF_NO_ROCM();
+            ASSERT_EQ(
+                hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+                hipSuccess);
+        }
+
+        void TearDown() override
+        {
+            if (stream_)
+            {
+                EXPECT_EQ(hipStreamDestroy(stream_), hipSuccess);
+                stream_ = nullptr;
+            }
         }
 
 #ifdef HAVE_ROCM
+        hipStream_t stream_ = nullptr;
+
         // Helper to allocate GPU memory and copy data
         float *allocGpuFloat(size_t count)
         {
             float *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(float));
+            (void)hipMalloc(&d_ptr, count * sizeof(float));
             return d_ptr;
         }
 
         uint16_t *allocGpuU16(size_t count)
         {
             uint16_t *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(uint16_t));
+            (void)hipMalloc(&d_ptr, count * sizeof(uint16_t));
             return d_ptr;
         }
 
         void copyToGpu(float *d_dst, const float *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
         }
 
         void copyToGpu(uint16_t *d_dst, const uint16_t *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(uint16_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_dst, h_src, count * sizeof(uint16_t), hipMemcpyHostToDevice);
         }
 
         void copyFromGpu(float *h_dst, const float *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
         }
 
         void copyFromGpu(uint16_t *h_dst, const uint16_t *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(h_dst, d_src, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
         }
 
         void freeGpu(void *d_ptr)
         {
             if (d_ptr)
-                hipFree(d_ptr);
+                (void)hipFree(d_ptr);
         }
 #endif
     };
@@ -200,7 +215,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
 
         // Validate
@@ -248,7 +263,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
 
         EXPECT_FALSE(hasNanOrInf(rocm_output->data(), num_elements)) << "ROCm output contains NaN/Inf";
@@ -300,7 +315,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         // Dequantize for comparison
@@ -354,7 +369,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -411,7 +426,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -464,7 +479,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -519,20 +534,21 @@ namespace
 
         // Upload tensors to GPU using ensureOnDevice (as the pipeline does)
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream_));
 
         // ROCm kernel using apply_tensor() API (what the pipeline actually uses)
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
 
         // Mark output dirty and sync back to host
-        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        TransferEngine::publishCurrentDeviceWrite(rocm_output, stream_);
         const float *result = rocm_output->data(); // This syncs GPU→host
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -564,17 +580,18 @@ namespace
             num_elements, nullptr, -1));
 
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(rocm_output->ensureOnDevice(rocm_device, stream_));
 
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        TransferEngine::publishCurrentDeviceWrite(rocm_output, stream_);
         const float *result = rocm_output->data();
 
         EXPECT_FALSE(hasNanOrInf(result, num_elements)) << "ROCm output contains NaN/Inf";
@@ -607,17 +624,18 @@ namespace
         }
 
         DeviceId rocm_device = DeviceId::rocm(0);
-        ASSERT_TRUE(input->ensureOnDevice(rocm_device));
-        ASSERT_TRUE(residual->ensureOnDevice(rocm_device));
+        ASSERT_TRUE(input->ensureOnDevice(rocm_device, stream_));
+        ASSERT_TRUE(residual->ensureOnDevice(rocm_device, stream_));
 
         // Mirror the pipeline's in-place residual pattern: output aliases residual/hidden.
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
+        rocm_kernel.setGPUStream(stream_);
         ASSERT_TRUE(rocm_kernel.apply_tensor(
             input.get(), residual.get(), residual.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
-        residual->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        TransferEngine::publishCurrentDeviceWrite(residual, stream_);
         const float *result = residual->data();
         ASSERT_NE(result, nullptr);
 

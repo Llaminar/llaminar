@@ -1,0 +1,2 @@
+backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed
+NodeLocalTP_2xMPI_CPU_27B,0,0,0,0,false,0,0,false

@@ -1,6 +1,11 @@
 /**
  * @file StageRunnerFactory.cpp
- * @brief Implementation of StageRunnerFactory
+ * @brief Stage-scoped construction using canonical policy and resource owners.
+ *
+ * Pipeline stages retain distinct layer ranges, not competing copies of model
+ * weights or collective contexts. The runtime config is projected by the same
+ * factories used for whole-model execution so composition cannot silently
+ * reset MTP, prefix caching, graph capacity or expert maintenance policy.
  *
  * @author David Sanftenberg
  * @date May 2026
@@ -18,15 +23,19 @@ namespace llaminar2
 {
     namespace
     {
+        /** @brief Retain the model's prepared namespace with this stage's layer scope. */
         std::shared_ptr<StageWeightContext> makeStageWeightContext(
             const RankStageAction &action,
-            const FactoryPPStageConfig &pp_cfg)
+            const FactoryPPStageConfig &pp_cfg,
+            const std::shared_ptr<PreparedWeightStore> &prepared_store)
         {
             auto context = std::make_shared<StageWeightContext>();
             context->stage_id = action.stage_id;
             context->domain_name = action.domain_name;
             context->pp_stage_config = pp_cfg;
-            context->prepared_store = std::make_shared<PreparedWeightStore>();
+            if (!prepared_store)
+                throw std::invalid_argument("Pipeline stage requires the model-owned prepared weight store");
+            context->prepared_store = prepared_store;
             return context;
         }
     }
@@ -108,9 +117,9 @@ namespace llaminar2
             device = action.device.toLocalDeviceId();
         }
 
-        InferenceRunnerConfig runner_cfg = ctx.runner_config;
+        InferenceRunnerConfig runner_cfg = InferenceRunnerConfig::fromRuntime(ctx.runtime);
         runner_cfg.pp_stage_config = pp_cfg;
-        auto weight_context = makeStageWeightContext(action, pp_cfg);
+        auto weight_context = makeStageWeightContext(action, pp_cfg, ctx.prepared_weight_store);
         runner_cfg.prepared_weight_store = weight_context->prepared_store;
 
         std::unique_ptr<IInferenceRunner> runner;
@@ -160,22 +169,8 @@ namespace llaminar2
                 " has no devices");
         }
 
-        // Create LocalTPContext for entry lifetime tracking.
-        // createRankOrchestrator takes unique_ptr ownership so we create a second
-        // independent context with identical parameters for the runner itself.
-        auto entry_ctx = TPContextFactory::createLocal(
-            action.devices,
-            action.tp_weights,
-            action.backend);
-
-        if (!entry_ctx)
-        {
-            throw std::runtime_error(
-                "StageRunnerFactory: TPContextFactory::createLocal failed for stage " +
-                std::to_string(action.stage_id));
-        }
-
-        // Second context owned by RankOrchestrator
+        // Ownership moves into RankOrchestrator. Stage diagnostics query that
+        // live owner instead of allocating another collective for bookkeeping.
         auto runner_ctx = TPContextFactory::createLocal(
             action.devices,
             action.tp_weights,
@@ -184,22 +179,17 @@ namespace llaminar2
         if (!runner_ctx)
         {
             throw std::runtime_error(
-                "StageRunnerFactory: second TPContextFactory::createLocal failed for stage " +
+                "StageRunnerFactory: TPContextFactory::createLocal failed for stage " +
                 std::to_string(action.stage_id));
         }
 
         // Build RankOrchestrator::Config for local TP with nested PP stage config
-        auto weight_context = makeStageWeightContext(action, pp_cfg);
-        RankOrchestrator::Config ro_config;
+        auto weight_context = makeStageWeightContext(action, pp_cfg, ctx.prepared_weight_store);
+        auto ro_config = RankOrchestrator::Config::fromRuntime(ctx.runtime);
         ro_config.mode = RankOrchestrator::ParallelismMode::TP;
         ro_config.devices = action.devices;
         ro_config.weights = action.tp_weights;
         ro_config.backend = action.backend;
-        ro_config.max_seq_len = static_cast<size_t>(ctx.runner_config.max_seq_len);
-        ro_config.batch_size = ctx.runner_config.batch_size;
-        ro_config.activation_precision = ctx.runner_config.activation_precision;
-        ro_config.kv_cache_precision = ctx.runner_config.kv_cache_precision;
-        ro_config.use_mapped_memory = ctx.runner_config.use_mapped_memory;
         ro_config.nested_pp_stage_config = pp_cfg;
         ro_config.prepared_weight_store = weight_context->prepared_store;
 
@@ -224,7 +214,6 @@ namespace llaminar2
         entry.domain_name = action.domain_name;
         entry.action = action;
         entry.runner = std::move(rank_runner);
-        entry.local_tp_ctx = std::move(entry_ctx);
         entry.pp_stage_config = pp_cfg;
         entry.weight_context = std::move(weight_context);
         return entry;
@@ -274,11 +263,11 @@ namespace llaminar2
         entry_action.tp_rank_in_domain = tp_device_index;
         entry_action.tp_domain_size = tp_domain_size;
 
-        InferenceRunnerConfig runner_cfg = ctx.runner_config;
+        InferenceRunnerConfig runner_cfg = InferenceRunnerConfig::fromRuntime(ctx.runtime);
         runner_cfg.pp_stage_config = pp_cfg;
         runner_cfg.tp_ctx = global_tp_ctx.get();
         runner_cfg.tp_device_index = tp_device_index;
-        auto weight_context = makeStageWeightContext(entry_action, pp_cfg);
+        auto weight_context = makeStageWeightContext(entry_action, pp_cfg, ctx.prepared_weight_store);
         runner_cfg.prepared_weight_store = weight_context->prepared_store;
 
         std::unique_ptr<IInferenceRunner> runner;

@@ -60,6 +60,13 @@ namespace
         void *defaultStream() override { return &fake_stream_; }
         void *createStream() override { return &fake_stream_; }
         void destroyStream(void *) override {}
+        void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+        {
+            if (created)
+                *created = false;
+            return &fake_auxiliary_stream_;
+        }
+        void resetAuxiliaryStreams() override {}
 
         void *createEvent() override
         {
@@ -104,7 +111,15 @@ namespace
 
         void synchronize() override {}
         void synchronizeStream(void *) override {}
-        void insertStreamDependency(void *, void *) override {}
+        GPUStreamExecutionState queryStreamExecutionState(
+            void *stream,
+            std::string_view boundary) override
+        {
+            if (!stream || boundary.empty())
+                throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+            return GPUStreamExecutionState::Complete;
+        }
+        bool insertStreamDependency(void *, void *) override { return true; }
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *) override { return nullptr; }
@@ -123,6 +138,7 @@ namespace
 
     private:
         int fake_stream_ = 0;
+        int fake_auxiliary_stream_ = 0;
     };
 
     class ScopedEnv
@@ -252,8 +268,9 @@ TEST_F(Test__StageTimeline, RecordAndCollect_BasicFlow)
     // Collect timings
     timeline.collect(gpu_ctx_.get());
 
-    // Should sync once (on last stop event) and query all 3 pairs
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 1);
+    // Sync each stage stop event so backend failures are attributed to the
+    // earliest stage that observes them.
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 3);
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 3);
 
     // Check total GPU time
@@ -284,10 +301,10 @@ TEST_F(Test__StageTimeline, CollectSynchronizesLastStopEventOnEachStream)
 
     timeline.collect(gpu_ctx_.get());
 
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 2)
-        << "stage timing must wait for every explicit stream before querying elapsed events";
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 3)
+        << "stage timing must wait for every recorded stage before querying elapsed events";
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 3);
-    ASSERT_EQ(gpu_ctx_->synchronized_events_.size(), 2u);
+    ASSERT_EQ(gpu_ctx_->synchronized_events_.size(), 3u);
     EXPECT_NE(gpu_ctx_->synchronized_events_[0], gpu_ctx_->synchronized_events_[1]);
 }
 
@@ -571,7 +588,7 @@ TEST_F(Test__StageTimeline, StaleEvents_WouldBeCollectedWithoutReset)
     timeline.collect(gpu_ctx_.get());
 
     // Without reset, it DOES try to sync and query all 4 events
-    EXPECT_EQ(gpu_ctx_->events_synchronized_, 1);
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 4);
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 4);
 }
 

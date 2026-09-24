@@ -2,9 +2,10 @@
  * @file Test__HiddenStateRowSelectStage.cpp
  * @brief Unit tests for bucketed-prefill hidden-state row selection.
  *
- * Verifies that dynamic PrefillReplayParams select the expected hidden-state row
- * on CPU and that LMHeadStage can consume the stable one-row scratch at GEMM
- * activation offset zero while the selected source row changes.
+ * Verifies both row-ownership policies: dynamic PrefillReplayParams select the
+ * expected hidden-state row, while graph-fixed checkpoints reject replay
+ * mutation and declare no GPU metadata workspace. LMHeadStage also consumes
+ * the stable one-row scratch at GEMM activation offset zero.
  */
 
 #include <gtest/gtest.h>
@@ -18,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -219,6 +221,116 @@ TEST(Test__HiddenStateRowSelectStage, CPUReplayParamsChangeSelectedRow)
     }
 }
 
+/**
+ * @brief Prove fixed checkpoint rows cannot acquire mutable replay state.
+ *
+ * A diagnostic checkpoint's row is part of its graph geometry. Updating
+ * PrefillReplayParams must therefore leave the row unchanged, and GPU versions
+ * must not declare the device scalar used by dynamic bucket replay.
+ */
+TEST(Test__HiddenStateRowSelectStage, FixedDeviceRowHasNoReplayOrScalarWorkspace)
+{
+    const int seq_len = 6;
+    const int d_model = 8;
+    auto hidden = makeHiddenStates(seq_len, d_model);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+
+    HiddenStateRowSelectStage::Params cpu_params;
+    cpu_params.device_id = DeviceId::cpu();
+    cpu_params.input = hidden.get();
+    cpu_params.output = scratch.get();
+    cpu_params.seq_len = seq_len;
+    cpu_params.d_model = d_model;
+    cpu_params.selected_row_idx = 4;
+    cpu_params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+
+    HiddenStateRowSelectStage cpu_stage(cpu_params);
+    EXPECT_FALSE(cpu_stage.hasPrefillReplayParams());
+    cpu_stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
+        /*real_seq_len=*/2,
+        /*bucket_seq_len=*/seq_len,
+        /*token_offset=*/0});
+    EXPECT_EQ(cpu_stage.selectedRowForTesting(), 4);
+    ASSERT_TRUE(cpu_stage.execute(nullptr));
+    for (int column = 0; column < d_model; ++column)
+    {
+        EXPECT_FLOAT_EQ(
+            scratch->data()[column],
+            hidden->data()[static_cast<size_t>(4) * d_model + column]);
+    }
+
+    HiddenStateRowSelectStage::Params gpu_params;
+    gpu_params.device_id = DeviceId::rocm(0);
+    gpu_params.seq_len = seq_len;
+    gpu_params.d_model = d_model;
+    gpu_params.selected_row_idx = 4;
+    gpu_params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+
+    HiddenStateRowSelectStage gpu_stage(gpu_params);
+    EXPECT_FALSE(gpu_stage.hasPrefillReplayParams());
+    EXPECT_EQ(
+        gpu_stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
+    EXPECT_TRUE(
+        gpu_stage.getWorkspaceRequirements(seq_len, d_model, 0)
+            .buffers.empty());
+}
+
+/**
+ * @brief Prove resident request lengths bypass every host replay mechanism.
+ *
+ * The pointer is deliberately an opaque non-null sentinel because unit tests
+ * must not perform GPU work. Construction-time policy is the behavior under
+ * test: no mutable replay parameters, no graph-launch upload hook, and no
+ * selected-row workspace may be declared.
+ */
+TEST(Test__HiddenStateRowSelectStage, DeviceResidentRequestLengthHasNoHostReplayState)
+{
+    constexpr uintptr_t kOpaqueDeviceAddress = 0x1000;
+    const auto *request_length_device =
+        reinterpret_cast<const int32_t *>(kOpaqueDeviceAddress);
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 512;
+    params.d_model = 2048;
+    params.selected_row_idx = 511;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength;
+    params.request_sequence_length_device = request_length_device;
+
+    HiddenStateRowSelectStage stage(params);
+    EXPECT_EQ(
+        stage.selectionPolicyForTesting(),
+        HiddenStateRowSelectStage::SelectionPolicy::
+            DeviceResidentRequestLength);
+    EXPECT_EQ(
+        stage.requestSequenceLengthDeviceForTesting(),
+        request_length_device);
+    EXPECT_FALSE(stage.hasPrefillReplayParams());
+    EXPECT_EQ(
+        stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
+    EXPECT_TRUE(
+        stage.getWorkspaceRequirements(
+                 params.seq_len,
+                 params.d_model,
+                 0)
+            .buffers.empty());
+
+    stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
+        /*real_seq_len=*/443,
+        /*bucket_seq_len=*/512,
+        /*token_offset=*/0});
+    EXPECT_EQ(stage.selectedRowForTesting(), 511)
+        << "Resident metadata, not a host replay setter, owns the row";
+}
+
 TEST(Test__HiddenStateRowSelectStage, GPUWorkspaceRequirementsDeclareSelectedRowScalar)
 {
     HiddenStateRowSelectStage::Params params;
@@ -277,14 +389,16 @@ TEST(Test__HiddenStateRowSelectStage, UsesExplicitStableWorkspaceBufferName)
     EXPECT_EQ(after.buffers[0].name, "mtp_terminal_hidden_selected_row");
 }
 
-TEST(Test__HiddenStateRowSelectStage, GPUStagesOptIntoGraphLaunchPreparation)
+TEST(Test__HiddenStateRowSelectStage, GraphLaunchPreparationPolicyIsExplicit)
 {
     HiddenStateRowSelectStage::Params single_gpu_params;
     single_gpu_params.device_id = DeviceId::cuda(0);
     single_gpu_params.seq_len = 8;
     single_gpu_params.d_model = 32;
     HiddenStateRowSelectStage single_gpu(single_gpu_params);
-    EXPECT_TRUE(single_gpu.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        single_gpu.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
 
     HiddenStateRowsSelectStage::Params multi_gpu_params;
     multi_gpu_params.device_id = DeviceId::rocm(0);
@@ -292,14 +406,18 @@ TEST(Test__HiddenStateRowSelectStage, GPUStagesOptIntoGraphLaunchPreparation)
     multi_gpu_params.d_model = 32;
     multi_gpu_params.selected_row_count = 3;
     HiddenStateRowsSelectStage multi_gpu(multi_gpu_params);
-    EXPECT_TRUE(multi_gpu.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        multi_gpu.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
 
     HiddenStateRowSelectStage::Params cpu_params;
     cpu_params.device_id = DeviceId::cpu();
     cpu_params.seq_len = 8;
     cpu_params.d_model = 32;
     HiddenStateRowSelectStage cpu_stage(cpu_params);
-    EXPECT_FALSE(cpu_stage.needsGraphLaunchPreparation());
+    EXPECT_EQ(
+        cpu_stage.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::None);
 }
 
 TEST(Test__HiddenStateRowSelectStage, LMHeadUsesScratchOffsetZeroWhenSelectedRowChanges)
@@ -506,7 +624,7 @@ TEST(Test__HiddenStateRowSelectStage, ReplayMutatorsDoNotTouchGpuWorkspace)
     }
 }
 
-TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateWorkspace)
+TEST(Test__HiddenStateRowSelectStage, WorkspaceBoundRowMetadataDoesNotDeclareOrMutateProducerBuffer)
 {
     HiddenStateRowsSelectStage::Params params;
     params.device_id = DeviceId::cuda(0);
@@ -514,14 +632,133 @@ TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataDoesNotDeclareOrMutateW
     params.d_model = 32;
     params.selected_row_count = 3;
     params.selected_row_indices = {1, 2, 3};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::WorkspaceBoundDeviceIndices;
     params.workspace_buffer_name = "mtp_spec_decode_verifier_rows";
-    params.declare_selected_rows_workspace = false;
-    params.upload_selected_rows_to_workspace = false;
     HiddenStateRowsSelectStage stage(params);
 
     EXPECT_TRUE(stage.getWorkspaceRequirements(8, 32, 0).buffers.empty())
-        << "External metadata mode must let the metadata owner declare the row-index buffer";
+        << "Workspace-bound metadata mode must let the producer declare the row-index buffer";
     EXPECT_FALSE(stage.setSelectedRowsForReplay({5, 0, 7}))
-        << "External metadata mode must not silently update a stale stage-local row list";
+        << "Workspace-bound metadata mode must not silently update a stale stage-local row list";
     EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
+}
+
+TEST(Test__HiddenStateRowSelectStage, ExternalRowMetadataUsesOnlyTheExactProducerPointer)
+{
+    const int32_t producer_owned_rows[] = {1, 2, 3};
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 8;
+    params.d_model = 32;
+    params.selected_row_count = 3;
+    params.selected_row_indices = {1, 2, 3};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::ExternalDeviceIndices;
+    params.external_device_row_indices = producer_owned_rows;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(8, 32, 0).buffers.empty())
+        << "An exact external producer pointer must never declare or discover a graph workspace buffer";
+    EXPECT_FALSE(stage.setSelectedRowsForReplay({5, 0, 7}))
+        << "External metadata mode must not silently adopt stage-owned host rows";
+    EXPECT_EQ(stage.selectedRowsForTesting(), std::vector<int>({1, 2, 3}));
+}
+
+TEST(Test__HiddenStateRowSelectStage,
+     ExternalCheckpointOutputRetainsArenaInputAuthority)
+{
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 3;
+    params.d_model = 32;
+    params.input_buffer_id = BufferId::NORMALIZED;
+    params.selection_policy =
+        HiddenStateRowSelectStage::SelectionPolicy::FixedDeviceRow;
+    HiddenStateRowSelectStage stage(params);
+
+    const StageBufferContract contract = stage.bufferContract();
+    ASSERT_EQ(contract.inputs.size(), 1u);
+    EXPECT_EQ(contract.inputs.front().id, BufferId::NORMALIZED);
+    EXPECT_TRUE(contract.outputs.empty())
+        << "An external diagnostic tensor must not masquerade as an arena output";
+    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::FULL)
+        << "The executor must bind and cohere the graph-produced arena input";
+}
+
+TEST(Test__HiddenStateRowSelectStage,
+     ShiftedPrefillTransactionDeclaresCompletePersistentArenaContract)
+{
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 16;
+    params.d_model = 32;
+    params.selected_row_count = 16;
+    params.input_buffer_id = BufferId::HIDDEN_STATE;
+    params.output_buffer_id = BufferId::NORMALIZED;
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            ShiftedPrefillTransaction;
+    params.terminal_hidden_archive_buffer_id =
+        BufferId::PREFIX_TERMINAL_HIDDEN;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(16, 32, 0).buffers.empty())
+        << "Integrated shifted prefill derives all metadata from persistent device owners.";
+    const StageBufferContract contract = stage.bufferContract();
+    const auto has_binding = [](const auto &bindings, BufferId id)
+    {
+        return std::any_of(
+            bindings.begin(),
+            bindings.end(),
+            [id](const BufferBinding &binding)
+            {
+                return binding.id == id;
+            });
+    };
+
+    const auto reads = contract.allArenaReads();
+    const auto writes = contract.allWrites();
+    EXPECT_TRUE(has_binding(reads, BufferId::HIDDEN_STATE));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_TOKEN_IDS));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_POSITION_IDS));
+    EXPECT_TRUE(has_binding(reads, BufferId::REQUEST_BATCH_GEOMETRY));
+    EXPECT_TRUE(has_binding(reads, BufferId::PREFIX_TERMINAL_HIDDEN));
+    EXPECT_TRUE(has_binding(writes, BufferId::PREFIX_TERMINAL_HIDDEN));
+    EXPECT_TRUE(has_binding(writes, BufferId::NORMALIZED));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_TOKEN_IDS));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_POSITION_IDS));
+    EXPECT_TRUE(has_binding(
+        writes,
+        BufferId::MTP_SHIFTED_PREFILL_APPEND_LENGTHS));
+}
+
+TEST(Test__HiddenStateRowSelectStage, FixedContiguousGpuRowsHaveNoHostMetadataLifecycle)
+{
+    HiddenStateRowsSelectStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 16;
+    params.d_model = 32;
+    params.selected_row_count = 4;
+    params.selected_row_indices = {3, 4, 5, 6};
+    params.device_row_index_source =
+        HiddenStateRowsSelectStage::DeviceRowIndexSource::
+            FixedContiguousRange;
+    params.fixed_contiguous_row_start = 3;
+    HiddenStateRowsSelectStage stage(params);
+
+    EXPECT_TRUE(stage.getWorkspaceRequirements(16, 32, 0).buffers.empty())
+        << "An immutable contiguous D2D source needs no device row-index workspace.";
+    EXPECT_FALSE(stage.setSelectedRowsForReplay({7, 8, 9, 10}))
+        << "Captured fixed-range geometry must not adopt a host replay plan.";
+    EXPECT_EQ(stage.selectedRowsForTesting(),
+              std::vector<int>({3, 4, 5, 6}));
+    EXPECT_TRUE(stage.prepareGraphLaunch(
+        /*ctx=*/nullptr,
+        reinterpret_cast<void *>(static_cast<uintptr_t>(1))))
+        << "Launch preparation must accept an explicit stream without allocating or uploading metadata.";
 }

@@ -6,19 +6,17 @@
  *
  * **Design**:
  * - Inherits from ROCmKernelBase for workspace and device context support
- * - Implements IDeviceKernel for universal caching via DeviceKernelCache
  * - Uses hipBLAS sgemm (FP32), hgemm (FP16), or emulated BF16 (via FP32 compute)
  * - Expects input/output matrices already on GPU device
  * - Caller responsible for device memory management
  *
- * **Device Context Support (Phase 4)**:
- * - Can use hipBLAS handle from IWorkerGPUContext instead of creating own
- * - Backward compatible: existing constructor still creates own handle
+ * All construction forms borrow context-owned library resources. Projection
+ * lifetime never owns hipBLAS teardown. Context-scoped submission locking
+ * protects exact stream and persistent arena workspace selection.
  *
- * **Usage** (via DeviceKernelCache):
+ * **Usage**:
  * ```cpp
- * auto* gemm = DeviceKernelCache::getKernel<HipBLASGemmKernel>(
- *     DeviceId::rocm(0), KernelType::BLAS_GEMM);
+ * auto gemm = std::make_unique<HipBLASGemmKernel>(DeviceId::rocm(0));
  * gemm->execute(d_A, d_B, d_C, M, N, K, transA, transB);
  * ```
  *
@@ -32,10 +30,10 @@
 #pragma once
 
 #include "../ROCmKernelBase.h"
-#include "../../DeviceKernelCache.h"
 #include "../../../backends/DeviceId.h"
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 // NOTE: DO NOT include HIP headers here!
@@ -55,7 +53,7 @@ namespace llaminar2
          * @brief hipBLAS-based GEMM kernel for floating-point tensors
          *
          * Inherits from ROCmKernelBase for workspace and device context support.
-         * Implements IDeviceKernel for universal caching.
+         * Library ownership and submission serialization belong to the context.
          *
          * Supports:
          * - FP32: hipblasSgemm
@@ -71,7 +69,7 @@ namespace llaminar2
          * - No Tensor Cores, but matrix FMA is well optimized
          * - BF16 requires conversion overhead (no hardware support)
          */
-        class HipBLASGemmKernel : public ROCmKernelBase, public IDeviceKernel
+        class HipBLASGemmKernel : public ROCmKernelBase
         {
         public:
             /**
@@ -85,7 +83,7 @@ namespace llaminar2
             };
 
             /**
-             * @brief Create hipBLAS GEMM kernel (legacy constructor - creates own handle)
+             * @brief Borrow the persistent worker context selected by device identity.
              *
              * @param device_id DeviceId (must be ROCm)
              * @param precision Floating-point precision to use
@@ -109,7 +107,7 @@ namespace llaminar2
             explicit HipBLASGemmKernel(IWorkerGPUContext *ctx, Precision precision = Precision::FP32);
 
             /**
-             * @brief Destructor - destroys hipBLAS handle only if owned
+             * @brief Destroy only this projection view, never the context's library.
              */
             ~HipBLASGemmKernel() override;
 
@@ -125,8 +123,8 @@ namespace llaminar2
             // IDeviceKernel Interface
             // =================================================================
 
-            KernelType type() const override { return KernelType::BLAS_GEMM; }
-            DeviceId device() const override { return device_id_; }
+            /** @return Physical device whose context owns the library. */
+            DeviceId device() const { return device_id_; }
 
             // =================================================================
             // Device Query
@@ -172,6 +170,23 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             /**
+             * @brief Submit FP32 GEMM on one exact non-null HIP stream.
+             *
+             * The context's hipBLAS handle is shared by floating projections
+             * on a device. This entry point binds that handle and submits
+             * the operation while holding its context-scoped dispatch lock, so
+             * another stream cannot retarget the handle between those actions.
+             * The lock is released immediately after enqueue and does not wait
+             * for device execution.
+             */
+            bool executeOnStream(
+                ExplicitGPUStream stream,
+                const float *d_A, const float *d_B, float *d_C,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
              * @brief Batched FP32 GEMM with row-major Llaminar layout.
              *
              * All batch entries share dimensions and transpose flags, but may use
@@ -179,6 +194,17 @@ namespace llaminar2
              * device memory and valid for the active stream.
              */
             bool execute_batched(
+                const float *const *d_A_array,
+                const float *const *d_B_array,
+                float *const *d_C_array,
+                int M, int N, int K,
+                int batch_count,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /** @brief Submit batched FP32 GEMM on one exact HIP stream. */
+            bool executeBatchedOnStream(
+                ExplicitGPUStream stream,
                 const float *const *d_A_array,
                 const float *const *d_B_array,
                 float *const *d_C_array,
@@ -214,6 +240,15 @@ namespace llaminar2
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
 
+            /** @brief Submit fused-bias FP32 GEMM on one exact HIP stream. */
+            bool executeWithBiasOnStream(
+                ExplicitGPUStream stream,
+                const float *d_A, const float *d_B, float *d_C,
+                const float *d_bias,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
             /**
              * @brief FP16 GEMM: C = alpha * A @ B + beta * C
              *
@@ -225,39 +260,58 @@ namespace llaminar2
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
 
+            /** @brief Submit native FP16 GEMM on one exact HIP stream. */
+            bool executeFP16OnStream(
+                ExplicitGPUStream stream,
+                const void *d_A, const void *d_B, void *d_C,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
+             * @brief Declare stable hipBLASLt algorithm workspace.
+             *
+             * Fused-bias GEMM is graph capturable only when its library
+             * workspace has setup-owned storage and a stable address.
+             */
+            WorkspaceRequirements getWorkspaceRequirements(
+                int m, int n = 0, int k = 0) const override;
+
             // Getters
             int device_ordinal() const { return device_id_.ordinal; }
             Precision precision() const { return precision_; }
 
             /**
-             * @brief Check if this kernel owns its hipBLAS handle
-             * @return true if destructor will destroy the handle, false if using context's handle
+             * @brief Report that projection views never own library handles.
+             * @return false; the context is the sole library lifetime authority.
              */
-            bool ownsHandle() const { return owns_handle_; }
+            bool ownsHandle() const { return false; }
 
             /**
-             * @brief Set the stream on the underlying hipBLAS handle
-             * @param stream HIP stream (cast to hipStream_t internally)
+             * @brief Retain the exact validated stream for legacy entry points.
+             *
+             * The handle is rebound only inside the dispatch critical section
+             * immediately before enqueue.  Merely binding a wrapper therefore
+             * cannot retarget another wrapper that shares this low-level
+             * kernel.
+             *
+             * @param stream Non-null HIP stream validated by the public kernel
+             *        interface.
              */
-            void setStream(void *stream);
+            void bindStream(ExplicitGPUStream stream);
+
+            /**
+             * @brief End the borrowed stream lifetime without selecting stream zero.
+             */
+            void clearStreamBinding() noexcept;
 
         private:
-            // hipblasHandle_t and hipblasLtHandle_t stored as void* to avoid including HIP headers.
-            // This allows g++-compiled files to include this header without HIP namespace pollution.
-            void *handle_ = nullptr;
-            void *lt_handle_ = nullptr; // hipBLASLt handle for fused operations
             DeviceId device_id_;
             Precision precision_ = Precision::FP32;
-            bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
-            bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
-
-            // Cached hipBLASLt workspace (avoids per-call hipMalloc/hipFree)
-            void *lt_workspace_ = nullptr;
-            size_t lt_workspace_size_ = 0;
         };
 
         /**
-         * @brief Factory function for hipBLAS GEMM kernel (legacy - creates own handle)
+         * @brief Create a submission view borrowing the selected device context.
          */
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
             const DeviceId &device_id,
@@ -269,13 +323,6 @@ namespace llaminar2
         std::unique_ptr<HipBLASGemmKernel> createHipBLASGemm(
             IWorkerGPUContext *ctx,
             HipBLASGemmKernel::Precision precision = HipBLASGemmKernel::Precision::FP32);
-
-        /**
-         * @brief Register hipBLAS GEMM kernel factory with DeviceKernelCache
-         *
-         * Call this at startup to enable automatic kernel creation for ROCm devices.
-         */
-        void registerHipBLASGemmKernelFactory();
 
     } // namespace rocm
 } // namespace llaminar2

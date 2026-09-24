@@ -22,6 +22,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 #include <mpi.h>
 #include <vector>
 #include <cmath>
@@ -43,6 +44,7 @@
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 #include "config/TPDomain.h"
+#include "planning/ClusterInventoryGatherer.h"
 
 using namespace llaminar2;
 
@@ -94,113 +96,41 @@ namespace
     // =========================================================================
 
     /**
-     * @brief Serialized representation of a rank's device info for MPI transfer
-     */
-    struct SerializedRankInfo
-    {
-        int rank;
-        int node_id;
-        int local_rank;
-        int cuda_count;
-        int rocm_count;
-        // Device memory (up to 8 CUDA + 8 ROCm devices per rank)
-        uint64_t cuda_memory[8];
-        uint64_t rocm_memory[8];
-    };
-
-    /**
-     * @brief Build a distributed ClusterInventory using MPI_Allgather
+     * @brief Select collective participants from the production MPI inventory.
+     * @param mpi_ctx Actual communicator, including physical node membership.
+     * @param backends Explicit backend membership for this collective test.
+     * @return Selected views with original UUIDs, capacity and measured peers.
      *
-     * Each rank contributes its local device info, and all ranks receive
-     * the complete cluster inventory. This is essential for proper backend
-     * selection in multi-rank scenarios.
+     * The gatherer owns discovery and serialization. This fixture only removes
+     * unselected backend views; it never invents rank-local physical devices.
      */
     ClusterInventory buildDistributedInventory(
         std::shared_ptr<IMPIContext> mpi_ctx,
-        int cuda_count,
-        int rocm_count)
+        std::initializer_list<DeviceType> backends)
     {
-        // Gather local info
-        SerializedRankInfo local_info{};
-        local_info.rank = mpi_ctx->rank();
-        local_info.node_id = 0; // Single node assumed for integration tests
-        local_info.local_rank = mpi_ctx->rank();
-        local_info.cuda_count = cuda_count;
-        local_info.rocm_count = rocm_count;
-
-#ifdef HAVE_CUDA
-        auto *cuda_backend = getCUDABackend();
-        if (cuda_backend != nullptr)
+        // This test deliberately projects a mutable backend subset; production
+        // planning retains the immutable context-owned observation instead.
+        auto inventory = *gatherClusterInventory(mpi_ctx);
+        const auto selected = [&](DeviceType type) {
+            return std::find(backends.begin(), backends.end(), type) != backends.end();
+        };
+        for (auto &rank : inventory.ranks)
         {
-            for (int i = 0; i < std::min(cuda_count, 8); ++i)
+            std::erase_if(rank.gpus, [&](const DeviceInfo &gpu) { return !selected(gpu.type); });
+            if (!selected(DeviceType::CUDA))
             {
-                local_info.cuda_memory[i] = cuda_backend->deviceMemoryTotal(i);
+                rank.p2p_cuda.clear();
+                rank.p2p_cuda_count = 0;
+            }
+            if (!selected(DeviceType::ROCm))
+            {
+                rank.p2p_rocm.clear();
+                rank.p2p_rocm_count = 0;
             }
         }
-#endif
-
-#ifdef HAVE_ROCM
-        auto *rocm_backend = getROCmBackend();
-        if (rocm_backend != nullptr)
-        {
-            for (int i = 0; i < std::min(rocm_count, 8); ++i)
-            {
-                local_info.rocm_memory[i] = rocm_backend->deviceMemoryTotal(i);
-            }
-        }
-#endif
-
-        // Gather from all ranks
-        std::vector<SerializedRankInfo> all_info(static_cast<size_t>(mpi_ctx->world_size()));
-        MPI_Allgather(
-            &local_info, sizeof(SerializedRankInfo), MPI_BYTE,
-            all_info.data(), sizeof(SerializedRankInfo), MPI_BYTE,
-            mpi_ctx->communicator());
-
-        // Build ClusterInventory
-        ClusterInventory inv;
-        inv.world_size = mpi_ctx->world_size();
-        inv.node_count = 1; // Single node assumed
-        inv.ranks.resize(static_cast<size_t>(mpi_ctx->world_size()));
-
-        for (size_t r = 0; r < all_info.size(); ++r)
-        {
-            const auto &info = all_info[r];
-            auto &rank_inv = inv.ranks[r];
-
-            rank_inv.rank = info.rank;
-            rank_inv.node_id = info.node_id;
-            rank_inv.local_rank = info.local_rank;
-            rank_inv.hostname = "localhost";
-
-            // Add CUDA devices
-            for (int i = 0; i < info.cuda_count && i < 8; ++i)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::CUDA;
-                gpu.local_device_id = i;
-                gpu.memory_bytes = info.cuda_memory[i];
-                gpu.name = "CUDA GPU " + std::to_string(i);
-                gpu.supports_p2p = true;
-                rank_inv.gpus.push_back(gpu);
-            }
-
-            // Add ROCm devices
-            for (int i = 0; i < info.rocm_count && i < 8; ++i)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::ROCm;
-                gpu.local_device_id = i;
-                gpu.memory_bytes = info.rocm_memory[i];
-                gpu.name = "ROCm GPU " + std::to_string(i);
-                rank_inv.gpus.push_back(gpu);
-            }
-        }
-
-        inv.buildNodeAggregations();
-        return inv;
+        inventory.buildNodeAggregations();
+        return inventory;
     }
-
 } // namespace
 
 // =============================================================================
@@ -259,7 +189,7 @@ protected:
      */
     ClusterInventory buildFullInventory()
     {
-        return buildDistributedInventory(mpi_ctx_, cuda_count_, rocm_count_);
+        return buildDistributedInventory(mpi_ctx_, {DeviceType::CUDA, DeviceType::ROCm});
     }
 
     /**
@@ -267,7 +197,7 @@ protected:
      */
     ClusterInventory buildCUDAOnlyInventory()
     {
-        return buildDistributedInventory(mpi_ctx_, cuda_count_, 0);
+        return buildDistributedInventory(mpi_ctx_, {DeviceType::CUDA});
     }
 
     /**
@@ -275,7 +205,7 @@ protected:
      */
     ClusterInventory buildROCmOnlyInventory()
     {
-        return buildDistributedInventory(mpi_ctx_, 0, rocm_count_);
+        return buildDistributedInventory(mpi_ctx_, {DeviceType::ROCm});
     }
 
     void verifyAllReduceResult(
@@ -577,7 +507,6 @@ TEST_F(Test__CollectiveNVIDIA, AllReduceSumViaNCCL)
     // Upload to GPU
     ASSERT_TRUE(tensor->ensureOnDevice(cuda_dev_))
         << "Failed to upload tensor to CUDA device";
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Execute AllReduce
     bool success = ctx->executeAllreduce(
@@ -587,9 +516,6 @@ TEST_F(Test__CollectiveNVIDIA, AllReduceSumViaNCCL)
         CollectiveOp::ALLREDUCE_SUM);
 
     ASSERT_TRUE(success) << "NCCL AllReduce failed";
-
-    // Mark device dirty after GPU collective
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Download result
     ASSERT_TRUE(tensor->ensureOnHost()) << "Failed to download result";
@@ -693,7 +619,6 @@ TEST_F(Test__CollectiveAMD, AllReduceSumViaRCCL)
     // Upload to GPU
     ASSERT_TRUE(tensor->ensureOnDevice(rocm_dev_))
         << "Failed to upload tensor to ROCm device";
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Execute AllReduce
     bool success = ctx->executeAllreduce(
@@ -703,9 +628,6 @@ TEST_F(Test__CollectiveAMD, AllReduceSumViaRCCL)
         CollectiveOp::ALLREDUCE_SUM);
 
     ASSERT_TRUE(success) << "RCCL AllReduce failed";
-
-    // Mark device dirty after GPU collective
-    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
     // Download result
     ASSERT_TRUE(tensor->ensureOnHost()) << "Failed to download result";

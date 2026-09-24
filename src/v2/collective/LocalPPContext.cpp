@@ -286,89 +286,27 @@ namespace llaminar2
         const DeviceId src_device = config_.stage_devices[stage_from].toLocalDeviceId();
         const DeviceId dst_device = config_.stage_devices[stage_to].toLocalDeviceId();
 
-        // Handle GPU↔CPU transfers via host memory (transferTo only supports GPU-to-GPU)
-        if (src_device.is_cpu() || dst_device.is_cpu())
+        /*
+         * TransferEngine owns source selection, transport selection, destination
+         * buffer promotion, and coherence publication. Keeping all four steps
+         * together prevents PP callers from repairing partial transfers with
+         * guessed coherence state mutations.
+         */
+        auto result = TransferEngine::instance().transferActivation(
+            activations,
+            dst_device,
+            active_bytes);
+        if (!result.success)
         {
-            // GPU → CPU: Use ensureOnHost() to download data
-            if (!dst_device.is_cpu())
-            {
-                // CPU → GPU: First ensure on host (should already be), then upload to GPU
-                if (!activations->ensureOnDevice(dst_device))
-                {
-                    LOG_ERROR("LocalPPContext::transfer: Failed to upload to "
-                              << dst_device.toString());
-                    return false;
-                }
-                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-                LOG_DEBUG("LocalPPContext::transfer: CPU → GPU transfer to "
-                          << dst_device.toString() << " (" << activations->numel() << " elements)");
-            }
-            else
-            {
-                // GPU → CPU or CPU → CPU: Ensure data is on host
-                // The data() call will sync from GPU if device-dirty
-                if (!activations->data())
-                {
-                    LOG_ERROR("LocalPPContext::transfer: Failed to sync to host from "
-                              << src_device.toString());
-                    return false;
-                }
-                // Mark GPU data as stale - host is now authoritative
-                activations->invalidateGpuData();
-                LOG_DEBUG("LocalPPContext::transfer: GPU → CPU transfer from "
-                          << src_device.toString() << " (" << activations->numel() << " elements)");
-            }
-            return true;
-        }
-
-        // Ensure tensor is on source device first (if not already authoritative there)
-        if (!activations->isDeviceAuthoritative(src_device))
-        {
-            if (!activations->ensureOnDevice(src_device))
-            {
-                LOG_ERROR("LocalPPContext::transfer: Failed to ensure on source device "
-                          << src_device.toString());
-                return false;
-            }
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
-        }
-
-        // Cross-vendor GPU transfer (CUDA↔ROCm): use host-staged transfer.
-        // Direct cross-vendor copies are not supported.
-        const bool is_cross_vendor =
-            (src_device.is_cuda() && dst_device.is_rocm()) ||
-            (src_device.is_rocm() && dst_device.is_cuda());
-
-        if (is_cross_vendor)
-        {
-            // Cross-vendor GPU transfer: delegate to TransferEngine which
-            // handles the host-bounce pattern (D2H → H2D) correctly for all
-            // memory residency types.
-            auto result = TransferEngine::instance().transferActivation(activations, dst_device);
-            if (!result.success)
-            {
-                LOG_ERROR("LocalPPContext::transfer: TransferEngine failed: " << result.error
-                                                                              << " (" << src_device.toString() << " → " << dst_device.toString() << ")");
-                return false;
-            }
-
-            LOG_DEBUG("LocalPPContext::transfer: Cross-vendor transfer via TransferEngine "
-                      << src_device.toString() << " → " << dst_device.toString()
-                      << " method=" << to_string(result.method_used)
-                      << " (" << activations->numel() << " elements)");
-            return true;
-        }
-
-        // Same-vendor GPU-to-GPU: direct transfer
-        if (!activations->transferTo(dst_device, active_bytes))
-        {
-            LOG_ERROR("LocalPPContext::transfer: transferTo() failed "
-                      << src_device.toString() << " → " << dst_device.toString());
+            LOG_ERROR("LocalPPContext::transfer: TransferEngine failed: "
+                      << result.error << " (" << src_device.toString()
+                      << " → " << dst_device.toString() << ")");
             return false;
         }
 
-        LOG_DEBUG("LocalPPContext::transfer: Direct P2P/BAR transfer "
+        LOG_DEBUG("LocalPPContext::transfer: "
                   << src_device.toString() << " → " << dst_device.toString()
+                  << " method=" << to_string(result.method_used)
                   << " (" << activations->numel() << " elements)");
         return true;
     }
@@ -1095,112 +1033,22 @@ namespace llaminar2
             return true;
         }
 
-        // Check if CPU is involved - use coherence model instead of transferTo()
-        if (src_device.is_cpu() || dst_device.is_cpu())
+        auto result = TransferEngine::instance().transferActivation(
+            activations,
+            dst_device,
+            active_bytes);
+        if (!result.success)
         {
-            LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: CPU involved, using coherence model");
-
-            if (dst_device.is_cpu())
-            {
-                // GPU → CPU: ensure data on source, then sync to host
-                if (!activations->ensureOnDevice(src_device))
-                {
-                    LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
-                              "Failed to ensure on source device "
-                              << src_device.toString());
-                    return false;
-                }
-                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
-
-                // Force sync to host via data() - this sets authoritative_device_ = nullopt
-                (void)activations->data();
-
-                LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
-                          << src_device.toString() << " → CPU complete");
-                return true;
-            }
-            else
-            {
-                // CPU → GPU: ensure we have host data, then upload
-                (void)activations->data(); // Ensure host has data
-
-                if (!activations->ensureOnDevice(dst_device))
-                {
-                    LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
-                              "Failed to upload to "
-                              << dst_device.toString());
-                    return false;
-                }
-                activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-
-                LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
-                          << "CPU → " << dst_device.toString() << " complete");
-                return true;
-            }
-        }
-
-        // GPU → GPU: Ensure tensor is on source device
-        if (!activations->isDeviceAuthoritative(src_device))
-        {
-            if (!activations->ensureOnDevice(src_device))
-            {
-                LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
-                          "Failed to ensure on source device "
-                          << src_device.toString());
-                return false;
-            }
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, src_device);
-        }
-
-        // Cross-vendor GPU transfer (CUDA↔ROCm): use host bounce.
-        const bool is_cross_vendor =
-            (src_device.is_cuda() && dst_device.is_rocm()) ||
-            (src_device.is_rocm() && dst_device.is_cuda());
-
-        if (is_cross_vendor)
-        {
-            // GPU → host (data() triggers D2H sync for device-dirty tensors)
-            const void *host_ptr = activations->data();
-            if (!host_ptr)
-            {
-                LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
-                          "Failed to sync to host from "
-                          << src_device.toString()
-                          << " for cross-vendor bounce");
-                return false;
-            }
-
-            // Invalidate old GPU data — host is now authoritative
-            activations->invalidateGpuData();
-
-            // Host → destination GPU
-            if (!activations->ensureOnDevice(dst_device))
-            {
-                LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
-                          "Failed to upload to "
-                          << dst_device.toString()
-                          << " after cross-vendor host bounce");
-                return false;
-            }
-            activations->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
-
-            LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
-                      "Cross-vendor host bounce "
-                      << src_device.toString() << " → CPU → " << dst_device.toString()
-                      << " (" << activations->numel() << " elements)");
-            return true;
-        }
-
-        // Same-vendor GPU-to-GPU: use direct transfer
-        if (!activations->transferTo(dst_device, active_bytes))
-        {
-            LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: transferTo() failed "
-                      << src_device.toString() << " → " << dst_device.toString());
+            LOG_ERROR("HierarchicalPPContext::transferSingleToSingle: "
+                      "TransferEngine failed: " << result.error << " ("
+                      << src_device.toString() << " → "
+                      << dst_device.toString() << ")");
             return false;
         }
 
         LOG_DEBUG("HierarchicalPPContext::transferSingleToSingle: "
                   << src_device.toString() << " → " << dst_device.toString()
+                  << " method=" << to_string(result.method_used)
                   << " (" << activations->numel() << " elements)");
         return true;
     }

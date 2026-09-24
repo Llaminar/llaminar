@@ -22,6 +22,7 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <stdexcept>
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
@@ -251,21 +252,43 @@ namespace llaminar2
             size_t availableMemory() const override { return available_memory_; }
             size_t totalMemory() const override { return total_memory_; }
 
-            bool copyToDevice(void *dst, const void *src, size_t bytes) override
+            bool copyToDevice(
+                void *dst,
+                const void *src,
+                size_t bytes,
+                void *stream) override
             {
+                validateTransferStream(stream, "copyToDevice");
                 h2d_transfers_.push_back(bytes);
                 return true;
             }
 
-            bool copyToHost(void *dst, const void *src, size_t bytes) override
+            bool copyToHost(
+                void *dst,
+                const void *src,
+                size_t bytes,
+                void *stream) override
             {
+                validateTransferStream(stream, "copyToHost");
                 d2h_transfers_.push_back(bytes);
                 return true;
             }
 
-            bool copyFromDevice(void *dst, const void *src, size_t bytes,
-                                IDeviceContext *src_ctx) override
+            bool copyFromDevice(
+                void *dst,
+                const void *src,
+                size_t bytes,
+                IDeviceContext *src_ctx,
+                void *source_stream,
+                void *destination_stream) override
             {
+                if (!src_ctx)
+                    throw std::invalid_argument(
+                        "MockDeviceContext::copyFromDevice requires a source context");
+                if (src_ctx->isGPU() && !source_stream)
+                    throw std::invalid_argument(
+                        "MockDeviceContext::copyFromDevice requires a non-null source stream");
+                validateTransferStream(destination_stream, "copyFromDevice");
                 d2d_transfers_.push_back(bytes);
                 return true;
             }
@@ -327,6 +350,22 @@ namespace llaminar2
             }
 
         private:
+            void validateTransferStream(void *stream, const char *operation) const
+            {
+                if (isGPU() && !stream)
+                {
+                    throw std::invalid_argument(
+                        std::string("MockDeviceContext::") + operation +
+                        " requires an explicit non-null GPU stream");
+                }
+                if (!isGPU() && stream)
+                {
+                    throw std::invalid_argument(
+                        std::string("MockDeviceContext::") + operation +
+                        " requires a null stream for synchronous CPU execution");
+                }
+            }
+
             DeviceId device_id_;
             ComputeBackendType backend_;
 

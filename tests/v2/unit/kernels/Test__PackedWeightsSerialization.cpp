@@ -9,8 +9,8 @@
 #include <gtest/gtest.h>
 
 #include "kernels/PackedWeightsSerialization.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIWeightPacker.h"
-#include "kernels/cpu/native_vnni/CPUPackedWeights.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUPackedWeights.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -45,7 +45,9 @@ CPUNativeVNNIPackedWeights buildTestPacked(
     packed.blocks_per_row           = blocks_per_row;
     packed.codebook_id              = codebook_id;
     packed.payload_bytes            = payload_bytes_val;
-    packed.is_nibble_lut            = is_nibble_lut;
+    packed.encoding = is_nibble_lut
+                          ? CPUNativeVNNIEncoding::NibbleLUT
+                          : CPUNativeVNNIEncoding::ExpandedInt8;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -101,7 +103,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
     EXPECT_EQ(p.blocks_per_row, 8);
     EXPECT_EQ(p.codebook_id, 0);
     EXPECT_EQ(p.payload_bytes, 16);
-    EXPECT_TRUE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesNibbleLUT());
     EXPECT_FALSE(p.is_asymmetric);
     EXPECT_FALSE(p.is_superblock);
     EXPECT_EQ(p.data_stride, 1024);
@@ -124,6 +126,46 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
 
     // Should NOT be a CPUPackedWeightsWithNativeBlocks
     EXPECT_EQ(dynamic_cast<const CPUPackedWeightsWithNativeBlocks*>(result.get()), nullptr);
+}
+
+TEST(Test__PackedWeightsSerialization, CompactMultiScalePreservesEveryNativeMetadataBit)
+{
+    for (const auto &entry : native_vnni_formats::kAllSourceFormats)
+    {
+        const auto &format = *entry.metadata;
+        if (!hasCompactMultiScaleVnniPayload(format.codebook_id))
+            continue;
+        SCOPED_TRACE(std::string(entry.quant_type));
+        auto packed = buildTestPacked(
+            67, 544, format.codebook_id, 17, format.payload_bytes,
+            false, true, true, 1024, 1536, 2 * 17 * 1536, 0, 0);
+        packed.encoding = CPUNativeVNNIEncoding::CompactMultiScale;
+        CPUPackedWeights owner(std::move(packed));
+        const auto blob = serialize(owner);
+        ASSERT_FALSE(blob.empty());
+        auto result = deserialize(blob.data(), blob.size());
+        ASSERT_NE(result, nullptr);
+        const auto *native = dynamic_cast<const CPUPackedWeights *>(result.get());
+        ASSERT_NE(native, nullptr);
+        const auto &received = native->packed();
+        ASSERT_TRUE(received.usesCompactMultiScale());
+        EXPECT_FALSE(received.usesInlineCompensation());
+        EXPECT_EQ(received.payload_bytes, format.payload_bytes);
+        ASSERT_EQ(received.native_interleaved.size(), owner.packed().native_interleaved.size());
+        EXPECT_EQ(std::memcmp(received.native_interleaved.data(),
+                              owner.packed().native_interleaved.data(),
+                              received.native_interleaved.size()), 0);
+        EXPECT_TRUE(received.int8_flat.empty());
+
+        // Older producers encoded these same source identities using a lossy
+        // single-scale representation. The archive version is an arithmetic
+        // contract too, not merely a check that the struct fields fit.
+        auto legacy_blob = blob;
+        const uint32_t legacy_version = 2;
+        std::memcpy(legacy_blob.data() + offsetof(PackedWeightsHeader, version),
+                    &legacy_version, sizeof(legacy_version));
+        EXPECT_EQ(deserialize(legacy_blob.data(), legacy_blob.size()), nullptr);
+    }
 }
 
 TEST(Test__PackedWeightsSerialization, SerializeDeserialize_AsymmetricQ4_1)
@@ -151,7 +193,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_AsymmetricQ4_1)
     EXPECT_EQ(p.codebook_id, 5);
     EXPECT_EQ(p.payload_bytes, 20);
     EXPECT_TRUE(p.is_asymmetric);
-    EXPECT_TRUE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesNibbleLUT());
     EXPECT_FALSE(p.is_superblock);
     EXPECT_EQ(p.interleaved_block_stride, 1408);
 }
@@ -385,7 +427,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
     EXPECT_EQ(p.codebook_id, 19);
     EXPECT_EQ(p.data_stride, 2048);
     EXPECT_EQ(p.interleaved_block_stride, 2304);
-    EXPECT_FALSE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesExpandedInt8());
 
     ASSERT_EQ(p.int8_flat.size(), static_cast<size_t>(1 * 4 * 64 * 32));
     for (size_t i = 0; i < p.int8_flat.size(); ++i)

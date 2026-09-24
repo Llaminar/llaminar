@@ -7,6 +7,7 @@
 #include "../../../utils/Logger.h"
 
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <limits>
 
@@ -34,6 +35,29 @@ namespace llaminar2
                 }
             }
             return false;
+        }
+
+        /**
+         * @brief Terminate after detecting an impossible prefill-capture state.
+         *
+         * Native graph capture is an ownership transaction, not a performance
+         * hint. Seeing a request reset, invalidation, or a second warmup while
+         * the transaction body is active means two control-flow owners are
+         * attempting to mutate the same stream lifecycle. Continuing would make
+         * it impossible to know which launches belong to the graph.
+         */
+        [[noreturn]] void terminatePrefillGraphLifecycle(
+            const char *operation,
+            const PrefillGraphCacheKey &key)
+        {
+            LOG_ERROR(
+                "[PrefillGraphCache] Fatal prefill graph lifecycle violation"
+                << " operation=" << (operation ? operation : "unknown")
+                << " seq_len=" << key.seq_len
+                << " device=" << key.device_id.toString()
+                << " domain=" << key.domain_id
+                << " participant=" << key.participant_id);
+            std::terminate();
         }
     }
 
@@ -85,8 +109,8 @@ namespace llaminar2
             return "None";
         case PrefillGraphRejectReason::FeatureDisabled:
             return "FeatureDisabled";
-        case PrefillGraphRejectReason::SeqLenBelowMinimum:
-            return "SeqLenBelowMinimum";
+        case PrefillGraphRejectReason::PaddedBucketBelowMinimum:
+            return "PaddedBucketBelowMinimum";
         case PrefillGraphRejectReason::NotGPUDevice:
             return "NotGPUDevice";
         case PrefillGraphRejectReason::SnapshotsActive:
@@ -99,6 +123,8 @@ namespace llaminar2
             return "StageNotCapturable";
         case PrefillGraphRejectReason::GDNWithPaddedBucket:
             return "GDNWithPaddedBucket";
+        case PrefillGraphRejectReason::HostPolicyDisabled:
+            return "HostPolicyDisabled";
         case PrefillGraphRejectReason::NoGPUContext:
             return "NoGPUContext";
         case PrefillGraphRejectReason::InvalidatedByPlacement:
@@ -176,7 +202,10 @@ namespace llaminar2
         auto it = entries_.find(key);
         if (it == entries_.end())
             return false;
-        return it->second.phase == PrefillGraphPhase::Ready;
+        return it->second.phase == PrefillGraphPhase::Ready &&
+               it->second.submission_state !=
+                   PrefillGraphExecutableSubmissionState::Empty &&
+               it->second.capture && it->second.capture->hasExecutable();
     }
 
     /**
@@ -195,34 +224,44 @@ namespace llaminar2
         bool moe_rebalancing_active,
         int real_seq_len,
         int bucket_seq_len,
-        PrefillGraphPreflightMode mode) const
+        PrefillGraphPreflightMode mode,
+        bool collectives_graph_capturable,
+        bool heterogeneous_segmentation_admitted,
+        PrefillMoEGraphStability moe_graph_stability,
+        std::string *reject_stage_name,
+        std::string *reject_stage_type) const
     {
+        if (reject_stage_name)
+            reject_stage_name->clear();
+        if (reject_stage_type)
+            reject_stage_type->clear();
+
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
-
-        if (key.seq_len < config_.min_seq_len)
-            return PrefillGraphRejectReason::SeqLenBelowMinimum;
 
         if (!key.device_id.is_gpu())
             return PrefillGraphRejectReason::NotGPUDevice;
 
-        if (snapshots_active)
-            return PrefillGraphRejectReason::SnapshotsActive;
-
-        if (moe_rebalancing_active)
-            return PrefillGraphRejectReason::ActiveMoERebalancing;
-
-        if (collective_nodes && !collective_nodes->empty())
-            return PrefillGraphRejectReason::CollectiveNodesPresent;
+        (void)snapshots_active;
 
         const bool padded_bucket =
             real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
+        if (padded_bucket && bucket_seq_len < config_.minimum_padded_bucket_seq_len)
+            return PrefillGraphRejectReason::PaddedBucketBelowMinimum;
+        const bool support_only_preflight = mode != PrefillGraphPreflightMode::CaptureReady;
         const bool cold_padded_preflight =
-            padded_bucket &&
-            (mode == PrefillGraphPreflightMode::ColdPaddedSupport ||
-             (mode == PrefillGraphPreflightMode::Default && phase(key) == PrefillGraphPhase::Cold));
+            padded_bucket && support_only_preflight;
         if (padded_bucket && !config_.buckets_enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
+
+        if (moe_rebalancing_active && padded_bucket &&
+            moe_graph_stability != PrefillMoEGraphStability::Stable)
+            return PrefillGraphRejectReason::ActiveMoERebalancing;
+
+        if (collective_nodes && !collective_nodes->empty() &&
+            !collectives_graph_capturable &&
+            !heterogeneous_segmentation_admitted)
+            return PrefillGraphRejectReason::CollectiveNodesPresent;
 
         if (padded_bucket && containsPaddedBucketUnsafeGDNStage(graph))
         {
@@ -244,11 +283,27 @@ namespace llaminar2
             if (!node || !node->stage)
                 continue;
             const bool stage_ok =
-                (mode != PrefillGraphPreflightMode::CaptureReady && cold_padded_preflight)
+                cold_padded_preflight
                     ? node->stage->supportsPaddedPrefillGraphCapturePreflight()
+                : support_only_preflight
+                    ? node->stage->supportsLazyPrefillGraphCapturePreflight()
                     : node->stage->isGraphCapturable();
             if (!stage_ok)
             {
+                const bool declared_heterogeneous_boundary =
+                    heterogeneous_segmentation_admitted &&
+                    (node->stage->isCollectiveStage() ||
+                     node->stage->isManualGraphBoundary()) &&
+                    (!padded_bucket ||
+                     node->stage
+                         ->supportsPaddedPrefillGraphCapturePreflight());
+                if (declared_heterogeneous_boundary)
+                    continue;
+
+                if (reject_stage_name)
+                    *reject_stage_name = name;
+                if (reject_stage_type)
+                    *reject_stage_type = computeStageTypeName(node->stage->type());
                 if (config_.trace)
                 {
                     LOG_INFO("[PrefillGraphCache] Stage '" << name << "' "
@@ -273,8 +328,14 @@ namespace llaminar2
     void PrefillGraphCache::markWarmedUp(const PrefillGraphCacheKey &key)
     {
         auto &entry = entries_[key];
+        if (entry.phase == PrefillGraphPhase::Capturing)
+            terminatePrefillGraphLifecycle("markWarmedUp", key);
+
         entry.key = key;
+        entry.capture.reset();
         entry.phase = PrefillGraphPhase::Warmup;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
         lifecycle_stats_[key].warmup_count++;
         touchEntry(entry);
         enforceCapacity(&key);
@@ -289,24 +350,55 @@ namespace llaminar2
         }
     }
 
-    /**
-     * @brief Start recording a monolithic prefill GPU graph on an explicit stream.
-     */
-    bool PrefillGraphCache::beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream)
+    void PrefillGraphCache::markInitializedForSetupMaterialization(
+        const PrefillGraphCacheKey &key)
+    {
+        auto &entry = entries_[key];
+        if (entry.phase == PrefillGraphPhase::Initialized)
+            return;
+        if (entry.phase != PrefillGraphPhase::Cold)
+        {
+            terminatePrefillGraphLifecycle(
+                "markInitializedForSetupMaterialization", key);
+        }
+
+        entry.key = key;
+        entry.capture.reset();
+        entry.phase = PrefillGraphPhase::Initialized;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
+        entry.node_count = 0;
+        entry.replay_count = 0;
+        lifecycle_stats_[key].initialized_count++;
+        touchEntry(entry);
+        enforceCapacity(&key);
+    }
+
+    bool PrefillGraphCache::captureAndInstantiate(
+        const PrefillGraphCacheKey &key,
+        IWorkerGPUContext *gpu_ctx,
+        void *stream,
+        const std::function<bool()> &record_graph_body,
+        GraphCaptureDependencyLedger *dependency_ledger)
     {
         auto it = entries_.find(key);
         if (it == entries_.end() ||
             (it->second.phase != PrefillGraphPhase::Warmup &&
              it->second.phase != PrefillGraphPhase::Initialized))
         {
-            LOG_ERROR("[PrefillGraphCache] beginCapture() called but entry not capture-armed"
+            LOG_ERROR("[PrefillGraphCache] captureAndInstantiate() called but entry not capture-armed"
                       << " (seq_len=" << key.seq_len << ")");
             return false;
         }
 
         if (!gpu_ctx)
         {
-            LOG_ERROR("[PrefillGraphCache] beginCapture() called with null GPU context");
+            LOG_ERROR("[PrefillGraphCache] captureAndInstantiate() called with null GPU context");
+            return false;
+        }
+        if (!record_graph_body)
+        {
+            LOG_ERROR("[PrefillGraphCache] captureAndInstantiate() requires a graph body");
             return false;
         }
 
@@ -315,64 +407,77 @@ namespace llaminar2
 
         if (!stream)
         {
-            LOG_ERROR("[PrefillGraphCache] beginCapture() requires an explicit capture stream");
+            LOG_ERROR("[PrefillGraphCache] captureAndInstantiate() requires an explicit capture stream");
             return false;
         }
 
-        // Create graph capture object on the caller-managed prefill stream.
-        entry.capture = gpu_ctx->createGraphCapture(stream);
-
-        if (!entry.capture)
+        /*
+         * Keep the in-progress backend object local. The cache entry cannot
+         * expose a half-recorded graph to invalidation, replay, or request
+         * reset. Only a closed and instantiated executable is published.
+         */
+        auto pending_capture = gpu_ctx->createGraphCapture(stream);
+        if (!pending_capture)
         {
             LOG_ERROR("[PrefillGraphCache] Failed to create graph capture object");
             return false;
         }
 
-        // Begin stream capture
-        if (!entry.capture->beginCapture())
+        const std::string operation =
+            "prefill capture seq_len=" + std::to_string(key.seq_len) +
+            " device=" + key.device_id.toString() +
+            " domain=" + key.domain_id +
+            " participant=" + std::to_string(key.participant_id);
+        ScopedBackendGraphCapture capture_transaction(
+            *gpu_ctx,
+            *pending_capture,
+            operation,
+            dependency_ledger);
+        if (!capture_transaction.begin())
         {
             LOG_ERROR("[PrefillGraphCache] beginCapture() failed on GPU graph object");
-            entry.capture.reset();
             return false;
         }
 
         entry.phase = PrefillGraphPhase::Capturing;
-
         if (config_.trace)
-        {
             LOG_INFO("[PrefillGraphCache] Capture started for seq_len=" << key.seq_len);
-        }
 
-        return true;
-    }
-
-    /**
-     * @brief Finish recording and instantiate the captured prefill graph.
-     */
-    bool PrefillGraphCache::endCaptureAndInstantiate(const PrefillGraphCacheKey &key)
-    {
-        auto it = entries_.find(key);
-        if (it == entries_.end() || it->second.phase != PrefillGraphPhase::Capturing)
+        bool body_succeeded = false;
+        try
         {
-            LOG_ERROR("[PrefillGraphCache] endCaptureAndInstantiate() called but entry not in Capturing phase"
-                      << " (seq_len=" << key.seq_len << ")");
-            return false;
+            body_succeeded = record_graph_body();
         }
-
-        auto &entry = it->second;
-        touchEntry(entry);
-
-        // End capture
-        if (!entry.capture->endCapture())
+        catch (...)
         {
-            LOG_ERROR("[PrefillGraphCache] endCapture() failed");
-            entry.capture.reset();
             entry.phase = PrefillGraphPhase::Cold;
+            throw;
+        }
+
+        /*
+         * `finish()` is unconditional. Even a graph-body failure must leave
+         * native stream capture before ordinary C++ control flow can inspect
+         * the result. A failed backend endCapture is fatal inside the owner.
+         */
+        capture_transaction.finish();
+        if (entry.phase != PrefillGraphPhase::Capturing)
+            terminatePrefillGraphLifecycle("capture body changed cache phase", key);
+
+        if (!body_succeeded)
+        {
+            LOG_ERROR(
+                "[PrefillGraphCache] Graph body failed during mandatory prefill capture"
+                << " seq_len=" << key.seq_len);
+            entry.phase = PrefillGraphPhase::Cold;
+            entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
+            entry.node_count = 0;
+            entry.replay_count = 0;
             return false;
         }
 
-        // Instantiate the graph executable
-        if (!entry.capture->instantiate())
+        if (!pending_capture->instantiate())
         {
             LOG_ERROR("[PrefillGraphCache] instantiate() failed");
             entry.capture.reset();
@@ -380,8 +485,11 @@ namespace llaminar2
             return false;
         }
 
-        entry.node_count = entry.capture->nodeCount();
+        entry.node_count = pending_capture->nodeCount();
+        entry.capture = std::move(pending_capture);
         entry.phase = PrefillGraphPhase::Ready;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::MaterializedUnlaunched;
         entry.replay_count = 0;
         lifecycle_stats_[key].capture_count++;
 
@@ -412,6 +520,13 @@ namespace llaminar2
             LOG_ERROR("[PrefillGraphCache] launch() called but no executable graph");
             return false;
         }
+        if (entry.submission_state ==
+            PrefillGraphExecutableSubmissionState::Empty)
+        {
+            LOG_ERROR(
+                "[PrefillGraphCache] launch() found an executable with no submission lifecycle");
+            return false;
+        }
 
         if (!entry.capture->launch())
         {
@@ -420,6 +535,8 @@ namespace llaminar2
         }
 
         entry.replay_count++;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::ReplayReady;
         return true;
     }
 
@@ -428,8 +545,13 @@ namespace llaminar2
         size_t count = entries_.size();
         for (auto &[k, entry] : entries_)
         {
+            if (entry.phase == PrefillGraphPhase::Capturing)
+                terminatePrefillGraphLifecycle("invalidateAll", k);
+
             entry.phase = PrefillGraphPhase::Cold;
             entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
             entry.node_count = 0;
             entry.replay_count = 0;
         }
@@ -442,25 +564,48 @@ namespace llaminar2
     }
 
     /**
-     * @brief Split reusable lazy initialization from request-local warmup state.
+     * @brief Apply the typed request-boundary policy to every prefill executable.
      *
-     * Ready entries keep their executable graphs. Warmup/Initialized entries keep
-     * only the fact that first-use stage/kernel setup has happened; they are not
-     * allowed to replay, and they cannot capture until the executor prepares
-     * fresh request metadata and reruns strict capture-readiness preflight.
+     * Preserving reset retains only complete Ready executables. Their graph nodes
+     * reference persistent device buffers, while request-local contents and
+     * scalar metadata are republished before the next launch. Hard reset demotes
+     * those same entries to Initialized so capture readiness must be established
+     * again. Warmup is never preserved as replayable state because it represents
+     * an unfinished request-local lifecycle transition.
      */
-    PrefillGraphRequestResetSummary PrefillGraphCache::prepareEntriesForRequestReset()
+    PrefillGraphRequestResetSummary PrefillGraphCache::prepareEntriesForRequestReset(
+        bool preserve_ready_executables)
     {
         PrefillGraphRequestResetSummary summary;
         for (auto &[key, entry] : entries_)
         {
+            if (entry.phase == PrefillGraphPhase::Capturing)
+            {
+                terminatePrefillGraphLifecycle(
+                    "prepareEntriesForRequestReset",
+                    key);
+            }
+
             const bool ready_for_replay =
                 entry.phase == PrefillGraphPhase::Ready &&
                 entry.capture &&
                 entry.capture->hasExecutable();
             if (ready_for_replay)
             {
-                ++summary.ready_preserved;
+                if (preserve_ready_executables)
+                {
+                    ++summary.ready_preserved;
+                    continue;
+                }
+
+                entry.phase = PrefillGraphPhase::Initialized;
+                entry.capture.reset();
+                entry.submission_state =
+                    PrefillGraphExecutableSubmissionState::Empty;
+                entry.node_count = 0;
+                entry.replay_count = 0;
+                lifecycle_stats_[key].initialized_count++;
+                ++summary.ready_demoted;
                 continue;
             }
 
@@ -471,6 +616,8 @@ namespace llaminar2
                 // graph object and replay counters from the previous prompt.
                 entry.phase = PrefillGraphPhase::Initialized;
                 entry.capture.reset();
+                entry.submission_state =
+                    PrefillGraphExecutableSubmissionState::Empty;
                 entry.node_count = 0;
                 entry.replay_count = 0;
                 lifecycle_stats_[key].initialized_count++;
@@ -480,31 +627,33 @@ namespace llaminar2
 
             entry.phase = PrefillGraphPhase::Cold;
             entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
             entry.node_count = 0;
             entry.replay_count = 0;
             ++summary.dropped;
         }
 
-        if (summary.initialized > 0 || summary.dropped > 0)
+        if (summary.ready_demoted > 0 || summary.initialized > 0 || summary.dropped > 0)
         {
             last_invalidation_reason_ = PrefillGraphRejectReason::RequestStateReset;
             LOG_INFO("[PrefillGraphCache] Request reset preserved "
                      << summary.ready_preserved
-                     << " ready prefill graph executables, kept "
+                     << " ready prefill graph executable(s), demoted "
+                     << summary.ready_demoted
+                     << " ready executable(s), kept "
                      << summary.initialized
                      << " entries as lazy-initialized only, and dropped "
                      << summary.dropped
                      << " stale entries");
         }
+        else if (summary.ready_preserved > 0 && config_.trace)
+        {
+            LOG_INFO("[PrefillGraphCache] Request reset preserved "
+                     << summary.ready_preserved
+                     << " complete prefill graph executable(s)");
+        }
         return summary;
-    }
-
-    /**
-     * @brief Backward-compatible reset helper for callers that only need drops.
-     */
-    size_t PrefillGraphCache::preserveReadyEntriesAcrossRequestReset()
-    {
-        return prepareEntriesForRequestReset().dropped;
     }
 
     void PrefillGraphCache::invalidate(const PrefillGraphCacheKey &key)
@@ -512,9 +661,13 @@ namespace llaminar2
         auto it = entries_.find(key);
         if (it == entries_.end())
             return;
+        if (it->second.phase == PrefillGraphPhase::Capturing)
+            terminatePrefillGraphLifecycle("invalidate", key);
 
         it->second.phase = PrefillGraphPhase::Cold;
         it->second.capture.reset();
+        it->second.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
         it->second.node_count = 0;
         it->second.replay_count = 0;
 
@@ -543,6 +696,18 @@ namespace llaminar2
         if (it == entries_.end())
             return 0;
         return it->second.replay_count;
+    }
+
+    bool PrefillGraphCache::materializedTransactionZeroPending(
+        const PrefillGraphCacheKey &key) const
+    {
+        const auto it = entries_.find(key);
+        return it != entries_.end() &&
+               it->second.phase == PrefillGraphPhase::Ready &&
+               it->second.capture && it->second.capture->hasExecutable() &&
+               it->second.submission_state ==
+                   PrefillGraphExecutableSubmissionState::
+                       MaterializedUnlaunched;
     }
 
     uint64_t PrefillGraphCache::warmupCount(const PrefillGraphCacheKey &key) const

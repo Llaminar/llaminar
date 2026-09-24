@@ -15,6 +15,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KVCacheProfiler.h"
@@ -22,6 +23,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 namespace llaminar2
 {
@@ -69,11 +72,6 @@ namespace llaminar2
                     return false;
                 }
 
-                if (conv_scratch_k_ && !conv_scratch_workspace_backed_)
-                    cudaFree(conv_scratch_k_);
-                if (conv_scratch_v_ && !conv_scratch_workspace_backed_)
-                    cudaFree(conv_scratch_v_);
-
                 conv_scratch_k_ = workspace_k;
                 conv_scratch_v_ = workspace_v;
                 conv_scratch_capacity_ = std::min(workspace_k_size, workspace_v_size);
@@ -82,78 +80,18 @@ namespace llaminar2
             }
         }
 
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[ICUDARingKVCache] Refusing to allocate conversion scratch during CUDA graph capture; "
-                      "bind KV-cache conversion scratch through IWorkspaceConsumer");
-            return false;
-        }
-
-        if (conv_scratch_workspace_backed_)
-        {
-            conv_scratch_k_ = nullptr;
-            conv_scratch_v_ = nullptr;
-            conv_scratch_capacity_ = 0;
-            conv_scratch_workspace_backed_ = false;
-        }
-
-        if (bytes <= conv_scratch_capacity_)
-            return true;
-
-        // Grow to requested size (round up to 4KB for alignment)
-        const size_t alloc_size = (bytes + 4095) & ~size_t(4095);
-
-        void *new_k = nullptr;
-        void *new_v = nullptr;
-        if (cudaMalloc(&new_k, alloc_size) != cudaSuccess ||
-            cudaMalloc(&new_v, alloc_size) != cudaSuccess)
-        {
-            if (new_k)
-                cudaFree(new_k);
-            if (new_v)
-                cudaFree(new_v);
-            LOG_ERROR("[ICUDARingKVCache] Failed to allocate conversion scratch buffers ("
-                      << alloc_size << " bytes each)");
-            return false;
-        }
-
-        // Free old buffers
-        if (conv_scratch_k_)
-            cudaFree(conv_scratch_k_);
-        if (conv_scratch_v_)
-            cudaFree(conv_scratch_v_);
-
-        conv_scratch_k_ = new_k;
-        conv_scratch_v_ = new_v;
-        conv_scratch_capacity_ = alloc_size;
-
-        LOG_DEBUG("[ICUDARingKVCache] Allocated conversion scratch: "
-                  << alloc_size << " bytes each (" << (alloc_size * 2 / 1024) << " KB total)");
-        return true;
+        LOG_ERROR("[ICUDARingKVCache] Conversion requires pre-bound graph workspace: required="
+                  << bytes << " bytes per K/V buffer");
+        return false;
     }
 
     void ICUDARingKVCache::freeConvScratch()
     {
-        if (conv_scratch_workspace_backed_)
-        {
-            conv_scratch_k_ = nullptr;
-            conv_scratch_v_ = nullptr;
-            conv_scratch_capacity_ = 0;
-            conv_scratch_workspace_backed_ = false;
-            return;
-        }
-
-        if (conv_scratch_k_)
-        {
-            cudaFree(conv_scratch_k_);
-            conv_scratch_k_ = nullptr;
-        }
-        if (conv_scratch_v_)
-        {
-            cudaFree(conv_scratch_v_);
-            conv_scratch_v_ = nullptr;
-        }
+        // Conversion scratch is always workspace-owned.
+        conv_scratch_k_ = nullptr;
+        conv_scratch_v_ = nullptr;
         conv_scratch_capacity_ = 0;
+        conv_scratch_workspace_backed_ = false;
     }
 
     // =========================================================================
@@ -180,50 +118,48 @@ namespace llaminar2
                                             const ITensor *K, const ITensor *V,
                                             int num_tokens, void *gpu_stream)
     {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ICUDARingKVCache::appendWithStream");
         if (!K || !V)
         {
             LOG_DEBUG("[ICUDARingKVCache::appendWithStream] Null K or V tensor");
             return false;
         }
-        if (!gpu_stream)
-        {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] Null CUDA stream is not allowed");
-            return false;
-        }
-
         const auto target = DeviceId::cuda(device_id());
+
+        const auto require_input = [&](const ITensor *tensor, const char *label)
+        {
+            if (const auto *prepared =
+                    dynamic_cast<const PreparedGpuTensorView *>(tensor))
+            {
+                if (!prepared->isPreparedFor(target, gpu_stream))
+                {
+                    throw std::runtime_error(
+                        std::string("[ICUDARingKVCache::appendWithStream] Prepared ") +
+                        label + " slice does not match the CUDA consumer device/stream");
+                }
+                return;
+            }
+
+            /*
+             * An ordinary tensor must publish its producer event through the
+             * canonical transfer owner. Only the stage-created prepared slice
+             * above may bypass this join, because it names the exact stream on
+             * which its parent was already ordered.
+             */
+            TransferEngine::requireDeviceInput(
+                const_cast<ITensor *>(tensor), target, gpu_stream);
+        };
+        require_input(K, "K");
+        require_input(V, "V");
 
         const void *d_k = K->gpu_data_ptr();
         const void *d_v = V->gpu_data_ptr();
 
-        if (!d_k)
-        {
-            auto *k_mut = const_cast<ITensor *>(K);
-            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
-            if (!(k_tensor ? k_tensor->ensureOnDevice(target, gpu_stream) : k_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure K on "
-                          << target.toString());
-                return false;
-            }
-            d_k = K->gpu_data_ptr();
-        }
-        if (!d_v)
-        {
-            auto *v_mut = const_cast<ITensor *>(V);
-            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
-            if (!(v_tensor ? v_tensor->ensureOnDevice(target, gpu_stream) : v_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure V on "
-                          << target.toString());
-                return false;
-            }
-            d_v = V->gpu_data_ptr();
-        }
-
         if (!d_k || !d_v)
         {
-            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks GPU data after ensureOnDevice().");
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] K or V tensor lacks validated GPU storage");
             return false;
         }
 
@@ -237,14 +173,29 @@ namespace llaminar2
         // append() call below. If a future asymmetric FP16/Q8_1 cache is
         // added, the conversion paths must be split into separate K and V
         // gates using k_precision() / v_precision() respectively.
-        if (k_precision() == ActivationPrecision::FP16 &&
-            (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16))
+        const ActivationPrecision destination_precision = k_precision();
+        const bool floating_cache =
+            destination_precision == ActivationPrecision::FP32 ||
+            destination_precision == ActivationPrecision::FP16 ||
+            destination_precision == ActivationPrecision::BF16;
+        const bool source_matches_cache =
+            (destination_precision == ActivationPrecision::FP32 &&
+             K->native_type() == TensorType::FP32 &&
+             V->native_type() == TensorType::FP32) ||
+            (destination_precision == ActivationPrecision::FP16 &&
+             K->native_type() == TensorType::FP16 &&
+             V->native_type() == TensorType::FP16) ||
+            (destination_precision == ActivationPrecision::BF16 &&
+             K->native_type() == TensorType::BF16 &&
+             V->native_type() == TensorType::BF16);
+
+        if (floating_cache && !source_matches_cache)
         {
             const auto &k_shape = K->shape();
             const auto &v_shape = V->shape();
             if (k_shape.size() < 2 || v_shape.size() < 2)
             {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for FP16 conversion");
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Invalid K/V shape for floating cache conversion");
                 return false;
             }
 
@@ -254,52 +205,31 @@ namespace llaminar2
             {
                 return append(layer, seq_idx, d_k, d_v, num_tokens, stream);
             }
-
-            // --- Profiling: ensure scratch buffers ---
-            const auto alloc_start = std::chrono::high_resolution_clock::now();
-
-            const size_t buf_bytes = static_cast<size_t>(elements) * sizeof(uint16_t);
-            if (!ensureConvScratch(buf_bytes))
+            if (K->native_type() != V->native_type())
             {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure FP16 conversion scratch");
-                return false;
-            }
-            auto *d_k_fp16 = static_cast<uint16_t *>(conv_scratch_k_);
-            auto *d_v_fp16 = static_cast<uint16_t *>(conv_scratch_v_);
-
-            const auto alloc_end = std::chrono::high_resolution_clock::now();
-
-            // --- Profiling: FP16 conversion kernels ---
-            const auto conv_start = std::chrono::high_resolution_clock::now();
-
-            const bool k_ok = cuda_convert_tensor_to_fp16(d_k, K->native_type(), d_k_fp16, elements, stream);
-            const bool v_ok = cuda_convert_tensor_to_fp16(d_v, V->native_type(), d_v_fp16, elements, stream);
-
-            if (!k_ok || !v_ok)
-            {
-                LOG_ERROR("[ICUDARingKVCache::appendWithStream] GPU FP16 conversion failed");
+                LOG_ERROR("[ICUDARingKVCache::appendWithStream] Asymmetric K/V source types are unsupported for fused floating append: K="
+                          << static_cast<int>(K->native_type())
+                          << " V=" << static_cast<int>(V->native_type()));
                 return false;
             }
 
-            const auto conv_end = std::chrono::high_resolution_clock::now();
-
-            // --- Profiling: ring buffer append ---
             const auto append_start = std::chrono::high_resolution_clock::now();
-            const bool ok = append(layer, seq_idx, d_k_fp16, d_v_fp16, num_tokens, stream);
+            const bool ok = appendConvertedWithStream(layer, seq_idx, d_k, d_v,
+                                                      K->native_type(), num_tokens, stream);
             const auto append_end = std::chrono::high_resolution_clock::now();
-
-            // Record profiling breakdown
             {
                 auto to_ns = [](auto d) -> uint64_t
                 {
                     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
                 };
-                const uint64_t alloc_ns = to_ns(alloc_end - alloc_start);
-                const uint64_t conv_ns = to_ns(conv_end - conv_start);
                 const uint64_t append_ns = to_ns(append_end - append_start);
-                const uint64_t bytes = static_cast<uint64_t>(elements) * sizeof(uint16_t) * 2;
-                KVCacheProfiler::record(KVCacheOpType::GPU_ALLOC, alloc_ns);
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_FP16, conv_ns, static_cast<uint64_t>(num_tokens), bytes);
+                const uint64_t destination_element_bytes =
+                    destination_precision == ActivationPrecision::FP32
+                        ? sizeof(float)
+                        : sizeof(uint16_t);
+                const uint64_t bytes =
+                    static_cast<uint64_t>(elements) *
+                    destination_element_bytes * 2;
                 KVCacheProfiler::record(KVCacheOpType::APPEND, append_ns, static_cast<uint64_t>(num_tokens), bytes);
             }
 
@@ -455,7 +385,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 view_cols,
                 tensor_type,
-                device_id_);
+                DeviceId::cuda(device_id_));
 
             LOG_TRACE("[CUDARingKVCache::get_k] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -533,7 +463,7 @@ namespace llaminar2
                 static_cast<size_t>(kv_len),
                 view_cols,
                 tensor_type,
-                device_id_);
+                DeviceId::cuda(device_id_));
 
             LOG_TRACE("[CUDARingKVCache::get_v] Created view for layer=" << layer
                                                                          << " seq=" << seq_idx << " kv_len=" << kv_len);
@@ -603,7 +533,8 @@ namespace llaminar2
         if (!k_view || k_view->gpu_data_ptr() != d_k || k_view->rows() != rows)
         {
             k_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_k), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_k), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         // Update V view (index 1)
@@ -611,7 +542,8 @@ namespace llaminar2
         if (!v_view || v_view->gpu_data_ptr() != d_v || v_view->rows() != rows)
         {
             v_view = std::make_unique<GpuTensorView>(
-                const_cast<void *>(d_v), rows, view_cols, tensor_type, device_id_);
+                const_cast<void *>(d_v), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
         }
 
         if (out_k)
@@ -633,6 +565,112 @@ namespace llaminar2
         ITensor *k = nullptr;
         ITensor *v = nullptr;
         bool ok = const_cast<CUDARingKVCache<Precision> *>(this)->get_kv(layer, seq_idx, &k, &v, out_kv_len);
+        if (ok)
+        {
+            if (out_k)
+                *out_k = k;
+            if (out_v)
+                *out_v = v;
+        }
+        return ok;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::get_kv_snapshot_view(
+        int layer, int seq_idx,
+        int token_count,
+        ITensor **out_k, ITensor **out_v,
+        int *out_kv_len)
+    {
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
+
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            token_count <= 0 || token_count > max_seq_len_)
+        {
+            return false;
+        }
+
+        const EntryT &entry = entries_[layer][seq_idx];
+        KVCacheSequenceState state;
+        if (!entry.d_K || !entry.d_V ||
+            !observeDeviceSequenceState(layer, seq_idx, &state) ||
+            token_count < state.cached_tokens)
+            return false;
+
+        const int tail =
+            (state.implementation_head - state.cached_tokens + max_seq_len_) %
+            max_seq_len_;
+        if (state.cached_tokens > 0 && tail != 0)
+            return false;
+        if (state.implementation_head != state.cached_tokens)
+            return false;
+
+        constexpr TensorType tensor_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+                return TensorType::Q8_1;
+            else
+                return TensorType::FP32;
+        }();
+
+        if (snapshot_tensor_views_.empty())
+        {
+            snapshot_tensor_views_.resize(n_layers_);
+            for (int l = 0; l < n_layers_; ++l)
+                snapshot_tensor_views_[l].resize(batch_size_);
+        }
+
+        const size_t rows = static_cast<size_t>(token_count);
+        const size_t view_cols = (Precision == ActivationPrecision::Q8_1)
+                                     ? static_cast<size_t>(kv_storage_dim_)
+                                     : static_cast<size_t>(kv_dim_);
+
+        auto &k_view = snapshot_tensor_views_[layer][seq_idx][0];
+        if (!k_view || k_view->gpu_data_ptr() != entry.d_K || k_view->rows() != rows)
+        {
+            k_view = std::make_unique<GpuTensorView>(
+                static_cast<void *>(entry.d_K), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
+        }
+
+        auto &v_view = snapshot_tensor_views_[layer][seq_idx][1];
+        if (!v_view || v_view->gpu_data_ptr() != entry.d_V || v_view->rows() != rows)
+        {
+            v_view = std::make_unique<GpuTensorView>(
+                static_cast<void *>(entry.d_V), rows, view_cols, tensor_type,
+                DeviceId::cuda(device_id_));
+        }
+
+        if (out_k)
+            *out_k = k_view.get();
+        if (out_v)
+            *out_v = v_view.get();
+        if (out_kv_len)
+            *out_kv_len = token_count;
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::get_kv_snapshot_view(
+        int layer, int seq_idx,
+        int token_count,
+        const ITensor **out_k, const ITensor **out_v,
+        int *out_kv_len) const
+    {
+        ITensor *k = nullptr;
+        ITensor *v = nullptr;
+        const bool ok = const_cast<CUDARingKVCache<Precision> *>(this)->get_kv_snapshot_view(
+            layer, seq_idx, token_count, &k, &v, out_kv_len);
         if (ok)
         {
             if (out_k)
@@ -672,6 +710,14 @@ namespace llaminar2
     template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv(int, int, const ITensor **, const ITensor **, int *) const;
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv(int, int, ITensor **, ITensor **, int *);
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv(int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::FP32>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::FP32>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::FP16>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::FP16>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::BF16>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
+    template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_snapshot_view(int, int, int, ITensor **, ITensor **, int *);
+    template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_snapshot_view(int, int, int, const ITensor **, const ITensor **, int *) const;
 
     // =========================================================================
     // get_kv_converted(): FP16 shadow buffers with optional RoPE
@@ -690,7 +736,7 @@ namespace llaminar2
         cudaStream_t stream, int rope_dim = 0);
 
     template <ActivationPrecision Precision>
-    void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx) const
+    void CUDARingKVCache<Precision>::ensureRoPEShadow(int layer, int seq_idx)
     {
         // Lazy init the outer vectors
         if (rope_shadows_.empty())
@@ -701,15 +747,16 @@ namespace llaminar2
         }
 
         auto &shadow = rope_shadows_[layer][seq_idx];
-        if (!shadow.d_K)
+        const size_t fp16_bytes =
+            static_cast<size_t>(max_seq_len_) *
+            static_cast<size_t>(kv_dim_) * sizeof(__half);
+        if (!ensureConvScratch(fp16_bytes))
         {
-            const size_t buf_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
-            cudaMalloc(&shadow.d_K, buf_bytes);
-            cudaMalloc(&shadow.d_V, buf_bytes);
-            shadow.converted_count = 0;
-            shadow.last_head = -1;
-            shadow.rope_applied = false;
+            throw std::runtime_error(
+                "[CUDARingKVCache] RoPE conversion requires bound K/V workspace");
         }
+        shadow.d_K = static_cast<__half *>(conv_scratch_k_);
+        shadow.d_V = static_cast<__half *>(conv_scratch_v_);
     }
 
     template <ActivationPrecision Precision>
@@ -721,9 +768,6 @@ namespace llaminar2
             return;
 
         auto &shadow = rope_shadows_[layer][seq_idx];
-        shadow.converted_count = 0;
-        shadow.last_head = -1;
-        shadow.rope_applied = false;
         shadow.k_view.reset();
         shadow.v_view.reset();
     }
@@ -738,20 +782,39 @@ namespace llaminar2
     {
         (void)target; // We always produce FP16 on GPU
 
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (out_kv_len)
+            *out_kv_len = 0;
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Scalar conversion is forbidden during graph capture; use get_kv_batched_converted_device_view");
+            return false;
+        }
 
         const auto &entry = entries_[layer][seq_idx];
-        if (entry.count == 0)
+        KVCacheSequenceState state;
+        if (!observeDeviceSequenceState(layer, seq_idx, &state))
+            return false;
+        const int requested_token_count =
+            rope && rope->requested_token_count > 0
+                ? rope->requested_token_count
+                : 0;
+        if (requested_token_count > 0 &&
+            requested_token_count != state.cached_tokens)
         {
-            if (out_k)
-                *out_k = nullptr;
-            if (out_v)
-                *out_v = nullptr;
-            if (out_kv_len)
-                *out_kv_len = 0;
-            return true;
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Requested scalar span does not match canonical device count"
+                      << " requested=" << requested_token_count
+                      << " device_count=" << state.cached_tokens);
+            return false;
         }
+        const int read_count = state.cached_tokens;
+        if (read_count == 0)
+            return true;
 
         // If no RoPE is requested, the raw cache tensors already have the
         // required representation.
@@ -760,9 +823,7 @@ namespace llaminar2
         // has already been remapped by the hybrid override of get_kv_converted().
         const bool want_rope = (rope && rope->rope_theta > 0.0f);
         if (!want_rope)
-        {
             return CUDARingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
-        }
 
         cudaSetDevice(device_id_);
         const cudaStream_t stream = getEffectiveStream(
@@ -770,228 +831,108 @@ namespace llaminar2
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];
+        if (!shadow.d_K || !shadow.d_V || read_count > max_seq_len_)
+        {
+            LOG_ERROR("[CUDARingKVCache::get_kv_converted] Scalar conversion storage is unavailable");
+            return false;
+        }
 
-        // Incremental update: only process new tokens since last call.
-        // Detect whether we can do an incremental update or need a full rebuild.
-        // Full rebuild if: first call, eviction happened (count shrunk), or ring reset.
-        const int new_tokens = entry.count - shadow.converted_count;
-        const bool need_full_rebuild = (shadow.converted_count == 0 ||
-                                        new_tokens < 0 ||
-                                        shadow.converted_count > entry.count);
-
+        /*
+         * This API is deliberately a complete observation-boundary rebuild.
+         * Incremental validity cannot be inferred from host counters once graph
+         * replay owns append/publication. The production grouped API performs
+         * its fixed-shape conversion directly from canonical device metadata.
+         */
         if constexpr (Precision == ActivationPrecision::FP16)
         {
-            if (need_full_rebuild)
-            {
-                // Full rebuild: linearize all K/V to shadow + apply RoPE to all K
-                int kv_len = 0;
-                // Qualified call avoids virtual dispatch — prevents CUDAHybridRingKVCache
-                // from double-remapping the already-remapped layer index.
-                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
-                    return false;
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
-            else if (new_tokens > 0)
-            {
-                // Incremental: linearize all data from ring buffer into shadow.
-                // IMPORTANT: linearize_to overwrites the ENTIRE shadow with fresh
-                // (non-RoPE'd) data from the ring buffer. Unlike FP32/Q8_1/BF16
-                // paths which use a separate scratch buffer and only copy new tokens
-                // to the shadow, the FP16 path writes directly to the shadow.
-                // Therefore we must re-apply RoPE to ALL tokens, not just the new ones.
-                int kv_len = 0;
-                if (!CUDARingKVCache::linearize_to(layer, seq_idx, shadow.d_K, shadow.d_V, &kv_len, stream))
-                    return false;
-
-                // Apply RoPE to all tokens (linearize overwrote previously RoPE'd data)
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                shadow.converted_count = kv_len;
-            }
-            // else: new_tokens == 0, shadow is already up-to-date
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                shadow.d_K, shadow.d_V, stream);
+            if (!cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
+                return false;
         }
         else if constexpr (Precision == ActivationPrecision::FP32)
         {
-            // FP32 cache → linearize to scratch, apply RoPE, convert to FP16 shadow
-            const size_t row_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
-            const size_t total_bytes = static_cast<size_t>(entry.count) * row_bytes;
-
-            if (!ensureConvScratch(total_bytes))
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_rope_apply_fp32(
+                    d_temp_k, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::FP32,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream))
                 return false;
-
-            auto *d_temp_k = static_cast<float *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<float *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_rope_apply_fp32(d_temp_k, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-            }
-            else if (new_tokens > 0)
-            {
-                // RoPE only new tokens in scratch, convert only new tokens to shadow
-                const int old_count = shadow.converted_count;
-                float *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                float *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_rope_apply_fp32(new_k_start, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-
-                __half *shadow_k_new = reinterpret_cast<__half *>(shadow.d_K) + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = reinterpret_cast<__half *>(shadow.d_V) + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::FP32,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-            }
-
-            shadow.converted_count = kv_len;
         }
         else if constexpr (Precision == ActivationPrecision::Q8_1)
         {
-            // Q8_1 cache → linearize to scratch, dequant to FP16 shadow, RoPE
-            const size_t q8_row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(Q8_1Block);
-            const size_t q8_total = static_cast<size_t>(entry.count) * q8_row_bytes;
-
-            if (!ensureConvScratch(q8_total))
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::Q8_1,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream) ||
+                !cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
                 return false;
-
-            auto *d_temp_k = static_cast<Q8_1Block *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<Q8_1Block *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                // Dequant only new tokens, RoPE only new tokens
-                const int old_count = shadow.converted_count;
-                Q8_1Block *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_storage_dim_;
-                Q8_1Block *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_storage_dim_;
-
-                __half *shadow_k_new = shadow.d_K + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = shadow.d_V + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::Q8_1,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta,
-                                     rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
         }
         else if constexpr (Precision == ActivationPrecision::BF16)
         {
-            // BF16 → linearize to scratch, convert to FP16 shadow, RoPE
-            const size_t bf16_bytes = static_cast<size_t>(entry.count) * kv_dim_ * sizeof(__nv_bfloat16);
-
-            if (!ensureConvScratch(bf16_bytes))
+            auto *d_temp_k = entry.d_K_scratch;
+            auto *d_temp_v = entry.d_V_scratch;
+            launch_linearize_kernel(
+                entry, state.implementation_head, read_count,
+                d_temp_k, d_temp_v, stream);
+            if (!cuda_convert_tensor_to_fp16(
+                    d_temp_k, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow.d_K),
+                    read_count * kv_dim_, stream) ||
+                !cuda_convert_tensor_to_fp16(
+                    d_temp_v, TensorType::BF16,
+                    reinterpret_cast<uint16_t *>(shadow.d_V),
+                    read_count * kv_dim_, stream) ||
+                !cuda_rope_apply_fp16(
+                    shadow.d_K, read_count, local_n_kv_heads_, head_dim_,
+                    rope->rope_theta, rope->position_start, stream,
+                    rope->rope_dim))
                 return false;
-
-            auto *d_temp_k = static_cast<__nv_bfloat16 *>(conv_scratch_k_);
-            auto *d_temp_v = static_cast<__nv_bfloat16 *>(conv_scratch_v_);
-
-            int kv_len = 0;
-            if (!CUDARingKVCache::linearize_to(layer, seq_idx, d_temp_k, d_temp_v, &kv_len, stream))
-                return false;
-
-            if (need_full_rebuild)
-            {
-                cuda_convert_tensor_to_fp16(d_temp_k, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow.d_K),
-                                            kv_len * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(d_temp_v, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow.d_V),
-                                            kv_len * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow.d_K, kv_len, n_kv_heads_, head_dim_,
-                                     rope->rope_theta, rope->position_start, stream,
-                                     rope->rope_dim);
-            }
-            else if (new_tokens > 0)
-            {
-                const int old_count = shadow.converted_count;
-                __nv_bfloat16 *new_k_start = d_temp_k + static_cast<size_t>(old_count) * kv_dim_;
-                __nv_bfloat16 *new_v_start = d_temp_v + static_cast<size_t>(old_count) * kv_dim_;
-
-                __half *shadow_k_new = shadow.d_K + static_cast<size_t>(old_count) * kv_dim_;
-                __half *shadow_v_new = shadow.d_V + static_cast<size_t>(old_count) * kv_dim_;
-
-                cuda_convert_tensor_to_fp16(new_k_start, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow_k_new),
-                                            new_tokens * kv_dim_, stream);
-                cuda_convert_tensor_to_fp16(new_v_start, TensorType::BF16,
-                                            reinterpret_cast<uint16_t *>(shadow_v_new),
-                                            new_tokens * kv_dim_, stream);
-
-                cuda_rope_apply_fp16(shadow_k_new, new_tokens, n_kv_heads_, head_dim_,
-                                     rope->rope_theta,
-                                     rope->position_start + old_count, stream,
-                                     rope->rope_dim);
-            }
-
-            shadow.converted_count = kv_len;
         }
 
-        shadow.last_head = entry.head;
-        shadow.rope_applied = true;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
 
         // Create/update GpuTensorViews
-        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.k_view || shadow.k_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.k_view = std::make_unique<GpuTensorView>(
-                shadow.d_K, shadow.converted_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                shadow.d_K, read_count, kv_dim_,
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
-        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(shadow.converted_count))
+        if (!shadow.v_view || shadow.v_view->shape()[0] != static_cast<size_t>(read_count))
         {
             shadow.v_view = std::make_unique<GpuTensorView>(
-                shadow.d_V, shadow.converted_count, kv_dim_,
-                TensorType::FP16, device_id_);
+                shadow.d_V, read_count, kv_dim_,
+                TensorType::FP16, DeviceId::cuda(device_id_));
         }
 
         if (out_k)
@@ -999,7 +940,7 @@ namespace llaminar2
         if (out_v)
             *out_v = shadow.v_view.get();
         if (out_kv_len)
-            *out_kv_len = shadow.converted_count;
+            *out_kv_len = read_count;
 
         return true;
     }
@@ -1011,10 +952,10 @@ namespace llaminar2
     template bool CUDARingKVCache<ActivationPrecision::Q8_1>::get_kv_converted(int, int, ActivationPrecision, ITensor **, ITensor **, int *, const KVReadParams *);
 
     // Explicit template instantiations for shadow helpers
-    template void CUDARingKVCache<ActivationPrecision::FP32>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::FP16>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::BF16>::ensureRoPEShadow(int, int) const;
-    template void CUDARingKVCache<ActivationPrecision::Q8_1>::ensureRoPEShadow(int, int) const;
+    template void CUDARingKVCache<ActivationPrecision::FP32>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::FP16>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::BF16>::ensureRoPEShadow(int, int);
+    template void CUDARingKVCache<ActivationPrecision::Q8_1>::ensureRoPEShadow(int, int);
 
     template void CUDARingKVCache<ActivationPrecision::FP32>::invalidateRoPEShadow(int, int) const;
     template void CUDARingKVCache<ActivationPrecision::FP16>::invalidateRoPEShadow(int, int) const;

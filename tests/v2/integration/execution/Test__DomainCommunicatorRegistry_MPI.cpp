@@ -48,7 +48,7 @@ namespace llaminar2::test
         s0.has_lm_head = false;
         s0.is_global_tp = true;
         s0.participating_ranks = {0, 1};
-        s0.per_rank_device = GlobalDeviceAddress::cpu();
+        s0.per_rank_device = GlobalDeviceAddress::cpu(0); // Explicit fixture endpoint.
 
         // Stage 1: global TP, participants {1, 2}, layers 12-23
         GlobalPPStageSpec s1;
@@ -60,7 +60,7 @@ namespace llaminar2::test
         s1.has_lm_head = true;
         s1.is_global_tp = true;
         s1.participating_ranks = {1, 2};
-        s1.per_rank_device = GlobalDeviceAddress::cpu();
+        s1.per_rank_device = GlobalDeviceAddress::cpu(0); // Explicit fixture endpoint.
 
         return GlobalPPTopology::build({s0, s1}, /*total_layers=*/24, /*world_size=*/3);
     }

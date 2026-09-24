@@ -99,20 +99,6 @@ namespace
 class Test__AttentionPaddingParity : public ::testing::Test
 {
 protected:
-    void SetUp() override
-    {
-        // Force the FP32 path so this test validates causal masking, not VNNI
-        // quantization or CPU feature dispatch differences.
-        setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "0", 1);
-        mutableDebugEnv().attention.reload();
-    }
-
-    void TearDown() override
-    {
-        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12");
-        mutableDebugEnv().attention.reload();
-    }
-
     CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel_;
 };
 

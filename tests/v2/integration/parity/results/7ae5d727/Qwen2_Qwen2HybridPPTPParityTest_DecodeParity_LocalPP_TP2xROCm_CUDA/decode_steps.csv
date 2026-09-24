@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+LocalPP_TP2xROCm_CUDA,0,0.998859,0.00314465,1,1,323,323,true,true,true,true
+LocalPP_TP2xROCm_CUDA,1,0.998787,0.00815823,1,1,279,279,true,true,true,true
+LocalPP_TP2xROCm_CUDA,2,0.999528,0.00503444,1,0.8,3974,3974,true,true,true,true
+LocalPP_TP2xROCm_CUDA,3,0.999497,0.00140555,1,1,13876,13876,true,true,true,true
+LocalPP_TP2xROCm_CUDA,4,0.999653,0.000111844,1,1,38835,38835,true,true,true,true

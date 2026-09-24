@@ -14,9 +14,28 @@ concurrency:
 
 jobs:
   e2e:
-    runs-on: [llaminar-bench]
-    timeout-minutes: 360
+    runs-on: [llaminar-xeon-host]
+    # Both ISA suites must finish even if every independent 15-minute cell is
+    # red: the current 26-cell projection, including its two AVX2 CPU
+    # allowances, can consume 400 minutes before shared setup and publication.
+    timeout-minutes: 480
     steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retire legacy checkout evidence with its cache-owner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy="$GITHUB_WORKSPACE/parity-results"
+          if [[ -d "$legacy" ]]; then
+            docker run --rm --user 0:0 --entrypoint /bin/rm \
+              --mount "type=bind,src=$legacy,dst=/legacy" \
+              "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
+              -rf /legacy/published-e2e /legacy/published-benchmarks
+          fi
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -30,15 +49,10 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Test both published runtime images with the full canonical HTTP suite
         run: |
-          python3 scripts/ci/run_published_image_suite.py e2e \
-            --output parity-results/published-e2e \
+          exec python3 scripts/ci/run_published_image_suite.py e2e \
+            --output "$RUNNER_TEMP/llaminar-published-e2e-$GITHUB_RUN_ID" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - name: Retain image-bound E2E evidence
         if: always()
@@ -46,17 +60,17 @@ jobs:
         with:
           name: published-e2e-${{ github.run_id }}
           path: |
-            parity-results/published-e2e/images.json
-            parity-results/published-e2e/all-cells.json
-            parity-results/published-e2e/manifest.json
-            parity-results/published-e2e/inventory-image.json
-            parity-results/published-e2e/e2e-receipt.json
-            parity-results/published-e2e/pull.log
-            parity-results/published-e2e/build-driver.log
-            parity-results/published-e2e/driver-image.json
-            parity-results/published-e2e/inventory/*.log
-            parity-results/published-e2e/inventory/build-timeline.jsonl
-            parity-results/published-e2e/avx512/**
-            parity-results/published-e2e/avx2/**
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/images.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/all-cells.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/manifest.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/inventory-image.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/e2e-receipt.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/pull.log
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/build-driver.log
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/driver-image.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/inventory/*.log
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/inventory/build-timeline.jsonl
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/avx512/**
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/avx2/**
           if-no-files-found: error
           retention-days: 30

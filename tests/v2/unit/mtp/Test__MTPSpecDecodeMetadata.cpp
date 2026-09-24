@@ -198,7 +198,7 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
     EXPECT_FALSE(binding.devicePointers().complete());
 }
 
-TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingCapacityGrowthRequiresRebind)
 {
     if (!hasCPUBackend())
     {
@@ -223,7 +223,7 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
     // persistent metadata buffers. The binding must report an undersized
     // workspace and clear device pointers rather than continuing with stale
     // pointers from the previous shape.
-    binding.setShape(large_shape);
+    binding.ensureCapacity(large_shape);
     EXPECT_FALSE(binding.hasWorkspace());
     EXPECT_THAT(binding.bindingError(), HasSubstr("too small"));
     EXPECT_FALSE(binding.devicePointers().complete());
@@ -233,6 +233,122 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingShapeGrowthRequiresRebind)
     binding.bindWorkspace(&large_workspace);
     EXPECT_TRUE(binding.hasWorkspace()) << binding.bindingError();
     EXPECT_TRUE(binding.devicePointers().complete());
+}
+
+TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingCapacityCannotShrink)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape large_capacity{
+        .max_requests = 2,
+        .max_draft_tokens = 8,
+    };
+    const MTPSpecDecodeMetadataShape small_request{
+        .max_requests = 1,
+        .max_draft_tokens = 3,
+    };
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(large_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    const auto pointers_before = binding.devicePointers();
+
+    binding.ensureCapacity(small_request);
+
+    EXPECT_EQ(binding.capacity().max_requests, 2);
+    EXPECT_EQ(binding.capacity().max_draft_tokens, 8);
+    EXPECT_TRUE(binding.covers(small_request));
+    EXPECT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+    EXPECT_EQ(
+        binding.devicePointers().verifier_logit_rows,
+        pointers_before.verifier_logit_rows);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, SmallerVerifierPlanUsesReservedCapacityWithoutMutation)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape workspace_capacity{
+        .max_requests = 1,
+        .max_draft_tokens = 8,
+    };
+    const MTPSpecDecodeMetadataShape request_shape{
+        .max_requests = 1,
+        .max_draft_tokens = 5,
+    };
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {3, 5, 7, 9, 11};
+    const MTPSpecDecodeVerifierInputPlan plan =
+        buildMTPSpecDecodeVerifierInputPlan(request_shape, {request});
+    ASSERT_TRUE(plan.ok) << plan.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(workspace_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierInputPlan(
+            plan,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+
+    ASSERT_TRUE(upload.ok) << upload.error;
+    EXPECT_EQ(binding.capacity().max_requests, 1);
+    EXPECT_EQ(binding.capacity().max_draft_tokens, 8);
+    EXPECT_TRUE(binding.covers(request_shape));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, VerifierPlanCannotOverflowReservedCapacity)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    const MTPSpecDecodeMetadataShape workspace_capacity{
+        .max_requests = 1,
+        .max_draft_tokens = 3,
+    };
+    const MTPSpecDecodeMetadataShape request_shape{
+        .max_requests = 1,
+        .max_draft_tokens = 5,
+    };
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {3, 5, 7, 9, 11};
+    const MTPSpecDecodeVerifierInputPlan plan =
+        buildMTPSpecDecodeVerifierInputPlan(request_shape, {request});
+    ASSERT_TRUE(plan.ok) << plan.error;
+
+    MTPSpecDecodeMetadataWorkspaceBinding binding(workspace_capacity);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 64 * 1024);
+    ASSERT_TRUE(workspace.allocate(binding.getWorkspaceRequirements(0, 0, 0)));
+    binding.bindWorkspace(&workspace);
+    ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
+
+    const MTPSpecDecodeMetadataUploadResult upload =
+        uploadMTPSpecDecodeVerifierInputPlan(
+            plan,
+            binding,
+            DeviceId::cpu(),
+            /*backend=*/nullptr,
+            /*stream=*/nullptr);
+
+    EXPECT_FALSE(upload.ok);
+    EXPECT_THAT(upload.error, HasSubstr("setup-owned workspace capacity"));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingDoesNotRequireCommittedRowCompatibilityBuffers)
@@ -531,7 +647,7 @@ TEST(Test__MTPSpecDecodeMetadata, UploadBatchRejectsGpuNullStream)
     EXPECT_THAT(upload.error, HasSubstr("explicit non-null stream"));
 }
 
-TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
+TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanSkipsFullPhysicalIdentityRows)
 {
     if (!hasCPUBackend())
     {
@@ -557,6 +673,13 @@ TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
     binding.bindWorkspace(&workspace);
     ASSERT_TRUE(binding.hasWorkspace()) << binding.bindingError();
 
+    const auto &ptrs = binding.devicePointers();
+    ASSERT_NE(ptrs.verifier_logit_rows, nullptr);
+    std::fill_n(
+        ptrs.verifier_logit_rows,
+        plan.compact_logit_row_count,
+        int32_t{-77});
+
     MTPSpecDecodeMetadataUploadResult upload =
         uploadMTPSpecDecodeVerifierInputPlan(
             plan,
@@ -565,13 +688,13 @@ TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesCompactRows)
             /*backend=*/nullptr,
             /*stream=*/nullptr);
     ASSERT_TRUE(upload.ok) << upload.error;
-    EXPECT_EQ(upload.bytes_uploaded, 3u * sizeof(int32_t));
+    EXPECT_EQ(upload.bytes_uploaded, 0u);
 
-    const auto &ptrs = binding.devicePointers();
     EXPECT_THAT(std::vector<int32_t>(
                     ptrs.verifier_logit_rows,
                     ptrs.verifier_logit_rows + 3),
-                ElementsAre(0, 1, 2));
+                Each(-77))
+        << "identity verifier rows must not touch the metadata workspace";
 }
 
 TEST(Test__MTPSpecDecodeMetadata, UploadVerifierLogitRowsCopiesDirectGraphRows)
@@ -820,6 +943,34 @@ TEST(Test__MTPSpecDecodeMetadata, MaterializesVerifierGraphRowsForPaddedRequestB
     EXPECT_THAT(graph_plan.sequence_lengths, ElementsAre(2, 3));
     EXPECT_THAT(graph_plan.verifier_logit_rows, ElementsAre(0, 1, 3, 4, 5));
     EXPECT_THAT(graph_plan.bonus_logit_rows, ElementsAre(1, 5));
+    EXPECT_EQ(
+        graph_plan.logit_row_layout,
+        MTPSpecDecodeVerifierLogitRowLayout::ExplicitSelection);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, ClassifiesSingleRequestVerifierRowsAsFullPhysicalIdentity)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeVerifierDraftRequest request;
+    request.request_id = 0;
+    request.draft_tokens = {7, 9, 8};
+
+    const MTPSpecDecodeVerifierInputPlan logical_plan =
+        buildMTPSpecDecodeVerifierInputPlan(shape, {request});
+    ASSERT_TRUE(logical_plan.ok) << logical_plan.error;
+
+    const MTPSpecDecodeVerifierGraphForwardPlan graph_plan =
+        buildMTPSpecDecodeVerifierGraphForwardPlan(logical_plan);
+
+    ASSERT_TRUE(graph_plan.ok) << graph_plan.error;
+    EXPECT_EQ(graph_plan.total_graph_tokens, 3);
+    EXPECT_THAT(graph_plan.verifier_logit_rows, ElementsAre(0, 1, 2));
+    EXPECT_EQ(
+        graph_plan.logit_row_layout,
+        MTPSpecDecodeVerifierLogitRowLayout::FullPhysicalIdentity);
 }
 
 TEST(Test__MTPSpecDecodeMetadata, UploadVerifierInputPlanCopiesPaddedGraphRows)
@@ -985,6 +1136,83 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromGreedyCatchupRejectAfterPref
                 ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
 }
 
+TEST(Test__MTPSpecDecodeMetadata, FinalAcceptedStopHasNoBonusContinuation)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {8};
+    const MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    const MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/1000,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_TRUE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1));
+    EXPECT_THAT(batch.stopped_flags, ElementsAre(1));
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(3));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(3));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(8));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_state_slot_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, AcceptedStopTruncationIsNotARejection)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {9};
+    const MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+    ASSERT_TRUE(result.ok) << result.error;
+
+    const MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/1000,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_FALSE(batch.transactions.front().allDraftsAccepted())
+        << "Token comparison sees a truncated row, while the explicit outcome "
+           "records that no verifier comparison rejected";
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1));
+    EXPECT_THAT(batch.stopped_flags, ElementsAre(1));
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(2));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(2));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(2));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(9));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(0));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, UsesExplicitVerifierStateCommitCountForRejectedCorrection)
 {
     MTPSpecDecodeMetadataShape shape;
@@ -1067,6 +1295,47 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromAcceptedOutcomeWithoutSynthe
                 ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
 }
 
+/**
+ * @brief A device-resident stop truncates publication before accepted rows.
+ *
+ * GPU speculative sampling cannot inspect the first sampled token on the host
+ * before launching the captured sidecar and verifier graph. The compact device
+ * reducer may therefore report that every comparison it reached accepted while
+ * also truncating visible output at the first stop token. Such an outcome must
+ * commit no verifier-input state and must not fabricate a bonus token or replay
+ * any suffix merely to satisfy the non-terminal all-accepted invariant.
+ */
+TEST(Test__MTPSpecDecodeMetadata, AcceptsStopTruncatedDeviceResidentOutcome)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecDecodeAcceptedOutcome outcome;
+    outcome.request_id = 0;
+    outcome.vocab_size = 100;
+    outcome.draft_count = 2;
+    outcome.committed_output_tokens = {7};
+    outcome.accepted_verifier_input_prefix = 0;
+    outcome.target_verifier_state_commit_count = 0;
+    outcome.all_drafts_accepted = true;
+    outcome.stopped_on_output = true;
+
+    const MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromAcceptedOutcome(shape, outcome);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(1));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(1));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(0));
+    EXPECT_THAT(batch.accepted_state_counts, ElementsAre(0));
+    EXPECT_THAT(batch.all_drafts_accepted_flags, ElementsAre(1));
+    EXPECT_THAT(batch.stopped_flags, ElementsAre(1));
+    EXPECT_THAT(batch.correction_replay_counts, ElementsAre(0));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
 TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAllOutcome)
 {
     using namespace sampling_math;
@@ -1092,6 +1361,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAll
         /*bonus_ready_token=*/4,
         /*has_bonus_ready_token=*/1,
         output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
         meta.data());
 
     ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
@@ -1137,6 +1407,265 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactAcceptAll
            "is the next decode condition.";
 }
 
+TEST(Test__MTPSpecDecodeMetadata, ClipsAcceptAllPublicationAtSerialVisibleResponseBoundary)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{760, -1, -1, -1};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{1, 0, 0, 0};
+    std::array<int32_t, kSpeculativeBatchMaxOutputTokens> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+
+    summarize_speculative_verify_batch(
+        /*first_token=*/198,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/1,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/3841,
+        /*has_bonus_ready_token=*/1,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+    ASSERT_EQ(meta[kSpecBatchMetaOutputCount], 2);
+    ASSERT_EQ(output_tokens[0], 198);
+    ASSERT_EQ(output_tokens[1], 760);
+
+    int restore_row = -1;
+    int target_cached_tokens = -1;
+    int accepted_state_count = -1;
+    int32_t next_condition_token = -1;
+    int all_drafts_accepted = 0;
+    int stopped = 0;
+    int ok = 0;
+    derive_speculative_publication_metadata(
+        meta.data(),
+        kSpeculativeBatchMetaCount,
+        /*request_index=*/0,
+        /*padded_state_rows_per_request=*/2,
+        /*base_cached_tokens=*/10,
+        /*max_state_commit_rows=*/1,
+        &restore_row,
+        &target_cached_tokens,
+        &accepted_state_count,
+        &ok,
+        output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
+        &next_condition_token,
+        &all_drafts_accepted,
+        &stopped);
+
+    EXPECT_EQ(ok, 1);
+    EXPECT_EQ(accepted_state_count, 1);
+    EXPECT_EQ(restore_row, 0);
+    EXPECT_EQ(target_cached_tokens, 11);
+    EXPECT_EQ(next_condition_token, 760)
+        << "The final visible token stays pending; the farther-ahead sampled "
+           "terminal token must not become the live condition.";
+    EXPECT_EQ(all_drafts_accepted, 1)
+        << "Publication clipping must not rewrite acceptance evidence.";
+    EXPECT_EQ(stopped, 0);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, CommitBoundaryIsTotalAcrossEverySupportedMTPDepth)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{};
+    std::array<int, kSpeculativeBatchMaxRows + 1> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+    for (int row = 0; row < kSpeculativeBatchMaxRows; ++row)
+    {
+        row_tokens[static_cast<size_t>(row)] = 1000 + row;
+        row_accepted[static_cast<size_t>(row)] = 1;
+    }
+
+    /*
+     * Cover every grouped-verifier depth and every possible boundary inside
+     * it. The ready token must always be the first target sample beyond the
+     * committed state prefix, which is exactly what serial decode would use as
+     * the next condition after running maintenance.
+     */
+    for (int row_count = 1;
+         row_count <= kSpeculativeBatchMaxRows;
+         ++row_count)
+    {
+        for (int leading_committed_output_count : {0, 1})
+        {
+            const int max_new_commit_rows =
+                row_count + 1 - leading_committed_output_count;
+            for (int new_commit_budget = 1;
+                 new_commit_budget <= max_new_commit_rows;
+                 ++new_commit_budget)
+            {
+                summarize_speculative_verify_batch_at_commit_boundary(
+                    /*first_token=*/77,
+                    row_tokens.data(),
+                    row_accepted.data(),
+                    row_count,
+                    /*stop_tokens=*/nullptr,
+                    /*stop_token_count=*/0,
+                    /*bonus_ready_token=*/9000,
+                    /*has_bonus_ready_token=*/1,
+                    new_commit_budget,
+                    output_tokens.data(),
+                    static_cast<int>(output_tokens.size()),
+                    meta.data(),
+                    /*greedy_draft_tokens=*/nullptr,
+                    leading_committed_output_count);
+
+                const int physical_commit_rows =
+                    new_commit_budget + leading_committed_output_count;
+                SCOPED_TRACE(::testing::Message()
+                             << "row_count=" << row_count
+                             << " new_commit_budget=" << new_commit_budget
+                             << " leading_committed_output_count="
+                             << leading_committed_output_count);
+                ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+                EXPECT_EQ(meta[kSpecBatchMetaOutputCount], physical_commit_rows);
+                EXPECT_EQ(meta[kSpecBatchMetaAcceptedSpeculativePrefix],
+                          physical_commit_rows - 1);
+                EXPECT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount],
+                          physical_commit_rows);
+                EXPECT_EQ(meta[kSpecBatchMetaConsumedVerifierRows],
+                          physical_commit_rows - 1);
+                EXPECT_EQ(
+                    meta[kSpecBatchMetaLeadingCommittedOutputCount],
+                    leading_committed_output_count);
+                EXPECT_EQ(
+                    speculative_new_commit_count(
+                        meta[kSpecBatchMetaOutputCount],
+                        meta[kSpecBatchMetaLeadingCommittedOutputCount]),
+                    new_commit_budget);
+                EXPECT_EQ(meta[kSpecBatchMetaReadyToken],
+                          physical_commit_rows < row_count + 1
+                              ? row_tokens[static_cast<size_t>(
+                                    physical_commit_rows - 1)]
+                              : 9000);
+                const bool clipped = physical_commit_rows < row_count + 1;
+                EXPECT_EQ(meta[kSpecBatchMetaCommitBoundaryClipped],
+                          clipped ? 1 : 0);
+                EXPECT_EQ(meta[kSpecBatchMetaAllSpeculativeAccepted],
+                          clipped ? 0 : 1);
+                EXPECT_EQ(meta[kSpecBatchMetaSampledTerminal],
+                          clipped ? 0 : 1);
+                EXPECT_EQ(output_tokens[0], 77);
+                for (int output = 1; output < physical_commit_rows; ++output)
+                {
+                    EXPECT_EQ(output_tokens[static_cast<size_t>(output)],
+                              row_tokens[static_cast<size_t>(output - 1)]);
+                }
+            }
+        }
+    }
+}
+
+TEST(Test__MTPSpecDecodeMetadata,
+     PendingCorrectionCadenceCountsEverySerialOutputExactlyOnce)
+{
+    using namespace sampling_math;
+
+    uint32_t committed_rounds = 0;
+    uint32_t remaining_rounds = 5;
+    const std::array<std::pair<int, int>, 3> compact_transactions = {
+        std::pair{3, 0},
+        std::pair{2, 1},
+        std::pair{2, 1}};
+
+    for (size_t transaction = 0;
+         transaction < compact_transactions.size();
+         ++transaction)
+    {
+        const auto [output_count, leading_count] =
+            compact_transactions[transaction];
+        const int new_commits =
+            speculative_new_commit_count(output_count, leading_count);
+        ASSERT_GE(new_commits, 0);
+        ASSERT_LE(static_cast<uint32_t>(new_commits), remaining_rounds);
+        committed_rounds += static_cast<uint32_t>(new_commits);
+        remaining_rounds -= static_cast<uint32_t>(new_commits);
+
+        if (transaction == 1)
+        {
+            EXPECT_EQ(committed_rounds, 4u)
+                << "The carried correction row was already counted by the first transaction";
+            EXPECT_EQ(remaining_rounds, 1u);
+        }
+    }
+
+    EXPECT_EQ(committed_rounds, 5u);
+    EXPECT_EQ(remaining_rounds, 0u);
+    EXPECT_EQ(speculative_new_commit_count(/*output_count=*/1,
+                                           /*leading_count=*/1),
+              0);
+    EXPECT_EQ(speculative_new_commit_count(/*output_count=*/0,
+                                           /*leading_count=*/0),
+              -1);
+    EXPECT_EQ(speculative_new_commit_count(/*output_count=*/1,
+                                           /*leading_count=*/2),
+              -1);
+}
+
+TEST(Test__MTPSpecDecodeMetadata, CommitBoundaryPreservesEarlierRejectAndStopSemantics)
+{
+    using namespace sampling_math;
+
+    std::array<int, kSpeculativeBatchMaxRows> row_tokens{101, 102, 103, 104};
+    std::array<int, kSpeculativeBatchMaxRows> row_accepted{1, 0, 1, 1};
+    std::array<int, kSpeculativeBatchMaxRows + 1> output_tokens{};
+    std::array<int, kSpeculativeBatchMetaCount> meta{};
+
+    summarize_speculative_verify_batch_at_commit_boundary(
+        /*first_token=*/100,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/4,
+        /*stop_tokens=*/nullptr,
+        /*stop_token_count=*/0,
+        /*bonus_ready_token=*/105,
+        /*has_bonus_ready_token=*/1,
+        /*max_state_commit_rows=*/4,
+        output_tokens.data(),
+        static_cast<int>(output_tokens.size()),
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaOutputCount], 3);
+    EXPECT_EQ(meta[kSpecBatchMetaAcceptedSpeculativePrefix], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+    EXPECT_EQ(meta[kSpecBatchMetaRejectedVerifiedToken], 102);
+    EXPECT_EQ(meta[kSpecBatchMetaReadyToken], -1);
+    EXPECT_EQ(meta[kSpecBatchMetaCommitBoundaryClipped], 0);
+
+    const std::array<int, 1> stop_tokens{101};
+    row_accepted.fill(1);
+    summarize_speculative_verify_batch_at_commit_boundary(
+        /*first_token=*/100,
+        row_tokens.data(),
+        row_accepted.data(),
+        /*row_count=*/4,
+        stop_tokens.data(),
+        static_cast<int>(stop_tokens.size()),
+        /*bonus_ready_token=*/105,
+        /*has_bonus_ready_token=*/1,
+        /*max_state_commit_rows=*/4,
+        output_tokens.data(),
+        static_cast<int>(output_tokens.size()),
+        meta.data());
+
+    ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaOutputCount], 2);
+    EXPECT_EQ(meta[kSpecBatchMetaAcceptedSpeculativePrefix], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaTargetVerifierStateCommitCount], 2);
+    EXPECT_EQ(meta[kSpecBatchMetaStoppedOnOutput], 1);
+    EXPECT_EQ(meta[kSpecBatchMetaReadyToken], -1);
+    EXPECT_EQ(meta[kSpecBatchMetaCommitBoundaryClipped], 0);
+}
+
 TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactRejectFirstOutcome)
 {
     using namespace sampling_math;
@@ -1163,6 +1692,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesPublicationMetadataFromCompactRejectFir
         /*bonus_ready_token=*/-1,
         /*has_bonus_ready_token=*/0,
         output_tokens.data() + kSpeculativeBatchMaxOutputTokens,
+        kSpeculativeBatchMaxOutputTokens,
         request_meta);
 
     ASSERT_EQ(request_meta[kSpecBatchMetaOk], 1);
@@ -1226,6 +1756,7 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         /*bonus_ready_token=*/4,
         /*has_bonus_ready_token=*/1,
         output_tokens.data(),
+        kSpeculativeBatchMaxOutputTokens,
         meta.data());
 
     ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
@@ -1235,13 +1766,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
     int accepted_state_count = -1;
     int ok = 0;
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/10,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/13,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/0,
         &target_cached_tokens,
         &accepted_state_count,
@@ -1252,13 +1780,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         << "At normal context lengths depth-0 shifted KV advances by every "
            "committed verifier row.";
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/10,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/13,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/2,
         &target_cached_tokens,
         &accepted_state_count,
@@ -1269,13 +1794,10 @@ TEST(Test__MTPSpecDecodeMetadata, DerivesShiftedPublicationMetadataForMTPKVDepth
         << "Deeper shifted caches use the same accepted delta once the base "
            "context is longer than the shift.";
 
-    derive_shifted_speculative_publication_metadata(
-        meta.data(),
-        kSpeculativeBatchMetaCount,
-        /*request_index=*/0,
-        /*padded_state_rows_per_request=*/3,
+    derive_shifted_speculative_publication_metadata_from_primary(
         /*base_cached_tokens=*/0,
-        /*max_state_commit_rows=*/3,
+        /*main_target_cached_tokens=*/3,
+        /*main_publication_ok=*/1,
         /*mtp_depth=*/0,
         &target_cached_tokens,
         &accepted_state_count,

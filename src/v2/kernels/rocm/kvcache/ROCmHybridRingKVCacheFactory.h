@@ -16,6 +16,7 @@
 namespace llaminar2
 {
     struct HybridKVCacheConfig;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Create a ROCmHybridRingKVCache with the specified precision
@@ -28,7 +29,8 @@ namespace llaminar2
         int max_seq_len,
         int n_kv_heads,
         int head_dim,
-        int device_id);
+        int device_id,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority);
 
     /**
      * @brief Create a sharded ROCmHybridRingKVCache for tensor parallelism
@@ -43,6 +45,7 @@ namespace llaminar2
         int local_n_kv_heads,
         int kv_head_start,
         int head_dim,
-        int device_id);
+        int device_id,
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority);
 
 } // namespace llaminar2

@@ -10,6 +10,7 @@
  */
 
 #include "UPIBackend.h"
+#include "../CollectiveTimeoutPolicy.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/NodeTopology.h"
@@ -17,13 +18,39 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
-#include <thread>
 #include <vector>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Drive one nonblocking MPI collective to completion with a fatal timeout.
+         *
+         * Open MPI's segmented collective algorithms may advance only a bounded
+         * amount of work on each `MPI_Test()` call when no asynchronous progress
+         * thread is enabled.  The inference thread must therefore keep calling
+         * `MPI_Test()` continuously.  Sleeping between calls does not merely save
+         * CPU time: it throttles protocol progress and can add one sleep interval
+         * for every transport segment.  At the Qwen3.6-35B prefill geometry that
+         * turned a roughly two-millisecond same-node allreduce into an 84 ms one.
+         *
+         * The caller is synchronously waiting for this collective before it can
+         * execute the dependent graph stage, so active progress is the economical
+         * use of the rank's orchestration thread.  The deadline remains mandatory;
+         * a timed-out request leaves collective ordering indeterminate and aborts
+         * the entire MPI job rather than permitting inference to continue.
+         *
+         * @param request Live nonblocking MPI request owned by the caller.
+         * @param timeout_ms Positive fatal timeout in milliseconds.
+         * @param operation Human-readable MPI operation name for diagnostics.
+         * @param domain_rank Rank within the collective's domain communicator.
+         * @param domain_size Number of ranks in the collective domain.
+         * @param count Number of logical elements in the operation payload.
+         * @param last_error Destination for a precise failure diagnostic.
+         * @return true when MPI completed the request successfully; false only
+         *         for an MPI error. A timeout terminates the MPI job.
+         */
         bool waitForCollectiveRequest(
             MPI_Request &request,
             int timeout_ms,
@@ -54,7 +81,9 @@ namespace llaminar2
                     return false;
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // MPI_Test is also the progress engine on ordinary Open MPI
+                // installations.  Do not sleep or yield here: either one can
+                // serialize a segmented collective behind scheduler quanta.
             }
 
             if (result != MPI_SUCCESS)
@@ -199,60 +228,28 @@ namespace llaminar2
         MPI_Op mpi_op = toMPIOp(op);
 
         int result = MPI_SUCCESS;
-        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
-        if (timeout_ms > 0)
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms);
+        MPI_Request request = MPI_REQUEST_NULL;
+        result = MPI_Iallreduce(
+            MPI_IN_PLACE,
+            buffer,
+            static_cast<int>(count),
+            mpi_dtype,
+            mpi_op,
+            domain_comm_,
+            &request);
+        if (result == MPI_SUCCESS &&
+            !waitForCollectiveRequest(request,
+                                      timeout_ms,
+                                      "MPI_Iallreduce",
+                                      domain_rank_,
+                                      domain_size_,
+                                      count,
+                                      last_error_))
         {
-            MPI_Request request = MPI_REQUEST_NULL;
-            result = MPI_Iallreduce(
-                MPI_IN_PLACE,
-                buffer,
-                static_cast<int>(count),
-                mpi_dtype,
-                mpi_op,
-                domain_comm_,
-                &request);
-
-            if (result == MPI_SUCCESS)
-            {
-                const auto start = std::chrono::steady_clock::now();
-                const auto deadline = start + std::chrono::milliseconds(timeout_ms);
-                int complete = 0;
-                while (!complete)
-                {
-                    result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
-                    if (result != MPI_SUCCESS || complete)
-                        break;
-
-                    if (std::chrono::steady_clock::now() >= deadline)
-                    {
-                        last_error_ = "MPI_Iallreduce timed out after " + std::to_string(timeout_ms) +
-                                      "ms on domain rank " + std::to_string(domain_rank_) +
-                                      "/" + std::to_string(domain_size_) +
-                                      " (count=" + std::to_string(count) + ")";
-                        LOG_ERROR("UPICollectiveBackend::allreduce - " << last_error_
-                                  << "; aborting MPI job to avoid rank desynchronization");
-
-                        // A timed-out nonblocking collective leaves the communicator in
-                        // an unsafe state; continuing into later MPI calls can deadlock or
-                        // corrupt ordering. Fail the MPI job deliberately and loudly.
-                        MPI_Abort(MPI_COMM_WORLD, 1);
-                        return false;
-                    }
-
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
-            }
-        }
-        else
-        {
-            // Use MPI_IN_PLACE for efficient in-place allreduce.
-            result = MPI_Allreduce(
-                MPI_IN_PLACE,
-                buffer,
-                static_cast<int>(count),
-                mpi_dtype,
-                mpi_op,
-                domain_comm_);
+            return false;
         }
 
         if (result != MPI_SUCCESS)
@@ -411,37 +408,27 @@ namespace llaminar2
         MPI_Datatype mpi_dtype = toMPIDatatype(dtype);
 
         int result = MPI_SUCCESS;
-        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
-        if (timeout_ms > 0)
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms);
+        MPI_Request request = MPI_REQUEST_NULL;
+        result = MPI_Ibcast(
+            buffer,
+            static_cast<int>(count),
+            mpi_dtype,
+            root_rank,
+            domain_comm_,
+            &request);
+        if (result == MPI_SUCCESS &&
+            !waitForCollectiveRequest(request,
+                                      timeout_ms,
+                                      "MPI_Ibcast",
+                                      domain_rank_,
+                                      domain_size_,
+                                      count,
+                                      last_error_))
         {
-            MPI_Request request = MPI_REQUEST_NULL;
-            result = MPI_Ibcast(
-                buffer,
-                static_cast<int>(count),
-                mpi_dtype,
-                root_rank,
-                domain_comm_,
-                &request);
-            if (result == MPI_SUCCESS &&
-                !waitForCollectiveRequest(request,
-                                          timeout_ms,
-                                          "MPI_Ibcast",
-                                          domain_rank_,
-                                          domain_size_,
-                                          count,
-                                          last_error_))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            result = MPI_Bcast(
-                buffer,
-                static_cast<int>(count),
-                mpi_dtype,
-                root_rank,
-                domain_comm_);
+            return false;
         }
 
         if (result != MPI_SUCCESS)
@@ -469,26 +456,21 @@ namespace llaminar2
         }
 
         int result = MPI_SUCCESS;
-        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
-        if (timeout_ms > 0)
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms);
+        MPI_Request request = MPI_REQUEST_NULL;
+        result = MPI_Ibarrier(domain_comm_, &request);
+        if (result == MPI_SUCCESS &&
+            !waitForCollectiveRequest(request,
+                                      timeout_ms,
+                                      "MPI_Ibarrier",
+                                      domain_rank_,
+                                      domain_size_,
+                                      0,
+                                      last_error_))
         {
-            MPI_Request request = MPI_REQUEST_NULL;
-            result = MPI_Ibarrier(domain_comm_, &request);
-            if (result == MPI_SUCCESS &&
-                !waitForCollectiveRequest(request,
-                                          timeout_ms,
-                                          "MPI_Ibarrier",
-                                          domain_rank_,
-                                          domain_size_,
-                                          0,
-                                          last_error_))
-            {
-                return false;
-            }
-        }
-        else
-        {
-            result = MPI_Barrier(domain_comm_);
+            return false;
         }
 
         if (result != MPI_SUCCESS)

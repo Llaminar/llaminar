@@ -1,0 +1,4 @@
+interface:
+  display_name: "CPU Kernel Tuning"
+  short_description: "Profile and tune CPU kernels with Linux perf"
+  default_prompt: "Use $cpu-tuning to profile this CPU kernel, diagnose the bottleneck, and validate a parity-preserving optimization."

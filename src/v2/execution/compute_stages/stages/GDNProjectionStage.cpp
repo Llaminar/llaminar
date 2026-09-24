@@ -1,6 +1,6 @@
-/**
- * @file GDNProjectionStage.cpp
+/** @file GDNProjectionStage.cpp
  * @brief Implementation of GDN 4-projection stage
+ * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
  */
 
 #include "GDNProjectionStage.h"
@@ -45,46 +45,86 @@ namespace llaminar2
         {
             if (!sameKernelType(lhs, rhs))
                 return false;
+
+            /*
+             * Native-VNNI engines are compatible only when the decoder
+             * codebook agrees.  A single grouped launch is driven by the seed
+             * engine, so accepting a different codebook here would make that
+             * engine reinterpret the following projection's packed bytes.
+             */
             if (lhs_codebook.has_value() != rhs_codebook.has_value())
                 return false;
             if (lhs_codebook.has_value())
                 return lhs_codebook.value() == rhs_codebook.value();
+
+            /*
+             * Floating GEMM implementations use one C++ class for FP16,
+             * BF16, and FP32 weights.  Type identity alone therefore is not a
+             * complete fusion key.  Query the public immutable weight view so
+             * a BF16 QKV/Z pair and an FP32 alpha/beta pair become two valid
+             * fused subgroups instead of asking the BF16 seed kernel to decode
+             * FP32 bytes.  Geometry intentionally is not part of this key:
+             * grouped implementations split different N widths internally
+             * while retaining one physical weight format per subgroup.
+             */
+            ContiguousFloatingPointWeightDescriptor lhs_floating;
+            ContiguousFloatingPointWeightDescriptor rhs_floating;
+            const bool lhs_exports_floating =
+                lhs->exportContiguousFloatingPointWeights(lhs_floating) &&
+                lhs_floating.valid();
+            const bool rhs_exports_floating =
+                rhs->exportContiguousFloatingPointWeights(rhs_floating) &&
+                rhs_floating.valid();
+            if (lhs_exports_floating != rhs_exports_floating)
+                return false;
+            if (lhs_exports_floating)
+                return lhs_floating.type == rhs_floating.type;
+
             return true;
         }
 
-        bool multiplyProjectionFallback(
-            const TensorBase *input,
-            const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
-            int m,
-            int k,
-            DeviceWorkspaceManager *workspace)
+        bool validateProjectionTensorCapacity(
+            const TensorBase *tensor,
+            const char *name,
+            int rows_required,
+            int cols_required,
+            const DeviceId &device_id)
         {
-            for (const auto &projection : projections)
+            if (!tensor)
             {
-                if (!projection.kernel || !projection.output)
-                    return false;
-
-                const bool ok = projection.kernel->multiply_tensor(
-                    input,
-                    projection.output,
-                    m,
-                    projection.n,
-                    k,
-                    true,
-                    1.0f,
-                    0.0f,
-                    projection.bias,
-                    nullptr,
-                    -1,
-                    workspace);
-                if (!ok)
-                {
-                    LOG_ERROR("[GDNProjectionStage] Projection fallback failed for "
-                              << (projection.name ? projection.name : "unnamed"));
-                    return false;
-                }
+                LOG_ERROR("[GDNProjectionStage] Missing tensor for " << name
+                                                                     << " on " << device_id.toString());
+                return false;
             }
-            return true;
+            if (rows_required <= 0 || cols_required <= 0)
+            {
+                LOG_ERROR("[GDNProjectionStage] Invalid projection extent for " << name
+                                                                                << " on " << device_id.toString()
+                                                                                << ": rows=" << rows_required
+                                                                                << " cols=" << cols_required);
+                return false;
+            }
+
+            const size_t required_rows = static_cast<size_t>(rows_required);
+            const size_t required_cols = static_cast<size_t>(cols_required);
+            const size_t required_elements = required_rows * required_cols;
+            const bool shape_ok = tensor->rows() >= required_rows && tensor->cols() >= required_cols;
+            const bool numel_ok = tensor->numel() >= required_elements;
+            if (shape_ok && numel_ok)
+                return true;
+
+            LOG_ERROR("[GDNProjectionStage] Tensor capacity is too small for " << name
+                                                                               << " on " << device_id.toString()
+                                                                               << ": shape=" << tensor->rows()
+                                                                               << "x" << tensor->cols()
+                                                                               << " numel=" << tensor->numel()
+                                                                               << " bytes=" << tensor->size_bytes()
+                                                                               << " dtype=" << tensor->dtype_name()
+                                                                               << " gpu_ptr=" << tensor->gpu_data_ptr()
+                                                                               << " required_shape=" << required_rows
+                                                                               << "x" << required_cols
+                                                                               << " required_elements=" << required_elements);
+            return false;
         }
 
         std::vector<ITensorGemm::TensorProjectionDesc> selectProjections(
@@ -106,7 +146,7 @@ namespace llaminar2
             const std::vector<size_t> &indices,
             const std::array<std::optional<uint8_t>, 4> &native_codebooks)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("kernel"))
                 return;
 
             std::ostringstream names;
@@ -150,6 +190,74 @@ namespace llaminar2
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void GDNProjectionStage::clearCachedGemmStreams()
+    {
+        if (params_.gemm_qkv)
+            params_.gemm_qkv->clearGPUStreamBinding();
+        if (params_.gemm_z)
+            params_.gemm_z->clearGPUStreamBinding();
+        if (params_.gemm_a)
+            params_.gemm_a->clearGPUStreamBinding();
+        if (params_.gemm_b)
+            params_.gemm_b->clearGPUStreamBinding();
+    }
+
+    void GDNProjectionStage::resetSessionState()
+    {
+        IComputeStage::resetSessionState();
+        clearCachedGemmStreams();
+    }
+
+    void GDNProjectionStage::resetSessionStatePreservingCapturedReplay()
+    {
+        IComputeStage::resetSessionStatePreservingCapturedReplay();
+        clearCachedGemmStreams();
+    }
+
+    void GDNProjectionStage::resetSessionStatePreservingLazyInitialization()
+    {
+        resetSessionStatePreservingCapturedReplay();
+    }
+
+    bool GDNProjectionStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[GDNProjectionStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+
+        auto *gemm_qkv = resolveGemm(
+            params_.w_qkv, params_.gemm_qkv, "w_qkv");
+        auto *gemm_z = resolveGemm(params_.w_z, params_.gemm_z, "w_z");
+        auto *gemm_a = resolveGemm(params_.w_a, params_.gemm_a, "w_a");
+        auto *gemm_b = resolveGemm(params_.w_b, params_.gemm_b, "w_b");
+        if (!gemm_qkv || !gemm_z || !gemm_a || !gemm_b)
+            return false;
+
+        constexpr size_t projection_count = 4;
+        const std::array<ITensorGemm *, projection_count> kernels = {
+            gemm_qkv, gemm_z, gemm_a, gemm_b};
+        for (ITensorGemm *kernel : kernels)
+        {
+            bindStageStream(kernel);
+            if (!kernel->prepareFusedProjectionGraphCapture(
+                    projection_count))
+            {
+                LOG_ERROR("[GDNProjectionStage] Failed to provision persistent "
+                          "four-projection resources before graph capture"
+                          << " device=" << params_.device_id.toString());
+                return false;
+            }
+        }
+        return true;
     }
 
     bool GDNProjectionStage::validatePreparedWeights(std::string *error) const
@@ -276,11 +384,20 @@ namespace llaminar2
         if (!C_qkv || !C_z || !C_a || !C_b)
             return false;
 
+        if (!validateProjectionTensorCapacity(A_base, "input", M, K, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_qkv, "output_qkv", M, params_.n_qkv, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_z, "output_z", M, params_.n_z, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_a, "output_a", M, params_.n_a, params_.device_id) ||
+            !validateProjectionTensorCapacity(C_b, "output_b", M, params_.n_b, params_.device_id))
+        {
+            return false;
+        }
+
         // Set GPU stream on all engines (no-op for CPU)
-        gemm_qkv->setGPUStream(gpuStream());
-        gemm_z->setGPUStream(gpuStream());
-        gemm_a->setGPUStream(gpuStream());
-        gemm_b->setGPUStream(gpuStream());
+        bindStageStream(gemm_qkv);
+        bindStageStream(gemm_z);
+        bindStageStream(gemm_a);
+        bindStageStream(gemm_b);
 
         // Fused 4-projection GEMM: quantizes input once, single OMP region
         // for decode (M=1). For prefill (M>1), falls back to sequential GEMMs
@@ -299,6 +416,15 @@ namespace llaminar2
 
         if (params_.force_decode_equivalent_verifier_prefill && M > 1)
         {
+            auto verifier_rows = gemm_qkv->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
+            /**
+             * Group verifier projections only when the prepared GEMM engines
+             * can legally share one fused decode path.  The verifier rows must
+             * be bitwise-equivalent to running the decode stage once per row;
+             * mixing native VNNI projections with different codebooks under the
+             * first projection's kernel can decode the later projections with
+             * the wrong format even though the C++ kernel type is identical.
+             */
             auto try_grouped_verifier_projections =
                 [&](const std::vector<ITensorGemm::TensorProjectionDesc> &all_projections) -> bool
             {
@@ -314,7 +440,11 @@ namespace llaminar2
                     for (size_t j = i + 1; j < all_projections.size(); ++j)
                     {
                         if (!completed[j] && all_projections[j].kernel &&
-                            sameKernelType(all_projections[i].kernel, all_projections[j].kernel))
+                            fusedProjectionCompatible(
+                                all_projections[i].kernel,
+                                all_projections[j].kernel,
+                                native_codebooks[i],
+                                native_codebooks[j]))
                         {
                             group_indices.push_back(j);
                         }
@@ -351,12 +481,12 @@ namespace llaminar2
                 return std::all_of(completed.begin(), completed.end(), [](bool done) { return done; });
             };
 
-            const bool homogeneous_projection_kernels =
-                sameKernelType(gemm_qkv, gemm_z) &&
-                sameKernelType(gemm_qkv, gemm_a) &&
-                sameKernelType(gemm_qkv, gemm_b);
+            const bool homogeneous_projection_group =
+                fusedProjectionCompatible(gemm_qkv, gemm_z, native_codebooks[0], native_codebooks[1]) &&
+                fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
+                fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
 
-            if ((homogeneous_projection_kernels &&
+            if ((homogeneous_projection_group &&
                  gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
                      A_base,
                      projections,
@@ -367,7 +497,7 @@ namespace llaminar2
                 try_grouped_verifier_projections(projections))
             {
                 recordGDNProjectionRoute(
-                    homogeneous_projection_kernels
+                    homogeneous_projection_group
                         ? "grouped_decode_equivalent_verifier"
                         : "grouped_decode_equivalent_verifier_mixed",
                     M,
@@ -409,17 +539,28 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
+            LOG_TRACE("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
             std::vector<bool> completed(projections.size(), false);
             auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
             {
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
-                    if (completed[i] || !projections[i].kernel ||
-                        !projections[i].kernel->supports_fused_projection())
-                    {
+                    if (completed[i])
                         continue;
+                    if (!projections[i].kernel)
+                        return false;
+                    if (require_native_compatibility &&
+                        !native_codebooks[i].has_value())
+                        continue;
+                    if (!projections[i].kernel->supports_fused_projection())
+                    {
+                        LOG_ERROR("[GDNProjectionStage] Projection bundle member "
+                                  << (projections[i].name
+                                          ? projections[i].name
+                                          : "unnamed")
+                                  << " has no first-class fused implementation");
+                        return false;
                     }
 
                     std::vector<size_t> group_indices;
@@ -427,7 +568,9 @@ namespace llaminar2
                     for (size_t j = i + 1; j < projections.size(); ++j)
                     {
                         if (!completed[j] && projections[j].kernel &&
-                            projections[j].kernel->supports_fused_projection())
+                            projections[j].kernel->supports_fused_projection() &&
+                            (!require_native_compatibility ||
+                             native_codebooks[j].has_value()))
                         {
                             const bool compatible =
                                 require_native_compatibility
@@ -438,14 +581,15 @@ namespace llaminar2
                                           projections[j].kernel,
                                           native_codebooks[i],
                                           native_codebooks[j]))
-                                    : sameKernelType(projections[i].kernel, projections[j].kernel);
+                                    : fusedProjectionCompatible(
+                                          projections[i].kernel,
+                                          projections[j].kernel,
+                                          native_codebooks[i],
+                                          native_codebooks[j]);
                             if (compatible)
                                 group_indices.push_back(j);
                         }
                     }
-
-                    if (group_indices.size() < 2)
-                        continue;
 
                     auto group = selectProjections(projections, group_indices);
                     recordGDNProjectionRoute(
@@ -475,25 +619,18 @@ namespace llaminar2
             if (!runFusedSubgroups(/*require_native_compatibility=*/false))
                 return false;
 
-            std::vector<ITensorGemm::TensorProjectionDesc> remaining;
-            remaining.reserve(projections.size());
-            for (size_t i = 0; i < projections.size(); ++i)
-            {
-                if (!completed[i])
+            success = std::all_of(
+                completed.begin(),
+                completed.end(),
+                [](bool projection_complete)
                 {
-                    recordGDNProjectionRoute(
-                        "fallback_single",
-                        M,
-                        K,
-                        projections,
-                        {i},
-                        native_codebooks);
-                    remaining.push_back(projections[i]);
-                }
+                    return projection_complete;
+                });
+            if (!success)
+            {
+                LOG_ERROR("[GDNProjectionStage] Projection bundle left an "
+                          "unexecuted member; per-projection replay is forbidden");
             }
-
-            success = remaining.empty() ||
-                      multiplyProjectionFallback(A_base, remaining, M, K, bound_workspace_);
         }
 
         if (!success)
@@ -502,7 +639,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_DEBUG("[GDNProjectionStage] Executed: M=" << M << " K=" << K
+        LOG_TRACE("[GDNProjectionStage] Executed: M=" << M << " K=" << K
                                                       << " n_qkv=" << params_.n_qkv
                                                       << " n_z=" << params_.n_z
                                                       << " n_a=" << params_.n_a
@@ -555,21 +692,21 @@ namespace llaminar2
         const size_t rows = static_cast<size_t>(params_.m);
         const size_t k = static_cast<size_t>(params_.k);
 
-        // Inputs: normalized hidden state + 4 weight matrices
+        // The normalized hidden state is the only activation input. Projection
+        // weights are declared through the dedicated weight channel because
+        // production GPU execution consumes immutable PreparedWeightStore
+        // handles; their source tensors may intentionally release raw host data
+        // after preparation and therefore are not valid activation buffers.
         if (params_.input)
             info.addInput("input", params_.input, rows, k);
         if (params_.w_qkv)
-            info.addInput("w_qkv", params_.w_qkv,
-                          params_.w_qkv->shape()[0], params_.w_qkv->shape()[1]);
+            info.addWeight("w_qkv", params_.w_qkv);
         if (params_.w_z)
-            info.addInput("w_z", params_.w_z,
-                          params_.w_z->shape()[0], params_.w_z->shape()[1]);
+            info.addWeight("w_z", params_.w_z);
         if (params_.w_a)
-            info.addInput("w_a", params_.w_a,
-                          params_.w_a->shape()[0], params_.w_a->shape()[1]);
+            info.addWeight("w_a", params_.w_a);
         if (params_.w_b)
-            info.addInput("w_b", params_.w_b,
-                          params_.w_b->shape()[0], params_.w_b->shape()[1]);
+            info.addWeight("w_b", params_.w_b);
 
         // Outputs: 4 projection results
         if (params_.output_qkv)
@@ -654,15 +791,27 @@ namespace llaminar2
             contract.addOutput(*params_.output_a_buffer_id);
         if (params_.output_b_buffer_id)
             contract.addOutput(*params_.output_b_buffer_id);
-        // Model weights are not arena-managed
+        // Every GDN projection consumes a store-owned prepared representation.
         if (params_.w_qkv)
-            contract.addWeight(const_cast<ITensor *>(params_.w_qkv));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_qkv),
+                params_.prepared_store,
+                params_.prepared_ref_qkv.value_or(PreparedWeightRef{}));
         if (params_.w_z)
-            contract.addWeight(const_cast<ITensor *>(params_.w_z));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_z),
+                params_.prepared_store,
+                params_.prepared_ref_z.value_or(PreparedWeightRef{}));
         if (params_.w_a)
-            contract.addWeight(const_cast<ITensor *>(params_.w_a));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_a),
+                params_.prepared_store,
+                params_.prepared_ref_a.value_or(PreparedWeightRef{}));
         if (params_.w_b)
-            contract.addWeight(const_cast<ITensor *>(params_.w_b));
+            contract.addPreparedWeight(
+                const_cast<ITensor *>(params_.w_b),
+                params_.prepared_store,
+                params_.prepared_ref_b.value_or(PreparedWeightRef{}));
         return contract;
     }
 
@@ -703,6 +852,17 @@ namespace llaminar2
         mergeFrom(self->params_.w_z, self->params_.gemm_z, "w_z", self->params_.n_z);
         mergeFrom(self->params_.w_a, self->params_.gemm_a, "w_a", self->params_.n_a);
         mergeFrom(self->params_.w_b, self->params_.gemm_b, "w_b", self->params_.n_b);
+
+        const std::array<int, 4> fused_columns = {
+            self->params_.n_qkv > 0 ? self->params_.n_qkv : n,
+            self->params_.n_z > 0 ? self->params_.n_z : n,
+            self->params_.n_a > 0 ? self->params_.n_a : n,
+            self->params_.n_b > 0 ? self->params_.n_b : n};
+        if (auto *anchor = dynamic_cast<IWorkspaceConsumer *>(self->params_.gemm_qkv))
+        {
+            anchor->appendFusedProjectionWorkspaceRequirements(
+                combined, workspace_m, fused_columns, workspace_k);
+        }
         addCudaConcurrentDecodeGemvSideStreamWorkspace(
             combined, self->params_.device_id, workspace_m, /*projection_count=*/4);
         return combined;
@@ -717,7 +877,7 @@ namespace llaminar2
             if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm))
             {
                 consumer->bindWorkspace(workspace);
-                LOG_DEBUG("[GDNProjectionStage] Bound workspace to " << name << " kernel");
+                LOG_TRACE("[GDNProjectionStage] Bound workspace to " << name << " kernel");
             }
         };
 

@@ -2,6 +2,8 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "../mocks/MockBackend.h"
 
+#include <memory>
+
 /**
  * @file Test__WeightVRAMPool.cpp
  * @brief Unit tests for planning, allocation, and staging cleanup in WeightVRAMPool.
@@ -46,6 +48,26 @@ namespace llaminar2
         // w3: blocks_per_row=16, payload=16*256*16=65536, scales=16*256*2=8192
         size_t min_expected = (262144 + 32768) + (1048576 + 131072) + (65536 + 8192);
         EXPECT_GE(pool.totalPlannedBytes(), min_expected);
+    }
+
+    /** @brief Non-concurrent raw/packed views pay the larger size, never both. */
+    TEST(Test__WeightVRAMPool, ContiguousAliasSharesPackedStorageWithoutOverlap)
+    {
+        constexpr size_t raw_bytes = 32u * 64u * sizeof(float);
+        WeightVRAMPool pool;
+        pool.planWeight("mixed", 32, 64, 16, true, true, 0,
+                        {.bytes = raw_bytes});
+        EXPECT_EQ(pool.totalPlannedBytes(), raw_bytes);
+        pool.planRawWeight("following", 32, 64, raw_bytes);
+        EXPECT_EQ(pool.totalPlannedBytes(), 2u * raw_bytes);
+
+        // A smaller alias cannot truncate native scales/minima or move the
+        // next allocation backward. Quantized-only plans remain byte identical.
+        WeightVRAMPool baseline;
+        WeightVRAMPool smaller;
+        baseline.planWeight("native", 32, 64, 32, true, true, 0);
+        smaller.planWeight("native", 32, 64, 32, true, true, 0, {.bytes = 16});
+        EXPECT_EQ(smaller.totalPlannedBytes(), baseline.totalPlannedBytes());
     }
 
     TEST(Test__WeightVRAMPool, GetSlotBeforeAllocate)
@@ -179,6 +201,20 @@ namespace llaminar2
         EXPECT_GE(pool.totalPlannedBytes(), bytes_no_staging + 600000);
     }
 
+    TEST(Test__WeightVRAMPool, ExplicitStagingSlotSizeCapsTemporaryAllocation)
+    {
+        WeightVRAMPool pool;
+        pool.planWeight("large", 1024, 1024, kQ4PayloadBytes, false, false, 800000);
+        const size_t persistent_bytes = pool.totalPlannedBytes();
+
+        ASSERT_TRUE(pool.allocate(nullptr, 0, /*staging_slot_count=*/3,
+                                  /*staging_slot_bytes=*/200000));
+
+        EXPECT_EQ(pool.maxStagingSlotBytes(), 200000u);
+        EXPECT_GE(pool.totalPlannedBytes(), persistent_bytes + 600000u);
+        EXPECT_LT(pool.totalPlannedBytes(), persistent_bytes + 800000u * 3u);
+    }
+
     TEST(Test__WeightVRAMPool, ReleaseStagingKeepsWeightSlotValid)
     {
         test::MockBackend backend(DeviceType::ROCm);
@@ -211,6 +247,31 @@ namespace llaminar2
         auto after = pool.getSlot("w1");
         ASSERT_TRUE(after.has_value());
         EXPECT_EQ(after->d_native_vnni_payload, payload_before);
+    }
+
+    /**
+     * @brief Prepared accounting follows the physical pool, not its owner.
+     *
+     * A maintenance transaction may retain a LoadOrchestrator after releasing
+     * its pool.  The weak token must therefore expire at the pool's persistent
+     * backend free, otherwise final model retirement overstates live bytes.
+     */
+    TEST(Test__WeightVRAMPool, PersistentAllocationLifetimeEndsWithPoolRelease)
+    {
+        test::MockBackend backend(DeviceType::ROCm);
+        WeightVRAMPool pool;
+        pool.planRawWeight("raw", 16, 16, 16u * 16u * sizeof(float));
+
+        ASSERT_TRUE(pool.allocate(&backend, 0, 0));
+        ASSERT_EQ(backend.getAllocationCount(), 1u);
+        const std::weak_ptr<void> lifetime =
+            pool.persistentAllocationLifetime();
+        EXPECT_FALSE(lifetime.expired());
+
+        pool.release();
+
+        EXPECT_TRUE(lifetime.expired());
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
     }
 
 } // namespace llaminar2

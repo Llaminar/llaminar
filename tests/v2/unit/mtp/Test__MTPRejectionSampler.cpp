@@ -87,6 +87,48 @@ namespace llaminar2::test
         EXPECT_EQ(sampleMTPDistributionWithThreshold(distribution, 2.0f), 4);
     }
 
+    TEST(Test__MTPRejectionSampler, SerialEquivalentRowAcceptsMatchingDraft)
+    {
+        const auto target = dist({{3, 0.25f}, {4, 0.75f}});
+
+        const MTPRejectionSampleRowResult result =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/4,
+                /*sample_threshold=*/0.5f);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_TRUE(result.accepted);
+        EXPECT_EQ(result.token, 4);
+        EXPECT_EQ(result.draft_token, 4);
+        EXPECT_FLOAT_EQ(result.accept_probability, 1.0f);
+        EXPECT_FLOAT_EQ(result.accept_threshold, 0.5f);
+    }
+
+    TEST(Test__MTPRejectionSampler, SerialEquivalentCorrectionIgnoresDraftChoice)
+    {
+        const auto target = dist({{3, 0.25f}, {4, 0.75f}});
+
+        const MTPRejectionSampleRowResult matching =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/4,
+                /*sample_threshold=*/0.5f);
+        const MTPRejectionSampleRowResult mismatching =
+            sampleMTPSerialEquivalentTargetRow(
+                target,
+                /*draft_token=*/3,
+                /*sample_threshold=*/0.5f);
+
+        ASSERT_TRUE(matching.ok) << matching.error;
+        ASSERT_TRUE(mismatching.ok) << mismatching.error;
+        EXPECT_EQ(matching.token, 4);
+        EXPECT_EQ(mismatching.token, matching.token);
+        EXPECT_TRUE(matching.accepted);
+        EXPECT_FALSE(mismatching.accepted);
+        EXPECT_FLOAT_EQ(mismatching.accept_probability, 0.0f);
+    }
+
     TEST(Test__MTPRejectionSampler, SharedDistributionSamplerReportsSelectedProbability)
     {
         const int token_ids[] = {7, 11, 13, -1};
@@ -494,6 +536,7 @@ namespace llaminar2::test
             /*stop_tokens=*/nullptr,
             /*stop_token_count=*/0,
             output_tokens,
+            kSpeculativeBatchMaxOutputTokens,
             meta);
 
         ASSERT_EQ(meta[kSpecBatchMetaOk], 1);
@@ -515,6 +558,8 @@ namespace llaminar2::test
         outcome.consumed_verifier_rows =
             meta[kSpecBatchMetaConsumedVerifierRows];
         outcome.sampled_terminal = meta[kSpecBatchMetaSampledTerminal] != 0;
+        outcome.commit_boundary_clipped =
+            meta[kSpecBatchMetaCommitBoundaryClipped] != 0;
 
         MTPDecodeCatchupGreedyResult device_result =
             buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
@@ -535,6 +580,42 @@ namespace llaminar2::test
         EXPECT_EQ(device_result.ready_token, row_result.ready_token);
         EXPECT_EQ(device_result.rejected_verified_token,
                   row_result.rejected_verified_token);
+    }
+
+    TEST(Test__MTPRejectionSampler,
+         BuildsCatchupFromExplicitCommitBoundaryOutcome)
+    {
+        MTPDecodeCatchupGreedyRequest request;
+        request.draft_tokens = {10, 11, 12};
+
+        MTPDeviceRejectionBatchOutcome outcome;
+        outcome.ok = true;
+        outcome.output_tokens[0] = 10;
+        outcome.output_token_count = 1;
+        outcome.accepted_speculative_prefix = 0;
+        outcome.target_verifier_state_commit_count = 1;
+        outcome.ready_token = 11;
+        outcome.rejected_verified_token = -1;
+        outcome.stopped_on_output = false;
+        outcome.all_speculative_accepted = false;
+        outcome.consumed_verifier_rows = 0;
+        outcome.sampled_terminal = false;
+        outcome.commit_boundary_clipped = true;
+
+        MTPDecodeCatchupGreedyResult result =
+            buildAllPositionMTPDecodeCatchupFromDeviceBatchOutcome(
+                request,
+                outcome);
+
+        ASSERT_TRUE(result.ok) << result.error;
+        EXPECT_THAT(result.accepted_tokens, ElementsAre(10));
+        EXPECT_TRUE(result.verifier_tokens.empty());
+        EXPECT_EQ(result.accepted_speculative_prefix, 0);
+        EXPECT_EQ(result.target_verifier_state_commit_count, 1);
+        EXPECT_EQ(result.ready_token, 11);
+        EXPECT_EQ(result.rejected_verified_token, -1);
+        EXPECT_FALSE(result.all_speculative_accepted);
+        EXPECT_FALSE(result.stopped_on_output);
     }
 
     TEST(Test__MTPRejectionSampler, BuildsRejectCatchupWithAcceptedStatePrefix)

@@ -19,6 +19,7 @@
 
 namespace llaminar2
 {
+    class PhysicalMemoryAllocationLease;
 
     /**
      * @brief GPU-resident prepared embedding weights
@@ -28,6 +29,25 @@ namespace llaminar2
      */
     struct PreparedEmbeddingWeights
     {
+        /**
+         * @brief Compute the exact backing allocation for an embedding shard.
+         * @param vocab_size Number of rows resident in this shard.
+         * @param d_model Logical embedding width.
+         * @return Checked bytes occupied by the universal EmbedQ8 layout.
+         */
+        [[nodiscard]] static size_t allocationBytes(
+            size_t vocab_size,
+            int d_model);
+
+        /**
+         * @brief Bind the allocation's sole live physical-memory claim.
+         * @param lease Exact claim acquired before `device_data` allocation.
+         * @throws std::invalid_argument for an invalid or size-mismatched claim.
+         * @throws std::logic_error when a claim is already installed.
+         */
+        void bindPhysicalMemoryLease(
+            PhysicalMemoryAllocationLease lease);
+
         void *device_data = nullptr; ///< GPU pointer to EmbedQ8Block array
         size_t byte_size = 0;        ///< Total bytes allocated on device
         size_t blocks_per_row = 0;   ///< EmbedQ8 blocks per vocabulary entry
@@ -40,11 +60,19 @@ namespace llaminar2
         ~PreparedEmbeddingWeights();
 
         // Non-copyable, movable
-        PreparedEmbeddingWeights() = default;
+        PreparedEmbeddingWeights();
         PreparedEmbeddingWeights(const PreparedEmbeddingWeights &) = delete;
         PreparedEmbeddingWeights &operator=(const PreparedEmbeddingWeights &) = delete;
         PreparedEmbeddingWeights(PreparedEmbeddingWeights &&other) noexcept;
         PreparedEmbeddingWeights &operator=(PreparedEmbeddingWeights &&other) noexcept;
+
+    private:
+        /** Ledger claim released only after the matching backing allocation. */
+        std::unique_ptr<PhysicalMemoryAllocationLease>
+            physical_memory_lease_;
+
+        /** @brief Free owned storage while preserving noexcept teardown. */
+        void releaseDeviceData() noexcept;
     };
 
     /**

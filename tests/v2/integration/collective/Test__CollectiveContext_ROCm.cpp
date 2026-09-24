@@ -24,6 +24,7 @@
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/Logger.h"
+#include "../../utils/ObservedCollectiveInventory.h"
 
 #include <iostream>
 #include <cmath>
@@ -44,9 +45,11 @@ namespace llaminar2
     // process exit (not between tests).
     // =========================================================================
 
+    /** @brief Real-device collective fixture backed by canonical hardware observation. */
     class CollectiveContextROCmTest : public ::testing::Test
     {
     protected:
+        /** @brief Require the suite's real backend before constructing participants. */
         void SetUp() override
         {
             auto *rocm_backend = getROCmBackend();
@@ -70,6 +73,7 @@ namespace llaminar2
             }
         }
 
+        /** @brief Join the fixture's device work before releasing test resources. */
         void TearDown() override
         {
             auto *rocm_backend = getROCmBackend();
@@ -114,59 +118,16 @@ namespace llaminar2
         int rocm_count_ = 0;
 
     private:
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildROCmInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *rocm_backend = getROCmBackend();
-            if (rocm_backend != nullptr)
-            {
-                for (int i = 0; i < rocm_count_; ++i)
-                {
-                    DeviceInfo gpu;
-                    gpu.type = DeviceType::ROCm;
-                    gpu.local_device_id = i;
-                    gpu.memory_bytes = rocm_backend->deviceMemoryTotal(i);
-                    gpu.name = rocm_backend->deviceName(i);
-                    rank_inv.gpus.push_back(gpu);
-                }
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(0, rocm_count_);
         }
 
+        /** @return Selected real participants, with canonical UUID/P2P evidence. */
         ClusterInventory buildSingleROCmInventory()
         {
-            ClusterInventory inv;
-            RankInventory rank_inv;
-            rank_inv.rank = 0;
-            rank_inv.node_id = 0;
-            rank_inv.local_rank = 0;
-            rank_inv.hostname = "localhost";
-
-            auto *rocm_backend = getROCmBackend();
-            if (rocm_backend != nullptr && rocm_count_ > 0)
-            {
-                DeviceInfo gpu;
-                gpu.type = DeviceType::ROCm;
-                gpu.local_device_id = 0;
-                gpu.memory_bytes = rocm_backend->deviceMemoryTotal(0);
-                gpu.name = rocm_backend->deviceName(0);
-                rank_inv.gpus.push_back(gpu);
-            }
-
-            inv.ranks.push_back(rank_inv);
-            inv.world_size = 1;
-            inv.buildNodeAggregations();
-            return inv;
+            return test::observedLocalCollectiveInventory(0, 1);
         }
 
         // Static context caching - RCCL communicators live for the process lifetime
@@ -196,7 +157,7 @@ namespace llaminar2
     // AllReduce
     // =========================================================================
 
-    TEST_F(CollectiveContextROCmTest, AllReduce)
+    TEST_F(CollectiveContextROCmTest, RejectsHostAllReduceRoutedAsROCm)
     {
         auto *ctx = getSingleROCmContext();
         ASSERT_NE(ctx, nullptr);
@@ -204,69 +165,43 @@ namespace llaminar2
         constexpr size_t TENSOR_SIZE = 64;
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
 
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
         DeviceId rocm_device = DeviceId::rocm(0);
-        bool result = ctx->executeAllreduce(tensor.get(), TENSOR_SIZE, rocm_device);
-        EXPECT_TRUE(result) << "AllReduce on ROCm device routing failed";
-
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FALSE(std::isnan(result_data[i])) << "NaN at index " << i;
-            EXPECT_FALSE(std::isinf(result_data[i])) << "Inf at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeAllreduce(
+                tensor.get(), TENSOR_SIZE, rocm_device),
+            std::invalid_argument);
     }
 
     // =========================================================================
     // AllGather
     // =========================================================================
 
-    TEST_F(CollectiveContextROCmTest, AllGather)
+    TEST_F(CollectiveContextROCmTest, RejectsHostAllGatherRoutedAsROCm)
     {
         auto *ctx = getROCmContext();
         ASSERT_NE(ctx, nullptr);
 
         constexpr size_t TENSOR_SIZE = 8;
-        const size_t num_devices = ctx->localDevices().size();
-
         auto local_input = std::make_unique<FP32Tensor>(
             std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
         auto full_output = std::make_unique<FP32Tensor>(
-            std::vector<size_t>{TENSOR_SIZE * num_devices}, DeviceId::cpu());
-
-        float *input_data = local_input->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            input_data[i] = static_cast<float>(i + 1);
-        }
-
-        float *output_data = full_output->mutable_data();
-        std::fill(output_data, output_data + TENSOR_SIZE * num_devices, 0.0f);
+            std::vector<size_t>{TENSOR_SIZE * 2}, DeviceId::cpu());
 
         DeviceId rocm_device = DeviceId::rocm(0);
-        bool result = ctx->executeAllgather(
-            local_input.get(), full_output.get(), TENSOR_SIZE, rocm_device);
-        EXPECT_TRUE(result) << "AllGather on ROCm device routing failed";
-
-        const float *result_data = full_output->data();
-        for (size_t i = 0; i < TENSOR_SIZE * num_devices; ++i)
-        {
-            EXPECT_FALSE(std::isnan(result_data[i])) << "NaN at index " << i;
-            EXPECT_FALSE(std::isinf(result_data[i])) << "Inf at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeAllgather(
+                local_input.get(),
+                full_output.get(),
+                TENSOR_SIZE,
+                rocm_device),
+            std::invalid_argument);
     }
 
     // =========================================================================
     // Broadcast
     // =========================================================================
 
-    TEST_F(CollectiveContextROCmTest, Broadcast)
+    TEST_F(CollectiveContextROCmTest, RejectsHostBroadcastRoutedAsROCm)
     {
         auto *ctx = getROCmContext();
         ASSERT_NE(ctx, nullptr);
@@ -274,23 +209,11 @@ namespace llaminar2
         constexpr size_t TENSOR_SIZE = 64;
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{TENSOR_SIZE}, DeviceId::cpu());
 
-        float *data = tensor->mutable_data();
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            data[i] = static_cast<float>(i + 1);
-        }
-
         DeviceId rocm_device = DeviceId::rocm(0);
-        bool result = ctx->executeBroadcast(tensor.get(), TENSOR_SIZE, 0, rocm_device);
-        EXPECT_TRUE(result) << "Broadcast on ROCm device routing failed";
-
-        const float *result_data = tensor->data();
-        ASSERT_NE(result_data, nullptr);
-        for (size_t i = 0; i < TENSOR_SIZE; ++i)
-        {
-            EXPECT_FLOAT_EQ(result_data[i], static_cast<float>(i + 1))
-                << "Data mismatch at index " << i;
-        }
+        EXPECT_THROW(
+            ctx->executeBroadcast(
+                tensor.get(), TENSOR_SIZE, 0, rocm_device),
+            std::invalid_argument);
     }
 
 } // namespace llaminar2

@@ -91,7 +91,7 @@ ctest --test-dir build_v2 -L "Kernels" -L "Parity"
 ## Requirements
 
 - **PyTorch tests**: Require pre-generated snapshots and ZLIB for .npz loading
-- **MPI tests**: Require ENABLE_PIPELINE_SNAPSHOTS (Debug or E2ERelease build)
+- **MPI tests**: Require ENABLE_PIPELINE_SNAPSHOTS (Debug or Integration build)
 - **Kernel tests**: Run standalone, no model or special build flags required
 
 ## Key Findings (2025-12-25)

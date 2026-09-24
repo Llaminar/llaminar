@@ -181,7 +181,8 @@ protected:
 
     /**
      * Run attention with raw Q16_1 tensors (fused path).
-     * The kernel should detect Q16_1 native_type and dispatch to compute_decode_q16kv.
+     * The kernel should detect Q16_1 native_type and dispatch to the unified
+     * native-Q16 VNNI scheduler used by decode, grouped verification, and prefill.
      */
     std::vector<float> runFusedQ16Path(
         FP32Tensor *Q,

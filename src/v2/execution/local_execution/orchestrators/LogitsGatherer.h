@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -20,6 +21,20 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Logical model phase that produced the main logits tensor.
+     *
+     * The phase is deliberately independent of the physical row count. A
+     * one-token request prefill is still prefill, while ordinary M=1 decode is
+     * decode. Keeping this distinction typed prevents gather policy from being
+     * inferred from `seq_len == 1`, which is not a valid lifecycle boundary.
+     */
+    enum class LogitsForwardPhase : uint8_t
+    {
+        Prefill,
+        Decode,
+    };
 
     class TensorBase;
     class IBackend;
@@ -71,9 +86,9 @@ namespace llaminar2
         /**
          * @brief Pin the combined logits buffer for DMA transfer.
          *
-         * Page-locks the buffer memory via the GPU backend, enabling zero-copy
-         * DMA without internal staging buffers (~50-100µs savings per D2H).
-         * Call once after construction with a GPU device.
+         * Page-locks the decode-sized prefix of the buffer via the GPU backend,
+         * enabling fast single-row DMA without registering the full max-context
+         * logits arena. Call once after construction with a GPU device.
          *
          * @param device GPU device to pin for
          */
@@ -103,8 +118,7 @@ namespace llaminar2
          * @brief Gather already-resolved local logits shards into the combined buffer.
          *
          * This is used for logits surfaces that are not the main LOGITS_LOCAL buffer,
-         * such as MTP sidecar logits. The copy semantics and CPU/GPU fallbacks are
-         * identical to gather().
+         * such as MTP sidecar logits. The copy semantics are identical to gather().
          */
         bool gatherLocalInfos(const std::vector<LogitsLocalInfo> &device_infos,
                               size_t seq_len,
@@ -114,19 +128,26 @@ namespace llaminar2
          * @brief Copy logits from a PP stage runner into the combined buffer.
          *
          * @param stage_runner The stage runner with logits
-         * @param fallback_copy_elements Fallback element count if no prior gather size
+         * @param copy_elements_hint Explicit element count when the caller already
+         *                           knows the PP-stage logits width; 0 means copy
+         *                           one full stage vocabulary row.
          * @param batch_size Batch size for buffer allocation
          * @param max_seq_len Max sequence length for buffer allocation
          */
         void copyFromStage(const IInferenceRunner &stage_runner,
-                           size_t fallback_copy_elements,
+                           size_t copy_elements_hint,
                            int batch_size, int max_seq_len);
 
         // =========================================================================
         // Access
         // =========================================================================
 
-        /// Get combined logits data pointer (may be nullptr if not allocated)
+        /**
+         * @brief Get the most recently gathered host logits.
+         *
+         * @return The host buffer only while it contains current gathered data;
+         *         nullptr before the first gather or after invalidate().
+         */
         const float *data() const;
 
         /// Get mutable data pointer for direct writes
@@ -141,6 +162,16 @@ namespace llaminar2
         /// Actual size of the last gather/copy operation
         size_t lastGatheredSize() const { return last_gathered_size_; }
 
+        /**
+         * @brief Invalidate host-visible data before a new forward transaction.
+         *
+         * Allocation lifetime and data lifetime are intentionally separate.
+         * The persistent allocation may be reused, but an old request's logits
+         * must never remain observable while the new device forward is pending
+         * or when host gathering is disabled.
+         */
+        void invalidate() noexcept { last_gathered_size_ = 0; }
+
         // =========================================================================
         // Skip-gather control
         // =========================================================================
@@ -151,21 +182,46 @@ namespace llaminar2
         bool skipPrefill() const { return skip_prefill_; }
 
         /**
-         * @brief Determine if a gather is needed for the given sequence length.
+         * @brief Determine if a gather is enabled for the typed forward phase.
          *
-         * @param seq_len Current sequence length
+         * @param phase Logical phase selected by the forward entry point.
          * @return true if logits need to be gathered
          */
-        bool needsGather(size_t seq_len) const;
+        bool needsGather(LogitsForwardPhase phase) const;
 
     private:
         /// @brief Resolve a backend through the injected test resolver or global BackendManager.
         IBackend *resolveBackend(DeviceId device) const;
 
+        /**
+         * @brief Copy one local-logits span through its declared ownership path.
+         *
+         * GPU spans require a device pointer, a resolvable backend, and the
+         * explicit stream returned by a consuming runner API. Missing metadata
+         * or failed DMA is fatal to the gather; this method never falls through
+         * to TensorBase::data() for a GPU tensor. CPU spans are copied directly
+         * from their host-resident tensor.
+         *
+         * @param dst Host destination.
+         * @param src Source pointer for this span. For GPU data this may point
+         *        at a row within info.gpu_ptr.
+         * @param bytes Number of bytes to copy.
+         * @param info Ownership and stream metadata for the source tensor.
+         * @param fast Whether the backend's validated hot D2H path may be used.
+         * @return true after a complete copy; false on any contract violation.
+         */
+        bool copyLocalSpanToHost(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            const LogitsLocalInfo &info,
+            bool fast) const;
+
         std::unique_ptr<TensorBase> buffer_;
+        size_t vocab_size_ = 0;
         BackendResolver backend_resolver_ = nullptr; ///< Optional test hook for backend selection.
         bool pinned_ = false;
-        DeviceType pinned_device_type_ = DeviceType::CPU; ///< Backend type used for pinning (for correct unpin)
+        DeviceId pinned_device_ = DeviceId::invalid(); ///< Exact backend/device registration owner.
         bool skip_decode_ = false;
         bool skip_prefill_ = false;
         size_t last_gathered_size_ = 0;

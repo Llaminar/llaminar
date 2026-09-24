@@ -5,6 +5,7 @@
 #include "tensors/TensorClasses.h"
 #include "tensors/TensorType.h"
 #include "tensors/VnniPackContext.h"
+#include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
@@ -14,7 +15,7 @@ namespace llaminar2::cuda
 {
     extern "C"
     {
-        void cudaQuantGemm_freeDevice(void *d_ptr);
+        void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
     namespace
@@ -82,8 +83,13 @@ namespace llaminar2::cuda
             {
                 out.native_emins.assign(static_cast<size_t>(blocks_per_row) * N, uint32_t{0});
             }
-            out.native_codebook_id = info->codebook_id;
+            out.native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
             out.native_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+            out.native_source_identity = {
+                .codebook_id = info->codebook_id,
+                .is_superblock = info->is_superblock,
+                .present = true,
+            };
 
             VnniPackContext ctx{};
             ctx.raw_bytes = nullptr;
@@ -101,7 +107,7 @@ namespace llaminar2::cuda
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    quant_accessor->packVnniBlock(ctx, n, b);
+                    quant_accessor->packVnniBlock(ctx, n, n, b);
                 }
             }
 
@@ -111,36 +117,28 @@ namespace llaminar2::cuda
 
     CUDAPackedWeights::~CUDAPackedWeights()
     {
-        // Free row-major transpose (per-weight, used by ROWPAR GEMV)
-        if (rowmajor_)
-        {
-            cudaRowMajorWeights_destroy(rowmajor_);
-            rowmajor_ = nullptr;
-        }
-
         for (auto &[device_id, upload] : device_uploads)
         {
-            (void)device_id;
             if (upload.d_native_vnni)
-                cudaQuantGemm_freeDevice(upload.d_native_vnni);
+                cudaQuantGemm_freeDevice(upload.d_native_vnni, device_id);
             if (upload.d_native_scales)
-                cudaQuantGemm_freeDevice(upload.d_native_scales);
+                cudaQuantGemm_freeDevice(upload.d_native_scales, device_id);
             if (upload.d_native_mins)
-                cudaQuantGemm_freeDevice(upload.d_native_mins);
+                cudaQuantGemm_freeDevice(upload.d_native_mins, device_id);
             if (upload.d_native_emins)
-                cudaQuantGemm_freeDevice(upload.d_native_emins);
+                cudaQuantGemm_freeDevice(upload.d_native_emins, device_id);
         }
 
         if (device_uploads.empty())
         {
             if (d_native_vnni)
-                cudaQuantGemm_freeDevice(d_native_vnni);
+                cudaQuantGemm_freeDevice(d_native_vnni, cuda_device_id);
             if (d_native_scales)
-                cudaQuantGemm_freeDevice(d_native_scales);
+                cudaQuantGemm_freeDevice(d_native_scales, cuda_device_id);
             if (d_native_mins)
-                cudaQuantGemm_freeDevice(d_native_mins);
+                cudaQuantGemm_freeDevice(d_native_mins, cuda_device_id);
             if (d_native_emins)
-                cudaQuantGemm_freeDevice(d_native_emins);
+                cudaQuantGemm_freeDevice(d_native_emins, cuda_device_id);
         }
     }
 
@@ -176,6 +174,7 @@ namespace llaminar2::cuda
         out.native_emins.clear();
         out.native_codebook_id = 0;
         out.native_blocks_per_row = 0;
+        out.native_source_identity = {};
 
         const int N = static_cast<int>(tensor->rows());
         const int K = static_cast<int>(tensor->cols());
@@ -212,22 +211,21 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
-        void cudaQuantGemm_freeDevice(void *d_ptr);
+        void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
     MoEBatchPackedWeightsCUDA::~MoEBatchPackedWeightsCUDA()
     {
         for (auto &[device_id, upload] : device_uploads)
         {
-            (void)device_id;
             if (upload.d_vnni)
-                cudaQuantGemm_freeDevice(upload.d_vnni);
+                cudaQuantGemm_freeDevice(upload.d_vnni, device_id);
             if (upload.d_scales)
-                cudaQuantGemm_freeDevice(upload.d_scales);
+                cudaQuantGemm_freeDevice(upload.d_scales, device_id);
             if (upload.d_mins)
-                cudaQuantGemm_freeDevice(upload.d_mins);
+                cudaQuantGemm_freeDevice(upload.d_mins, device_id);
             if (upload.d_emins)
-                cudaQuantGemm_freeDevice(upload.d_emins);
+                cudaQuantGemm_freeDevice(upload.d_emins, device_id);
         }
     }
 
@@ -260,10 +258,10 @@ namespace llaminar2::cuda
             !uploadArray(all_mins, &upload.d_mins) ||
             !uploadArray(all_emins, &upload.d_emins))
         {
-            if (upload.d_vnni) cudaQuantGemm_freeDevice(upload.d_vnni);
-            if (upload.d_scales) cudaQuantGemm_freeDevice(upload.d_scales);
-            if (upload.d_mins) cudaQuantGemm_freeDevice(upload.d_mins);
-            if (upload.d_emins) cudaQuantGemm_freeDevice(upload.d_emins);
+            if (upload.d_vnni) cudaQuantGemm_freeDevice(upload.d_vnni, cuda_device_id);
+            if (upload.d_scales) cudaQuantGemm_freeDevice(upload.d_scales, cuda_device_id);
+            if (upload.d_mins) cudaQuantGemm_freeDevice(upload.d_mins, cuda_device_id);
+            if (upload.d_emins) cudaQuantGemm_freeDevice(upload.d_emins, cuda_device_id);
             return false;
         }
 
@@ -346,7 +344,7 @@ namespace llaminar2::cuda
         batch->rows_per_expert = rows_per_expert;
         batch->K = K;
         batch->blocks_per_row = blocks_per_row;
-        batch->codebook_id = info->codebook_id;
+        batch->codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
 
         // Per-expert sizes
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
@@ -392,7 +390,7 @@ namespace llaminar2::cuda
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    eq->packVnniBlock(ctx, n, b);
+                    eq->packVnniBlock(ctx, n, n, b);
                 }
             }
         }

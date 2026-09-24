@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -36,6 +37,7 @@ namespace llaminar2
 
         size_t end() const { return start + count; }
         bool empty() const { return count == 0; }
+        constexpr bool operator==(const SliceSpec &) const noexcept = default;
     };
 
     /**
@@ -46,13 +48,13 @@ namespace llaminar2
      */
     struct FusedQKVSliceResult
     {
-        SliceSpec q;               ///< Q sub-block slice
-        SliceSpec k;               ///< K sub-block slice
-        SliceSpec v;               ///< V sub-block slice
-        size_t q_total = 0;        ///< Total Q rows in original weight
-        size_t k_total = 0;        ///< Total K rows in original weight
-        size_t v_total = 0;        ///< Total V rows in original weight
-        bool replicate_qk = false; ///< GDN: Q and K are replicated, only V sharded
+        SliceSpec q;                    ///< Q sub-block slice.
+        SliceSpec k;                    ///< K sub-block slice.
+        std::vector<SliceSpec> v;       ///< V slices in participant-local packed order.
+        size_t q_total = 0;             ///< Total Q rows in original weight.
+        size_t k_total = 0;             ///< Total K rows in original weight.
+        size_t v_total = 0;             ///< Total V rows in original weight.
+        bool modulo_linked_gdn = false; ///< Whether V spans use modulo-linked GDN ownership.
     };
 
     /**
@@ -134,7 +136,10 @@ namespace llaminar2
         /**
          * @brief Compute fused QKV sub-block aware slicing for a device assignment
          *
-         * Like computeFusedQKVSlice but uses DeviceShardingAssignment instead of rank/ws.
+         * Unlike the rank/world overload, this method admits uneven TP widths
+         * by consuming the exact query- and KV-head ranges selected by
+         * TensorParallelConfig.  Replicated GQA KV ranges remain full slices;
+         * modulo-linked GDN returns every dependency-closed value span.
          *
          * @param name Weight tensor name
          * @param total_rows Total rows in the fused weight

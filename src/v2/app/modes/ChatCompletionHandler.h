@@ -7,6 +7,11 @@
  *
  * Supports both non-streaming and SSE streaming responses with
  * reasoning_content extraction for thinking models.
+ * Non-streaming callers may request exact prompt/completion token IDs. These
+ * are observations of ordinary committed runner output, not model snapshots
+ * or a separate inference path, and remain independent of text framing.
+ * Optional runtime JSON also projects the placement owner's completed,
+ * model-lifetime movement ledger without polling or joining maintenance.
  */
 
 #pragma once
@@ -49,6 +54,52 @@ namespace llaminar2
         bool dry_sequence_breakers{false};
     };
 
+    /** @brief Optional response representation; never changes sampling or execution. */
+    enum class CompletionTokenOutput
+    {
+        TextOnly,       ///< Standard HTTP response with no token-vector storage.
+        TextAndIds,     ///< Non-streaming terminal response includes exact token IDs.
+    };
+
+    /** @brief Optional completed-request observations; never a live-state probe. */
+    enum class CompletionRuntimeOutput
+    {
+        Omit,    ///< Standard response; no runtime-summary JSON.
+        Include, ///< Non-streaming response includes terminal summary and passive lifetime movement evidence.
+    };
+
+    /** @brief Validated OpenAI tool-selection policy for one request. */
+    enum class ToolChoiceMode
+    {
+        Auto,             ///< Model may answer or call any admitted tool.
+        None,             ///< Tools are not exposed and generated markers remain text.
+        Required,         ///< Model must call at least one admitted tool.
+        SpecificFunction, ///< Model must call the named admitted function.
+    };
+
+    /**
+     * @brief Typed tool-selection policy; invalid JSON never reaches inference.
+     *
+     * Keeping this typed avoids reinterpreting a raw JSON union independently
+     * during prompt construction, streaming, and terminal response parsing.
+     */
+    struct ToolChoicePolicy
+    {
+        ToolChoiceMode mode{ToolChoiceMode::Auto};
+        std::string function_name; ///< Populated only for SpecificFunction.
+
+        /** @brief Whether generated tool calls are admitted for this request. */
+        bool permitsCalls() const { return mode != ToolChoiceMode::None; }
+
+        /** @brief Whether the prompt must require a tool invocation. */
+        bool requiresCall() const
+        {
+            return mode == ToolChoiceMode::Required ||
+                   mode == ToolChoiceMode::SpecificFunction;
+        }
+    };
+
+    /** @brief Validated immutable request policy consumed by the serving handler. */
     struct ChatCompletionRequest
     {
         std::vector<ChatMessage> messages;
@@ -58,6 +109,10 @@ namespace llaminar2
         SamplingParams sampling;
         SamplingOverrides sampling_set;  ///< Per-field "user specified" flags
         bool stream{false};         ///< If true, use SSE streaming response
+        CompletionTokenOutput token_output{CompletionTokenOutput::TextOnly};
+                                   ///< Requested terminal representation, independent of model state.
+        CompletionRuntimeOutput runtime_output{CompletionRuntimeOutput::Omit};
+                                   ///< Optional immutable outcome, independent of logging/PerfStats.
         bool enable_thinking{true}; ///< If true, enable thinking mode for thinking models
         std::string model;          ///< Model identifier from request (optional)
 
@@ -74,9 +129,8 @@ namespace llaminar2
         /// JSON array of {type: "function", function: {name, description, parameters}}.
         nlohmann::json tools;
 
-        /// Tool choice control: "none", "auto", "required", or
-        /// {"type": "function", "function": {"name": "..."}} to force a specific tool.
-        nlohmann::json tool_choice;
+        /// Validated tool choice control; raw request JSON is not retained.
+        ToolChoicePolicy tool_choice;
 
         /// Allow model to call multiple tools in a single response.
         bool parallel_tool_calls{false};
@@ -100,12 +154,14 @@ namespace llaminar2
      *
      * During streaming, tokens are emitted one at a time. This class tracks whether
      * we're inside a <think> block and buffers partial end-tag matches to avoid
-     * splitting tags across chunks.
+     * splitting tags across chunks. This is a field-framing authority only:
+     * reasoning delimiters never terminate generation, including when the model
+     * emits a natural close after a budget-injected close.
      */
     class StreamingThinkSplitter
     {
     public:
-        /// Construct with the thinking end tag (e.g., "</think>")
+        /** @brief Start the reasoning phase with the model's exact closing marker. */
         explicit StreamingThinkSplitter(const std::string &end_tag);
 
         /// Construct a no-op splitter (no thinking support)
@@ -117,27 +173,34 @@ namespace llaminar2
         {
             std::string field; ///< "reasoning_content" or "content"
             std::string text;  ///< Text to emit (may be empty if buffering)
-            /**
-             * @brief True when a structural thinking marker was seen after
-             *        the reasoning block had already been closed.
-             *
-             * Thinking tags are protocol markers, not user-visible answer
-             * text.  A second end tag means generation has entered a malformed
-             * answer loop, so callers should stop without emitting the tag.
-             */
-            bool stop_generation{false};
         };
+        /** @brief Consume one tokenizer piece, retaining a possible partial marker. */
         SplitResult process(const std::string &token_text);
 
         /// Flush any buffered partial tag match (call at end of generation)
         SplitResult flush();
 
         /// Whether we're currently in the thinking phase
-        bool inThinking() const { return in_thinking_; }
+        bool inThinking() const { return phase_ == Phase::Reasoning; }
 
     private:
+        /** @brief The same reasoning/answer lifecycle governs HTTP and SSE output. */
+        enum class Phase
+        {
+            Reasoning,      ///< Before the first complete close marker.
+            AwaitingAnswer, ///< Closed reasoning, but no visible answer yet.
+            Content,        ///< Answer text has begun (or reasoning is disabled).
+        };
+
+        /**
+         * @brief Drain answer text without exposing structural closing markers.
+         * @param terminal True only when flushing the final buffered fragment.
+         * @return Content with complete structural markers removed, never a stop decision.
+         */
+        SplitResult drainContent(bool terminal);
+
         std::string end_tag_;
-        bool in_thinking_{true}; ///< Start in thinking mode (model begins with <think>)
+        Phase phase_{Phase::Reasoning}; ///< Single authority for output transitions.
         std::string buffer_;     ///< Buffer for partial end-tag matches
     };
 
@@ -150,6 +213,16 @@ namespace llaminar2
     class ChatCompletionHandler
     {
     public:
+        /**
+         * @brief Maximum committed tokens between streaming publications.
+         *
+         * This spans the widest supported MTP transaction (depth 15 plus its
+         * target row), so streaming never clips useful speculative work. Each
+         * window executes the same complete retained production graph and
+         * preserves its device-owned continuation for the following window.
+         */
+        static constexpr int kStreamingPublicationWindowTokens = 16;
+
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
                               const std::string &model_name = "");
 

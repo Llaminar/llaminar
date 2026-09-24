@@ -294,13 +294,24 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
     throw std::runtime_error("Unknown (built-in) filter '" + name + "' for type " + input->type());
 }
 
-value filter_expression::execute_impl(context & ctx) {
-    value input = operand ? operand->execute(ctx) : val;
-
+/**
+ * Apply one parsed filter node without taking ownership of the AST.
+ *
+ * A compiled template is immutable model-lifetime state.  In particular, a
+ * filter block must not move its filter node into a temporary expression and
+ * then try to restore it: an exception between those operations permanently
+ * damages the program and forces callers to parse the template per request.
+ * Keeping the node borrowed also makes concurrent executions independent;
+ * every mutable value remains in the request-local context.
+ */
+static value apply_filter(context & ctx, value input, statement * filter) {
+    if (filter == nullptr) {
+        throw std::runtime_error("Filter AST node is missing");
+    }
     JJ_DEBUG("Applying filter to %s", input->type().c_str());
 
-    if (is_stmt<identifier>(filter)) {
-        auto filter_id = cast_stmt<identifier>(filter)->val;
+    if (const auto * identifier_filter = dynamic_cast<const identifier *>(filter)) {
+        auto filter_id = identifier_filter->val;
 
         if (filter_id == "trim") {
             filter_id = "strip"; // alias
@@ -321,12 +332,12 @@ value filter_expression::execute_impl(context & ctx) {
         }
         return try_builtin_func(ctx, filter_id, input)->invoke(func_args(ctx));
 
-    } else if (is_stmt<call_expression>(filter)) {
-        auto call = cast_stmt<call_expression>(filter);
-        if (!is_stmt<identifier>(call->callee)) {
+    } else if (const auto * call = dynamic_cast<const call_expression *>(filter)) {
+        const auto * callee = dynamic_cast<const identifier *>(call->callee.get());
+        if (callee == nullptr) {
             throw std::runtime_error("Filter callee must be an identifier");
         }
-        auto filter_id = cast_stmt<identifier>(call->callee)->val;
+        auto filter_id = callee->val;
 
         if (filter_id == "trim") {
             filter_id = "strip"; // alias
@@ -344,6 +355,11 @@ value filter_expression::execute_impl(context & ctx) {
     }
 }
 
+value filter_expression::execute_impl(context & ctx) {
+    value input = operand ? operand->execute(ctx) : val;
+    return apply_filter(ctx, std::move(input), filter.get());
+}
+
 value filter_statement::execute_impl(context & ctx) {
     // eval body as string, then apply filter
     auto body_val = exec_statements(body, ctx);
@@ -351,12 +367,7 @@ value filter_statement::execute_impl(context & ctx) {
     gather_string_parts_recursive(body_val, parts);
 
     JJ_DEBUG("FilterStatement: applying filter to body string of length %zu", parts->val_str.length());
-    filter_expression filter_expr(std::move(parts), std::move(filter));
-    value out = filter_expr.execute(ctx);
-
-    // this node can be reused later, make sure filter is preserved
-    this->filter = std::move(filter_expr.filter);
-    return out;
+    return apply_filter(ctx, std::move(parts), filter.get());
 }
 
 value test_expression::execute_impl(context & ctx) {

@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "GDNDeviceStateBinding.h"
+#include "HybridGDNStateGeometry.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -40,8 +42,14 @@ namespace llaminar2
      * - Recurrence state: delta-rule S matrix, updated in-place each step
      * - Conv state: causal convolution sliding window of (kernel-1) tokens
      *
-     * Always stored in FP32. The --kv-cache-precision flag has no effect
-     * on GDN state precision.
+     * CPU backends store the live state in the FP32 vectors below. GPU
+     * backends leave those vectors empty and keep the only live copies in the
+     * short-convolution and recurrence kernel objects. The explicit element
+     * counts describe the participant-local bank without requiring a host
+     * allocation, which prevents graph construction from accidentally treating
+     * a stale host vector as authoritative GPU state.
+     *
+     * The --kv-cache-precision flag has no effect on GDN state precision.
      */
     struct HybridGDNLayerState
     {
@@ -51,30 +59,89 @@ namespace llaminar2
         int d_v = 0;       ///< Value dimension per head
         int conv_kernel_size = 0;
 
-        /// Recurrence state S: [n_v_heads, d_k, d_v] (FP32)
+        /// Participant-local recurrence bank size in FP32 elements.
+        int local_recurrence_state_size = 0;
+
+        /// Participant-local short-convolution bank size in FP32 elements.
+        int local_conv_state_size = 0;
+
+        /**
+         * @brief Full decode-bank recurrence size in FP32 elements.
+         *
+         * Tensor-parallel GDN execution can keep two GPU-resident state banks:
+         * the local bank used by suffix prefill and the full bank used by
+         * decode. The host recurrence_state vector deliberately stores the
+         * local logical state, so the full size must be tracked separately
+         * instead of inferred from whichever GPU bank is currently active.
+         */
+        int full_recurrence_state_size = 0;
+
+        /**
+         * @brief Full decode-bank short-conv size in FP32 elements.
+         *
+         * This is the qkv_dim_full * (kernel_size - 1) shape captured in
+         * prefix payload device sections. Keeping it explicit lets restore
+         * paths allocate and import the full bank even when the target cache is
+         * fresh and only has the local bank resident.
+         */
+        int full_conv_state_size = 0;
+
+        /// CPU-owned recurrence state S: [n_v_heads, d_k, d_v] (FP32).
+        /// GPU caches deliberately leave this vector empty.
         std::vector<float> recurrence_state;
 
-        /// Short convolution state: [qkv_dim, conv_kernel-1] (FP32)
+        /// CPU-owned short-convolution state: [qkv_dim, kernel-1] (FP32).
+        /// GPU caches deliberately leave this vector empty.
         std::vector<float> conv_state;
 
         /// Kernel instances for this layer (owned by the cache)
         std::shared_ptr<ITensorShortConvolution> conv_kernel;
         std::shared_ptr<ITensorGatedDeltaNet> rec_kernel;
 
-        /// Initialize (zero-fill) all state
-        void initialize(int qkv_dim)
-        {
-            const size_t s_size = static_cast<size_t>(n_v_heads) *
-                                  static_cast<size_t>(d_k) *
-                                  static_cast<size_t>(d_v);
-            recurrence_state.assign(s_size, 0.0f);
+        /**
+         * @brief Cache-owned device slices bound into the short-conv kernel.
+         *
+         * CPU caches leave this empty. CUDA and ROCm caches populate it from
+         * HybridGDNDeviceStateArena before KernelFactory creates the kernel.
+         */
+        GDNDeviceStateBinding conv_device_state;
 
-            if (conv_kernel_size > 1)
-            {
-                const size_t c_size = static_cast<size_t>(qkv_dim) *
-                                      static_cast<size_t>(conv_kernel_size - 1);
-                conv_state.assign(c_size, 0.0f);
-            }
+        /**
+         * @brief Cache-owned device slices bound into the recurrence kernel.
+         */
+        GDNDeviceStateBinding recurrence_device_state;
+
+        /**
+         * @brief Initialize the CPU-owned live state vectors.
+         *
+         * GPU caches must call @ref initializeShape instead and let their
+         * backend kernels allocate the live device banks.
+         */
+        void initializeCPUState(int qkv_dim)
+        {
+            initializeShape(qkv_dim);
+            recurrence_state.assign(
+                static_cast<size_t>(local_recurrence_state_size), 0.0f);
+
+            conv_state.assign(
+                static_cast<size_t>(local_conv_state_size), 0.0f);
+        }
+
+        /**
+         * @brief Record local bank dimensions without allocating host storage.
+         *
+         * This is the GPU initialization path. The shape remains available to
+         * graph planning, prefix serialization, and device-bank allocation,
+         * while the empty vectors make accidental host-state adoption visible.
+         */
+        void initializeShape(int qkv_dim)
+        {
+            local_recurrence_state_size = n_v_heads * d_k * d_v;
+            local_conv_state_size = conv_kernel_size > 1
+                                        ? qkv_dim * (conv_kernel_size - 1)
+                                        : 0;
+            recurrence_state.clear();
+            conv_state.clear();
         }
 
         /// Reset host-side state to zero (for new sequence)
@@ -87,12 +154,20 @@ namespace llaminar2
 
         /// Reset GPU-resident kernel state (call after reset() for GPU backends)
         /// Requires full ITensorShortConvolution/ITensorGatedDeltaNet definitions.
-        void resetGPUKernelState();
+        bool resetGPUKernelState(void *stream = nullptr);
 
-        /// Total memory in bytes
-        size_t memoryBytes() const
+        /// Total CPU-owned live-state memory in bytes.
+        size_t cpuMemoryBytes() const
         {
             return (recurrence_state.size() + conv_state.size()) * sizeof(float);
+        }
+
+        /// Participant-local logical state size independent of memory residence.
+        size_t localStateBytes() const
+        {
+            return (static_cast<size_t>(local_recurrence_state_size) +
+                    static_cast<size_t>(local_conv_state_size)) *
+                   sizeof(float);
         }
     };
 
@@ -119,6 +194,9 @@ namespace llaminar2
         int gdn_group_count = 0;      ///< Key head count (ssm.group_count)
         int gdn_time_step_rank = 0;   ///< Value head count (ssm.time_step_rank)
 
+        /// First global attention head owned by this participant.
+        int local_head_start = 0;
+
         /// TP-aware local head count (0 = use full n_heads, no sharding)
         int local_n_heads = 0;
         int n_heads = 0; ///< Total attention head count
@@ -130,6 +208,28 @@ namespace llaminar2
         /// Returns true if this config represents a hybrid model
         bool isHybrid() const { return !layer_types.empty(); }
 
+        /**
+         * @brief Resolve the sole GDN shape used by planning and allocation.
+         *
+         * Keeping physical-memory authority out of this value is deliberate:
+         * model geometry is immutable configuration, whereas the top-level
+         * KV-cache transaction carries the one rank-bound allocation ledger.
+         *
+         * @return Validated local/full state geometry.
+         */
+        [[nodiscard]] HybridGDNStateGeometry gdnStateGeometry() const
+        {
+            return HybridGDNStateGeometry::resolve(
+                n_heads,
+                local_head_start,
+                local_n_heads,
+                gdn_group_count,
+                gdn_time_step_rank,
+                gdn_state_size,
+                gdn_inner_size,
+                gdn_conv_kernel_size);
+        }
+
         /// Count the number of full-attention layers
         int countKVLayers() const
         {
@@ -140,6 +240,12 @@ namespace llaminar2
                     ++count;
             }
             return count;
+        }
+
+        /** @return Number of recurrent/GDN layers in this cache shard. */
+        int countGDNLayers() const
+        {
+            return static_cast<int>(layer_types.size()) - countKVLayers();
         }
     };
 

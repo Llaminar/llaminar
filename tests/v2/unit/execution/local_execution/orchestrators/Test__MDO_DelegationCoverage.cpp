@@ -844,9 +844,10 @@ TEST_F(Test__MDO_DelegationCoverage, SetSkipLogitsGatherDecode_Wiring)
     int token = 42;
     EXPECT_TRUE(mdo->forward(&token, 1));
 
-    // logits() will return primary runner's logits since gather was skipped
-    // and single-device path returns primary logits
-    EXPECT_NE(mdo->logits(), nullptr);
+    // Persistent host storage is not a current publication. Skipping the
+    // gather must invalidate the aggregate instead of exposing one child's
+    // logits or bytes retained from an earlier transaction.
+    EXPECT_EQ(mdo->logits(), nullptr);
 }
 
 TEST_F(Test__MDO_DelegationCoverage, SetSkipLogitsGatherPrefill_Wiring)
@@ -857,7 +858,7 @@ TEST_F(Test__MDO_DelegationCoverage, SetSkipLogitsGatherPrefill_Wiring)
 
     int tokens[] = {1, 2, 3, 4};
     EXPECT_TRUE(mdo->forward(tokens, 4));
-    EXPECT_NE(mdo->logits(), nullptr);
+    EXPECT_EQ(mdo->logits(), nullptr);
 }
 
 // =============================================================================

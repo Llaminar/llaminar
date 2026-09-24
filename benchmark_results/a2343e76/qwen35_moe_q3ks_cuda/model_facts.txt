@@ -1,0 +1,4 @@
+model_path=/opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf
+315cce210c0406ae05c4e482ceba154c9225fa0bb4c9e779465209dec08e625d  /opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf
+size_bytes=15265856128
+llaminar_head=a2343e76

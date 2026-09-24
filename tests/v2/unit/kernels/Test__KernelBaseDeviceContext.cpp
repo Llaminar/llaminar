@@ -5,6 +5,8 @@
  * Tests the Phase 4 GPU Device Context Refactor additions to kernel base classes:
  * - setDeviceContext() / deviceContext() / hasDeviceContext()
  * - getStream() / getBlasHandle() helpers
+ * - context-owned BLAS submission scopes, rejecting incomplete state and
+ *   serializing host API mutation without scheduling or waiting for GPU work.
  *
  * These tests use mock contexts and don't require actual GPU hardware.
  *
@@ -13,6 +15,11 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <type_traits>
+#include <vector>
 #include "kernels/cuda/CUDAKernelBase.h"
 #include "kernels/rocm/ROCmKernelBase.h"
 #include "backends/IWorkerGPUContext.h"
@@ -33,8 +40,13 @@ using namespace llaminar2;
 class MockGPUContext : public IWorkerGPUContext
 {
 public:
-    explicit MockGPUContext(int device_ordinal, bool initialized = true)
-        : device_ordinal_(device_ordinal), initialized_(initialized)
+    explicit MockGPUContext(
+        int device_ordinal,
+        bool initialized = true,
+        bool owns_current_thread = true)
+        : device_ordinal_(device_ordinal),
+          initialized_(initialized),
+          owns_current_thread_(owns_current_thread)
     {
     }
 
@@ -43,20 +55,32 @@ public:
     std::string deviceName() const override { return "MockGPU-" + std::to_string(device_ordinal_); }
     bool isInitialized() const override { return initialized_; }
 
-    // Work Submission (no-op for mock)
-    void submitAndWait(std::function<void()> work) override { work(); }
+    // Work Submission
+    bool ownsCurrentThread() const noexcept override
+    {
+        return owns_current_thread_;
+    }
+
     std::future<void> submitAsync(std::function<void()> work) override
     {
-        work();
-        std::promise<void> p;
-        p.set_value();
-        return p.get_future();
+        ++queued_submission_count_;
+        std::packaged_task<void()> task(std::move(work));
+        auto future = task.get_future();
+        task();
+        return future;
     }
 
     // Stream Access - return mock pointers
     void *defaultStream() override { return mock_stream_; }
     void *createStream() override { return mock_stream_; }
     void destroyStream(void * /*stream*/) override {}
+    void *getOrCreateAuxiliaryStream(const std::string & /*name*/, bool *created = nullptr) override
+    {
+        if (created)
+            *created = false;
+        return mock_auxiliary_stream_;
+    }
+    void resetAuxiliaryStreams() override {}
 
     // Event Access - return mock pointers
     void *createEvent() override { return mock_event_; }
@@ -77,7 +101,15 @@ public:
     // Synchronization
     void synchronize() override {}
     void synchronizeStream(void * /*stream*/) override {}
-    void insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override {}
+    GPUStreamExecutionState queryStreamExecutionState(
+        void *stream,
+        std::string_view boundary) override
+    {
+        if (!stream || boundary.empty())
+            throw std::invalid_argument("mock stream query requires an exact stream and boundary");
+        return GPUStreamExecutionState::Complete;
+    }
+    bool insertStreamDependency(void * /*dependent_stream*/, void * /*dependency_stream*/) override { return true; }
 
     // Graph Capture
     std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
@@ -88,16 +120,106 @@ public:
     void setMockBlasHandle(void *handle) { mock_blas_handle_ = handle; }
     void setMockBlasLtHandle(void *handle) { mock_blas_lt_handle_ = handle; }
     void setInitialized(bool init) { initialized_ = init; }
+    int queuedSubmissionCount() const { return queued_submission_count_; }
 
 private:
     int device_ordinal_;
     bool initialized_;
+    bool owns_current_thread_ = true;
+    int queued_submission_count_ = 0;
     void *mock_stream_ = reinterpret_cast<void *>(0xDEADBEEF);
+    void *mock_auxiliary_stream_ = reinterpret_cast<void *>(0xDEADCAFE);
     void *mock_event_ = reinterpret_cast<void *>(0xCAFEBABE);
     void *mock_blas_handle_ = reinterpret_cast<void *>(0x12345678);
     void *mock_blas_lt_handle_ = reinterpret_cast<void *>(0x87654321);
     void *mock_comm_ = nullptr;
 };
+
+TEST(Test__WorkerGPUContextSubmission, NestedSynchronousWorkExecutesInline)
+{
+    MockGPUContext context(/*device_ordinal=*/0,
+                           /*initialized=*/true,
+                           /*owns_current_thread=*/true);
+    bool ran = false;
+
+    context.submitAndWait([&ran]() { ran = true; });
+
+    EXPECT_TRUE(ran);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+}
+
+/** @brief Incomplete library ownership fails before any backend or queue submission. */
+TEST(Test__WorkerGPUContextSubmission, BlasScopeRejectsIncompleteContext)
+{
+    static_assert(!std::is_copy_constructible_v<GPUBlasSubmission>);
+    static_assert(!std::is_move_constructible_v<GPUBlasSubmission>);
+    MockGPUContext context(0, false);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    context.setInitialized(true);
+    context.setMockBlasHandle(nullptr);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    context.setMockBlasHandle(reinterpret_cast<void *>(1));
+    context.setMockBlasLtHandle(nullptr);
+    EXPECT_THROW((void)context.acquireBlasSubmission(), std::logic_error);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+}
+
+/** @brief Distinct adapters serialize handle mutation at their common context only. */
+TEST(Test__WorkerGPUContextSubmission, BlasScopesSerializeOneContextWithoutWorkerQueue)
+{
+    MockGPUContext context(0);
+    std::atomic<int> active{0};
+    std::atomic<int> overlaps{0};
+    std::atomic<int> calls{0};
+    std::vector<std::thread> submitters;
+    for (int thread = 0; thread < 8; ++thread)
+        submitters.emplace_back([&]
+        {
+            for (int call = 0; call < 256; ++call)
+            {
+                const auto submission = context.acquireBlasSubmission();
+                if (active.fetch_add(1) != 0)
+                    ++overlaps;
+                std::this_thread::yield();
+                --active;
+                ++calls;
+            }
+        });
+    for (auto &thread : submitters)
+        thread.join();
+    EXPECT_EQ(overlaps, 0);
+    EXPECT_EQ(calls, 2048);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+
+    // Different physical devices have independent submission locks. Holding
+    // one cannot prevent another device from scheduling its library work.
+    MockGPUContext other(1);
+    std::future<void> independent;
+    {
+        const auto first = context.acquireBlasSubmission();
+        independent = std::async(std::launch::async, [&]
+        {
+            const auto second = other.acquireBlasSubmission();
+            EXPECT_EQ(second.handle(), other.blasHandle());
+            EXPECT_EQ(second.ltHandle(), other.blasLtHandle());
+        });
+        EXPECT_EQ(independent.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    }
+    independent.get();
+}
+
+TEST(Test__WorkerGPUContextSubmission, ForeignSynchronousWorkUsesQueueAndPropagatesFailure)
+{
+    MockGPUContext context(/*device_ordinal=*/0,
+                           /*initialized=*/true,
+                           /*owns_current_thread=*/false);
+
+    EXPECT_THROW(
+        context.submitAndWait(
+            []() { throw std::runtime_error("worker setup failed"); }),
+        std::runtime_error);
+    EXPECT_EQ(context.queuedSubmissionCount(), 1);
+}
 
 // ============================================================================
 // Test Derived Classes (Concrete implementations of base classes)
@@ -170,18 +292,27 @@ TEST_F(Test__CUDAKernelBaseDeviceContext, SetDeviceContext_CanClear)
     EXPECT_EQ(kernel_->deviceContext(), nullptr);
 }
 
-TEST_F(Test__CUDAKernelBaseDeviceContext, GetStream_ReturnsNullWithoutContext)
+TEST_F(Test__CUDAKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBeforeLaunch)
 {
-    EXPECT_EQ(kernel_->getStream(), nullptr);
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
-TEST_F(Test__CUDAKernelBaseDeviceContext, GetStream_ReturnsContextStream)
+TEST_F(Test__CUDAKernelBaseDeviceContext, ContextStreamDoesNotBecomeAnImplicitKernelBinding)
 {
     void *expected_stream = reinterpret_cast<void *>(0xABCDEF);
     mock_ctx_->setMockStream(expected_stream);
     kernel_->setDeviceContext(mock_ctx_.get());
 
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
+
+    kernel_->bindGPUStream(ExplicitGPUStream{expected_stream});
+    EXPECT_TRUE(kernel_->hasExplicitGPUStream());
     EXPECT_EQ(kernel_->getStream(), expected_stream);
+
+    kernel_->clearGPUStreamBinding();
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__CUDAKernelBaseDeviceContext, GetBlasHandle_ReturnsNullWithoutContext)
@@ -251,18 +382,27 @@ TEST_F(Test__ROCmKernelBaseDeviceContext, SetDeviceContext_CanClear)
     EXPECT_EQ(kernel_->deviceContext(), nullptr);
 }
 
-TEST_F(Test__ROCmKernelBaseDeviceContext, GetStream_ReturnsNullWithoutContext)
+TEST_F(Test__ROCmKernelBaseDeviceContext, GetStreamRejectsMissingOwnershipBeforeLaunch)
 {
-    EXPECT_EQ(kernel_->getStream(), nullptr);
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
-TEST_F(Test__ROCmKernelBaseDeviceContext, GetStream_ReturnsContextStream)
+TEST_F(Test__ROCmKernelBaseDeviceContext, ContextStreamDoesNotBecomeAnImplicitKernelBinding)
 {
     void *expected_stream = reinterpret_cast<void *>(0xFEDCBA);
     mock_ctx_->setMockStream(expected_stream);
     kernel_->setDeviceContext(mock_ctx_.get());
 
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
+
+    kernel_->bindGPUStream(ExplicitGPUStream{expected_stream});
+    EXPECT_TRUE(kernel_->hasExplicitGPUStream());
     EXPECT_EQ(kernel_->getStream(), expected_stream);
+
+    kernel_->clearGPUStreamBinding();
+    EXPECT_FALSE(kernel_->hasExplicitGPUStream());
+    EXPECT_THROW(kernel_->getStream(), std::runtime_error);
 }
 
 TEST_F(Test__ROCmKernelBaseDeviceContext, GetBlasHandle_ReturnsNullWithoutContext)
@@ -294,6 +434,11 @@ TEST_F(Test__ROCmKernelBaseDeviceContext, WorkspaceAndContextAreIndependent)
 // ============================================================================
 // Cross-Context Tests
 // ============================================================================
+
+TEST(Test__KernelBaseDeviceContext, ExplicitGPUStreamRejectsNullBeforeKernelBinding)
+{
+    EXPECT_THROW((void)ExplicitGPUStream{nullptr}, std::invalid_argument);
+}
 
 TEST(Test__KernelBaseDeviceContext, MultipleKernelsCanShareContext)
 {

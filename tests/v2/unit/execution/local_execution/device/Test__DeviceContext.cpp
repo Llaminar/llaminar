@@ -108,7 +108,8 @@ TEST_F(CPUDeviceContextTest, CopyToDevice)
     void *device = ctx->allocate(host_data.size() * sizeof(float));
     ASSERT_NE(device, nullptr);
 
-    ctx->copyToDevice(device, host_data.data(), host_data.size() * sizeof(float));
+    ctx->copyToDevice(
+        device, host_data.data(), host_data.size() * sizeof(float), nullptr);
 
     // Verify (CPU context is a memcpy)
     float *fptr = static_cast<float *>(device);
@@ -132,7 +133,7 @@ TEST_F(CPUDeviceContextTest, CopyToHost)
     fptr[3] = 40.0f;
 
     std::vector<float> host_data(4);
-    ctx->copyToHost(host_data.data(), device, 4 * sizeof(float));
+    ctx->copyToHost(host_data.data(), device, 4 * sizeof(float), nullptr);
 
     EXPECT_EQ(host_data[0], 10.0f);
     EXPECT_EQ(host_data[1], 20.0f);
@@ -155,7 +156,8 @@ TEST_F(CPUDeviceContextTest, CopyDeviceToDevice)
     src_ptr[2] = 3.0f;
     src_ptr[3] = 4.0f;
 
-    ctx->copyFromDevice(dst, src, 4 * sizeof(float), ctx.get());
+    ctx->copyFromDevice(
+        dst, src, 4 * sizeof(float), ctx.get(), nullptr, nullptr);
 
     float *dst_ptr = static_cast<float *>(dst);
     EXPECT_EQ(dst_ptr[0], 1.0f);

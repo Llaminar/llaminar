@@ -63,6 +63,18 @@ def _to_float(s: str | None) -> float | None:
         return None
 
 
+def _is_direct_cpu_device(device: str) -> bool:
+    return device == "cpu" or device.startswith("cpu:")
+
+
+def _device_label(row: dict[str, str]) -> str:
+    device = row.get("device", "?")
+    cpu_isa = row.get("cpu_isa", "")
+    if cpu_isa and _is_direct_cpu_device(device):
+        return f"{device}[{cpu_isa}]"
+    return device
+
+
 def _collect_series(
     commits: list[Path],
     metric_col: str,
@@ -77,7 +89,7 @@ def _collect_series(
             if value is None:
                 continue
             model_name = r.get("model_name", "?")
-            device = r.get("device", "?")
+            device = _device_label(r)
             label = f"{model_name} · {device}"
             out.setdefault(label, []).append((commit_short, value))
     return out

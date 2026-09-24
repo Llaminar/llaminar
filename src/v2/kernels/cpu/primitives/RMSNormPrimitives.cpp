@@ -2628,6 +2628,126 @@ namespace llaminar2::primitives
             return _mm512_reduce_add_epi32(v32);
         }
 #endif
+
+#if defined(__AVX2__)
+        __attribute__((always_inline)) inline int32_t reduce_add_i32_avx2(__m256i v)
+        {
+            __m128i lo = _mm256_castsi256_si128(v);
+            __m128i hi = _mm256_extracti128_si256(v, 1);
+            __m128i sum = _mm_add_epi32(lo, hi);
+            sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+            sum = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+            return _mm_cvtsi128_si32(sum);
+        }
+
+        __attribute__((always_inline)) inline int32_t reduce_max_i32_avx2(__m256i v)
+        {
+            __m128i lo = _mm256_castsi256_si128(v);
+            __m128i hi = _mm256_extracti128_si256(v, 1);
+            __m128i m = _mm_max_epi32(lo, hi);
+            m = _mm_max_epi32(m, _mm_shuffle_epi32(m, _MM_SHUFFLE(1, 0, 3, 2)));
+            m = _mm_max_epi32(m, _mm_shuffle_epi32(m, _MM_SHUFFLE(2, 3, 0, 1)));
+            return _mm_cvtsi128_si32(m);
+        }
+
+        __attribute__((always_inline)) inline void rmsnorm_q8_1_apply_block_float_scaled_avx2(
+            const Q8_1Block &in_blk,
+            const int16_t *gamma_block,
+            Q8_1Block &out_blk,
+            float inv_rms_float)
+        {
+            alignas(32) int32_t prod[32];
+            __m256i max_abs_v = _mm256_setzero_si256();
+
+            for (int i = 0; i < 32; i += 8)
+            {
+                const __m128i qs8 = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(in_blk.qs + i));
+                const __m128i gamma16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(gamma_block + i));
+                const __m256i qs32 = _mm256_cvtepi8_epi32(qs8);
+                const __m256i gamma32 = _mm256_cvtepi16_epi32(gamma16);
+                const __m256i prod32 = _mm256_mullo_epi32(qs32, gamma32);
+                _mm256_store_si256(reinterpret_cast<__m256i *>(prod + i), prod32);
+                max_abs_v = _mm256_max_epi32(max_abs_v, _mm256_abs_epi32(prod32));
+            }
+
+            const int32_t max_abs = reduce_max_i32_avx2(max_abs_v);
+            const float max_prod = static_cast<float>(max_abs);
+            const float d_in = fp16_to_fp32_q8(in_blk.d);
+            const float d_out = (max_abs > 0)
+                                    ? (d_in * max_prod * inv_rms_float * (1.0f / (127.0f * 2048.0f)))
+                                    : 0.0f;
+            const float requant_scale = (max_abs > 0) ? (127.0f / max_prod) : 0.0f;
+            const __m256 scale_v = _mm256_set1_ps(requant_scale);
+            const __m256i lo_v = _mm256_set1_epi32(-127);
+            const __m256i hi_v = _mm256_set1_epi32(127);
+
+            int32_t sum_qs = 0;
+            for (int i = 0; i < 32; i += 8)
+            {
+                const __m256i prod32 = _mm256_load_si256(reinterpret_cast<const __m256i *>(prod + i));
+                __m256i q32 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(prod32), scale_v));
+                q32 = _mm256_max_epi32(lo_v, _mm256_min_epi32(hi_v, q32));
+                sum_qs += reduce_add_i32_avx2(q32);
+
+                const __m128i q16 = _mm_packs_epi32(
+                    _mm256_castsi256_si128(q32),
+                    _mm256_extracti128_si256(q32, 1));
+                const __m128i q8 = _mm_packs_epi16(q16, _mm_setzero_si128());
+                _mm_storel_epi64(reinterpret_cast<__m128i *>(out_blk.qs + i), q8);
+            }
+
+            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
+            out_blk.d = fp32_to_fp16_q8(d_out);
+        }
+#endif
+
+        __attribute__((always_inline)) inline void rmsnorm_q8_1_apply_block_float_scaled_scalar(
+            const Q8_1Block &in_blk,
+            const int16_t *gamma_block,
+            Q8_1Block &out_blk,
+            float inv_rms_float)
+        {
+            int32_t prod[32];
+            int32_t max_abs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                prod[i] = static_cast<int32_t>(in_blk.qs[i]) * static_cast<int32_t>(gamma_block[i]);
+                max_abs = std::max(max_abs, std::abs(prod[i]));
+            }
+
+            const float max_prod = static_cast<float>(max_abs);
+            const float d_in = fp16_to_fp32_q8(in_blk.d);
+            const float d_out = (max_abs > 0)
+                                    ? (d_in * max_prod * inv_rms_float * (1.0f / (127.0f * 2048.0f)))
+                                    : 0.0f;
+            const float requant_scale = (max_abs > 0) ? (127.0f / max_prod) : 0.0f;
+
+            int32_t sum_qs = 0;
+            for (int i = 0; i < 32; ++i)
+            {
+                int32_t q = static_cast<int32_t>(std::lrint(static_cast<float>(prod[i]) * requant_scale));
+                q = (q > 127) ? 127 : (q < -127) ? -127
+                                                 : q;
+                out_blk.qs[i] = static_cast<int8_t>(q);
+                sum_qs += q;
+            }
+
+            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
+            out_blk.d = fp32_to_fp16_q8(d_out);
+        }
+
+        __attribute__((always_inline)) inline void rmsnorm_q8_1_apply_block_float_scaled(
+            const Q8_1Block &in_blk,
+            const int16_t *gamma_block,
+            Q8_1Block &out_blk,
+            float inv_rms_float)
+        {
+#if defined(__AVX2__)
+            rmsnorm_q8_1_apply_block_float_scaled_avx2(in_blk, gamma_block, out_blk, inv_rms_float);
+#else
+            rmsnorm_q8_1_apply_block_float_scaled_scalar(in_blk, gamma_block, out_blk, inv_rms_float);
+#endif
+        }
     }
 
     /**
@@ -2648,6 +2768,7 @@ namespace llaminar2::primitives
     {
         if (!input || !gamma_q12 || !output || blocks_per_row == 0)
             return;
+        (void)epsilon_scaled;
 
         const size_t cols = blocks_per_row * 32;
 
@@ -2722,12 +2843,7 @@ namespace llaminar2::primitives
         double mean_sq = total_sum_sq / cols;
         mean_sq += 1e-5; // Epsilon
         double rms = std::sqrt(mean_sq);
-        double inv_rms_f = 16777216.0 / rms;
-        if (inv_rms_f > 2147483647.0)
-            inv_rms_f = 2147483647.0;
-        uint32_t inv_rms_q24 = static_cast<uint32_t>(inv_rms_f);
-        if (inv_rms_q24 == 0)
-            inv_rms_q24 = 1;
+        const float inv_rms_float = 1.0f / static_cast<float>(rms);
 
         // ====================================================================
         // Phase 4: Apply normalization (Unrolled 2x)
@@ -2735,7 +2851,6 @@ namespace llaminar2::primitives
 
 #if defined(__AVX512F__)
         // Optimized implementation using float scaling to avoid 64-bit integer ops
-        float inv_rms_float = 1.0f / static_cast<float>(rms);
         __m512 v_inv_rms_f = _mm512_set1_ps(inv_rms_float);
         __m512i v_127_i = _mm512_set1_epi32(127);
         __m512i v_neg127_i = _mm512_set1_epi32(-127);
@@ -2975,48 +3090,9 @@ namespace llaminar2::primitives
             out.sum_qs = static_cast<int16_t>(_mm512_reduce_add_epi32(final_i_lo) + _mm512_reduce_add_epi32(final_i_hi));
         }
 #endif
-        // Scalar fallback for remaining blocks
         for (; b < blocks_per_row; ++b)
         {
-            const Q8_1Block &in_blk = input[b];
-            Q8_1Block &out_blk = output[b];
-            float d_in = fp16_to_fp32_q8(in_blk.d);
-
-            int32_t y_raw[32];
-            int32_t max_abs = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                size_t ch = b * 32 + i;
-                int64_t term = static_cast<int64_t>(in_blk.qs[i]) * gamma_q12[ch];
-                int64_t res = term * inv_rms_q24;
-                y_raw[i] = static_cast<int32_t>(res >> 20);
-                max_abs = std::max(max_abs, std::abs(y_raw[i]));
-            }
-
-            float d_out;
-            float scale_factor = 1.0f;
-            if (max_abs == 0)
-            {
-                d_out = 0.0f;
-                scale_factor = 0.0f;
-            }
-            else
-            {
-                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
-                scale_factor = 127.0f / static_cast<float>(max_abs);
-            }
-
-            int32_t sum_qs = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                int32_t y = static_cast<int32_t>(std::round(y_raw[i] * scale_factor));
-                y = (y > 127) ? 127 : (y < -127) ? -127
-                                                 : y;
-                out_blk.qs[i] = static_cast<int8_t>(y);
-                sum_qs += y;
-            }
-            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
-            out_blk.d = fp32_to_fp16_q8(d_out);
+            rmsnorm_q8_1_apply_block_float_scaled(input[b], gamma_q12 + b * 32, output[b], inv_rms_float);
         }
     }
 
@@ -3029,6 +3105,7 @@ namespace llaminar2::primitives
     {
         if (!input || !gamma_q12 || !output || blocks_per_row == 0)
             return;
+        (void)epsilon_scaled;
 
         const size_t cols = blocks_per_row * 32;
 
@@ -3066,6 +3143,7 @@ namespace llaminar2::primitives
         // Compute 1/sqrt(mean_qs_sq) in Q24 format
         // inv_rms = 2^24 / sqrt(mean_sq)
         double rms = std::sqrt(mean_sq);
+#if defined(__AVX512F__)
         double inv_rms_f = 16777216.0 / rms;
 
         // Clamp to uint32 range to avoid overflow in integer loop
@@ -3075,6 +3153,9 @@ namespace llaminar2::primitives
         uint32_t inv_rms_q24 = static_cast<uint32_t>(inv_rms_f);
         if (inv_rms_q24 == 0)
             inv_rms_q24 = 1;
+#else
+        const float inv_rms_float = 1.0f / static_cast<float>(rms);
+#endif
 
         // ====================================================================
         // Phase 4: Apply normalization (vectorized)
@@ -3204,52 +3285,9 @@ namespace llaminar2::primitives
             out_blk.d = fp32_to_fp16_q8(d_out);
         }
 #else
-        // Scalar fallback
         for (size_t b = 0; b < blocks_per_row; ++b)
         {
-            const Q8_1Block &in_blk = input[b];
-            Q8_1Block &out_blk = output[b];
-            float d_in = fp16_to_fp32_q8(in_blk.d);
-
-            // First pass: compute raw y values and find max_abs
-            int32_t y_raw[32];
-            int32_t max_abs = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                size_t ch = b * 32 + i;
-                // High precision computation: qs * gamma * inv_rms
-                int64_t term = static_cast<int64_t>(in_blk.qs[i]) * gamma_q12[ch];
-                int64_t res = term * inv_rms_q24;
-                y_raw[i] = static_cast<int32_t>(res >> 20);
-                max_abs = std::max(max_abs, std::abs(y_raw[i]));
-            }
-
-            // Compute output scale
-            float d_out;
-            float scale_factor = 1.0f;
-            if (max_abs == 0)
-            {
-                d_out = 0.0f;
-                scale_factor = 0.0f;
-            }
-            else
-            {
-                d_out = d_in * static_cast<float>(max_abs) / (127.0f * 32768.0f);
-                scale_factor = 127.0f / static_cast<float>(max_abs);
-            }
-
-            // Second pass: rescale and clamp
-            int32_t sum_qs = 0;
-            for (int i = 0; i < 32; ++i)
-            {
-                int32_t y = static_cast<int32_t>(std::round(y_raw[i] * scale_factor));
-                y = (y > 127) ? 127 : (y < -127) ? -127
-                                                 : y;
-                out_blk.qs[i] = static_cast<int8_t>(y);
-                sum_qs += y;
-            }
-            out_blk.sum_qs = static_cast<int16_t>(sum_qs);
-            out_blk.d = fp32_to_fp16_q8(d_out);
+            rmsnorm_q8_1_apply_block_float_scaled(input[b], gamma_q12 + b * 32, output[b], inv_rms_float);
         }
 #endif
     }

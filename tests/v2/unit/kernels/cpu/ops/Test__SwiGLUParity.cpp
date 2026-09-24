@@ -16,11 +16,17 @@
  */
 
 #include <gtest/gtest.h>
-#include <cmath>
-#include <vector>
+#include <array>
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
+#include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "utils/Logger.h"
+#include "../../../../utils/VerifierRowTestInventory.h"
 
 using namespace llaminar2;
 
@@ -279,4 +285,83 @@ TEST_F(SwiGLUParityTest, LargeBatch)
     LOG_INFO("Large batch test (32 seq × 32 features = 1024 elements):");
     LOG_INFO("  Max abs diff: " << max_diff << " (threshold: 1e-5)");
     LOG_INFO("  Status: ✓ Correct on large batch");
+}
+
+/**
+ * @brief Prove fused SwiGLU/Q8_1 publication is the exact two-stage operation.
+ *
+ * The CPU MoE verifier down projection consumes Q8_1 activation rows. This
+ * regression covers every canonical runtime-M verifier depth and both odd and
+ * even Q8 block counts so the hot path cannot trade byte equivalence for one
+ * fewer intermediate buffer.
+ */
+TEST_F(SwiGLUParityTest, FusedQ8PublicationMatchesTwoStageBytesForRuntimeM)
+{
+    using llaminar2::cpu::native_vnni::quantize_activations_to_q8_1;
+    using llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1;
+
+    constexpr std::array<int, 4> widths = {32, 64, 96, 512};
+    std::vector<int> row_counts = {1};
+    row_counts.insert(
+        row_counts.end(),
+        test::kGroupedVerifierRuntimeRows.begin(),
+        test::kGroupedVerifierRuntimeRows.end());
+
+    for (const int rows : row_counts)
+    {
+        for (const int width : widths)
+        {
+            SCOPED_TRACE(
+                "M=" + std::to_string(rows) +
+                " K=" + std::to_string(width));
+            const size_t element_count =
+                static_cast<size_t>(rows) * static_cast<size_t>(width);
+            std::vector<float> gate(element_count);
+            std::vector<float> up(element_count);
+            for (size_t index = 0; index < element_count; ++index)
+            {
+                const int gate_centered =
+                    static_cast<int>((index * 17u + index / 5u) % 257u) - 128;
+                const int up_centered =
+                    static_cast<int>((index * 29u + index / 11u) % 193u) - 96;
+                gate[index] = static_cast<float>(gate_centered) * 0.0078125f;
+                up[index] = static_cast<float>(up_centered) * 0.010416667f;
+            }
+
+            std::vector<float> activated(element_count);
+            const int blocks_per_row = width / Q8_1Block::BLOCK_SIZE;
+            const size_t block_count =
+                static_cast<size_t>(rows) *
+                static_cast<size_t>(blocks_per_row);
+            std::vector<Q8_1Block> expected(block_count);
+            std::vector<Q8_1Block> actual(block_count);
+
+            primitives::compute_swiglu(
+                gate.data(),
+                up.data(),
+                activated.data(),
+                static_cast<int>(element_count));
+            quantize_activations_to_q8_1(
+                activated.data(),
+                expected.data(),
+                rows,
+                width,
+                blocks_per_row);
+            swiglu_quantize_activations_to_q8_1(
+                gate.data(),
+                up.data(),
+                actual.data(),
+                rows,
+                width,
+                blocks_per_row);
+
+            ASSERT_EQ(
+                std::memcmp(
+                    actual.data(),
+                    expected.data(),
+                    block_count * sizeof(Q8_1Block)),
+                0)
+                << "fused CPU MoE SwiGLU/Q8_1 publication changed bytes";
+        }
+    }
 }

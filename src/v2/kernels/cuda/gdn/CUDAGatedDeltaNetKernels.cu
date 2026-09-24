@@ -20,8 +20,12 @@
  */
 
 #include "../ops/CUDAHelpers.cuh"
+#include "../../../utils/DebugEnv.h"
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
 
 namespace
 { // anonymous namespace to avoid symbol conflicts with ROCm kernels
@@ -40,7 +44,124 @@ namespace
     //      (was 16 blocks / 108 SMs, now 32+ blocks)
     // =========================================================================
 
-    __global__ void cuda_gdn_recurrent_step_kernel(
+    constexpr int kGdnRecurrentThreads = 256;
+    constexpr int kGdnRecurrentRowSplit = 8;
+    constexpr int kGdnRecurrentColumnsPerBlock =
+        kGdnRecurrentThreads / kGdnRecurrentRowSplit;
+
+    /**
+     * @brief Return the byte-stable query scale shared by every CUDA GDN regime.
+     *
+     * CUDA emits different FP32 values for runtime `rsqrtf(128)` and the same
+     * expression constant-folded in a `D_K=128` specialization. Query scaling
+     * affects outputs without affecting recurrent state, which allowed long
+     * prefill to differ from serial decode by several ULPs. Supported GDN key
+     * widths therefore use explicit correctly rounded FP32 constants. The host
+     * route rejects every other width before launch; the trap makes violating
+     * that contract fatal even if a future caller bypasses host validation.
+     *
+     * @param d_k Runtime key width selected by model topology.
+     * @return Exact FP32 value of `1 / sqrt(d_k)` for a supported width.
+     */
+    __device__ __forceinline__ float cuda_gdn_query_scale(int d_k)
+    {
+        if (d_k == 64)
+            return 0x1p-3f;
+        if (d_k == 128)
+            return 0x1.6a09e6p-4f;
+        asm volatile("trap;");
+        return 0.0f;
+    }
+
+    /**
+     * @brief Start one vectorized Ampere global-to-shared Q/K transfer group.
+     *
+     * Long-prefill recurrence consumes one complete Q row and one complete K
+     * row at every causal step.  Each participating lane moves four adjacent
+     * FP32 values directly into shared memory with `cp.async`, avoiding the
+     * register-staged load/store dependency that otherwise dominates sampled
+     * long-scoreboard stalls.  The caller owns the double-buffer lifetime and
+     * must wait for this group before exposing the destination stage.
+     *
+     * The CUDA build requires an SM80-or-newer target, so this is the sole
+     * production implementation rather than an architecture-dependent eager
+     * alternative.
+     *
+     * @tparam D_K Compile-time Q/K row width, divisible by four floats.
+     * @param q_stage Shared-memory destination for the Q row.
+     * @param k_stage Shared-memory destination for the K row.
+     * @param q_src Global-memory source for the Q row.
+     * @param k_src Global-memory source for the K row.
+     */
+    template <int D_K>
+    __device__ __forceinline__ void cuda_gdn_stage_qk_async(
+        float *q_stage,
+        float *k_stage,
+        const float *q_src,
+        const float *k_src)
+    {
+        static_assert(D_K % 4 == 0);
+        const int vector_index = static_cast<int>(threadIdx.x);
+        if (vector_index < D_K / 4)
+        {
+            const int element = vector_index * 4;
+            const uint32_t q_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(q_stage + element));
+            const uint32_t k_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(k_stage + element));
+            asm volatile(
+                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
+                :
+                : "r"(q_shared), "l"(q_src + element), "r"(16)
+                : "memory");
+            asm volatile(
+                "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
+                :
+                : "r"(k_shared), "l"(k_src + element), "r"(16)
+                : "memory");
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+
+    /**
+     * @brief Wait until every Q/K transfer group issued by this lane is done.
+     *
+     * A following CTA barrier publishes the completed stage to all consumers.
+     * Keeping the wait and barrier separate makes the producer/consumer edge
+     * explicit and lets recurrence work overlap the in-flight next-row group.
+     */
+    __device__ __forceinline__ void cuda_gdn_wait_qk_async()
+    {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+
+    /**
+     * @brief Advance request-local GDN rows with one fixed, batch-invariant tree.
+     *
+     * Temporal rows remain causal and execute in increasing order inside one
+     * resident block. Within a row, eight lanes own contiguous, disjoint K
+     * partitions for each value column. Both M=1 decode and runtime-sized MTP
+     * verification launch this exact specialization, so the partial-sum order
+     * is independent of M and grouped outputs remain byte-identical to serial
+     * calls of the same production kernel.
+     *
+     * A lane keeps its state partition in registers across every row. For the
+     * Qwen GDN geometry (`D_K=128`) this is sixteen floats per lane: state is
+     * loaded once and committed once, while optional post-row snapshots are
+     * still published for every verifier row. This removes the old second
+     * global state read and exposes eight times as many warps without atomics,
+     * launch-level row replay, or a host-owned recurrence.
+     *
+     * Q/K normalization deliberately retains the former one-warp arithmetic
+     * tree. Preserving that preprocessing order limits numerical change to the
+     * newly explicit K-part reduction itself and keeps capture identity stable.
+     *
+     * @tparam D_K Compile-time key width. Supported graph geometries select a
+     *              specialization before capture; no runtime fallback exists.
+     */
+    template <int D_K, bool OutOfPlaceState>
+    __global__ __launch_bounds__(kGdnRecurrentThreads, 2)
+    void cuda_gdn_recurrent_step_kernel(
         const float *__restrict__ q,        // [n_heads * d_k]
         const float *__restrict__ k,        // [n_heads * d_k]
         const float *__restrict__ v,        // [n_heads * d_v]
@@ -49,158 +170,359 @@ namespace
         const float *__restrict__ A_log,    // [n_heads]
         const float *__restrict__ dt_bias,  // [n_heads]
         float *__restrict__ output,         // [n_heads * d_v]
-        float *__restrict__ state,          // [n_heads, d_k, d_v]
-        int n_heads, int d_k, int d_v,
+        const float *initial_state,
+        float *updated_state,
+        int request_count, int request_seq_len,
+        int n_heads, int d_v,
         bool use_qk_l2norm,
         const int *__restrict__ effective_seq_len_ptr,
-        int effective_row_idx)
+        int effective_row_idx,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows)
     {
-        const int h = blockIdx.x;
-        if (h >= n_heads)
+        const int request_head = blockIdx.x;
+        const int request = request_head / n_heads;
+        const int h = request_head - request * n_heads;
+        if (request >= request_count || h >= n_heads)
             return;
+
+        static_assert(D_K % kGdnRecurrentRowSplit == 0);
+        constexpr int kRowsPerSplit = D_K / kGdnRecurrentRowSplit;
 
         const int tid = threadIdx.x;
-        const int block_size = blockDim.x;
+        const int split_id = tid / kGdnRecurrentColumnsPerBlock;
+        const int column_in_block = tid % kGdnRecurrentColumnsPerBlock;
+        const int vi =
+            blockIdx.y * kGdnRecurrentColumnsPerBlock + column_in_block;
 
-        // Column this thread handles (2D grid: blockIdx.y selects column tile)
-        const int vi = blockIdx.y * block_size + tid;
-
-        // Pointers for this head
-        const float *q_head = q + h * d_k;
-        const float *k_head = k + h * d_k;
-        const float *v_head = v + h * d_v;
-        float *S = state + (size_t)h * d_k * d_v;
-        float *o_head = output + h * d_v;
-
-        if (effective_seq_len_ptr && effective_row_idx >= *effective_seq_len_ptr)
-        {
-            if (vi < d_v)
-                o_head[vi] = 0.0f;
-            return;
-        }
+        // Request-local state persists across every row processed by this block.
+        const size_t request_qk_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(D_K);
+        const size_t request_v_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(d_v);
+        const size_t request_state_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(D_K) *
+            static_cast<size_t>(d_v);
+        const float *state_source =
+            OutOfPlaceState ? initial_state : updated_state;
+        const float *S_initial =
+            state_source + static_cast<size_t>(request) * request_state_stride +
+            static_cast<size_t>(h) * D_K * d_v;
+        float *S_updated =
+            updated_state + static_cast<size_t>(request) * request_state_stride +
+            static_cast<size_t>(h) * D_K * d_v;
 
         // Shared memory for preprocessed Q and K
         extern __shared__ float smem[];
-        float *q_local = smem;       // [d_k]
-        float *k_local = smem + d_k; // [d_k]
+        float *q_local = smem;                       // [D_K]
+        float *k_local = smem + D_K;                 // [D_K]
+        float *reduce_kv = smem + 2 * D_K;           // [blockDim.x]
+        float *reduce_out = reduce_kv + blockDim.x;  // [blockDim.x]
 
-        // ── Step 0: Preprocessing ──
-        const float scale = rsqrtf((float)d_k);
-
-        // Load Q and K into shared memory
-        for (int i = tid; i < d_k; i += block_size)
+        const float scale = cuda_gdn_query_scale(D_K);
+        __shared__ float warp_sums[1];
+        __shared__ float decay_shared;
+        __shared__ float beta_shared;
+        const int lane_id = tid % 32;
+        /*
+         * Each lane owns one contiguous state partition. The compile-time
+         * extent is essential: nvcc scalarizes this array into registers, so
+         * grouped rows reuse live state without local-memory spills.
+         */
+        float state_rows[kRowsPerSplit];
+        const int row_begin = split_id * kRowsPerSplit;
+        if (vi < d_v)
         {
-            q_local[i] = q_head[i];
-            k_local[i] = k_head[i];
-        }
-        __syncthreads();
-
-        // L2 normalize Q and K if requested
-        if (use_qk_l2norm)
-        {
-            // Compute Q norm
-            float q_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
-                q_sum += q_local[i] * q_local[i];
-
-            // Warp-level reduction
-            for (int offset = 16; offset > 0; offset >>= 1)
-                q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
-
-            // Cross-warp reduction via shared memory
-            __shared__ float warp_sums[8]; // max 256 threads = 8 warps
-            int warp_id = tid / 32;
-            int lane_id = tid % 32;
-            if (lane_id == 0)
-                warp_sums[warp_id] = q_sum;
-            __syncthreads();
-            if (tid == 0)
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
             {
-                float total = 0.0f;
-                int num_warps = (block_size + 31) / 32;
-                for (int w = 0; w < num_warps; w++)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
+                const int state_row = row_begin + local_row;
+                state_rows[local_row] = S_initial[state_row * d_v + vi];
             }
-            __syncthreads();
-            float q_norm_sq = warp_sums[0];
-            float q_inv = scale / fmaxf(sqrtf(q_norm_sq), 1e-6f);
-
-            // Apply Q scale
-            for (int i = tid; i < d_k; i += block_size)
-                q_local[i] *= q_inv;
-            __syncthreads();
-
-            // Compute K norm
-            float k_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
-                k_sum += k_local[i] * k_local[i];
-            for (int offset = 16; offset > 0; offset >>= 1)
-                k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
-            if (lane_id == 0)
-                warp_sums[warp_id] = k_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                int num_warps = (block_size + 31) / 32;
-                for (int w = 0; w < num_warps; w++)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
-            }
-            __syncthreads();
-            float k_norm_sq = warp_sums[0];
-            float k_inv = 1.0f / fmaxf(sqrtf(k_norm_sq), 1e-6f);
-
-            for (int i = tid; i < d_k; i += block_size)
-                k_local[i] *= k_inv;
-            __syncthreads();
         }
         else
         {
-            // Just scale Q
-            for (int i = tid; i < d_k; i += block_size)
-                q_local[i] *= scale;
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
+                state_rows[local_row] = 0.0f;
+        }
+
+        for (int request_row = 0; request_row < request_seq_len; ++request_row)
+        {
+            const int flat_row = request * request_seq_len + request_row;
+            const float *q_head =
+                q + static_cast<size_t>(flat_row) * request_qk_stride +
+                static_cast<size_t>(h) * D_K;
+            const float *k_head =
+                k + static_cast<size_t>(flat_row) * request_qk_stride +
+                static_cast<size_t>(h) * D_K;
+            const float *v_head =
+                v + static_cast<size_t>(flat_row) * request_v_stride +
+                static_cast<size_t>(h) * d_v;
+            float *o_head =
+                output + static_cast<size_t>(flat_row) * request_v_stride +
+                static_cast<size_t>(h) * d_v;
+
+            const int logical_row = effective_row_idx + request_row;
+            if (effective_seq_len_ptr &&
+                logical_row >= effective_seq_len_ptr[request])
+            {
+                if (vi < d_v && split_id == 0)
+                    o_head[vi] = 0.0f;
+                __syncthreads();
+                continue;
+            }
+
+            // Load and preprocess Q/K exactly as the M=1 scalar route does.
+            for (int i = tid; i < D_K; i += blockDim.x)
+            {
+                q_local[i] = q_head[i];
+                k_local[i] = k_head[i];
+            }
+            __syncthreads();
+
+            if (use_qk_l2norm)
+            {
+                if (tid < 32)
+                {
+                    float q_sum = 0.0f;
+                    for (int i = tid; i < D_K; i += 32)
+                        q_sum += q_local[i] * q_local[i];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                    {
+                        q_sum +=
+                            __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
+                    }
+                    if (lane_id == 0)
+                        warp_sums[0] = q_sum;
+                }
+                __syncthreads();
+                const float q_inv =
+                    scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                for (int i = tid; i < D_K; i += blockDim.x)
+                    q_local[i] *= q_inv;
+                __syncthreads();
+
+                if (tid < 32)
+                {
+                    float k_sum = 0.0f;
+                    for (int i = tid; i < D_K; i += 32)
+                        k_sum += k_local[i] * k_local[i];
+                    for (int offset = 16; offset > 0; offset >>= 1)
+                    {
+                        k_sum +=
+                            __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
+                    }
+                    if (lane_id == 0)
+                        warp_sums[0] = k_sum;
+                }
+                __syncthreads();
+                const float k_inv =
+                    1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+                for (int i = tid; i < D_K; i += blockDim.x)
+                    k_local[i] *= k_inv;
+                __syncthreads();
+            }
+            else
+            {
+                for (int i = tid; i < D_K; i += blockDim.x)
+                    q_local[i] *= scale;
+                __syncthreads();
+            }
+
+            if (tid == 0)
+            {
+                const size_t gate_index =
+                    static_cast<size_t>(flat_row) *
+                        static_cast<size_t>(n_heads) +
+                    h;
+                const float x = alpha[gate_index] + dt_bias[h];
+                const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+                decay_shared = expf(A_log[h] * sp);
+                beta_shared =
+                    1.0f / (1.0f + expf(-beta_raw[gate_index]));
+            }
+            __syncthreads();
+            const float decay = decay_shared;
+            const float beta_h = beta_shared;
+
+            float partial_kv = 0.0f;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int local_row = 0;
+                     local_row < kRowsPerSplit;
+                     ++local_row)
+                {
+                    const int state_row = row_begin + local_row;
+                    state_rows[local_row] *= decay;
+                    partial_kv += state_rows[local_row] * k_local[state_row];
+                }
+            }
+            reduce_kv[tid] = partial_kv;
+            __syncthreads();
+
+            float delta = 0.0f;
+            if (vi < d_v)
+            {
+                float kv = 0.0f;
+#pragma unroll
+                for (int split = 0;
+                     split < kGdnRecurrentRowSplit;
+                     ++split)
+                {
+                    kv += reduce_kv[
+                        column_in_block +
+                        split * kGdnRecurrentColumnsPerBlock];
+                }
+                delta = (v_head[vi] - kv) * beta_h;
+            }
+
+            float partial_out = 0.0f;
+            float *snapshot =
+                state_snapshots && flat_row < max_snapshot_rows
+                    ? state_snapshots +
+                          static_cast<size_t>(flat_row) *
+                              static_cast<size_t>(snapshot_stride_floats) +
+                          static_cast<size_t>(h) * D_K * d_v
+                    : nullptr;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int local_row = 0;
+                     local_row < kRowsPerSplit;
+                     ++local_row)
+                {
+                    const int state_row = row_begin + local_row;
+                    const float s_new =
+                        state_rows[local_row] +
+                        k_local[state_row] * delta;
+                    state_rows[local_row] = s_new;
+                    if (snapshot)
+                        snapshot[state_row * d_v + vi] = s_new;
+                    partial_out += s_new * q_local[state_row];
+                }
+            }
+            reduce_out[tid] = partial_out;
+            __syncthreads();
+
+            if (vi < d_v && split_id == 0)
+            {
+                float out_vi = 0.0f;
+#pragma unroll
+                for (int split = 0;
+                     split < kGdnRecurrentRowSplit;
+                     ++split)
+                {
+                    out_vi += reduce_out[
+                        column_in_block +
+                        split * kGdnRecurrentColumnsPerBlock];
+                }
+                o_head[vi] = out_vi;
+            }
+
+            // Shared Q/K and reduction slots belong to exactly one causal row.
             __syncthreads();
         }
 
-        // Compute gate and beta (single thread, broadcast via shared mem)
-        __shared__ float decay_shared;
-        __shared__ float beta_shared;
-        if (tid == 0)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (vi < d_v && !terminal_state_is_snapshotted)
         {
-            float x = alpha[h] + dt_bias[h];
-            float sp = (x > 20.0f) ? x : log1pf(expf(x));
-            decay_shared = expf(A_log[h] * sp);
-            beta_shared = 1.0f / (1.0f + expf(-beta_raw[h]));
+#pragma unroll
+            for (int local_row = 0; local_row < kRowsPerSplit; ++local_row)
+            {
+                const int state_row = row_begin + local_row;
+                S_updated[state_row * d_v + vi] = state_rows[local_row];
+            }
         }
-        __syncthreads();
-        float decay = decay_shared;
-        float beta_h = beta_shared;
+    }
 
-        // Fused per-column processing — NO separate decay pass
-        if (vi < d_v)
+    /**
+     * @brief Launch the fixed CUDA GDN recurrence specialization for a graph.
+     *
+     * GDN key width is model topology, not a hot-path tuning input. Selecting
+     * the concrete specialization here makes register ownership and launch
+     * geometry part of capture construction. Unknown widths fail immediately;
+     * there is no scalar or eager alternate path.
+     */
+    bool launch_cuda_gdn_recurrent_step(
+        const char *caller,
+        const float *q,
+        const float *k,
+        const float *v,
+        const float *alpha,
+        const float *beta_raw,
+        const float *A_log,
+        const float *dt_bias,
+        float *output,
+        const float *initial_state,
+        float *updated_state,
+        int request_count,
+        int request_seq_len,
+        int n_heads,
+        int d_k,
+        int d_v,
+        bool use_qk_l2norm,
+        const int *effective_seq_len_ptr,
+        int effective_row_idx,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        cudaStream_t stream)
+    {
+        const dim3 grid(
+            request_count * n_heads,
+            (d_v + kGdnRecurrentColumnsPerBlock - 1) /
+                kGdnRecurrentColumnsPerBlock);
+        const size_t shared_bytes =
+            static_cast<size_t>(2 * d_k + 2 * kGdnRecurrentThreads) *
+            sizeof(float);
+
+#define LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(D_K, OUT_OF_PLACE)                  \
+    cuda_gdn_recurrent_step_kernel<D_K, OUT_OF_PLACE>                          \
+        <<<grid, kGdnRecurrentThreads, shared_bytes, stream>>>(                 \
+            q, k, v, alpha, beta_raw, A_log, dt_bias, output,                  \
+            initial_state, updated_state,                                      \
+            request_count, request_seq_len, n_heads, d_v, use_qk_l2norm,       \
+            effective_seq_len_ptr, effective_row_idx, state_snapshots,          \
+            snapshot_stride_floats, max_snapshot_rows)
+
+        switch (d_k)
         {
-            // Pass 1: Fused decay + kv dot product (read-only, no write-back)
-            float kv = 0.0f;
-            for (int j = 0; j < d_k; j++)
-            {
-                float s_decayed = S[j * d_v + vi] * decay;
-                kv += s_decayed * k_local[j];
-            }
-
-            float delta = (v_head[vi] - kv) * beta_h;
-
-            // Pass 2: Fused decay + delta update + output (read-modify-write)
-            float out_vi = 0.0f;
-            for (int j = 0; j < d_k; j++)
-            {
-                float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-                S[j * d_v + vi] = s_new;
-                out_vi += s_new * q_local[j];
-            }
-            o_head[vi] = out_vi;
+        case 64:
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(64, true);
+            break;
+        case 128:
+            if (initial_state == updated_state)
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128, false);
+            else
+                LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT(128, true);
+            break;
+        default:
+            fprintf(
+                stderr,
+                "[%s] unsupported CUDA GDN d_k=%d; capture supports d_k in "
+                "{64,128}\n",
+                caller,
+                d_k);
+            return false;
         }
+
+#undef LLAMINAR_LAUNCH_CUDA_GDN_RECURRENT
+
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[%s] %s\n", caller, cudaGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     // =========================================================================
@@ -210,83 +532,84 @@ namespace
     //   1. 2D grid: dim3(n_heads, col_blocks) — each column block processes
     //      a subset of the d_v columns. Columns are fully independent in the
     //      delta-rule recurrence, so no cross-block sync is needed.
-    //   2. Fused 2-pass column processing (same as decode kernel):
-    //      Pass 1: decay + kv (read-only); Pass 2: decay + update + output
-    //      (read-modify-write). Eliminates the separate decay pass.
-    //   3. Each thread owns one column vi — all per-column operations are
-    //      independent, so no __syncthreads() in the column processing body.
+    //   2. Fused recurrence: decay each resident state row exactly once while
+    //      accumulating K*S, then update that same resident row and accumulate
+    //      Q*S. This is the serial-decode arithmetic schedule.
+    //   3. A fixed eight-lane reduction tree owns each output column. D_K is a
+    //      template parameter so both supported widths have complete row
+    //      coverage and no runtime-width indexing can silently truncate state.
     // =========================================================================
 
-    __global__ __launch_bounds__(256, 2) void cuda_gdn_chunk_forward_kernel(
+    template <int D_K>
+    __global__ __launch_bounds__(64, 10) void cuda_gdn_chunk_forward_kernel(
         const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
         const float *__restrict__ K,        // [seq_len, n_heads * d_k]
         const float *__restrict__ V,        // [seq_len, n_heads * d_v]
-        const float *__restrict__ alpha,    // [seq_len, n_heads]
-        const float *__restrict__ beta_raw, // [seq_len, n_heads]
-        const float *__restrict__ A_log,    // [n_heads]
-        const float *__restrict__ dt_bias,  // [n_heads]
+        const float *__restrict__ decay,    // preprocessed [seq_len, n_heads]
+        const float *__restrict__ beta,     // preprocessed [seq_len, n_heads]
         float *__restrict__ output,         // [seq_len, n_heads * d_v]
-        float *__restrict__ state,          // [n_heads, d_k, d_v]
+        const float *initial_state,
+        float *updated_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
-        int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
-        bool inputs_preprocessed)
+        int request_count, int request_seq_len,
+        int n_heads, int d_v)
     {
+        static_assert(D_K % kGdnRecurrentRowSplit == 0);
+        const int request = blockIdx.z;
         const int h = blockIdx.x;
-        if (h >= n_heads)
+        if (request >= request_count || h >= n_heads)
             return;
 
         const int tid = threadIdx.x;
         const int block_size = blockDim.x;
 
-        // Row-split parallelism: ROW_SPLIT threads collaborate on each
-        // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
-        // 256 threads/block: 8 warps/block — optimal for Ampere L1 latency.
-        constexpr int ROW_SPLIT = 8;
-        constexpr int ROWS_PER_SPLIT = 16;
+        // Row-split parallelism: eight lanes collaborate on each column and
+        // own disjoint contiguous D_K/8 state rows.  Keep all eight lanes in
+        // one warp so their partial sums can be exchanged without shared
+        // reduction buffers or CTA-wide barriers.  Four columns fit in each
+        // warp; a 64-thread block owns eight columns and exposes enough
+        // independent CTAs to hide the remaining scalar and value-load latency.
+        constexpr int ROW_SPLIT = kGdnRecurrentRowSplit;
+        constexpr int ROWS_PER_SPLIT = D_K / ROW_SPLIT;
+        constexpr int COLUMNS_PER_WARP = 32 / ROW_SPLIT;
         const int cols_per_block = block_size / ROW_SPLIT;
-        const int split_id = tid / cols_per_block; // 0..ROW_SPLIT-1
-        const int col_in_block = tid % cols_per_block;
+        const int lane_id = tid & 31;
+        const int warp_id = tid >> 5;
+        const int split_id = lane_id / COLUMNS_PER_WARP;
+        const int col_in_warp = lane_id % COLUMNS_PER_WARP;
+        const int col_in_block =
+            warp_id * COLUMNS_PER_WARP + col_in_warp;
         const int vi = blockIdx.y * cols_per_block + col_in_block;
 
-        const int qk_stride = n_heads * d_k;
+        const int qk_stride = n_heads * D_K;
         const int v_stride = n_heads * d_v;
-        const float scale = rsqrtf((float)d_k);
 
-        float *S = state + (size_t)h * d_k * d_v;
+        const int request_row_base = request * request_seq_len;
+        const size_t request_state_stride =
+            static_cast<size_t>(n_heads) * D_K * d_v;
+        const float *S_initial = initial_state +
+                                 static_cast<size_t>(request) * request_state_stride +
+                                 static_cast<size_t>(h) * D_K * d_v;
+        float *S_updated = updated_state +
+                           static_cast<size_t>(request) * request_state_stride +
+                           static_cast<size_t>(h) * D_K * d_v;
 
         extern __shared__ float smem[];
-        float *q_local = smem;       // [d_k]
-        float *k_local = smem + d_k; // [d_k]
-        // Shared reduction scratch follows
-        float *warp_sums = smem + 2 * d_k; // [16] for warp reduction (up to 16 warps)
-        // Double-buffered reduction arrays for row-split partial sums
-        float *reduce_kv = smem + 2 * d_k + 16;               // [block_size]
-        float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
+        float *q_stages = smem;             // [2][D_K]
+        float *k_stages = smem + 2 * D_K;   // [2][D_K]
 
-        // Pre-load A_log and dt_bias only for the legacy in-kernel preprocessing
-        // path. Captured prefill uses the separate preprocess kernel and skips
-        // this uniform barrier on the hot recurrence path.
-        __shared__ float A_log_h;
-        __shared__ float dt_bias_h;
-        if (!inputs_preprocessed)
-        {
-            if (tid == 0)
-            {
-                A_log_h = A_log[h];
-                dt_bias_h = dt_bias[h];
-            }
-            __syncthreads();
-        }
-
-        int effective_seq_len = seq_len;
+        int effective_seq_len = request_seq_len;
         if (effective_seq_len_ptr)
         {
-            const int raw_effective = *effective_seq_len_ptr;
-            effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+            const int raw_effective = effective_seq_len_ptr[request];
+            effective_seq_len = raw_effective < 0
+                                    ? 0
+                                    : (raw_effective > request_seq_len
+                                           ? request_seq_len
+                                           : raw_effective);
         }
 
         // Keep this thread's recurrence-state slice resident across the entire
@@ -300,7 +623,7 @@ namespace
         {
 #pragma unroll
             for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                sc[j] = S[(j_start + j) * d_v + vi];
+                sc[j] = S_initial[(j_start + j) * d_v + vi];
         }
         else
         {
@@ -309,13 +632,27 @@ namespace
                 sc[j] = 0.0f;
         }
 
-        // Process each timestep sequentially (inherent to recurrence)
-        for (int t = 0; t < seq_len; t++)
+        // Seed the first Q/K stage once.  Subsequent rows are loaded into the
+        // opposite stage while the current causal recurrence is executing.
+        int active_qk_stage = 0;
+        if (effective_seq_len > 0)
         {
-            const float *q_src = Q + t * qk_stride + h * d_k;
-            const float *k_src = K + t * qk_stride + h * d_k;
-            const float *v_src = V + t * v_stride + h * d_v;
-            float *o_dst = output + t * v_stride + h * d_v;
+            const int first_row = request_row_base;
+            cuda_gdn_stage_qk_async<D_K>(
+                q_stages,
+                k_stages,
+                Q + first_row * qk_stride + h * D_K,
+                K + first_row * qk_stride + h * D_K);
+            cuda_gdn_wait_qk_async();
+            __syncthreads();
+        }
+
+        // Process each timestep sequentially (inherent to recurrence).
+        for (int t = 0; t < request_seq_len; t++)
+        {
+            const int row = request_row_base + t;
+            const float *v_src = V + row * v_stride + h * d_v;
+            float *o_dst = output + row * v_stride + h * d_v;
 
             if (t >= effective_seq_len)
             {
@@ -324,96 +661,27 @@ namespace
                 continue;
             }
 
-            // Load Q and K into shared memory (all threads cooperate)
-            for (int i = tid; i < d_k; i += block_size)
+            const int next_qk_stage = active_qk_stage ^ 1;
+            const bool has_next_row = t + 1 < effective_seq_len;
+            if (has_next_row)
             {
-                q_local[i] = q_src[i];
-                k_local[i] = k_src[i];
-            }
-            __syncthreads();
-
-            // Q/K and gate preprocessing can be shared by all column tiles. The
-            // CUDA wrapper runs that separate graph-capturable kernel for
-            // prefill so this recurrence kernel only handles the sequential
-            // delta-rule state update.
-            if (!inputs_preprocessed && use_qk_l2norm)
-            {
-                int warp_id = tid / 32;
-                int lane_id = tid % 32;
-                int num_warps = (block_size + 31) / 32;
-
-                // Q norm
-                float q_sum = 0.0f;
-                for (int i = tid; i < d_k; i += block_size)
-                    q_sum += q_local[i] * q_local[i];
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
-                if (lane_id == 0)
-                    warp_sums[warp_id] = q_sum;
-                __syncthreads();
-                if (tid == 0)
-                {
-                    float total = 0.0f;
-                    for (int w = 0; w < num_warps; w++)
-                        total += warp_sums[w];
-                    warp_sums[0] = total;
-                }
-                __syncthreads();
-                float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-                for (int i = tid; i < d_k; i += block_size)
-                    q_local[i] *= q_inv;
-                __syncthreads();
-
-                // K norm
-                float k_sum = 0.0f;
-                for (int i = tid; i < d_k; i += block_size)
-                    k_sum += k_local[i] * k_local[i];
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
-                if (lane_id == 0)
-                    warp_sums[warp_id] = k_sum;
-                __syncthreads();
-                if (tid == 0)
-                {
-                    float total = 0.0f;
-                    for (int w = 0; w < num_warps; w++)
-                        total += warp_sums[w];
-                    warp_sums[0] = total;
-                }
-                __syncthreads();
-                float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
-                for (int i = tid; i < d_k; i += block_size)
-                    k_local[i] *= k_inv;
-                __syncthreads();
-            }
-            else if (!inputs_preprocessed)
-            {
-                for (int i = tid; i < d_k; i += block_size)
-                    q_local[i] *= scale;
-                __syncthreads();
+                const int next_row = row + 1;
+                cuda_gdn_stage_qk_async<D_K>(
+                    q_stages + next_qk_stage * D_K,
+                    k_stages + next_qk_stage * D_K,
+                    Q + next_row * qk_stride + h * D_K,
+                    K + next_row * qk_stride + h * D_K);
             }
 
-            // Gate and beta (thread 0 computes, broadcast via shared mem)
-            float decay, beta_h;
-            if (inputs_preprocessed)
-            {
-                const int gate_idx = t * n_heads + h;
-                decay = alpha[gate_idx];
-                beta_h = beta_raw[gate_idx];
-            }
-            else
-            {
-                if (tid == 0)
-                {
-                    float x = alpha[t * n_heads + h] + dt_bias_h;
-                    float sp = (x > 20.0f) ? x : log1pf(expf(x));
-                    warp_sums[0] = expf(A_log_h * sp);
-                    warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
-                }
-                __syncthreads();
-                decay = warp_sums[0];
-                beta_h = warp_sums[1];
-            }
+            const float *q_local = q_stages + active_qk_stage * D_K;
+            const float *k_local = k_stages + active_qk_stage * D_K;
+
+            // The mandatory captured preprocessor publishes canonical Q/K and
+            // gate values before this kernel. Long recurrence has no second
+            // preprocessing regime or hidden scalar path.
+            const int gate_idx = row * n_heads + h;
+            const float decay_h = decay[gate_idx];
+            const float beta_h = beta[gate_idx];
 
             float partial_kv = 0.0f;
             if (vi < d_v)
@@ -421,19 +689,32 @@ namespace
 #pragma unroll
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
                 {
-                    sc[j] *= decay;
+                    sc[j] *= decay_h;
                     partial_kv += sc[j] * k_local[j_start + j];
                 }
             }
-            reduce_kv[tid] = partial_kv;
-            __syncthreads();
+            float kv = 0.0f;
+            // Every lane named by the full-warp mask participates, including
+            // lanes assigned to a padded tail column.  Their partial is zero,
+            // which keeps the exchange valid without changing a real column.
+#pragma unroll
+            for (int s = 0; s < ROW_SPLIT; ++s)
+            {
+                // Preserve the historical arithmetic exactly: partition zero
+                // is added first and partition seven last.  A tree reduction
+                // would be faster-looking but would change rounding and break
+                // serial-decode byte equivalence.
+                const int source_lane =
+                    s * COLUMNS_PER_WARP + col_in_warp;
+                kv += __shfl_sync(
+                    0xFFFFFFFF,
+                    partial_kv,
+                    source_lane);
+            }
 
             float delta = 0.0f;
             if (vi < d_v)
             {
-                float kv = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    kv += reduce_kv[col_in_block + s * cols_per_block];
                 delta = (v_src[vi] - kv) * beta_h;
             }
 
@@ -447,35 +728,51 @@ namespace
                     partial_out += sc[j] * q_local[j_start + j];
                 }
             }
-            reduce_out[tid] = partial_out;
-            __syncthreads();
-
+            float out_vi = 0.0f;
+#pragma unroll
+            for (int s = 0; s < ROW_SPLIT; ++s)
+            {
+                const int source_lane =
+                    s * COLUMNS_PER_WARP + col_in_warp;
+                out_vi += __shfl_sync(
+                    0xFFFFFFFF,
+                    partial_out,
+                    source_lane);
+            }
             if (vi < d_v && split_id == 0)
             {
-                float out_vi = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    out_vi += reduce_out[col_in_block + s * cols_per_block];
                 o_dst[vi] = out_vi;
             }
 
-            if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows && vi < d_v)
+            if (state_snapshots &&
+                t < effective_seq_len &&
+                row < max_snapshot_rows &&
+                vi < d_v)
             {
                 float *snapshot =
                     state_snapshots +
-                    static_cast<size_t>(t) * static_cast<size_t>(snapshot_stride_floats) +
-                    static_cast<size_t>(h) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v);
+                    static_cast<size_t>(row) * static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(h) * static_cast<size_t>(D_K) * static_cast<size_t>(d_v);
 #pragma unroll
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
                     snapshot[(j_start + j) * d_v + vi] = sc[j];
             }
-            __syncthreads();
+            if (has_next_row)
+            {
+                // Every thread finishes consuming the active stage before any
+                // thread may recycle it two iterations later.  The same edge
+                // also publishes the completed asynchronous next-row stage.
+                cuda_gdn_wait_qk_async();
+                __syncthreads();
+                active_qk_stage = next_qk_stage;
+            }
         }
 
         if (vi < d_v)
         {
 #pragma unroll
             for (int j = 0; j < ROWS_PER_SPLIT; ++j)
-                S[(j_start + j) * d_v + vi] = sc[j];
+                S_updated[(j_start + j) * d_v + vi] = sc[j];
         }
     }
 
@@ -486,73 +783,87 @@ namespace
         float *__restrict__ beta_raw,
         const float *__restrict__ A_log,
         const float *__restrict__ dt_bias,
-        int seq_len, int n_heads, int d_k,
+        const int *__restrict__ effective_seq_lens,
+        int request_count, int request_seq_len,
+        int n_heads, int d_k,
         bool use_qk_l2norm)
     {
-        const int h = blockIdx.x;
-        const int t = blockIdx.y;
-        if (h >= n_heads || t >= seq_len)
+        const int work = blockIdx.x;
+        const int h = work % n_heads;
+        const int row = work / n_heads;
+        const int request = row / request_seq_len;
+        const int request_row = row - request * request_seq_len;
+        if (request >= request_count || h >= n_heads)
+            return;
+        if (effective_seq_lens)
+        {
+            const int raw_effective = effective_seq_lens[request];
+            const int effective = raw_effective < 0
+                                      ? 0
+                                      : (raw_effective > request_seq_len
+                                             ? request_seq_len
+                                             : raw_effective);
+            if (request_row >= effective)
+                return;
+        }
+
+        if (row >= request_count * request_seq_len)
             return;
 
         const int tid = threadIdx.x;
         const int block_size = blockDim.x;
         const int qk_stride = n_heads * d_k;
-        const float scale = rsqrtf(static_cast<float>(d_k));
+        const float scale = cuda_gdn_query_scale(d_k);
 
-        float *q_head = Q + t * qk_stride + h * d_k;
-        float *k_head = K + t * qk_stride + h * d_k;
+        float *q_head = Q + row * qk_stride + h * d_k;
+        float *k_head = K + row * qk_stride + h * d_k;
 
-        __shared__ float warp_sums[8];
-        const int warp_id = tid / 32;
+        // Decode uses one fixed warp to reduce D_K. Long prefill must use that
+        // same tree so preprocessing does not introduce a batch-size-dependent
+        // rounding regime before the recurrent kernel begins.
+        __shared__ float norm_sum;
         const int lane_id = tid % 32;
-        const int num_warps = (block_size + 31) / 32;
 
         if (use_qk_l2norm)
         {
-            float q_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
+            if (tid < 32)
             {
-                const float qv = q_head[i];
-                q_sum += qv * qv;
-            }
-            for (int offset = 16; offset > 0; offset >>= 1)
-                q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
-            if (lane_id == 0)
-                warp_sums[warp_id] = q_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                for (int w = 0; w < num_warps; ++w)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
+                float q_sum = 0.0f;
+                for (int i = lane_id; i < d_k; i += 32)
+                {
+                    const float qv = q_head[i];
+                    q_sum += qv * qv;
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    q_sum +=
+                        __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
+                if (lane_id == 0)
+                    norm_sum = q_sum;
             }
             __syncthreads();
-            const float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            const float q_inv =
+                scale / fmaxf(sqrtf(norm_sum), 1e-6f);
             for (int i = tid; i < d_k; i += block_size)
                 q_head[i] *= q_inv;
             __syncthreads();
 
-            float k_sum = 0.0f;
-            for (int i = tid; i < d_k; i += block_size)
+            if (tid < 32)
             {
-                const float kv = k_head[i];
-                k_sum += kv * kv;
-            }
-            for (int offset = 16; offset > 0; offset >>= 1)
-                k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
-            if (lane_id == 0)
-                warp_sums[warp_id] = k_sum;
-            __syncthreads();
-            if (tid == 0)
-            {
-                float total = 0.0f;
-                for (int w = 0; w < num_warps; ++w)
-                    total += warp_sums[w];
-                warp_sums[0] = total;
+                float k_sum = 0.0f;
+                for (int i = lane_id; i < d_k; i += 32)
+                {
+                    const float kv = k_head[i];
+                    k_sum += kv * kv;
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    k_sum +=
+                        __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
+                if (lane_id == 0)
+                    norm_sum = k_sum;
             }
             __syncthreads();
-            const float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            const float k_inv =
+                1.0f / fmaxf(sqrtf(norm_sum), 1e-6f);
             for (int i = tid; i < d_k; i += block_size)
                 k_head[i] *= k_inv;
         }
@@ -564,7 +875,7 @@ namespace
 
         if (tid == 0)
         {
-            const int gate_idx = t * n_heads + h;
+            const int gate_idx = row * n_heads + h;
             const float x = alpha[gate_idx] + dt_bias[h];
             const float sp = (x > 20.0f) ? x : log1pf(expf(x));
             alpha[gate_idx] = expf(A_log[h] * sp);
@@ -584,7 +895,8 @@ namespace
         const float *__restrict__ weight, // [channels, kernel_size]
         const float *__restrict__ bias,   // [channels] or nullptr
         float *__restrict__ output,       // [channels]
-        float *__restrict__ conv_state,   // [channels, kernel_size-1]
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int channels, int kernel_size,
         bool apply_silu)
     {
@@ -598,7 +910,7 @@ namespace
         // (must compute before shift to avoid overwriting state values)
         float sum = 0.0f;
         for (int k = 0; k < ks_minus1; k++)
-            sum += conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
+            sum += initial_conv_state[ch * ks_minus1 + k] * weight[ch * kernel_size + k];
         sum += input[ch] * weight[ch * kernel_size + ks_minus1];
 
         if (bias)
@@ -612,8 +924,9 @@ namespace
 
         // Now shift conv_state left by 1, insert new input at the end
         for (int k = 0; k < ks_minus1 - 1; k++)
-            conv_state[ch * ks_minus1 + k] = conv_state[ch * ks_minus1 + k + 1];
-        conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
+            updated_conv_state[ch * ks_minus1 + k] =
+                initial_conv_state[ch * ks_minus1 + k + 1];
+        updated_conv_state[ch * ks_minus1 + ks_minus1 - 1] = input[ch];
     }
 
     // =========================================================================
@@ -628,7 +941,7 @@ namespace
         const float *__restrict__ weight, // [channels, kernel_size]
         const float *__restrict__ bias,   // [channels] or nullptr
         float *__restrict__ output,       // [seq_len, channels]
-        float *__restrict__ conv_state,   // [channels, kernel_size-1] (updated at end)
+        const float *__restrict__ initial_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -661,8 +974,8 @@ namespace
                 float val = 0.0f;
                 if (src_t >= 0)
                     val = input[src_t * channels + ch];
-                else if (conv_state)
-                    val = conv_state[ch * ks_minus1 + ks_minus1 + src_t];
+                else if (initial_conv_state)
+                    val = initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t];
                 sum += val * weight[ch * kernel_size + k];
             }
 
@@ -684,7 +997,7 @@ namespace
                 const int src_t = t - ks_minus1 + 1 + state_idx;
                 snapshot[state_idx] =
                     (src_t >= 0) ? input[src_t * channels + ch]
-                                 : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+                                 : (initial_conv_state ? initial_conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
             }
         }
     }
@@ -692,18 +1005,20 @@ namespace
     /**
      * @brief Decode-equivalent grouped short-conv kernel for MTP verifier rows.
      *
-     * MTP verifier groups are tiny (M=2..4).  The long-prefill kernel uses a
-     * second launch to update live state safely; doing that for verifier rows
-     * burns most of the M=2 win.  This kernel keeps one lane responsible for a
-     * channel, walks the small row group in causal order, writes every row
-     * snapshot, and only then publishes the channel's final live state.
+     * The long-prefill kernel uses a second launch to update live state safely.
+     * A verifier already needs every post-row snapshot, so this kernel keeps one
+     * lane responsible for a channel, walks the runtime-sized row group in
+     * causal order, writes every snapshot, and only then commits the channel's
+     * final speculative state. There is one launch for the complete matrix and
+     * no host or launch-level row replay.
      */
     __global__ void cuda_short_conv1d_small_m_kernel(
         const float *__restrict__ input,
         const float *__restrict__ weight,
         const float *__restrict__ bias,
         float *__restrict__ output,
-        float *__restrict__ conv_state,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         float *__restrict__ state_snapshots,
         int snapshot_stride_floats,
@@ -729,9 +1044,9 @@ namespace
 
         const float *channel_weight =
             weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
-        const float *initial_state =
-            conv_state
-                ? conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1)
+        const float *channel_initial_state =
+            initial_conv_state
+                ? initial_conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1)
                 : nullptr;
 
         for (int t = 0; t < seq_len; ++t)
@@ -745,8 +1060,8 @@ namespace
                     const float val =
                         (src_t >= 0)
                             ? input[static_cast<size_t>(src_t) * channels + ch]
-                            : (initial_state
-                                   ? initial_state[ks_minus1 + src_t]
+                            : (channel_initial_state
+                                   ? channel_initial_state[ks_minus1 + src_t]
                                    : 0.0f);
                     sum += val * channel_weight[k];
                 }
@@ -770,36 +1085,39 @@ namespace
                     snapshot[state_idx] =
                         (src_t >= 0)
                             ? input[static_cast<size_t>(src_t) * channels + ch]
-                            : (initial_state
-                                   ? initial_state[ks_minus1 + src_t]
+                            : (channel_initial_state
+                                   ? channel_initial_state[ks_minus1 + src_t]
                                    : 0.0f);
                 }
             }
         }
 
-        if (conv_state)
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr && max_snapshot_rows >= seq_len;
+        if (updated_conv_state && !terminal_state_is_snapshotted)
         {
             float *state =
-                conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+                updated_conv_state + static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
             for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
             {
                 const int src_t = effective_seq_len - ks_minus1 + state_idx;
                 state[state_idx] =
                     (src_t >= 0 && src_t < effective_seq_len)
                         ? input[static_cast<size_t>(src_t) * channels + ch]
-                        : initial_state[ks_minus1 + src_t];
+                    : channel_initial_state[ks_minus1 + src_t];
             }
         }
     }
 
     __global__ void cuda_short_conv1d_state_update_kernel(
         const float *__restrict__ input,
-        float *__restrict__ conv_state,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         const int *__restrict__ effective_seq_len_ptr,
         int seq_len, int channels, int kernel_size)
     {
         int ch = blockIdx.x * blockDim.x + threadIdx.x;
-        if (ch >= channels || !conv_state)
+        if (ch >= channels || !initial_conv_state || !updated_conv_state)
             return;
 
         const int ks_minus1 = kernel_size - 1;
@@ -813,13 +1131,270 @@ namespace
             effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
         }
 
-        float *state = conv_state + ch * ks_minus1;
+        const float *initial_state = initial_conv_state + ch * ks_minus1;
+        float *updated_state = updated_conv_state + ch * ks_minus1;
         for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
         {
             const int src_t = effective_seq_len - ks_minus1 + state_idx;
-            state[state_idx] =
+            updated_state[state_idx] =
                 (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
-                                                           : state[ks_minus1 + src_t];
+                                                           : initial_state[ks_minus1 + src_t];
+        }
+    }
+
+    /**
+     * @brief Grouped short-conv for small request-local row groups.
+     *
+     * One lane owns one `(request, channel)` pair and advances that channel in
+     * row order. This preserves the scalar decode accumulation order while a
+     * single launch covers the entire request matrix. Padded rows are zeroed,
+     * and each request commits state after its own device-resident real length.
+     */
+    __global__ void cuda_short_conv1d_batched_small_m_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ weight,
+        const float *__restrict__ bias,
+        float *__restrict__ output,
+        const float *initial_request_states,
+        float *updated_request_states,
+        const int *__restrict__ request_seq_lens,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size,
+        bool apply_silu)
+    {
+        const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+        const int request = blockIdx.y;
+        if (ch >= channels || request >= request_count)
+            return;
+
+        const int ks_minus1 = kernel_size - 1;
+        if (ks_minus1 <= 0)
+            return;
+
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t row_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len);
+        const size_t element_base = row_base * static_cast<size_t>(channels);
+        const size_t state_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(channels) *
+            static_cast<size_t>(ks_minus1);
+        const float *channel_initial_state =
+            initial_request_states + state_base +
+            static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+        float *channel_updated_state =
+            updated_request_states + state_base +
+            static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+        const float *channel_weight =
+            weight + static_cast<size_t>(ch) * static_cast<size_t>(kernel_size);
+
+        for (int t = 0; t < request_seq_len; ++t)
+        {
+            float sum = 0.0f;
+            if (t < real_len)
+            {
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    const int src_t = t - ks_minus1 + k;
+                    const float value =
+                        src_t >= 0
+                            ? input[element_base +
+                                    static_cast<size_t>(src_t) * channels + ch]
+                            : channel_initial_state[ks_minus1 + src_t];
+                    sum += value * channel_weight[k];
+                }
+                if (bias)
+                    sum += bias[ch];
+                if (apply_silu)
+                    sum = sum / (1.0f + expf(-sum));
+            }
+            output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+            const int snapshot_row =
+                request * request_seq_len + t;
+            if (state_snapshots &&
+                t < real_len &&
+                snapshot_row < max_snapshot_rows)
+            {
+                float *snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(snapshot_row) *
+                        static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+                for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+                {
+                    const int src_t = t - ks_minus1 + 1 + state_idx;
+                    snapshot[state_idx] =
+                        src_t >= 0
+                            ? input[element_base +
+                                    static_cast<size_t>(src_t) * channels + ch]
+                            : channel_initial_state[ks_minus1 + src_t];
+                }
+            }
+        }
+
+        const bool terminal_state_is_snapshotted =
+            state_snapshots != nullptr &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (!terminal_state_is_snapshotted)
+        {
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = real_len - ks_minus1 + state_idx;
+                channel_updated_state[state_idx] =
+                    src_t >= 0 && src_t < real_len
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_initial_state[ks_minus1 + src_t];
+            }
+        }
+    }
+
+    /**
+     * @brief Grouped long-prefill convolution over flattened request rows.
+     *
+     * Every thread computes one `(request, row, channel)` output. Request-local
+     * indexing prevents padding or a neighboring request from entering the
+     * causal window. State publication is performed by the companion grouped
+     * commit kernel after all outputs have stopped reading initial state.
+     */
+    __global__ void cuda_short_conv1d_batched_prefill_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ weight,
+        const float *__restrict__ bias,
+        float *__restrict__ output,
+        const float *__restrict__ request_states,
+        const int *__restrict__ request_seq_lens,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size,
+        bool apply_silu)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int request_elements = request_seq_len * channels;
+        const int total = request_count * request_elements;
+        if (idx >= total)
+            return;
+
+        const int request = idx / request_elements;
+        const int request_element = idx - request * request_elements;
+        const int t = request_element / channels;
+        const int ch = request_element - t * channels;
+        const int ks_minus1 = kernel_size - 1;
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t row_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len);
+        const size_t element_base = row_base * static_cast<size_t>(channels);
+        const float *channel_state =
+            request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+
+        float sum = 0.0f;
+        if (t < real_len)
+        {
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                const int src_t = t - ks_minus1 + k;
+                const float value =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+                sum += value * weight[ch * kernel_size + k];
+            }
+            if (bias)
+                sum += bias[ch];
+            if (apply_silu)
+                sum = sum / (1.0f + expf(-sum));
+        }
+        output[element_base + static_cast<size_t>(t) * channels + ch] = sum;
+
+        const int snapshot_row = request * request_seq_len + t;
+        if (state_snapshots &&
+            t < real_len &&
+            snapshot_row < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(snapshot_row) *
+                    static_cast<size_t>(snapshot_stride_floats) +
+                static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = t - ks_minus1 + 1 + state_idx;
+                snapshot[state_idx] =
+                    src_t >= 0
+                        ? input[element_base +
+                                static_cast<size_t>(src_t) * channels + ch]
+                        : channel_state[ks_minus1 + src_t];
+            }
+        }
+    }
+
+    /** @brief Commit each request's terminal real-row convolution state. */
+    __global__ void cuda_short_conv1d_batched_state_update_kernel(
+        const float *__restrict__ input,
+        const float *initial_request_states,
+        float *updated_request_states,
+        const int *__restrict__ request_seq_lens,
+        int request_count,
+        int request_seq_len,
+        int channels,
+        int kernel_size)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = request_count * channels;
+        if (idx >= total)
+            return;
+
+        const int request = idx / channels;
+        const int ch = idx - request * channels;
+        const int ks_minus1 = kernel_size - 1;
+        if (ks_minus1 <= 0)
+            return;
+        const int raw_real_len = request_seq_lens[request];
+        const int real_len =
+            raw_real_len < 0 ? 0 :
+            (raw_real_len > request_seq_len ? request_seq_len : raw_real_len);
+        const size_t element_base =
+            static_cast<size_t>(request) *
+            static_cast<size_t>(request_seq_len) *
+            static_cast<size_t>(channels);
+        const float *channel_initial_state =
+            initial_request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+        float *channel_updated_state =
+            updated_request_states +
+            static_cast<size_t>(request) * channels * ks_minus1 +
+            static_cast<size_t>(ch) * ks_minus1;
+
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = real_len - ks_minus1 + state_idx;
+            channel_updated_state[state_idx] =
+                src_t >= 0 && src_t < real_len
+                    ? input[element_base +
+                            static_cast<size_t>(src_t) * channels + ch]
+                    : channel_initial_state[ks_minus1 + src_t];
         }
     }
 
@@ -1071,6 +1646,7 @@ namespace
         const int *__restrict__ row_indices,
         int request_count,
         int row_index_stride,
+        int request_row_width,
         int rows,
         int state_size)
     {
@@ -1089,7 +1665,11 @@ namespace
         {
             const int request = linear / state_size;
             const int state_offset = linear - request * state_size;
-            const int row = row_indices[request * row_index_stride];
+            const int metadata_value = row_indices[request * row_index_stride];
+            const int row =
+                request_row_width > 0
+                    ? request * request_row_width + metadata_value - 1
+                    : metadata_value;
             if (row < 0 || row >= rows)
                 continue;
             dst[linear] =
@@ -1098,26 +1678,89 @@ namespace
         }
     }
 
+    /**
+     * @brief Convert rank-major allgather output to modulo-linked group order.
+     *
+     * Prefix groups describe Q and K when present. Value groups are one group
+     * per modulo repeat. Every group is uniformly partitioned by key-head
+     * ownership, so each output element resolves to exactly one participant
+     * and one participant-local offset without a lookup table.
+     */
+    __global__ void cuda_gdn_reassemble_modulo_linked_state_kernel(
+        const float *__restrict__ gathered,
+        float *__restrict__ full,
+        int degree,
+        int global_key_heads,
+        int repeat_factor,
+        int key_elements_per_head,
+        int value_elements_per_head,
+        int prefix_group_count)
+    {
+        if (!gathered || !full ||
+            degree <= 0 || global_key_heads <= 0 ||
+            global_key_heads % degree != 0 || repeat_factor <= 0 ||
+            key_elements_per_head < 0 || value_elements_per_head <= 0 ||
+            prefix_group_count < 0)
+        {
+            return;
+        }
+
+        const int local_key_heads = global_key_heads / degree;
+        const int local_key_group =
+            local_key_heads * key_elements_per_head;
+        const int full_key_group =
+            global_key_heads * key_elements_per_head;
+        const int local_value_group =
+            local_key_heads * value_elements_per_head;
+        const int full_value_group =
+            global_key_heads * value_elements_per_head;
+        const int local_prefix = prefix_group_count * local_key_group;
+        const int full_prefix = prefix_group_count * full_key_group;
+        const int local_state_size =
+            local_prefix + repeat_factor * local_value_group;
+        const int full_state_size =
+            full_prefix + repeat_factor * full_value_group;
+        const int stride = blockDim.x * gridDim.x;
+        for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+             idx < full_state_size;
+             idx += stride)
+        {
+            int participant = 0;
+            int participant_offset = 0;
+            if (idx < full_prefix)
+            {
+                const int group = idx / full_key_group;
+                const int within_group = idx - group * full_key_group;
+                participant = within_group / local_key_group;
+                participant_offset =
+                    group * local_key_group + within_group % local_key_group;
+            }
+            else
+            {
+                const int value_offset = idx - full_prefix;
+                const int repeat = value_offset / full_value_group;
+                const int within_group =
+                    value_offset - repeat * full_value_group;
+                participant = within_group / local_value_group;
+                participant_offset =
+                    local_prefix + repeat * local_value_group +
+                    within_group % local_value_group;
+            }
+            full[idx] = gathered[
+                static_cast<size_t>(participant) *
+                    static_cast<size_t>(local_state_size) +
+                static_cast<size_t>(participant_offset)];
+        }
+    }
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
-// GPU Memory Management Helpers (called from headers via extern "C")
+// GPU transfer helpers (called from headers via extern "C")
 // =========================================================================
 
 extern "C"
 {
-
-    bool cudaGDN_gpu_malloc(float **ptr, size_t count)
-    {
-        cudaError_t err = cudaMalloc(ptr, count * sizeof(float));
-        return err == cudaSuccess;
-    }
-
-    void cudaGDN_gpu_free(float *ptr)
-    {
-        if (ptr)
-            cudaFree(ptr);
-    }
 
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count)
     {
@@ -1239,6 +1882,7 @@ extern "C"
             device_row_indices,
             request_count,
             row_index_stride,
+            /*request_row_width=*/0,
             rows,
             state_size);
         cudaError_t err = cudaGetLastError();
@@ -1246,6 +1890,129 @@ extern "C"
         {
             fprintf(stderr,
                     "[cudaGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths(
+        float *dst,
+        const float *capture,
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        int rows,
+        int state_size,
+        int device_idx,
+        void *stream)
+    {
+        if (!dst || !capture || !device_request_seq_lens ||
+            request_count <= 0 || request_row_width <= 0 ||
+            rows < request_count * request_row_width ||
+            state_size <= 0 || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        constexpr int threads = 256;
+        int blocks = ((request_count * state_size) + threads - 1) / threads;
+        blocks = std::max(1, std::min(blocks, 1024));
+        cuda_gdn_copy_capture_rows_from_device_indices_kernel<<<
+            blocks,
+            threads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            dst,
+            capture,
+            device_request_seq_lens,
+            request_count,
+            /*row_index_stride=*/1,
+            request_row_width,
+            rows,
+            state_size);
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_gpu_copy_capture_terminal_rows_from_device_lengths] %s\n",
+                    cudaGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaGDN_reassemble_modulo_linked_state(
+        const float *gathered,
+        float *full,
+        int degree,
+        int global_key_heads,
+        int global_value_heads,
+        int key_elements_per_head,
+        int value_elements_per_head,
+        int prefix_group_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!gathered || !full || !stream ||
+            degree <= 0 || global_key_heads <= 0 ||
+            global_value_heads <= 0 ||
+            global_key_heads % degree != 0 ||
+            global_value_heads % global_key_heads != 0 ||
+            (prefix_group_count != 0 && prefix_group_count != 2) ||
+            (prefix_group_count > 0 && key_elements_per_head <= 0) ||
+            value_elements_per_head <= 0)
+        {
+            return false;
+        }
+
+        const long long full_state_size_wide =
+            static_cast<long long>(prefix_group_count) * global_key_heads *
+                key_elements_per_head +
+            static_cast<long long>(global_value_heads) *
+                value_elements_per_head;
+        if (full_state_size_wide <= 0 ||
+            full_state_size_wide > std::numeric_limits<int>::max())
+        {
+            return false;
+        }
+
+        cudaError_t set_err = cudaSetDevice(device_idx);
+        if (set_err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_reassemble_modulo_linked_state] cudaSetDevice(%d) failed: %s\n",
+                    device_idx,
+                    cudaGetErrorString(set_err));
+            return false;
+        }
+        (void)cudaGetLastError();
+        const int full_state_size = static_cast<int>(full_state_size_wide);
+        constexpr int threads = 256;
+        int blocks = (full_state_size + threads - 1) / threads;
+        if (blocks < 1)
+            blocks = 1;
+        if (blocks > 1024)
+            blocks = 1024;
+        cuda_gdn_reassemble_modulo_linked_state_kernel<<<
+            blocks,
+            threads,
+            0,
+            (cudaStream_t)stream>>>(
+            gathered,
+            full,
+            degree,
+            global_key_heads,
+            global_value_heads / global_key_heads,
+            key_elements_per_head,
+            value_elements_per_head,
+            prefix_group_count);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_reassemble_modulo_linked_state] %s\n",
                     cudaGetErrorString(err));
             return false;
         }
@@ -1267,15 +2034,46 @@ extern "C"
         int d_k, int d_v, int global_v_offset,
         int device_idx, void *stream)
     {
-        cudaSetDevice(device_idx);
+        cudaError_t set_device_err = cudaSetDevice(device_idx);
+        if (set_device_err != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] cudaSetDevice(%d) failed: %s "
+                    "merged=%p out_q=%p out_k=%p out_v=%p stream=%p\n",
+                    device_idx, cudaGetErrorString(set_device_err),
+                    (const void *)merged, (void *)out_q, (void *)out_k, (void *)out_v, stream);
+            return false;
+        }
 
         int q_dst_dim = n_v_heads * d_k;
         int k_dst_dim = n_v_heads * d_k;
         int v_dim = n_v_heads * d_v;
         int total = seq_len * (q_dst_dim + k_dst_dim + v_dim);
+        if (seq_len <= 0 || n_k_heads <= 0 || n_v_heads <= 0 ||
+            d_k <= 0 || d_v <= 0 || total <= 0)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] invalid launch geometry: "
+                    "seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                    "global_v_offset=%d total=%d stream=%p\n",
+                    seq_len, n_k_heads, n_v_heads, d_k, d_v,
+                    global_v_offset, total, stream);
+            return false;
+        }
 
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
+        cudaError_t pre_launch_sticky = cudaPeekAtLastError();
+        cudaStreamCaptureStatus pre_capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t pre_capture_query =
+            stream ? cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &pre_capture_status) : cudaSuccess;
+        cudaError_t pre_stream_query = cudaSuccess;
+        if (stream &&
+            pre_capture_query == cudaSuccess &&
+            pre_capture_status == cudaStreamCaptureStatusNone)
+        {
+            pre_stream_query = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+        }
 
         cuda_gdn_deinterleave_qkv_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
             merged, out_q, out_k, out_v,
@@ -1284,7 +2082,31 @@ extern "C"
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "[cudaGDN_deinterleave_qkv] %s\n", cudaGetErrorString(err));
+            int current_device = -1;
+            (void)cudaGetDevice(&current_device);
+            cudaError_t post_stream_query = cudaSuccess;
+            if (stream &&
+                pre_capture_query == cudaSuccess &&
+                pre_capture_status == cudaStreamCaptureStatusNone)
+            {
+                post_stream_query = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+            }
+            fprintf(stderr,
+                    "[cudaGDN_deinterleave_qkv] %s "
+                    "(seq_len=%d n_k_heads=%d n_v_heads=%d d_k=%d d_v=%d "
+                    "global_v_offset=%d total=%d blocks=%d requested_device=%d current_device=%d "
+                    "merged=%p out_q=%p out_k=%p out_v=%p stream=%p "
+                    "pre_sticky=%s pre_stream_query=%s post_stream_query=%s "
+                    "capture_query=%s capture_status=%d)\n",
+                    cudaGetErrorString(err), seq_len, n_k_heads, n_v_heads,
+                    d_k, d_v, global_v_offset, total, blocks,
+                    device_idx, current_device,
+                    (const void *)merged, (void *)out_q, (void *)out_k, (void *)out_v, stream,
+                    cudaGetErrorString(pre_launch_sticky),
+                    cudaGetErrorString(pre_stream_query),
+                    cudaGetErrorString(post_stream_query),
+                    cudaGetErrorString(pre_capture_query),
+                    static_cast<int>(pre_capture_status));
             return false;
         }
         return true;
@@ -1303,42 +2125,33 @@ extern "C"
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
 
-        // 2D grid: x=heads, y=column tiles (32 threads = 1 warp per block)
-        int col_threads = 32;
-        if (d_v > 128)
-            col_threads = 64;
-        int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-        int smem_size = 2 * d_k * sizeof(float) + 8 * sizeof(float); // q_local + k_local + warp_sums
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        return launch_cuda_gdn_recurrent_step(
+            "cudaGDN_recurrent_step",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
-            output, state,
-            n_heads, d_k, d_v, use_qk_l2norm,
+            output, initial_state, updated_state,
+            /*request_count=*/1, /*request_seq_len=*/1,
+            n_heads, d_k, d_v,
+            use_qk_l2norm,
             nullptr,
-            -1);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_recurrent_step] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            -1,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0,
+            static_cast<cudaStream_t>(stream));
     }
 
     bool cudaGDN_recurrent_step_effective_row(
         const float *q, const float *k, const float *v,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -1347,35 +2160,28 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int col_threads = 32;
-        if (d_v > 128)
-            col_threads = 64;
-        const int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-        const int smem_size = 2 * d_k * sizeof(float) + 8 * sizeof(float);
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_recurrent_step_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        return launch_cuda_gdn_recurrent_step(
+            "cudaGDN_recurrent_step_effective_row",
             q, k, v, alpha, beta_raw, A_log, dt_bias,
-            output, state,
-            n_heads, d_k, d_v, use_qk_l2norm,
+            output, initial_state, updated_state,
+            /*request_count=*/1, /*request_seq_len=*/1,
+            n_heads, d_k, d_v,
+            use_qk_l2norm,
             device_effective_seq_len,
-            row_idx);
-
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_recurrent_step_effective_row] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            row_idx,
+            /*state_snapshots=*/nullptr,
+            /*snapshot_stride_floats=*/0,
+            /*max_snapshot_rows=*/0,
+            static_cast<cudaStream_t>(stream));
     }
 
-    bool cudaGDN_chunk_forward_kernel_route(
+    bool cudaGDN_chunk_forward_batched_kernel_route(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
-        int seq_len, int n_heads, int d_k, int d_v,
+        float *output, const float *initial_state, float *updated_state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
         int snapshot_stride_floats,
@@ -1384,25 +2190,82 @@ extern "C"
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-
-        // Row-split: 256 threads per block, 8 threads per column = 32 cols/block.
-        // More column blocks keep Ampere GPUs occupied during the sequential recurrence.
-        int col_threads = 256;
-        int cols_per_block = col_threads / 8; // 32 columns per block
-        if (d_v <= 64)
+        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !initial_state || !updated_state || !stream ||
+            seq_len <= 0 || request_count <= 0 || request_seq_len <= 0 ||
+            seq_len != request_count * request_seq_len ||
+            n_heads <= 0 || (d_k != 64 && d_k != 128) || d_v <= 0)
         {
-            col_threads = 128;
-            cols_per_block = col_threads / 8; // 16 columns per block
+            return false;
         }
-        int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-        // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
-        int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
 
-        cuda_gdn_prefill_preprocess_kernel<<<dim3(n_heads, seq_len), 64, 0, (cudaStream_t)stream>>>(
+        const int required_snapshot_stride = n_heads * d_k * d_v;
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
+        /*
+         * Small request matrices use the exact scalar recurrence because launch
+         * economy is better than the row-split prefill route. More importantly,
+         * every verifier transaction that supplied a complete post-row state
+         * matrix must use this path regardless of M: publication can select any
+         * row, so each snapshot and output must have scalar decode's arithmetic
+         * schedule. Ordinary long prefill has no complete capture matrix and
+         * retains the throughput-oriented row-split implementation below.
+         */
+        if (request_seq_len <= 8 || complete_verifier_capture)
+        {
+            if (llaminar2::debugEnv().runtime_debug.cuda_gdn_pointer_trace)
+            {
+                fprintf(
+                    stderr,
+                    "[cudaGDN_recurrent_step_batched] requests=%d heads=%d d_k=%d d_v=%d state=%p output=%p lengths=%p\n",
+                    request_count,
+                    n_heads,
+                    d_k,
+                    d_v,
+                    static_cast<const void *>(initial_state),
+                    static_cast<void *>(output),
+                    static_cast<const void *>(device_effective_seq_len));
+            }
+            return launch_cuda_gdn_recurrent_step(
+                "cudaGDN_recurrent_step_batched",
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, initial_state, updated_state,
+                request_count, request_seq_len,
+                n_heads, d_k, d_v,
+                use_qk_l2norm,
+                device_effective_seq_len,
+                /*effective_row_idx=*/0,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                static_cast<cudaStream_t>(stream));
+        }
+
+        // Eight threads retain one deterministic key-row partition per output
+        // column. A 64-thread block owns eight columns, giving the Qwen
+        // D_V=128 geometry 512 independent blocks while retaining exactly the
+        // same within-column arithmetic tree. Profiling selects ten resident
+        // blocks as the best spill-free register/occupancy point on SM86.
+        constexpr int col_threads = 64;
+        constexpr int cols_per_block =
+            col_threads / kGdnRecurrentRowSplit;
+        const int num_col_blocks =
+            (d_v + cols_per_block - 1) / cols_per_block;
+        // Q/K use two shared stages so row t+1 transfers overlap row t's exact
+        // recurrence. No reduction workspace or extra graph binding is needed.
+        const int smem_size = 4 * d_k * sizeof(float);
+
+        const int preprocess_blocks = seq_len * n_heads;
+        cuda_gdn_prefill_preprocess_kernel<<<preprocess_blocks, 64, 0, (cudaStream_t)stream>>>(
             const_cast<float *>(Q), const_cast<float *>(K),
             const_cast<float *>(alpha), const_cast<float *>(beta_raw),
             A_log, dt_bias,
-            seq_len, n_heads, d_k, use_qk_l2norm);
+            device_effective_seq_len,
+            request_count, request_seq_len,
+            n_heads, d_k, use_qk_l2norm);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1410,16 +2273,40 @@ extern "C"
             return false;
         }
 
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
-            Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
-            device_effective_seq_len,
-            state_snapshots,
-            snapshot_stride_floats,
-            max_snapshot_rows,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-            true);
+        const dim3 grid(n_heads, num_col_blocks, request_count);
+        switch (d_k)
+        {
+        case 64:
+            cuda_gdn_chunk_forward_kernel<64>
+                <<<grid, col_threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+                    Q, K, V, alpha, beta_raw,
+                    output, initial_state, updated_state,
+                    device_effective_seq_len,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    request_count, request_seq_len,
+                    n_heads, d_v);
+            break;
+        case 128:
+            cuda_gdn_chunk_forward_kernel<128>
+                <<<grid, col_threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+                    Q, K, V, alpha, beta_raw,
+                    output, initial_state, updated_state,
+                    device_effective_seq_len,
+                    state_snapshots,
+                    snapshot_stride_floats,
+                    max_snapshot_rows,
+                    request_count, request_seq_len,
+                    n_heads, d_v);
+            break;
+        default:
+            fprintf(
+                stderr,
+                "[cudaGDN_chunk_forward] unsupported d_k=%d; expected 64 or 128\n",
+                d_k);
+            return false;
+        }
 
         err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -1430,11 +2317,36 @@ extern "C"
         return true;
     }
 
+    bool cudaGDN_chunk_forward_kernel_route(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, const float *initial_state, float *updated_state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream)
+    {
+        return cudaGDN_chunk_forward_batched_kernel_route(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            seq_len, /*request_count=*/1, /*request_seq_len=*/seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            device_effective_seq_len,
+            device_idx, stream);
+    }
+
     bool cudaGDN_chunk_forward(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         float *state_snapshots,
@@ -1452,7 +2364,7 @@ extern "C"
          */
         return cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+        output, initial_state, updated_state,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
@@ -1465,7 +2377,7 @@ extern "C"
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
-        float *output, float *state,
+        float *output, const float *initial_state, float *updated_state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
@@ -1478,7 +2390,7 @@ extern "C"
 
         const bool ok = cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
-            output, state,
+            output, initial_state, updated_state,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
@@ -1488,9 +2400,47 @@ extern "C"
         return ok;
     }
 
+    /**
+     * @brief Launch one request-grouped recurrence over a padded row matrix.
+     *
+     * The grid's Z dimension owns requests while X/Y retain the production
+     * head/column tiling. Each block reads its request's real length directly
+     * from device memory, so no host loop or scalar replay sits between graph
+     * capture and the recurrent state bank.
+     */
+    bool cudaGDN_chunk_forward_batched_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, const float *initial_state, float *updated_state,
+        int seq_len, int request_count, int request_seq_len,
+        int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        if (!device_effective_seq_lens)
+            return false;
+        return cudaGDN_chunk_forward_batched_kernel_route(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, initial_state, updated_state,
+            seq_len, request_count, request_seq_len,
+            n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            device_effective_seq_lens,
+            device_idx, stream);
+    }
+
     bool cudaGDN_short_conv1d(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         float *state_snapshots,
@@ -1500,12 +2450,38 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len == 1)
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
+        /*
+         * A complete capture matrix identifies verifier execution. Route it
+         * through the one-channel-owner kernel even at M=1 so every post-row
+         * state is materialized for device-side publication. Ordinary decode
+         * and prefill retain their dedicated throughput paths.
+         */
+        if (complete_verifier_capture)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        }
+        else if (seq_len == 1)
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 channels, kernel_size, apply_silu);
         }
         else if (seq_len <= 4)
@@ -1513,7 +2489,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 nullptr,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -1526,7 +2503,7 @@ extern "C"
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output, initial_conv_state,
                 nullptr,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -1534,7 +2511,7 @@ extern "C"
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, conv_state, nullptr,
+                input, initial_conv_state, updated_conv_state, nullptr,
                 seq_len, channels, kernel_size);
         }
 
@@ -1549,7 +2526,9 @@ extern "C"
 
     bool cudaGDN_short_conv1d_effective(
         const float *input, const float *weight, const float *bias,
-        float *output, float *conv_state,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
@@ -1560,12 +2539,32 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        if (seq_len == 1)
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= seq_len;
+
+        if (complete_verifier_capture)
+        {
+            int threads = 256;
+            int blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
+                device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                seq_len, channels, kernel_size, apply_silu);
+        }
+        else if (seq_len == 1)
         {
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_decode_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 channels, kernel_size, apply_silu);
         }
         else if (seq_len <= 4)
@@ -1573,7 +2572,8 @@ extern "C"
             int threads = 256;
             int blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_small_m_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output,
+                initial_conv_state, updated_conv_state,
                 device_effective_seq_len,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -1586,7 +2586,7 @@ extern "C"
             int threads = 256;
             int blocks = (total + threads - 1) / threads;
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, weight, bias, output, conv_state,
+                input, weight, bias, output, initial_conv_state,
                 device_effective_seq_len,
                 state_snapshots,
                 snapshot_stride_floats,
@@ -1594,7 +2594,8 @@ extern "C"
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(
-                input, conv_state, device_effective_seq_len,
+                input, initial_conv_state, updated_conv_state,
+                device_effective_seq_len,
                 seq_len, channels, kernel_size);
         }
 
@@ -1602,6 +2603,100 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[cudaGDN_short_conv1d_effective] %s\n", cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Launch native grouped request-batched short convolution.
+     *
+     * The request dimension is encoded in the launch geometry, so this wrapper
+     * performs no host request loop. Small verifier/decode groups require one
+     * launch; longer prefill uses one output launch plus one race-free grouped
+     * state commit, matching the scalar long-prefill algorithm.
+     */
+    bool cudaGDN_short_conv1d_batched(
+        const float *input, const float *weight, const float *bias,
+        float *output,
+        const float *initial_request_states,
+        float *updated_request_states,
+        int request_count, int request_seq_len,
+        int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_request_seq_lens,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        if (!input || !weight || !output ||
+            !initial_request_states || !updated_request_states ||
+            !device_request_seq_lens || !stream ||
+            request_count <= 0 || request_seq_len <= 0 ||
+            channels <= 0 || kernel_size <= 1)
+        {
+            return false;
+        }
+
+        constexpr int threads = 256;
+        const int required_snapshot_stride = channels * (kernel_size - 1);
+        const bool complete_verifier_capture =
+            state_snapshots != nullptr &&
+            snapshot_stride_floats >= required_snapshot_stride &&
+            max_snapshot_rows >= request_count * request_seq_len;
+        if (request_seq_len <= 4 || complete_verifier_capture)
+        {
+            const int channel_blocks = (channels + threads - 1) / threads;
+            cuda_short_conv1d_batched_small_m_kernel<<<
+                dim3(channel_blocks, request_count),
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, weight, bias, output,
+                initial_request_states, updated_request_states,
+                device_request_seq_lens,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+                request_count, request_seq_len,
+                channels, kernel_size, apply_silu);
+        }
+        else
+        {
+            const int output_elements =
+                request_count * request_seq_len * channels;
+            const int output_blocks =
+                (output_elements + threads - 1) / threads;
+            cuda_short_conv1d_batched_prefill_kernel<<<
+                output_blocks,
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, weight, bias, output, initial_request_states,
+                device_request_seq_lens,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+                request_count, request_seq_len,
+                channels, kernel_size, apply_silu);
+
+            const int state_elements = request_count * channels;
+            const int state_blocks =
+                (state_elements + threads - 1) / threads;
+            cuda_short_conv1d_batched_state_update_kernel<<<
+                state_blocks,
+                threads,
+                0,
+                static_cast<cudaStream_t>(stream)>>>(
+                input, initial_request_states, updated_request_states,
+                device_request_seq_lens,
+                request_count, request_seq_len, channels, kernel_size);
+        }
+
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            fprintf(stderr,
+                    "[cudaGDN_short_conv1d_batched] %s\n",
+                    cudaGetErrorString(error));
             return false;
         }
         return true;

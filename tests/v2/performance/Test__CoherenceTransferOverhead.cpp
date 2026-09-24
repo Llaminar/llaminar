@@ -467,7 +467,8 @@ TEST_F(Test__CoherenceTransferOverhead, TransferOverhead_allocateOnDevice_NoH2D)
         << "GPU data pointer should be valid after allocateOnDevice";
 
     // Device should NOT be marked as valid (no data uploaded yet)
-    // The kernel will write to it and then transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) will set device_valid_
+    // The kernel will write to it and TransferEngine publication will set
+    // device_valid_ while invalidating the stale host copy.
     EXPECT_FALSE(tensor->isDeviceValid())
         << "Device should NOT be marked valid after allocateOnDevice (no data uploaded)";
 

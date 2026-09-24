@@ -65,6 +65,23 @@ namespace llaminar2
         std::copy(fp16_data.begin(), fp16_data.end(), host_fp16_data_.begin());
     }
 
+    FP16Tensor::FP16Tensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint16_t> fp16_data)
+        : shape_(shape), device_(DeviceId::cpu()), is_view_(false),
+          host_fp16_data_(std::move(fp16_data)), parent_data_ptr_(nullptr),
+          view_offset_(0), parent_(nullptr), device_data_(nullptr)
+    {
+        if (shape.empty())
+            throw std::invalid_argument("FP16Tensor: shape cannot be empty");
+
+        size_t expected_elements = 1u;
+        for (const size_t dimension : shape)
+            expected_elements *= dimension;
+        if (host_fp16_data_.size() != expected_elements)
+            throw std::invalid_argument("FP16Tensor: data size mismatch");
+    }
+
     // Private view constructor
     FP16Tensor::FP16Tensor(const std::vector<size_t> &shape,
                            DeviceId device,
@@ -81,6 +98,7 @@ namespace llaminar2
 
     FP16Tensor::~FP16Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // TODO: Free device memory when device support is added
     }
 

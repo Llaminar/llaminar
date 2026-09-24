@@ -1,0 +1,109 @@
+{
+  "schema_version": "qwen35-qwen36-release-models-v1",
+  "vocabulary_size": 248320,
+  "attention_head_dimension": 256,
+  "gdn_key_head_count": 16,
+  "gdn_key_head_dimension": 128,
+  "releases": [
+    {
+      "release_id": "Qwen3.5-0.8B",
+      "kind": "dense",
+      "hidden_size": 1024,
+      "feed_forward_size": 3584,
+      "attention_head_count": 8,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 16,
+      "gdn_time_step_rank": 16
+    },
+    {
+      "release_id": "Qwen3.5-2B",
+      "kind": "dense",
+      "hidden_size": 2048,
+      "feed_forward_size": 6144,
+      "attention_head_count": 8,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 16,
+      "gdn_time_step_rank": 16
+    },
+    {
+      "release_id": "Qwen3.5-4B",
+      "kind": "dense",
+      "hidden_size": 2560,
+      "feed_forward_size": 9216,
+      "attention_head_count": 16,
+      "attention_kv_head_count": 4,
+      "gdn_value_head_count": 32,
+      "gdn_time_step_rank": 32
+    },
+    {
+      "release_id": "Qwen3.5-9B",
+      "kind": "dense",
+      "hidden_size": 4096,
+      "feed_forward_size": 12288,
+      "attention_head_count": 16,
+      "attention_kv_head_count": 4,
+      "gdn_value_head_count": 32,
+      "gdn_time_step_rank": 32
+    },
+    {
+      "release_id": "Qwen3.5-27B",
+      "kind": "dense",
+      "hidden_size": 5120,
+      "feed_forward_size": 17408,
+      "attention_head_count": 24,
+      "attention_kv_head_count": 4,
+      "gdn_value_head_count": 48,
+      "gdn_time_step_rank": 48
+    },
+    {
+      "release_id": "Qwen3.5-35B-A3B",
+      "kind": "moe",
+      "hidden_size": 2048,
+      "feed_forward_size": 512,
+      "attention_head_count": 16,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 32,
+      "gdn_time_step_rank": 32
+    },
+    {
+      "release_id": "Qwen3.5-122B-A10B",
+      "kind": "moe",
+      "hidden_size": 3072,
+      "feed_forward_size": 1024,
+      "attention_head_count": 32,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 64,
+      "gdn_time_step_rank": 64
+    },
+    {
+      "release_id": "Qwen3.5-397B-A17B",
+      "kind": "moe",
+      "hidden_size": 4096,
+      "feed_forward_size": 1024,
+      "attention_head_count": 32,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 64,
+      "gdn_time_step_rank": 64
+    },
+    {
+      "release_id": "Qwen3.6-27B",
+      "kind": "dense",
+      "hidden_size": 5120,
+      "feed_forward_size": 17408,
+      "attention_head_count": 24,
+      "attention_kv_head_count": 4,
+      "gdn_value_head_count": 48,
+      "gdn_time_step_rank": 48
+    },
+    {
+      "release_id": "Qwen3.6-35B-A3B",
+      "kind": "moe",
+      "hidden_size": 2048,
+      "feed_forward_size": 512,
+      "attention_head_count": 16,
+      "attention_kv_head_count": 2,
+      "gdn_value_head_count": 32,
+      "gdn_time_step_rank": 32
+    }
+  ]
+}

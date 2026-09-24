@@ -172,6 +172,24 @@ TEST(Test__GlobalDeviceAddress, Parse_ShortForm_TypeOrdinal_WithCurrentNuma)
     EXPECT_EQ(addr.device_ordinal, 1);
 }
 
+/**
+ * @brief A CPU short selector names a NUMA endpoint, never a CPU ordinal.
+ *
+ * CPU participant addresses cross the pre-MPI and post-MPI topology boundary.
+ * Keeping the interpretation in this value type prevents bootstrap from
+ * ignoring the node while the inventory binder guesses it from list order.
+ */
+TEST(Test__GlobalDeviceAddress, Parse_ShortForm_CPUUsesExplicitNumaEndpoint)
+{
+    auto addr = GlobalDeviceAddress::parse("cpu:1", 7);
+
+    EXPECT_EQ(addr.hostname, "localhost");
+    EXPECT_EQ(addr.numa_node, 1);
+    EXPECT_EQ(addr.device_type, DeviceType::CPU);
+    EXPECT_EQ(addr.device_ordinal, 0);
+    EXPECT_TRUE(addr.hasValidNuma());
+}
+
 TEST(Test__GlobalDeviceAddress, Parse_MediumForm_NumaTypeOrdinal)
 {
     // "0:cuda:0" -> localhost:0:cuda:0

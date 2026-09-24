@@ -25,7 +25,9 @@ namespace llaminar2
     {
         /**
          * @brief Load NCCL library dynamically with isolated symbols
-         * @param library_path Optional path to libnccl.so (nullptr for default search)
+         * @param library_path Exact explicit library, or nullptr for the
+         *        installed libllaminar_nccl.so.2 capture-reentry implementation.
+         *        A failed load never selects a different library.
          * @return true if loaded successfully
          *
          * The library is loaded with RTLD_NOW | RTLD_LOCAL to:
@@ -119,10 +121,31 @@ namespace llaminar2
 
         // Communicator management
         ncclResult_t ncclCommInitRank(ncclComm_t *comm, int nranks, ncclUniqueId commId, int rank);
-        ncclResult_t ncclCommInitAll(ncclComm_t *comms, int ndev, const int *devlist);
+
+        /**
+         * @brief Initialize one rank with an optional per-communicator network module.
+         *
+         * A null or empty module name uses ncclCommInitRank and preserves NCCL's
+         * automatic network selection. A non-empty name uses
+         * ncclCommInitRankConfig and writes only ncclConfig_t::netName, leaving
+         * every other configuration field at NCCL's documented default.
+         *
+         * @param comm Receives the initialized communicator.
+         * @param nranks Number of ranks in the communicator.
+         * @param comm_id Unique communicator identifier shared by every rank.
+         * @param rank Rank represented by the calling thread and CUDA device.
+         * @param network_module Exact NCCL network module name, or null for auto.
+         * @return NCCL status from communicator construction.
+         */
+        ncclResult_t ncclCommInitRankWithNetwork(
+            ncclComm_t *comm,
+            int nranks,
+            ncclUniqueId comm_id,
+            int rank,
+            const char *network_module);
+
         ncclResult_t ncclCommDestroy(ncclComm_t comm);
         ncclResult_t ncclCommAbort(ncclComm_t comm);
-        bool hasCommAbort();
         ncclResult_t ncclCommCount(const ncclComm_t comm, int *count);
         ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int *device);
         ncclResult_t ncclCommUserRank(const ncclComm_t comm, int *rank);

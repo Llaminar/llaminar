@@ -131,6 +131,16 @@ namespace llaminar2
 
         void TearDown() override
         {
+            for (size_t i = 0; i < producer_streams_.size(); ++i)
+            {
+                if (producer_streams_[i] != nullptr)
+                {
+                    cudaSetDevice(static_cast<int>(i));
+                    cudaStreamDestroy(producer_streams_[i]);
+                }
+            }
+            producer_streams_.clear();
+
             // Synchronize and clear any CUDA errors
             for (int i = 0; i < device_count_; ++i)
             {
@@ -164,7 +174,36 @@ namespace llaminar2
             return group;
         }
 
+        /**
+         * @brief Register explicit producer streams for a local NCCL domain.
+         *
+         * Multi-device collectives require one known producer stream per
+         * participant. This mirrors the production graph executor contract and
+         * prevents tests from relying on default-stream ordering.
+         */
+        bool registerProducerStreams(NCCLBackend &backend, int num_devices)
+        {
+            producer_streams_.assign(num_devices, nullptr);
+            std::vector<void *> opaque_streams(num_devices, nullptr);
+
+            for (int i = 0; i < num_devices; ++i)
+            {
+                if (cudaSetDevice(i) != cudaSuccess)
+                    return false;
+                if (cudaStreamCreateWithFlags(
+                        &producer_streams_[i],
+                        cudaStreamNonBlocking) != cudaSuccess)
+                    return false;
+                opaque_streams[i] =
+                    static_cast<void *>(producer_streams_[i]);
+            }
+
+            backend.setComputeStreams(opaque_streams);
+            return true;
+        }
+
         int device_count_ = 0;
+        std::vector<cudaStream_t> producer_streams_;
     };
 
 // GTEST_SKIP() only returns from the function it's called in, so this must be
@@ -626,41 +665,6 @@ namespace llaminar2
     // Multi-GPU Tests (require 2+ GPUs)
     // =========================================================================
 
-    TEST_F(NCCLBackendTest, AllReduce_MultiGPU_DoesNotCrash)
-    {
-        SKIP_IF_LESS_THAN(2);
-
-        NCCLBackend backend;
-        DeviceGroup group = createDeviceGroup(2);
-        ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
-
-        // Note: In a single-process test, we can only exercise one rank.
-        // This test verifies the multi-GPU initialization path works
-        // and doesn't crash when calling allreduce.
-
-        constexpr size_t count = 512;
-        std::vector<float> h_data(count, 3.14159f);
-
-        // Use device 0 (the local_rank device)
-        cudaSetDevice(0);
-        float *d_data = allocGPU<float>(count, 0);
-        ASSERT_NE(d_data, nullptr);
-        copyToGPU(d_data, h_data.data(), count);
-
-        // This will hang if communicator setup is wrong
-        // In single-process mode with 2 GPUs, NCCL may require special handling
-        bool success = backend.allreduce(d_data, count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
-
-        // Note: This may fail in single-process multi-GPU mode because NCCL
-        // expects all ranks to call allreduce. For proper multi-GPU testing,
-        // we'd need separate threads or processes for each GPU.
-        // For now, we just check it doesn't crash.
-        (void)success;
-
-        freeGPU(d_data);
-        backend.shutdown();
-    }
-
     /**
      * @brief Multi-GPU single-process AllReduce test using allreduceMulti API
      *
@@ -675,6 +679,7 @@ namespace llaminar2
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);
         ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
+        ASSERT_TRUE(registerProducerStreams(backend, device_count_));
 
         // Verify multi-GPU mode is detected
         EXPECT_TRUE(backend.isMultiGpuSingleProcess()) << "Should be in multi-GPU single-process mode";
@@ -753,6 +758,7 @@ namespace llaminar2
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);
         ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
+        ASSERT_TRUE(registerProducerStreams(backend, device_count_));
         EXPECT_TRUE(backend.isMultiGpuSingleProcess());
 
         constexpr size_t send_count = 256; // Elements per GPU
@@ -840,6 +846,7 @@ namespace llaminar2
         NCCLBackend backend;
         DeviceGroup group = createDeviceGroup(device_count_);
         ASSERT_TRUE(backend.initialize(group)) << backend.lastError();
+        ASSERT_TRUE(registerProducerStreams(backend, device_count_));
         EXPECT_TRUE(backend.isMultiGpuSingleProcess());
 
         constexpr size_t count = 512;

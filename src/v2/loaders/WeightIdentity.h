@@ -1,3 +1,13 @@
+/**
+ * @file WeightIdentity.h
+ * @brief Typed identity, derivation, residency, and lifecycle metadata for model weights.
+ *
+ * Weight roles describe semantic use rather than merely matching tensor names or
+ * ranks. Preparation and graph construction use these roles to choose packed
+ * GEMM representations, immutable scalar/vector storage, expert residency, and
+ * release policy without relying on ambiguous shape heuristics.
+ */
+
 #pragma once
 
 #include "../backends/DeviceId.h"
@@ -7,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -28,6 +39,8 @@ namespace llaminar2
         AttentionWO,
         FusedQKV,
         GDNProjection,
+        /** Alpha/beta projections feeding GDN recurrence and input gating. */
+        GDNAlphaBetaProjection,
         GDNSsmParam,
         FFNGate,
         FFNUp,
@@ -37,12 +50,29 @@ namespace llaminar2
         MoEExpertUp,
         MoEExpertDown,
         SharedExpertGate,
+        /** Input-dependent sigmoid gate vector; immutable FP32, never a GEMM weight. */
+        SharedExpertInputGate,
         SharedExpertUp,
         SharedExpertDown,
         Norm,
         Bias,
         Other,
     };
+
+    inline bool isRoutedExpertRole(WeightRole role)
+    {
+        return role == WeightRole::MoEExpertGate ||
+               role == WeightRole::MoEExpertUp ||
+               role == WeightRole::MoEExpertDown;
+    }
+
+    inline bool isSharedExpertRole(WeightRole role)
+    {
+        return role == WeightRole::SharedExpertGate ||
+               role == WeightRole::SharedExpertInputGate ||
+               role == WeightRole::SharedExpertUp ||
+               role == WeightRole::SharedExpertDown;
+    }
 
     enum class WeightDerivationKind
     {
@@ -111,6 +141,15 @@ namespace llaminar2
         size_t col_count = 0;
         size_t expert_start = 0;
         size_t expert_count = 0;
+        /**
+         * Explicit global expert IDs in packed tensor order.
+         *
+         * Empty means the legacy contiguous interval described by
+         * expert_start/expert_count. A non-empty vector is authoritative and
+         * permits immutable non-contiguous static ownership without losing the
+         * mapping between packed tensor slots and logical router IDs.
+         */
+        std::vector<int> expert_ids;
         bool inner_is_presliced = false;
     };
 

@@ -27,7 +27,7 @@ namespace llaminar2
      * This interface abstracts work distribution across:
      * - MPI ranks (tensor parallelism)
      * - Devices within a rank (heterogeneous execution)
-     * - MoE expert placement (expert parallelism)
+     * - MoE whole-expert-ID placement
      *
      * Implementations:
      * - WorkDistributor: Real implementation with configurable topology
@@ -202,7 +202,7 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Distribute experts across devices (Expert Parallelism)
+         * @brief Apportion whole expert IDs across devices.
          *
          * Maps each expert to a device based on device weights/capacity.
          * Used at model load time to determine expert placement.

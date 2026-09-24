@@ -116,6 +116,10 @@ namespace llaminar2
          *
          * For unit tests that need a ModelContext but don't need real model data.
          * Initializes a minimal valid GGUFModel structure to prevent undefined behavior.
+         * Most tests should leave with_weight_manager=false and use MockModelContext when
+         * they need interface-level weight behavior. Tests that exercise production-only
+         * WeightManager facilities, such as ExpertGemmRegistry graph lowering, can opt in
+         * to a concrete WeightManager without loading a GGUF file.
          *
          * @param model_path Dummy path (can be anything)
          * @param mpi_ctx Optional MPI context for multi-rank tests (use nullptr for single-rank)
@@ -124,7 +128,8 @@ namespace llaminar2
         static std::shared_ptr<ModelContext> createForTesting(
             const std::string &model_path = "test.gguf",
             std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
-            uint32_t block_count = 1);
+            uint32_t block_count = 1,
+            bool with_weight_manager = false);
 
         // =========================================================================
         // IModelContext Implementation
@@ -134,6 +139,14 @@ namespace llaminar2
          * @brief Get model file path
          */
         const std::string &path() const override { return model_path_; }
+
+        /** @brief Return the complete ordered GGUF shard set loaded by this context. */
+        std::vector<std::string> artifactPaths() const override
+        {
+            const auto &paths = loader_.getModel().split_paths;
+            return paths.empty() ? std::vector<std::string>{model_path_}
+                                 : paths;
+        }
 
         /**
          * @brief Get GGUF model metadata
@@ -155,6 +168,22 @@ namespace llaminar2
          */
         ModelLoader &concreteLoader() { return loader_; }
         const ModelLoader &concreteLoader() const { return loader_; }
+
+        /**
+         * @brief Report whether model tensors use file-backed mapped storage.
+         *
+         * This exposes the effective loader policy to memory planning without
+         * allowing callers to mutate it after model metadata has been loaded.
+         * GPU upload preflight uses this distinction because mmap payloads are
+         * consumed through a bounded pinned staging ring rather than copied
+         * wholesale into anonymous host memory.
+         *
+         * @return true when the underlying loader was configured for mmap.
+         */
+        [[nodiscard]] bool usesMmap() const noexcept
+        {
+            return loader_.usesMmap();
+        }
 
         /**
          * @brief Get weight tensor for a specific device (device-isolated instance)

@@ -45,16 +45,6 @@ namespace llaminar2
         return expert_it->second;
     }
 
-    const ExpertWeightBlobs *ExpertWeightPayloadProvider::payloadPtr(int layer, int expert_id) const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto layer_it = payloads_.find(layer);
-        if (layer_it == payloads_.end()) return nullptr;
-        auto expert_it = layer_it->second.find(expert_id);
-        if (expert_it == layer_it->second.end()) return nullptr;
-        return &expert_it->second;
-    }
-
     std::unordered_map<int, ExpertWeightBlobs> ExpertWeightPayloadProvider::payloadsForLayer(int layer) const
     {
         std::lock_guard<std::mutex> lock(mutex_);

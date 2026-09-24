@@ -63,13 +63,22 @@ Testing/
 pytorch_attention*/
 pytorch_incremental*/
 pytorch_qwen*/
+# Generated model packs include fine-tunes and future families, not just Qwen.
+/pytorch*_snapshots/
 **/pytorch_layer_captures/**/*
 **/pytorch_snapshots*/**/*
 **/test_pytorch*/**/*
 *.npy
 *.npz
 *.out
+/parity-results/
 *benchmark_result*/
+!benchmark_results/
+benchmark_results/*
+!benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+!benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**
+# Published corpora belong to the optional top-level corpora/ submodule.
+# NativeVNNI work/results (including the former corpus location) stay ignored.
 *output.txt
 **/wget-log*
 **/*.data
@@ -79,6 +88,10 @@ flash_rebar/
 **/*.db
 artifacts/**/*
 **/results.*
+!tests/v2/integration/parity/results/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/*.csv
 
 # Python, C++, and Markdown files created in the root (for debugging/testing)
 /*.py

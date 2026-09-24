@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+ExpertOverlay_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold,0,0.999466,0.0052368,1,1,198,198,true,true,true,true
+ExpertOverlay_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold,1,0.999627,0.00443866,1,1,760,760,true,true,true,true
+ExpertOverlay_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold,2,0.998878,0.00596079,1,1,3841,3841,true,true,true,true
+ExpertOverlay_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold,3,0.998875,0.0013954,1,1,13477,13477,true,true,true,true
+ExpertOverlay_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold,4,0.998812,0.00037197,1,0.8,37550,37550,true,true,true,true

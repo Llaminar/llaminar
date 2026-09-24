@@ -195,6 +195,7 @@ namespace llaminar2
                 {
                     nlohmann::ordered_json cpu;
                     cpu["cores"] = rank.cpu_cores;
+                    cpu["worker_threads"] = rank.cpu_worker_threads;
                     cpu["sockets"] = rank.cpu_sockets;
                     cpu["numa_nodes"] = rank.numa_nodes;
                     cpu["memory_bytes"] = rank.cpu_memory_bytes;
@@ -288,6 +289,7 @@ namespace llaminar2
                 {
                     y << "    cpu:\n"
                       << "      cores: " << rank.cpu_cores << "\n"
+                      << "      worker_threads: " << rank.cpu_worker_threads << "\n"
                       << "      sockets: " << rank.cpu_sockets << "\n"
                       << "      numa_nodes: " << rank.numa_nodes << "\n"
                       << "      memory_gb: " << std::setprecision(1) << to_gb(rank.cpu_memory_bytes) << "\n";
@@ -446,7 +448,7 @@ namespace llaminar2
         if (!session.is_output_rank)
             return 0;
 
-        return renderOutput(cfg, session.inventory);
+        return renderOutput(cfg, session.inventory());
     }
 
 } // namespace llaminar2

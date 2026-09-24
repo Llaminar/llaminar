@@ -2,12 +2,13 @@
  * @file IHybridKVCache.h
  * @brief Interface for hybrid KV caches that combine FA and GDN layer state
  *
- * Extends IKVCache with GDN state access methods. Stages can dynamic_cast
- * an IKVCache* to IHybridKVCache* to access per-layer GDN state:
+ * Extends IKVCache with GDN state access methods. CPU caches expose their
+ * host-owned live vectors; GPU caches expose kernel resources while keeping
+ * all live recurrent state private to device-resident kernel banks.
  *
  *   auto* hybrid = dynamic_cast<IHybridKVCache*>(kv_cache);
  *   if (hybrid && hybrid->isGDNLayer(layer_idx)) {
- *       float* conv_state = hybrid->getConvState(layer_idx);
+ *       float* conv_state = hybrid->getConvState(layer_idx); // CPU only
  *       ITensorShortConvolution* kernel = hybrid->getConvKernel(layer_idx);
  *       ...
  *   }
@@ -16,6 +17,9 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 
 namespace llaminar2
 {
@@ -57,6 +61,40 @@ namespace llaminar2
     public:
         virtual ~IHybridKVCache() = default;
 
+        /**
+         * @brief Retain the canonical claim for CPU-owned recurrent payloads.
+         *
+         * KernelFactory acquires this claim before constructing a CPU hybrid
+         * cache. Derived recurrent vectors are destroyed before this interface
+         * base, so the lease returns bytes only after their storage is gone.
+         * GPU live state is owned and claimed by HybridGDNDeviceStateArena and
+         * therefore never binds this host-payload lease.
+         *
+         * @param lease Non-null type-erased PhysicalMemoryAllocationLease.
+         * @throws std::invalid_argument for a null lease.
+         * @throws std::logic_error if the cache was already bound.
+         */
+        void bindRecurrentLiveMemoryLease(std::shared_ptr<void> lease)
+        {
+            if (!lease)
+            {
+                throw std::invalid_argument(
+                    "Hybrid KV cache recurrent-state lease cannot be null");
+            }
+            if (recurrent_live_memory_lease_)
+            {
+                throw std::logic_error(
+                    "Hybrid KV cache recurrent-state lease cannot be rebound");
+            }
+            recurrent_live_memory_lease_ = std::move(lease);
+        }
+
+        /** @return Whether CPU recurrent storage has an admitted live claim. */
+        [[nodiscard]] bool hasRecurrentLiveMemoryLease() const noexcept
+        {
+            return recurrent_live_memory_lease_ != nullptr;
+        }
+
         // =====================================================================
         // Layer Type Queries
         // =====================================================================
@@ -81,10 +119,12 @@ namespace llaminar2
         virtual HybridGDNLayerState *getGDNState(int layer) = 0;
         virtual const HybridGDNLayerState *getGDNState(int layer) const = 0;
 
-        /// Get mutable recurrence state [n_v_heads, d_k, d_v] (nullptr if FA)
+        /// Get CPU-owned recurrence state [n_v_heads, d_k, d_v].
+        /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getRecurrenceState(int layer) = 0;
 
-        /// Get mutable conv state [qkv_dim, conv_kernel-1] (nullptr if FA)
+        /// Get CPU-owned conv state [qkv_dim, conv_kernel-1].
+        /// Returns nullptr for FA layers and every GPU cache.
         virtual float *getConvState(int layer) = 0;
 
         // =====================================================================
@@ -122,6 +162,9 @@ namespace llaminar2
             const HybridPrefixStateDescriptor &desc,
             const void *src_host,
             const void *src_device) = 0;
+
+    private:
+        std::shared_ptr<void> recurrent_live_memory_lease_;
     };
 
 } // namespace llaminar2

@@ -1,0 +1,4 @@
+length,phase,decode_step,driver_token,logits_cosine,logits_kl,cpu_top1,rocm_top1,top5_overlap,cpu_top1_in_rocm_top5,worst_selected_stage,passed
+4096,prefill,-1,-1,0.999520898,0.00216675433,220,220,1,1,LM_HEAD/logits,1
+4096,decode,0,220,0.99977535,0.00117555063,16,16,1,1,LM_HEAD/logits,1
+4096,decode,1,16,0.998752415,0.00421139784,15,15,1,1,LM_HEAD/logits,1

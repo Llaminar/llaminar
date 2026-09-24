@@ -22,6 +22,7 @@
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
 #include "v2/backends/IBackend.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 namespace llaminar2::test
 {
@@ -102,22 +103,30 @@ namespace llaminar2::test
 
         bool hostToDeviceCUDA(void *dst, const void *src, size_t bytes, int ordinal = 0)
         {
-            return cuda_backend_->hostToDevice(dst, src, bytes, ordinal);
+            ScopedGPUStream stream(DeviceId::cuda(ordinal));
+            return cuda_backend_->hostToDevice(
+                dst, src, bytes, ordinal, stream.get());
         }
 
         bool deviceToHostCUDA(void *dst, const void *src, size_t bytes, int ordinal = 0)
         {
-            return cuda_backend_->deviceToHost(dst, src, bytes, ordinal);
+            ScopedGPUStream stream(DeviceId::cuda(ordinal));
+            return cuda_backend_->deviceToHost(
+                dst, src, bytes, ordinal, stream.get());
         }
 
         bool hostToDeviceROCm(void *dst, const void *src, size_t bytes, int ordinal = 0)
         {
-            return rocm_backend_->hostToDevice(dst, src, bytes, ordinal);
+            ScopedGPUStream stream(DeviceId::rocm(ordinal));
+            return rocm_backend_->hostToDevice(
+                dst, src, bytes, ordinal, stream.get());
         }
 
         bool deviceToHostROCm(void *dst, const void *src, size_t bytes, int ordinal = 0)
         {
-            return rocm_backend_->deviceToHost(dst, src, bytes, ordinal);
+            ScopedGPUStream stream(DeviceId::rocm(ordinal));
+            return rocm_backend_->deviceToHost(
+                dst, src, bytes, ordinal, stream.get());
         }
 
         IBackend *cuda_backend_ = nullptr;

@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #ifdef HAVE_CUDA
 
@@ -454,6 +455,25 @@ namespace
             {
                 throw std::runtime_error("KernelFactory::createGemm returned null");
             }
+            cudaStream_t stream = nullptr;
+            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+            {
+                throw std::runtime_error("Failed to create CUDA GEMM stream");
+            }
+            kernel->setGPUStream(stream);
+            struct StreamGuard
+            {
+                ITensorGemm *kernel = nullptr;
+                cudaStream_t stream = nullptr;
+
+                ~StreamGuard()
+                {
+                    if (kernel)
+                        kernel->clearGPUStreamBinding();
+                    if (stream)
+                        (void)cudaStreamDestroy(stream);
+                }
+            } stream_guard{kernel.get(), stream};
 
             // Set up workspace via IWorkspaceConsumer interface
             auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
@@ -476,9 +496,9 @@ namespace
             std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(m) * k * sizeof(float));
             auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
-            if (!A_tensor->ensureOnDevice(device_))
+            if (!A_tensor->ensureOnDevice(device_, stream))
                 throw std::runtime_error("ensureOnDevice A failed");
-            if (!C_tensor->ensureOnDevice(device_))
+            if (!C_tensor->ensureOnDevice(device_, stream))
                 throw std::runtime_error("ensureOnDevice C failed");
 
             std::vector<double> times_us;
@@ -503,9 +523,9 @@ namespace
                     throw std::runtime_error("cudaEventCreate failed");
                 }
 
-                cudaEventRecord(start);
+                cudaEventRecord(start, stream);
                 const bool run_ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k);
-                cudaEventRecord(stop);
+                cudaEventRecord(stop, stream);
                 cudaEventSynchronize(stop);
 
                 float elapsed_ms = 0.0f;
@@ -524,7 +544,7 @@ namespace
             // Download result
             RunResult result;
             result.output.resize(static_cast<size_t>(m) * n);
-            C_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            TransferEngine::publishCurrentDeviceWrite(C_tensor, stream);
             std::memcpy(result.output.data(), C_tensor->data(), static_cast<size_t>(m) * n * sizeof(float));
 
             if (ws_consumer)

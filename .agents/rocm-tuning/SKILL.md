@@ -1,6 +1,6 @@
 ---
 name: rocm-tuning
-description: Profile and tune Llaminar V2 ROCm/HIP INT8 VNNI GEMM and GEMV kernels on AMD Instinct GPUs (gfx906 MI50/MI60) using rocprof per-dispatch timing and LLVM ISA analysis (llvm-objcopy/readelf/objdump), benchmarked against AMD Composable Kernel (CK). Use when asked to find a slow HIP kernel, diagnose occupancy / VGPR pressure / register spills / waitcnt stalls, A/B kernel variants (V1-V7), close a GEMM gap vs CK, or distinguish a real GPU-kernel gap from PCIe/wallclock noise while keeping parity.
+description: Profile and tune Llaminar V2 ROCm/HIP kernels on AMD Instinct GPUs (gfx906 MI50/MI60), including INT8 VNNI GEMM/GEMV, sampling, grouped verification, and graph-captured inference. Use rocprof per-dispatch timing/counters plus LLVM ISA analysis to diagnose occupancy, vectorization, VGPR pressure, spills, divergence, LDS conflicts, and throughput while retaining byte-exact production behavior.
 ---
 
 # ROCm / HIP Kernel Profiling & Tuning (Llaminar V2, gfx906)
@@ -13,19 +13,91 @@ the V7 native kernel matching/beating AMD's Composable Kernel (CK) on N-heavy LL
 
 It chains three tools:
 
-1. **`rocprof`** — per-dispatch GPU kernel timing (the *only* trustworthy latency number).
-2. **LLVM ISA toolchain** (`llvm-objcopy` / `llvm-readelf` / `llvm-objdump`) — extract code
+1. **PerfStats GPU event timing** — production-graph replay timing and structured route/host counters.
+2. **`rocprof`** — per-dispatch GPU kernel timing (the *only* trustworthy latency number).
+3. **LLVM ISA toolchain** (`llvm-objcopy` / `llvm-readelf` / `llvm-objdump`) — extract code
    objects, read VGPR/SGPR/LDS metadata, disassemble, and census instructions.
-3. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
+4. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
 
 The golden rule of gfx906 tuning: **wallclock lies.** On PCIe-bottlenecked topologies,
 >90% of GEMM wallclock is memory transfer. Always quote `rocprof` per-dispatch GPU time,
 not wallclock, when comparing kernels.
 
+## Production hot-path invariants
+
+ROCm kernel tuning must preserve the production execution architecture, not
+trade architecture for an isolated microbenchmark win:
+
+- **No dynamic allocation or deallocation.** Hot-path kernels and launch
+  bridges consume persistent workspace bindings. `hipMalloc`,
+  `hipMallocAsync`, `hipFree`, container growth, or hidden scratch allocation
+  belongs in explicit initialization/workspace infrastructure only.
+- **No host transfer.** Do not insert H2D/D2H copies, host-visible mirrors, or
+  host polling into execution. Deliberate RAM/disk KV-cache tier movement is a
+  transfer-service operation at an explicit lifecycle boundary, not kernel
+  plumbing.
+- **No stream or device synchronization.** `hipStreamSynchronize`,
+  `hipDeviceSynchronize`, blocking copies, and event synchronization on the
+  host are forbidden in the hot path. They are permitted only in explicitly
+  scoped test/profiler result collection or terminal result surfacing.
+- **No order-dependent atomics in batch-invariant paths.** Grouped verifier,
+  deterministic decode, and batch-invariant prefill kernels must give every
+  output a unique deterministic writer. An atomic is acceptable only when its
+  value is provably independent of inter-thread order, bitwise equivalence is
+  covered by the all-format/M-totality sweep, and profiling proves it is
+  economical.
+- **Use explicit producer/consumer events.** A producer launches on an explicit
+  non-null stream and publishes completion by recording an event on that exact
+  stream. A consumer on another stream waits for that event before reading.
+  Never publish a write on a guessed/default stream, transition coherence
+  manually after a blocking sync, or replace the dependency with a global
+  barrier.
+- **Remain graph-capturable end to end.** Persistent buffers, launches, event
+  record/wait edges, and collectives must be capturable. Homogeneous GPU
+  inference requires one complete captured graph; segmented execution is not a
+  tuning fallback.
+
 The full reference write-up lives at
 `src/v2/kernels/rocm/gemm/README.vnni-gemm-tuning.md` (and the companion
 `README.native-vnni-isa-analysis.md` for GEMV). Read those for the V1-V7 history and the
 CK ISA census; this skill is the operational checklist.
+
+For whole-model diagnosis, first measure the production captured graph:
+
+```bash
+LLAMINAR_PERF_STATS_JSON=/tmp/rocm-profile.json \
+LLAMINAR_PERF_STATS_SUMMARY=1 \
+LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
+./build_v2_release/llaminar2 benchmark -m <model>.gguf -d rocm:0
+```
+
+The `stage_gpu` graph-replay rows are GPU-event measurements around the real
+captured graph. They do not fabricate per-stage attribution inside a monolithic
+graph; use rocprof for that dispatch-level view. `LLAMINAR_PROFILING=1` is
+deprecated and exists only as a warning compatibility alias to these PerfStats
+requests. It must never disable graph capture or select eager execution.
+
+---
+
+## Profiler attachment and evidence rules
+
+- Pass `--no-mpi-bootstrap` only when profiling or debugging `llaminar2`
+  directly so the profiler attaches to the compute process rather than the
+  `mpirun` wrapper. Never use it for production or canonical benchmark timing;
+  it disables the ordinary placement bootstrap.
+- Do not pass `--no-mpi-bootstrap` to standalone test/performance binaries;
+  they do not auto-bootstrap MPI.
+- Preserve `LLAMINAR_*`, `HSA_*`, and `ROCR_*` variables with `sudo -E` only on
+  hosts that require privilege escalation. Ordinary `sudo` strips them.
+- Write rocprof CSVs, traces, extracted code objects, and disassembly under an
+  explicit result directory outside the repository.
+- Use one exact kernel/ISA/shape/M candidate per profiler launch. Treat
+  rocprof timing and counters as diagnostic evidence beside the unprofiled
+  canonical timing corpus; never train dispatch on profiler overhead or replay
+  duration.
+- Keep the profiler generation and metric groups required by the repository's
+  evidence collector. Do not silently substitute `rocprofv3` output for a
+  `rocprof`/rocprofiler schema expected by the trainer.
 
 ---
 
@@ -88,6 +160,48 @@ Force a specific variant with env vars when isolating:
 | `LLAMINAR_ROCM_WIDE_TILE_V7=1` | Force V7 |
 | `LLAMINAR_ROCM_WIDE_TILE_V6=1` … `_V2=1` | Force V6 … V2 |
 
+### Isolate one production-shaped launch
+
+Whole-graph PerfStats identifies the expensive captured fragment. Attribute
+individual kernels with a standalone performance harness that invokes the same
+backend entrypoint, geometry, persistent scratch contract, and tensor format as
+production. Never disable graph capture or select eager inference merely to
+make a profiler attach: that measures a different engine. Some rocprofiler
+versions cannot trace retained HIP graphs reliably; retain the outer graph
+event measurement and profile the isolated real kernel instead.
+
+Keep canonical timing unprofiled, then gather timing, counters, and ISA in a
+separate deterministic profiler invocation for that exact candidate. Read
+[`references/rocprof-isolated-kernel.md`](references/rocprof-isolated-kernel.md)
+for the tested rocprof v1 dispatch-range/counter commands, metric
+interpretation, wave64 vectorization checks, and ROCm 7 `.hip_fatbin`
+extraction workflow.
+
+For ROCm FlashAttention2, build
+`v2_perf_rocm_flash_attention_prefill` and use its exact-candidate test so one
+profiler invocation contains one captured transaction and no unrelated model
+work. Select the production geometry explicitly: `qwen7_tp1` exercises the
+packed device-direct branch, `qwen27_tp4` exercises long-context partition
+publication/reduction, and `qwen35_tp8` exercises replicated GQA. For example:
+
+```bash
+LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY=qwen7_tp1 \
+LLAMINAR_ROCM_FA2_PROFILE_M=128 \
+LLAMINAR_ROCM_FA2_PROFILE_KV=8192 \
+LLAMINAR_ROCM_FA2_PROFILE_CAPACITY=131072 \
+LLAMINAR_ROCM_FA2_PROFILE_FORMAT=FP16 \
+LLAMINAR_ROCM_FA2_PROFILE_MODE=context \
+rocprofv3 --kernel-trace --stats --output-directory /tmp/rocm-fa2-qwen7 \
+  -- ./build_v2_release/tests/v2/v2_perf_rocm_flash_attention_prefill \
+  --gtest_filter=ROCmFlashAttentionContextParallelPerf.ExactCandidateProfilerLaunch
+```
+
+Use `LLAMINAR_ROCM_FA2_PROFILE_PHASE_BLOCKS`,
+`LLAMINAR_ROCM_FA2_PROFILE_SLOTS`,
+`LLAMINAR_ROCM_FA2_PROFILE_REDUCER_WAVEFRONTS`, and
+`LLAMINAR_ROCM_FA2_PROFILE_REDUCER_BLOCKS` only to isolate a measured tournament
+candidate. Leave them unset to profile the installed capture-time policy.
+
 ---
 
 ## Step 3: ISA deep-dive (occupancy + scheduling)
@@ -115,6 +229,10 @@ llvm-objdump -d --mcpu=gfx906 /tmp/co.elf > /tmp/disasm.txt
 # 4. Locate kernels (CK symbols are >1000 chars due to C++ templates)
 grep -n '<_Z' /tmp/disasm.txt | head -40
 ```
+
+For ROCm 7 objects that use `.hip_fatbin`, use the extraction workflow in the
+linked isolated-kernel reference. The unprofiled benchmark, rocprof evidence,
+and static ISA must always describe the same compiled candidate.
 
 ### Read the metadata FIRST
 
@@ -209,6 +327,10 @@ select per shape; don't assume one kernel wins everywhere.
 
 ## Step 6: Train generated NativeVNNI dispatch tables
 
+Read `.agents/nativevnni-gemm-tuning/SKILL.md` for the shared corpus, learner,
+certification, Git LFS, and installation workflow. This section owns only
+ROCm-specific kernel/profiler constraints.
+
 ROCm NativeVNNI dispatch should follow the same automatic sweep/generate/validate
 pipeline as CUDA. Avoid hand-coded per-shape overrides except as throwaway
 experiments.
@@ -217,14 +339,18 @@ experiments.
    `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp` for prefill
    and `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp` for
    decode/GEMV.
-2. For decode/GEMV dispatch tables, prefer the turnkey refresh wrapper:
-   `scripts/refresh_native_vnni_dispatch_tables.sh --backend rocm --profile qwen36`.
+2. For decode/GEMV dispatch tables, use the Git-LFS-aware turnkey transaction:
+   `scripts/train_native_vnni_dispatch.sh --backend rocm --install`.
+   The lower-level `refresh_native_vnni_dispatch_tables.sh` remains the phase
+   executor used by the driver and for focused diagnostic collection.
    It runs with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`, sweeps canonical
-   `M={1,2,3,4}` verifier buckets, generates the M-aware include, validates it,
-   and can install it with `--install`.
-   Keep the generated decision surface keyed by M as well as N/K.  Qwen3.6
-   verifier buckets can prefer different families at M=1 versus M=2..4 for the
-   same projection shape, and CUDA/ROCm refresh evidence must stay comparable.
+   serial `M=1` first and grouped verifier `M=2..16,31` against that exact frozen
+   dependency, generates the include, validates it, and can install it with
+   `--install`. M31 is a deeper sentinel rather than a production maximum.
+   Keep public M1 decisions keyed by every runtime-visible discriminator.
+   Grouped verifier buckets must inherit the frozen M1 K partition and ordered
+   reduction tree; selecting a different M2+ family is incompatible with the
+   byte-exact serial-row contract.
    The durable decode selector must generalize by aspect ratio plus work-size
    segments. Exact `(M,N,K)` winners are allowed only as overlays above that
    broad fallback; do not land an exact-shape-only table that would require
@@ -240,6 +366,25 @@ experiments.
    compares candidates with a reset-AUTO native output instead of building a
    multi-GB FP32 hipBLAS mirror. Treat that as a dispatch-equivalence trainer
    proxy; model parity and benchmarks still gate any `--install`.
+   Production collection derives immutable profiler requests only after the
+   canonical timing CSV and raw timing sidecar are sealed. Each request starts
+   a fresh process. `roctxProfilerResume(0)`/`roctxProfilerPause(0)` bracket one
+   extra production launch, while a request-specific ROCTx range identifies the
+   exact pipeline in PMC passes. The trace pass keeps physical kernel names;
+   renamed PMC rows join back by contiguous dispatch order. On gfx906, collect
+   `FetchSize`, `WriteSize`, `Wavefronts`, `VALUUtilization`, and
+   `LDSBankConflict` as reviewed singleton passes. Combining the TCC traffic
+   metrics exceeds hardware profile capabilities and can hang rocprofiler's
+   abort path. Never let profiler replay or overhead enter canonical timing.
+   The final `rocm_profiler_features.csv` must be the authenticated export of
+   the canonical observation, request, and evidence manifests, with one row per
+   physical dispatch rather than an ad hoc join of rocprof CSVs.
+   The common policy fit may separately use every ROCm and CUDA device through
+   exact leaf-primary scorer DSOs. The refresh wrapper auto-discovers devices;
+   `--policy-accelerators` fixes the inventory and `--policy-lanes` controls
+   independent CPU orchestration lanes per device. Those scorer launches do not
+   time candidate kernels and never enter rocprof evidence. Keep CUDA and HIP
+   in separate worker processes and hard-fail any requested accelerator error.
 3. Use `--profile family-smoke` for a bounded representative training pass before
    a full acceptance refresh. This profile is stratified by format: it runs one
    small sweep per codebook/family, writes per-format partial CSVs, combines them,

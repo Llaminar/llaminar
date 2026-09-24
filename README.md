@@ -14,9 +14,7 @@ Llaminar is **experimental** and very much in an **alpha** stage of development.
 [Benchmarks](#benchmarks) · [Development](#development) ·
 [Architecture](#llaminar-architecture)
 
-**Discord:**
-
-https://discord.com/channels/1404857025854312528/1519609695793446979
+**Discord:** https://discord.com/channels/1404857025854312528/1519609695793446979
 
 ## Supported Hardware
 
@@ -35,7 +33,7 @@ Llaminar supports the following model architectures initially:
 
 * Qwen 2.5 (dense)
 * Qwen 3 (dense)
-* Qwen 3.5/3.6/3.8 (dense and MoE)
+* Qwen 3.5/3.6 (dense and MoE), including Qwen 3.8 dense GGUFs
 
 ## Quickstart
 
@@ -212,6 +210,7 @@ Use constraints only when they express a real requirement:
 | Intent | Option |
 |---|---|
 | Only ROCm compute | `--only-backends rocm` |
+| Exactly two ROCm devices, with automatic placement | `--only-backends rocm --auto-device-counts rocm=2` |
 | Only TP or PP candidates | `--only-strategies tp,pp` |
 | Prefer a backend when candidates otherwise tie | `--prefer-backend rocm` |
 | Rank for an expected request length | `--plan-workload 512,384` |
@@ -219,6 +218,9 @@ Use constraints only when they express a real requirement:
 
 `--plan-workload` is an optional costing horizon, not a prompt generator or
 output limit. Auto may choose fewer devices when that is predicted to be faster.
+Use `--auto-device-counts` only when a count is required: it preserves automatic
+device selection and placement but rejects candidates with a different count.
+CPU counts refer to NUMA compute endpoints, not threads or MPI processes.
 Benchmark the result; a cost estimate is not a measured throughput guarantee.
 
 Do not add an `expert-overlay` strategy filter merely because the model is MoE:
@@ -416,24 +418,33 @@ kernel dispatch. Leave profiling/debug overrides off for timing runs.
 
 ### Published benchmark results
 
+These scores use the exact canonical E2E configurations, including their
+explicit MTP and expert-movement settings—not an auto-planner/default-policy
+performance sweep. Context is the allocated capacity; each timing request uses
+the prompt and decode lengths shown in the chart.
+
+Results are grouped by model size (27B, 35B, 122B). Within each cell, prefill
+and decode each use that cell's AVX512 result as the 100% reference for AVX2.
+Compare absolute tok/s values across cells, not their normalized bar lengths.
+
 <!-- published-benchmarks:begin -->
 
-Published-image results will appear here after the manual HTTP E2E and
-benchmark workflows complete for both AVX512 and AVX2. No unmeasured rates are
-shown. See [manual image testing](docs/production-ci.md#manual-published-image-workflows)
-to run them.
+![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)
+
+Tested image source: [`6f823000cd06`](https://github.com/Llaminar/llaminar/commit/6f823000cd0654cf70b1187cae2128aff551ce95). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
+[Exact configurations, image digests and samples](benchmarks/production/published/results.json). This is E2E/benchmark evidence, not full production-image certification.
 
 <!-- published-benchmarks:end -->
 
 Ad hoc benchmarking does not certify an image. The
 [production CI pipeline](docs/production-ci.md) benchmarks only E2E-tagged
 canonical cells, after both ISA images finish their full E2E suites. Official
-runs maintain [high-water marks](https://github.com/Llaminar/llaminar/blob/develop/benchmarks/production/high_water.json) and
+runs maintain [high-water marks](benchmarks/production/high_water.json) and
 compact results under `benchmarks/production/results/`. AVX2 and AVX512 evidence
 is separate. The ordinary develop image gate runs Unit/preflight only.
 
-See the [testing workflow](https://github.com/Llaminar/llaminar/blob/develop/.agents/llaminar-testing/SKILL.md) for certification
-and the [llama.cpp comparison workflow](https://github.com/Llaminar/llaminar/blob/develop/.agents/llama-cpp-comparison/SKILL.md)
+See the [testing workflow](.agents/llaminar-testing/SKILL.md) for certification
+and the [llama.cpp comparison workflow](.agents/llama-cpp-comparison/SKILL.md)
 for matched cross-engine workloads and profiling.
 
 ## HTTP diagnostics
@@ -463,7 +474,7 @@ The recommended development environment is the repository's
 [devcontainer](.devcontainer/README.md). It supplies the toolchains and the
 patched NCCL/RCCL dependencies required for capture. Open it in VS Code and run
 the Build Release or Build Integration task, or follow the
-[terminal/SSH workflow](https://github.com/Llaminar/llaminar/blob/develop/.devcontainer/SSH_CODEX.md).
+[terminal/SSH workflow](.devcontainer/SSH_CODEX.md).
 
 For a Release build inside that environment:
 
@@ -627,3 +638,10 @@ keeping placement, collectives, and graph replay explicit.
 * Tensors want to be open and free: so is Llaminar.
 * Tensors want to be sliced, sharded, and pipelined: Llaminar lets them be.
 * Tensors want to run on a variety of hardware types without artificial handicaps: Llaminar helps them to do so.
+
+## Activation precision
+
+Production inference currently supports FP32 model activations only.
+`--activation-precision fp32` is the default; other activation modes fail as
+unimplemented. KV-cache precision and model/expert weight formats are separate
+settings and retain their own supported formats.

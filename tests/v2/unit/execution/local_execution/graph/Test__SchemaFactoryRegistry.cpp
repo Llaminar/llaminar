@@ -1,6 +1,11 @@
 /**
  * @file Test__SchemaFactoryRegistry.cpp
- * @brief Unit tests for SchemaFactoryRegistry self-registration pattern
+ * @brief Unit tests for schema registration and model-owned continuation policy.
+ *
+ * Thinking-budget prompts are continuation bytes, not independent chat turns.
+ * Their paragraph boundary must survive factory lookup: joining a stop phrase
+ * directly onto a truncated reasoning token changes the model's input and can
+ * cause answer loops even in the independent CPU/FP32 reference.
  * @author David Sanftenberg
  * @date March 2026
  */
@@ -10,6 +15,24 @@
 #include "execution/local_execution/graph/GraphSchema.h"
 
 using namespace llaminar2;
+
+/** @brief Every Qwen thinking schema preserves the documented paragraph splice. */
+TEST(Test__SchemaFactoryThinkingPolicy, QwenStopPromptPreservesContinuationBoundary)
+{
+    // Independent literal deliberately covers whitespace as well as content.
+    // See Qwen's quickstart, Thinking Budget: the leading blank paragraph and
+    // space keep a forced continuation separate from a truncated reasoning row.
+    const std::string expected =
+        "\n\n Considering the limited time by the user, I have to give the "
+        "solution based on the thinking directly now.\n</think>\n\n";
+    for (const auto *architecture : {"qwen3", "qwen35", "qwen35moe"})
+    {
+        SCOPED_TRACE(architecture);
+        const auto factory = SchemaFactoryRegistry::getFactory(architecture);
+        ASSERT_NE(factory, nullptr);
+        EXPECT_EQ(factory->getStopThinkingPrompt(), expected);
+    }
+}
 
 // ============================================================================
 // Stub schema factory for self-registration testing

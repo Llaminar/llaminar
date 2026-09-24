@@ -295,9 +295,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
             }
 #endif
@@ -371,23 +371,23 @@ namespace
             const int blocks_per_row = K / 32;
             constexpr int MAX_KB = 64;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_scale, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
-            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_scale, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_blockwise, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Pre-quantize activations (shared across all iterations)
             rocmQuantGemm_quantizeActivationsBlockwise(
                 d_A, d_A_int8, d_scale_A_blockwise, 1, K, device_id_, nullptr, 32);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Determine which kernel path works
             auto run_gemv = [&]() -> bool
@@ -413,40 +413,40 @@ namespace
                     goto cleanup;
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Benchmark with HIP events
             {
                 hipEvent_t ev_start, ev_stop;
-                hipEventCreate(&ev_start);
-                hipEventCreate(&ev_stop);
+                (void)hipEventCreate(&ev_start);
+                (void)hipEventCreate(&ev_stop);
 
                 std::vector<double> times_us;
                 times_us.reserve(bench_runs);
 
                 for (int i = 0; i < bench_runs; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, 0);
+                    (void)hipDeviceSynchronize();
+                    (void)hipEventRecord(ev_start, 0);
 
                     if (!run_gemv())
                     {
                         result.success = false;
-                        hipEventDestroy(ev_start);
-                        hipEventDestroy(ev_stop);
+                        (void)hipEventDestroy(ev_start);
+                        (void)hipEventDestroy(ev_stop);
                         goto cleanup;
                     }
 
-                    hipEventRecord(ev_stop, 0);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, 0);
+                    (void)hipEventSynchronize(ev_stop);
 
                     float ms = 0.0f;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times_us.push_back(static_cast<double>(ms) * 1000.0);
                 }
 
-                hipEventDestroy(ev_start);
-                hipEventDestroy(ev_stop);
+                (void)hipEventDestroy(ev_start);
+                (void)hipEventDestroy(ev_stop);
 
                 // Compute stats
                 std::sort(times_us.begin(), times_us.end());

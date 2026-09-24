@@ -14,13 +14,18 @@ venv/
 # layer (see Dockerfile). Excluding it from the build context avoids
 # uploading the host's local checkout (which can include a multi-GB
 # build/ dir after a dev build) on every `docker build`.
-external/onednn/
+external/*
+!external/vendor/
+!external/vendor/**
+flash_rebar/
 
 # Core dumps & profiling artefacts
 core
 core.*
 gpucore
 gpucore.*
+vgcore
+vgcore.*
 *.cubin
 *.nsys-rep
 *.ncu-rep
@@ -28,6 +33,12 @@ gpucore.*
 
 # Test / benchmark outputs
 results.*
+benchmark_results/
+corpora/
+parity-results/
+*_snapshots/
+*_captures/
+pytorch_qwen2_test/
 gemm_tuning_results.csv
 gemv_tile_occupancy*.csv
 rocm_worker*.csv
@@ -44,9 +55,9 @@ models/
 *.bin
 
 # Python / node caches
-__pycache__/
-*.pyc
-*.pyo
+**/__pycache__/
+**/*.pyc
+**/*.pyo
 node_modules/
 
 # Editor cruft
@@ -66,14 +77,12 @@ changelog/
 README.md
 HANDOVER_*.md
 
-# Scripts not needed at runtime (but KEEP scripts/docker/*.sh — those are
-# used by the Dockerfile itself to install system deps).
-*.sh
-run_llaminar*
-test_pytorch_parity.sh
-install_onednn.sh
-!scripts/docker/
-!scripts/docker/**
+# The builder executes the complete Unit/preflight/parity gates. Shell helpers
+# and source-policy inputs must be present there; the runtime's explicit COPYs
+# still ship only compiled artifacts.
+!.devcontainer/
+!.devcontainer/**
+!README.md
 
 # Python scripts at repo root (debug/analysis helpers)
 debug_*.py

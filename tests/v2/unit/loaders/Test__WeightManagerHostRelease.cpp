@@ -10,7 +10,8 @@
  * 5. releaseHostResidentWeightData() releases only host-resident tensors
  * 6. releaseHostResidentWeightData() retains non-host-resident tensors
  * 7. releaseHostResidentWeightData() deduplicates shared tensor pointers
- * 8. Return counts are correct
+ * 8. Scheduled post-prefill reclaim owns residual host release
+ * 9. Return counts are correct
  *
  * Uses lifecycle-gate control plus TensorBase prepared-device-state metadata to
  * exercise the release decision tree without depending on KernelFactory static state.
@@ -19,12 +20,50 @@
 #include <gtest/gtest.h>
 #include <memory>
 
+#include "config/TensorParallelConfig.h"
+#include "execution/local_execution/graph/GraphSchema.h"
+#include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockModelLoader.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    void registerPreparedState(
+        PreparedWeightStore &store,
+        const std::shared_ptr<TensorBase> &tensor,
+        uint64_t binding_id)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(
+            "test.prepared." + std::to_string(binding_id),
+            ModelContextId{99},
+            binding_id);
+        binding.tensor = tensor.get();
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        binding.immutable = true;
+
+        auto handle =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+        handle->tensor = tensor.get();
+        handle->device_id = DeviceId::cpu();
+        handle->kind =
+            llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+        handle->prepared_weights =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+        store.registerPreparedGemmHandle(
+            binding,
+            PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu(),
+            std::move(handle));
+    }
+}
 
 // ============================================================================
 // TestableWeightManager — opens lifecycle gates for release decision tests
@@ -99,7 +138,8 @@ TEST_F(Test__WeightManagerHostRelease, ReleasesHostResidentWhenPreparedExists)
     auto tensor = loadTensor(wm, "token_embd.weight");
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
-    tensor->has_prepared_device_state_ = true;
+    PreparedWeightStore prepared_store(ModelContextId{99});
+    registerPreparedState(prepared_store, tensor, 1);
     ASSERT_TRUE(tensor->isHostResident());
 
     size_t released = wm.releaseAllHostWeightData();
@@ -155,10 +195,11 @@ TEST_F(Test__WeightManagerHostRelease, ReturnsCorrectReleaseCount)
     ASSERT_NE(t3, nullptr);
 
     // Mark only two as host-resident
+    PreparedWeightStore prepared_store(ModelContextId{99});
     t1->setHostResident();
-    t1->has_prepared_device_state_ = true;
+    registerPreparedState(prepared_store, t1, 1);
     t3->setHostResident();
-    t3->has_prepared_device_state_ = true;
+    registerPreparedState(prepared_store, t3, 3);
     // t2 stays non host-resident with no device data → retained
 
     size_t released = wm.releaseAllHostWeightData();
@@ -182,7 +223,8 @@ TEST_F(Test__WeightManagerHostRelease, MixedStatesProcessedCorrectly)
     already_released->release_host_weight_data();
     // Mark one host-resident
     host_resident->setHostResident();
-    host_resident->has_prepared_device_state_ = true;
+    PreparedWeightStore prepared_store(ModelContextId{99});
+    registerPreparedState(prepared_store, host_resident, 2);
     // cpu_only stays default (no device, not host-resident)
 
     size_t released = wm.releaseAllHostWeightData();
@@ -258,4 +300,68 @@ TEST_F(Test__WeightManagerHostRelease, ReleaseHostResident_ReturnsZeroWhenNoneHo
     size_t released = wm.releaseHostResidentWeightData();
 
     EXPECT_EQ(released, 0);
+}
+
+TEST_F(Test__WeightManagerHostRelease, ReleaseHostResident_SkipsBorrowedTensorSliceViews)
+{
+    constexpr const char *kWeightName = "blk.0.ffn_gate.weight";
+    mock_loader_->addFP32RandomTensor(kWeightName, {64, 16});
+
+    TestableWeightManager wm(*mock_loader_);
+
+    WeightShardingConfig sharding;
+    sharding.exact_matches[kWeightName] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches[kWeightName] = WeightDimensionType::FFNHidden;
+    wm.setWeightShardingConfig(sharding);
+
+    const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    auto tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            2,
+            4,
+            2,
+            64,
+            128,
+            devices));
+    wm.setTensorParallelConfig(tp_config);
+
+    const auto &assignment = tp_config->forDevice(DeviceId::cuda(1));
+    auto slice = wm.getShardedWeightForAssignment(kWeightName, DeviceId::cuda(1), assignment, 0);
+    ASSERT_NE(slice, nullptr);
+    ASSERT_TRUE(slice->is_view());
+
+    slice->setHostResident();
+    ASSERT_TRUE(slice->isHostResident());
+    ASSERT_FALSE(slice->is_raw_data_released());
+
+    size_t released = wm.releaseHostResidentWeightData();
+
+    EXPECT_EQ(released, 0);
+    EXPECT_FALSE(slice->is_raw_data_released())
+        << "Borrowed TensorSlice views must not release their wrapped storage during the broad host-resident sweep";
+}
+
+TEST_F(
+    Test__WeightManagerHostRelease,
+    ScheduledPostPrefillReclaimReleasesResidualHostWeightsBeforeAllocationBarrier)
+{
+    TestableWeightManager wm(*mock_loader_);
+
+    auto tensor = loadTensor(wm, "token_embd.weight");
+    ASSERT_NE(tensor, nullptr);
+    tensor->setHostResident();
+    ASSERT_FALSE(tensor->is_raw_data_released());
+
+    EXPECT_EQ(
+        wm.scheduleMmapReclaim(),
+        MmapReclaimLifecycle::Submission::Scheduled);
+    const auto completion =
+        wm.awaitMmapReclaimBeforeHostAllocation();
+
+    EXPECT_EQ(completion.state, MmapReclaimLifecycle::State::Complete);
+    EXPECT_TRUE(tensor->is_raw_data_released())
+        << "The worker must complete residual host release before model/JIT allocation proceeds";
+    EXPECT_EQ(
+        wm.scheduleMmapReclaim(),
+        MmapReclaimLifecycle::Submission::AlreadyComplete);
 }

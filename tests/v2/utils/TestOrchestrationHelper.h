@@ -33,6 +33,11 @@
 #include <string>
 #include <optional>
 
+namespace llaminar2
+{
+    class ModelContext;
+}
+
 namespace llaminar2::test
 {
 
@@ -82,6 +87,31 @@ namespace llaminar2::test
          */
         static std::unique_ptr<IOrchestrationRunner> create(
             const OrchestrationConfig &config);
+
+        /**
+         * @brief Create a production runner around a retained real-weight context
+         *
+         * The runner still builds and initializes its production execution plan,
+         * graphs, arenas, streams, and runtime controllers.  Only immutable model
+         * parsing and prepared weights are shared across process-resident tests.
+         *
+         * @param config Complete orchestration configuration
+         * @param reuse_contract Retained context and certifying production plan
+         * @return Runner instance; initialize() reports any compatibility failure
+         */
+        static std::unique_ptr<IOrchestrationRunner> create(
+            const OrchestrationConfig &config,
+            std::shared_ptr<ModelContext> model_ctx);
+
+        /**
+         * @brief Create a runner with a plan-certified prepared-weight authority.
+         * @param config Complete orchestration configuration.
+         * @param reuse_contract Prior production runner's reuse certificate.
+         * @return Runner instance; initialize() validates the prepared topology.
+         */
+        static std::unique_ptr<IOrchestrationRunner> create(
+            const OrchestrationConfig &config,
+            ModelContextReuseContract reuse_contract);
 
         // =========================================================================
         // Pipeline Parallel (PP) Configuration

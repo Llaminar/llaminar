@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,9 @@ namespace llaminar2
             void *d_native_vnni_mins = nullptr;
             void *d_native_vnni_emins = nullptr;
             size_t payload_bytes = 0;
+            size_t scales_bytes = 0;
+            size_t mins_bytes = 0;
+            size_t emins_bytes = 0;
             size_t staging_bytes = 0;
         };
 
@@ -52,11 +56,22 @@ namespace llaminar2
         WeightVRAMPool(WeightVRAMPool &&other) noexcept;
         WeightVRAMPool &operator=(WeightVRAMPool &&other) noexcept;
 
-        /// Phase 1: Plan — calculate sizes, no allocation.
-        /// Call once per weight that will be stored on this device.
+        /** @brief Mutually exclusive contiguous view sharing a packed allocation. */
+        struct ContiguousAlias
+        {
+            size_t bytes; ///< Zero disables the alias; otherwise reserve max, not sum.
+        };
+
+        /**
+         * @brief Plan a packed weight and optional mutually exclusive raw view.
+         * @param alias Contiguous capacity beginning at the payload address.
+         * Native planes retain their offsets. The allocator alone extends the
+         * region when the raw view is larger; callers never reproduce alignment
+         * arithmetic or allocate two copies for non-concurrent representations.
+         */
         void planWeight(const std::string &name, int N, int K,
                         int payload_bytes_per_block, bool is_asymmetric, bool has_emins,
-                        size_t raw_gguf_bytes);
+                        size_t raw_gguf_bytes, ContiguousAlias alias = {0});
 
         /// Phase 1 (raw): Plan a floating-point weight that needs no repack.
         /// Allocates a contiguous region for raw bytes (H2D copy only, no repack).
@@ -66,12 +81,32 @@ namespace llaminar2
         /// @param backend  GPU backend (CUDA or ROCm) — if null, falls back to no-op (unit tests)
         /// @param device_id  Device ordinal
         /// @param staging_slot_count  How many staging slots (ring-buffer overlap). 0 = no staging.
-        bool allocate(IBackend *backend, int device_id, int staging_slot_count = 0);
+        /// @param staging_slot_bytes  Optional bounded bytes per staging slot. 0 uses the
+        ///        largest planned raw weight (legacy behavior). Oversized weights can be
+        ///        submitted to DeviceLoadPipeline as row chunks.
+        bool allocate(IBackend *backend, int device_id, int staging_slot_count = 0,
+                      size_t staging_slot_bytes = 0);
 
         /// Phase 3: Get slot — zero-cost offset lookup by weight name.
         std::optional<WeightSlot> getSlot(const std::string &name) const;
 
         size_t totalPlannedBytes() const;
+        /**
+         * @brief Return the exact lifetime token for the persistent allocation.
+         *
+         * The token is non-owning from the ledger's point of view: callers
+         * retain only a weak reference to it.  It remains live while this
+         * pool's persistent device allocation exists and expires immediately
+         * after @ref release() frees that allocation.  This is deliberately
+         * distinct from the LoadOrchestrator lifetime because a maintenance
+         * transaction may retain an orchestrator while retiring its pool.
+         *
+         * @return Shared token, or an empty handle before allocation.
+         */
+        [[nodiscard]] std::shared_ptr<void>
+        persistentAllocationLifetime() const noexcept;
+        /** @return Largest logical raw source transaction in the plan. */
+        size_t maximumPlannedStagingBytes() const;
         size_t numPlannedWeights() const;
         bool isAllocated() const;
         int deviceId() const;
@@ -90,6 +125,19 @@ namespace llaminar2
 
         /// Maximum bytes per staging slot.
         size_t maxStagingSlotBytes() const;
+
+        /**
+         * @brief Physical byte stride between adjacent device staging slots.
+         *
+         * The logical slot capacity returned by maxStagingSlotBytes() is kept
+         * within the caller's bounded staging budget. The physical stride may
+         * be slightly larger because every GPU repack source must begin at a
+         * naturally aligned address, even when the configured budget divided
+         * by the lane count produces an odd capacity.
+         *
+         * @return Aligned device byte stride, or zero when staging is absent.
+         */
+        size_t stagingSlotStrideBytes() const;
 
     private:
         static constexpr size_t kAlignment = 256;
@@ -118,9 +166,20 @@ namespace llaminar2
         size_t staging_region_bytes_ = 0;
         int staging_slot_count_ = 0;
         size_t max_staging_slot_bytes_ = 0;
+        size_t staging_slot_stride_bytes_ = 0;
         IBackend *backend_ = nullptr;
         int device_id_ = -1;
         bool allocated_ = false;
+
+        /**
+         * @brief Identity of the currently materialized persistent allocation.
+         *
+         * Prepared-device accounting stores this identity as a weak owner.
+         * Reset it only after the matching backend free so the canonical
+         * retirement BOM cannot count a released pool merely because its
+         * orchestrator object is still retained by a kernel or transaction.
+         */
+        std::shared_ptr<void> persistent_allocation_lifetime_;
 
         size_t current_offset_ = 0;
 

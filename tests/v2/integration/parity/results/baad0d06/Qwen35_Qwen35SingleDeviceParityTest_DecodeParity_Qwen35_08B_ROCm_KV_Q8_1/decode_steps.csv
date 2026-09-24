@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen35_08B_ROCm_KV_Q8_1,0,0.979258,0.0801878,1,0.8,198,198,true,true,true,true
+Qwen35_08B_ROCm_KV_Q8_1,1,0.978289,0.120529,1,0.8,760,760,true,true,true,true
+Qwen35_08B_ROCm_KV_Q8_1,2,0.993386,0.254822,1,0.6,3841,3841,true,true,true,true
+Qwen35_08B_ROCm_KV_Q8_1,3,0.980651,0.0116691,1,1,13477,13477,true,true,true,true
+Qwen35_08B_ROCm_KV_Q8_1,4,0.99282,0.0424953,1,0.8,37550,37550,true,true,true,true

@@ -10,12 +10,14 @@
  */
 
 #include <gtest/gtest.h>
+#include "transfer/TransferEngine.h"
 
 #include "execution/local_execution/coherence/CrossDomainTransfer.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/ScopedGPUStream.h"
 
 #include <cstring>
 #include <vector>
@@ -104,8 +106,11 @@ namespace llaminar2::test
 
         // Create and upload source to GPU
         auto src = TestTensorFactory::createFP32Random({32, 64}, -1.0f, 1.0f, 42);
-        src->ensureOnDevice(gpu_device_);
-        src->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Mark GPU as having the data
+        ScopedGPUStream producer_stream(gpu_device_);
+        src->ensureOnDevice(gpu_device_, producer_stream.get());
+        TransferEngine::publishCurrentDeviceWrite(
+            src,
+            producer_stream.get());  // Mark GPU as having the data
 
         // Create destination
         auto dst = TestTensorFactory::createFP32({32, 64});
@@ -277,8 +282,11 @@ namespace llaminar2::test
 
         // Create tensor and upload to GPU
         auto gpu_src = TestTensorFactory::createFP32Random({32, 64});
-        gpu_src->ensureOnDevice(gpu_device_);
-        gpu_src->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        ScopedGPUStream producer_stream(gpu_device_);
+        gpu_src->ensureOnDevice(gpu_device_, producer_stream.get());
+        TransferEngine::publishCurrentDeviceWrite(
+            gpu_src,
+            producer_stream.get());
 
         // Transfer from GPU to CPU with automatic allocation
         auto result = transfer.transfer(gpu_src.get(), DeviceType::CPU);

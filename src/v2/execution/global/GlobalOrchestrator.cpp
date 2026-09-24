@@ -2,12 +2,20 @@
  * @file GlobalOrchestrator.cpp
  * @brief Implementation of cross-machine MPI cluster inference orchestrator
  *
+ * Named-domain runners own participant-local execution; this layer joins
+ * their immutable request results. Prefix coordination preserves the epoch
+ * selected by each lookup rather than relabeling it from later live state.
+ * One explicit stage registry owns every runner; remote endpoints cannot be
+ * replaced by an anonymous rank runner or the nearest local layer scope.
+ *
  * @author David Sanftenberg
  * @date April 2026
  */
 
 #include "GlobalOrchestrator.h"
+#include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../global_pp/GlobalPPRankPlanBuilder.h"
+#include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../tensors/TensorClasses.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
@@ -22,6 +30,12 @@
 
 namespace llaminar2
 {
+    const ILocalTPContext *StageRunnerEntry::localTPContext() const noexcept
+    {
+        const auto *rank_runner = dynamic_cast<const IRankOrchestrator *>(runner.get());
+        return rank_runner ? rank_runner->localTPContext() : nullptr;
+    }
+
     namespace
     {
         struct ParsedLayerSnapshotKey
@@ -169,6 +183,8 @@ namespace llaminar2
         {
             entry.domain_name = entry.action.domain_name;
         }
+        if (entry.domain_name != entry.action.domain_name)
+            throw std::invalid_argument("StageRunnerRegistry: domain name/action mismatch");
 
         for (const auto &existing : entries_)
         {
@@ -176,28 +192,22 @@ namespace llaminar2
             {
                 throw std::invalid_argument("StageRunnerRegistry: duplicate stage_id");
             }
+            if ((existing.action.has_embedding && entry.action.has_embedding) ||
+                (existing.action.has_lm_head && entry.action.has_lm_head))
+                throw std::invalid_argument("StageRunnerRegistry: duplicate pipeline endpoint owner");
         }
 
         entries_.push_back(std::move(entry));
     }
 
-    void StageRunnerRegistry::setCompatibilityRunner(std::unique_ptr<IInferenceRunner> runner)
-    {
-        if (!runner)
-        {
-            throw std::invalid_argument("StageRunnerRegistry: compatibility runner is required");
-        }
-        compatibility_runner_ = std::move(runner);
-    }
-
     bool StageRunnerRegistry::empty() const
     {
-        return entries_.empty() && !compatibility_runner_;
+        return entries_.empty();
     }
 
     size_t StageRunnerRegistry::size() const
     {
-        return entries_.size() + (compatibility_runner_ ? 1u : 0u);
+        return entries_.size();
     }
 
     bool StageRunnerRegistry::hasRunnerForStage(int stage_id) const
@@ -262,7 +272,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::runnerForStage(int stage_id) const
@@ -274,7 +284,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::runnerForDomain(const std::string &domain_name)
@@ -304,7 +314,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return defaultRunner();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::pipelineHeadRunner() const
@@ -316,7 +326,7 @@ namespace llaminar2
                 return entry.runner.get();
             }
         }
-        return defaultRunner();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::pipelineTailRunner()
@@ -328,7 +338,7 @@ namespace llaminar2
                 return entry_it->runner.get();
             }
         }
-        return lastLocalRunner();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::pipelineTailRunner() const
@@ -340,7 +350,7 @@ namespace llaminar2
                 return entry_it->runner.get();
             }
         }
-        return lastLocalRunner();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::defaultRunner()
@@ -349,7 +359,7 @@ namespace llaminar2
         {
             return entries_.front().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::defaultRunner() const
@@ -358,7 +368,7 @@ namespace llaminar2
         {
             return entries_.front().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     IInferenceRunner *StageRunnerRegistry::lastLocalRunner()
@@ -367,7 +377,7 @@ namespace llaminar2
         {
             return entries_.back().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     const IInferenceRunner *StageRunnerRegistry::lastLocalRunner() const
@@ -376,19 +386,96 @@ namespace llaminar2
         {
             return entries_.back().runner.get();
         }
-        return compatibility_runner_.get();
+        return nullptr;
     }
 
     void StageRunnerRegistry::clearCacheAll()
     {
         for (auto &entry : entries_)
         {
-            entry.runner->clear_cache();
+            entry.runner->resetInferenceState(
+                InferenceStateResetRequest::requestBoundary("global-stage-registry"));
         }
-        if (compatibility_runner_)
+    }
+
+    bool StageRunnerRegistry::purgePrefixCacheAll()
+    {
+        for (auto &entry : entries_)
         {
-            compatibility_runner_->clear_cache();
+            if (!entry.runner || !entry.runner->purgePrefixCache())
+                return false;
         }
+        return true;
+    }
+
+    bool StageRunnerRegistry::configureMTPRequestStopTokensAll(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        bool saw_runner = false;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner)
+            {
+                throw std::logic_error(
+                    "Cannot configure MTP request stop tokens on null global "
+                    "stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+            if (!entry.runner->configureMTPRequestStopTokens(stop_tokens))
+            {
+                throw std::runtime_error(
+                    "MTP request stop-token configuration was rejected by "
+                    "global stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+        }
+
+
+        if (!saw_runner)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request stop tokens without a local "
+                "global stage runner");
+        }
+        return true;
+    }
+
+    bool StageRunnerRegistry::configureMTPRequestPenaltyPolicyAll(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        bool saw_runner = false;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            if (!entry.runner)
+            {
+                throw std::logic_error(
+                    "Cannot configure MTP request penalty policy on null global "
+                    "stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+            if (!entry.runner->configureMTPRequestPenaltyPolicy(policy))
+            {
+                throw std::runtime_error(
+                    "MTP request penalty-policy configuration was rejected by "
+                    "global stage runner " +
+                    std::to_string(entry.stage_id) + " (domain='" +
+                    entry.domain_name + "')");
+            }
+        }
+
+
+        if (!saw_runner)
+        {
+            throw std::logic_error(
+                "Cannot configure MTP request penalty policy without a local "
+                "global stage runner");
+        }
+        return true;
     }
 
     void StageRunnerRegistry::setSkipLogitsGatherDecodeAll(bool skip)
@@ -396,10 +483,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->setSkipLogitsGatherDecode(skip);
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSkipLogitsGatherDecode(skip);
         }
     }
 
@@ -409,10 +492,6 @@ namespace llaminar2
         {
             entry.runner->setSkipLogitsGatherPrefill(skip);
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSkipLogitsGatherPrefill(skip);
-        }
     }
 
     void StageRunnerRegistry::setSuppressTimelineAll(bool suppress)
@@ -420,10 +499,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->setSuppressTimeline(suppress);
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setSuppressTimeline(suppress);
         }
     }
 
@@ -433,10 +508,6 @@ namespace llaminar2
         {
             entry.runner->setAccumulatePrefill(accumulate);
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->setAccumulatePrefill(accumulate);
-        }
     }
 
     void StageRunnerRegistry::flushStageTimelineAll()
@@ -444,10 +515,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->flushStageTimeline();
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->flushStageTimeline();
         }
     }
 
@@ -458,14 +525,6 @@ namespace llaminar2
         {
             saw_runner = true;
             if (!entry.runner->supportsChainedMTPDrafts())
-            {
-                return false;
-            }
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            if (!compatibility_runner_->supportsChainedMTPDrafts())
             {
                 return false;
             }
@@ -482,11 +541,6 @@ namespace llaminar2
             saw_runner = true;
             ok = entry.runner->forwardMTP(draft_condition_token) && ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->forwardMTP(draft_condition_token) && ok;
-        }
         return saw_runner && ok;
     }
 
@@ -500,14 +554,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->forwardMTPFromLastDraft(
-                     draft_condition_token,
-                     position_id) &&
-                 ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->forwardMTPFromLastDraft(
                      draft_condition_token,
                      position_id) &&
                  ok;
@@ -531,13 +577,31 @@ namespace llaminar2
                      already_appended_tokens) &&
                  ok;
         }
-        if (compatibility_runner_)
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::commitMTPShiftedRowsFromPartialForwardAll(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
         {
             saw_runner = true;
-            ok = compatibility_runner_->commitMTPShiftedRowsFromLastForward(
+            ok = entry.runner->commitMTPShiftedRowsFromPartialForward(
                      tokens,
                      token_count,
-                     already_appended_tokens) &&
+                     already_appended_tokens,
+                     main_forward_token_count,
+                     allow_speculative_discard,
+                     position_offset_override,
+                     already_appended_shifted_kv_tokens) &&
                  ok;
         }
         return saw_runner && ok;
@@ -561,17 +625,45 @@ namespace llaminar2
                      position_offset_override) &&
                  ok;
         }
-        if (compatibility_runner_)
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+        const PrefixStateSnapshot &checkpoint,
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!checkpoint.valid || checkpoint.participant_snapshots.empty())
+            return false;
+
+        size_t participant_index = 0;
+        bool saw_runner = false;
+        bool ok = true;
+        auto commit_runner = [&](IInferenceRunner &runner)
         {
             saw_runner = true;
-            ok = compatibility_runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+            if (participant_index >= checkpoint.participant_snapshots.size())
+            {
+                ok = false;
+                return;
+            }
+            ok = runner.commitMTPShiftedRowFromCheckpointTerminalHidden(
+                     checkpoint.participant_snapshots[participant_index++],
                      token,
                      already_appended_tokens,
                      allow_speculative_discard,
                      position_offset_override) &&
                  ok;
+        };
+
+        for (auto &entry : entries_)
+        {
+            commit_runner(*entry.runner);
         }
-        return saw_runner && ok;
+        return saw_runner && ok &&
+               participant_index == checkpoint.participant_snapshots.size();
     }
 
     bool StageRunnerRegistry::setComputeAllPositionLogitsAll(bool enabled)
@@ -583,10 +675,71 @@ namespace llaminar2
             saw_runner = true;
             ok = entry.runner->setComputeAllPositionLogits(enabled) && ok;
         }
-        if (compatibility_runner_)
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::setComputeRowIndexedAllPositionLogitsAll(
+        bool enabled,
+        int row_count)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
         {
             saw_runner = true;
-            ok = compatibility_runner_->setComputeAllPositionLogits(enabled) && ok;
+            ok = entry.runner->setComputeRowIndexedAllPositionLogits(
+                     enabled,
+                     row_count) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::setMTPSpecVerifierInputPlanAll(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->setMTPSpecVerifierInputPlan(plan) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    void StageRunnerRegistry::clearMTPSpecVerifierInputPlanAll()
+    {
+        for (auto &entry : entries_)
+        {
+            entry.runner->clearMTPSpecVerifierInputPlan();
+        }
+    }
+
+    bool StageRunnerRegistry::publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        std::string first_error;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            std::string local_error;
+            const bool runner_ok =
+                entry.runner->publishGroupedDecodeEquivalentMTPSpecStateBatch(
+                    plans,
+                    &local_error);
+            if (!runner_ok && first_error.empty())
+                first_error = local_error;
+            ok = runner_ok && ok;
+        }
+        if ((!saw_runner || !ok) && error)
+        {
+            *error = first_error.empty()
+                         ? "global grouped decode-equivalent publication had no local runner"
+                         : first_error;
         }
         return saw_runner && ok;
     }
@@ -600,11 +753,6 @@ namespace llaminar2
             saw_runner = true;
             ok = entry.runner && entry.runner->ensureMTPCheckpointTerminalHidden() && ok;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->ensureMTPCheckpointTerminalHidden() && ok;
-        }
         return saw_runner && ok;
     }
 
@@ -615,11 +763,329 @@ namespace llaminar2
         {
             epoch = std::max(epoch, entry.runner->moePlacementEpoch());
         }
-        if (compatibility_runner_)
+        return epoch;
+    }
+
+    uint64_t StageRunnerRegistry::moeRuntimeMovementEpochAll() const
+    {
+        uint64_t epoch = 0;
+        for (const auto &entry : entries_)
         {
-            epoch = std::max(epoch, compatibility_runner_->moePlacementEpoch());
+            epoch = std::max(epoch, entry.runner->moeRuntimeMovementEpoch());
         }
         return epoch;
+    }
+
+    PrefixLookupResult StageRunnerRegistry::lookupPrefixAll(
+        const std::vector<int32_t> &tokens)
+    {
+        last_prefix_hits_.clear();
+
+        std::vector<PrefixParticipantLookup> participants;
+        int block_size = 0;
+        int participant_id = 0;
+        for (auto &entry : entries_)
+        {
+            PrefixLookupResult hit = entry.runner->lookupPrefix(tokens);
+            if (block_size <= 0 && hit.block_size > 0)
+                block_size = hit.block_size;
+            participants.push_back(makePrefixParticipantLookup(
+                participant_id++,
+                entry.runner->primaryDeviceId(),
+                hit,
+                entry.domain_name,
+                PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally));
+            last_prefix_hits_.push_back(std::move(hit));
+        }
+
+        if (participants.empty())
+            return {};
+
+        PrefixLookupResult aggregate = makePrefixLookupResult(
+            coordinatePrefixLookups(std::move(participants)), block_size);
+        const int common_tokens = std::max(0, aggregate.cached_tokens);
+        if (common_tokens > 0)
+        {
+            auto copy_representative = [&](const PrefixLookupResult &candidate)
+            {
+                if (candidate.cached_tokens < common_tokens || candidate.blocks.empty())
+                    return false;
+                aggregate.blocks = candidate.clampedTo(common_tokens).blocks;
+                return true;
+            };
+            for (const auto &hit : last_prefix_hits_)
+            {
+                if (copy_representative(hit))
+                {
+                    break;
+                }
+            }
+        }
+        return aggregate;
+    }
+
+    bool StageRunnerRegistry::populatePrefixAll(
+        const PrefixLookupResult &hit,
+        int seq_idx)
+    {
+        const int common_tokens = std::max(0, hit.cached_tokens);
+        if (common_tokens <= 0)
+            return true;
+        if (last_prefix_hits_.size() != entries_.size())
+        {
+            return false;
+        }
+
+        for (size_t index = 0; index < entries_.size(); ++index)
+        {
+            PrefixLookupResult child_hit =
+                last_prefix_hits_[index].clampedTo(common_tokens);
+            child_hit.restore_model_runtime_state = hit.restore_model_runtime_state;
+            child_hit.restore_hybrid_state_for_suffix_prefill =
+                hit.restore_hybrid_state_for_suffix_prefill;
+            if (!entries_[index].runner->populatePrefix(child_hit, seq_idx))
+            {
+                clearCacheAll();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool StageRunnerRegistry::harvestPrefixAll(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count)
+    {
+        if (!admission.cache_enabled || !admission.supported ||
+            last_prefix_hits_.size() != entries_.size())
+        {
+            return false;
+        }
+
+        bool saw_runner = false;
+        bool ok = true;
+        for (size_t index = 0; index < entries_.size(); ++index)
+        {
+            saw_runner = true;
+            ok = entries_[index].runner->harvestPrefix(
+                     last_prefix_hits_[index],
+                     tokens,
+                     prompt_token_count) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::restorePrefixTerminalStateAll(
+        const PrefixLookupResult &hit)
+    {
+        const int common_tokens = std::max(0, hit.cached_tokens);
+        if (common_tokens <= 0 ||
+            (hit.requires_terminal_logits && !hit.has_terminal_logits))
+        {
+            return false;
+        }
+        if (last_prefix_hits_.size() != entries_.size())
+        {
+            return false;
+        }
+
+        for (size_t index = 0; index < entries_.size(); ++index)
+        {
+            if (!entries_[index].runner->restorePrefixTerminalState(
+                    last_prefix_hits_[index].clampedTo(common_tokens)))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    PrefixRuntimeStateSnapshot StageRunnerRegistry::prefixStateProbeAll(
+        const PrefixProbeCapturePolicy &capture_policy) const
+    {
+        std::vector<PrefixRuntimeStateSnapshot> children;
+        children.reserve(entries_.size());
+        for (const auto &entry : entries_)
+            children.push_back(entry.runner->prefixStateProbe(capture_policy));
+        if (children.empty())
+            return {};
+        if (children.size() == 1u)
+            return std::move(children.front());
+
+        PrefixRuntimeStateSnapshot aggregate = std::move(children.front());
+        aggregate.execution_path = "global-stage-registry";
+
+        constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
+        constexpr uint64_t kFnvPrime = 1099511628211ull;
+        auto fold_value = [](uint64_t digest, uint64_t value)
+        {
+            for (unsigned byte = 0; byte < sizeof(value); ++byte)
+            {
+                digest ^= value & 0xffull;
+                digest *= kFnvPrime;
+                value >>= 8;
+            }
+            return digest;
+        };
+        auto fold_hash = [&](bool child_available,
+                             size_t child_bytes,
+                             uint64_t child_hash,
+                             bool *available,
+                             size_t *bytes,
+                             uint64_t *hash)
+        {
+            if (!child_available)
+                return;
+            uint64_t digest = *available ? *hash : kFnvOffsetBasis;
+            digest = fold_value(digest, static_cast<uint64_t>(child_bytes));
+            digest = fold_value(digest, child_hash);
+            *available = true;
+            *bytes += child_bytes;
+            *hash = digest;
+        };
+
+        for (size_t index = 1; index < children.size(); ++index)
+        {
+            const auto &child = children[index];
+            aggregate.initialized = aggregate.initialized && child.initialized;
+            aggregate.prefill_logits_ready =
+                aggregate.prefill_logits_ready || child.prefill_logits_ready;
+            aggregate.has_hidden = aggregate.has_hidden || child.has_hidden;
+            aggregate.has_logits = aggregate.has_logits || child.has_logits;
+            aggregate.current_position =
+                std::max(aggregate.current_position, child.current_position);
+            aggregate.session_epoch =
+                std::max(aggregate.session_epoch, child.session_epoch);
+            aggregate.moe_runtime_movement_epoch = std::max(
+                aggregate.moe_runtime_movement_epoch,
+                child.moe_runtime_movement_epoch);
+            aggregate.live_state_epoch =
+                std::max(aggregate.live_state_epoch, child.live_state_epoch);
+            aggregate.live_state_mutations += child.live_state_mutations;
+            aggregate.live_state_accepted_publications +=
+                child.live_state_accepted_publications;
+            aggregate.live_state_rejected_corrections +=
+                child.live_state_rejected_corrections;
+            aggregate.live_state_prefix_restores += child.live_state_prefix_restores;
+            aggregate.live_state_prefix_truncates += child.live_state_prefix_truncates;
+            aggregate.live_state_session_resets += child.live_state_session_resets;
+
+            aggregate.prefix_cache_config_enabled =
+                aggregate.prefix_cache_config_enabled &&
+                child.prefix_cache_config_enabled;
+            aggregate.prefix_cache_ready =
+                aggregate.prefix_cache_ready && child.prefix_cache_ready;
+            aggregate.prefix_cache_bypassed =
+                aggregate.prefix_cache_bypassed || child.prefix_cache_bypassed;
+            if (aggregate.prefix_cache_bypass_reason.empty())
+                aggregate.prefix_cache_bypass_reason = child.prefix_cache_bypass_reason;
+
+            auto sum = [&](uint64_t PrefixRuntimeStateSnapshot::*member)
+            {
+                aggregate.*member += child.*member;
+            };
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_lookups);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_hits);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_partial_hits);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_misses);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_matched_blocks);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_matched_tokens);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_stores);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_inserts);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_evictions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_promotions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_ram_to_disk_demotions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_device_hot_promotions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_device_hot_repromotions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_device_hot_evictions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_disk_evictions);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_device_hot_direct_hits);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_disk_hydrations);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_terminal_state_hits);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_ram_bytes);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_device_bytes);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_disk_bytes);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_hybrid_state_bytes);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_mtp_state_bytes);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_bypasses);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_unsupported_backend_bypasses);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_fingerprint_bypasses);
+            sum(&PrefixRuntimeStateSnapshot::prefix_cache_terminal_state_bypasses);
+
+            aggregate.mtp_config_enabled =
+                aggregate.mtp_config_enabled || child.mtp_config_enabled;
+            aggregate.mtp_bypassed = aggregate.mtp_bypassed || child.mtp_bypassed;
+            if (aggregate.mtp_bypass_reason.empty())
+                aggregate.mtp_bypass_reason = child.mtp_bypass_reason;
+            sum(&PrefixRuntimeStateSnapshot::mtp_draft_steps);
+            sum(&PrefixRuntimeStateSnapshot::mtp_accepted_tokens);
+            sum(&PrefixRuntimeStateSnapshot::mtp_rejected_tokens);
+            sum(&PrefixRuntimeStateSnapshot::mtp_rollbacks);
+            sum(&PrefixRuntimeStateSnapshot::mtp_bypasses);
+            sum(&PrefixRuntimeStateSnapshot::mtp_verifier_runs);
+            sum(&PrefixRuntimeStateSnapshot::mtp_verifier_token_count);
+            sum(&PrefixRuntimeStateSnapshot::mtp_stochastic_accept_tests);
+            sum(&PrefixRuntimeStateSnapshot::mtp_stochastic_accepts);
+            sum(&PrefixRuntimeStateSnapshot::mtp_stochastic_residual_samples);
+            sum(&PrefixRuntimeStateSnapshot::mtp_stochastic_terminal_samples);
+            sum(&PrefixRuntimeStateSnapshot::mtp_transaction_commits);
+            sum(&PrefixRuntimeStateSnapshot::mtp_transaction_rollbacks);
+            sum(&PrefixRuntimeStateSnapshot::mtp_transaction_validation_failures);
+            sum(&PrefixRuntimeStateSnapshot::mtp_unsafe_verifier_state_rejections);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_windows);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_updates);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_promotions);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_demotions);
+            sum(&PrefixRuntimeStateSnapshot::mtp_depth_policy_observe_recommendations);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunk_schedules);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunk_successful_schedules);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunks);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunk_real_tokens);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunk_padded_tokens);
+            sum(&PrefixRuntimeStateSnapshot::prefill_chunk_failures);
+
+            fold_hash(
+                child.terminal_hidden_hash_available,
+                child.terminal_hidden_bytes,
+                child.terminal_hidden_hash,
+                &aggregate.terminal_hidden_hash_available,
+                &aggregate.terminal_hidden_bytes,
+                &aggregate.terminal_hidden_hash);
+            aggregate.terminal_hidden_values.insert(
+                aggregate.terminal_hidden_values.end(),
+                child.terminal_hidden_values.begin(),
+                child.terminal_hidden_values.end());
+            fold_hash(
+                child.terminal_logits_hash_available,
+                child.terminal_logits_bytes,
+                child.terminal_logits_hash,
+                &aggregate.terminal_logits_hash_available,
+                &aggregate.terminal_logits_bytes,
+                &aggregate.terminal_logits_hash);
+            aggregate.terminal_logits_values.insert(
+                aggregate.terminal_logits_values.end(),
+                child.terminal_logits_values.begin(),
+                child.terminal_logits_values.end());
+            if (aggregate.primary_device.is_cpu() && !child.primary_device.is_cpu())
+                aggregate.primary_device = child.primary_device;
+            aggregate.kv_caches.insert(
+                aggregate.kv_caches.end(),
+                child.kv_caches.begin(), child.kv_caches.end());
+            aggregate.mtp_kv_caches.insert(
+                aggregate.mtp_kv_caches.end(),
+                child.mtp_kv_caches.begin(), child.mtp_kv_caches.end());
+            aggregate.gdn_layers.insert(
+                aggregate.gdn_layers.end(),
+                child.gdn_layers.begin(), child.gdn_layers.end());
+            aggregate.prefill_graphs.insert(
+                aggregate.prefill_graphs.end(),
+                child.prefill_graphs.begin(), child.prefill_graphs.end());
+        }
+        if (aggregate.prefix_cache_bypassed)
+            aggregate.prefix_cache_ready = false;
+        return aggregate;
     }
 
     PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixStateAll(int seq_idx) const
@@ -668,10 +1134,6 @@ namespace llaminar2
             if (!capture_runner(*entry.runner))
                 return {};
         }
-        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
-        {
-            return {};
-        }
         if (!saw_runner || !have_common_tokens)
         {
             return {};
@@ -684,7 +1146,8 @@ namespace llaminar2
         return aggregate;
     }
 
-    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixCheckpointAll(int seq_idx) const
+    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixCheckpointAll(
+        const PrefixCheckpointCaptureRequest &request) const
     {
         PrefixStateSnapshot aggregate;
         bool saw_runner = false;
@@ -698,7 +1161,8 @@ namespace llaminar2
         auto capture_runner = [&](const IInferenceRunner &runner)
         {
             saw_runner = true;
-            PrefixStateSnapshot child = runner.captureLivePrefixCheckpoint(seq_idx);
+            PrefixStateSnapshot child =
+                runner.captureLivePrefixCheckpoint(request);
             if (!child.valid)
                 return false;
 
@@ -730,10 +1194,6 @@ namespace llaminar2
         {
             if (!capture_runner(*entry.runner))
                 return {};
-        }
-        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
-        {
-            return {};
         }
         if (!saw_runner || !have_common_tokens)
         {
@@ -778,10 +1238,6 @@ namespace llaminar2
         {
             restore_runner(*entry.runner);
         }
-        if (compatibility_runner_)
-        {
-            restore_runner(*compatibility_runner_);
-        }
 
         return saw_runner && ok && participant_index == snapshot.participant_snapshots.size();
     }
@@ -794,11 +1250,6 @@ namespace llaminar2
         {
             saw_runner = true;
             ok = entry.runner->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
-        }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            ok = compatibility_runner_->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
         }
         return saw_runner && ok;
     }
@@ -813,13 +1264,6 @@ namespace llaminar2
             if (!reason.empty())
                 return reason;
         }
-        if (compatibility_runner_)
-        {
-            saw_runner = true;
-            std::string reason = compatibility_runner_->mtpDecodeUnsupportedReason();
-            if (!reason.empty())
-                return reason;
-        }
         return saw_runner ? std::string{} : "MTP decode requires a global stage runner";
     }
 
@@ -829,9 +1273,48 @@ namespace llaminar2
         {
             entry.runner->enableSnapshotCapture(output_dir);
         }
-        if (compatibility_runner_)
+    }
+
+    void StageRunnerRegistry::setSnapshotCaptureFilterAll(
+        const std::vector<std::string> &keys)
+    {
+        for (auto &entry : entries_)
         {
-            compatibility_runner_->enableSnapshotCapture(output_dir);
+            if (keys.empty())
+            {
+                entry.runner->setSnapshotCaptureFilter({});
+                continue;
+            }
+
+            std::vector<std::string> stage_keys;
+            stage_keys.reserve(keys.size() * 2u);
+            for (const auto &key : keys)
+            {
+                auto parsed = parseLayerSnapshotKey(key);
+                if (!parsed)
+                {
+                    stage_keys.push_back(key);
+                    continue;
+                }
+                if (!stageOwnsGlobalLayer(entry, parsed->layer))
+                    continue;
+
+                // Stage graph builders may expose either global layer names or
+                // their stage-local ordinal. Accept both identities at this
+                // topology boundary; snapshot lookup later globalizes the one
+                // actually published.
+                stage_keys.push_back(key);
+                if (auto local_key = localStageSnapshotKey(entry, *parsed);
+                    local_key && *local_key != key)
+                {
+                    stage_keys.push_back(std::move(*local_key));
+                }
+            }
+            std::sort(stage_keys.begin(), stage_keys.end());
+            stage_keys.erase(
+                std::unique(stage_keys.begin(), stage_keys.end()),
+                stage_keys.end());
+            entry.runner->setSnapshotCaptureFilter(stage_keys);
         }
     }
 
@@ -841,10 +1324,6 @@ namespace llaminar2
         {
             entry.runner->disableSnapshotCapture();
         }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->disableSnapshotCapture();
-        }
     }
 
     void StageRunnerRegistry::clearSnapshotsAll()
@@ -852,10 +1331,6 @@ namespace llaminar2
         for (auto &entry : entries_)
         {
             entry.runner->clearSnapshots();
-        }
-        if (compatibility_runner_)
-        {
-            compatibility_runner_->clearSnapshots();
         }
     }
 
@@ -887,10 +1362,6 @@ namespace llaminar2
                     }
                 }
             }
-        }
-        if (compatibility_runner_)
-        {
-            return compatibility_runner_->getSnapshot(key, out_size);
         }
         out_size = 0;
         return nullptr;
@@ -925,10 +1396,6 @@ namespace llaminar2
                 }
             }
         }
-        if (compatibility_runner_)
-        {
-            return compatibility_runner_->getSnapshotWithShape(key);
-        }
         return {};
     }
 
@@ -953,10 +1420,6 @@ namespace llaminar2
                 key = globalizeStageSnapshotKey(entry, key);
             }
             append_unique(runner_keys);
-        }
-        if (compatibility_runner_)
-        {
-            append_unique(compatibility_runner_->getSnapshotKeys());
         }
         return keys;
     }
@@ -1208,20 +1671,35 @@ namespace llaminar2
         // Build this rank's execution plan from topology
         rank_plan_ = GlobalPPRankPlanBuilder::build(config_.topology, config_.rank);
 
+        const auto local_actions = rank_plan_.executeStages();
         for (auto &entry : config_.stage_runners)
         {
+            const auto expected = std::find_if(local_actions.begin(), local_actions.end(),
+                [&](const auto *action) { return action->stage_id == entry.stage_id; });
+            if (expected == local_actions.end() ||
+                entry.action.stage_id != (*expected)->stage_id ||
+                entry.action.role != RankStageAction::Role::EXECUTE ||
+                entry.action.first_layer != (*expected)->first_layer ||
+                entry.action.last_layer != (*expected)->last_layer ||
+                entry.action.has_embedding != (*expected)->has_embedding ||
+                entry.action.has_lm_head != (*expected)->has_lm_head ||
+                entry.action.domain_name != (*expected)->domain_name)
+                throw std::invalid_argument("GlobalOrchestrator: stage runner does not match this rank's topology action");
+            // A runner cannot claim a different local layer interval from the
+            // action that routes its activations and determines terminal authority.
+            if (entry.pp_stage_config &&
+                (entry.pp_stage_config->first_layer != (*expected)->first_layer ||
+                 entry.pp_stage_config->last_layer != (*expected)->last_layer + 1 ||
+                 entry.pp_stage_config->has_embedding != (*expected)->has_embedding ||
+                 entry.pp_stage_config->has_lm_head != (*expected)->has_lm_head))
+                throw std::invalid_argument("GlobalOrchestrator: stage runner scope disagrees with its topology action");
             stage_runners_.add(std::move(entry));
         }
         config_.stage_runners.clear();
 
-        if (config_.rank_runner)
-        {
-            stage_runners_.setCompatibilityRunner(std::move(config_.rank_runner));
-        }
-
         if (stage_runners_.empty())
         {
-            throw std::invalid_argument("GlobalOrchestrator: rank_runner or stage_runners is required");
+            throw std::invalid_argument("GlobalOrchestrator: explicit stage runners are required");
         }
 
         for (const auto *action : rank_plan_.executeStages())
@@ -1311,6 +1789,66 @@ namespace llaminar2
         return true;
     }
 
+    bool GlobalOrchestrator::forwardGroupedMTPVerifierWithHostTokenIds(
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        if (token_batches.empty() ||
+            std::any_of(
+                token_batches.begin(),
+                token_batches.end(),
+                [](const auto &row) { return row.empty(); }))
+        {
+            LOG_ERROR(
+                "GlobalOrchestrator: grouped MTP verifier requires one or "
+                "more non-empty request rows");
+            return false;
+        }
+
+        last_seq_len_ = static_cast<int>(
+            std::max_element(
+                token_batches.begin(),
+                token_batches.end(),
+                [](const auto &lhs, const auto &rhs)
+                {
+                    return lhs.size() < rhs.size();
+                })
+                ->size());
+
+        for (const auto &step : rank_plan_.steps)
+        {
+            switch (step.type)
+            {
+            case GlobalPPRankPlan::Step::Type::EXECUTE_STAGE:
+                if (step.stage_action.role == RankStageAction::Role::EXECUTE &&
+                    !executeGroupedMTPVerifierStage(
+                        step.stage_action,
+                        token_batches))
+                {
+                    LOG_ERROR(
+                        "GlobalOrchestrator: rank " << config_.rank
+                        << " failed grouped MTP verifier stage "
+                        << step.stage_action.stage_id);
+                    return false;
+                }
+                break;
+            case GlobalPPRankPlan::Step::Type::TRANSFER:
+                if (step.transfer_action.direction !=
+                        RankTransferAction::Direction::NONE &&
+                    !executeTransfer(step.transfer_action))
+                {
+                    LOG_ERROR(
+                        "GlobalOrchestrator: rank " << config_.rank
+                        << " failed grouped MTP verifier transfer (peer="
+                        << step.transfer_action.peer_rank
+                        << " tag=" << step.transfer_action.mpi_tag << ")");
+                    return false;
+                }
+                break;
+            }
+        }
+        return true;
+    }
+
     const float *GlobalOrchestrator::logits() const
     {
         // Only the tail rank (with LM head) has valid logits
@@ -1340,6 +1878,27 @@ namespace llaminar2
             LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
                       << " barrier in clear_cache failed: " << e.what());
         }
+    }
+
+    bool GlobalOrchestrator::purgePrefixCache()
+    {
+        const bool local_success = stage_runners_.purgePrefixCacheAll();
+        /*
+         * Global orchestration already owns rank coordination. Preserve that
+         * boundary so no rank begins a new lookup while a peer still exposes
+         * the old archive generation.
+         */
+        try
+        {
+            config_.mpi_ctx->barrier();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                      << " barrier in purgePrefixCache failed: " << e.what());
+            return false;
+        }
+        return local_success;
     }
 
     int GlobalOrchestrator::get_position() const
@@ -1397,6 +1956,27 @@ namespace llaminar2
             already_appended_tokens);
     }
 
+    bool GlobalOrchestrator::commitMTPShiftedRowsFromPartialForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count,
+        bool allow_speculative_discard,
+        int position_offset_override,
+        int already_appended_shifted_kv_tokens)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowsFromPartialForwardAll(
+            tokens,
+            token_count,
+            already_appended_tokens,
+            main_forward_token_count,
+            allow_speculative_discard,
+            position_offset_override,
+            already_appended_shifted_kv_tokens);
+    }
+
     bool GlobalOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
         int32_t token,
         int already_appended_tokens,
@@ -1406,6 +1986,23 @@ namespace llaminar2
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.commitMTPShiftedRowFromCurrentTerminalHiddenAll(
+            token,
+            already_appended_tokens,
+            allow_speculative_discard,
+            position_offset_override);
+    }
+
+    bool GlobalOrchestrator::commitMTPShiftedRowFromCheckpointTerminalHidden(
+        const PrefixStateSnapshot &checkpoint,
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowFromCheckpointTerminalHiddenAll(
+            checkpoint,
             token,
             already_appended_tokens,
             allow_speculative_discard,
@@ -1427,11 +2024,47 @@ namespace llaminar2
         return runner ? runner->mtpLogits() : nullptr;
     }
 
+    bool GlobalOrchestrator::configureMTPRequestStopTokens(
+        const std::vector<int32_t> &stop_tokens)
+    {
+        return stage_runners_.configureMTPRequestStopTokensAll(stop_tokens);
+    }
+
+    bool GlobalOrchestrator::configureMTPRequestPenaltyPolicy(
+        const MTPRequestPenaltyPolicy &policy)
+    {
+        return stage_runners_.configureMTPRequestPenaltyPolicyAll(policy);
+    }
+
     bool GlobalOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.setComputeAllPositionLogitsAll(enabled);
+    }
+
+    bool GlobalOrchestrator::setComputeRowIndexedAllPositionLogits(
+        bool enabled,
+        int row_count)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.setComputeRowIndexedAllPositionLogitsAll(
+            enabled,
+            row_count);
+    }
+
+    bool GlobalOrchestrator::setMTPSpecVerifierInputPlan(
+        const MTPSpecDecodeVerifierInputPlan &plan)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.setMTPSpecVerifierInputPlanAll(plan);
+    }
+
+    void GlobalOrchestrator::clearMTPSpecVerifierInputPlan()
+    {
+        stage_runners_.clearMTPSpecVerifierInputPlanAll();
     }
 
     const float *GlobalOrchestrator::getAllPositionLogits() const
@@ -1458,6 +2091,26 @@ namespace llaminar2
         return runner ? runner->getMTPLogitsLocalInfo() : LogitsLocalInfo{};
     }
 
+    LogitsLocalInfo GlobalOrchestrator::consumeMTPLogitsLocalInfoForSampling()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeMTPLogitsLocalInfoForSampling()
+                   : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeMTPLogitsLocalInfoForHostGather()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeMTPLogitsLocalInfoForHostGather()
+                   : LogitsLocalInfo{};
+    }
+
     bool GlobalOrchestrator::hasAllPositionLogitsLocal() const
     {
         if (!is_pipeline_tail_)
@@ -1472,6 +2125,41 @@ namespace llaminar2
             return {};
         const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
         return runner ? runner->getAllPositionLogitsLocalInfo() : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeAllPositionLogitsLocalInfoForSampling()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeAllPositionLogitsLocalInfoForSampling()
+                   : LogitsLocalInfo{};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeAllPositionLogitsLocalInfoForHostGather()
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner
+                   ? runner->consumeAllPositionLogitsLocalInfoForHostGather()
+                   : LogitsLocalInfo{};
+    }
+
+    bool GlobalOrchestrator::publishGroupedDecodeEquivalentMTPSpecStateBatch(
+        const MTPSpecStepPlanBatch &plans,
+        std::string *error)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+        {
+            if (error)
+                *error = mtpDecodeUnsupportedReason();
+            return false;
+        }
+        return stage_runners_.publishGroupedDecodeEquivalentMTPSpecStateBatchAll(
+            plans,
+            error);
     }
 
     std::string GlobalOrchestrator::mtpDecodeUnsupportedReason() const
@@ -1489,6 +2177,41 @@ namespace llaminar2
     uint64_t GlobalOrchestrator::moePlacementEpoch() const
     {
         return stage_runners_.moePlacementEpochAll();
+    }
+
+    uint64_t GlobalOrchestrator::moeRuntimeMovementEpoch() const
+    {
+        return stage_runners_.moeRuntimeMovementEpochAll();
+    }
+
+    PrefixLookupResult GlobalOrchestrator::lookupPrefix(
+        const std::vector<int32_t> &tokens)
+    {
+        return stage_runners_.lookupPrefixAll(tokens);
+    }
+
+    bool GlobalOrchestrator::populatePrefix(
+        const PrefixLookupResult &hit,
+        int seq_idx)
+    {
+        return stage_runners_.populatePrefixAll(hit, seq_idx);
+    }
+
+    bool GlobalOrchestrator::harvestPrefix(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count)
+    {
+        return stage_runners_.harvestPrefixAll(
+            admission,
+            tokens,
+            prompt_token_count);
+    }
+
+    bool GlobalOrchestrator::restorePrefixTerminalState(
+        const PrefixLookupResult &hit)
+    {
+        return stage_runners_.restorePrefixTerminalStateAll(hit);
     }
 
     int GlobalOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
@@ -1563,9 +2286,10 @@ namespace llaminar2
         return stage_runners_.captureLivePrefixStateAll(seq_idx);
     }
 
-    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixCheckpoint(
+        const PrefixCheckpointCaptureRequest &request) const
     {
-        return stage_runners_.captureLivePrefixCheckpointAll(seq_idx);
+        return stage_runners_.captureLivePrefixCheckpointAll(request);
     }
 
     bool GlobalOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
@@ -1578,9 +2302,23 @@ namespace llaminar2
         return stage_runners_.truncateLivePrefixStateAll(cached_tokens, seq_idx);
     }
 
+    PrefixRuntimeStateSnapshot GlobalOrchestrator::prefixStateProbe(
+        const PrefixProbeCapturePolicy &capture_policy) const
+    {
+        return stage_runners_.prefixStateProbeAll(capture_policy);
+    }
+
     // =========================================================================
     // GPU-side Sampling with Cross-Rank Broadcast
     // =========================================================================
+
+    bool GlobalOrchestrator::requiresMPICoordinatedDecodeSampling(
+        const SamplingParams &params) const
+    {
+        // Every rank must enter sampleGreedyOnDevice's terminal-token Bcast.
+        // Stochastic CPU sampling consumes only the tail's complete host row.
+        return params.is_greedy();
+    }
 
     int GlobalOrchestrator::sampleGreedyOnDevice()
     {
@@ -1592,13 +2330,13 @@ namespace llaminar2
             // Tail rank: sample locally
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleGreedyOnDevice() : -1;
-            if (token < 0)
+            if (token < 0 && runner && !runner->primaryDeviceId().is_gpu())
             {
-                // Fallback to CPU sampling
+                // CPU-only host sampling. GPU runners must surface the device
+                // sampling failure so callers do not silently copy logits.
                 const float *log = logits();
                 if (log)
                 {
-                    // Simple argmax fallback
                     token = 0;
                     float best = log[0];
                     for (int i = 1; i < config_.vocab_size; ++i)
@@ -1644,13 +2382,6 @@ namespace llaminar2
         {
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleOnDevice(params) : -1;
-            if (token < 0)
-            {
-                // Fallback: greedy
-                token = sampleGreedyOnDevice();
-                // Note: sampleGreedyOnDevice already broadcasts, so return directly
-                return token;
-            }
         }
 
         // Broadcast sampled token from tail rank to all ranks
@@ -1748,6 +2479,12 @@ namespace llaminar2
         stage_runners_.enableSnapshotCaptureAll(output_dir);
     }
 
+    void GlobalOrchestrator::setSnapshotCaptureFilter(
+        const std::vector<std::string> &keys)
+    {
+        stage_runners_.setSnapshotCaptureFilterAll(keys);
+    }
+
     void GlobalOrchestrator::disableSnapshotCapture()
     {
         stage_runners_.disableSnapshotCaptureAll();
@@ -1799,6 +2536,30 @@ namespace llaminar2
         {
             const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             return runner ? runner->getLogitsLocalInfo() : LogitsLocalInfo{};
+        }
+        return {};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeLogitsLocalInfoForSampling()
+    {
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner
+                       ? runner->consumeLogitsLocalInfoForSampling()
+                       : LogitsLocalInfo{};
+        }
+        return {};
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::consumeLogitsLocalInfoForHostGather()
+    {
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            return runner
+                       ? runner->consumeLogitsLocalInfoForHostGather()
+                       : LogitsLocalInfo{};
         }
         return {};
     }
@@ -1913,6 +2674,24 @@ namespace llaminar2
         return runner->forward(action.has_embedding ? tokens : nullptr, seq_len);
     }
 
+    bool GlobalOrchestrator::executeGroupedMTPVerifierStage(
+        const RankStageAction &action,
+        const std::vector<std::vector<int>> &token_batches)
+    {
+        IInferenceRunner *runner =
+            stage_runners_.runnerForStage(action.stage_id);
+        if (!runner)
+        {
+            LOG_ERROR(
+                "GlobalOrchestrator: rank " << config_.rank
+                << " has no grouped-verifier runner for stage "
+                << action.stage_id);
+            return false;
+        }
+        return runner->forwardGroupedMTPVerifierWithHostTokenIds(
+            token_batches);
+    }
+
     // =========================================================================
     // Internal: Execute Transfer
     // =========================================================================
@@ -1935,30 +2714,28 @@ namespace llaminar2
 
     int GlobalOrchestrator::findTailRank() const
     {
+        std::optional<int> owner;
         for (const auto &stage : config_.topology.stages)
         {
             if (stage.has_lm_head)
             {
+                if (owner)
+                    throw std::invalid_argument("GlobalOrchestrator: multiple vocabulary-head stages");
                 if (stage.is_global_tp)
                 {
-                    // For global TP stages, all participating ranks have the LM head.
-                    // Use the first participating rank as the "primary" tail for
-                    // broadcasting purposes.
-                    if (!stage.participating_ranks.empty())
-                        return stage.participating_ranks[0];
+                    // The domain leader is shared by all ranks' resolved plan;
+                    // it is not necessarily the last physical rank in the job.
+                    if (stage.participating_ranks.empty())
+                        throw std::invalid_argument("GlobalOrchestrator: vocabulary domain has no participants");
+                    owner = stage.participating_ranks.front();
                 }
-                return stage.owning_rank;
+                else
+                    owner = stage.owning_rank;
             }
         }
-        // Fallback: last stage's owner
-        if (!config_.topology.stages.empty())
-        {
-            const auto &last = config_.topology.stages.back();
-            return last.is_global_tp && !last.participating_ranks.empty()
-                       ? last.participating_ranks[0]
-                       : last.owning_rank;
-        }
-        return 0;
+        if (!owner || *owner < 0 || *owner >= config_.world_size)
+            throw std::invalid_argument("GlobalOrchestrator: no valid vocabulary-head request authority");
+        return *owner;
     }
 
 } // namespace llaminar2

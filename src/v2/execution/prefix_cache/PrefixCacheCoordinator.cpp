@@ -1,3 +1,12 @@
+/**
+ * @file PrefixCacheCoordinator.cpp
+ * @brief Implements typed common-prefix reductions and fingerprint policy.
+ *
+ * Coordination preserves each lookup's original key and epoch. It clamps
+ * payload coverage across participants without consulting live placement,
+ * which may have advanced asynchronously after the lookup was admitted.
+ */
+
 #include "execution/prefix_cache/PrefixCacheCoordinator.h"
 
 #include <algorithm>
@@ -75,6 +84,23 @@ namespace llaminar2
         return MPI_Allreduce(&local_value, global_value, 1, MPI_UINT64_T, MPI_MAX, communicator_) == MPI_SUCCESS;
     }
 
+    bool MPIPrefixCollectiveCoordinator::allPlacementEpochs(
+        PrefixPlacementEpochSpan local_value,
+        PrefixPlacementEpochSpan *global_value)
+    {
+        if (!global_value || communicator_ == MPI_COMM_NULL)
+            return false;
+        // Complement reverses unsigned order: MIN(~latest) encodes MAX(latest).
+        // Two fixed words therefore retain both endpoints in the same single
+        // admission collective previously used for the lossy maximum scalar.
+        const uint64_t local[2]{local_value.earliest(), ~local_value.latest()};
+        uint64_t global[2]{};
+        if (MPI_Allreduce(local, global, 2, MPI_UINT64_T, MPI_MIN, communicator_) != MPI_SUCCESS)
+            return false;
+        *global_value = PrefixPlacementEpochSpan::covering(global[0], ~global[1]);
+        return true;
+    }
+
     bool MPIPrefixCollectiveCoordinator::allAndBool(bool local_value, bool *global_value)
     {
         if (!global_value || communicator_ == MPI_COMM_NULL)
@@ -104,21 +130,32 @@ namespace llaminar2
         DeviceId device,
         const PrefixLookupResult &hit,
         std::string domain_id,
-        uint64_t placement_epoch)
+        PrefixFingerprintCoordinationPolicy fingerprint_policy)
     {
         PrefixParticipantLookup participant;
         participant.domain_id = std::move(domain_id);
         participant.participant_id = participant_id;
         participant.device = device;
-        participant.placement_epoch = placement_epoch != 0 ? placement_epoch : hit.placement_epoch;
+        participant.placement_epochs = hit.placement_epochs;
         participant.fingerprint_key = hit.fingerprint_key;
+        participant.fingerprint_policy = fingerprint_policy;
         participant.supported = hit.supported;
         participant.cache_enabled = hit.cache_enabled;
         participant.hit = hit.cached_tokens > 0;
         participant.matched_tokens = nonNegative(hit.cached_tokens);
-        participant.matched_blocks = !hit.blocks.empty()
-                                         ? static_cast<int>(hit.blocks.size())
-                                         : (hit.block_size > 0 ? participant.matched_tokens / hit.block_size : 0);
+        // Coordination compares logical coverage, not allocation count. One
+        // complete recurrent checkpoint can cover the same prefix as many
+        // attention blocks. A partial chunk needs an actual retained boundary
+        // witness; metadata alone only certifies complete block coverage.
+        const bool retained_terminal_boundary = !hit.blocks.empty() &&
+            hit.blocks.back().key.token_count > 0 &&
+            hit.blocks.back().key.token_start + hit.blocks.back().key.token_count ==
+                participant.matched_tokens;
+        participant.matched_blocks = hit.block_size > 0
+            ? participant.matched_tokens / hit.block_size +
+                (retained_terminal_boundary &&
+                 participant.matched_tokens % hit.block_size != 0 ? 1 : 0)
+            : 0;
         participant.requires_terminal_logits = hit.requires_terminal_logits;
         participant.requires_terminal_hidden = hit.requires_terminal_hidden;
         participant.has_terminal_logits = hit.has_terminal_logits;
@@ -152,7 +189,10 @@ namespace llaminar2
         int local_max_tokens = 0;
         uint64_t local_min_fingerprint = std::numeric_limits<uint64_t>::max();
         uint64_t local_max_fingerprint = 0;
-        uint64_t local_placement_epoch = 0;
+        // Seed from an actual participant: epoch zero is a valid admission,
+        // not a sentinel that may silently replace the oldest observed epoch.
+        PrefixPlacementEpochSpan local_placement_epochs =
+            result.participants.front().placement_epochs;
 
         for (const auto &participant : result.participants)
         {
@@ -164,9 +204,11 @@ namespace llaminar2
             local_min_tokens = std::min(local_min_tokens, participant_tokens);
             local_min_blocks = std::min(local_min_blocks, participant_blocks);
             local_max_tokens = std::max(local_max_tokens, participant_tokens);
-            local_placement_epoch = std::max(local_placement_epoch, participant.placement_epoch);
+            local_placement_epochs = local_placement_epochs.mergedWith(
+                participant.placement_epochs);
             if (participant_tokens > 0 &&
-                participant.fingerprint_must_match &&
+                participant.fingerprint_policy ==
+                    PrefixFingerprintCoordinationPolicy::RequireIdentical &&
                 participant.fingerprint_key != 0)
             {
                 local_min_fingerprint = std::min(local_min_fingerprint, participant.fingerprint_key);
@@ -198,7 +240,7 @@ namespace llaminar2
         int global_min_blocks = local_min_blocks;
         uint64_t global_min_fingerprint = local_min_fingerprint;
         uint64_t global_max_fingerprint = local_max_fingerprint;
-        uint64_t global_placement_epoch = local_placement_epoch;
+        PrefixPlacementEpochSpan global_placement_epochs = local_placement_epochs;
         bool global_any_cache_enabled = local_any_cache_enabled;
         bool global_all_supported = local_all_supported;
         bool global_any_terminal_logits_required = local_any_terminal_logits_required;
@@ -212,7 +254,7 @@ namespace llaminar2
                 !domain_coordinator->allMinInt(local_min_blocks, &global_min_blocks) ||
                 !domain_coordinator->allMinUInt64(local_min_fingerprint, &global_min_fingerprint) ||
                 !domain_coordinator->allMaxUInt64(local_max_fingerprint, &global_max_fingerprint) ||
-                !domain_coordinator->allMaxUInt64(local_placement_epoch, &global_placement_epoch) ||
+                !domain_coordinator->allPlacementEpochs(local_placement_epochs, &global_placement_epochs) ||
                 !domain_coordinator->allOrBool(local_any_cache_enabled, &global_any_cache_enabled) ||
                 !domain_coordinator->allOrBool(local_any_terminal_logits_required,
                                                &global_any_terminal_logits_required) ||
@@ -231,7 +273,7 @@ namespace llaminar2
 
         result.cache_enabled = global_any_cache_enabled;
         result.supported = global_all_supported;
-        result.placement_epoch = global_placement_epoch;
+        result.placement_epochs = global_placement_epochs;
         result.common_terminal_logits_required = global_any_terminal_logits_required;
         result.common_terminal_hidden_required = global_any_terminal_hidden_required;
         const bool fingerprint_mismatch =
@@ -289,7 +331,7 @@ namespace llaminar2
         result.cache_enabled = coordination.cache_enabled;
         result.block_size = block_size;
         result.fingerprint_key = coordination.fingerprint_key;
-        result.placement_epoch = coordination.placement_epoch;
+        result.placement_epochs = coordination.placement_epochs;
         result.requires_terminal_logits = coordination.common_terminal_logits_required;
         result.requires_terminal_hidden = coordination.common_terminal_hidden_required;
 

@@ -33,6 +33,7 @@ static const BufferDescriptor *findBuf(
 
 TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
 {
+    constexpr size_t kVerifierRowCapacity = 31;
     Qwen3SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
@@ -47,11 +48,12 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
     config.local_n_heads = 16;
     config.local_n_kv_heads = 4;
     config.local_d_ff = 8960;
+    config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
     // Qwen3 has 10 layer buffers, including one-row prefill scratch and
-    // four-row compact verifier scratch for row-indexed MTP target logits.
+    // caller-sized verifier scratch for row-indexed MTP target logits.
     EXPECT_EQ(reqs.buffers.size(), 10u) << "Expected 10 layer buffers";
 
     // normalized: [512, 2048]
@@ -117,11 +119,11 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_ExactShapes)
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2048u);
 
-    // lm_head_input_rows: [4, d_model] compact verifier rows for MTP target logits.
+    // lm_head_input_rows: [capacity, d_model] for MTP target logits.
     auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
     ASSERT_NE(lm_head_input_rows, nullptr);
     ASSERT_EQ(lm_head_input_rows->shape.size(), 2u);
-    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], kVerifierRowCapacity);
     EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
 }
 
@@ -223,6 +225,7 @@ TEST(Test__Qwen3BufferSizes, ModelBuffers_TP2)
 
 TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
 {
+    constexpr size_t kVerifierRowCapacity = 31;
     Qwen3SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
@@ -237,6 +240,7 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
     config.local_n_heads = 8;    // 16/2
     config.local_n_kv_heads = 2; // 4/2
     config.local_d_ff = 4480;    // 8960/2
+    config.custom_formulas["mtp_target_query_rows"] = kVerifierRowCapacity;
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
@@ -259,6 +263,6 @@ TEST(Test__Qwen3BufferSizes, LayerBuffers_TP2)
 
     auto *lm_head_input_rows = findBuf(reqs, "lm_head_input_rows");
     ASSERT_NE(lm_head_input_rows, nullptr);
-    EXPECT_EQ(lm_head_input_rows->shape[0], 4u);
+    EXPECT_EQ(lm_head_input_rows->shape[0], kVerifierRowCapacity);
     EXPECT_EQ(lm_head_input_rows->shape[1], 2048u);
 }

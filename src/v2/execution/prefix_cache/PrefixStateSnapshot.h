@@ -1,8 +1,18 @@
+/**
+ * @file PrefixStateSnapshot.h
+ * @brief Owned prefix lookup and persistent-state checkpoint contracts.
+ *
+ * Lookups retain the placement admission span alongside payload leases.
+ * Checkpoints own their exact memory and readiness events so asynchronous
+ * restore cannot outlive its sources or relabel state after expert movement.
+ */
 #pragma once
 
 #include "backends/DeviceId.h"
 #include "execution/prefix_cache/PrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixPlacementEpochSpan.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -26,6 +36,66 @@ namespace llaminar2
     const char *toString(PrefixStateProvenance provenance);
     bool isDecodeEquivalent(PrefixStateProvenance provenance);
 
+    /**
+     * @brief Typed terminal-block action selected at prefix harvest.
+     *
+     * A full prefix hit restores an immutable terminal archive and does not
+     * mutate that prompt state before harvest. Replacing the same archive in
+     * that case wastes D2H bandwidth and can temporarily require two physical
+     * RAM allocations while the restore event still owns the admitted block.
+     * Partial hits and incomplete terminal records must archive the newly
+     * computed live state instead.
+     */
+    enum class PrefixTerminalHarvestDisposition
+    {
+        ArchiveLiveState,
+        ReuseAdmittedArchive,
+    };
+
+    /**
+     * @brief Opaque device-owned checkpoint of one KV cache sequence.
+     *
+     * The checkpoint contains backend-private canonical ring metadata, never
+     * KV payload bytes and never a host mirror. @ref cache_depth identifies
+     * the primary cache with -1 and shifted MTP cache N with N. The allocation
+     * is retained through shared ownership so an asynchronous capture cannot
+     * outlive or race reuse of its pool slot.
+     */
+    struct DeviceKVSequenceStateCheckpoint
+    {
+        int cache_depth = -1;
+        int sequence_index = -1;
+        int metadata_layer_count = 0;
+        size_t bytes = 0;
+        DeviceId device = DeviceId::invalid();
+
+        /**
+         * Canonical SequenceMetadata claim retained with the pooled storage.
+         *
+         * This member precedes the allocation owner deliberately: reverse
+         * destruction frees VRAM before releasing its admitted byte claim.
+         */
+        std::shared_ptr<void> physical_memory_lease;
+        std::shared_ptr<void> storage;
+        std::shared_ptr<void> ready_event;
+
+        void *data() const
+        {
+            return storage.get();
+        }
+
+        bool valid() const
+        {
+            return cache_depth >= -1 &&
+                   sequence_index >= 0 &&
+                   metadata_layer_count > 0 &&
+                   bytes > 0 &&
+                   device.is_gpu() &&
+                   storage != nullptr &&
+                   ready_event != nullptr;
+        }
+    };
+
     struct PrefixLookupResult
     {
         bool supported = false;
@@ -33,16 +103,72 @@ namespace llaminar2
         int cached_tokens = 0;
         int block_size = 0;
         uint64_t fingerprint_key = 0;
-        uint64_t placement_epoch = 0;
+        PrefixPlacementEpochSpan placement_epochs;
         bool requires_terminal_hidden = true;
         bool requires_terminal_logits = true;
         bool has_terminal_hidden = false;
         bool has_terminal_logits = false;
+        bool restore_model_runtime_state = true;
+        bool restore_hybrid_state_for_suffix_prefill = false;
         std::string bypass_reason;
         std::vector<PrefixBlockHandle> blocks;
 
         bool hit() const { return supported && cached_tokens > 0 && !blocks.empty(); }
+
+        /**
+         * @brief Decide whether harvest can retain an exact terminal archive.
+         *
+         * The decision is purely about the admitted immutable payload. It
+         * never probes mutable cache state and therefore cannot turn an old
+         * lookup into a new authority. The caller must separately prove that
+         * the same key remains installed under the admitted fingerprint.
+         *
+         * @param terminal_key Terminal block reconstructed from request bytes.
+         * @param prompt_token_count Exact logical prompt width being harvested.
+         * @return Reuse only for a complete full-hit terminal record.
+         */
+        PrefixTerminalHarvestDisposition terminalHarvestDisposition(
+            const PrefixCacheKey &terminal_key,
+            int prompt_token_count) const;
+
         PrefixLookupResult clampedTo(int token_count) const;
+    };
+
+    /**
+     * @brief Scheduler-owned identity for one live rollback checkpoint.
+     *
+     * A GPU checkpoint archives device-owned KV and recurrent state
+     * asynchronously.  It must not rediscover the logical request cursor from
+     * a host mirror because that mirror may legitimately lag a graph-captured
+     * publication.  The request scheduler already owns the exact transaction
+     * position, so it supplies that immutable control-plane fact alongside the
+     * sequence being archived.
+     *
+     * The append limits describe the admitted transaction, not the retained
+     * graph family's maximum width. Logical rollback preserves resident KV
+     * bytes only while those appends cannot wrap over the archived prefix.
+     * A later transaction must acquire its own checkpoint and append limits.
+     *
+     * The fields intentionally have invalid defaults so callers cannot obtain
+     * a meaningful checkpoint by default construction.  Concrete runners must
+     * reject a request unless @ref valid returns true.
+     */
+    struct PrefixCheckpointCaptureRequest
+    {
+        int sequence_index = -1;
+        int logical_cached_tokens = -1;
+        int maximum_main_append_tokens = -1;
+        int maximum_shifted_append_tokens = -1;
+
+        /**
+         * @brief Whether the request names a cursor and explicit append bounds.
+         */
+        bool valid() const
+        {
+            return sequence_index >= 0 && logical_cached_tokens >= 0 &&
+                   maximum_main_append_tokens >= 0 &&
+                   maximum_shifted_append_tokens >= 0;
+        }
     };
 
     struct PrefixStateSnapshot
@@ -71,6 +197,8 @@ namespace llaminar2
         PrefixStateProvenance provenance = PrefixStateProvenance::Unknown;
         int cached_tokens = 0;
         std::vector<int> mtp_cached_tokens;
+        std::vector<DeviceKVSequenceStateCheckpoint>
+            device_sequence_state_checkpoints;
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
         std::vector<PrefixStateSnapshot> participant_snapshots;
@@ -102,6 +230,8 @@ namespace llaminar2
             swap(provenance, other.provenance);
             swap(cached_tokens, other.cached_tokens);
             mtp_cached_tokens.swap(other.mtp_cached_tokens);
+            device_sequence_state_checkpoints.swap(
+                other.device_sequence_state_checkpoints);
             blocks.swap(other.blocks);
             mtp_blocks.swap(other.mtp_blocks);
             participant_snapshots.swap(other.participant_snapshots);

@@ -4,6 +4,8 @@
 #include <numeric>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
+#include <limits>
 
 /**
  * @file ModelMemoryProfile.cpp
@@ -13,6 +15,8 @@
  * It records GGUF tensor names, element counts, native byte sizes, quantization
  * type strings, and inferred layer ownership so higher-level placement code can
  * estimate per-device weight pressure before constructing the execution graph.
+ * Wire decoding bounds all extents before allocating and consumes the complete
+ * payload, so a stale or malformed directory cannot become an admitted model.
  */
 
 namespace llaminar2
@@ -20,6 +24,11 @@ namespace llaminar2
 
     namespace
     {
+
+        /** @brief Stable marker preceding every serialized memory profile. */
+        constexpr uint32_t kProfileWireMagic = 0x4C4D5032U; // "LMP2"
+        /** @brief Current profile layout, including exact MoE geometry. */
+        constexpr uint32_t kProfileWireVersion = 2U;
 
         std::string ggufTypeToString(GGUFTensorType type)
         {
@@ -100,6 +109,66 @@ namespace llaminar2
             return result;
         }
 
+        /** @brief Whether a tensor is one packed parent containing every routed expert. */
+        bool isRoutedExpertParent(std::string_view name)
+        {
+            return name.ends_with(".ffn_gate_exps.weight") ||
+                   name.ends_with(".ffn_up_exps.weight") ||
+                   name.ends_with(".ffn_down_exps.weight");
+        }
+
+        /**
+         * @brief Recover the K dimension of one logical matrix from GGUF axes.
+         *
+         * ModelLoader normalizes ordinary 2-D tensors to `[N, K]`. Routed
+         * expert parents retain GGUF's three-dimensional `[K, N, experts]`
+         * representation because loading slices the outer expert axis before
+         * preparing an individual matrix. Treating the final axis as K turns
+         * the expert count into a matrix dimension and grossly overprices
+         * split-K workspace.
+         *
+         * @param tensor Parsed tensor directory entry.
+         * @param expert_count Model-wide routed expert cardinality.
+         * @return Inner dimension of one logical matrix, or zero for a scalar.
+         * @throws std::invalid_argument when a routed parent has an invalid
+         *         rank, expert axis, or zero matrix geometry.
+         */
+        size_t logicalMatrixK(
+            const GGUFTensorInfo &tensor,
+            int expert_count)
+        {
+            if (tensor.dimensions.empty())
+                return 0u;
+            if (!isRoutedExpertParent(tensor.name))
+                return static_cast<size_t>(tensor.dimensions.back());
+
+            if (tensor.dimensions.size() != 3u || expert_count <= 0 ||
+                tensor.dimensions[0] == 0u || tensor.dimensions[1] == 0u ||
+                tensor.dimensions[2] != static_cast<uint64_t>(expert_count))
+            {
+                throw std::invalid_argument(
+                    "Routed expert tensor has invalid [K, N, experts] geometry: " +
+                    tensor.name);
+            }
+            return static_cast<size_t>(tensor.dimensions[0]);
+        }
+
+        int firstPositiveMetadataInt(
+            const GGUFModel &model,
+            const std::vector<std::string> &keys)
+        {
+            for (const auto &key : keys)
+            {
+                const auto it = model.metadata.find(key);
+                if (it == model.metadata.end())
+                    continue;
+                const uint64_t value = it->second.asUInt64();
+                if (value > 0)
+                    return static_cast<int>(value);
+            }
+            return 0;
+        }
+
     } // anonymous namespace
 
     ModelMemoryProfile ModelMemoryProfile::fromGGUF(const GGUFModel &model)
@@ -113,6 +182,45 @@ namespace llaminar2
         profile.n_kv_heads = static_cast<int>(model.head_count_kv);
         profile.vocab_size = static_cast<int>(model.vocab_size);
         profile.max_seq_len = static_cast<int>(model.context_length);
+        profile.expert_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_count"});
+        profile.expert_used_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_used_count"});
+        profile.expert_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_feed_forward_length"});
+        profile.expert_shared_feed_forward_length = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".expert_shared_feed_forward_length"});
+        profile.mtp_layer_count = firstPositiveMetadataInt(
+            model,
+            {
+                model.architecture + ".nextn_predict_layers",
+                model.architecture + ".mtp_num_hidden_layers",
+                model.architecture + ".mtp.num_hidden_layers",
+                "mtp.num_hidden_layers",
+                "mtp_num_hidden_layers",
+            });
+        profile.full_attention_interval = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".full_attention_interval"});
+        profile.gdn_conv_kernel_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.conv_kernel"});
+        profile.gdn_state_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.state_size"});
+        profile.gdn_inner_size = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.inner_size"});
+        profile.gdn_group_count = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.group_count"});
+        profile.gdn_time_step_rank = firstPositiveMetadataInt(
+            model,
+            {model.architecture + ".ssm.time_step_rank"});
 
         // head_dim from key_length or computed
         if (model.key_length > 0)
@@ -163,7 +271,7 @@ namespace llaminar2
             info.native_bytes = static_cast<size_t>(t.size_bytes);
             info.quant_type = ggufTypeToString(t.type);
             info.elements = computeElements(t.dimensions);
-            info.K = t.dimensions.empty() ? 0 : static_cast<size_t>(t.dimensions.back());
+            info.K = logicalMatrixK(t, profile.expert_count);
             info.layer_index = parseLayerIndex(t.name);
 
             profile.total_native_bytes += info.native_bytes;
@@ -247,6 +355,7 @@ namespace llaminar2
     namespace
     {
 
+        /** @brief Append one native profile scalar without introducing alignment padding. */
         template <typename T>
         void writeVal(std::vector<uint8_t> &buf, T value)
         {
@@ -254,16 +363,20 @@ namespace llaminar2
             buf.insert(buf.end(), p, p + sizeof(T));
         }
 
+        /** @brief Append a length-prefixed string, rejecting unrepresentable lengths. */
         void writeStr(std::vector<uint8_t> &buf, const std::string &s)
         {
+            if (s.size() > std::numeric_limits<uint32_t>::max())
+                throw std::length_error("ModelMemoryProfile string exceeds wire capacity");
             writeVal<uint32_t>(buf, static_cast<uint32_t>(s.size()));
             buf.insert(buf.end(), s.begin(), s.end());
         }
 
+        /** @brief Read a scalar without forming a pointer outside the supplied extent. */
         template <typename T>
         T readVal(const uint8_t *&ptr, const uint8_t *end)
         {
-            if (ptr + sizeof(T) > end)
+            if (static_cast<size_t>(end - ptr) < sizeof(T))
                 throw std::runtime_error("ModelMemoryProfile deserialization: buffer underflow");
             T v;
             std::memcpy(&v, ptr, sizeof(T));
@@ -271,10 +384,11 @@ namespace llaminar2
             return v;
         }
 
+        /** @brief Validate the complete string extent before constructing its storage. */
         std::string readStr(const uint8_t *&ptr, const uint8_t *end)
         {
             uint32_t len = readVal<uint32_t>(ptr, end);
-            if (ptr + len > end)
+            if (static_cast<size_t>(end - ptr) < len)
                 throw std::runtime_error("ModelMemoryProfile deserialization: string buffer underflow");
             std::string s(reinterpret_cast<const char *>(ptr), len);
             ptr += len;
@@ -289,8 +403,14 @@ namespace llaminar2
 
     std::vector<uint8_t> ModelMemoryProfile::serialize() const
     {
+        if (tensors.size() > std::numeric_limits<uint32_t>::max())
+            throw std::length_error("ModelMemoryProfile tensor inventory exceeds wire capacity");
         std::vector<uint8_t> buf;
         buf.reserve(4096);
+
+        // Prefix scalars with a versioned identity so stale layouts fail hard.
+        writeVal<uint32_t>(buf, kProfileWireMagic);
+        writeVal<uint32_t>(buf, kProfileWireVersion);
 
         // Scalar fields
         writeStr(buf, architecture);
@@ -302,6 +422,17 @@ namespace llaminar2
         writeVal<int32_t>(buf, head_dim);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
+        writeVal<int32_t>(buf, expert_count);
+        writeVal<int32_t>(buf, expert_used_count);
+        writeVal<int32_t>(buf, expert_feed_forward_length);
+        writeVal<int32_t>(buf, expert_shared_feed_forward_length);
+        writeVal<int32_t>(buf, mtp_layer_count);
+        writeVal<int32_t>(buf, full_attention_interval);
+        writeVal<int32_t>(buf, gdn_conv_kernel_size);
+        writeVal<int32_t>(buf, gdn_state_size);
+        writeVal<int32_t>(buf, gdn_inner_size);
+        writeVal<int32_t>(buf, gdn_group_count);
+        writeVal<int32_t>(buf, gdn_time_step_rank);
         writeVal<uint64_t>(buf, total_native_bytes);
 
         // Tensor inventory
@@ -321,9 +452,25 @@ namespace llaminar2
 
     ModelMemoryProfile ModelMemoryProfile::deserialize(const uint8_t *data, size_t size)
     {
+        if (!data || size < 2 * sizeof(uint32_t))
+            throw std::runtime_error("ModelMemoryProfile deserialization: missing header");
         ModelMemoryProfile p;
         const uint8_t *ptr = data;
         const uint8_t *end = data + size;
+
+        const uint32_t magic = readVal<uint32_t>(ptr, end);
+        if (magic != kProfileWireMagic)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: invalid wire-format magic");
+        }
+        const uint32_t version = readVal<uint32_t>(ptr, end);
+        if (version != kProfileWireVersion)
+        {
+            throw std::runtime_error(
+                "ModelMemoryProfile deserialization: unsupported wire-format version " +
+                std::to_string(version));
+        }
 
         p.architecture = readStr(ptr, end);
         p.n_layers = readVal<int32_t>(ptr, end);
@@ -334,9 +481,27 @@ namespace llaminar2
         p.head_dim = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
+        p.expert_count = readVal<int32_t>(ptr, end);
+        p.expert_used_count = readVal<int32_t>(ptr, end);
+        p.expert_feed_forward_length = readVal<int32_t>(ptr, end);
+        p.expert_shared_feed_forward_length = readVal<int32_t>(ptr, end);
+        p.mtp_layer_count = readVal<int32_t>(ptr, end);
+        p.full_attention_interval = readVal<int32_t>(ptr, end);
+        p.gdn_conv_kernel_size = readVal<int32_t>(ptr, end);
+        p.gdn_state_size = readVal<int32_t>(ptr, end);
+        p.gdn_inner_size = readVal<int32_t>(ptr, end);
+        p.gdn_group_count = readVal<int32_t>(ptr, end);
+        p.gdn_time_step_rank = readVal<int32_t>(ptr, end);
         p.total_native_bytes = readVal<uint64_t>(ptr, end);
 
         uint32_t n_tensors = readVal<uint32_t>(ptr, end);
+        // Even an empty-name tensor needs both string lengths, three 64-bit
+        // extents and a layer index. Check this lower bound before reserve:
+        // a corrupt count must not trigger a multi-gigabyte allocation first.
+        constexpr size_t minimum_tensor_record_bytes =
+            2 * sizeof(uint32_t) + 3 * sizeof(uint64_t) + sizeof(int32_t);
+        if (n_tensors > static_cast<size_t>(end - ptr) / minimum_tensor_record_bytes)
+            throw std::runtime_error("ModelMemoryProfile deserialization: impossible tensor count");
         p.tensors.reserve(n_tensors);
         for (uint32_t i = 0; i < n_tensors; ++i)
         {
@@ -350,6 +515,8 @@ namespace llaminar2
             p.tensors.push_back(std::move(t));
         }
 
+        if (ptr != end)
+            throw std::runtime_error("ModelMemoryProfile deserialization: trailing payload bytes");
         return p;
     }
 

@@ -133,10 +133,10 @@ namespace llaminar2
             WeightPrecision weight_precision = WeightPrecision::NATIVE) = 0;
 
         /**
-         * @brief Load an expert slice of a 3D MoE tensor (for expert parallelism)
+         * @brief Load an expert-ID slice of a 3D MoE tensor.
          *
          * Only reads/returns experts [expert_start, expert_end) from a 3D tensor
-         * with shape [ne0, ne1, num_experts]. Used for MoE expert parallelism
+         * with shape [ne0, ne1, num_experts]. Used for expert-ID apportionment
          * where each rank loads only its assigned expert subset.
          *
          * @param name Tensor name (must be 3D: [cols, rows_per_expert, num_experts])
@@ -155,6 +155,43 @@ namespace llaminar2
             // Default: not implemented. Override in ModelLoader for GGUF 3D tensors.
             (void)name; (void)expert_start; (void)expert_end; (void)device; (void)weight_precision;
             return nullptr;
+        }
+
+        /**
+         * @brief Load an explicit ordered selection of expert IDs.
+         *
+         * The returned tensor's slowest dimension follows @p expert_ids exactly.
+         * This is the physical-loading contract required by non-contiguous
+         * static expert ownership. Implementations may preserve a zero-copy
+         * range when the IDs are contiguous, but must not silently substitute a
+         * different ownership set.
+         *
+         * @param name Tensor name (must be 3D expert-packed storage).
+         * @param expert_ids Strictly increasing logical expert IDs.
+         * @param device Target device for the materialized source tensor.
+         * @param weight_precision Requested source precision.
+         * @return Packed tensor with one slot per requested ID, or nullptr when
+         *         the loader cannot represent a non-contiguous selection.
+         */
+        virtual std::shared_ptr<TensorBase> loadTensorExpertSelection(
+            const std::string &name,
+            const std::vector<size_t> &expert_ids,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE)
+        {
+            if (expert_ids.empty())
+                return nullptr;
+            for (size_t index = 1; index < expert_ids.size(); ++index)
+            {
+                if (expert_ids[index] != expert_ids[index - 1] + 1u)
+                    return nullptr;
+            }
+            return loadTensorExpertSlice(
+                name,
+                expert_ids.front(),
+                expert_ids.back() + 1u,
+                device,
+                weight_precision);
         }
 
         /**
@@ -312,14 +349,13 @@ namespace llaminar2
         virtual void releaseMmapRegions() {}
 
         /**
-         * @brief Advise the OS to reclaim physical pages backing the mmap regions.
+         * @brief Perform backing-aware advice for all owned mmap regions.
          *
-         * Uses madvise(MADV_DONTNEED) to release physical pages without
-         * unmapping the virtual address range. Future reads re-fault from
-         * the page cache. Safe to call after all GEMM weights have been
-         * packed into interleaved format.
+         * This infrastructure method is called only by WeightManager's reclaim
+         * worker after every mmap host registration has retired. Durable files
+         * use MADV_DONTNEED; memory-filesystem mappings intentionally no-op.
          *
-         * @return Total bytes advised
+         * @return Total durable-mapping bytes actually advised.
          */
         virtual size_t adviseMmapDontneed() { return 0; }
     };

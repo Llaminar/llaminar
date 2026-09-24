@@ -42,6 +42,7 @@ namespace
         int get_position() const override { return position; }
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "fake-catchup"; }
+        DeviceId primaryDeviceId() const override { return device; }
 
         bool commitMTPShiftedRowFromCurrentTerminalHidden(
             int32_t token,
@@ -59,6 +60,21 @@ namespace
             return true;
         }
 
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false) override
+        {
+            if (!commit_ok)
+                return false;
+            ++commit_count;
+            committed_target_sample_slots.push_back(target_sample_slot);
+            committed_indices.push_back(already_appended_tokens);
+            committed_allow_discard.push_back(allow_speculative_discard);
+            return true;
+        }
+
+        DeviceId device = DeviceId::cpu();
         bool forward_ok = true;
         bool commit_ok = true;
         int position = 0;
@@ -66,6 +82,7 @@ namespace
         int commit_count = 0;
         std::vector<int> forward_tokens;
         std::vector<int32_t> committed_tokens;
+        std::vector<int> committed_target_sample_slots;
         std::vector<int> committed_indices;
         std::vector<bool> committed_allow_discard;
         std::vector<int> committed_position_offsets;
@@ -151,6 +168,51 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyTo
         runner.committed_allow_discard.begin(),
         runner.committed_allow_discard.end(),
         [](bool v) { return v; }));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseGPUConsumesEveryConditionTokenFromDeviceSlot)
+{
+    FakeCatchupRunner runner;
+    runner.device = DeviceId::cuda(0);
+    ScriptedSampler sampler({9, 8, 6, 4});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6};
+    request.base_sidecar_position = 42;
+    request.device_target_sample_slot = 3;
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&](int32_t) { return sampler(); });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(runner.committed_target_sample_slots,
+                ElementsAre(3, 3, 3, 3));
+    EXPECT_TRUE(runner.committed_tokens.empty())
+        << "GPU catch-up must not publish host-visible condition tokens";
+    EXPECT_THAT(runner.committed_indices, ElementsAre(0, 1, 2, 3));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseGPURejectsMissingDeviceTokenOwner)
+{
+    FakeCatchupRunner runner;
+    runner.device = DeviceId::cuda(0);
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [](int32_t) { return 9; });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("device-owned target-sample slot"));
+    EXPECT_EQ(runner.commit_count, 0);
+    EXPECT_EQ(runner.forward_count, 0);
 }
 
 TEST(Test__MTPDecodeCatchup, SharedStepwiseSamplerReceivesForwardedTokenHistory)
@@ -389,8 +451,32 @@ TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnAcceptedTokenWithoutReady
     EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
     EXPECT_THAT(result.verifier_tokens, ElementsAre(9));
     EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_TRUE(result.all_speculative_accepted)
+        << "A stop truncates continuation but does not invent a verifier rejection";
     EXPECT_EQ(result.ready_token, -1);
     EXPECT_EQ(result.target_verifier_state_commit_count, 2);
+}
+
+TEST(Test__MTPDecodeCatchup, AllPositionVerifierPreservesFinalAcceptedStop)
+{
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {8};
+
+    MTPDecodeCatchupGreedyResult result =
+        buildAllPositionMTPDecodeCatchupGreedyResult(
+            request,
+            /*sampled_verifier_rows=*/{9, 8, 123});
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 8));
+    EXPECT_TRUE(result.all_speculative_accepted);
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_EQ(result.accepted_speculative_prefix, 2);
+    EXPECT_EQ(result.ready_token, -1)
+        << "The unused bonus row must not become a continuation after a stop";
+    EXPECT_EQ(result.target_verifier_state_commit_count, 3);
 }
 
 TEST(Test__MTPDecodeCatchup, AllPositionVerifierStopsOnRejectedCorrectionWithoutReplay)

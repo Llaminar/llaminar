@@ -8,6 +8,8 @@
  *
  * Design: Each fused kernel reads inputs once and produces final outputs,
  * avoiding writing intermediate FP32 tensors to global memory.
+ * Quantized activations and scales are row-major; optional integer block sums
+ * use the same block-major representation as the ordinary CUDA quantizer.
  */
 
 #include "CUDAHelpers.cuh"
@@ -33,13 +35,21 @@
  *
  * Each 32-element K-block is independently quantized, so K-parallelism is trivial.
  * This is critical for decode (M=1) where a 1D grid of M blocks wastes 81 of 82 SMs.
+ *
+ * @param gate Row-major M by K gate projection.
+ * @param up Row-major M by K up projection.
+ * @param A_int8 Row-major M by K quantized activation destination.
+ * @param scales_A_blockwise Row-major M by K/32 FP32 scale destination.
+ * @param sums_A_blockwise Optional block-major K/32 by M INT32 sum destination.
+ * @param M Positive physical row count shared with the consuming graph.
+ * @param K Positive input width divisible by 32.
  */
 __global__ void fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ gate,         // [M × K]
     const float *__restrict__ up,           // [M × K]
     int8_t *__restrict__ A_int8,            // [M × K] output
     float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
-    int32_t *__restrict__ sums_A_blockwise, // [M × num_blocks] optional quantized sums
+    int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized sums
     int M, int K)
 {
     const int row = blockIdx.y;
@@ -100,7 +110,9 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
             for (int mask = 16; mask > 0; mask >>= 1)
                 sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, mask);
             if (lane == 0)
-                sums_A_blockwise[row * num_blocks + b] = sum_q;
+                // Publish directly in the consumer's coalesced layout. This
+                // changes neither activation bytes nor the integer reduction.
+                sums_A_blockwise[b * M + row] = sum_q;
         }
     }
 }
@@ -427,6 +439,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;
@@ -457,6 +473,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;
@@ -487,6 +507,10 @@ extern "C"
         int device_idx,
         void *stream)
     {
+        if (!input || !residual || !gamma || !residual_output || !norm_output ||
+            rows <= 0 || cols <= 0 || !stream)
+            return false;
+
         cudaSetDevice(device_idx);
 
         int threads_per_block = (cols <= 256) ? 256 : 1024;

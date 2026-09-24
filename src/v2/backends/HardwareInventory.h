@@ -1,9 +1,11 @@
 /**
  * @file HardwareInventory.h
- * @brief Complete hardware inventory detected once at startup
+ * @brief Startup-policy-scoped hardware inventory for one process
  *
- * Captures the full "world view" of the machine: CPU sockets (with model,
- * cores, HT threads, NUMA, memory), GPU devices, and P2P access matrices.
+ * Captures CPU sockets (with model, cores, HT threads, NUMA, memory) plus the
+ * GPU backends that the process startup policy permits. Excluded vendors are
+ * not queried: even a nominally read-only runtime call can materialize primary
+ * contexts and consume memory needed by a concurrent inference process.
  *
  * Detected once during DeviceManager::initialize() and available for
  * downstream orchestration decisions without re-detection.
@@ -15,6 +17,7 @@
 #pragma once
 
 #include "CPUSocketInfo.h"
+#include "CPUExecutionGeometry.h"
 #include "ComputeBackend.h"
 #include <string>
 #include <vector>
@@ -24,12 +27,14 @@ namespace llaminar2
 {
 
     /**
-     * @brief Complete hardware inventory for a single machine
+     * @brief Policy-scoped hardware inventory for one process on one machine
      *
-     * This struct is the single source of truth for all hardware detected
-     * at startup. It is populated once during DeviceManager::initialize()
-     * and should be used by all downstream components (orchestrator,
-     * placement engine, benchmark mode, etc.) instead of re-detecting.
+     * This struct is the single source of truth for hardware detected under
+     * `debugEnv().backend_startup`. Consumers must treat an absent accelerator
+     * vendor as excluded from this process, not as evidence that the physical
+     * host lacks that hardware. Downstream orchestration should reuse this
+     * value instead of bypassing the typed startup policy with direct driver
+     * discovery.
      *
      * Usage:
      * @code
@@ -50,6 +55,8 @@ namespace llaminar2
         // =====================================================================
 
         std::vector<CPUSocketInfo> cpu_sockets; ///< Per-socket CPU info (sorted by socket_id)
+        CPUExecutionGeometry cpu_execution; ///< Policy observed by this CPU execution process.
+        std::map<int, size_t> cpu_last_level_cache_bytes; ///< Socket ID -> observed distinct LLC domain sum; absent/zero is unknown.
 
         /// Total physical cores across all sockets
         int total_physical_cores() const
@@ -68,6 +75,14 @@ namespace llaminar2
                 n += s.num_threads();
             return n;
         }
+
+        /**
+         * @brief Project one CPU endpoint from this observation without rediscovery.
+         * @param numa_node Exact NUMA locality, or -1 for whole-host ownership.
+         * @return CPU device with observed capacity, thread count and model name.
+         * @throws std::invalid_argument for absent locality or malformed capacity.
+         */
+        ComputeDevice cpuDevice(int numa_node = -1) const;
 
         /// Total CPU memory across all NUMA nodes (bytes)
         size_t total_cpu_memory() const
@@ -94,8 +109,8 @@ namespace llaminar2
         // GPUs
         // =====================================================================
 
-        std::vector<ComputeDevice> cuda_devices; ///< All CUDA GPUs (unfiltered)
-        std::vector<ComputeDevice> rocm_devices; ///< All ROCm GPUs (unfiltered)
+        std::vector<ComputeDevice> cuda_devices; ///< CUDA GPUs visible when CUDA startup is enabled.
+        std::vector<ComputeDevice> rocm_devices; ///< ROCm GPUs visible when ROCm startup is enabled.
 
         /// P2P access matrices (populated if >=2 devices of that backend)
         std::optional<P2PMatrix> cuda_p2p;
@@ -115,10 +130,11 @@ namespace llaminar2
         /**
          * @brief Detect all hardware on this machine
          *
-         * Reads CPU topology from sysfs + /proc/cpuinfo, enumerates GPUs,
-         * and queries P2P access matrices. Called once by DeviceManager.
+         * Reads CPU topology from sysfs and `/proc/cpuinfo`. For each backend
+         * permitted by `BackendStartupConfig`, it enumerates visible GPUs and
+         * queries NUMA/P2P data. An excluded backend is not entered at all.
          *
-         * @return Fully populated HardwareInventory
+         * @return Inventory populated only with process-permitted backends.
          */
         static HardwareInventory detect();
 

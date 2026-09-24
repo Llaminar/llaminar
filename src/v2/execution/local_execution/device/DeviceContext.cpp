@@ -10,6 +10,7 @@
 #include <omp.h>
 #include <cstring>
 #include <cstdlib>
+#include <stdexcept>
 
 #ifdef __linux__
 #include <sys/sysinfo.h>
@@ -128,11 +129,10 @@ namespace llaminar2
     {
         if (bytes > workspace_size_)
         {
-            // Grow workspace (with some extra room)
-            size_t new_size = bytes + bytes / 4; // 25% headroom
-            workspace_.resize(new_size);
-            workspace_size_ = new_size;
-            LOG_DEBUG("CPUDeviceContext: workspace grown to " << new_size << " bytes");
+            workspace_.resize(bytes);
+            workspace_size_ = bytes;
+            LOG_DEBUG("CPUDeviceContext: workspace grown to exact requested capacity "
+                      << bytes << " bytes");
         }
 
         return workspace_.data();
@@ -164,35 +164,56 @@ namespace llaminar2
         return 16ULL * 1024 * 1024 * 1024;
     }
 
-    bool CPUDeviceContext::copyToDevice(void *dst, const void *src, size_t bytes)
+    bool CPUDeviceContext::copyToDevice(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (stream)
+            throw std::invalid_argument(
+                "CPUDeviceContext::copyToDevice does not accept a GPU stream");
         if (!dst || !src || bytes == 0)
             return false;
         std::memcpy(dst, src, bytes);
         return true;
     }
 
-    bool CPUDeviceContext::copyToHost(void *dst, const void *src, size_t bytes)
+    bool CPUDeviceContext::copyToHost(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (stream)
+            throw std::invalid_argument(
+                "CPUDeviceContext::copyToHost does not accept a GPU stream");
         if (!dst || !src || bytes == 0)
             return false;
         std::memcpy(dst, src, bytes);
         return true;
     }
 
-    bool CPUDeviceContext::copyFromDevice(void *dst, const void *src, size_t bytes,
-                                          IDeviceContext *src_ctx)
+    bool CPUDeviceContext::copyFromDevice(
+        void *dst,
+        const void *src,
+        size_t bytes,
+        IDeviceContext *src_ctx,
+        void *source_stream,
+        void *destination_stream)
     {
+        if (destination_stream)
+            throw std::invalid_argument(
+                "CPUDeviceContext::copyFromDevice does not accept a "
+                "destination GPU stream");
         if (!dst || !src || bytes == 0)
             return false;
 
         if (src_ctx && src_ctx->isGPU())
         {
             // Source is GPU - need to copy through host
-            return src_ctx->copyToHost(dst, src, bytes);
+            return src_ctx->copyToHost(dst, src, bytes, source_stream);
         }
 
         // Source is CPU - direct memcpy
+        if (source_stream)
+            throw std::invalid_argument(
+                "CPUDeviceContext::copyFromDevice received a GPU stream for "
+                "a CPU source");
         std::memcpy(dst, src, bytes);
         return true;
     }
@@ -291,18 +312,18 @@ namespace llaminar2
                 workspace_ = nullptr;
             }
 
-            // Allocate new workspace with headroom
-            size_t new_size = bytes + bytes / 4; // 25% headroom
-            workspace_ = allocate(new_size);
+            workspace_ = allocate(bytes);
             if (workspace_)
             {
-                workspace_size_ = new_size;
-                LOG_DEBUG("IGPUDeviceContext[" << gpu_device_id_ << "]: workspace grown to " << new_size << " bytes");
+                workspace_size_ = bytes;
+                LOG_DEBUG("IGPUDeviceContext[" << gpu_device_id_
+                                                << "]: workspace grown to exact requested capacity "
+                                                << bytes << " bytes");
             }
             else
             {
                 workspace_size_ = 0;
-                LOG_ERROR("IGPUDeviceContext: failed to allocate workspace of " << new_size << " bytes");
+                LOG_ERROR("IGPUDeviceContext: failed to allocate workspace of " << bytes << " bytes");
             }
         }
 
@@ -418,23 +439,42 @@ namespace llaminar2
         return getCUDABackend().deviceMemoryTotal(gpu_device_id_);
     }
 
-    bool CUDADeviceContext::copyToDevice(void *dst, const void *src, size_t bytes)
+    bool CUDADeviceContext::copyToDevice(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "CUDADeviceContext::copyToDevice requires an explicit stream");
         if (!dst || !src || bytes == 0)
             return false;
-        return getCUDABackend().hostToDevice(dst, src, bytes, gpu_device_id_);
+        return getCUDABackend().hostToDevice(
+            dst, src, bytes, gpu_device_id_, stream);
     }
 
-    bool CUDADeviceContext::copyToHost(void *dst, const void *src, size_t bytes)
+    bool CUDADeviceContext::copyToHost(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "CUDADeviceContext::copyToHost requires an explicit stream");
         if (!dst || !src || bytes == 0)
             return false;
-        return getCUDABackend().deviceToHost(dst, src, bytes, gpu_device_id_);
+        return getCUDABackend().deviceToHost(
+            dst, src, bytes, gpu_device_id_, stream);
     }
 
-    bool CUDADeviceContext::copyFromDevice(void *dst, const void *src, size_t bytes,
-                                           IDeviceContext *src_ctx)
+    bool CUDADeviceContext::copyFromDevice(
+        void *dst,
+        const void *src,
+        size_t bytes,
+        IDeviceContext *src_ctx,
+        void *source_stream,
+        void *destination_stream)
     {
+        if (!destination_stream)
+            throw std::invalid_argument(
+                "CUDADeviceContext::copyFromDevice requires an explicit "
+                "destination stream");
         if (!dst || !src || bytes == 0)
             return false;
 
@@ -443,15 +483,24 @@ namespace llaminar2
             // GPU-to-GPU copy
             // For now, go through host (TODO: use peer-to-peer or unified memory)
             std::vector<char> temp(bytes);
-            if (!src_ctx->copyToHost(temp.data(), src, bytes))
+            if (!source_stream)
+                throw std::invalid_argument(
+                    "CUDADeviceContext::copyFromDevice requires the source "
+                    "GPU stream");
+            if (!src_ctx->copyToHost(temp.data(), src, bytes, source_stream))
             {
                 return false;
             }
-            return copyToDevice(dst, temp.data(), bytes);
+            return copyToDevice(
+                dst, temp.data(), bytes, destination_stream);
         }
 
         // CPU-to-GPU copy
-        return copyToDevice(dst, src, bytes);
+        if (source_stream)
+            throw std::invalid_argument(
+                "CUDADeviceContext::copyFromDevice received a source stream "
+                "for CPU data");
+        return copyToDevice(dst, src, bytes, destination_stream);
     }
 
 #endif // HAVE_CUDA
@@ -548,23 +597,42 @@ namespace llaminar2
         return getROCmBackend().deviceMemoryTotal(gpu_device_id_);
     }
 
-    bool ROCmDeviceContext::copyToDevice(void *dst, const void *src, size_t bytes)
+    bool ROCmDeviceContext::copyToDevice(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "ROCmDeviceContext::copyToDevice requires an explicit stream");
         if (!dst || !src || bytes == 0)
             return false;
-        return getROCmBackend().hostToDevice(dst, src, bytes, gpu_device_id_);
+        return getROCmBackend().hostToDevice(
+            dst, src, bytes, gpu_device_id_, stream);
     }
 
-    bool ROCmDeviceContext::copyToHost(void *dst, const void *src, size_t bytes)
+    bool ROCmDeviceContext::copyToHost(
+        void *dst, const void *src, size_t bytes, void *stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "ROCmDeviceContext::copyToHost requires an explicit stream");
         if (!dst || !src || bytes == 0)
             return false;
-        return getROCmBackend().deviceToHost(dst, src, bytes, gpu_device_id_);
+        return getROCmBackend().deviceToHost(
+            dst, src, bytes, gpu_device_id_, stream);
     }
 
-    bool ROCmDeviceContext::copyFromDevice(void *dst, const void *src, size_t bytes,
-                                           IDeviceContext *src_ctx)
+    bool ROCmDeviceContext::copyFromDevice(
+        void *dst,
+        const void *src,
+        size_t bytes,
+        IDeviceContext *src_ctx,
+        void *source_stream,
+        void *destination_stream)
     {
+        if (!destination_stream)
+            throw std::invalid_argument(
+                "ROCmDeviceContext::copyFromDevice requires an explicit "
+                "destination stream");
         if (!dst || !src || bytes == 0)
             return false;
 
@@ -573,15 +641,24 @@ namespace llaminar2
             // GPU-to-GPU copy
             // For now, go through host (TODO: use peer-to-peer or unified memory)
             std::vector<char> temp(bytes);
-            if (!src_ctx->copyToHost(temp.data(), src, bytes))
+            if (!source_stream)
+                throw std::invalid_argument(
+                    "ROCmDeviceContext::copyFromDevice requires the source "
+                    "GPU stream");
+            if (!src_ctx->copyToHost(temp.data(), src, bytes, source_stream))
             {
                 return false;
             }
-            return copyToDevice(dst, temp.data(), bytes);
+            return copyToDevice(
+                dst, temp.data(), bytes, destination_stream);
         }
 
         // CPU-to-GPU copy
-        return copyToDevice(dst, src, bytes);
+        if (source_stream)
+            throw std::invalid_argument(
+                "ROCmDeviceContext::copyFromDevice received a source stream "
+                "for CPU data");
+        return copyToDevice(dst, src, bytes, destination_stream);
     }
 
 #endif // HAVE_ROCM

@@ -203,9 +203,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
                 num_cus_ = props.multiProcessorCount;
             }
@@ -304,21 +304,21 @@ namespace
 
             const int blocks_per_row = K / ACT_BLOCK_K;
 
-            hipMalloc(&d_A, K * sizeof(float));
-            hipMalloc(&d_A_int8, K * sizeof(int8_t));
-            hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
-            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
-            hipMalloc(&d_scale_B, N * sizeof(float));
-            hipMalloc(&d_C, N * sizeof(float));
+            (void)hipMalloc(&d_A, K * sizeof(float));
+            (void)hipMalloc(&d_A_int8, K * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_A_bw, blocks_per_row * sizeof(float));
+            (void)hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+            (void)hipMalloc(&d_scale_B, N * sizeof(float));
+            (void)hipMalloc(&d_C, N * sizeof(float));
 
-            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
-            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
-            hipMemcpy(d_scale_B, h_scale_B.data(), N * sizeof(float), hipMemcpyHostToDevice);
-            hipDeviceSynchronize();
+            (void)hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_scale_B, h_scale_B.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipDeviceSynchronize();
 
             // Pre-quantize activations (done once, not timed)
             rocmQuantGemm_quantizeActivationsBlockwise(d_A, d_A_int8, d_scale_A_bw, 1, K, device_id_, nullptr, ACT_BLOCK_K);
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Set KB override (-1 for auto)
             rocmGemv_int8_vnni_set_tuning_overrides(-1, kb_forced == 0 ? -1 : kb_forced);
@@ -330,20 +330,20 @@ namespace
                     d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale_B,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Timed runs
             hipEvent_t ev_start, ev_stop;
-            hipEventCreate(&ev_start);
-            hipEventCreate(&ev_stop);
+            (void)hipEventCreate(&ev_start);
+            (void)hipEventCreate(&ev_stop);
 
             std::vector<double> times_us;
             times_us.reserve(BENCH_ITERS);
 
             for (int i = 0; i < BENCH_ITERS; ++i)
             {
-                hipDeviceSynchronize();
-                hipEventRecord(ev_start, nullptr);
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(ev_start, nullptr);
 
                 bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, d_B_vnni, d_C, d_scale_A_bw, d_scale_B,
@@ -354,11 +354,11 @@ namespace
                     goto cleanup;
                 }
 
-                hipEventRecord(ev_stop, nullptr);
-                hipEventSynchronize(ev_stop);
+                (void)hipEventRecord(ev_stop, nullptr);
+                (void)hipEventSynchronize(ev_stop);
 
                 float ms = 0.0f;
-                hipEventElapsedTime(&ms, ev_start, ev_stop);
+                (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                 times_us.push_back(static_cast<double>(ms) * 1000.0);
             }
 
@@ -371,8 +371,8 @@ namespace
             }
 
         cleanup:
-            hipEventDestroy(ev_start);
-            hipEventDestroy(ev_stop);
+            (void)hipEventDestroy(ev_start);
+            (void)hipEventDestroy(ev_stop);
             rocmGemv_int8_vnni_reset_tuning_overrides();
 
             (void)hipFree(d_A);

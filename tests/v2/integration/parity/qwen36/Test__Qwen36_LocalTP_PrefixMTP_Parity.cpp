@@ -10,37 +10,145 @@ using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    DensePrefixRestoreParityCase localTPCase()
+    /**
+     * @brief Build a CUDA-only two-device LocalTP dense MTP fixture.
+     *
+     * Keeping the CUDA device list in the test definition, rather than relying
+     * on the generic LocalTP helper default, makes the test name itself prove
+     * which backend lane is being exercised.  The runtime availability guard in
+     * the shared parity helper will skip cleanly if the host has fewer than two
+     * CUDA devices.
+     */
+    DensePrefixRestoreParityCase cudaLocalTPCase()
     {
-        return qwen36DensePrefixParityCase(
-            "Qwen3.6 dense LocalTP parity",
+        auto test_case = qwen36DensePrefixParityCase(
+            "Qwen3.6 dense CUDA LocalTP parity",
             DensePrefixParityTopology::LocalTP);
+        test_case.devices = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+        test_case.required_cuda_devices = 2;
+        test_case.required_rocm_devices = 0;
+        return test_case;
+    }
+
+    /**
+     * @brief Build a ROCm-only two-device LocalTP dense MTP fixture.
+     *
+     * This is the explicit counterpart to @ref cudaLocalTPCase.  It preserves
+     * the current ROCm coverage while making it impossible to mistake a green
+     * generic LocalTP run for CUDA coverage.
+     */
+    DensePrefixRestoreParityCase rocmLocalTPCase()
+    {
+        auto test_case = qwen36DensePrefixParityCase(
+            "Qwen3.6 dense ROCm LocalTP parity",
+            DensePrefixParityTopology::LocalTP);
+        test_case.devices = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1),
+        };
+        test_case.required_cuda_devices = 0;
+        test_case.required_rocm_devices = 2;
+        return test_case;
     }
 }
 
-TEST(Qwen36LocalTPPrefixMTPParity, PrefixRestoreFullHit)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, PrefixRestoreFullHit)
 {
-    runDensePrefixRestoreParity(localTPCase(), PrefixRestoreParityMode::FullHit);
+    runDensePrefixRestoreParity(cudaLocalTPCase(), PrefixRestoreParityMode::FullHit);
 }
 
-TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
 {
-    runDenseMTPParity(localTPCase(), false);
+    runDenseMTPParity(cudaLocalTPCase(), false);
 }
 
-TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
 {
-    runDenseMTPParity(localTPCase(), false, 3);
+    runDenseMTPParity(cudaLocalTPCase(), false, 3);
 }
 
-TEST(Qwen36LocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
 {
-    runDenseDynamicMTPParity(localTPCase(), false);
+    runDenseDynamicMTPParity(cudaLocalTPCase(), false);
 }
 
-TEST(Qwen36LocalTPPrefixMTPParity, PrefixCacheMTPRestore)
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache)
 {
-    runDenseMTPParity(localTPCase(), true);
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 1);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 2);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(cudaLocalTPCase(), 3);
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(
+        cudaLocalTPCase(),
+        3,
+        qwen36DenseStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36CUDALocalTPPrefixMTPParity, PrefixCacheMTPRestore)
+{
+    runDenseMTPParity(cudaLocalTPCase(), true);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, PrefixRestoreFullHit)
+{
+    runDensePrefixRestoreParity(rocmLocalTPCase(), PrefixRestoreParityMode::FullHit);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(rocmLocalTPCase(), false);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(rocmLocalTPCase(), false, 3);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
+{
+    runDenseDynamicMTPParity(rocmLocalTPCase(), false);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth1VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 1);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth2VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 2);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDepth3VerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(rocmLocalTPCase(), 3);
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, StochasticMTPDynamicDepthVerifierMatchesAfterClearCache)
+{
+    runDenseStochasticMTPVerifierParity(
+        rocmLocalTPCase(),
+        3,
+        qwen36DenseStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36ROCmLocalTPPrefixMTPParity, PrefixCacheMTPRestore)
+{
+    runDenseMTPParity(rocmLocalTPCase(), true);
 }
 
 int main(int argc, char **argv)

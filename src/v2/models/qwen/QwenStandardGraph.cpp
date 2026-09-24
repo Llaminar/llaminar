@@ -20,6 +20,7 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../../memory/BufferId.h"
 #include <stdexcept>
+#include <vector>
 
 namespace llaminar2
 {
@@ -89,11 +90,13 @@ namespace llaminar2
         const int *position_ids,
         DeviceId device,
         const std::vector<int> *sequence_lengths,
-        const void *position_ids_device)
+        const void *position_ids_device,
+        const int32_t *sequence_lengths_device)
     {
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         LOG_DEBUG("[buildAttentionGraph] layer_idx=" << layer_idx << " seq_len=" << seq_len
@@ -123,9 +126,7 @@ namespace llaminar2
             const bool force_decode_equivalent_qkv_verifier_prefill =
                 (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
                 total_tokens > 1 &&
-                total_tokens <= 4 &&
-                config_.compute_all_position_logits &&
-                config_.mtp.enabled;
+                config_.usesMTPGroupedDecodeEquivalentRows();
 
             LOG_DEBUG("[QwenStandardGraph] Layer " << layer_idx << " QKV dims: q_n=" << q_n
                                             << " k_n=" << k_n << " v_n=" << v_n
@@ -155,6 +156,8 @@ namespace llaminar2
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
                               .force_decode_equivalent_verifier_prefill = force_decode_equivalent_qkv_verifier_prefill,
+                              .verifier_row_range = projectionVerifierRows(
+                                  device, seq_len, batch_size, sequence_lengths_device),
                               .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
                               .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
                               .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
@@ -166,6 +169,8 @@ namespace llaminar2
 
         // Resolve local head counts for TP
         auto [local_n_heads, local_n_kv_heads] = resolveLocalHeadCounts();
+        const attention::AttentionExecutionPolicy attention_policy =
+            resolveAttentionExecutionPolicy(device, kv_cache != nullptr);
 
         // Stage 2.5: Per-head QK RMSNorm (Qwen3)
         bool has_qk_norms = addQKNorms(
@@ -173,12 +178,22 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
+        std::vector<std::string> cache_source_dependencies;
+        if (has_qk_norms)
+        {
+            cache_source_dependencies.push_back(prefix + "q_norm");
+            cache_source_dependencies.push_back(prefix + "k_norm");
+        }
+        else if (has_qkv_proj)
+        {
+            cache_source_dependencies.push_back(prefix + "qkv_proj");
+        }
 
         // Stage 3: RoPE on Q and K
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device, attention_policy);
 
         // Wire RoPE dependencies
         if (has_qk_norms)
@@ -195,12 +210,19 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node);
+            kv_cache, position_ids, position_ids_device,
+            sequence_lengths_device,
+            device, has_qkv_proj, attention_policy, rope_node,
+            cache_source_dependencies);
 
-        // Stage 5: Wo projection + optional TP allreduce
-        std::string terminal = addWoProjectionAndAllreduce(
+        // Stage 5: publish the local Wo partial, then reconstruct TP output.
+        const std::string wo_projection = addWoProjection(
             graph, prefix, buffers, layer.wo, layer_bindings.wo,
-            total_tokens, layer_idx, device, attn_node);
+            total_tokens, device, attn_node, "wo_proj",
+            projectionVerifierRows(device, seq_len, batch_size, sequence_lengths_device));
+        const std::string terminal = addWoAllreduce(
+            graph, prefix, buffers, layer.wo,
+            total_tokens, layer_idx, device, wo_projection);
 
         graph.setTerminalNode(terminal);
         return graph;

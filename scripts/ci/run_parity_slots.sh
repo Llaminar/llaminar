@@ -33,7 +33,7 @@
 # Example (three CPU slots across Qwen families, run inside one container):
 #
 #   run_parity_slots.sh \
-#     qwen2-cpu  '^V2_Integration_Parity_(Qwen2|NodeLocalTP_Qwen2)_'  'CUDA|ROCm' \
+#     qwen2-cpu  '^V2_Integration_Parity_(Qwen2|NodeTP_Qwen2)_'  'CUDA|ROCm' \
 #     qwen3-cpu  '^V2_Integration_Parity_Qwen3_'                      'CUDA|ROCm' \
 #     qwen35-cpu '^V2_Integration_Parity_Qwen35_'                     'CUDA|ROCm'
 #

@@ -1,0 +1,2 @@
+backend,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed
+LocalPP_HOST_CUDA_CPU,EMBEDDING,0,,,,,,,,false

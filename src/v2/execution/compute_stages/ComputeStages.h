@@ -27,6 +27,7 @@
 // Attention stages
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/TPKVCacheStateAllGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 
 // FFN and residual
@@ -43,17 +44,31 @@
 #include "stages/AllGatherStage.h"
 
 // MoE stages
+#include "stages/MoEOverlayTicketPublishStage.h"
+#include "stages/MoEOverlayTicketConsumeStage.h"
+#include "stages/MoEOverlayActivationPacketStages.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoEExpertParallelReduceStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoERankBatchSparseStages.h"
+#include "stages/MoEDeviceRebalanceStage.h"
+#include "stages/MoEDeviceDecodeCommitBoundaryStage.h"
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"
+#include "stages/GDNLiveStateAllGatherStage.h"
 
 // MTP sidecar stages
 #include "stages/MTPConcatStage.h"
+#include "stages/MTPDraftTokenPublicationStage.h"
+#include "stages/MoEOverlayEpochBoundaryStage.h"
+#include "stages/MoEOverlayDeviceControllerStage.h"
+#include "stages/MTPVerifierPreparationStage.h"
+#include "stages/MTPVerifierOutcomeStage.h"
+#include "stages/MTPStochasticSerialOutcomeStage.h"
+#include "stages/MTPStochasticTargetDistributionStage.h"
+#include "stages/MTPSpeculativeStatePublicationStage.h"
 
 // Factory
 #include "ComputeStageFactory.h"

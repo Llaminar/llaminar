@@ -83,9 +83,8 @@ namespace llaminar2
     /**
      * @brief Coherence operations for the BufferArena.
      *
-     * Wraps the calls to TensorBase::ensureOnDevice / ensureOnHost /
-     * transitionTo(DEVICE_AUTHORITATIVE) so that BufferArena doesn't need to know about
-     * tensor internals.
+     * Wraps tensor movement and TransferEngine publication so BufferArena does
+     * not need to know about tensor coherence internals.
      */
     class CoherenceTracker
     {
@@ -115,7 +114,11 @@ namespace llaminar2
          * @param target  Target device for writing
          * @return true on success
          */
-        static bool prepareForWrite(TensorBase *tensor, CoherenceState &state, DeviceId target, void *stream = nullptr);
+        static bool prepareForWrite(
+            TensorBase *tensor,
+            CoherenceState &state,
+            DeviceId target,
+            void *stream);
 
         /**
          * @brief Mark buffer as written on device.
@@ -131,15 +134,19 @@ namespace llaminar2
         /**
          * @brief Mark buffer as written on device with stream event recording.
          *
-         * Like markWritten() but also records a GPU completion event on the
-         * tensor via transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream). This enables
-         * fine-grained sync: ensureOnHost() can wait on just this event
-         * instead of doing a full device synchronize.
+         * Like markWritten() but also publishes the GPU write through
+         * TransferEngine on the exact producer stream. This enables fine-grained
+         * synchronization: ensureOnHost() can wait on just this event instead
+         * of doing a full device synchronize.
          *
          * @param tensor  The underlying tensor
          * @param state   Coherence state to update
          * @param device  Device that now holds authoritative data
-         * @param stream  GPU stream where the kernel ran (nullptr = default)
+         * @param stream  Exact non-null GPU stream where the write was enqueued.
+         *                CPU writes do not use this argument.
+         *
+         * @throws std::invalid_argument when @p tensor is null, or when a GPU
+         *         write is published without a producer stream.
          */
         static void markWrittenWithEvent(TensorBase *tensor, CoherenceState &state,
                                          DeviceId device, void *stream);

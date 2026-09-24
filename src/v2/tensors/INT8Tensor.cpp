@@ -124,6 +124,11 @@ namespace llaminar2
         }
     }
 
+    INT8Tensor::~INT8Tensor()
+    {
+        retireHostTransferLifetimeBeforeStorageDestruction();
+    }
+
     const float *INT8Tensor::data() const
     {
         assertValid("INT8Tensor::data");

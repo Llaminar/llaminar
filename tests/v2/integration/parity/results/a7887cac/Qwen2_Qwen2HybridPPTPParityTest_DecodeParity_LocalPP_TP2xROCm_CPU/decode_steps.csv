@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+LocalPP_TP2xROCm_CPU,0,-0.279618,28.3036,0,0,56268,323,false,false,false,false
+LocalPP_TP2xROCm_CPU,1,-0.494552,27.8649,0,0,86797,279,false,false,false,false
+LocalPP_TP2xROCm_CPU,2,-0.498951,19.2295,0,0,75984,3974,false,false,false,false
+LocalPP_TP2xROCm_CPU,3,-0.600823,25.0644,0,0,84659,13876,false,false,false,false
+LocalPP_TP2xROCm_CPU,4,-0.618958,22.5329,0,0,79020,38835,false,false,false,false

@@ -46,9 +46,56 @@ namespace llaminar2
     // Single-vector quantize: scalar full-index helpers
     //
     // Used for value vectors, where direct reconstruction fidelity matters more
-    // than unbiased inner-product estimation. residual_norm < 0 signals this
-    // storage mode at dequantization time.
+    // than unbiased inner-product estimation. The second physical scalar stores
+    // the fitted reconstruction radius for the selected finite-D code vector.
     // ========================================================================
+
+    /**
+     * @brief Fit the optimal radial coefficient for one packed TQ4 block.
+     *
+     * `normalized_rotated` is `sqrt(D) * R * input / ||input||`. A decoder
+     * reconstructs `(radius / sqrt(D)) * R^T * centroids`. The source norm is
+     * only the optimal radius when the selected centroid vector has exactly
+     * norm `sqrt(D)`, which is not true for a finite head. Projecting the source
+     * onto the actual selected vector removes that avoidable radial error while
+     * retaining the block size, centroid indices, and rotation.
+     *
+     * @tparam D Number of coordinates in one attention head.
+     * @param normalized_rotated Scaled rotated source vector of length `D`.
+     * @param block Block whose packed centroid indices have already been set.
+     * @param source_norm Original input-vector L2 norm.
+     * @return Least-squares reconstruction radius, or zero for a degenerate
+     *         centroid vector.
+     */
+    template <int D>
+    inline float tq4_reconstruction_norm(
+        const float *normalized_rotated,
+        const TQ4Block<D> &block,
+        float source_norm)
+    {
+        float source_dot_centroids = 0.0f;
+        float centroid_norm_sq = 0.0f;
+        for (int coordinate = 0; coordinate < D; coordinate += 8)
+        {
+            const int group = coordinate / 8;
+            uint8_t low_indices[8];
+            tq3_unpack_8(block.mse_indices + group * 3, low_indices);
+            const uint8_t high_bits = block.high_bits[group];
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                const uint8_t index =
+                    low_indices[lane] |
+                    static_cast<uint8_t>(((high_bits >> lane) & 0x1u) << 3);
+                const float centroid = TQ4_CENTROIDS[index];
+                source_dot_centroids +=
+                    normalized_rotated[coordinate + lane] * centroid;
+                centroid_norm_sq += centroid * centroid;
+            }
+        }
+        return centroid_norm_sq > 0.0f
+                   ? source_norm * source_dot_centroids / centroid_norm_sq
+                   : 0.0f;
+    }
 
     // ========================================================================
     // Named ISA implementations: turboquant_quantize_tq4
@@ -70,7 +117,7 @@ namespace llaminar2
             norm_sq += input[i] * input[i];
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -103,6 +150,8 @@ namespace llaminar2
             tq3_pack_8(idx8, out.mse_indices + (i / 8) * 3);
             pack_bitplane_8(high_bits, out.high_bits + (i / 8));
         }
+        out.reconstruction_norm =
+            tq4_reconstruction_norm<D>(scratch0, out, norm);
     }
 
 #if defined(__AVX2__)
@@ -127,7 +176,7 @@ namespace llaminar2
         const float norm_sq = avx2::hsum_ps(vacc);
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -178,6 +227,8 @@ namespace llaminar2
             tq3_pack_8(idx8, out.mse_indices + g * 3);
             pack_bitplane_8(high_bits, out.high_bits + g);
         }
+        out.reconstruction_norm =
+            tq4_reconstruction_norm<D>(scratch0, out, norm);
     }
 #endif
 
@@ -203,7 +254,7 @@ namespace llaminar2
         const float norm_sq = _mm512_reduce_add_ps(vacc);
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -257,6 +308,8 @@ namespace llaminar2
                 pack_bitplane_8(high_bits, out.high_bits + g);
             }
         }
+        out.reconstruction_norm =
+            tq4_reconstruction_norm<D>(scratch0, out, norm);
     }
 #endif
 

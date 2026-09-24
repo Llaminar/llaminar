@@ -36,7 +36,7 @@
 
 #include <oneapi/dnnl/dnnl.hpp>
 
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "fort.hpp"

@@ -3,9 +3,15 @@
  * @brief Unit tests for ChatTemplate class
  * @author David Sanftenberg
  * @date 2025
+ *
+ * Exercise the actual embedded templates without models or devices. Prefix
+ * tests distinguish an in-progress assistant continuation from older history:
+ * rendering the former must retain its generation header byte-for-byte so a
+ * previously captured recurrent-state checkpoint remains reusable.
  */
 
 #include <gtest/gtest.h>
+#include "qwen/qwen35/Qwen35ChatTemplate.generated.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Sampler.h"
 
@@ -541,6 +547,38 @@ TEST(Test__ChatTemplate, JinjaHandlesMultiTurnConversation)
     EXPECT_EQ(count, 5) << "4 messages + 1 generation prompt = 5. Result: " << result;
 }
 
+/**
+ * A compiled Jinja program is immutable model-lifetime state. Filter blocks
+ * previously moved their filter node out of the AST while executing, which
+ * made reuse exception-sensitive and led the HTTP path to parse the complete
+ * model template for every request. Exercise the destructive node directly
+ * and alternate inputs to prove that no request state survives execution.
+ */
+TEST(Test__ChatTemplate, CompiledJinjaProgramIsReusableAcrossRequests)
+{
+    const std::string jinja_template = R"(
+<|im_start|>{% filter upper %}{{ messages[0]['content'] }}{% endfilter %}<|im_end|>
+{%- if add_generation_prompt %}<|im_start|>assistant{% endif %})";
+    auto tmpl = ChatTemplate::create(jinja_template, "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    const std::vector<ChatMessage> alpha = {{"user", "alpha"}};
+    const std::vector<ChatMessage> beta = {{"user", "beta"}};
+    const std::string expected_alpha = tmpl->apply(alpha, true);
+    const std::string expected_beta = tmpl->apply(beta, true);
+    ASSERT_NE(expected_alpha.find("ALPHA"), std::string::npos);
+    ASSERT_NE(expected_beta.find("BETA"), std::string::npos);
+
+    for (int request = 0; request < 256; ++request)
+    {
+        const bool use_alpha = (request % 2) == 0;
+        EXPECT_EQ(
+            tmpl->apply(use_alpha ? alpha : beta, true),
+            use_alpha ? expected_alpha : expected_beta)
+            << "compiled template retained request state at iteration " << request;
+    }
+}
+
 TEST(Test__ChatTemplate, JinjaExposesBoSEoSTokens)
 {
     // Template that uses bos_token and eos_token
@@ -650,6 +688,98 @@ TEST(Test__ChatTemplate, ThinkingModeAppendsStartTag)
     // Non-thinking mode may also have tags (model-dependent) but outputs differently
     EXPECT_NE(with_think, without_think)
         << "Thinking enabled vs disabled should produce different output";
+}
+
+TEST(Test__ChatTemplate, Qwen35CommunityTemplateHonorsNonThinkingControls)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    ASSERT_TRUE(tmpl->isThinkingModel());
+
+    std::vector<ChatMessage> messages = {
+        {"system", "<|think_off|>\nYou are a strict JSON renderer."},
+        {"user", "Return {\"answer\":\"ok\"} and no prose."},
+    };
+
+    std::string rendered = tmpl->apply(messages, true, false);
+    EXPECT_EQ(rendered.find("<|think_off|>"), std::string::npos)
+        << "Template control marker must not reach model input: " << rendered;
+    EXPECT_NE(rendered.find("<think>\n\n</think>\n\n"), std::string::npos)
+        << "Non-thinking Qwen prompts must close the thinking block before generation: "
+        << rendered;
+
+    std::string marker_overrides_true = tmpl->apply(messages, true, true);
+    EXPECT_NE(marker_overrides_true.find("<think>\n\n</think>\n\n"), std::string::npos)
+        << "<|think_off|> should override API thinking=true for deterministic E2E prompts: "
+        << marker_overrides_true;
+}
+
+/** Preserve the complete non-thinking seed when extending the active assistant. */
+TEST(Test__ChatTemplate, Qwen35AssistantContinuationPreservesNonThinkingPrefix)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+    std::vector<ChatMessage> messages = {{"system", "Continue the story."}, {"user", "A map was found."}};
+    const auto seed = tmpl->apply(messages, true, false);
+    ASSERT_TRUE(seed.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    messages.push_back({"assistant", "The keeper unfolded the map."});
+    const auto continuation = tmpl->apply(messages, true, false);
+    EXPECT_TRUE(continuation.starts_with(seed + "The keeper unfolded the map."))
+        << "An empty reasoning block is still part of the encoded prompt: " << continuation;
+
+    // A later user query deliberately ends that active turn. Its historical
+    // reasoning stripping policy remains unchanged; this is a distinct prompt.
+    messages.push_back({"user", "Where did the map lead?"});
+    const auto later_query = tmpl->apply(messages, true, false);
+    EXPECT_NE(later_query.find("<|im_start|>assistant\nThe keeper unfolded the map.<|im_end|>"), std::string::npos);
+}
+
+/** Preserve actual reasoning for an active assistant, never invent reasoning text. */
+TEST(Test__ChatTemplate, Qwen35AssistantContinuationKeepsExistingReasoning)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    std::vector<ChatMessage> messages = {{"user", "A map was found."}};
+    const auto seed = tmpl->apply(messages, true, true);
+    messages.push_back({"assistant", "<think>\nCheck the compass.\n</think>\n\nThe keeper turned north."});
+    EXPECT_TRUE(tmpl->apply(messages, true, true).starts_with(
+        seed + "Check the compass.\n</think>\n\nThe keeper turned north."));
+}
+
+/**
+ * OpenAI carries arguments as a JSON string; the Qwen template requires a
+ * structured map so it can recreate the native parameter blocks on the next
+ * agent turn.
+ */
+TEST(Test__ChatTemplate, Qwen35ToolResultContinuationUsesNativeParameterBlocks)
+{
+    auto tmpl = ChatTemplate::create(std::string(qwen35::kCommunityChatTemplate), "", "");
+    ASSERT_TRUE(tmpl->hasJinjaSupport());
+
+    ChatMessage assistant{"assistant", ""};
+    assistant.tool_calls.push_back(
+        R"({"id":"call_weather_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}})");
+    ChatMessage tool_result{"tool", R"({"temperature_c":18,"condition":"sunny"})"};
+    tool_result.tool_call_id = "call_weather_1";
+    tool_result.name = "get_weather";
+
+    const std::vector<ChatMessage> messages = {
+        {"user", "What is the weather in Paris?"},
+        assistant,
+        tool_result,
+    };
+    const std::string tools =
+        R"([{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])";
+    const auto rendered = tmpl->apply(messages, true, false, tools);
+
+    EXPECT_NE(rendered.find("<function=get_weather>\n<parameter=city>\nParis\n</parameter>"),
+              std::string::npos)
+        << rendered;
+    EXPECT_NE(rendered.find("<tool_response>\n{\"temperature_c\":18,\"condition\":\"sunny\"}\n</tool_response>"),
+              std::string::npos)
+        << rendered;
+    EXPECT_EQ(rendered.find("<function=get_weather>\n{\"city\":\"Paris\"}"),
+              std::string::npos)
+        << "Opaque OpenAI argument JSON must not leak into the native Qwen grammar";
 }
 
 // ============================================================================

@@ -1,11 +1,19 @@
 /**
  * @file RMSNormStage.cpp
- * @brief Implementation of RMSNormStage
+ * @brief Cross-backend RMSNorm execution and graph-stable diagnostic metadata.
+ *
+ * Kernel dispatch preserves the tensor's native device authority and exact
+ * producer stream.  Dump metadata describes persistent tensor addresses used
+ * by asynchronous snapshot copies; it never performs a transfer itself.  The
+ * MTP-only input publication is a read-only alias of the terminal-hidden tensor
+ * consumed by the norm, allowing parity to observe that boundary at no extra
+ * arithmetic cost.
  */
 
 #include "RMSNormStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 
@@ -60,7 +68,7 @@ namespace llaminar2
         // Create kernel via KernelFactory with automatic type dispatch
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
-        LOG_DEBUG("[RMSNormStage] Execute: seq_len=" << seq_len
+        LOG_TRACE("[RMSNormStage] Execute: seq_len=" << seq_len
                                                      << " hidden_dim=" << hidden_dim
                                                      << " eps=" << params_.eps
                                                      << " tensor_type=" << input_base->dtype_name()
@@ -149,11 +157,7 @@ namespace llaminar2
         if (success)
         {
             if (params_.device_id.is_gpu())
-            {
-                output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
-                                                   params_.device_id,
-                                                   gpuStream());
-            }
+                gpuExecution().publish(output_base);
             traceOutput("output", params_.output);
         }
         return success;
@@ -219,11 +223,27 @@ namespace llaminar2
         // Gamma weights
         if (params_.gamma)
         {
-            info.addInput("gamma", params_.gamma, 1, hidden_dim);
+            info.addWeight("gamma", params_.gamma);
         }
 
         // Output - use TensorBase* overload
         info.addOutput("output", params_.output, seq_len, hidden_dim);
+
+        if (params_.diagnostic_input_publication ==
+            DiagnosticInputPublication::MTPTerminalHidden)
+        {
+            /*
+             * The snapshot engine records tensor-backed outputs after the
+             * stage on the same captured stream. RMSNorm does not mutate its
+             * input, so this read-only alias is still the exact value consumed
+             * by the kernel. No identity stage or host observation is needed.
+             */
+            info.addOutput(
+                "mtp_terminal_hidden_input",
+                params_.input,
+                seq_len,
+                hidden_dim);
+        }
 
         // Scalar params
         info.addScalarInt("seq_len", seq_len);

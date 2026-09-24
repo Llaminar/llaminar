@@ -84,10 +84,11 @@ public:
             return {};
         const auto &shape = logits_local_->shape();
         return LogitsLocalInfo{
-            nullptr,
-            std::nullopt,
-            shape.size() >= 2 ? shape[1] : 0,
-            logits_local_.get()};
+            .gpu_ptr = nullptr,
+            .device = std::nullopt,
+            .vocab_local = shape.size() >= 2 ? shape[1] : 0,
+            .vocab_offset = 0,
+            .tensor = logits_local_.get()};
     }
 
     // Test utilities
@@ -237,7 +238,9 @@ TEST_F(Test__MDO_InterfaceDecoupling, LogitsLocalInfoBoolConversion)
     EXPECT_FALSE(static_cast<bool>(empty));
 
     FP32Tensor dummy({1, 4}, DeviceId::cpu());
-    LogitsLocalInfo valid{nullptr, std::nullopt, 4, &dummy};
+    LogitsLocalInfo valid{
+        .vocab_local = 4,
+        .tensor = &dummy};
     EXPECT_TRUE(static_cast<bool>(valid));
 }
 

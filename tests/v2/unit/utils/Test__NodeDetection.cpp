@@ -1,12 +1,15 @@
 /**
  * @file Test__NodeDetection.cpp
- * @brief Unit tests for NodeDetection — canonical hostname-based node detection
+ * @brief Device-free physical membership validation and synthetic label fixtures.
+ *
+ * Real MPI membership is exercised by ClusterInventoryBootstrap. These tests
+ * reject malformed shared-node leaders without opening MPI or device runtimes;
+ * hostname grouping remains only a convenience for explicit synthetic fixtures.
  */
 
 #include <gtest/gtest.h>
 #include "utils/NodeDetection.h"
-#include <fstream>
-#include <cstdio>
+#include <stdexcept>
 
 using namespace llaminar2;
 
@@ -102,182 +105,31 @@ TEST(Test__NodeDetection, FromHostnames_HostnamesPreserved)
     EXPECT_EQ(result.hostnames[2], "host-x");
 }
 
-// =============================================================================
-// detect() test — requires MPI, uses MPI_COMM_SELF (single rank)
-// =============================================================================
-
-TEST(Test__NodeDetection, Detect_SingleRank)
+/** Shared membership, not labels, is the physical topology authority. */
+TEST(Test__NodeDetection, SharedLeadersHandleInterleavedNodes)
 {
-    // MPI_COMM_SELF is a valid communicator with exactly 1 rank
-    auto result = NodeDetection::detect(MPI_COMM_SELF);
-    EXPECT_EQ(result.node_count, 1);
-    ASSERT_EQ(result.node_ids.size(), 1u);
-    EXPECT_EQ(result.node_ids[0], 0);
-    ASSERT_EQ(result.hostnames.size(), 1u);
-    EXPECT_FALSE(result.hostnames[0].empty());
+    const auto result = NodeDetection::fromSharedNodeLeaders({0, 1, 0, 1, 4, 4});
+    EXPECT_EQ(result.node_ids, (std::vector<int>{0, 1, 0, 1, 2, 2}));
+    EXPECT_EQ(result.node_count, 3);
 }
 
-TEST(Test__NodeDetection, Detect_NullComm)
+/** Unequal slots and noncontiguous placement need no rank/socket formula. */
+TEST(Test__NodeDetection, SharedLeadersHandleUnequalNodeMembership)
 {
-    auto result = NodeDetection::detect(MPI_COMM_NULL);
-    EXPECT_EQ(result.node_count, 0);
-    EXPECT_TRUE(result.node_ids.empty());
+    const auto result = NodeDetection::fromSharedNodeLeaders({0, 0, 2, 0, 2, 5});
+    EXPECT_EQ(result.node_ids, (std::vector<int>{0, 0, 1, 0, 1, 2}));
+    EXPECT_EQ(result.node_count, 3);
 }
 
-// =============================================================================
-// Helper: write a temporary hostfile for testing
-// =============================================================================
-
-namespace
+TEST(Test__NodeDetection, SharedLeadersRejectUnauthenticatedMembership)
 {
-    class TempHostfile
-    {
-    public:
-        explicit TempHostfile(const std::string &content)
-        {
-            path_ = std::tmpnam(nullptr);
-            std::ofstream ofs(path_);
-            ofs << content;
-        }
-        ~TempHostfile() { std::remove(path_.c_str()); }
-        const std::string &path() const { return path_; }
-
-    private:
-        std::string path_;
-    };
-} // namespace
-
-// =============================================================================
-// parseHostfile() tests
-// =============================================================================
-
-TEST(Test__NodeDetection, ParseHostfile_Basic)
-{
-    TempHostfile hf("node-a slots=4\nnode-b slots=2\n");
-    auto nodes = NodeDetection::parseHostfile(hf.path());
-    ASSERT_EQ(nodes.size(), 2u);
-    EXPECT_EQ(nodes[0].first, "node-a");
-    EXPECT_EQ(nodes[0].second, 0);
-    EXPECT_EQ(nodes[1].first, "node-b");
-    EXPECT_EQ(nodes[1].second, 1);
+    for (const auto &leaders : std::vector<std::vector<int>>{
+             {-1}, {1}, {0, 2}, {0, 0, 1}, {0, 7, 0}, {0, -1}})
+        EXPECT_THROW(NodeDetection::fromSharedNodeLeaders(leaders), std::invalid_argument);
 }
 
-TEST(Test__NodeDetection, ParseHostfile_DuplicateHostname)
+TEST(Test__NodeDetection, SharedLeadersEmptyAndSingleRank)
 {
-    // Same hostname appears twice — should be deduplicated
-    TempHostfile hf("node-a slots=2\nnode-b slots=2\nnode-a slots=1\n");
-    auto nodes = NodeDetection::parseHostfile(hf.path());
-    ASSERT_EQ(nodes.size(), 2u);
-    EXPECT_EQ(nodes[0].first, "node-a");
-    EXPECT_EQ(nodes[1].first, "node-b");
-}
-
-TEST(Test__NodeDetection, ParseHostfile_CommentsAndBlankLines)
-{
-    TempHostfile hf("# This is a comment\n\nnode-a\n  # another comment\nnode-b\n\n");
-    auto nodes = NodeDetection::parseHostfile(hf.path());
-    ASSERT_EQ(nodes.size(), 2u);
-    EXPECT_EQ(nodes[0].first, "node-a");
-    EXPECT_EQ(nodes[1].first, "node-b");
-}
-
-TEST(Test__NodeDetection, ParseHostfile_NoSlotsSpecifier)
-{
-    TempHostfile hf("node-a\nnode-b\n");
-    auto nodes = NodeDetection::parseHostfile(hf.path());
-    ASSERT_EQ(nodes.size(), 2u);
-    EXPECT_EQ(nodes[0].first, "node-a");
-    EXPECT_EQ(nodes[1].first, "node-b");
-}
-
-TEST(Test__NodeDetection, ParseHostfile_NonexistentFile)
-{
-    auto nodes = NodeDetection::parseHostfile("/nonexistent/path/hostfile.txt");
-    EXPECT_TRUE(nodes.empty());
-}
-
-// =============================================================================
-// fromHostnames(hostnames, hostfile_path) tests — hostfile-aware ordering
-// =============================================================================
-
-TEST(Test__NodeDetection, FromHostnames_WithHostfile_OverridesOrder)
-{
-    // Hostfile says: node-b is node 0, node-a is node 1
-    TempHostfile hf("node-b slots=2\nnode-a slots=2\n");
-
-    // MPI ranks: rank 0 on node-a, rank 1 on node-a, rank 2 on node-b, rank 3 on node-b
-    auto result = NodeDetection::fromHostnames(
-        {"node-a", "node-a", "node-b", "node-b"}, hf.path());
-
-    EXPECT_EQ(result.node_count, 2);
-    ASSERT_EQ(result.node_ids.size(), 4u);
-    // Hostfile ordering: node-b=0, node-a=1
-    EXPECT_EQ(result.node_ids[0], 1); // node-a → hostfile id 1
-    EXPECT_EQ(result.node_ids[1], 1);
-    EXPECT_EQ(result.node_ids[2], 0); // node-b → hostfile id 0
-    EXPECT_EQ(result.node_ids[3], 0);
-}
-
-TEST(Test__NodeDetection, FromHostnames_WithHostfile_UnknownHostFallback)
-{
-    // Hostfile only knows about node-a
-    TempHostfile hf("node-a slots=2\n");
-
-    // MPI has ranks on node-a and node-unknown
-    auto result = NodeDetection::fromHostnames(
-        {"node-a", "node-unknown", "node-a"}, hf.path());
-
-    EXPECT_EQ(result.node_count, 2);
-    ASSERT_EQ(result.node_ids.size(), 3u);
-    EXPECT_EQ(result.node_ids[0], 0); // node-a → from hostfile
-    EXPECT_EQ(result.node_ids[1], 1); // node-unknown → new sequential id
-    EXPECT_EQ(result.node_ids[2], 0); // node-a → from hostfile
-}
-
-TEST(Test__NodeDetection, FromHostnames_WithEmptyHostfile_FallsBackToDefault)
-{
-    TempHostfile hf("# only comments\n\n");
-
-    auto result = NodeDetection::fromHostnames(
-        {"node-a", "node-b"}, hf.path());
-
-    // Should fall back to first-appearance ordering
-    EXPECT_EQ(result.node_count, 2);
-    EXPECT_EQ(result.node_ids[0], 0); // node-a first
-    EXPECT_EQ(result.node_ids[1], 1); // node-b second
-}
-
-TEST(Test__NodeDetection, FromHostnames_WithNonexistentHostfile_FallsBack)
-{
-    auto result = NodeDetection::fromHostnames(
-        {"node-a", "node-b"}, "/nonexistent/hostfile");
-
-    // Should fall back to first-appearance ordering
-    EXPECT_EQ(result.node_count, 2);
-    EXPECT_EQ(result.node_ids[0], 0);
-    EXPECT_EQ(result.node_ids[1], 1);
-}
-
-// =============================================================================
-// detect() with hostfile — uses MPI_COMM_SELF (single rank)
-// =============================================================================
-
-TEST(Test__NodeDetection, Detect_WithHostfile_SingleRank)
-{
-    // Even with a hostfile, detect should work for a single rank
-    TempHostfile hf("some-host slots=1\n");
-    auto result = NodeDetection::detect(MPI_COMM_SELF, hf.path());
-    EXPECT_GE(result.node_count, 1);
-    ASSERT_EQ(result.node_ids.size(), 1u);
-    ASSERT_EQ(result.hostnames.size(), 1u);
-    EXPECT_FALSE(result.hostnames[0].empty());
-}
-
-TEST(Test__NodeDetection, Detect_WithEmptyHostfilePath_DefaultBehavior)
-{
-    // Empty hostfile path = default behavior
-    auto result = NodeDetection::detect(MPI_COMM_SELF, "");
-    EXPECT_EQ(result.node_count, 1);
-    ASSERT_EQ(result.node_ids.size(), 1u);
-    EXPECT_EQ(result.node_ids[0], 0);
+    EXPECT_EQ(NodeDetection::fromSharedNodeLeaders({}).node_count, 0);
+    EXPECT_EQ(NodeDetection::fromSharedNodeLeaders({0}).node_ids, (std::vector<int>{0}));
 }

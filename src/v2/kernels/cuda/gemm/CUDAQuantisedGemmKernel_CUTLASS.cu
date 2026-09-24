@@ -1,22 +1,28 @@
 /**
  * @file CUDAQuantisedGemmKernel_CUTLASS.cu
- * @brief CUDA utility kernels and memory management for CUDAQuantisedGemmKernel
+ * @brief CUDA utility kernels and setup-time transfers for CUDAQuantisedGemmKernel
  *
  * After the NativeVNNI-only transition, this file retains:
  * - Blockwise activation quantization (FP32→INT8 per-block-of-32)
- * - Work buffer management
- * - Device memory utilities (upload, alloc, copy, free)
+ * - Setup-time packed-weight upload through the canonical CUDA backend
+ * - Device copy utilities
  * - Stream/event management
  *
  * The CUTLASS INT8 GEMM, row-wise quantization, output scaling, and
  * blockwise dp4a GEMM kernels have been removed — NativeVNNI is now
  * the sole CUDA GEMM execution path.
+ * Activation scales remain row-major. Optional INT32 block sums are stored
+ * block-major so a tensor-core consumer reads adjacent rows coalescently;
+ * the producer writes that single representation directly, without a transpose.
  */
 
 #include <cuda_runtime.h>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+
+#include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 
 // =========================================================================
 // CUDA Error Checking Macros
@@ -93,12 +99,19 @@ namespace
      *
      * Each 32-element K-block is independently quantized, so K-parallelism is trivial.
      * Critical for decode (M=1) where a 1D grid wastes 81 of 82 SMs.
+     *
+     * @param A_fp32 Row-major FP32 input, M by K.
+     * @param A_int8 Row-major INT8 output with the same extent.
+     * @param scales_A_blockwise Row-major FP32 scales, M by K/32.
+     * @param sums_A_blockwise Optional block-major INT32 sums, K/32 by M.
+     * @param M Positive physical row count, also the sum buffer's row pitch.
+     * @param K Positive input width divisible by 32.
      */
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
-        int32_t *__restrict__ sums_A_blockwise, // [M × num_blocks] optional quantized activation sums
+        int32_t *__restrict__ sums_A_blockwise, // [num_blocks × M] optional quantized activation sums
         int M, int K)
     {
         const int row = blockIdx.y;
@@ -153,7 +166,10 @@ namespace
                 for (int mask = 16; mask > 0; mask >>= 1)
                     sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, mask);
                 if (lane == 0)
-                    sums_A_blockwise[row * num_blocks + b] = sum_q;
+                    // The captured producer and consumer share the same M.
+                    // Adjacent consumer rows now share cache sectors instead
+                    // of gathering one distant sum from each activation row.
+                    sums_A_blockwise[b * M + row] = sum_q;
             }
         }
     }
@@ -176,46 +192,6 @@ extern "C"
     /**
      * @brief Ensure work buffers are allocated for given M
      */
-    bool cudaQuantGemm_ensureWorkBuffers(
-        int8_t **d_A_int8,
-        float **d_scales_A,
-        int32_t **d_C_int32,
-        int *work_buffer_M,
-        int M, int K, int N,
-        int cuda_device_id)
-    {
-        if (M <= *work_buffer_M)
-        {
-            return true; // Already have enough capacity
-        }
-
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-
-        // Free existing
-        if (*d_A_int8)
-        {
-            cudaFree(*d_A_int8);
-        }
-        if (*d_scales_A)
-        {
-            cudaFree(*d_scales_A);
-        }
-        if (*d_C_int32)
-        {
-            cudaFree(*d_C_int32);
-        }
-
-        // Allocate new buffers with 2x headroom for growth
-        int alloc_M = M * 2;
-
-        CUDA_CHECK(cudaMalloc(d_A_int8, static_cast<size_t>(alloc_M) * K * sizeof(int8_t)));
-        CUDA_CHECK(cudaMalloc(d_scales_A, static_cast<size_t>(alloc_M) * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(d_C_int32, static_cast<size_t>(alloc_M) * N * sizeof(int32_t)));
-
-        *work_buffer_M = alloc_M;
-        return true;
-    }
-
     // NOTE: cudaQuantGemm_execute, cudaQuantGemm_applyScaling,
     // cudaQuantGemm_quantizeActivations (row-wise), and cudaQuantGemm_blockwiseGemm
     // have been removed — NativeVNNI is now the sole CUDA GEMM execution path.
@@ -275,6 +251,15 @@ extern "C"
 
     /**
      * @brief Quantize FP32 activations and also emit per-32-block INT8 sums.
+     * @param d_A_fp32 Row-major M by K source.
+     * @param d_A_int8 Row-major quantized destination.
+     * @param d_scales_A_blockwise Row-major M by K/32 FP32 scale destination.
+     * @param d_sums_A_blockwise Optional block-major K/32 by M INT32 destination.
+     * @param M Captured physical row count; consumers must use this same pitch.
+     * @param K Input width divisible by 32.
+     * @param cuda_device_id Owning CUDA device ordinal.
+     * @param stream Exact caller-owned execution stream.
+     * @return True after successfully submitting the quantization kernel.
      */
     bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
         const float *d_A_fp32,
@@ -340,30 +325,25 @@ extern "C"
     // NOTE: cudaQuantGemm_blockwiseGemm removed — NativeVNNI-only mode.
 
     /**
-     * @brief Free device memory
-     * @note Handles CUDA runtime shutdown gracefully during static destruction
+     * @brief Release setup-owned packed-weight storage through the CUDA backend.
+     *
+     * The explicit device ordinal is part of the ownership contract.  Teardown
+     * must not infer ownership from whichever CUDA context happens to be active.
      */
-    void cudaQuantGemm_freeDevice(void *d_ptr)
+    void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id)
     {
-        if (d_ptr)
-        {
-            cudaPointerAttributes attr;
-            cudaError_t pe = cudaPointerGetAttributes(&attr, d_ptr);
-            cudaError_t err = cudaFree(d_ptr);
-            // During static destruction at program exit, CUDA runtime may already
-            // be torn down. These error codes indicate this harmless condition.
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
-            {
-                // Only log actual errors, not shutdown-related ones
-                fprintf(stderr, "WARNING: cudaFree failed: %s ptr=%p attr_err=%d type=%d device=%d\n",
-                        cudaGetErrorString(err), d_ptr, (int)pe, (int)attr.type, attr.device);
-            }
-        }
+        if (!d_ptr)
+            return;
+
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            throw std::runtime_error(
+                "[CUDAQuantGemm] CUDA backend unavailable while releasing packed weights");
+        backend->free(d_ptr, cuda_device_id);
     }
 
     /**
-     * @brief Allocate raw bytes on device and copy from host
-     * @note Must be compiled by nvcc to ensure CUDA runtime context consistency
+     * @brief Allocate and upload setup-owned packed weights through the backend.
      */
     bool cudaQuantGemm_uploadRawBytes(
         const void *h_src,
@@ -376,19 +356,35 @@ extern "C"
         {
             return true;
         }
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        CUDA_CHECK(cudaMalloc(d_dst, bytes));
-        CUDA_CHECK(cudaMemcpy(*d_dst, h_src, bytes, cudaMemcpyHostToDevice));
-        return true;
-    }
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return false;
 
-    /**
-     * @brief Allocate float array on device
-     */
-    bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id)
-    {
-        CUDA_CHECK(cudaSetDevice(cuda_device_id));
-        CUDA_CHECK(cudaMalloc(d_ptr, count * sizeof(float)));
+        *d_dst = backend->allocate(bytes, cuda_device_id);
+        if (!*d_dst)
+            return false;
+        void *const setup_stream =
+            llaminar2::GPUDeviceContextPool::instance()
+                .getNvidiaContext(cuda_device_id)
+                .defaultStream();
+        if (!setup_stream)
+        {
+            backend->free(*d_dst, cuda_device_id);
+            *d_dst = nullptr;
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Packed-weight upload has no explicit setup stream");
+        }
+        if (!backend->hostToDevice(
+                *d_dst,
+                h_src,
+                bytes,
+                cuda_device_id,
+                setup_stream))
+        {
+            backend->free(*d_dst, cuda_device_id);
+            *d_dst = nullptr;
+            return false;
+        }
         return true;
     }
 

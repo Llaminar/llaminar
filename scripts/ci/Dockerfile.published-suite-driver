@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.6
+# Control-plane tools only. This image never substitutes for a tested runtime:
+# the canonical HTTP/benchmark drivers launch the separately pinned GHCR IDs.
+# Inheriting the AVX2 runtime supplies both vendors' memory-telemetry libraries
+# on hosts whose ARC pod has neither a GPU SDK nor writable model-cache mounts.
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      docker.io curl jq pciutils procps python3-requests python3-yaml \
+ && rm -rf /var/lib/apt/lists/*
+LABEL org.llaminar.image_role="suite-driver"
+ENTRYPOINT []

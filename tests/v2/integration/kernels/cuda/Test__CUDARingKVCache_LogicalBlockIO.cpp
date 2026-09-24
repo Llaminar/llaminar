@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace llaminar2;
@@ -129,7 +130,11 @@ TEST(Test__CUDARingKVCache_LogicalBlockIO, FP32WrappedExportImportAndTruncateWit
     ASSERT_TRUE(target.truncateSequence(0, 2, stream));
     EXPECT_EQ(target.sequenceState(0, 0).cached_tokens, 2);
     EXPECT_EQ(target.sequenceState(0, 0).implementation_head, 2);
-    EXPECT_FALSE(target.truncateSequence(0, 3, stream));
+    ASSERT_TRUE(target.truncateSequence(0, 3, stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(target.sequenceState(0, 0).cached_tokens, 2)
+        << "A device-only truncate request may enqueue asynchronously, but it "
+           "must never extend canonical sequence state.";
 
     std::vector<float> truncated_k(2 * KV_DIM, 0.0f);
     std::vector<float> truncated_v(2 * KV_DIM, 0.0f);
@@ -165,4 +170,457 @@ TEST(Test__CUDARingKVCache_LogicalBlockIO, Q8ShardedLayoutReportsDeviceResidentB
     EXPECT_EQ(layout.k_bytes, 3u * 4u * sizeof(Q8_1Block));
     EXPECT_EQ(layout.v_bytes, layout.k_bytes);
     EXPECT_TRUE(layout.device_resident);
+}
+
+/**
+ * @brief Reproduce the Qwen3.5-4B LocalTP pageable-host probe geometry.
+ *
+ * Production parity hashes every full-attention KV payload after prefill.  A
+ * Qwen3.5-4B TP participant owns two 256-wide KV heads, so one FP16 logical row
+ * is 1024 bytes and the nine-token probe is backed by an ordinary pageable
+ * `std::vector`.  CUDA logical-block Host mode promises completed bytes for
+ * exactly that storage class; it must not rely on page-locked-only async-copy
+ * behavior.  The round trip also locks down the symmetric Host import contract.
+ */
+TEST(Test__CUDARingKVCache_LogicalBlockIO,
+     FP16Qwen35LocalTPPageableHostProbeRoundTripsEveryFALayer)
+{
+    if (!hasCUDADevice())
+    {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int FA_LAYERS = 8;
+    constexpr int TOKENS = 9;
+    constexpr int GLOBAL_KV_HEADS = 4;
+    constexpr int LOCAL_KV_HEADS = 2;
+    constexpr int HEAD_DIM = 256;
+    constexpr int LOCAL_KV_DIM = LOCAL_KV_HEADS * HEAD_DIM;
+    constexpr size_t PAYLOAD_BYTES =
+        static_cast<size_t>(TOKENS) * LOCAL_KV_DIM * sizeof(uint16_t);
+
+    CUDARingKVCacheFP16 source(
+        FA_LAYERS,
+        /*batch_size=*/1,
+        /*max_seq_len=*/4096,
+        GLOBAL_KV_HEADS,
+        LOCAL_KV_HEADS,
+        /*kv_head_start=*/0,
+        HEAD_DIM,
+        /*device_id=*/0);
+    CUDARingKVCacheFP16 target(
+        /*n_layers=*/1,
+        /*batch_size=*/1,
+        /*max_seq_len=*/4096,
+        GLOBAL_KV_HEADS,
+        LOCAL_KV_HEADS,
+        /*kv_head_start=*/0,
+        HEAD_DIM,
+        /*device_id=*/0);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    void *device_k = nullptr;
+    void *device_v = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device_k, PAYLOAD_BYTES));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device_v, PAYLOAD_BYTES));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(device_k, 0x2a, PAYLOAD_BYTES, stream));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(device_v, 0x5c, PAYLOAD_BYTES, stream));
+
+    for (int layer = 0; layer < FA_LAYERS; ++layer)
+    {
+        ASSERT_TRUE(source.append(
+            layer,
+            /*seq_idx=*/0,
+            device_k,
+            device_v,
+            TOKENS,
+            stream));
+    }
+
+    std::vector<uint8_t> exported_k(PAYLOAD_BYTES);
+    std::vector<uint8_t> exported_v(PAYLOAD_BYTES);
+    for (int layer = 0; layer < FA_LAYERS; ++layer)
+    {
+        IKVCache::KVCacheLogicalBlockDescriptor descriptor{
+            layer,
+            /*seq_idx=*/0,
+            /*logical_token_start=*/0,
+            TOKENS,
+            stream};
+        ASSERT_TRUE(source.exportLogicalBlock(
+            descriptor,
+            exported_k.data(),
+            exported_v.data()))
+            << "layer=" << layer;
+        EXPECT_TRUE(std::all_of(
+            exported_k.begin(), exported_k.end(),
+            [](uint8_t byte) { return byte == 0x2a; }));
+        EXPECT_TRUE(std::all_of(
+            exported_v.begin(), exported_v.end(),
+            [](uint8_t byte) { return byte == 0x5c; }));
+    }
+
+    IKVCache::KVCacheLogicalBlockDescriptor target_descriptor{
+        /*layer=*/0,
+        /*seq_idx=*/0,
+        /*logical_token_start=*/0,
+        TOKENS,
+        stream};
+    ASSERT_TRUE(target.importLogicalBlock(
+        target_descriptor,
+        exported_k.data(),
+        exported_v.data()));
+    std::vector<uint8_t> roundtrip_k(PAYLOAD_BYTES);
+    std::vector<uint8_t> roundtrip_v(PAYLOAD_BYTES);
+    ASSERT_TRUE(target.exportLogicalBlock(
+        target_descriptor,
+        roundtrip_k.data(),
+        roundtrip_v.data()));
+    EXPECT_EQ(roundtrip_k, exported_k);
+    EXPECT_EQ(roundtrip_v, exported_v);
+
+    ASSERT_EQ(cudaSuccess, cudaFree(device_k));
+    ASSERT_EQ(cudaSuccess, cudaFree(device_v));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+/**
+ * @brief Prove oldest-row eviction is one device-owned metadata mutation.
+ *
+ * The production call returns after enqueueing work. The test synchronizes only
+ * at its observation boundary, then verifies that the ring head still names the
+ * end of the original append while the visible payload starts two rows later.
+ */
+TEST(Test__CUDARingKVCache_LogicalBlockIO,
+     EvictOldestPreservesHeadAndPublishesExactDeviceTail)
+{
+    if (!hasCUDADevice())
+    {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int KV_DIM = 2;
+    CUDARingKVCacheFP32 cache(
+        /*n_layers=*/1,
+        /*batch_size=*/1,
+        /*max_seq_len=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/KV_DIM,
+        /*device_id=*/0);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    const auto host_k = taggedRows(5, KV_DIM, 100.0f);
+    const auto host_v = taggedRows(5, KV_DIM, 200.0f);
+    float *device_k = nullptr;
+    float *device_v = nullptr;
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMalloc(&device_k, host_k.size() * sizeof(float)));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMalloc(&device_v, host_v.size() * sizeof(float)));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            device_k,
+            host_k.data(),
+            host_k.size() * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            device_v,
+            host_v.data(),
+            host_v.size() * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+    ASSERT_TRUE(cache.append(0, 0, device_k, device_v, 5, stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    cache.evict_oldest(0, 0, 2);
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    const auto state = cache.sequenceState(0, 0);
+    EXPECT_EQ(state.cached_tokens, 3);
+    EXPECT_EQ(state.implementation_head, 5);
+    EXPECT_FALSE(state.wrapped);
+
+    std::vector<float> visible_k(3 * KV_DIM, 0.0f);
+    std::vector<float> visible_v(3 * KV_DIM, 0.0f);
+    IKVCache::KVCacheLogicalBlockDescriptor desc{0, 0, 0, 3, stream};
+    ASSERT_TRUE(cache.exportLogicalBlock(
+        desc,
+        visible_k.data(),
+        visible_v.data()));
+    expectRows(visible_k, 3, KV_DIM, {120.0f, 130.0f, 140.0f});
+    expectRows(visible_v, 3, KV_DIM, {220.0f, 230.0f, 240.0f});
+
+    ASSERT_EQ(cudaSuccess, cudaFree(device_k));
+    ASSERT_EQ(cudaSuccess, cudaFree(device_v));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+/**
+ * @brief Prove opaque sequence rollback restores every layer without host replay.
+ *
+ * The checkpoint captures only canonical ring metadata. Payload rows remain in
+ * the cache while speculative appends advance the live heads; restoring the
+ * checkpoint makes the original three-row prefixes visible again. All capture,
+ * mutation, and restore operations are ordered on one explicit CUDA stream.
+ */
+TEST(Test__CUDARingKVCache_LogicalBlockIO,
+     DeviceSequenceCheckpointRestoresAllLayersAndRequestsExactly)
+{
+    if (!hasCUDADevice())
+    {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int LAYERS = 2;
+    constexpr int REQUESTS = 2;
+    constexpr int KV_DIM = 2;
+    constexpr int INITIAL_ROWS = 3;
+    constexpr int SPECULATIVE_ROWS = 2;
+    CUDARingKVCacheFP32 cache(
+        LAYERS,
+        REQUESTS,
+        /*max_seq_len=*/8,
+        /*n_kv_heads=*/1,
+        KV_DIM,
+        /*device_id=*/0);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    float *device_k = nullptr;
+    float *device_v = nullptr;
+    const size_t staging_elements =
+        static_cast<size_t>(INITIAL_ROWS) * KV_DIM;
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMalloc(&device_k, staging_elements * sizeof(float)));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMalloc(&device_v, staging_elements * sizeof(float)));
+
+    std::vector<std::vector<float>> expected_k(LAYERS * REQUESTS);
+    std::vector<std::vector<float>> expected_v(LAYERS * REQUESTS);
+    for (int layer = 0; layer < LAYERS; ++layer)
+    {
+        for (int request = 0; request < REQUESTS; ++request)
+        {
+            const size_t index =
+                static_cast<size_t>(layer * REQUESTS + request);
+            expected_k[index] = taggedRows(
+                INITIAL_ROWS,
+                KV_DIM,
+                1000.0f + static_cast<float>(layer * 100 + request * 10));
+            expected_v[index] = taggedRows(
+                INITIAL_ROWS,
+                KV_DIM,
+                2000.0f + static_cast<float>(layer * 100 + request * 10));
+            ASSERT_EQ(
+                cudaSuccess,
+                cudaMemcpyAsync(
+                    device_k,
+                    expected_k[index].data(),
+                    expected_k[index].size() * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream));
+            ASSERT_EQ(
+                cudaSuccess,
+                cudaMemcpyAsync(
+                    device_v,
+                    expected_v[index].data(),
+                    expected_v[index].size() * sizeof(float),
+                    cudaMemcpyHostToDevice,
+                    stream));
+            ASSERT_TRUE(cache.append(
+                layer,
+                request,
+                device_k,
+                device_v,
+                INITIAL_ROWS,
+                stream));
+        }
+    }
+
+    const size_t checkpoint_bytes =
+        cache.deviceSequenceStateCheckpointBytes();
+    ASSERT_GT(checkpoint_bytes, 0u);
+    std::vector<void *> checkpoints(REQUESTS, nullptr);
+    for (int request = 0; request < REQUESTS; ++request)
+    {
+        ASSERT_EQ(
+            cudaSuccess,
+            cudaMalloc(&checkpoints[static_cast<size_t>(request)],
+                       checkpoint_bytes));
+        std::string error;
+        ASSERT_TRUE(cache.captureDeviceSequenceStateCheckpoint(
+            request,
+            checkpoints[static_cast<size_t>(request)],
+            checkpoint_bytes,
+            stream,
+            &error))
+            << error;
+    }
+
+    auto speculative_k = taggedRows(
+        SPECULATIVE_ROWS,
+        KV_DIM,
+        9000.0f);
+    auto speculative_v = taggedRows(
+        SPECULATIVE_ROWS,
+        KV_DIM,
+        10000.0f);
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            device_k,
+            speculative_k.data(),
+            speculative_k.size() * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            device_v,
+            speculative_v.data(),
+            speculative_v.size() * sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream));
+    for (int layer = 0; layer < LAYERS; ++layer)
+    {
+        for (int request = 0; request < REQUESTS; ++request)
+        {
+            ASSERT_TRUE(cache.append(
+                layer,
+                request,
+                device_k,
+                device_v,
+                SPECULATIVE_ROWS,
+                stream));
+        }
+    }
+    for (int request = 0; request < REQUESTS; ++request)
+    {
+        std::string error;
+        ASSERT_TRUE(cache.restoreDeviceSequenceStateCheckpoint(
+            request,
+            checkpoints[static_cast<size_t>(request)],
+            checkpoint_bytes,
+            stream,
+            &error))
+            << error;
+    }
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    for (int layer = 0; layer < LAYERS; ++layer)
+    {
+        for (int request = 0; request < REQUESTS; ++request)
+        {
+            const auto state = cache.sequenceState(layer, request);
+            EXPECT_EQ(state.cached_tokens, INITIAL_ROWS);
+            EXPECT_EQ(state.implementation_head, INITIAL_ROWS);
+            EXPECT_FALSE(state.wrapped);
+
+            std::vector<float> restored_k(
+                static_cast<size_t>(INITIAL_ROWS) * KV_DIM,
+                0.0f);
+            std::vector<float> restored_v(
+                static_cast<size_t>(INITIAL_ROWS) * KV_DIM,
+                0.0f);
+            IKVCache::KVCacheLogicalBlockDescriptor descriptor{
+                layer,
+                request,
+                /*logical_token_start=*/0,
+                INITIAL_ROWS,
+                stream};
+            ASSERT_TRUE(cache.exportLogicalBlock(
+                descriptor,
+                restored_k.data(),
+                restored_v.data()));
+            const size_t index =
+                static_cast<size_t>(layer * REQUESTS + request);
+            EXPECT_EQ(restored_k, expected_k[index]);
+            EXPECT_EQ(restored_v, expected_v[index]);
+        }
+    }
+
+    for (void *checkpoint : checkpoints)
+        ASSERT_EQ(cudaSuccess, cudaFree(checkpoint));
+    ASSERT_EQ(cudaSuccess, cudaFree(device_k));
+    ASSERT_EQ(cudaSuccess, cudaFree(device_v));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+/**
+ * @brief Reproduce the LocalTP sibling-device checkpoint launch boundary.
+ *
+ * LocalTP participant runners share a coordinator thread, so CUDA's current
+ * device can still name the last sibling when an earlier participant begins a
+ * live MTP checkpoint. Capture and restore own enough information to establish
+ * their cache's allocation device and must never depend on ambient host-thread
+ * state inherited from the previous participant.
+ */
+TEST(Test__CUDARingKVCache_LogicalBlockIO,
+     DeviceCheckpointReactivatesOwningDeviceAfterSiblingExecution)
+{
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2)
+    {
+        GTEST_SKIP() << "Two CUDA devices are required";
+    }
+
+    ASSERT_EQ(cudaSuccess, cudaSetDevice(0));
+    CUDARingKVCacheFP32 cache(
+        /*n_layers=*/2,
+        /*batch_size=*/1,
+        /*max_seq_len=*/8,
+        /*n_kv_heads=*/1,
+        /*head_dim=*/2,
+        /*device_id=*/0);
+
+    cudaStream_t owner_stream = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&owner_stream));
+    const size_t checkpoint_bytes =
+        cache.deviceSequenceStateCheckpointBytes();
+    ASSERT_GT(checkpoint_bytes, 0u);
+
+    void *checkpoint = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&checkpoint, checkpoint_bytes));
+
+    ASSERT_EQ(cudaSuccess, cudaSetDevice(1));
+    std::string capture_error;
+    ASSERT_TRUE(cache.captureDeviceSequenceStateCheckpoint(
+        /*seq_idx=*/0,
+        checkpoint,
+        checkpoint_bytes,
+        owner_stream,
+        &capture_error))
+        << capture_error;
+
+    int current_device = -1;
+    ASSERT_EQ(cudaSuccess, cudaGetDevice(&current_device));
+    EXPECT_EQ(current_device, 0);
+
+    ASSERT_EQ(cudaSuccess, cudaSetDevice(1));
+    std::string restore_error;
+    ASSERT_TRUE(cache.restoreDeviceSequenceStateCheckpoint(
+        /*seq_idx=*/0,
+        checkpoint,
+        checkpoint_bytes,
+        owner_stream,
+        &restore_error))
+        << restore_error;
+    ASSERT_EQ(cudaSuccess, cudaGetDevice(&current_device));
+    EXPECT_EQ(current_device, 0);
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(owner_stream));
+
+    ASSERT_EQ(cudaSuccess, cudaFree(checkpoint));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(owner_stream));
 }

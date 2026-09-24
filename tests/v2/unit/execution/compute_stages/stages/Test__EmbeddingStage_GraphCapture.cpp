@@ -168,6 +168,8 @@ namespace llaminar2
             PreparedEmbeddingHandle handle;
             handle.tensor = embed_table.get();
             handle.device_id = DeviceId::cuda(0);
+            handle.weights = std::make_shared<PreparedEmbeddingWeights>();
+            handle.weights->device_id = DeviceId::cuda(0);
 
             params.prepared_ref = store.registerPreparedEmbeddingFromPipeline(
                 binding, DeviceId::cuda(0), &handle);

@@ -1,24 +1,46 @@
 /**
  * @file mpi_gtest_main.cpp
- * @brief Custom GTest main that initializes MPI for integration tests
+ * @brief Custom GTest main with background-safe MPI initialization.
+ *
+ * Integration binaries use the same MPI_THREAD_MULTIPLE contract as the
+ * production runtime. This permits real tests of maintenance/progress threads
+ * while remaining compatible with tests that make MPI calls only on main.
+ * Process-wide collective and GPU context owners are retired before MPI so a
+ * passing test cannot defer device-thread or communicator teardown to static
+ * destruction.
  */
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
 
 int main(int argc, char **argv)
 {
-    // Initialize MPI
-    MPI_Init(&argc, &argv);
+    int provided = MPI_THREAD_SINGLE;
+    const int init_result = MPI_Init_thread(
+        &argc,
+        &argv,
+        MPI_THREAD_MULTIPLE,
+        &provided);
+    if (init_result != MPI_SUCCESS || provided < MPI_THREAD_MULTIPLE)
+        return 2;
 
     // Initialize GTest
     ::testing::InitGoogleTest(&argc, argv);
 
     // Run all tests
-    int result = RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
+
+    /* Match production parity teardown: context workers and any collective
+     * communicator owners must be joined while MPI and GPU runtimes are live. */
+    llaminar2::GlobalBackendRouter::shutdown();
+    llaminar2::GPUDeviceContextPool::instance().shutdown();
 
     // Finalize MPI
-    MPI_Finalize();
+    if (MPI_Finalize() != MPI_SUCCESS)
+        return 3;
 
     return result;
 }

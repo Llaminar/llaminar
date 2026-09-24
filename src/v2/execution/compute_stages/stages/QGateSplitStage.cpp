@@ -64,16 +64,16 @@ namespace llaminar2
         // GPU dispatch path
         if (params_.device_id.is_gpu())
         {
-            // Ensure all tensors are on device
-            const_cast<TensorBase *>(input_base)->ensureOnDevice(params_.device_id);
-            q_base->allocateOnDevice(params_.device_id);
-            gate_base->allocateOnDevice(params_.device_id);
-
-            const float *src_gpu = static_cast<const float *>(input_base->active_data_ptr());
-            float *dst_q_gpu = static_cast<float *>(q_base->active_mutable_data_ptr());
-            float *dst_gate_gpu = static_cast<float *>(gate_base->active_mutable_data_ptr());
-            int dev_idx = params_.device_id.toKernelDeviceIndex();
             void *stream = gpuStream();
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(const_cast<TensorBase *>(input_base));
+            execution.requirePreparedOutput(q_base);
+            execution.requirePreparedOutput(gate_base);
+
+            const float *src_gpu = static_cast<const float *>(input_base->gpu_data_ptr());
+            float *dst_q_gpu = static_cast<float *>(q_base->gpu_data_ptr());
+            float *dst_gate_gpu = static_cast<float *>(gate_base->gpu_data_ptr());
+            int dev_idx = params_.device_id.toKernelDeviceIndex();
 
 #ifdef HAVE_CUDA
             if (params_.device_id.is_cuda())

@@ -20,13 +20,93 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../collective/ILocalTPContext.h"
 #include "../../../collective/ITPContext.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
+#include "../../moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
+    class DeviceWorkspaceManager;
+    class IMoEKernel;
+    class MappedHostTransferRegion;
+    class MoEOverlayNodeLocalRouteExchange;
+    struct WorkspaceRequirements;
+
+    /**
+     * @brief Arithmetic authority used to publish one tensor-parallel sum.
+     *
+     * NativeCollective delegates both transport and floating-point reduction
+     * to the configured collective backend. CanonicalRankOrder uses the native
+     * backend only to allgather immutable participant banks, then folds those
+     * banks on device from rank zero upward. The latter is required whenever a
+     * grouped MTP row must be byte-identical to an independently decoded row.
+     */
+    enum class TPAllreduceArithmeticPolicy
+    {
+        NativeCollective,
+        CanonicalRankOrder
+    };
+
+    /** @return Stable diagnostic name for @p policy. */
+    const char *toString(TPAllreduceArithmeticPolicy policy) noexcept;
+
+    /**
+     * @brief Native rooted LocalTP collective selected declaratively by a graph.
+     */
+    enum class TPLocalRootedCollectiveOperation
+    {
+        ReduceSum,
+        Broadcast
+    };
+
+    /** @return Stable diagnostic name for @p operation. */
+    const char *toString(TPLocalRootedCollectiveOperation operation) noexcept;
+
+    /**
+     * @brief Exact tensor ownership role of one rooted-collective participant.
+     *
+     * A rooted collective is not uniformly in-place on every participant.
+     * Reduce contributors and the broadcast root only consume their local
+     * tensor, while the reduce root and broadcast receivers produce bytes.
+     * Keeping this distinction typed prevents the graph executor from
+     * requiring nonexistent receiver input or publishing imaginary writes.
+     */
+    enum class TPLocalRootedCollectiveTensorRole
+    {
+        ReduceRootInOut,
+        ReduceContributorInput,
+        BroadcastRootInput,
+        BroadcastReceiverOutput
+    };
+
+    /** @return Stable diagnostic name for @p role. */
+    const char *toString(TPLocalRootedCollectiveTensorRole role) noexcept;
+
+    /**
+     * @brief Workspace-backed control sideband attached to a TP allreduce.
+     *
+     * The graph builder names persistent device workspace buffers here. At
+     * execution/capture time TPAllreduceStage resolves them to raw device
+     * pointers and passes the compact sideband to LocalTP. This keeps rebalance
+     * metadata on the graph stream without baking allocator addresses into graph
+     * construction.
+     */
+    struct TPAllreduceSidebandWorkspaceBinding
+    {
+        LocalTPCollectiveSidebandKind kind = LocalTPCollectiveSidebandKind::AllreduceSum;
+        std::string send_buffer_name;
+        std::string recv_buffer_name;
+        size_t element_count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root_device_index = 0;
+        std::string name;
+    };
 
     /**
      * @brief Parameters for TPAllreduceStage
@@ -40,7 +120,12 @@ namespace llaminar2
         size_t count = 0;                         ///< Elements to reduce (0 = use tensor->numel())
         std::string stage_name;                   ///< Stage identifier for registered tensor lookup (optional)
         std::string precision;                    ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
+        TPAllreduceArithmeticPolicy arithmetic_policy =
+            TPAllreduceArithmeticPolicy::NativeCollective; ///< Floating-point reduction authority.
         std::optional<BufferId> tensor_buffer_id; ///< Arena BufferId for the in-place tensor (enables contract-based coherence)
+        int sideband_device_index = -1;           ///< LocalTP participant index for optional sidebands.
+        std::vector<LocalTPCollectiveSidebandBuffer> sidebands; ///< Optional same-stream control sidebands.
+        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings; ///< Workspace-resolved sidebands.
     };
 
     /**
@@ -52,7 +137,7 @@ namespace llaminar2
      *
      * Thread safety: Execute must be called from appropriate device context.
      */
-    class TPAllreduceStage : public IComputeStage
+    class TPAllreduceStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         using Params = TPAllreduceParams;
@@ -98,6 +183,16 @@ namespace llaminar2
          * @return true
          */
         bool requiresAllreduce() const override { return true; }
+
+        /**
+         * @brief TP allreduce sidebands reuse buffers declared by producer stages.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
         /**
          * @brief Check if stage supports a backend type
@@ -154,13 +249,214 @@ namespace llaminar2
         TensorBase *getTensor() const { return params_.tensor; }
 
         /**
+         * @brief Return the explicit collective element count.
+         * @return Number of tensor elements passed to the collective, or zero
+         *         when the full tensor size is selected at execution time.
+         */
+        [[nodiscard]] size_t getCount() const { return params_.count; }
+
+        /**
+         * @brief Return the graph-bound collective precision policy.
+         * @return Empty string for the global policy, otherwise the explicit
+         *         precision name supplied by the graph builder.
+         */
+        [[nodiscard]] const std::string &getPrecision() const
+        {
+            return params_.precision;
+        }
+
+        /** @return Graph-bound floating-point reduction authority. */
+        [[nodiscard]] TPAllreduceArithmeticPolicy getArithmeticPolicy() const
+            noexcept
+        {
+            return params_.arithmetic_policy;
+        }
+
+        /**
+         * @brief Return the arena identity of the in-place tensor.
+         * @return Optional BufferId used by declarative coherence handling.
+         */
+        [[nodiscard]] std::optional<BufferId> getTensorBufferId() const
+        {
+            return params_.tensor_buffer_id;
+        }
+
+        /**
+         * @brief Return immutable workspace-backed sideband declarations.
+         *
+         * Graph-lowering tests and topology diagnostics use this view to prove
+         * that a producer was attached to the intended physical collective.
+         * The returned declarations contain stable workspace names rather than
+         * bound device pointers, so inspecting them cannot observe or mutate a
+         * live graph transaction.
+         *
+         * @return Graph-owned sideband declarations in launch order.
+         */
+        [[nodiscard]] const std::vector<TPAllreduceSidebandWorkspaceBinding> &
+        sidebandWorkspaceBindings() const noexcept
+        {
+            return params_.sideband_workspace_bindings;
+        }
+
+        /**
          * @brief Update parameters (for stage reuse)
          * @param params New parameters
          */
         void setParams(const Params &params);
 
     private:
+        /**
+         * @brief Execute the native-allgather plus fixed-rank device fold.
+         *
+         * @param local_tp Homogeneous LocalTP authority owning the collective.
+         * @param effective_count FP32 values contributed by each participant.
+         * @param stage_stream Exact graph stream for transport and reduction.
+         * @param sidebands Optional control collectives ordered after allgather.
+         * @return true after all operations were enqueued successfully.
+         */
+        bool executeCanonicalRankOrder(
+            ILocalTPContext *local_tp,
+            size_t effective_count,
+            void *stage_stream,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands);
+
         Params params_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+    };
+
+    /**
+     * @brief Graph-capturable rooted collective with participant-specific ownership.
+     *
+     * This stage exists for protocols whose result is needed on one fixed root
+     * before a compact publication. `ReduceSum` reduces the complete tensor to
+     * that root; `Broadcast` publishes the root tensor to every participant.
+     * The declarative contract distinguishes existing root/contributor inputs
+     * from receiver outputs that the executor prepares before capture. Both
+     * operations are issued directly on the executor-selected explicit stream.
+     * There is no host rendezvous, transport emulation, hot-path allocation, or
+     * synchronization path.
+     */
+    class TPLocalRootedCollectiveStage final
+        : public IComputeStage,
+          public IWorkspaceConsumer
+    {
+    public:
+        /** @brief Immutable graph-bound operation parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            ILocalTPContext *tp_ctx = nullptr;
+            TensorBase *tensor = nullptr;
+            size_t count = 0;
+            CollectiveDataType dtype = CollectiveDataType::FLOAT32;
+            TPLocalRootedCollectiveOperation operation =
+                TPLocalRootedCollectiveOperation::ReduceSum;
+            int root_device_index = 0;
+            int participant_device_index = -1;
+            std::string stage_name;
+            std::optional<BufferId> tensor_buffer_id;
+            /**
+             * @brief Explicit no-P2P dense publication authority.
+             *
+             * Non-null is valid only for `Broadcast`. The graph builder sets
+             * this after topology selection proves the native homogeneous
+             * collective has no peer path. Native NCCL/RCCL remains mandatory
+             * whenever this owner is absent.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                mapped_dense_publication_exchange;
+            /**
+             * @brief Persistent-workspace metadata collectives ordered after
+             *        the rooted activation collective on the same stream.
+             *
+             * Rebalance metadata used to ride beside the routed activation
+             * allreduce. Keeping these declarations on the replacement stage
+             * preserves one symmetric collective order on every participant
+             * without retaining a dummy activation allreduce.
+             */
+            std::vector<TPAllreduceSidebandWorkspaceBinding>
+                sideband_workspace_bindings;
+        };
+
+        explicit TPLocalRootedCollectiveStage(Params params);
+
+        /** @brief Release the endpoint-local kernel facade after graph teardown. */
+        ~TPLocalRootedCollectiveStage() override;
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::ROOTED_COLLECTIVE;
+        }
+        std::string name() const override
+        {
+            return "tp_local_rooted_collective";
+        }
+        bool requiresAllreduce() const override { return true; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override;
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        StageDumpInfo buildDumpInfoImpl() const override;
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m,
+            int n = 0,
+            int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override
+        {
+            return bound_workspace_ != nullptr;
+        }
+        DeviceWorkspaceManager *getWorkspace() const override
+        {
+            return bound_workspace_;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::OUTPUT;
+        }
+        /**
+         * @brief Return this participant's exact read/write ownership role.
+         * @return Role derived solely from the graph-bound operation, root,
+         *         and participant indices.
+         */
+        [[nodiscard]] TPLocalRootedCollectiveTensorRole tensorRole() const
+            noexcept;
+        /** @return Immutable operation parameters for graph regressions. */
+        [[nodiscard]] const Params &params() const { return params_; }
+
+    private:
+        void recordBillOfMaterials() const;
+
+        Params params_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
+        /**
+         * @brief Prebound device descriptors for same-stream control collectives.
+         *
+         * Workspace names are resolved once while the graph is bound. Keeping
+         * the resulting descriptors here makes execute() allocation-free and
+         * guarantees that capture observes stable device addresses. The vector
+         * reserves its complete capacity during stage construction and is only
+         * populated outside graph capture by bindWorkspace().
+         */
+        std::vector<LocalTPCollectiveSidebandBuffer> bound_sidebands_;
+
+        /** Capture-stable endpoint aliases for mapped dense publication. */
+        MoENodeLocalDensePublicationDeviceBinding
+            mapped_dense_publication_binding_{};
+
+        /** Registration lifetime retained by every embedded copy node. */
+        std::shared_ptr<const MappedHostTransferRegion>
+            mapped_dense_publication_region_;
+
+        /** Byte offset of the one shared dense FP32 payload bank. */
+        std::size_t mapped_dense_publication_payload_offset_ = 0u;
+
+        /** Backend facade that owns only explicit-stream progress kernels. */
+        std::unique_ptr<IMoEKernel> mapped_dense_publication_kernel_;
     };
 
 } // namespace llaminar2

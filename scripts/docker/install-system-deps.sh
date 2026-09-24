@@ -17,6 +17,7 @@
 set -euo pipefail
 
 MODE="${MODE:-build}"
+NINJA_VERSION="${NINJA_VERSION:-1.13.0}"
 export DEBIAN_FRONTEND=noninteractive
 
 # Make apt resilient to transient network failures. Self-hosted runners and
@@ -75,6 +76,24 @@ if [[ "${MODE}" == "build" ]]; then
         python3-dev \
         python3-pip \
         python3-venv
+
+    # Ubuntu 24.04 ships Ninja 1.11 while the Python/reference environment
+    # installs the newer PyPI Ninja binary. Mixing those executables against
+    # one build tree changes Ninja's recorded command hashes and forces a full
+    # rebuild on every switch. Install one pinned binary as both the PATH and
+    # /usr/bin authority so CMake caches and activated virtualenvs agree.
+    python3 -m pip install \
+        --break-system-packages \
+        --no-cache-dir \
+        "ninja==${NINJA_VERSION}"
+    NINJA_PYPI_BIN="$(python3 -c \
+        'import os, ninja; print(os.path.join(ninja.BIN_DIR, "ninja"))')"
+    test -x "${NINJA_PYPI_BIN}"
+    case "$("${NINJA_PYPI_BIN}" --version)" in
+        "${NINJA_VERSION}"*) ;;
+        *) echo "Pinned Ninja binary does not report ${NINJA_VERSION}" >&2; exit 1 ;;
+    esac
+    install -m 0755 "${NINJA_PYPI_BIN}" /usr/bin/ninja
 
     # Build & install GoogleTest headers+libs so CMake find_package(GTest) works.
     cmake -S /usr/src/googletest -B /tmp/googletest-build

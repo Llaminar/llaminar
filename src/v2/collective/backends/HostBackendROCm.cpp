@@ -54,7 +54,7 @@ bool hipCopyFromHost(void* device_dst, const void* host_src, int device_ordinal,
     return (err == hipSuccess);
 }
 
-bool hipHostRegisterBuffer(void* ptr, size_t size)
+bool hipHostRegisterBuffer(void* ptr, size_t size, int device_ordinal)
 {
     // Use hipHostRegisterDefault (current device only) instead of hipHostRegisterPortable
     // (all devices). hipHostRegisterPortable modifies page tables of ALL GPUs in the system,
@@ -68,14 +68,40 @@ bool hipHostRegisterBuffer(void* ptr, size_t size)
     // Additionally, serialize all registration calls via mutex because the KFD driver's
     // internal page table update logic is not guaranteed thread-safe for concurrent calls.
     std::lock_guard<std::mutex> lock(s_hip_host_register_mutex);
-    hipError_t err = hipHostRegister(ptr, size, hipHostRegisterDefault);
-    return (err == hipSuccess);
+    int previous_device = -1;
+    if (!ptr || size == 0 || device_ordinal < 0 ||
+        hipGetDevice(&previous_device) != hipSuccess ||
+        hipSetDevice(device_ordinal) != hipSuccess)
+        return false;
+
+    const hipError_t error =
+        hipHostRegister(ptr, size, hipHostRegisterDefault);
+    if (previous_device != device_ordinal &&
+        hipSetDevice(previous_device) != hipSuccess)
+    {
+        if (error == hipSuccess)
+        {
+            (void)hipSetDevice(device_ordinal);
+            (void)hipHostUnregister(ptr);
+        }
+        return false;
+    }
+    return error == hipSuccess;
 }
 
-void hipHostUnregisterBuffer(void* ptr)
+bool hipHostUnregisterBuffer(void* ptr, int device_ordinal)
 {
     std::lock_guard<std::mutex> lock(s_hip_host_register_mutex);
-    (void)hipHostUnregister(ptr);  // Ignore return value in cleanup
+    int previous_device = -1;
+    if (!ptr || device_ordinal < 0 ||
+        hipGetDevice(&previous_device) != hipSuccess ||
+        hipSetDevice(device_ordinal) != hipSuccess)
+        return false;
+
+    const hipError_t error = hipHostUnregister(ptr);
+    const bool restored = previous_device == device_ordinal ||
+                          hipSetDevice(previous_device) == hipSuccess;
+    return error == hipSuccess && restored;
 }
 
 } // namespace host_backend_detail

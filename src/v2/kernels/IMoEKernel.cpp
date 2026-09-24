@@ -14,32 +14,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace llaminar2
 {
-
-    bool IMoEKernel::routeWithTensors(
-        ITensor *hidden, ITensor *gate_weights,
-        int seq_len, int d_model, int num_experts, int top_k,
-        bool normalize_weights,
-        ITensor *output_indices, ITensor *output_weights,
-        MoERoutingResult &host_result)
-    {
-        // CPU default: route with host pointers, write results via mutable_data()
-        if (!route(hidden->data(), gate_weights->data(),
-                   seq_len, d_model, num_experts, top_k,
-                   normalize_weights, host_result))
-            return false;
-
-        const size_t n = static_cast<size_t>(seq_len) * top_k;
-        float *idx = output_indices->mutable_data();
-        float *wt = output_weights->mutable_data();
-        for (size_t i = 0; i < n; ++i)
-            idx[i] = static_cast<float>(host_result.expert_indices[i]);
-        std::copy(host_result.expert_weights.begin(),
-                  host_result.expert_weights.end(), wt);
-        return true;
-    }
 
     bool IMoEKernel::routeWithTensorsEffectiveSeqLen(
         ITensor *hidden, ITensor *gate_weights,
@@ -175,6 +153,155 @@ namespace llaminar2
         return true;
     }
 
+    bool IMoEKernel::publishSharedExpertRankBank(
+        ITensor *shared_output,
+        ITensor *canonical_publication,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_index,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!shared_output || !canonical_publication ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_index < 0 || participant_index >= participant_count)
+        {
+            return false;
+        }
+        if (device_effective_seq_len)
+        {
+            LOG_ERROR("[IMoEKernel] CPU canonical rank-bank publication cannot "
+                      "consume a device effective-length scalar");
+            return false;
+        }
+
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t route_elements =
+            row_elements * static_cast<size_t>(top_k);
+        const size_t required_elements =
+            route_elements +
+            row_elements * static_cast<size_t>(participant_count);
+        if (shared_output->numel() < row_elements ||
+            canonical_publication->numel() < required_elements)
+        {
+            return false;
+        }
+
+        float *rank_banks =
+            canonical_publication->mutable_data() + route_elements;
+        std::fill_n(
+            rank_banks,
+            row_elements * static_cast<size_t>(participant_count),
+            0.0f);
+        std::copy_n(
+            shared_output->data(),
+            row_elements,
+            rank_banks +
+                static_cast<size_t>(participant_index) * row_elements);
+        return true;
+    }
+
+    bool IMoEKernel::finalizeCanonicalMoEPublication(
+        ITensor *input,
+        ITensor *gate_inp,
+        ITensor *canonical_publication,
+        ITensor *routed_output,
+        ITensor *shared_output,
+        ITensor *combined_output,
+        int seq_len,
+        int top_k,
+        int d_model,
+        int participant_count,
+        const int *device_effective_seq_len)
+    {
+        if (!input || !gate_inp || !canonical_publication ||
+            !routed_output || !shared_output || !combined_output ||
+            seq_len <= 0 || top_k <= 0 || d_model <= 0 ||
+            participant_count <= 0)
+        {
+            return false;
+        }
+        if (device_effective_seq_len)
+        {
+            LOG_ERROR("[IMoEKernel] CPU canonical publication finalizer cannot "
+                      "consume a device effective-length scalar");
+            return false;
+        }
+
+        const size_t row_elements =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t route_elements =
+            row_elements * static_cast<size_t>(top_k);
+        const size_t required_elements =
+            route_elements +
+            row_elements * static_cast<size_t>(participant_count);
+        if (input->numel() < row_elements ||
+            gate_inp->numel() < static_cast<size_t>(d_model) ||
+            canonical_publication->numel() < required_elements ||
+            routed_output->numel() < row_elements ||
+            shared_output->numel() < row_elements ||
+            combined_output->numel() < row_elements)
+        {
+            return false;
+        }
+
+        const float *input_data = input->data();
+        const float *gate_data = gate_inp->data();
+        const float *publication = canonical_publication->data();
+        const float *rank_banks = publication + route_elements;
+        float *routed_data = routed_output->mutable_data();
+        float *shared_data = shared_output->mutable_data();
+        float *combined_data = combined_output->mutable_data();
+
+        for (int token = 0; token < seq_len; ++token)
+        {
+            const size_t row_offset =
+                static_cast<size_t>(token) * static_cast<size_t>(d_model);
+            float gate_dot = 0.0f;
+            for (int column = 0; column < d_model; ++column)
+            {
+                gate_dot += input_data[row_offset + column] * gate_data[column];
+            }
+            const float gate = 1.0f / (1.0f + std::exp(-gate_dot));
+
+            for (int column = 0; column < d_model; ++column)
+            {
+                float routed = 0.0f;
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const size_t route_index =
+                        (static_cast<size_t>(token) *
+                             static_cast<size_t>(top_k) +
+                         static_cast<size_t>(route)) *
+                            static_cast<size_t>(d_model) +
+                        static_cast<size_t>(column);
+                    routed = std::fma(1.0f, publication[route_index], routed);
+                }
+
+                float shared = 0.0f;
+                for (int participant = 0;
+                     participant < participant_count;
+                     ++participant)
+                {
+                    const size_t shared_index =
+                        static_cast<size_t>(participant) * row_elements +
+                        row_offset + static_cast<size_t>(column);
+                    shared = std::fma(1.0f, rank_banks[shared_index], shared);
+                }
+
+                const size_t output_index =
+                    row_offset + static_cast<size_t>(column);
+                const float gated_shared = gate * shared;
+                routed_data[output_index] = routed;
+                shared_data[output_index] = gated_shared;
+                combined_data[output_index] = routed + gated_shared;
+            }
+        }
+        return true;
+    }
+
     void IMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)
     {
         swiGLU(gate->mutable_data(), up->data(), count);
@@ -186,81 +313,120 @@ namespace llaminar2
         weightedAdd(output->mutable_data(), input->data(), weight, count);
     }
 
-    // =================================================================
-    // Phase 4: GPU-side expert dispatch — CPU defaults
-    // =================================================================
-
-    bool IMoEKernel::prepareExpertGroups(
-        ITensor *routing_indices, ITensor *routing_weights,
-        int seq_len, int num_experts, int top_k)
+    bool IMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *mirrored_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *mirrored_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx)
     {
-        // CPU default: read routing data from host, build token lists
-        const float *idx = routing_indices->data();
-        const float *wt = routing_weights->data();
-        const int total = seq_len * top_k;
-
-        host_expert_counts_.assign(num_experts, 0);
-        host_expert_offsets_.resize(num_experts);
-        host_grouped_indices_.resize(total);
-        host_grouped_weights_.resize(total);
-
-        // Count per expert
-        for (int i = 0; i < total; ++i)
-            host_expert_counts_[static_cast<int>(idx[i])]++;
-
-        // Exclusive scan
-        int running = 0;
-        for (int e = 0; e < num_experts; ++e)
-        {
-            host_expert_offsets_[e] = running;
-            running += host_expert_counts_[e];
-        }
-
-        // Scatter into grouped arrays
-        std::vector<int> write_pos(num_experts, 0);
-        for (int i = 0; i < total; ++i)
-        {
-            int expert_id = static_cast<int>(idx[i]);
-            int dest = host_expert_offsets_[expert_id] + write_pos[expert_id]++;
-            host_grouped_indices_[dest] = i / top_k; // token index
-            host_grouped_weights_[dest] = wt[i];
-        }
-
-        prepared_num_experts_ = num_experts;
-        return true;
+        (void)launch;
+        (void)runtime_layer;
+        (void)mirrored_plan_entries;
+        (void)mirrored_command_headers;
+        (void)plan_capacity;
+        (void)status;
+        (void)config;
+        (void)payload_slot_capacity;
+        (void)layer_idx;
+        LOG_ERROR("[IMoEKernel] Mirrored LLEP domain command materialization "
+                  "was requested on a backend that does not implement it");
+        throw std::logic_error(
+            "Mirrored LLEP domain command materialization is not implemented by this MoE kernel");
     }
 
-    int IMoEKernel::getExpertTokenCount(int expert_id) const
+    bool IMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count)
     {
-        if (expert_id < 0 || expert_id >= prepared_num_experts_)
-            return 0;
-        return host_expert_counts_[expert_id];
+        (void)launch;
+        (void)runtime_layer;
+        (void)plan_entries;
+        (void)plan_count;
+        (void)plan_capacity;
+        (void)command_header;
+        (void)status;
+        (void)config;
+        (void)payload_slot_capacity;
+        (void)layer_idx;
+        (void)command_buffer_count;
+        LOG_ERROR("[IMoEKernel] LLEP prefill transfer command materialization "
+                  "was requested on a backend that does not implement it");
+        throw std::logic_error(
+            "LLEP prefill transfer command materialization is not implemented by this MoE kernel");
     }
 
-    void IMoEKernel::gatherExpertBatch(
-        ITensor *hidden, ITensor *batch_buffer,
-        int expert_id, int d_model)
+    bool IMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k,
+        const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
     {
-        int count = getExpertTokenCount(expert_id);
-        if (count <= 0) return;
-        int offset = host_expert_offsets_[expert_id];
-        gatherTokenBatchFromTensors(
-            hidden, batch_buffer,
-            host_grouped_indices_.data() + offset, count, d_model);
+        (void)launch;
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        (void)config;
+        LOG_ERROR("[IMoEKernel] LLEP prefill route planning was requested "
+                  "on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LLEP current-batch prefill route planning is not implemented by this MoE kernel");
     }
 
-    void IMoEKernel::scatterExpertResults(
-        ITensor *output, ITensor *expert_results,
-        int expert_id, int d_model)
+    bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k)
     {
-        int count = getExpertTokenCount(expert_id);
-        if (count <= 0) return;
-        int offset = host_expert_offsets_[expert_id];
-        scatterAddWeightedFromTensors(
-            output, expert_results,
-            host_grouped_indices_.data() + offset,
-            host_grouped_weights_.data() + offset,
-            count, d_model);
+        (void)launch;
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        LOG_ERROR("[IMoEKernel] LLEP resident-only prefill route assignment "
+                  "was requested on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LLEP resident-only current-batch prefill assignment is not implemented by this MoE kernel");
+    }
+
+    bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k,
+        const DeviceMoERebalanceStatus *transfer_status,
+        const DeviceMoERebalanceApplyStatus *apply_status)
+    {
+        (void)launch;
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        (void)transfer_status;
+        (void)apply_status;
+        LOG_ERROR("[IMoEKernel] LLEP transfer-backed prefill route assignment "
+                  "was requested on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LLEP transfer-backed current-batch prefill assignment is not implemented by this MoE kernel");
     }
 
 } // namespace llaminar2

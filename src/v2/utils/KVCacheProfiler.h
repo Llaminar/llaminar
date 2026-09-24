@@ -104,7 +104,8 @@ namespace llaminar2
 
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("kv_cache");
         }
 
         static void setCurrentPhase(Phase phase)

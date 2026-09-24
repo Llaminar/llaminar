@@ -69,7 +69,10 @@ namespace llaminar2
         GraphSchema getSchema() const override;
 
         /// Reset GDN conv/recurrence state between sessions (no-op: state is in hybrid cache)
-        void resetState() override {};
+        void resetState(void *execution_stream = nullptr) override
+        {
+            (void)execution_stream;
+        }
 
         /// Wire GDN-specific arena buffers after base wiring
         void setArena(BufferArena *arena) override;
@@ -88,36 +91,176 @@ namespace llaminar2
             const int *position_ids,
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr,
-            const void *position_ids_device = nullptr) override;
+            const void *position_ids_device = nullptr,
+            const int32_t *sequence_lengths_device = nullptr) override;
 
+        /**
+         * @brief Build one MTP graph from an explicitly materialized weight view.
+         *
+         * This legacy tensor overload assumes @p weights already represent the
+         * graph's declared sidecar layout. Production frozen-weight callers use
+         * the typed binding overload below so replicated predictors cannot be
+         * handed a primary-model TP shard.
+         */
         ComputeGraph buildMTPGraph(
             int depth_idx,
             const MTPDepthWeights &weights,
             const MTPForwardInput &input,
             MTPForwardOutput &output);
 
+        /**
+         * @brief Build one MTP graph from the canonical typed sidecar binding.
+         *
+         * Tensor-parallel predictors consume @p bindings directly. A declared
+         * replicated-per-participant predictor instead resolves the matching
+         * depth from the auxiliary full-width binding set installed on the
+         * builder. This single selection boundary serves retained live
+         * sidecars and graph-integrated shifted-prefill cache publication.
+         *
+         * @param depth_idx Logical MTP predictor depth being built.
+         * @param bindings Caller-visible primary weight binding; used directly
+         *        only when the sidecar policy is tensor parallel.
+         * @param input Typed sidecar input and shifted-state ownership.
+         * @param output Persistent graph output bindings.
+         * @return Complete participant-local MTP transaction graph.
+         * @throws std::runtime_error when a replicated policy has no unique
+         *         full-width binding for @p depth_idx.
+         */
         ComputeGraph buildMTPGraph(
             int depth_idx,
             const MTPDepthWeightBindings &bindings,
             const MTPForwardInput &input,
             MTPForwardOutput &output) override;
 
-            /**
-             * @brief Resolve the global GDN value-head offset for a local TP shard.
-             *
-             * GDN value heads can have a different count from FA/Q attention heads,
-             * so recurrence state indexing must follow the actual value-projection
-             * shard rather than GraphConfig::head_start when slice metadata exists.
-             */
-            static int resolveGDNGlobalVHeadOffset(
-                const WeightBinding *value_projection_binding,
-                int d_v,
-                int n_v_heads,
-                int n_v_heads_full,
-                const GraphConfig &config,
-                const IMPIContext *mpi_ctx);
+        /**
+         * @brief Declare dense Qwen3.5/3.6 MTP sidecar state ownership.
+         *
+         * The sidecar writes only MTP-prefixed activation buffers and its
+         * shifted KV cache. Its first shifted row is the same row that dense
+         * accepted-state publication would append, so the row may be retained.
+         */
+        [[nodiscard]] MTPSidecarStateContract
+        mtpSidecarStateContract() const noexcept override
+        {
+            return {
+                .main_state = MTPSidecarMainStatePolicy::Preserved,
+                .shifted_row =
+                    MTPShiftedRowPublicationPolicy::ReuseSidecarRow,
+            };
+        }
+
+    protected:
+        /**
+         * @brief Return whether a recursive MTP sidecar is being assembled.
+         *
+         * Derived dense/MoE FFN builders use this typed construction context to
+         * select sidecar-owned buffers, registries, and semantic node names.
+         * It is never runtime inference state and is restored by RAII before
+         * graph construction returns.
+         */
+        [[nodiscard]] bool mtpGraphContextActive() const noexcept
+        {
+            return mtp_graph_context_active_;
+        }
+
+        /**
+         * @brief Return the depth owned by the active MTP graph context.
+         * @return Non-negative MTP depth while @ref mtpGraphContextActive is
+         *         true, otherwise -1.
+         */
+        [[nodiscard]] int mtpGraphDepthIndex() const noexcept
+        {
+            return mtp_graph_depth_idx_;
+        }
+
+        /**
+         * @brief Name dense FFN nodes after their executable sidecar owner.
+         *
+         * The trailing Qwen3.6 NextN block borrows weights from a model layer,
+         * but it is not that main-graph layer. Keeping the depth namespace
+         * here aligns dense and MoE graphs and makes every production
+         * checkpoint addressable as `MTP<n>_*`.
+         */
+        [[nodiscard]] std::string ffnGraphStagePrefix(
+            int layer_idx) const override;
+
+        /**
+         * @brief Optionally insert one terminal-row checkpoint into a GDN graph.
+         *
+         * The dense graph has no diagnostic storage and returns @p dependency
+         * unchanged. Derived graph families can override this hook to make
+         * projection, short-convolution, recurrence, and output-projection
+         * boundaries observable without teaching the GDN graph builder about
+         * a particular logging or tensor-retention policy.
+         *
+         * Implementations that add a node must return that node's name. The
+         * caller makes the next mutating GDN stage depend on it, so an in-place
+         * short-convolution cannot overwrite the projection row before the
+         * checkpoint has captured it.
+         *
+         * @param graph GDN subgraph being assembled.
+         * @param boundary Stable backend-neutral boundary name.
+         * @param source Tensor whose final real row is retained.
+         * @param source_buffer_id Arena slot that owns @p source.
+         * @param dependency Producer that must complete before row selection.
+         * @param layer_idx Global transformer layer index.
+         * @param total_tokens Flattened captured graph row count.
+         * @param feature_dim Number of FP32 values in one source row.
+         * @param device Device that owns both source and checkpoint.
+         * @param sequence_lengths_device Resident real-length owner for padded
+         *        prefill, or null for exact-row graph regimes.
+         * @return @p dependency when disabled, otherwise the inserted node.
+         */
+        virtual std::string maybeAddGDNDiagnosticCheckpoint(
+            ComputeGraph &graph,
+            const std::string &boundary,
+            const ITensor *source,
+            BufferId source_buffer_id,
+            const std::string &dependency,
+            int layer_idx,
+            int total_tokens,
+            int feature_dim,
+            DeviceId device,
+            const int32_t *sequence_lengths_device);
+
+        /**
+         * @brief Resolve the independently executable GDN graph-role namespace.
+         *
+         * Mutable long-context scratch is shared by all serialized GDN layers
+         * in one graph role, but it must never alias another role that may
+         * replay on a different stream. Keeping this policy in the declarative
+         * graph builder makes the ownership distinction explicit and prevents
+         * individual stages from inventing ad hoc workspace identities.
+         *
+         * @return Empty for main inference, otherwise a stable role name.
+         */
+        std::string gdnWorkspaceRoleNamespace() const;
 
     private:
+        /**
+         * @brief RAII owner for one recursive MTP graph-construction context.
+         *
+         * Nested calls are supported because binding-based builders delegate
+         * to legacy tensor views. Restoring the previous context prevents an
+         * unsuccessful sidecar build from leaking its depth into the next
+         * ordinary forward graph.
+         */
+        class ScopedMTPGraphContext
+        {
+        public:
+            ScopedMTPGraphContext(Qwen35Graph &graph, int depth_idx) noexcept;
+            ~ScopedMTPGraphContext();
+
+            ScopedMTPGraphContext(const ScopedMTPGraphContext &) = delete;
+            ScopedMTPGraphContext &operator=(
+                const ScopedMTPGraphContext &) = delete;
+
+        private:
+            Qwen35Graph &graph_;
+            bool previous_active_ = false;
+            int previous_depth_idx_ = -1;
+        };
+
         // =====================================================================
         // FA (Full Attention) Sub-Graph Building
         // =====================================================================
@@ -144,10 +287,22 @@ namespace llaminar2
             const void *position_ids_device,
             DeviceId device,
             const std::vector<int> *sequence_lengths,
+            const int32_t *sequence_lengths_device,
             const std::string &stage_prefix_override = {},
             bool layer_idx_is_cache_local = false);
 
-        ComputeGraph buildFAKVCacheAppendGraph(
+        /**
+         * @brief Build the exact shifted-MTP K/V cache-publication sidecar.
+         *
+         * This graph deliberately excludes Q projection, query gating, query
+         * normalization, attention, FFN/MoE, and vocabulary projection. It emits
+         * only the transforms required to derive and append the MTP K/V bytes
+         * from terminal hidden rows and shifted draft tokens.
+         *
+         * @return A graph terminating at the MTP KV append node, or an empty
+         *         graph when required state is absent.
+         */
+        ComputeGraph buildMTPFAKVCacheAppendGraph(
             const LayerWeights &layer,
             ActivationBuffers &buffers,
             int layer_idx,
@@ -156,13 +311,17 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             const void *position_ids_device,
+            const int32_t *sequence_lengths_device,
             DeviceId device,
             const std::string &stage_prefix_override = {},
-            bool layer_idx_is_cache_local = false);
+            bool layer_idx_is_cache_local = false,
+            int first_seq_idx = 0);
 
         // =====================================================================
         // GDN Attention Sub-Graph Building
         // =====================================================================
+
+        bool gdnLiveStateAllGatherAvailable(int total_tokens, DeviceId device) const;
 
         /**
          * @brief Build GDN attention sub-graph for a single layer
@@ -177,12 +336,19 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             IKVCache *kv_cache,
-            DeviceId device);
+            DeviceId device,
+            const std::vector<int> *sequence_lengths,
+            const int32_t *sequence_lengths_device);
 
         /**
          * @brief Check if a layer uses GDN (vs full attention)
          */
         bool isGDNLayer(int layer_idx) const;
+
+        /** Graph-construction-only owner for depth-specific sidecar policy. */
+        bool mtp_graph_context_active_ = false;
+        /** Recursive depth paired with @ref mtp_graph_context_active_. */
+        int mtp_graph_depth_idx_ = -1;
     };
 
 } // namespace llaminar2

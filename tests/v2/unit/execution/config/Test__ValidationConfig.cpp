@@ -9,7 +9,7 @@
  * - Buffer validation integration with DeviceGraphExecutor
  *
  * @see DebugEnv.h for ValidationConfig struct
- * @see DeviceGraphExecutor.cpp for validateStageOutputs implementation
+ * @see StageVerifier.cpp for stream-ordered stage validation
  */
 
 #include <gtest/gtest.h>

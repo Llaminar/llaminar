@@ -7,6 +7,11 @@
  * - Single-GPU inference without MPI
  * - Clean separation of concerns
  *
+ * A context owns one immutable hardware publication for its exact communicator.
+ * Topology and admission consume that publication instead of rediscovering it.
+ * Both lazy initialization boundaries retain failure as well as success: a
+ * later caller must not restart a collective after another rank has left it.
+ *
  * @author David Sanftenberg
  */
 
@@ -19,6 +24,9 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <mutex>
+#include <exception>
+#include <variant>
 #include "../tensors/BlockStructures.h"
 #include "../tensors/SIMDHelpers.h"
 #include "../interfaces/IMPIContext.h"
@@ -27,6 +35,13 @@ namespace llaminar2
 {
     // Forward declaration for lazy topology access
     class MPITopology;
+    class ExecutionRankMembership;
+
+    /** @brief Successful admission that assigns this discovery rank no runtime. */
+    struct InactiveMPIRank
+    {
+        int discovery_rank; ///< Original identity, never a fabricated execution rank.
+    };
 
     /**
      * @brief MPI context for distributed coordination
@@ -52,6 +67,9 @@ namespace llaminar2
         MPIContext(int rank, int world_size, int local_rank, MPI_Comm comm)
             : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(local_rank) {}
 
+        /** @brief Retire derived topology before releasing an owned communicator. */
+        ~MPIContext() override;
+
         // Accessors (IMPIContext overrides)
         int rank() const override { return rank_; }
         int world_size() const override { return world_size_; }
@@ -59,6 +77,12 @@ namespace llaminar2
         int local_rank() const override { return local_rank_; }
         MPI_Comm communicator() const override { return comm_; }
         MPI_Comm comm() const { return comm_; }
+
+        /** @copydoc IMPIContext::clusterInventory */
+        std::shared_ptr<const ClusterInventory> clusterInventory() const override;
+
+        /** @return Selected rank mapping, or null for an original borrowed context. */
+        const ExecutionRankMembership *executionMembership() const noexcept { return membership_.get(); }
 
         /**
          * @brief Get the MPI topology for placement computation
@@ -553,6 +577,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Drive one request by one non-blocking MPI progress operation.
+         * @throws std::invalid_argument for a null request owner.
+         * @throws std::runtime_error if MPI_Test fails.
+         */
+        bool test(
+            MPI_Request *request,
+            MPI_Status *status = nullptr) const override
+        {
+            if (!request)
+                throw std::invalid_argument("MPI_Test requires a non-null request owner");
+            int complete = 0;
+            const int ret = MPI_Test(
+                request,
+                &complete,
+                status ? status : MPI_STATUS_IGNORE);
+            if (ret != MPI_SUCCESS)
+            {
+                char error_string[MPI_MAX_ERROR_STRING];
+                int length = 0;
+                MPI_Error_string(ret, error_string, &length);
+                throw std::runtime_error(
+                    std::string("MPI_Test failed: ") + error_string);
+            }
+            return complete != 0;
+        }
+
+        /**
          * @brief Wait for all non-blocking operations to complete
          *
          * @param requests Vector of MPI_Request handles (all set to MPI_REQUEST_NULL on completion)
@@ -672,11 +723,28 @@ namespace llaminar2
         }
 
     private:
+        friend class MPIContextFactory;
+        /** @brief Only the collective admission factory can install owned membership. */
+        MPIContext(std::shared_ptr<IMPIContext> discovery,
+                   std::shared_ptr<const ExecutionRankMembership> membership, int rank);
+
+        // The admission factory installs the split only after all fallible
+        // local preparation succeeds. An unbound selected context cannot escape.
+        enum class CommunicatorOwnership { Borrowed, Owned };
+        CommunicatorOwnership communicator_ownership_ = CommunicatorOwnership::Borrowed;
+        std::shared_ptr<IMPIContext> discovery_owner_; ///< Keeps the parent namespace alive.
+        std::shared_ptr<const ExecutionRankMembership> membership_; ///< Immutable projection owner.
         int rank_;
         int world_size_;
         MPI_Comm comm_;
         int local_rank_;
         mutable std::unique_ptr<MPITopology> topology_; ///< Lazily initialized topology
+        mutable std::once_flag topology_once_; ///< Serializes construction, not inference.
+        mutable std::exception_ptr topology_failure_; ///< A failed collective cannot be retried.
+        mutable std::once_flag inventory_once_; ///< One publication transaction per context.
+        /** Unobserved -> immutable observation OR retained failure; never reset. */
+        mutable std::variant<std::monostate,
+            std::shared_ptr<const ClusterInventory>, std::exception_ptr> inventory_publication_;
     };
 
     /**
@@ -686,13 +754,34 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Collectively admit an ordered execution subset of discovery.
+         * @param discovery Existing communicator and its canonical observation.
+         * @param ranks Selected discovery ranks, identical and ordered on every peer.
+         * @return Owned active context or an explicit inactive result; never SELF substitution.
+         * @throws std::runtime_error collectively for invalid or inconsistent membership.
+         *
+         * Every discovery rank enters once. All local validation/allocation is
+         * voted before splitting. Afterwards excluded peers owe no execution
+         * collective; the enclosing application still owns MPI session shutdown.
+         */
+        static std::variant<InactiveMPIRank, std::shared_ptr<MPIContext>> selectRanks(
+            const std::shared_ptr<IMPIContext> &discovery, const std::vector<int> &ranks);
+
+        /**
          * @brief Get global MPI context (MPI_COMM_WORLD)
          *
-         * @return Shared pointer to global context (singleton)
+         * The factory observes the live application-owned context; it must not
+         * pin MPI-dependent topology until static destruction after finalization.
+         * Application scopes retain their context throughout discovery/execution.
+         *
+         * @return Shared pointer to the current application-owned WORLD context.
          */
         static std::shared_ptr<MPIContext> global()
         {
-            static std::shared_ptr<MPIContext> instance;
+            static std::weak_ptr<MPIContext> cached;
+            static std::mutex mutex;
+            const std::lock_guard lock(mutex);
+            auto instance = cached.lock();
             if (!instance)
             {
                 int rank, world_size;
@@ -709,6 +798,34 @@ namespace llaminar2
                     MPI_Comm_free(&local_comm);
                 }
                 instance = std::make_shared<MPIContext>(rank, world_size, local_rank, MPI_COMM_WORLD);
+                cached = instance;
+            }
+            return instance;
+        }
+
+        /**
+         * @brief Get a process-local MPI context backed by MPI_COMM_SELF.
+         *
+         * Participant-local device graphs use this context so ordinary graph
+         * setup cannot accidentally issue a collective on a larger
+         * orchestration communicator. Cross-rank graph edges must carry their
+         * own explicit domain context.
+         *
+         * @return Shared caller-owned context with rank 0 and size 1.
+         */
+        static std::shared_ptr<MPIContext> self()
+        {
+            // SELF can own derived topology too. A weak lookup preserves sharing
+            // without extending any MPI dependency beyond its final caller.
+            static std::weak_ptr<MPIContext> cached;
+            static std::mutex mutex;
+            const std::lock_guard lock(mutex);
+            auto instance = cached.lock();
+            if (!instance)
+            {
+                instance = std::make_shared<MPIContext>(
+                    /*rank=*/0, /*world_size=*/1, /*local_rank=*/0, MPI_COMM_SELF);
+                cached = instance;
             }
             return instance;
         }
@@ -735,19 +852,18 @@ namespace llaminar2
 {
     inline const IMPITopology *MPIContext::topology() const
     {
-        if (!topology_)
-        {
-            topology_ = std::make_unique<MPITopology>(comm_);
-        }
-        return topology_.get();
+        return &concrete_topology();
     }
 
     inline const MPITopology &MPIContext::concrete_topology() const
     {
-        if (!topology_)
-        {
-            topology_ = std::make_unique<MPITopology>(comm_);
-        }
+        // Catch inside call_once: its default retry-on-exception behavior would
+        // be unsafe for a collective whose peers already observed the failure.
+        std::call_once(topology_once_, [this] {
+            try { topology_ = std::make_unique<MPITopology>(*this); }
+            catch (...) { topology_failure_ = std::current_exception(); }
+        });
+        if (topology_failure_) std::rethrow_exception(topology_failure_);
         return *topology_;
     }
 

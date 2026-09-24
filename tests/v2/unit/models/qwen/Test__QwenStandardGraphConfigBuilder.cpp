@@ -129,7 +129,7 @@ namespace
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.weight_shard.shard_index = 0;
         plan.weight_shard.total_shards = 1;
         plan.weight_shard.work_fraction = 1.0f;
@@ -229,6 +229,39 @@ TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice, BuildConfig_AllLayers)
     EXPECT_EQ(result.execution_info.last_layer, 31);
     EXPECT_TRUE(result.execution_info.has_embedding);
     EXPECT_TRUE(result.execution_info.has_lm_head);
+}
+
+/**
+ * @brief Prove terminal MTP ownership originates in the model graph definition.
+ *
+ * Runtime graph-family selection may choose greedy or stochastic reduction, but
+ * it must not infer whether rank orchestration or each graph participant owns
+ * the result. Qwen declares participant-local ownership here; QwenGraphBase is
+ * then responsible for lowering that immutable policy into concrete stages.
+ */
+TEST_F(Test__QwenStandardGraphConfigBuilder_SingleDevice,
+       BuildGraphConfig_DeclaresParticipantLocalMTPVerifierOutcomeOwnership)
+{
+    GraphConfig config;
+    ASSERT_TRUE(builder->buildGraphConfig(
+        plan,
+        model_config,
+        g_stub_weight_manager,
+        config));
+
+    EXPECT_EQ(
+        config.mtp_verifier_outcome_ownership,
+        MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal);
+    EXPECT_EQ(
+        config.mtp_request_terminal_hidden_publication,
+        MTPRequestTerminalHiddenPublicationPolicy::
+            GraphCapturedDeviceGeometry)
+        << "Qwen must declare prompt-width-total device geometry in the graph definition; runtime code may not invent selector topology.";
+    EXPECT_EQ(
+        config.mtp_shifted_prefill_hidden_publication,
+        MTPShiftedPrefillHiddenPublicationPolicy::
+            GraphIntegratedKVTransaction)
+        << "Qwen must declare shifted-prefill preparation and KV append as one device-owned main-prefill graph transaction.";
 }
 
 // ============================================================================
@@ -379,7 +412,7 @@ protected:
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.local_tp_devices = {
             GlobalDeviceAddress::cuda(0),
             GlobalDeviceAddress::cuda(1)};
@@ -401,7 +434,7 @@ protected:
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.local_tp_devices = {
             GlobalDeviceAddress::cuda(0), // NVIDIA
             GlobalDeviceAddress::rocm(0)  // AMD

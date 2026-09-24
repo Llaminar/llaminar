@@ -16,47 +16,12 @@
 
 // Backend interface (no GPU headers exposed)
 #include "../backends/IBackend.h"
-
-// Conditional backend includes (separate compilation units)
-#ifdef HAVE_CUDA
-#include "../backends/cuda/CUDABackend.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../backends/rocm/ROCmBackend.h"
-#endif
+#include "../backends/BackendManager.h"
+#include "../backends/GPUDeviceContextPool.h"
+#include "../transfer/TransferEngine.h"
 
 namespace llaminar2
 {
-    // ========================================================================
-    // Global backend instance (initialized at first use)
-    // ========================================================================
-
-    namespace
-    {
-        IBackend *g_gpu_backend = nullptr;
-        bool g_backend_initialized = false;
-
-        IBackend *getBackend()
-        {
-            if (!g_backend_initialized)
-            {
-#ifdef HAVE_CUDA
-                g_gpu_backend = new CUDABackend();
-                LOG_INFO("[MPIStager] Initialized CUDA backend (" << g_gpu_backend->deviceCount() << " devices)");
-#elif defined(HAVE_ROCM)
-                g_gpu_backend = new ROCmBackend();
-                LOG_INFO("[MPIStager] Initialized ROCm backend (" << g_gpu_backend->deviceCount() << " devices)");
-#else
-                g_gpu_backend = nullptr;
-                LOG_DEBUG("[MPIStager] No GPU backend available (CPU-only mode)");
-#endif
-                g_backend_initialized = true;
-            }
-            return g_gpu_backend;
-        }
-    } // anonymous namespace
-
     // ========================================================================
     // Public API: FP32 staging
     // ========================================================================
@@ -91,11 +56,9 @@ namespace llaminar2
             // GPU tensor - device-to-host transfer
             // CRITICAL: Use active_data_ptr() to get the GPU pointer directly,
             // NOT data() which would sync GPU→Host and return the host pointer!
-            int device_id = home_device.toKernelDeviceIndex();
             const float *gpu_ptr = static_cast<const float *>(tensor->active_data_ptr());
             LOG_DEBUG("[MPIStager] toHost: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
-            synchronizeDevice(device_id);
-            deviceToHost(host_buffer.data(), gpu_ptr, numel, device_id);
+            deviceToHost(host_buffer.data(), gpu_ptr, numel, home_device);
         }
 
         return host_buffer;
@@ -134,13 +97,14 @@ namespace llaminar2
             // GPU tensor - host-to-device transfer
             // CRITICAL: Use active_mutable_data_ptr() to get the GPU pointer directly,
             // NOT mutable_data() which would return the host pointer!
-            int device_id = home_device.toKernelDeviceIndex();
             float *gpu_ptr = static_cast<float *>(tensor->active_mutable_data_ptr());
             LOG_DEBUG("[MPIStager] toDevice: GPU tensor (" << home_device.toString() << "), staging " << numel << " elements");
-            hostToDevice(gpu_ptr, host_buffer.data(), numel, device_id);
-            synchronizeDevice(device_id);
-            // Mark device data as authoritative after H2D transfer (with event for fine-grained sync)
-            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            hostToDevice(gpu_ptr, host_buffer.data(), numel, home_device);
+            // The explicit device synchronization above completed this H2D
+            // boundary; no asynchronous producer remains to publish.
+            TransferEngine::publishCompletedDeviceWrite(
+                tensor,
+                home_device);
         }
     }
 
@@ -148,29 +112,6 @@ namespace llaminar2
     {
         // GPU tensors require staging (host<->device transfer) for MPI
         return tensor && tensor->home_device().is_gpu();
-    }
-
-    void MPIStager::synchronizeDevice(int device_id)
-    {
-        if (device_id < 0)
-        {
-            return; // CPU device - no sync needed
-        }
-
-        IBackend *backend = getBackend();
-        if (!backend)
-        {
-            LOG_WARN("[MPIStager] synchronizeDevice called but no GPU backend available (device_id=" << device_id << ")");
-            return;
-        }
-
-        if (!backend->synchronize(device_id))
-        {
-            LOG_ERROR("[MPIStager] " << backend->backendName() << " synchronize failed (device " << device_id << ")");
-            throw std::runtime_error("GPU synchronize failed");
-        }
-
-        LOG_TRACE("[MPIStager] " << backend->backendName() << " device " << device_id << " synchronized");
     }
 
     // ========================================================================
@@ -195,19 +136,33 @@ namespace llaminar2
     // Private: GPU memcpy wrappers (using backend interface)
     // ========================================================================
 
-    void MPIStager::deviceToHost(float *dst, const float *src, size_t count, int device_id)
+    void MPIStager::deviceToHost(
+        float *dst,
+        const float *src,
+        size_t count,
+        DeviceId device)
     {
-        IBackend *backend = getBackend();
+        IBackend *backend = getBackendFor(device);
         if (!backend)
         {
             LOG_ERROR("[MPIStager] deviceToHost called but no GPU backend available");
             throw std::runtime_error("No GPU backend available for staging");
         }
 
-        size_t bytes = count * sizeof(float);
-        if (!backend->deviceToHost(dst, src, bytes, device_id))
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(device)
+                .defaultStream();
+        if (!stream)
         {
-            LOG_ERROR("[MPIStager] " << backend->backendName() << " D2H memcpy failed (device " << device_id << ")");
+            throw std::runtime_error(
+                "MPIStager::deviceToHost requires an explicit GPU stream");
+        }
+        size_t bytes = count * sizeof(float);
+        if (!backend->deviceToHost(
+                dst, src, bytes, device.gpu_ordinal(), stream))
+        {
+            LOG_ERROR("[MPIStager] " << backend->backendName() << " D2H memcpy failed (device " << device.toString() << ")");
             throw std::runtime_error("GPU D2H memcpy failed");
         }
 
@@ -215,19 +170,33 @@ namespace llaminar2
                                  << (bytes / 1024.0 / 1024.0) << " MB)");
     }
 
-    void MPIStager::hostToDevice(float *dst, const float *src, size_t count, int device_id)
+    void MPIStager::hostToDevice(
+        float *dst,
+        const float *src,
+        size_t count,
+        DeviceId device)
     {
-        IBackend *backend = getBackend();
+        IBackend *backend = getBackendFor(device);
         if (!backend)
         {
             LOG_ERROR("[MPIStager] hostToDevice called but no GPU backend available");
             throw std::runtime_error("No GPU backend available for staging");
         }
 
-        size_t bytes = count * sizeof(float);
-        if (!backend->hostToDevice(dst, src, bytes, device_id))
+        void *const stream =
+            GPUDeviceContextPool::instance()
+                .getContext(device)
+                .defaultStream();
+        if (!stream)
         {
-            LOG_ERROR("[MPIStager] " << backend->backendName() << " H2D memcpy failed (device " << device_id << ")");
+            throw std::runtime_error(
+                "MPIStager::hostToDevice requires an explicit GPU stream");
+        }
+        size_t bytes = count * sizeof(float);
+        if (!backend->hostToDevice(
+                dst, src, bytes, device.gpu_ordinal(), stream))
+        {
+            LOG_ERROR("[MPIStager] " << backend->backendName() << " H2D memcpy failed (device " << device.toString() << ")");
             throw std::runtime_error("GPU H2D memcpy failed");
         }
 

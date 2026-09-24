@@ -1,0 +1,4 @@
+interface:
+  display_name: "NativeVNNI GEMM Tuning"
+  short_description: "Train cross-backend NativeVNNI dispatch policies"
+  default_prompt: "Use the NativeVNNI corpus workflow to collect or reuse evidence, fit and certify dispatch policy, and preserve bitwise grouped-decode correctness."

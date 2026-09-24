@@ -168,7 +168,7 @@ namespace llaminar2
                                                     << " - proceeding anyway");
         }
 
-        LOG_DEBUG("[AllGatherStage] Execute: seq_len=" << seq_len
+        LOG_TRACE("[AllGatherStage] Execute: seq_len=" << seq_len
                                                        << " vocab_local=" << vocab_local
                                                        << " vocab_full=" << vocab_full
                                                        << " world_size=" << world_size);

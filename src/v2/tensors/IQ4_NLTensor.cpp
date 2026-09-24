@@ -36,18 +36,33 @@ namespace llaminar2
 
     // ========== Constructor & Destructor ==========
 
-    IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
+    IQ4_NLTensor::IQ4_NLTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : IQ4_NLTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    IQ4_NLTensor::IQ4_NLTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
+        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr),
           view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
-        if (shape_.size() != 2)
+        if (shape_.size() != 2u && shape_.size() != 3u)
         {
-            throw std::invalid_argument("IQ4_NLTensor only supports 2D tensors");
+            throw std::invalid_argument("IQ4_NLTensor requires a 2D matrix or 3D expert tensor");
         }
 
-        // Per-row block counting: each row is independently padded to block boundary
-        size_t rows = shape_[0];
-        size_t cols = shape_[1];
+        // GGUF stores 3D experts as [K, N, E], whereas ordinary matrices use
+        // [N, K]. Flattening only the outer N/E axes preserves the exact native
+        // row layout consumed by create_view().
+        const size_t rows = shape_.size() == 3u
+                                ? shape_[1] * shape_[2]
+                                : shape_[0];
+        const size_t cols = shape_.size() == 3u
+                                ? shape_[0]
+                                : shape_[1];
         size_t blocks_per_row = (cols + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
         size_t total_blocks = rows * blocks_per_row;
         size_t expected_size = total_blocks * sizeof(IQ4_NLBlock);
@@ -104,6 +119,7 @@ namespace llaminar2
 
     IQ4_NLTensor::~IQ4_NLTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // TODO: Free device_blocks_ if allocated
         if (device_blocks_)
         {
@@ -113,7 +129,7 @@ namespace llaminar2
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -690,10 +706,10 @@ namespace llaminar2
             &output->d);  // Output: Q8_0 FP16 scale
     }
 
-    void IQ4_NLTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void IQ4_NLTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
         std::memcpy(vnniPayloadDst(ctx, linear), blk->qs, 16);
         ctx.scales_array[linear] = blk->d;
     }

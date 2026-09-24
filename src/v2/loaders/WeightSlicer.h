@@ -117,13 +117,14 @@ namespace llaminar2
          * @param[out] q_rows Q sub-block row count
          * @param[out] k_rows K sub-block row count
          * @param[out] v_rows V sub-block row count
-         * @param[out] replicate_qk Whether Q and K should be replicated (GDN)
+         * @param[out] modulo_linked_gdn Whether the exact GDN geometry uses
+         *        modulo-linked Q/K/V ownership.
          * @return true if sub-block sizes were determined
          */
         bool determineFusedQKVSubBlockSizes(
             size_t total_rows,
             size_t &q_rows, size_t &k_rows, size_t &v_rows,
-            bool &replicate_qk) const;
+            bool &modulo_linked_gdn) const;
 
         /**
          * @brief Compute slice within a single sub-block
@@ -131,11 +132,10 @@ namespace llaminar2
          * @param block_rows Total rows in this sub-block
          * @param rank MPI rank
          * @param world_size Total MPI ranks
-         * @param replicate If true, return full block (no slicing)
          * @return SliceSpec within the sub-block
          */
         static SliceSpec computeSubBlockSlice(
-            size_t block_rows, int rank, int world_size, bool replicate);
+            size_t block_rows, int rank, int world_size);
 
         // =========================================================================
         // Proportional slicing helpers

@@ -32,7 +32,17 @@ namespace llaminar2
         std::string model_name;          ///< CPU model from /proc/cpuinfo
         std::vector<int> physical_cores; ///< First thread of each physical core (sorted)
         std::vector<int> ht_threads;     ///< HyperThreading sibling threads (sorted, empty if no HT)
-        size_t memory_bytes = 0;         ///< NUMA-local memory in bytes
+        size_t memory_bytes = 0;         ///< Total NUMA-local memory in bytes.
+        /**
+         * Memory conservatively allocatable on this NUMA node at discovery.
+         *
+         * This is deliberately distinct from `memory_bytes`: tmpfs/ramdisk
+         * pages and unrelated anonymous allocations consume the latter, while
+         * inactive ordinary file cache may be reclaimed. Capacity admission
+         * must use this value (or a smaller explicit limit) so two socket-local
+         * CPU tiers cannot each claim the machine's nominal RAM.
+         */
+        size_t available_memory_bytes = 0;
 
         /// Number of physical cores on this socket
         int num_physical_cores() const { return static_cast<int>(physical_cores.size()); }

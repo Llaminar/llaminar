@@ -359,13 +359,16 @@ namespace
         {
             // Token IDs
             token_ids_.resize(batch_size * seq_len);
+            position_ids_.resize(batch_size * seq_len);
             for (int i = 0; i < batch_size * seq_len; ++i)
             {
                 token_ids_[i] = i % config_.vocab_size;
+                position_ids_[i] = i % seq_len;
             }
 
             ForwardInput input;
             input.token_ids = token_ids_.data();
+            input.position_ids = position_ids_.data();
             input.batch_size = batch_size;
             input.seq_len = seq_len;
             input.position_offset = 0;
@@ -445,6 +448,7 @@ namespace
 
         // Forward input data
         std::vector<int> token_ids_;
+        std::vector<int> position_ids_;
     };
 
     // ============================================================================

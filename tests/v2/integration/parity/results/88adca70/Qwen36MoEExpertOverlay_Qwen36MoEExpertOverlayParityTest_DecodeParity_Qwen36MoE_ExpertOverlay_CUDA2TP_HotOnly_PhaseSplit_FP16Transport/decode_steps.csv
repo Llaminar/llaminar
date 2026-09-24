@@ -1,0 +1,4 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport,0,0.992916,0.0246135,1,1,271,271,true,true,true,true
+Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport,1,0.992238,0.0387237,0,1,760,71093,false,true,true,true
+Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport,2,0.996274,0.0149724,1,0.8,12305,12305,true,true,true,true

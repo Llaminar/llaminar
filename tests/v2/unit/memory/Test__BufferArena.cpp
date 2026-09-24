@@ -12,6 +12,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
+#include <limits>
 #include "memory/BufferArena.h"
 #include "memory/BufferId.h"
 #include "memory/BufferAccess.h"
@@ -43,6 +45,65 @@ TEST(Test__BufferArena, RegisterBufferRejectsDoubleRegistration)
     EXPECT_TRUE(arena.registerBuffer(BufferId::HIDDEN_STATE, 4, 896, "FP32", DeviceId::cpu()));
     EXPECT_FALSE(arena.registerBuffer(BufferId::HIDDEN_STATE, 8, 896, "FP32", DeviceId::cpu()));
     EXPECT_EQ(arena.registeredCount(), 1u);
+}
+
+/**
+ * @brief Graph registration must preserve the capacity of every logical axis.
+ *
+ * Canonical MoE publication uses a rank-three `[rows, routes, width]`
+ * descriptor. The arena intentionally exposes matrix tensors to kernels, so it
+ * must flatten the two trailing dimensions rather than dropping `width`.
+ */
+TEST(Test__BufferArena, GraphDescriptorRegistrationFlattensEveryTrailingAxis)
+{
+    BufferArena arena;
+    const BufferDescriptor descriptor = BufferDescriptor::scratch(
+        "moe_canonical_route_contributions",
+        {7, 3, 5},
+        BufferTensorType::FP32);
+
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+        descriptor));
+    EXPECT_EQ(arena.getRows(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS), 7u);
+    EXPECT_EQ(arena.getCols(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS), 15u);
+}
+
+TEST(Test__BufferArena, GraphDescriptorRegistrationPreservesRankOneCapacity)
+{
+    BufferArena arena;
+    const BufferDescriptor descriptor = BufferDescriptor::scratch(
+        "one_dimensional_scratch",
+        {4096},
+        BufferTensorType::FP32);
+
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GEMM_WORKSPACE, descriptor));
+    EXPECT_EQ(arena.getRows(BufferId::GEMM_WORKSPACE), 4096u);
+    EXPECT_EQ(arena.getCols(BufferId::GEMM_WORKSPACE), 1u);
+}
+
+TEST(Test__BufferArena, GraphDescriptorRegistrationRejectsInvalidShapes)
+{
+    BufferArena arena;
+
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch("empty", {}, BufferTensorType::FP32)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch("zero", {4, 0, 8}, BufferTensorType::FP32)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        arena.registerBuffer(
+            BufferId::HIDDEN_STATE,
+            BufferDescriptor::scratch(
+                "overflow",
+                {2, std::numeric_limits<size_t>::max()},
+                BufferTensorType::FP32)),
+        std::overflow_error);
 }
 
 TEST(Test__BufferArena, RegisterMultipleBuffers)
@@ -82,6 +143,89 @@ TEST(Test__BufferArena, BindExternalBufferCanReplaceDynamicScratch)
     EXPECT_EQ(arena.getRows(BufferId::ALL_POSITION_LOGITS), 3u);
     EXPECT_EQ(arena.getCoherenceState(BufferId::ALL_POSITION_LOGITS).authority,
               CoherenceState::UNINITIALIZED);
+}
+
+TEST(Test__BufferArena, ArenaBindingsInstallStableBufferDebugNames)
+{
+    auto external = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{2, 128},
+        DeviceId::cpu());
+    ASSERT_TRUE(external->debugName().empty());
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.bindExternalBuffer(
+        BufferId::ALL_POSITION_LOGITS,
+        external.get()));
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MTP_VERIFIER_INPUT_TOKENS,
+        1,
+        16,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.allocate());
+
+    EXPECT_EQ(external->debugName(), "ALL_POSITION_LOGITS");
+    auto *owned = dynamic_cast<TensorBase *>(
+        arena.getTensor(BufferId::MTP_VERIFIER_INPUT_TOKENS));
+    ASSERT_NE(owned, nullptr);
+    EXPECT_EQ(owned->debugName(), "MTP_VERIFIER_INPUT_TOKENS");
+}
+
+/**
+ * @brief Address diagnostics must expose real ranges in numeric order.
+ *
+ * Out-of-bounds GPU diagnostics depend on identifying the buffers immediately
+ * below and above a suspect allocation. The formatter is tested independently
+ * of logging so a logger-level change cannot silently remove that evidence.
+ */
+TEST(Test__BufferArena, AllocationAddressMapSortsRealBufferRanges)
+{
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::REQUEST_POSITION_IDS,
+        1,
+        16,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.registerBuffer(
+        BufferId::MTP_LOGICAL_SEQUENCE_STATE,
+        7,
+        1,
+        "INT32",
+        DeviceId::cpu()));
+    ASSERT_TRUE(arena.allocate());
+
+    const auto *positions =
+        arena.getTensor(BufferId::REQUEST_POSITION_IDS);
+    const auto *logical_state =
+        arena.getTensor(BufferId::MTP_LOGICAL_SEQUENCE_STATE);
+    ASSERT_NE(positions, nullptr);
+    ASSERT_NE(logical_state, nullptr);
+
+    const uintptr_t positions_address =
+        reinterpret_cast<uintptr_t>(positions->raw_data());
+    const uintptr_t logical_state_address =
+        reinterpret_cast<uintptr_t>(logical_state->raw_data());
+    const std::string map = arena.allocationAddressMap();
+
+    EXPECT_NE(map.find("Allocation address map"), std::string::npos);
+    EXPECT_NE(map.find("device=CPU"), std::string::npos);
+    EXPECT_NE(map.find("name=REQUEST_POSITION_IDS"), std::string::npos);
+    EXPECT_NE(map.find("name=MTP_LOGICAL_SEQUENCE_STATE"),
+              std::string::npos);
+    EXPECT_NE(map.find("range=[0x"), std::string::npos);
+    EXPECT_NE(map.find("ownership=arena"), std::string::npos);
+    EXPECT_NE(map.find("space=host"), std::string::npos);
+    EXPECT_NE(map.find("shape=7x1"), std::string::npos);
+
+    const size_t positions_offset =
+        map.find("name=REQUEST_POSITION_IDS");
+    const size_t logical_state_offset =
+        map.find("name=MTP_LOGICAL_SEQUENCE_STATE");
+    if (positions_address < logical_state_address)
+        EXPECT_LT(positions_offset, logical_state_offset);
+    else
+        EXPECT_LT(logical_state_offset, positions_offset);
 }
 
 TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
@@ -173,7 +317,8 @@ TEST(Test__BufferArena, PrepareForWriteThenMarkWritten)
     arena.registerBuffer(BufferId::FFN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
     arena.allocate();
 
-    EXPECT_TRUE(arena.prepareForWrite(BufferId::FFN_OUTPUT, DeviceId::cpu()));
+    EXPECT_TRUE(arena.prepareForWrite(
+        BufferId::FFN_OUTPUT, DeviceId::cpu(), nullptr));
     arena.markWritten(BufferId::FFN_OUTPUT, DeviceId::cpu());
 
     auto state = arena.getCoherenceState(BufferId::FFN_OUTPUT);
@@ -563,6 +708,54 @@ TEST(Test__StageBufferContract, InOutBinding)
 
     EXPECT_EQ(contract.inouts.size(), 1u);
     EXPECT_EQ(contract.inouts[0].access, BufferAccess::READWRITE);
+    EXPECT_TRUE(contract.inouts[0].prepare_write_storage);
+}
+
+TEST(Test__StageBufferContract, PreallocatedInOutSkipsWritePreparationOnly)
+{
+    auto contract = StageBufferContract::build()
+                        .addOutput(BufferId::ATTN_OUTPUT)
+                        .addPreallocatedInOut(BufferId::HIDDEN_STATE, "FP32");
+
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts[0].access, BufferAccess::READWRITE);
+    EXPECT_FALSE(contract.inouts[0].prepare_write_storage);
+
+    auto reads = contract.allArenaReads();
+    EXPECT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads[0].id, BufferId::HIDDEN_STATE);
+
+    auto writes = contract.allWrites();
+    EXPECT_EQ(writes.size(), 2u);
+
+    auto write_preps = contract.writesRequiringPrepare();
+    ASSERT_EQ(write_preps.size(), 1u);
+    EXPECT_EQ(write_preps[0].id, BufferId::ATTN_OUTPUT);
+}
+
+TEST(Test__StageBufferContract, PreallocatedOutputIsWriteOnlyAndSkipsRebinding)
+{
+    auto contract = StageBufferContract::build()
+                        .addInput(BufferId::STOCHASTIC_BATCH_OUTPUT_META)
+                        .addPreallocatedOutput(
+                            BufferId::MTP_CONDITION_TOKEN,
+                            "INT32");
+
+    ASSERT_EQ(contract.outputs.size(), 1u);
+    EXPECT_EQ(contract.outputs[0].id, BufferId::MTP_CONDITION_TOKEN);
+    EXPECT_EQ(contract.outputs[0].access, BufferAccess::WRITE);
+    EXPECT_FALSE(contract.outputs[0].prepare_write_storage);
+
+    const auto reads = contract.allArenaReads();
+    ASSERT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads[0].id, BufferId::STOCHASTIC_BATCH_OUTPUT_META)
+        << "A persistent output mailbox must not become a graph-frontier read";
+
+    const auto writes = contract.allWrites();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].id, BufferId::MTP_CONDITION_TOKEN);
+    EXPECT_TRUE(contract.writesRequiringPrepare().empty())
+        << "Setup-owned mailbox storage must retain its capture-time address";
 }
 
 TEST(Test__StageBufferContract, WorkspaceBinding)
@@ -597,6 +790,45 @@ TEST(Test__StageBufferContract, AllWritesGathersOutputsInouts)
 
     auto writes = contract.allWrites();
     EXPECT_EQ(writes.size(), 2u); // output + inout
+}
+
+TEST(Test__StageBufferContract,
+     GraphDependencyTrackerExcludesProducedEmbeddingFromCaptureInputs)
+{
+    GraphArenaDependencyTracker tracker;
+
+    const auto embedding = StageBufferContract::build()
+                               .addOutput(BufferId::MTP_EMBEDDING);
+    EXPECT_TRUE(tracker.observeStage(embedding).empty());
+
+    const auto embedding_allreduce = StageBufferContract::build()
+                                         .addPreallocatedInOut(
+                                             BufferId::MTP_EMBEDDING);
+    EXPECT_TRUE(tracker.observeStage(embedding_allreduce).empty())
+        << "An in-place collective consumes the embedding produced inside the same graph";
+
+    const auto norm_embedding = StageBufferContract::build()
+                                    .addInput(BufferId::MTP_EMBEDDING)
+                                    .addInput(BufferId::HIDDEN_STATE)
+                                    .addOutput(BufferId::MTP_NORM_EMBEDDING);
+    const auto external_reads = tracker.observeStage(norm_embedding);
+    ASSERT_EQ(external_reads.size(), 1u);
+    EXPECT_EQ(external_reads.front().id, BufferId::HIDDEN_STATE)
+        << "Only the graph-external hidden state requires a pre-capture event join";
+}
+
+TEST(Test__StageBufferContract,
+     GraphDependencyTrackerTreatsUnproducedInOutAsExternal)
+{
+    GraphArenaDependencyTracker tracker;
+    const auto external_allreduce = StageBufferContract::build()
+                                        .addPreallocatedInOut(
+                                            BufferId::MTP_EMBEDDING);
+
+    const auto external_reads = tracker.observeStage(external_allreduce);
+    ASSERT_EQ(external_reads.size(), 1u);
+    EXPECT_EQ(external_reads.front().id, BufferId::MTP_EMBEDDING)
+        << "A capture unit beginning with an in-place consumer must join its prior segment";
 }
 
 // ============================================================================
@@ -741,13 +973,16 @@ TEST(Test__BufferId, NameRoundTrips)
     EXPECT_STREQ(bufferIdName(BufferId::ALLREDUCE_STAGING), "ALLREDUCE_STAGING");
     EXPECT_STREQ(bufferIdName(BufferId::MTP_PROJECTED), "MTP_PROJECTED");
     EXPECT_STREQ(bufferIdName(BufferId::MTP_LOGITS), "MTP_LOGITS");
+    EXPECT_STREQ(
+        bufferIdName(BufferId::MTP_LOGITS_GATHERED),
+        "MTP_LOGITS_GATHERED");
 }
 
 TEST(Test__BufferId, CountIsReasonable)
 {
     auto count = static_cast<size_t>(BufferId::_COUNT);
     EXPECT_GT(count, 10u);
-    EXPECT_LT(count, 100u);
+    EXPECT_LT(count, 128u);
 }
 
 // ============================================================================
@@ -805,7 +1040,7 @@ TEST(Test__BufferArena, EndToEndCPUWorkflow)
 
     // 4. Prepare for stage execution
     EXPECT_TRUE(arena.prepareForRead(BufferId::HIDDEN_STATE, cpu));
-    EXPECT_TRUE(arena.prepareForWrite(BufferId::Q_PROJ, cpu));
+    EXPECT_TRUE(arena.prepareForWrite(BufferId::Q_PROJ, cpu, nullptr));
 
     // 5. Build bound buffers
     arena.acquireReadBorrow(BufferId::HIDDEN_STATE);
@@ -900,7 +1135,7 @@ TEST(Test__ArenaContractCoherence, PrepareForReadWriteFromContract)
     // Simulate executor coherence: prepare writes
     for (const auto &binding : contract.allWrites())
     {
-        EXPECT_TRUE(arena.prepareForWrite(binding.id, cpu));
+        EXPECT_TRUE(arena.prepareForWrite(binding.id, cpu, nullptr));
     }
 
     // (Stage would execute here — we just verify coherence tracking)
@@ -964,6 +1199,53 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesFP32)
     EXPECT_EQ(t1->cols(), 896u);
     EXPECT_EQ(t2->rows(), 4u);
     EXPECT_EQ(t2->cols(), 128u);
+}
+
+TEST(Test__BufferArena, GpuActivationAndPublicationBuffersRemainDeviceLocal)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+
+    ArenaConfig config;
+    config.factory = &factory;
+
+    BufferArena arena(config);
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_ALPHA, 256, 16, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_BETA, 256, 16, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS_LOCAL, 16, 2048, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::ALL_POSITION_LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::ALL_POSITION_LOGITS_LOCAL, 16, 2048, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::PREFIX_TERMINAL_LOGITS, 1, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::STOCHASTIC_PROCESSED_LOGITS, 1, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS, 16, 4096, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::MTP_LOGITS_GATHERED, 16, 8192, "FP32", DeviceId::rocm(0)));
+
+    ASSERT_TRUE(arena.allocate());
+
+    const std::array<BufferId, 10> graph_buffers{
+        BufferId::GDN_ALPHA,
+        BufferId::GDN_BETA,
+        BufferId::LOGITS,
+        BufferId::LOGITS_LOCAL,
+        BufferId::ALL_POSITION_LOGITS,
+        BufferId::ALL_POSITION_LOGITS_LOCAL,
+        BufferId::PREFIX_TERMINAL_LOGITS,
+        BufferId::STOCHASTIC_PROCESSED_LOGITS,
+        BufferId::MTP_LOGITS,
+        BufferId::MTP_LOGITS_GATHERED,
+    };
+    for (const BufferId id : graph_buffers)
+    {
+        auto *tensor = dynamic_cast<TensorBase *>(arena.getTensor(id));
+        ASSERT_NE(tensor, nullptr) << bufferIdName(id);
+        EXPECT_FALSE(tensor->isMapped())
+            << bufferIdName(id)
+            << " is graph activation/publication storage; host-visible mappings "
+               "must be explicit TransferEngine regions";
+        EXPECT_EQ(tensor->home_device(), DeviceId::rocm(0))
+            << bufferIdName(id);
+    }
 }
 
 TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)

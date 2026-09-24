@@ -1,6 +1,19 @@
 /**
  * @file PerfStatsCollector.cpp
- * @brief Unified structured performance counter and timer collection.
+ * @brief Immutable-policy structured performance evidence collection.
+ *
+ * Collection policy and record storage have deliberately separate lifetimes.
+ * A policy reload parses the process environment once and release-publishes an
+ * immutable snapshot. Hot counter/timer sites acquire-load that pointer and
+ * return immediately when collection is disabled. Older snapshots are retained
+ * until process exit, which gives concurrent readers RCU-like safety without a
+ * reference-count increment, lock, environment lookup, or allocation in the
+ * inference path.
+ *
+ * Actual enabled records remain protected by the collector mutex. Callers that
+ * need expensive arguments or tags should still guard their construction with
+ * @ref PerfStatsCollector::isDomainEnabled; the policy cache makes that guard
+ * economical in both enabled and disabled configurations.
  */
 
 #include "PerfStatsCollector.h"
@@ -11,6 +24,7 @@
 #include "fort.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -18,10 +32,14 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <tuple>
+#include <utility>
 
 namespace llaminar2
 {
@@ -51,6 +69,9 @@ namespace llaminar2
             uint64_t total_ns = 0;
             uint64_t min_ns = std::numeric_limits<uint64_t>::max();
             uint64_t max_ns = 0;
+            uint64_t sequence_word_count = 0;
+            uint64_t sequence_digest_lo = 0;
+            uint64_t sequence_digest_hi = 0;
         };
 
         struct PerfStatsState
@@ -67,6 +88,79 @@ namespace llaminar2
         {
             static PerfStatsState instance;
             return instance;
+        }
+
+        /**
+         * @brief One immutable, fully parsed PerfStats collection policy.
+         *
+         * The special CPU/GPU timing booleans retain the existing rule that an
+         * explicit family switch overrides a narrower export filter. All other
+         * domains are selected by @ref filters, or collectively by
+         * @ref collect_all_domains.
+         */
+        struct PerfStatsCollectionPolicy
+        {
+            bool enabled = false;
+            bool collect_all_domains = false;
+            bool cpu_stage_timing = false;
+            bool gpu_stage_timing = false;
+            bool collect_cpu_stage_family = false;
+            bool collect_gpu_stage_family = false;
+            std::vector<std::string> filters;
+
+            /** @return Whether the immutable filter selects @p domain. */
+            [[nodiscard]] bool requestsDomain(
+                std::string_view domain) const noexcept
+            {
+                if (!enabled || domain.empty())
+                    return false;
+                if (collect_all_domains)
+                    return true;
+                if ((domain == "stage_cpu" ||
+                     domain == "stage_cpu_detail") &&
+                    collect_cpu_stage_family)
+                {
+                    return true;
+                }
+                if ((domain == "stage_gpu" ||
+                     domain == "mtp_stage_gpu") &&
+                    collect_gpu_stage_family)
+                {
+                    return true;
+                }
+                return std::any_of(
+                    filters.begin(),
+                    filters.end(),
+                    [domain](const std::string &filter)
+                    {
+                        return filter == "*" || filter == "all" ||
+                               filter == domain ||
+                               (filter.size() > domain.size() &&
+                                filter.starts_with(domain) &&
+                                filter[domain.size()] == '.');
+                    });
+            }
+        };
+
+        /**
+         * @brief RCU-style owner for every published policy generation.
+         *
+         * Reloads are rare setup/test transitions. Retaining old generations
+         * avoids a shared-pointer reference-count operation at every dormant
+         * counter while making a concurrent reload safe for an existing reader.
+         */
+        struct PerfStatsPolicyAuthority
+        {
+            std::mutex publication_mutex;
+            std::vector<std::unique_ptr<const PerfStatsCollectionPolicy>>
+                generations;
+            std::atomic<const PerfStatsCollectionPolicy *> published{nullptr};
+        };
+
+        PerfStatsPolicyAuthority &policyAuthority()
+        {
+            static PerfStatsPolicyAuthority authority;
+            return authority;
         }
 
         std::string trim(std::string value)
@@ -110,9 +204,24 @@ namespace llaminar2
                    normalized == "off" || normalized == "no";
         }
 
+        /**
+         * @brief Return whether the deprecated unified profiling alias is enabled.
+         *
+         * The legacy switch is read directly from the process environment so it
+         * cannot leak back into `DebugEnv::ProfileConfig` or
+         * `DebugEnv::ExecutionConfig`.  This separation is architectural: a
+         * request for measurements must never select eager execution, disable a
+         * captured graph, or otherwise change the engine being measured.
+         */
+        bool legacyUnifiedProfilingRequested()
+        {
+            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PROFILING"));
+        }
+
         bool isSummaryRequested()
         {
-            return !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE")) ||
+            return legacyUnifiedProfilingRequested() ||
+                   !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_TABLE")) ||
                    !isFalseyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_SUMMARY"));
         }
 
@@ -142,6 +251,31 @@ namespace llaminar2
             return value;
         }
 
+        /**
+         * @brief Expand the explicit MPI-rank token in a diagnostic path.
+         *
+         * A rank-qualified path is an opt-in to per-participant evidence. Plain
+         * paths retain the ordinary rank-zero-only behavior, preventing two MPI
+         * processes from racing to replace the same report.
+         */
+        std::string expandRankToken(std::string path, int rank)
+        {
+            constexpr std::string_view token = "{rank}";
+            const std::string replacement = std::to_string(std::max(rank, 0));
+            size_t position = 0;
+            while ((position = path.find(token, position)) != std::string::npos)
+            {
+                path.replace(position, token.size(), replacement);
+                position += replacement.size();
+            }
+            return path;
+        }
+
+        bool hasRankToken(const std::string &path)
+        {
+            return path.find("{rank}") != std::string::npos;
+        }
+
         bool isExportRequested()
         {
             return exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
@@ -149,14 +283,24 @@ namespace llaminar2
                    isSummaryRequested();
         }
 
-        std::vector<std::string> filterListFromEnv()
+        const std::vector<std::string> &filterListFromEnv()
         {
-            std::vector<std::string> filters;
+            thread_local bool initialized = false;
+            thread_local std::string cached_value;
+            thread_local std::vector<std::string> filters;
             const char *env = DebugEnv::envValue("LLAMINAR_PERF_STATS_FILTER");
-            if (!env)
+            const std::string_view current = env ? std::string_view(env)
+                                                 : std::string_view{};
+            if (initialized && current == cached_value)
                 return filters;
 
-            std::stringstream stream(env);
+            initialized = true;
+            cached_value.assign(current);
+            filters.clear();
+            if (cached_value.empty())
+                return filters;
+
+            std::stringstream stream(cached_value);
             std::string item;
             while (std::getline(stream, item, ','))
             {
@@ -172,7 +316,7 @@ namespace llaminar2
             if (!isExportRequested())
                 return false;
 
-            const auto filters = filterListFromEnv();
+            const auto &filters = filterListFromEnv();
             return std::any_of(filters.begin(), filters.end(), [](const std::string &filter)
                                {
                                    return filter == "stage_gpu" ||
@@ -184,25 +328,183 @@ namespace llaminar2
                                });
         }
 
+        /**
+         * @brief Return whether the export filter explicitly requests CPU stages.
+         *
+         * Exporting an unrelated PerfStats family must not inject two
+         * clock-and-map operations around every CPU graph node.  Stage timing
+         * is therefore activated by its own domains rather than by the broad
+         * collector enablement gate.
+         */
+        bool filterRequestsStageCpuTiming()
+        {
+            if (!isExportRequested())
+                return false;
+
+            const auto &filters = filterListFromEnv();
+            return std::any_of(filters.begin(), filters.end(), [](const std::string &filter)
+                               {
+                                   return filter == "stage_cpu" ||
+                                          filter == "stage_cpu.*" ||
+                                          filter.starts_with("stage_cpu.") ||
+                                          filter == "stage_cpu_detail" ||
+                                          filter == "stage_cpu_detail.*" ||
+                                          filter.starts_with("stage_cpu_detail.");
+                               });
+        }
+
+        bool perfStatsCpuStageTimingRequested()
+        {
+            return legacyUnifiedProfilingRequested() ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING")) ||
+                   filterRequestsStageCpuTiming();
+        }
+
         bool perfStatsGpuStageTimingRequested()
         {
-            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
+            return legacyUnifiedProfilingRequested() ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
                    filterRequestsStageGpuTiming();
         }
 
-        bool recordMatchesFilters(const PerfStatRecord &record, const std::vector<std::string> &filters)
+        /** @return Whether either live legacy GPU timing switch is enabled. */
+        bool gpuStageTimingEnvRequested();
+
+        /**
+         * @brief Parse every environment-owned PerfStats decision exactly once.
+         * @return Complete immutable policy ready for release publication.
+         */
+        PerfStatsCollectionPolicy buildCollectionPolicy()
+        {
+            const bool legacy_profile = legacyUnifiedProfilingRequested();
+            const bool cpu_stage_timing =
+                debugEnv().profile.enabled ||
+                perfStatsCpuStageTimingRequested();
+            const bool gpu_stage_timing =
+                debugEnv().gpu_stage_timing ||
+                debugEnv().profile.enabled ||
+                gpuStageTimingEnvRequested() ||
+                perfStatsGpuStageTimingRequested();
+            const bool summary_requested = isSummaryRequested();
+            const bool json_requested =
+                !exportPathFromEnv(
+                     "LLAMINAR_PERF_STATS_JSON",
+                     "/tmp/llaminar_perf_stats.json")
+                     .empty();
+            const bool csv_requested =
+                !exportPathFromEnv(
+                     "LLAMINAR_PERF_STATS_CSV",
+                     "/tmp/llaminar_perf_stats.csv")
+                     .empty();
+
+            PerfStatsCollectionPolicy policy;
+            policy.cpu_stage_timing = cpu_stage_timing;
+            policy.gpu_stage_timing = gpu_stage_timing;
+            /* A filter-derived timing request turns on the relevant clocks but
+             * must retain its exact domain/name selection. Only the explicit
+             * family switches override a narrower filter. */
+            policy.collect_cpu_stage_family =
+                isTruthyEnvValue(DebugEnv::envValue(
+                    "LLAMINAR_PERF_STATS_CPU_STAGE_TIMING"));
+            policy.collect_gpu_stage_family =
+                debugEnv().gpu_stage_timing ||
+                gpuStageTimingEnvRequested() ||
+                isTruthyEnvValue(DebugEnv::envValue(
+                    "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"));
+            policy.filters = filterListFromEnv();
+            policy.enabled = debugEnv().profile.enabled || legacy_profile ||
+                             cpu_stage_timing || gpu_stage_timing ||
+                             summary_requested || json_requested ||
+                             csv_requested;
+            /* Legacy profiling explicitly means every historical family. An
+             * otherwise enabled unfiltered export retains the same contract. */
+            policy.collect_all_domains =
+                debugEnv().profile.enabled || legacy_profile ||
+                (policy.enabled && policy.filters.empty());
+            return policy;
+        }
+
+        /**
+         * @brief Publish one process-lifetime policy generation.
+         * @param force Replace an existing generation when true.
+         * @return The currently published immutable policy.
+         */
+        const PerfStatsCollectionPolicy &publishCollectionPolicy(bool force)
+        {
+            auto &authority = policyAuthority();
+            std::lock_guard<std::mutex> lock(authority.publication_mutex);
+            if (!force)
+            {
+                if (const auto *existing = authority.published.load(
+                        std::memory_order_acquire))
+                {
+                    return *existing;
+                }
+            }
+
+            auto policy = std::make_unique<const PerfStatsCollectionPolicy>(
+                buildCollectionPolicy());
+            const auto *const published = policy.get();
+            authority.generations.push_back(std::move(policy));
+            authority.published.store(published, std::memory_order_release);
+            return *published;
+        }
+
+        /** @return Current policy, lazily initialized before its first use. */
+        const PerfStatsCollectionPolicy &collectionPolicy()
+        {
+            auto &authority = policyAuthority();
+            if (const auto *published = authority.published.load(
+                    std::memory_order_acquire))
+            {
+                return *published;
+            }
+            return publishCollectionPolicy(/*force=*/false);
+        }
+
+        /**
+         * @brief Return whether GPU stage timing is requested by the live process environment.
+         *
+         * Several unit-test binaries link `PerfStatsCollector` from `libllaminar2_core.so`
+         * while their small RAII environment guards call the inline `mutableDebugEnv()`
+         * accessor from the executable image.  Reading the live environment here keeps
+         * this diagnostic gate coherent across shared-library and test-executable
+         * boundaries, and it also mirrors how command-line profiling tools toggle the
+         * feature immediately before launching a process.
+         */
+        bool gpuStageTimingEnvRequested()
+        {
+            return isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_GPU_STAGE_TIMING")) ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_GPU_STAGE_TIMING_DETAIL"));
+        }
+
+        /**
+         * @brief Test a retained map key before copying its strings and tags.
+         *
+         * Snapshot polling often asks for one small control-plane domain while
+         * stage diagnostics retain hundreds of thousands of distinct tagged
+         * records. Filtering the immutable key first keeps those unrelated
+         * records out of the collector's critical section copy cost.
+         */
+        bool keyMatchesFilters(
+            const PerfStatKey &key,
+            const std::vector<std::string> &filters)
         {
             if (filters.empty())
                 return true;
-            const std::string qualified = record.domain + "." + record.name;
             for (const auto &filter : filters)
             {
-                if (filter == "*" || filter == "all")
+                if (filter == "*" || filter == "all" ||
+                    key.domain == filter)
+                {
                     return true;
-                if (record.domain == filter || qualified == filter)
+                }
+                const std::string qualified = key.domain + "." + key.name;
+                if (qualified == filter ||
+                    qualified.starts_with(filter + "."))
+                {
                     return true;
-                if (qualified.starts_with(filter + "."))
-                    return true;
+                }
             }
             return false;
         }
@@ -215,8 +517,60 @@ namespace llaminar2
                 return "counter";
             case PerfStatRecord::Kind::Timer:
                 return "timer";
+            case PerfStatRecord::Kind::OrderedSequence:
+                return "ordered_sequence";
             }
             return "unknown";
+        }
+
+        /** Fold one integer into an architecture-independent FNV-style lane. */
+        void mixSequenceWord(
+            uint64_t &digest,
+            uint64_t word,
+            uint64_t prime) noexcept
+        {
+            // Select bytes explicitly so a big-endian host produces the same
+            // evidence as the little-endian machines used in production.
+            for (unsigned byte = 0; byte < sizeof(word); ++byte)
+            {
+                digest ^= (word >> (byte * 8u)) & 0xffu;
+                digest *= prime;
+            }
+        }
+
+        /** Append one delimited step to both independent digest lanes. */
+        void appendSequenceStep(
+            PerfStatAccumulator &record,
+            std::initializer_list<uint64_t> words) noexcept
+        {
+            constexpr uint64_t kLowOffset = 14695981039346656037ull;
+            constexpr uint64_t kLowPrime = 1099511628211ull;
+            constexpr uint64_t kHighOffset = 7809847782465536322ull;
+            constexpr uint64_t kHighPrime = 14029467366897019727ull;
+            constexpr uint64_t kStepBegin = 0x6c6c616d696e6172ull;
+            constexpr uint64_t kStepEnd = 0x73657175656e6365ull;
+
+            if (record.count == 0u)
+            {
+                record.sequence_digest_lo = kLowOffset;
+                record.sequence_digest_hi = kHighOffset;
+            }
+            mixSequenceWord(
+                record.sequence_digest_lo,
+                kStepBegin ^ static_cast<uint64_t>(words.size()),
+                kLowPrime);
+            mixSequenceWord(
+                record.sequence_digest_hi,
+                ~kStepBegin ^ static_cast<uint64_t>(words.size()),
+                kHighPrime);
+            for (const uint64_t word : words)
+            {
+                mixSequenceWord(record.sequence_digest_lo, word, kLowPrime);
+                mixSequenceWord(record.sequence_digest_hi, ~word, kHighPrime);
+            }
+            mixSequenceWord(record.sequence_digest_lo, kStepEnd, kLowPrime);
+            mixSequenceWord(record.sequence_digest_hi, ~kStepEnd, kHighPrime);
+            record.sequence_word_count += static_cast<uint64_t>(words.size());
         }
 
         std::string jsonEscape(const std::string &value)
@@ -310,26 +664,82 @@ namespace llaminar2
 
     bool PerfStatsCollector::isEnabled()
     {
-        return debugEnv().profile.enabled ||
-               debugEnv().gpu_stage_timing ||
-               perfStatsGpuStageTimingRequested() ||
-               isSummaryRequested() ||
-               exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
-               exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
+        return collectionPolicy().enabled;
+    }
+
+    bool PerfStatsCollector::isDomainEnabled(std::string_view domain)
+    {
+        return collectionPolicy().requestsDomain(domain);
+    }
+
+    bool PerfStatsCollector::cpuStageTimingEnabled()
+    {
+        return collectionPolicy().cpu_stage_timing;
     }
 
     bool PerfStatsCollector::gpuStageEventTimingEnabled()
     {
-        return debugEnv().gpu_stage_timing ||
-               debugEnv().profile.enabled ||
-               perfStatsGpuStageTimingRequested();
+        return collectionPolicy().gpu_stage_timing;
+    }
+
+    void PerfStatsCollector::reloadConfigurationFromEnvironment()
+    {
+        (void)publishCollectionPolicy(/*force=*/true);
     }
 
     void PerfStatsCollector::reset()
     {
+        reloadConfigurationFromEnvironment();
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         s.records.clear();
+        ++s.version;
+        s.json_version = 0;
+        s.csv_version = 0;
+        s.summary_version = 0;
+    }
+
+    void PerfStatsCollector::resetPreservingDomains(
+        const std::vector<std::string> &domains_to_preserve)
+    {
+        resetPreserving(domains_to_preserve, {});
+    }
+
+    void PerfStatsCollector::resetPreserving(
+        const std::vector<std::string> &domains_to_preserve,
+        const std::vector<RecordFamily> &record_families_to_preserve)
+    {
+        if (domains_to_preserve.empty() &&
+            record_families_to_preserve.empty())
+        {
+            reset();
+            return;
+        }
+
+        reloadConfigurationFromEnvironment();
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        for (auto it = s.records.begin(); it != s.records.end();)
+        {
+            const bool preserve_domain =
+                std::find(domains_to_preserve.begin(),
+                          domains_to_preserve.end(),
+                          it->first.domain) != domains_to_preserve.end();
+            const bool preserve_record_family =
+                std::any_of(
+                    record_families_to_preserve.begin(),
+                    record_families_to_preserve.end(),
+                    [&](const RecordFamily &family)
+                    {
+                        return family.domain == it->first.domain &&
+                               family.name == it->first.name;
+                    });
+            const bool preserve = preserve_domain || preserve_record_family;
+            if (preserve)
+                ++it;
+            else
+                it = s.records.erase(it);
+        }
         ++s.version;
         s.json_version = 0;
         s.csv_version = 0;
@@ -344,7 +754,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isEnabled())
+        if (!isDomainEnabled(domain))
             return;
 
         PerfStatKey key;
@@ -372,7 +782,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isEnabled())
+        if (!isDomainEnabled(domain))
             return;
 
         PerfStatKey key;
@@ -394,14 +804,49 @@ namespace llaminar2
         ++s.version;
     }
 
+    void PerfStatsCollector::recordOrderedSequenceStep(
+        std::string domain,
+        std::string name,
+        std::initializer_list<uint64_t> words,
+        std::string phase,
+        std::string device,
+        Tags tags)
+    {
+        if (!isDomainEnabled(domain))
+            return;
+        if (words.size() == 0u)
+        {
+            throw std::invalid_argument(
+                "PerfStats ordered sequence steps require at least one word");
+        }
+
+        PerfStatKey key;
+        key.kind = PerfStatRecord::Kind::OrderedSequence;
+        key.domain = std::move(domain);
+        key.name = std::move(name);
+        key.phase = std::move(phase);
+        key.device = std::move(device);
+        key.tags = std::move(tags);
+
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        auto &record = s.records[key];
+        record.kind = PerfStatRecord::Kind::OrderedSequence;
+        appendSequenceStep(record, words);
+        ++record.count;
+        record.value += 1.0;
+        ++s.version;
+    }
+
     std::vector<PerfStatRecord> PerfStatsCollector::snapshot(
         const std::vector<std::string> &filters)
     {
         std::vector<PerfStatRecord> result;
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        result.reserve(s.records.size());
-        for (const auto &[key, acc] : s.records)
+        const auto append_record = [&result](
+                                       const PerfStatKey &key,
+                                       const PerfStatAccumulator &acc)
         {
             PerfStatRecord record;
             record.kind = key.kind;
@@ -415,8 +860,49 @@ namespace llaminar2
             record.total_ns = acc.total_ns;
             record.min_ns = acc.min_ns == std::numeric_limits<uint64_t>::max() ? 0 : acc.min_ns;
             record.max_ns = acc.max_ns;
-            if (recordMatchesFilters(record, filters))
-                result.push_back(std::move(record));
+            record.sequence_word_count = acc.sequence_word_count;
+            record.sequence_digest_lo = acc.sequence_digest_lo;
+            record.sequence_digest_hi = acc.sequence_digest_hi;
+            result.push_back(std::move(record));
+        };
+
+        /*
+         * PerfStatKey is ordered by kind and then domain. A single unqualified
+         * filter therefore has one exact contiguous range per record kind.
+         * This is the latency-sensitive path used by background-protocol
+         * polling and avoids scanning or copying unrelated stage evidence.
+         */
+        if (filters.size() == 1u && filters.front() != "*" &&
+            filters.front() != "all" &&
+            filters.front().find('.') == std::string::npos)
+        {
+            const std::string &domain = filters.front();
+            for (const auto kind : {
+                     PerfStatRecord::Kind::Counter,
+                     PerfStatRecord::Kind::Timer,
+                     PerfStatRecord::Kind::OrderedSequence})
+            {
+                PerfStatKey lower;
+                lower.kind = kind;
+                lower.domain = domain;
+                auto record = s.records.lower_bound(lower);
+                while (record != s.records.end() &&
+                       record->first.kind == kind &&
+                       record->first.domain == domain)
+                {
+                    append_record(record->first, record->second);
+                    ++record;
+                }
+            }
+            return result;
+        }
+
+        result.reserve(s.records.size());
+        for (const auto &[key, acc] : s.records)
+        {
+            if (!keyMatchesFilters(key, filters))
+                continue;
+            append_record(key, acc);
         }
         return result;
     }
@@ -460,7 +946,13 @@ namespace llaminar2
             out << "      \"total_ms\": " << std::setprecision(17) << total_ms << ",\n";
             out << "      \"avg_us\": " << std::setprecision(17) << avg_us << ",\n";
             out << "      \"min_us\": " << std::setprecision(17) << min_us << ",\n";
-            out << "      \"max_us\": " << std::setprecision(17) << max_us << "\n";
+            out << "      \"max_us\": " << std::setprecision(17) << max_us << ",\n";
+            out << "      \"sequence_word_count\": "
+                << record.sequence_word_count << ",\n";
+            out << "      \"sequence_digest_lo\": "
+                << record.sequence_digest_lo << ",\n";
+            out << "      \"sequence_digest_hi\": "
+                << record.sequence_digest_hi << "\n";
             out << "    }" << (i + 1 == records.size() ? "\n" : ",\n");
         }
         out << "  ]\n";
@@ -472,7 +964,7 @@ namespace llaminar2
     {
         const auto records = snapshot(filters);
         std::ostringstream out;
-        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us\n";
+        out << "kind,domain,name,phase,device,tags,count,value,total_ns,total_ms,avg_us,min_us,max_us,sequence_word_count,sequence_digest_lo,sequence_digest_hi\n";
         for (const auto &record : records)
         {
             const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
@@ -494,7 +986,10 @@ namespace llaminar2
                 << std::setprecision(17) << total_ms << ','
                 << std::setprecision(17) << avg_us << ','
                 << std::setprecision(17) << min_us << ','
-                << std::setprecision(17) << max_us << '\n';
+                << std::setprecision(17) << max_us << ','
+                << record.sequence_word_count << ','
+                << record.sequence_digest_lo << ','
+                << record.sequence_digest_hi << '\n';
         }
         return out.str();
     }
@@ -597,7 +1092,7 @@ namespace llaminar2
                       << tagsToDisplay(record.tags)
                       << fort::endr;
             }
-            else
+            else if (record.kind == PerfStatRecord::Kind::Counter)
             {
                 const double avg = record.count > 0
                                        ? record.value / static_cast<double>(record.count)
@@ -609,6 +1104,21 @@ namespace llaminar2
                       << std::to_string(record.count)
                       << fmt_value(record.value)
                       << fmt_value(avg)
+                      << tagsToDisplay(record.tags)
+                      << fort::endr;
+            }
+            else
+            {
+                std::ostringstream digest;
+                digest << std::hex << record.sequence_digest_hi << ':'
+                       << record.sequence_digest_lo;
+                table << "sequence"
+                      << metric
+                      << record.phase
+                      << record.device
+                      << std::to_string(record.count)
+                      << digest.str()
+                      << std::to_string(record.sequence_word_count) + " words"
                       << tagsToDisplay(record.tags)
                       << fort::endr;
             }
@@ -652,17 +1162,50 @@ namespace llaminar2
 
     bool PerfStatsCollector::flushFromEnv()
     {
-        if (Logger::getInstance().getRank() > 0)
-            return true;
+        const int rank = Logger::getInstance().getRank();
 
-        const std::string json_path =
+        if (legacyUnifiedProfilingRequested())
+        {
+            static std::once_flag warning_once;
+            std::call_once(
+                warning_once,
+                []
+                {
+                    LOG_WARN(
+                        "[PerfStatsCollector] LLAMINAR_PROFILING is deprecated "
+                        "and now aliases graph-safe PerfStats collection. Use "
+                        "LLAMINAR_PERF_STATS_SUMMARY=1 and "
+                        "LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1, optionally "
+                        "with LLAMINAR_PERF_STATS_JSON/CSV. The deprecated "
+                        "switch no longer changes graph capture or executor "
+                        "topology.");
+                });
+        }
+
+        std::string json_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json");
-        const std::string csv_path =
+        std::string csv_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv");
-        if (json_path.empty() && csv_path.empty())
+        const bool json_is_rank_qualified = hasRankToken(json_path);
+        const bool csv_is_rank_qualified = hasRankToken(csv_path);
+        if (rank > 0)
+        {
+            if (!json_is_rank_qualified)
+                json_path.clear();
+            if (!csv_is_rank_qualified)
+                csv_path.clear();
+        }
+        json_path = expandRankToken(std::move(json_path), rank);
+        csv_path = expandRankToken(std::move(csv_path), rank);
+
+        // Human-readable summaries remain a single rank-zero stream. Use a
+        // rank-qualified JSON or CSV path when participant-local evidence is
+        // required for TP/PP imbalance analysis.
+        const bool summary_requested = rank <= 0 && isSummaryRequested();
+        if (json_path.empty() && csv_path.empty() && !summary_requested)
             return true;
 
-        const auto filters = filterListFromEnv();
+        const auto &filters = filterListFromEnv();
         auto &s = state();
         size_t version = 0;
         size_t json_version = 0;
@@ -699,7 +1242,7 @@ namespace llaminar2
                 s.csv_version = s.version;
             }
         }
-        if (isSummaryRequested() && summary_version != version)
+        if (summary_requested && summary_version != version)
         {
             printSummary(filters, summaryLimitFromEnv());
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -714,13 +1257,13 @@ namespace llaminar2
         std::string phase,
         std::string device,
         Tags tags)
-        : enabled_(PerfStatsCollector::isEnabled()),
-          domain_(std::move(domain)),
+        : domain_(std::move(domain)),
           name_(std::move(name)),
           phase_(std::move(phase)),
           device_(std::move(device)),
           tags_(std::move(tags))
     {
+        enabled_ = PerfStatsCollector::isDomainEnabled(domain_);
         if (device_.empty() && ProfilingContext::hasDeviceContext())
             device_ = ProfilingContext::getCurrentDeviceKey();
         if (enabled_)

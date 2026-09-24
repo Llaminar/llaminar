@@ -6,11 +6,12 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
-#include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "../../utils/PreparedWeightTestHarness.h"
 
 #include <cstring>
+#include "../../utils/CPUProjectionTestWorkspace.h"
 #include <memory>
 #include <random>
 
@@ -221,10 +222,12 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedGemmProducesCorrectOutput)
     auto output_sliced2 = createFP32(M, N / 2, 0.0f);
 
     auto *full_kernel = fixture.store->gemmKernel(fixture.ref);
+    CPUProjectionTestWorkspace workspace(M, K);
     ASSERT_NE(full_kernel, nullptr);
     ASSERT_TRUE(full_kernel->multiply_tensor(
         input.get(), output_full.get(),
-        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     auto *sliced1 = fixture.store->slicedGemmKernel(fixture.ref, 0, N / 2);
     auto *sliced2 = fixture.store->slicedGemmKernel(fixture.ref, N / 2, N);
@@ -233,10 +236,12 @@ TEST_F(PreparedWeightStoreSlicedTest, SlicedGemmProducesCorrectOutput)
 
     ASSERT_TRUE(sliced1->multiply_tensor(
         input.get(), output_sliced1.get(),
-        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K)));
+        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K),
+        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
     ASSERT_TRUE(sliced2->multiply_tensor(
         input.get(), output_sliced2.get(),
-        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K)));
+        static_cast<int>(M), static_cast<int>(N / 2), static_cast<int>(K),
+        true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));
 
     const float *full_data = output_full->data();
     const float *slice1_data = output_sliced1->data();

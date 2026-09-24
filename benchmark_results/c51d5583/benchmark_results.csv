@@ -1,0 +1,5 @@
+commit,timestamp,model_name,model_path,device,prefill_tok_s,decode_tok_s,baseline_prefill_tok_s,baseline_decode_tok_s
+c51d5583,2026-04-22T10:29:04Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cpu,325.29,19.40,337.99,19.63
+c51d5583,2026-04-22T10:29:04Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cuda:0,4831.53,94.69,4879.29,95.16
+c51d5583,2026-04-22T10:29:04Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",rocm:0,1204.24,78.72,1214.71,78.41
+c51d5583,2026-04-22T10:29:04Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",cpu,436.83,25.73,440.03,27.70

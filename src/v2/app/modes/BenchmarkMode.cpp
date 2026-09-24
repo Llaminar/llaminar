@@ -1,23 +1,27 @@
 /**
  * @file BenchmarkMode.cpp
- * @brief Benchmark mode (--benchmark)
+ * @brief Release benchmark entry point sharing production readiness and policy.
+ *
+ * Request termination belongs to this mode; process finalization belongs to
+ * the caller's MPIProcessSession. Returning first retires mode-local adapters
+ * and handlers before the runner, contexts and outer session are destroyed.
+ *
+ * The orchestration runner owns model preparation and topology-resolved runtime
+ * defaults. This mode drives the requested workload and exports that resolved
+ * configuration without adding benchmark-only calibration or device policy.
  */
 
 #include "app/modes/BenchmarkMode.h"
-#include "app/modes/BenchmarkPrefillBucketPolicy.h"
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/moe/MoEExpertOverlayProfiler.h"
-#include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IMPIContext.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/BenchmarkRunner.h"
-#include "app/MPIShutdown.h"
 
-#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -41,123 +45,48 @@ namespace llaminar2
             return oss.str();
         }
 
-        /// @brief Detect whether this benchmark run executes a multi-device
-        ///        (tensor- or pipeline-parallel) configuration whose per-device
-        ///        graphs contain collective stages.
-        ///
-        /// Padded bucketed prefill is intentionally unsupported when collective
-        /// nodes are present (Phase 6 fail-loud guard in ForwardExecutionEngine):
-        /// padding the sequence to a bucket length would desynchronize collective
-        /// sizes across participants. For these runs we must execute the exact
-        /// prefill length instead of a padded bucket.
-        ///
-        /// @param config  Parsed orchestration configuration for this run.
-        /// @param mpi_ctx MPI context (used to detect global/multi-rank TP).
-        /// @return true if the run uses TP/PP collectives and must not bucket prefill.
-        bool benchmarkUsesCollectives(const OrchestrationConfig &config,
-                                      const std::shared_ptr<IMPIContext> &mpi_ctx)
-        {
-            // Simple tensor parallelism (degree or explicit device list).
-            if (config.tp_degree > 1 || config.tp_devices.size() > 1)
-                return true;
-            // Hybrid local/global TP degrees.
-            if (config.tp_local_degree > 1 || config.tp_global_degree > 1)
-                return true;
-            // Pipeline parallelism (simple degree or named domains / pp-stages).
-            if (config.pp_degree > 1 || config.usesNamedDomains())
-                return true;
-            // Global TP/PP distributed across multiple MPI ranks.
-            if (mpi_ctx && mpi_ctx->world_size() > 1)
-                return true;
-            return false;
-        }
-
-        bool benchmarkHasDynamicMoERebalance(IOrchestrationRunner *runner)
-        {
-            auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner);
-            if (orch_runner == nullptr)
-                return false;
-            auto *controller = orch_runner->moeRebalanceController();
-            return controller != nullptr && controller->mode() == MoERebalanceMode::DYNAMIC;
-        }
-
-        /// @brief Opt benchmark mode into production bucketed prefill defaults.
-        void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
-                                              const OrchestrationConfig &config,
-                                              IOrchestrationRunner *runner)
+        /**
+         * @brief Report the already-published production prefill policy.
+         *
+         * Benchmarking must not change graph or bucket settings according to
+         * topology. The same 512-token request works through the serving
+         * runner's captured chunk scheduler even when a PP graph has a
+         * 256-row activation arena. Disabling buckets here used to bypass that
+         * scheduler and send the whole prompt to one undersized graph.
+         */
+        void logBenchmarkPrefillPolicy()
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
             const bool user_selected_bucket_sizes = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
             const bool user_selected_gpu_graphs = env.presence.has("LLAMINAR_GPU_GRAPHS");
-
-            // Multi-device TP/PP runs cannot use padded bucketed prefill (collective
-            // stages would desynchronize). Only auto-enable bucketing for
-            // single-device runs; an explicit user opt-in is still honored (and will
-            // hit the fail-loud guard if it is incompatible with collectives).
-            const bool uses_collectives = benchmarkUsesCollectives(config, mpi_ctx);
-
-            // MoE dynamic rebalancing rejects padded bucketed prefill graphs during
-            // preflight (PrefillGraphRejectReason::ActiveMoERebalancing): a captured
-            // padded-bucket graph would embed expert-placement pointers that a
-            // rebalance could invalidate. Auto-enabling padded buckets in that case
-            // makes warmup prefill fail hard, so leave bucketing disabled and run the
-            // exact prefill length (the fixed benchmark prompt is still graph-captured
-            // at its exact shape, so no replay benefit is lost).
-            const bool moe_rebalancing_active = benchmarkHasDynamicMoERebalance(runner);
-            const BenchmarkPrefillBucketDisableReason disable_reason =
-                benchmarkPrefillBucketDisableReason(uses_collectives, moe_rebalancing_active);
-
-            if (!user_selected_bucket_mode)
-            {
-                if (disable_reason != BenchmarkPrefillBucketDisableReason::None)
-                {
-                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0", 1);
-                    if (mpi_ctx && mpi_ctx->rank() == 0)
-                    {
-                        const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);
-                        LOG_INFO("[Benchmark] " << reason
-                                                << " — leaving prefill graph bucketing disabled "
-                                                   "(running exact prefill length)");
-                    }
-                }
-                else
-                {
-                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
-                }
-            }
-            else if (!env.execution.prefill_graph_buckets && !user_selected_gpu_graphs)
-            {
-                setenv("LLAMINAR_GPU_GRAPHS", "0", 1);
-            }
-
-            // Leave LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES unset unless the user
-            // explicitly supplied it. DebugEnv then reloads the production
-            // geometric bucket ladder instead of a benchmark-prompt-sized list.
-            auto &mutable_env = mutableDebugEnv();
-            mutable_env.presence.reload();
-            mutable_env.execution.reload();
-
-            if (mpi_ctx && mpi_ctx->rank() == 0)
-            {
-                const auto &exec = debugEnv().execution;
-                LOG_INFO("[Benchmark] Prefill graph buckets "
-                         << (exec.prefill_graph_buckets ? "enabled" : "disabled")
-                         << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
-                         << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
-                         << "; mode=" << (user_selected_bucket_mode ? "env override" : "benchmark default")
-                         << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
-                         << (user_selected_gpu_graphs ? " (env override)" : ""));
-            }
+            const auto &exec = env.execution;
+            LOG_INFO("[Benchmark] Prefill graph buckets "
+                     << (exec.prefill_graph_buckets ? "enabled" : "disabled")
+                     << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
+                     << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
+                     << "; mode=" << (user_selected_bucket_mode ? "env override" : "production default")
+                     << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
+                     << (user_selected_gpu_graphs ? " (env override)" : ""));
         }
 
-        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        /**
+         * @brief Terminate the request channel while retaining outer MPI ownership.
+         * @param ctx Active caller-owned application resources.
+         * @param detail Failure shared with followers before runner retirement.
+         * @return Nonzero command exit; the caller's scope finalizes MPI later.
+         */
+        int shutdownAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
-            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
-            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_authority =
+                ctx.runner &&
+                ctx.coordinatedRequestRole() ==
+                    CoordinatedRequestRole::Authority;
+            const bool notify_workers =
+                has_mpi && ctx.mpi_ctx->world_size() > 1 && is_authority;
 
-            if (is_root)
+            if (is_authority)
                 LOG_ERROR("Benchmark mode failed with unhandled exception: " << detail);
 
             if (ctx.runner)
@@ -168,7 +97,6 @@ namespace llaminar2
             }
 
             MoEExpertOverlayProfiler::flush();
-            mpiShutdown();
             return 1;
         }
 
@@ -186,55 +114,70 @@ namespace llaminar2
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
 
-        auto shutdownAndFinalize = [&](bool success, const std::string &failure_reason = {}) -> int
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        const CoordinatedRequestRole request_role =
+            ctx.coordinatedRequestRole();
+        const bool is_authority =
+            request_role == CoordinatedRequestRole::Authority;
+        if (mpi_coordinated && !is_authority)
+        {
+            /*
+             * BenchmarkRunner is the request controller, not a rank-local
+             * graph driver.  Exactly one controller must issue clear/prefill/
+             * decode commands; every other rank remains in the production
+             * command loop and participates when the continuation authority
+             * admits a command.
+             * Running one BenchmarkRunner per rank creates two competing MPI
+             * collective schedules (for example CLEAR_CACHE versus PREFILL).
+             */
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                              << " entering MPI worker loop for benchmark inference");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
+            runner->shutdown();
+            MoEExpertOverlayProfiler::flush();
+            return 0;
+        }
+
+        if (mpi_coordinated)
+            runner->setMPICoordinatedMode(true);
+
+        auto shutdownAndReturn = [&](bool success, const std::string &failure_reason = {}) -> int
         {
             MoEExpertOverlayProfiler::flush();
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
             runner->shutdown();
-            mpiShutdown();
             return success ? 0 : 1;
         };
 
-        if (mpi_ctx->rank() == 0)
-        {
-            LOG_DEBUG("Running benchmark mode...");
-        }
+        LOG_DEBUG("Running benchmark mode on coordinated authority rank "
+                  << runner->coordinatedRootRank() << "...");
 
-        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config, runner.get());
+        logBenchmarkPrefillPolicy();
+
+        /*
+         * Benchmarking and serving share this exact application-startup
+         * boundary. The orchestration layer owns any production-shaped setup;
+         * BenchmarkRunner receives an already-ready model and times only the
+         * caller-requested workload.
+         */
+        if (!runner->prepareForInference())
+        {
+            LOG_ERROR(
+                "Inference runtime did not become ready for benchmarking: "
+                << runner->lastError());
+            return shutdownAndReturn(
+                false, "inference runtime preparation failed");
+        }
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 
-        BenchmarkRunner benchmark(adapter, tokenizer, mpi_ctx);
-
-        // Set up MoE expert rebalancing (incremental, during decode)
-        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
-        {
-            if (auto *controller = orch_runner->moeRebalanceController())
-            {
-                if (controller->mode() == MoERebalanceMode::DYNAMIC)
-                {
-                    // Strategy: Do one swap-based rebalance after warmup using
-                    // the 128-token histogram, then run benchmark with zero
-                    // ongoing overhead. Per-step callback only tracks histogram
-                    // (no rebalancing) for profiling summary.
-                    benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]()
-                                                    {
-                        orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true);
-                        if (mpi_ctx->rank() == 0)
-                        {
-                    LOG_DEBUG("[MoE] Post-warmup setup complete"
-                              << (controller->hasReplicas()
-                                  ? " (with per-token replica dispatch)"
-                                  : " (local rebalance only)"));
-                        } });
-                    // No per-step rebalancing — the post-warmup placement
-                    // is used for all benchmark iterations.
-                }
-            }
-        }
+        BenchmarkRunner benchmark(adapter, tokenizer);
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
-        if (mpi_ctx->rank() == 0 && !ctx.config.benchmark_json_output_path.empty())
+        if (!ctx.config.benchmark_json_output_path.empty())
         {
             std::ofstream json_out(ctx.config.benchmark_json_output_path);
             if (!json_out)
@@ -242,46 +185,33 @@ namespace llaminar2
                 LOG_ERROR("Failed to open benchmark JSON output path: "
                           << ctx.config.benchmark_json_output_path);
                 MoEExpertOverlayProfiler::flush();
-                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+                return shutdownAndReturn(false, "failed to write benchmark JSON");
             }
-            json_out << benchmarkResultToJsonString(result, &ctx.config) << '\n';
+            // The runner exposes the topology-resolved startup configuration;
+            // raw CLI intent cannot attest which hardware defaults ran.
+            json_out << benchmarkResultToJsonString(result, &runner->config()) << '\n';
             if (!json_out)
             {
                 LOG_ERROR("Failed to write benchmark JSON output path: "
                           << ctx.config.benchmark_json_output_path);
                 MoEExpertOverlayProfiler::flush();
-                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+                return shutdownAndReturn(false, "failed to write benchmark JSON");
             }
             LOG_INFO("Benchmark JSON written to " << ctx.config.benchmark_json_output_path);
         }
         MoEExpertOverlayProfiler::flush();
 
-        // Log MoE histogram if controller is active
-        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
-        {
-            if (auto *controller = orch_runner->moeRebalanceController())
-            {
-                controller->logHistogramSummary();
-
-                // Print MoE profiling summary when LLAMINAR_PROFILING=1
-                if (KernelProfiler::isEnabled())
-                {
-                    std::print("{}", controller->getProfilingSummary());
-                }
-            }
-        }
-
-        return shutdownAndFinalize(
+        return shutdownAndReturn(
             result.success,
             result.success ? std::string{} : "benchmark runner reported failure");
     }
     catch (const std::exception &e)
     {
-        return finalizeAfterUnhandledException(ctx, e.what());
+        return shutdownAfterUnhandledException(ctx, e.what());
     }
     catch (...)
     {
-        return finalizeAfterUnhandledException(ctx, "unknown exception");
+        return shutdownAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

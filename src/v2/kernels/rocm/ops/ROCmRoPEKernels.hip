@@ -1029,8 +1029,50 @@ __global__ void rocm_rope_fp16_fused_qk_kernel(
 // Extern "C" Wrapper Functions (v2 - with inv_freq parameter)
 // =========================================================================
 
+/**
+ * @brief Publish one contiguous-position offset into graph-stable device state.
+ *
+ * HIP copies kernel arguments when the launch is enqueued. Passing the offset
+ * by value therefore prevents a later request from mutating an earlier
+ * publication that is still queued behind work on the same stream.
+ */
+__global__ void rocm_rope_publish_device_params_kernel(
+    llaminar2::rope::RoPEDeviceParams *__restrict__ device_params,
+    int pos_offset)
+{
+    device_params->pos_offset = pos_offset;
+}
+
 extern "C"
 {
+
+    /**
+     * @brief Enqueue a device-owned RoPE position publication.
+     *
+     * No host staging buffer participates in this path. The one-thread kernel
+     * is ordered by @p stream and carries the position as an immutable launch
+     * argument, so graph launches may be pipelined without host synchronization.
+     */
+    bool hipOps_rope_publish_device_params(
+        llaminar2::rope::RoPEDeviceParams *device_params,
+        int pos_offset,
+        int device_idx,
+        void *stream)
+    {
+        if (!device_params || !stream)
+            return false;
+
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
+        hipLaunchKernelGGL(
+            rocm_rope_publish_device_params_kernel,
+            dim3(1),
+            dim3(1),
+            0,
+            static_cast<hipStream_t>(stream),
+            device_params,
+            pos_offset);
+        return hipGetLastError() == hipSuccess;
+    }
 
     /**
      * @brief Optimized FP32 RoPE using precomputed inverse frequencies

@@ -1,3 +1,14 @@
+/**
+ * @file MTPSpecStatePublisher.h
+ * @brief Verifier-state publication helpers for MTP speculative decode.
+ *
+ * These helpers move accepted verifier-row state directly into each live state
+ * owner after a speculative verifier pass. Host-plan overloads exist for CPU
+ * and transaction tests. GPU resident publication uses device-indexed request
+ * shapes so accepted rows remain device-owned through the exact stage restore
+ * hook; there is no secondary derived-state publication lifecycle.
+ */
+
 #pragma once
 
 #include "MTPSpecStateContract.h"
@@ -20,6 +31,33 @@ namespace llaminar2
         int accepted_count = 0;
         int restored_stage_count = 0;
         int skipped_stage_count = 0;
+    };
+
+    /**
+     * @brief Host-known shape for device-indexed verifier-state publication.
+     *
+     * The compact GPU reducer owns the accepted-count and accepted-row values.
+     * Publication still needs structural bounds that are known before graph
+     * replay: how many request lanes are present and how many verifier rows were
+     * padded into each lane.  Keeping this separate from MTPSpecStepPlan avoids
+     * smuggling host accepted counts, cache positions, or row-replay plans into
+     * the GPU resident publication path.
+     */
+    struct MTPDeviceVerifierStatePublicationShape
+    {
+        int request_count = 1;
+        int target_rows = 0;
+        int request_id = 0;
+
+        bool validScalar() const
+        {
+            return request_count == 1 && target_rows > 0;
+        }
+
+        bool validBatch() const
+        {
+            return request_count > 0 && target_rows > 0;
+        }
     };
 
     MTPSpecStatePublicationResult publishAcceptedMTPSpecState(
@@ -47,6 +85,22 @@ namespace llaminar2
         bool require_captured_stage = false);
 
     /**
+     * @brief Publish a CPU request batch from host-selected verifier rows.
+     *
+     * Capturing stages receive the complete row vector exactly once and copy
+     * each accepted row into request-owned live state.  This replaces the
+     * obsolete scalar loop that repeatedly overwrote one stage state and
+     * cleared capture bindings after the first request.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRows(
+        const MTPSpecStepPlanBatch &plans,
+        const int *host_verifier_restore_rows,
+        const std::vector<IComputeStage *> &state_stages,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
      * @brief Publish verifier state from a row index stored in device memory.
      *
      * Phase 10 device-resident stochastic publication derives the accepted
@@ -56,6 +110,21 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
         const MTPSpecStepPlan &plan,
+        const int *device_verifier_restore_row,
+        const std::vector<IComputeStage *> &state_stages,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
+     * @brief Publish a scalar request from a device-owned verifier row index.
+     *
+     * This is the preferred GPU resident entry point.  The function forwards the
+     * row-index pointer directly to verifier-capturing stages; it never reads an
+     * accepted count or restore row from a host MTPSpecStepPlan.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+        const MTPDeviceVerifierStatePublicationShape &shape,
         const int *device_verifier_restore_row,
         const std::vector<IComputeStage *> &state_stages,
         DeviceId device,
@@ -73,6 +142,23 @@ namespace llaminar2
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPSpecStepPlanBatch &plans,
+        const int *device_verifier_restore_rows,
+        int row_index_stride,
+        const std::vector<IComputeStage *> &state_stages,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
+     * @brief Publish a request batch from device-owned verifier row indices.
+     *
+     * Request-aware stages receive the device row-index buffer once with the
+     * request count and stride.  Rejected rows are represented by negative
+     * device row indices produced by the reducer; the host does not decide which
+     * lanes restore.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+        const MTPDeviceVerifierStatePublicationShape &shape,
         const int *device_verifier_restore_rows,
         int row_index_stride,
         const std::vector<IComputeStage *> &state_stages,
@@ -99,6 +185,17 @@ namespace llaminar2
         bool require_captured_stage = false);
 
     /**
+     * @brief Graph-order CPU batch variant of host verifier-row publication.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromVerifierRows(
+        const MTPSpecStepPlanBatch &plans,
+        const int *host_verifier_restore_rows,
+        ComputeGraph &graph,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
      * @brief Graph-order variant of publishAcceptedMTPSpecStateFromDeviceVerifierRow().
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
@@ -110,10 +207,33 @@ namespace llaminar2
         bool require_captured_stage = false);
 
     /**
+     * @brief Graph-order variant of the scalar device-shape publisher.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRow(
+        const MTPDeviceVerifierStatePublicationShape &shape,
+        const int *device_verifier_restore_row,
+        ComputeGraph &graph,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
      * @brief Graph-order variant of publishAcceptedMTPSpecStateFromDeviceVerifierRows().
      */
     MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
         const MTPSpecStepPlanBatch &plans,
+        const int *device_verifier_restore_rows,
+        int row_index_stride,
+        ComputeGraph &graph,
+        DeviceId device,
+        void *stream,
+        bool require_captured_stage = false);
+
+    /**
+     * @brief Graph-order variant of the batched device-shape publisher.
+     */
+    MTPSpecStatePublicationResult publishAcceptedMTPSpecStateFromDeviceVerifierRows(
+        const MTPDeviceVerifierStatePublicationShape &shape,
         const int *device_verifier_restore_rows,
         int row_index_stride,
         ComputeGraph &graph,

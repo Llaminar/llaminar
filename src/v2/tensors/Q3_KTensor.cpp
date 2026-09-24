@@ -1,6 +1,11 @@
 /**
  * @file Q3_KTensor.cpp
  * @brief Q3_K quantized tensor implementation (3-bit K-quant, 256-element super-blocks)
+ *
+ * Native bytes remain in source order. Matrix views normalize ordinary [N,K]
+ * and routed [K,N,experts] parents without copying or repacking; the parent
+ * owns payload lifetime while each view carries a checked row-aligned offset.
+ * This lets expert preparation use the same tensor interface as dense GEMM.
  * @author David Sanftenberg
  */
 
@@ -10,6 +15,7 @@
 #include "SIMDHelpers.h"
 #include <cstring>
 #include <stdexcept>
+#include <limits>
 #include "../utils/Logger.h"
 
 #if defined(__AVX2__) || defined(__AVX512F__)
@@ -22,10 +28,19 @@
 namespace llaminar2
 {
 
-    Q3_KTensor::Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
+    Q3_KTensor::Q3_KTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : Q3_KTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    Q3_KTensor::Q3_KTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
         : shape_(shape),
           is_view_(false),
-          raw_data_(raw_data),
+          raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
@@ -98,30 +113,50 @@ namespace llaminar2
         }
     }
 
+    /**
+     * @brief Borrow a row-aligned 2-D matrix from a dense or routed expert parent.
+     * @param new_shape Positive [N,K] with the parent's native inner dimension.
+     * @param offset Logical element offset relative to this parent/view.
+     * @return A source-native view retaining the root allocation owner.
+     * @throws std::invalid_argument for rank, inner-dimension or alignment errors.
+     * @throws std::out_of_range for an interval outside the parent.
+     * @throws std::overflow_error for an unrepresentable 3-D row extent.
+     */
     std::shared_ptr<TensorBase> Q3_KTensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        if (shape_.size() != 2 || new_shape.size() != 2)
+        if ((shape_.size() != 2 && shape_.size() != 3) || new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q3_KTensor::create_view: only 2D views supported");
+            throw std::invalid_argument("Q3_KTensor::create_view: 2D view requires a 2D or 3D parent");
         }
-        if (new_shape[1] != shape_[1])
+        // GGUF preserves expert parents as [K,N,experts], whereas an ordinary
+        // matrix is already [N,K]. Flatten only the two outer expert axes.
+        const size_t cols = shape_[shape_.size() == 3 ? 0 : 1];
+        size_t total_rows = shape_[shape_.size() == 3 ? 1 : 0];
+        if (shape_.size() == 3)
+        {
+            if (shape_[2] && total_rows > std::numeric_limits<size_t>::max() / shape_[2])
+                throw std::overflow_error("Q3_KTensor::create_view: expert row extent overflow");
+            total_rows *= shape_[2];
+        }
+        if (cols == 0 || new_shape[0] == 0 || new_shape[1] != cols)
         {
             throw std::invalid_argument("Q3_KTensor::create_view: K dimension must match parent");
         }
-        if (offset % shape_[1] != 0)
+        if (offset % cols != 0)
         {
             throw std::invalid_argument("Q3_KTensor::create_view: offset must be row-aligned");
         }
-        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        const size_t first_row = offset / cols;
+        // Subtraction after checking the start prevents wrapped addition from
+        // admitting an out-of-bounds view of otherwise valid source storage.
+        if (first_row > total_rows || new_shape[0] > total_rows - first_row)
         {
             throw std::out_of_range("Q3_KTensor::create_view: view exceeds parent bounds");
         }
 
-        const size_t cols = shape_[1];
-        const size_t blocks_per_row = (cols + Q3_KBlock::BLOCK_SIZE - 1) / Q3_KBlock::BLOCK_SIZE;
-        const size_t first_row = offset / cols;
+        const size_t blocks_per_row = cols / Q3_KBlock::BLOCK_SIZE + (cols % Q3_KBlock::BLOCK_SIZE != 0);
         const size_t block_offset = first_row * blocks_per_row;
         const size_t byte_offset = block_offset * sizeof(Q3_KBlock);
 
@@ -417,10 +452,11 @@ namespace llaminar2
 
     Q3_KTensor::~Q3_KTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 
@@ -795,13 +831,13 @@ namespace llaminar2
         std::memcpy(buffer, temp_fp32.data() + offset, count * sizeof(float));
     }
 
-    void Q3_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void Q3_KTensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
         const int sb_idx = b / 8;
         const int sub_idx = b % 8;
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * sb_per_row + sb_idx];
 
         const int base = sub_idx * 32;
         uint8_t raw3[32];

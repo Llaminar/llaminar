@@ -30,6 +30,7 @@ namespace llaminar2
 
     // Forward declarations
     class ComputeGraph;
+    class IWorkerGPUContext;
     struct StageDumpInfo;
 
     /**
@@ -56,6 +57,23 @@ namespace llaminar2
         const std::string &node_name,
         const StageDumpInfo &dump_info)>;
 
+    /**
+     * @brief Decide whether one concrete stage publication belongs in a snapshot.
+     *
+     * A graph node name identifies the operation, but it does not necessarily
+     * identify the semantic value produced by that operation. Fused and
+     * policy-selected stages can publish different named outputs while retaining
+     * the same graph node name. Requiring the immutable output descriptor here
+     * prevents a filter from selecting a stale or merely possible producer.
+     * GPU graph preparation first receives the complete stage view and then a
+     * one-output view for every device tensor selected into immutable capture
+     * storage. Implementations must therefore decide from the supplied
+     * descriptors rather than depending on sibling-output presence.
+     */
+    using StageSnapshotFilter = std::function<bool(
+        const std::string &node_name,
+        const StageDumpInfo &dump_info)>;
+
     using StageFailureCallback = std::function<void(
         const std::string &node_name,
         const std::string &reason)>;
@@ -72,8 +90,18 @@ namespace llaminar2
         bool enable_validation = false;            ///< Validate outputs after each stage
         DeviceId default_device = DeviceId::cpu(); ///< Default device for stages
 
+        /**
+         * Production GPU snapshots may allocate only through a typed physical
+         * memory reservation. Isolated graph fixtures leave this false and
+         * deliberately own no production admission certificate.
+         */
+        bool require_snapshot_memory_authority = false;
+
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;
+
+        /// Optional concrete-publication filter for snapshot capture. Empty means all stages.
+        StageSnapshotFilter snapshot_stage_filter = nullptr;
 
         /// Callback invoked immediately when a stage fails. TP runners use this
         /// to abort shared collective contexts before sibling workers enter the
@@ -83,6 +111,17 @@ namespace llaminar2
         /// Callback queried before each stage. Return true to cancel this graph
         /// pass because a peer worker or rank already failed.
         ExecutionCancellationCallback cancellation_requested = nullptr;
+
+        /**
+         * @brief Optional worker-context resolver supplied by an execution host.
+         *
+         * Production standalone executors leave this empty and resolve the
+         * process-owned GPU context pool. Higher-level engines install a scoped
+         * resolver so hardware-free unit hosts can provide an in-memory worker
+         * without any CUDA or ROCm initialization.
+         */
+        std::function<IWorkerGPUContext *(DeviceId)> worker_gpu_context_resolver;
+        bool worker_gpu_context_uses_process_pool = false;
 
         // Context for stage dumping (set by pipeline before each layer)
         int current_layer_idx = -1; ///< Current layer being executed

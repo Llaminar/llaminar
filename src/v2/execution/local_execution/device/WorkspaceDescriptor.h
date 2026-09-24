@@ -24,6 +24,69 @@ namespace llaminar2
 {
 
     /**
+     * @brief Execution regime in which a workspace buffer may be live.
+     *
+     * A captured prefill graph and its decode/grouped-verifier companions are
+     * ordered serially by device events. Declaring regime ownership lets the
+     * family planner overlay buffers that can never be used by the same graph
+     * participant instead of conservatively summing their VRAM.
+     */
+    enum class WorkspaceExecutionRegime : uint8_t
+    {
+        /**
+         * @brief Buffer may be consumed by more than one graph-family role.
+         *
+         * Common buffers retain one stable address and the family planner
+         * publishes enough capacity for the largest participant that uses the
+         * name.
+         */
+        Any,
+
+        /**
+         * @brief Buffer is live only during ordinary M>1 prefill execution.
+         *
+         * Decode and grouped verification run after prefill through explicit
+         * device-event ordering. They may therefore overlay this storage while
+         * retaining stable captured addresses for every graph participant.
+         */
+        PrefillOnly,
+
+        /**
+         * @brief Buffer is live only during canonical decode or grouped verification.
+         *
+         * This category includes bounded K-partition reduction arenas whose
+         * demand is non-monotonic in M and which must not inflate the prefill
+         * participant merely because one kernel object serves both regimes.
+         */
+        CompactDecodeOnly,
+    };
+
+    /**
+     * @brief Lifetime of the bytes stored behind a stable workspace name.
+     *
+     * Every captured graph retains a stable pointer for each workspace name,
+     * but pointer stability alone does not say whether another serial graph is
+     * allowed to overwrite those bytes. Most scratch is participant-local and
+     * may be overlaid after its completion event. Immutable lookup tables and
+     * other initialize-once state remain live across the complete graph family
+     * and therefore require an exclusive physical interval.
+     */
+    enum class WorkspaceContentLifetime : uint8_t
+    {
+        /** @brief Contents die when the active graph participant completes. */
+        ParticipantExecution,
+
+        /**
+         * @brief Contents remain authoritative across serial graph participants.
+         *
+         * The family planner must prevent every differently named workspace
+         * interval from overlapping this buffer, even when the two names never
+         * occur in the same participant.
+         */
+        SerialGraphFamily,
+    };
+
+    /**
      * @brief Describes a single device workspace buffer requirement
      *
      * Each buffer has a unique name, size, alignment requirement, and
@@ -37,6 +100,10 @@ namespace llaminar2
         size_t size_bytes = 0;  ///< Required size in bytes
         size_t alignment = 256; ///< Alignment requirement (default 256 for device)
         bool required = true;   ///< If false, allocation failure is not fatal
+        WorkspaceExecutionRegime regime =
+            WorkspaceExecutionRegime::Any; ///< Participant lifetime classification
+        WorkspaceContentLifetime content_lifetime =
+            WorkspaceContentLifetime::ParticipantExecution; ///< Stored-byte lifetime
 
         // Default constructor
         WorkspaceDescriptor() = default;
@@ -46,8 +113,17 @@ namespace llaminar2
             const std::string &name_,
             size_t size_,
             size_t align_ = 256,
-            bool req_ = true)
-            : name(name_), size_bytes(size_), alignment(align_), required(req_)
+            bool req_ = true,
+            WorkspaceExecutionRegime regime_ =
+                WorkspaceExecutionRegime::Any,
+            WorkspaceContentLifetime content_lifetime_ =
+                WorkspaceContentLifetime::ParticipantExecution)
+            : name(name_),
+              size_bytes(size_),
+              alignment(align_),
+              required(req_),
+              regime(regime_),
+              content_lifetime(content_lifetime_)
         {
         }
 
@@ -56,8 +132,17 @@ namespace llaminar2
             const char *name_,
             size_t size_,
             size_t align_ = 256,
-            bool req_ = true)
-            : name(name_), size_bytes(size_), alignment(align_), required(req_)
+            bool req_ = true,
+            WorkspaceExecutionRegime regime_ =
+                WorkspaceExecutionRegime::Any,
+            WorkspaceContentLifetime content_lifetime_ =
+                WorkspaceContentLifetime::ParticipantExecution)
+            : name(name_),
+              size_bytes(size_),
+              alignment(align_),
+              required(req_),
+              regime(regime_),
+              content_lifetime(content_lifetime_)
         {
         }
     };
@@ -252,6 +337,22 @@ namespace llaminar2
                         }
                         // Keep required if either is required
                         existing.required = existing.required || buf.required;
+                        // A name used in more than one regime is a common
+                        // participant buffer and must retain one stable address.
+                        if (existing.regime != buf.regime)
+                        {
+                            existing.regime =
+                                WorkspaceExecutionRegime::Any;
+                        }
+                        // Persistent content is the stronger contract. One
+                        // initialize-once user makes the shared name live for
+                        // the complete serial graph family.
+                        if (buf.content_lifetime ==
+                            WorkspaceContentLifetime::SerialGraphFamily)
+                        {
+                            existing.content_lifetime =
+                                WorkspaceContentLifetime::SerialGraphFamily;
+                        }
                         found = true;
                         break;
                     }

@@ -8,18 +8,26 @@
 #include "DeviceSampler.h"
 #include "IInferenceRunner.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../kernels/common/SamplingMath.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/Sampler.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <limits>
-#include <random>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace
+    {
+        size_t logitsRowStride(const LogitsLocalInfo &info)
+        {
+            return info.row_stride > 0 ? info.row_stride : info.vocab_local;
+        }
+    } // namespace
 
     int DeviceSampler::sampleGreedy(
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
@@ -70,6 +78,14 @@ namespace llaminar2
         std::vector<DeviceResult> results;
         results.reserve(infos.size());
         size_t col_offset = 0;
+        const bool use_explicit_vocab_offsets =
+            std::any_of(
+                infos.begin(),
+                infos.end(),
+                [](const LogitsLocalInfo &info)
+                {
+                    return info.vocab_offset != 0;
+                });
 
         for (const auto &info : infos)
         {
@@ -101,11 +117,12 @@ namespace llaminar2
                 const auto &shape = info.tensor->shape();
                 const size_t rows = shape.size() >= 2 ? shape[0] : 1;
                 const size_t cols = info.vocab_local;
-                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                const size_t row_stride = logitsRowStride(info);
+                if (cols == 0 || row_stride < cols || static_cast<size_t>(row) >= rows)
                     return -1;
 
                 const auto *row_ptr =
-                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * cols;
+                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * row_stride;
 
                 // Drive the multi-block argmax with the runner's arena-owned scratch
                 // (null/zero capacity -> argmaxF32 fails, and we degrade to host-side
@@ -128,14 +145,15 @@ namespace llaminar2
                 const auto &shape = info.tensor->shape();
                 const size_t rows = shape.size() >= 2 ? shape[0] : 1;
                 const size_t cols = info.vocab_local;
-                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                const size_t row_stride = logitsRowStride(info);
+                if (cols == 0 || row_stride < cols || static_cast<size_t>(row) >= rows)
                     return -1;
 
                 const float *data = info.tensor->fp32_data();
                 if (!data)
                     return -1;
 
-                const float *row_data = data + static_cast<size_t>(row) * cols;
+                const float *row_data = data + static_cast<size_t>(row) * row_stride;
                 max_idx = 0;
                 max_val = row_data[0];
                 for (size_t i = 1; i < cols; ++i)
@@ -151,7 +169,9 @@ namespace llaminar2
             LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] local_argmax="
                       << max_idx << " val=" << max_val << " offset=" << col_offset);
 
-            results.push_back({max_val, max_idx, col_offset});
+            const size_t global_offset =
+                use_explicit_vocab_offsets ? info.vocab_offset : col_offset;
+            results.push_back({max_val, max_idx, global_offset});
             col_offset += info.vocab_local;
         }
 
@@ -183,9 +203,157 @@ namespace llaminar2
         return best_token;
     }
 
+    bool DeviceSampler::sampleGreedyRowsFromLocalInfos(
+        const std::vector<LogitsLocalInfo> &infos,
+        int start_row,
+        int row_count,
+        int32_t *out_tokens)
+    {
+        if (infos.size() < 2 || start_row < 0 || row_count <= 0 || !out_tokens)
+            return false;
+
+        struct ShardRows
+        {
+            size_t col_offset = 0;
+            std::vector<float> values;
+            std::vector<int> indices;
+        };
+
+        std::vector<ShardRows> shard_rows;
+        shard_rows.reserve(infos.size());
+        size_t col_offset = 0;
+        const bool use_explicit_vocab_offsets =
+            std::any_of(
+                infos.begin(),
+                infos.end(),
+                [](const LogitsLocalInfo &info)
+                {
+                    return info.vocab_offset != 0;
+                });
+
+        for (const auto &info : infos)
+        {
+            if (!info || info.vocab_local == 0 || !info.tensor)
+                return false;
+
+            const auto &shape = info.tensor->shape();
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols = info.vocab_local;
+            const size_t row_stride = logitsRowStride(info);
+            if (cols == 0 ||
+                row_stride < cols ||
+                static_cast<size_t>(start_row) >= rows ||
+                static_cast<size_t>(start_row + row_count) > rows ||
+                cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            ShardRows rows_out;
+            rows_out.col_offset =
+                use_explicit_vocab_offsets ? info.vocab_offset : col_offset;
+            rows_out.values.assign(static_cast<size_t>(row_count), 0.0f);
+            rows_out.indices.assign(static_cast<size_t>(row_count), -1);
+
+            if (info.device.has_value() && info.device->is_gpu())
+            {
+                /*
+                 * The backend batched argmax API assumes contiguous rows. If a
+                 * tensor has padded local-logit rows, keep the exact old
+                 * per-row sampler path instead of silently reading padding.
+                 */
+                if (!info.gpu_ptr || row_stride != cols || !info.stream)
+                    return false;
+
+                IBackend *backend = getBackendFor(*info.device);
+                if (!backend ||
+                    !info.argmax_partial_vals ||
+                    !info.argmax_partial_idxs ||
+                    info.argmax_partial_capacity < row_count)
+                {
+                    return false;
+                }
+
+                const auto *base = static_cast<const float *>(info.gpu_ptr);
+                const void *first_row =
+                    base + static_cast<size_t>(start_row) * row_stride;
+                if (!backend->argmaxF32BatchedRows(
+                        first_row,
+                        row_count,
+                        static_cast<int>(cols),
+                        info.device->gpu_ordinal(),
+                        rows_out.values.data(),
+                        rows_out.indices.data(),
+                        info.stream,
+                        info.argmax_partial_vals,
+                        info.argmax_partial_idxs,
+                        info.argmax_partial_capacity))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                const float *data = info.tensor->fp32_data();
+                if (!data)
+                    return false;
+
+                for (int i = 0; i < row_count; ++i)
+                {
+                    const float *row_data =
+                        data +
+                        static_cast<size_t>(start_row + i) * row_stride;
+                    int max_idx = 0;
+                    float max_val = row_data[0];
+                    for (size_t col = 1; col < cols; ++col)
+                    {
+                        if (row_data[col] > max_val)
+                        {
+                            max_val = row_data[col];
+                            max_idx = static_cast<int>(col);
+                        }
+                    }
+                    rows_out.values[static_cast<size_t>(i)] = max_val;
+                    rows_out.indices[static_cast<size_t>(i)] = max_idx;
+                }
+            }
+
+            shard_rows.push_back(std::move(rows_out));
+            col_offset += cols;
+        }
+
+        for (int row = 0; row < row_count; ++row)
+        {
+            int best_token = -1;
+            float best_value = -std::numeric_limits<float>::infinity();
+            for (const auto &shard : shard_rows)
+            {
+                const int local_index = shard.indices[static_cast<size_t>(row)];
+                if (local_index < 0)
+                    return false;
+                const int token =
+                    static_cast<int>(shard.col_offset) + local_index;
+                const float value = shard.values[static_cast<size_t>(row)];
+                if (value > best_value ||
+                    (value == best_value &&
+                     (best_token < 0 || token < best_token)))
+                {
+                    best_value = value;
+                    best_token = token;
+                }
+            }
+            if (best_token < 0)
+                return false;
+            out_tokens[row] = static_cast<int32_t>(best_token);
+        }
+
+        return true;
+    }
+
     int DeviceSampler::sample(
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
-        const SamplingParams &params)
+        const SamplingParams &params,
+        float threshold)
     {
         // Greedy: delegate to argmax path
         if (params.is_greedy())
@@ -279,83 +447,42 @@ namespace llaminar2
         if (all_candidates.empty())
             return -1;
 
-        // Sort all candidates by value descending
+        // Sort all candidates by value descending. Equal logits use the lower
+        // token id, matching greedy tie-breaking and keeping top-k/top-p rows
+        // independent of backend-local top-k emission order.
         std::sort(all_candidates.begin(), all_candidates.end(),
                   [](const DeviceCandidate &a, const DeviceCandidate &b)
-                  { return a.value > b.value; });
+                  {
+                      if (a.value != b.value)
+                          return a.value > b.value;
+                      return a.global_index < b.global_index;
+                  });
 
         // Keep only global top-k
         if (static_cast<int>(all_candidates.size()) > effective_k)
             all_candidates.resize(static_cast<size_t>(effective_k));
 
-        // Apply temperature scaling + softmax
-        float temperature = params.temperature;
-        if (temperature <= 0.0f)
-            temperature = 1.0f;
-
-        float max_logit = all_candidates[0].value;
-        std::vector<float> probs(all_candidates.size());
-        float sum = 0.0f;
+        std::vector<float> sorted_logits(all_candidates.size(), 0.0f);
+        std::vector<int> sorted_token_ids(all_candidates.size(), -1);
+        std::vector<float> scratch(all_candidates.size(), 0.0f);
         for (size_t i = 0; i < all_candidates.size(); ++i)
         {
-            probs[i] = std::exp((all_candidates[i].value - max_logit) / temperature);
-            sum += probs[i];
+            sorted_logits[i] = all_candidates[i].value;
+            sorted_token_ids[i] = all_candidates[i].global_index;
         }
-        for (auto &p : probs)
-            p /= sum;
-
-        // Top-p (nucleus) filtering
-        float top_p = params.top_p;
-        int nucleus_size = static_cast<int>(probs.size());
-        if (top_p < 1.0f && top_p > 0.0f)
-        {
-            float cumulative = 0.0f;
-            for (size_t i = 0; i < probs.size(); ++i)
-            {
-                cumulative += probs[i];
-                if (cumulative >= top_p)
-                {
-                    nucleus_size = static_cast<int>(i) + 1;
-                    break;
-                }
-            }
-            // Renormalize
-            float renorm_sum = 0.0f;
-            for (int i = 0; i < nucleus_size; ++i)
-                renorm_sum += probs[i];
-            for (int i = 0; i < nucleus_size; ++i)
-                probs[i] /= renorm_sum;
-        }
-
-        // Multinomial sampling
-        thread_local std::mt19937 rng{std::random_device{}()};
-        if (params.seed != 0)
-        {
-            static unsigned int last_seed = 0;
-            if (params.seed != last_seed)
-            {
-                rng.seed(params.seed);
-                last_seed = params.seed;
-            }
-        }
-
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(rng);
-        float cumulative = 0.0f;
-        int selected = all_candidates[0].global_index;
-        for (int i = 0; i < nucleus_size; ++i)
-        {
-            cumulative += probs[i];
-            if (r <= cumulative)
-            {
-                selected = all_candidates[i].global_index;
-                break;
-            }
-        }
+        const int selected =
+            sampling_math::sample_topk_topp_from_sorted_with_threshold(
+                sorted_logits.data(),
+                sorted_token_ids.data(),
+                static_cast<int>(sorted_logits.size()),
+                params.top_p,
+                params.temperature,
+                threshold,
+                scratch.data());
 
         LOG_TRACE("[DeviceSampler::sample] top-k/p selected token=" << selected
-                                                                    << " (k=" << effective_k << ", p=" << top_p
-                                                                    << ", T=" << temperature << ", nucleus=" << nucleus_size << ")");
+                                                                    << " (k=" << effective_k << ", p=" << params.top_p
+                                                                    << ", T=" << params.temperature << ")");
 
         if (!logged_once)
         {

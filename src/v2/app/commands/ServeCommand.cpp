@@ -68,7 +68,8 @@ namespace llaminar2
         full_argv.push_back(const_cast<char *>(kSubcmd));
         for (int i = 1; i < argc; ++i)
             full_argv.push_back(argv[i]);
-        int full_argc = static_cast<int>(full_argv.size());
+        full_argv.push_back(nullptr);
+        int full_argc = static_cast<int>(full_argv.size() - 1);
 
         // MPI Bootstrap
         MPIBootstrapPhase bootstrap;
@@ -78,10 +79,11 @@ namespace llaminar2
 
         // Runtime Initialization
         RuntimeInitPhase init;
-        auto ctx_opt = init.execute(config, argc, argv);
-        if (!ctx_opt)
-            return config.dry_run ? 0 : 1;
-        auto ctx = std::move(*ctx_opt);
+        auto initialized = init.execute(config, argc, argv);
+        if (const auto *terminal = std::get_if<RuntimeInitExit>(&initialized))
+            return static_cast<int>(*terminal);
+        // This owner outlives mode-local handlers and retires MPI last.
+        auto ctx = std::get<AppContext>(std::move(initialized));
 
         // Run server directly
         ServerMode server;

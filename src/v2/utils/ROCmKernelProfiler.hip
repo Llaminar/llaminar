@@ -9,6 +9,7 @@
 #include "ROCmKernelProfiler.h"
 #include <hip/hip_runtime.h>
 #include <cstdio>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -21,6 +22,10 @@ namespace llaminar2
         : type_(type), enabled_(ROCmKernelProfiler::isEnabled()),
           start_event_(nullptr), stop_event_(nullptr), stream_(stream)
     {
+        if (!stream_)
+            throw std::invalid_argument(
+                "ScopedROCmKernelTimer requires the exact non-null kernel stream");
+
         if (enabled_)
         {
             // Skip event timing if the stream is currently in graph capture mode.
@@ -50,7 +55,7 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to create stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
                 enabled_ = false;
                 return;
             }
@@ -61,8 +66,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to record start event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 enabled_ = false;
             }
         }
@@ -78,8 +83,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to record stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 return;
             }
 
@@ -89,8 +94,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to synchronize stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 return;
             }
 
@@ -109,8 +114,8 @@ namespace llaminar2
             }
 
             // Clean up events
-            hipEventDestroy(start_event_);
-            hipEventDestroy(stop_event_);
+            (void)hipEventDestroy(start_event_);
+            (void)hipEventDestroy(stop_event_);
         }
     }
 
@@ -135,7 +140,7 @@ namespace llaminar2
             err = hipEventCreate(&stop_event_);
             if (err != hipSuccess)
             {
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
                 enabled_ = false;
                 return;
             }
@@ -147,14 +152,18 @@ namespace llaminar2
         if (enabled_)
         {
             if (start_event_)
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
             if (stop_event_)
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(stop_event_);
         }
     }
 
     void ManualROCmKernelTimer::begin(hipStream_t stream)
     {
+        if (!stream)
+            throw std::invalid_argument(
+                "ManualROCmKernelTimer::begin requires the exact non-null kernel stream");
+
         if (enabled_)
         {
             // Skip if the stream is in graph capture mode — event timing is
@@ -217,4 +226,3 @@ namespace llaminar2
     }
 
 } // namespace llaminar2
-

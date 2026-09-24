@@ -5,27 +5,22 @@
  * Delegates to ITensorShortConvolution kernel for the actual computation.
  * Stage handles tensor extraction, null checks, and buffer contract management.
  *
- * GPU path: Uses ensureOnDevice() / allocateOnDevice() / gpu_data_ptr() to
- * keep data on-device. No H2D/D2H copies in the hot path.
+ * GPU path: The executor and TransferEngine prepare arena bindings on the
+ * stage's explicit stream; this stage consumes device pointers only. No
+ * H2D/D2H copies occur in the hot path.
  *
  * CPU path: Uses data() / mutable_data() host pointers.
  */
 
 #include "ShortConv1dStage.h"
+#include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
-
-#ifdef HAVE_CUDA
-#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
-#endif
-
-#ifdef HAVE_ROCM
-#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -34,29 +29,46 @@
 
 namespace llaminar2
 {
+
+    void ShortConv1dStage::updateDynamicParams(int pos_offset, int seq_len)
+    {
+        (void)pos_offset;
+
+        /*
+         * ForwardInput::seq_len is the width of one request.  The short-conv
+         * backend consumes a flattened [request, row] tensor, so preserve the
+         * per-request width separately and reconstruct the total row count.
+         * request_count is fixed by graph construction and is always positive
+         * for a valid stage.
+         */
+        params_.request_seq_len = seq_len;
+        if (seq_len <= 0 ||
+            params_.request_count <= 0 ||
+            seq_len > std::numeric_limits<int>::max() / params_.request_count)
+        {
+            /*
+             * `updateDynamicParams()` cannot return an error.  Publish an
+             * unmistakably invalid total so execute() rejects the stage rather
+             * than wrapping a positive request matrix into unrelated storage.
+             */
+            LOG_ERROR("[ShortConv1dStage] Invalid request-batched dynamic geometry: "
+                      << "request_count=" << params_.request_count
+                      << " request_seq_len=" << seq_len);
+            params_.seq_len = 0;
+            return;
+        }
+        params_.seq_len = params_.request_count * seq_len;
+    }
     namespace
     {
         std::atomic<uint32_t> g_shortconv_workspace_slice_counter{0};
     }
-
-    struct ShortConv1dStage::GpuEffectiveSeqLenState
-    {
-        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
-        int *device_effective_seq_len = nullptr; ///< Device scalar read by the short-conv kernel.
-        bool device_value_uploaded = false;       ///< True once the current host scalar is resident.
-    };
 
     ShortConv1dStage::ShortConv1dStage(Params params)
         : IComputeStage(params.device_id),
           params_(std::move(params)),
           workspace_slice_id_(g_shortconv_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
-    }
-
-    ShortConv1dStage::~ShortConv1dStage()
-    {
-        releaseGpuEffectiveSeqLenState();
     }
 
     WorkspaceRequirements ShortConv1dStage::getWorkspaceRequirements(int m, int n, int k) const
@@ -68,24 +80,34 @@ namespace llaminar2
         if (params_.channels <= 0)
             return reqs;
 
-        const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        /*
+         * Workspace planners pass `m` in rows per request, while this stage's
+         * tensors are flattened across requests. `params_.seq_len` already
+         * carries that flattened graph shape, so it is the minimum safe row
+         * capacity even when a dynamic planner supplies a smaller per-request
+         * value.
+         */
+        const int max_seq_len = std::max(
+            1,
+            std::max(params_.seq_len, m > 0 ? m : 0));
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows > 0 && params_.kernel_size > 1)
         {
             const int rows = std::min(speculative_slot_rows, max_seq_len);
-            const size_t state_floats =
-                static_cast<size_t>(params_.channels) *
-                static_cast<size_t>(params_.kernel_size - 1);
+            const auto footprint =
+                gdn_workspace::shortConvStateFootprint(
+                    rows,
+                    std::max(1, params_.request_count),
+                    params_.channels,
+                    params_.kernel_size);
             reqs.buffers.push_back({speculativeStateSlotsBufferName(),
-                                    static_cast<size_t>(rows) * state_floats * sizeof(float),
+                                    footprint.slot_bytes,
                                     256,
                                     true});
             if (params_.device_id.is_gpu())
             {
-                const int work_slots =
-                    std::max(1, params_.request_count > 1 ? params_.request_count : 1);
                 reqs.buffers.push_back({speculativeStateWorkBufferName(),
-                                        static_cast<size_t>(work_slots) * state_floats * sizeof(float),
+                                        footprint.work_bytes,
                                         256,
                                         true});
             }
@@ -94,23 +116,18 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
             return reqs;
 
-        if (max_seq_len > 1)
-            reqs.buffers.push_back({effectiveSeqLenScalarBufferName(), sizeof(int), alignof(int), true});
-
-        const size_t bytes = static_cast<size_t>(max_seq_len) *
-                             static_cast<size_t>(params_.channels) * sizeof(float);
-        reqs.buffers.push_back({WS_INPLACE_PREFILL_SCRATCH, bytes, 256, true});
+        if (params_.input == params_.output)
+        {
+            const size_t bytes = static_cast<size_t>(max_seq_len) *
+                                 static_cast<size_t>(params_.channels) * sizeof(float);
+            reqs.buffers.push_back({inplacePrefillScratchBufferName(), bytes, 256, true});
+        }
         return reqs;
     }
 
     void ShortConv1dStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        }
         bindKernelWorkspace();
     }
 
@@ -127,11 +144,12 @@ namespace llaminar2
 
         float *scratch = nullptr;
         int scratch_floats = 0;
-        if (bound_workspace_ && bound_workspace_->hasBuffer(WS_INPLACE_PREFILL_SCRATCH))
+        const std::string scratch_name = inplacePrefillScratchBufferName();
+        if (bound_workspace_ && bound_workspace_->hasBuffer(scratch_name))
         {
-            scratch = static_cast<float *>(bound_workspace_->getBuffer(WS_INPLACE_PREFILL_SCRATCH));
+            scratch = static_cast<float *>(bound_workspace_->getBuffer(scratch_name));
             const size_t available_floats =
-                bound_workspace_->getBufferSize(WS_INPLACE_PREFILL_SCRATCH) / sizeof(float);
+                bound_workspace_->getBufferSize(scratch_name) / sizeof(float);
             scratch_floats = static_cast<int>(std::min<size_t>(
                 available_floats,
                 static_cast<size_t>(std::numeric_limits<int>::max())));
@@ -173,15 +191,6 @@ namespace llaminar2
                     static_cast<size_t>(speculative_slot_rows),
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
-        }
-        else if (!params_.device_id.is_gpu() && capture_state_size > 0)
-        {
-            const int max_rows = std::max(1, params_.seq_len);
-            capture_rows = std::min(speculative_slot_rows, max_rows);
-            const size_t required_floats =
-                static_cast<size_t>(capture_rows) * static_cast<size_t>(capture_state_size);
-            host_verifier_state_slots_.resize(required_floats);
-            capture = host_verifier_state_slots_.empty() ? nullptr : host_verifier_state_slots_.data();
         }
         verifier_capture_workspace_bound_ =
             capture != nullptr && capture_rows > 0 && capture_state_size > 0;
@@ -247,13 +256,19 @@ namespace llaminar2
         return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
     }
 
-    bool ShortConv1dStage::shouldUseRealLengthContract() const
+    bool ShortConv1dStage::shouldUseScalarRealLengthContract() const
     {
-        return params_.seq_len > 1 &&
-               prefill_replay_params_set_ &&
-               prefill_bucket_seq_len_ == params_.seq_len &&
-               prefill_effective_seq_len_ > 0 &&
-               prefill_effective_seq_len_ < params_.seq_len &&
+        /*
+         * A one-request graph bucket owns the ordinary scalar live state.  Its
+         * device length is dynamic, but that does not make it a request-batched
+         * transaction.  Keep it on forwardWithEffectiveSeqLen(), which commits
+         * directly into the primary device state consumed by subsequent
+         * decode.  The packed request-state bank belongs exclusively to true
+         * multi-request execution.
+         */
+        return params_.seq_len > 1 && params_.request_count == 1 &&
+               params_.request_seq_len == params_.seq_len &&
+               params_.request_seq_lens_device != nullptr &&
                params_.kernel &&
                params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -280,9 +295,18 @@ namespace llaminar2
         return role_prefix + "slice" + std::to_string(workspace_slice_id_);
     }
 
-    std::string ShortConv1dStage::effectiveSeqLenScalarBufferName() const
+    std::string ShortConv1dStage::inplacePrefillScratchBufferName() const
     {
-        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
+        /*
+         * Layers within one graph role are serialized and can reuse this large
+         * in-place-preservation buffer. Independently replayable graph roles
+         * need separate keys so one role cannot overwrite another role's
+         * source rows while a long convolution is still consuming them.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_INPLACE_PREFILL_SCRATCH;
+        return std::string(WS_INPLACE_PREFILL_SCRATCH) + "_" +
+               params_.workspace_namespace;
     }
 
     std::string ShortConv1dStage::speculativeStateSlotsBufferName() const
@@ -292,7 +316,17 @@ namespace llaminar2
 
     std::string ShortConv1dStage::speculativeStateWorkBufferName() const
     {
-        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" + workspaceStableId();
+        /*
+         * Speculative work is transient scratch for one short-convolution stage.
+         * Layers in a transformer graph are dependency-serialized, so one work
+         * bank per graph role is sufficient. Persistent speculative state slots
+         * remain layer-qualified because accepted-state publication consumes
+         * every layer after verifier execution.
+         */
+        if (params_.workspace_namespace.empty())
+            return WS_SPECULATIVE_STATE_WORK;
+        return std::string(WS_SPECULATIVE_STATE_WORK) + "_" +
+               params_.workspace_namespace;
     }
 
     int ShortConv1dStage::requestedSpeculativeStateSlotRows() const
@@ -308,15 +342,23 @@ namespace llaminar2
         prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
-        refreshPinnedEffectiveSeqLen();
-        if (gpu_effective_seq_len_state_)
-            gpu_effective_seq_len_state_->device_value_uploaded = false;
-        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
-            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 
     bool ShortConv1dStage::supportsPaddedPrefillRealLengthContract() const
     {
+        if (params_.device_id.is_gpu())
+        {
+            if (!params_.kernel || !params_.request_seq_lens_device)
+                return false;
+            if (params_.request_count <= 1)
+                return params_.kernel->supportsPaddedPrefillRealLength();
+
+            const int state_size =
+                params_.channels * std::max(0, params_.kernel_size - 1);
+            return params_.kernel->supportsRequestLiveStateBank(
+                params_.request_count,
+                state_size);
+        }
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
 
@@ -324,7 +366,7 @@ namespace llaminar2
     {
         return params_.kernel &&
                verifierStateCaptureWorkspaceRequired() &&
-               params_.conv_state != nullptr;
+               (params_.device_id.is_gpu() || params_.conv_state != nullptr);
     }
 
     bool ShortConv1dStage::verifierStateCaptureWorkspaceRequired() const
@@ -369,35 +411,71 @@ namespace llaminar2
                 bound_workspace_->getBuffer(speculativeStateSlotsBufferName()));
         }
 
-        return host_verifier_state_slots_.empty()
-                   ? nullptr
-                   : host_verifier_state_slots_.data();
+        return nullptr;
     }
 
     bool ShortConv1dStage::restoreCPUVerifierStateCaptureRowDirect(int row)
     {
-        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
-            return false;
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        if (row < 0 || row >= verifier_capture_rows_bound_)
-            return false;
-
-        const float *capture = cpuVerifierStateCaptureSource();
-        if (!capture || !params_.conv_state)
+        const CPUVerifierStateRestorePlan plan =
+            planCPUVerifierStateRestoreRow(row);
+        if (!plan.ready())
             return false;
 
         /*
-         * CPU short-conv publication owns host capture slots at the stage
-         * level.  Copying directly keeps multi-layer publication parallel while
+         * CPU short-conv publication copies from this stage's manager-owned
+         * workspace binding. This keeps multi-layer publication parallel while
          * avoiding races through the shared backend kernel binding.
          */
         std::memcpy(
-            params_.conv_state,
-            capture + static_cast<size_t>(row) *
-                          static_cast<size_t>(verifier_capture_state_size_bound_),
-            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+            plan.destination,
+            plan.source,
+            plan.bytes);
         return true;
+    }
+
+    CPUVerifierStateRestorePlan
+    ShortConv1dStage::planCPUVerifierStateRestoreRow(int row)
+    {
+        if (params_.device_id.is_gpu())
+            return {};
+        if (!hasVerifierStateCapture() ||
+            !ensureVerifierStateCaptureWorkspaceBound())
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+        if (row < 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::NoOp,
+            };
+        }
+        if (row >= verifier_capture_rows_bound_ ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        const float *capture = cpuVerifierStateCaptureSource();
+        if (!capture || !params_.conv_state)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        return {
+            .status = CPUVerifierStateRestorePlanStatus::Ready,
+            .destination = params_.conv_state,
+            .source = capture +
+                static_cast<size_t>(row) *
+                    static_cast<size_t>(verifier_capture_state_size_bound_),
+            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
+                     sizeof(float),
+        };
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)
@@ -416,10 +494,32 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        // GPU publication restores the kernel-owned live bank on the verifier
+        // stream. GPU graph params deliberately contain no host state pointer.
         return params_.kernel->restoreVerifierStateCaptureRow(
-            params_.conv_state,
+            nullptr,
             row,
             stream ? stream : gpuStream());
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRows(
+        const int *host_row_indices,
+        int request_count,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || params_.device_id.is_gpu() ||
+            !host_row_indices || request_count <= 0 || !params_.kernel)
+        {
+            return false;
+        }
+        bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRows(
+            params_.conv_state,
+            host_row_indices,
+            request_count,
+            stream);
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceIndex(
@@ -433,13 +533,17 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
-        /*
-         * Keep resident MTP publication entirely device-owned. The accepted
-         * row index lives in GPU metadata, and the short-conv kernel restores
-         * its implementation-owned live state on this stream. Passing the host
-         * conv-state mirror would make the backend perform a D2H refresh and
-         * synchronize the stream, which is not allowed in the hot path.
-         */
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=shortconv_restore_device_row"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_index));
+        }
+        // The accepted row index and destination live bank are both resident.
         return params_.kernel->restoreVerifierStateCaptureRowFromDeviceIndex(
             nullptr,
             device_row_index,
@@ -463,11 +567,11 @@ namespace llaminar2
         if (!params_.device_id.is_gpu())
         {
             /*
-             * CPU short-conv currently stores one live state vector per layer.
-             * A batched restore needs request-owned conv-state slots before it
-             * can publish multiple requests safely.
+             * CPU request banks consume host row indices through
+             * restoreVerifierStateCaptureRows(). Device pointers are never
+             * adopted into the host publication path.
              */
-            LOG_ERROR("[ShortConv1dStage] Batched verifier-state restore requires request-owned CPU conv-state banks");
+            LOG_ERROR("[ShortConv1dStage] Device-indexed batch restore is GPU-only; CPU publication requires host rows");
             return false;
         }
 
@@ -477,6 +581,18 @@ namespace llaminar2
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
+        if (DebugEnv::isTruthyEnv("LLAMINAR_MTP_PUBLICATION_DIAGNOSTICS"))
+        {
+            LOG_INFO("[MTPPublicationDiagnostics] phase=shortconv_restore_device_rows"
+                     << " layer=" << params_.layer_idx
+                     << " device=" << params_.device_id.toString()
+                     << " request_count=" << request_count
+                     << " row_index_stride=" << row_index_stride
+                     << " capture_rows=" << verifier_capture_rows_bound_
+                     << " state_size=" << verifier_capture_state_size_bound_
+                     << " stream=" << stream
+                     << " row_ptr=" << static_cast<const void *>(device_row_indices));
+        }
 
         return params_.kernel->restoreVerifierStateCaptureRowsFromDeviceIndices(
             nullptr,
@@ -487,147 +603,65 @@ namespace llaminar2
             stream);
     }
 
-    void ShortConv1dStage::onGraphReplayed()
+    bool ShortConv1dStage::restoreVerifierStateCaptureRequestTerminalRows(
+        const int *device_request_seq_lens,
+        int request_count,
+        int request_row_width,
+        void *stream)
     {
-        // GDN hybrid kernels are shared by verifier, correction, and normal decode
-        // graphs. Replay bypasses execute(), so refresh the host-side kernel
-        // workspace binding before MTP publication restores a captured row.
+        if (!hasVerifierStateCapture() ||
+            !params_.device_id.is_gpu() ||
+            !device_request_seq_lens ||
+            request_count <= 0 ||
+            request_row_width <= 0 ||
+            !stream)
+        {
+            return false;
+        }
+
         bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRequestTerminalRows(
+            /*dst_states=*/nullptr,
+            device_request_seq_lens,
+            request_count,
+            request_row_width,
+            stream);
     }
 
-    bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()
+    bool ShortConv1dStage::requestBatchedTerminalStateCommittedDuringExecution(
+        int request_count,
+        int request_row_width) const
     {
-        const std::string scalar_buffer = effectiveSeqLenScalarBufferName();
-        if (!bound_workspace_ ||
-            !bound_workspace_->hasBuffer(scalar_buffer) ||
-            bound_workspace_->getBufferSize(scalar_buffer) < sizeof(int))
+        if (!params_.kernel ||
+            request_count <= 1 ||
+            request_row_width <= 0 ||
+            params_.request_count != request_count ||
+            params_.request_seq_len != request_row_width)
         {
-            LOG_ERROR("[ShortConv1dStage] Missing required graph workspace buffer '"
-                      << scalar_buffer << "' for effective sequence length on "
-                      << params_.device_id.toString());
             return false;
         }
-
-        auto *device_effective_seq_len =
-            static_cast<int *>(bound_workspace_->getBuffer(scalar_buffer));
-        if (!device_effective_seq_len)
-        {
-            LOG_ERROR("[ShortConv1dStage] Graph workspace buffer '"
-                      << scalar_buffer << "' resolved to null on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        if (gpu_effective_seq_len_state_)
-        {
-            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
-            if (!device_effective_seq_len)
-                gpu_effective_seq_len_state_->device_value_uploaded = false;
-            return true;
-        }
-
-        auto state = std::make_unique<GpuEffectiveSeqLenState>();
-        state->device = params_.device_id;
-        state->device_effective_seq_len = device_effective_seq_len;
-
-        bool allocated = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectHostParam(
-                params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectHostParam(
-                params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len);
-#endif
-        }
-
-        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
-        {
-            LOG_ERROR("[ShortConv1dStage] Failed to allocate pinned effective length replay scalar on "
-                      << params_.device_id.toString());
-            return false;
-        }
-
-        gpu_effective_seq_len_state_ = std::move(state);
-        refreshPinnedEffectiveSeqLen();
-        return true;
+        const int state_size =
+            params_.channels * std::max(0, params_.kernel_size - 1);
+        return params_.kernel->supportsRequestLiveStateBank(
+                   request_count,
+                   state_size) &&
+               verifier_capture_rows_bound_ < request_count * request_row_width;
     }
 
-    void ShortConv1dStage::refreshPinnedEffectiveSeqLen()
+    void ShortConv1dStage::clearVerifierStateCaptureBindingAfterPublication()
     {
-        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
-            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
-    }
-
-    bool ShortConv1dStage::uploadGpuEffectiveSeqLen()
-    {
-        if (!gpu_effective_seq_len_state_)
-            return false;
-        refreshPinnedEffectiveSeqLen();
-
-        if (isGraphCaptureActive())
-        {
-            if (!gpu_effective_seq_len_state_->device_value_uploaded)
-            {
-                LOG_ERROR("[ShortConv1dStage] Effective sequence length scalar was not uploaded before graph capture");
-                return false;
-            }
-            return true;
-        }
-
-        bool uploaded = false;
-        if (params_.device_id.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            uploaded = cuda::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        else if (params_.device_id.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            uploaded = rocm::uploadRowSelectParam(
-                gpu_effective_seq_len_state_->device_effective_seq_len,
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpuStream());
-#endif
-        }
-        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
-        return uploaded;
-    }
-
-    void ShortConv1dStage::releaseGpuEffectiveSeqLenState()
-    {
-        if (!gpu_effective_seq_len_state_)
+        if (!params_.device_id.is_gpu())
             return;
 
-        if (gpu_effective_seq_len_state_->device.is_cuda())
-        {
-#ifdef HAVE_CUDA
-            cuda::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-        else if (gpu_effective_seq_len_state_->device.is_rocm())
-        {
-#ifdef HAVE_ROCM
-            rocm::freeRowSelectHostParam(
-                gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len);
-#endif
-        }
-
-        gpu_effective_seq_len_state_.reset();
+        /*
+         * The accepted short-conv state is now live in the backend-owned GPU
+         * state vector.  Clear only the verifier capture/work binding so normal
+         * decode continues from that live vector instead of treating the next row
+         * as another speculative verifier row.
+         */
+        clearKernelVerifierStateWorkspace();
     }
 
     bool ShortConv1dStage::execute(IDeviceContext *ctx)
@@ -648,7 +682,7 @@ namespace llaminar2
         }
 
         // Bind stage stream to kernel before execution
-        params_.kernel->setGPUStream(gpuStream());
+        bindStageStream(params_.kernel);
         bindKernelWorkspace();
         if (!ensureVerifierStateCaptureWorkspaceBound())
             return false;
@@ -681,17 +715,6 @@ namespace llaminar2
                     d_bias = static_cast<const float *>(bias_base->gpu_data_ptr());
             }
 
-            const int effective_seq_len = effectivePrefillSeqLen();
-            const bool padded_effective_len =
-                params_.seq_len > 1 && prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
-            const bool use_real_length_contract = shouldUseRealLengthContract();
-            if (padded_effective_len && !use_real_length_contract)
-            {
-                LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
-                return false;
-            }
-
-            bool ok = false;
             const bool request_batched =
                 params_.request_count > 1 &&
                 params_.request_seq_len > 0 &&
@@ -705,40 +728,56 @@ namespace llaminar2
                           << ", request_seq_len=" << params_.request_seq_len << ")");
                 return false;
             }
-            if (use_real_length_contract)
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const bool padded_effective_len =
+                !request_batched &&
+                params_.seq_len > 1 &&
+                prefill_replay_params_set_ &&
+                effective_seq_len < params_.seq_len;
+            const bool use_scalar_real_length_contract =
+                shouldUseScalarRealLengthContract();
+            if (padded_effective_len && !use_scalar_real_length_contract)
             {
-                if (request_batched)
-                {
-                    LOG_ERROR("[ShortConv1dStage] Request-batched short-conv verifier does not support "
-                              "the scalar padded-prefill real-length contract");
-                    return false;
-                }
-                if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
-                {
-                    LOG_ERROR("[ShortConv1dStage] Failed to update GPU effective length scalar");
-                    return false;
-                }
-                ok = params_.kernel->forwardWithEffectiveSeqLen(
-                    d_input, d_weight, d_bias,
-                    d_output, params_.conv_state,
-                    params_.seq_len, params_.channels, params_.kernel_size,
-                    gpu_effective_seq_len_state_->device_effective_seq_len,
-                    /*apply_silu=*/true);
+                LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
+                return false;
             }
-            else if (request_batched)
+
+            bool ok = false;
+            if (request_batched)
             {
                 const int state_size = params_.channels * std::max(0, params_.kernel_size - 1);
+                if (!params_.request_seq_lens_device)
+                {
+                    LOG_ERROR("[ShortConv1dStage] GPU short-conv with dynamic real lengths requires device-owned request lengths");
+                    return false;
+                }
                 if (!params_.kernel->supportsRequestLiveStateBank(params_.request_count, state_size))
                 {
                     LOG_ERROR("[ShortConv1dStage] Backend lacks request-owned live conv-state bank for "
                               << params_.request_count << " requests");
                     return false;
                 }
-                ok = params_.kernel->forwardBatchedRequests(
+                ok = params_.kernel->forwardBatchedRequestsWithDeviceSeqLens(
                     d_input, d_weight, d_bias,
                     d_output, params_.conv_state,
                     params_.seq_len, params_.request_count, params_.request_seq_len,
                     params_.channels, params_.kernel_size,
+                    params_.request_seq_lens_device,
+                    /*apply_silu=*/true);
+            }
+            else if (use_scalar_real_length_contract)
+            {
+                /*
+                 * The first element of the persistent request-length allocation
+                 * is also the scalar request's graph-stable effective length.
+                 * The backend reads it on device and commits only those rows
+                 * into the primary live state; no request-bank handoff exists.
+                 */
+                ok = params_.kernel->forwardWithEffectiveSeqLen(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.channels, params_.kernel_size,
+                    params_.request_seq_lens_device,
                     /*apply_silu=*/true);
             }
             else
@@ -756,7 +795,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_DEBUG("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
+            LOG_TRACE("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
                                                          << " channels=" << params_.channels
                                                          << " effective_seq_len=" << effective_seq_len
                                                          << " kernel=" << params_.kernel_size
@@ -783,6 +822,50 @@ namespace llaminar2
         {
             LOG_ERROR("[ShortConv1dStage] Null data pointer");
             return false;
+        }
+
+        const bool request_batched =
+            params_.request_count > 1 &&
+            params_.request_seq_len > 0 &&
+            params_.seq_len == params_.request_count * params_.request_seq_len;
+        if (params_.request_count > 1 && !request_batched)
+        {
+            LOG_ERROR("[ShortConv1dStage] Request-batched CPU short-conv requires flattened "
+                      "seq_len == request_count * request_seq_len");
+            return false;
+        }
+        if (request_batched)
+        {
+            if (!params_.request_seq_lens_host ||
+                static_cast<int>(params_.request_seq_lens_host->size()) <
+                    params_.request_count)
+            {
+                LOG_ERROR("[ShortConv1dStage] Request-batched CPU short-conv requires host request lengths");
+                return false;
+            }
+            const int state_size =
+                params_.channels * std::max(0, params_.kernel_size - 1);
+            if (!params_.kernel->supportsRequestLiveStateBank(
+                    params_.request_count, state_size))
+            {
+                LOG_ERROR("[ShortConv1dStage] CPU backend lacks request-owned live conv-state storage");
+                return false;
+            }
+            const bool ok =
+                params_.kernel->forwardBatchedRequestsWithHostSeqLens(
+                    input_data, weight_data, bias_data,
+                    output_data, params_.conv_state,
+                    params_.seq_len, params_.request_count,
+                    params_.request_seq_len, params_.channels,
+                    params_.kernel_size,
+                    params_.request_seq_lens_host->data(),
+                    /*apply_silu=*/true);
+            if (!ok)
+            {
+                LOG_ERROR("[ShortConv1dStage] CPU grouped request kernel failed");
+                return false;
+            }
+            return true;
         }
 
         const int effective_seq_len = effectivePrefillSeqLen();
@@ -814,7 +897,7 @@ namespace llaminar2
             std::memset(output_data + first_pad, 0, pad_count * sizeof(float));
         }
 
-        LOG_DEBUG("[ShortConv1dStage] Executed: seq_len=" << params_.seq_len
+        LOG_TRACE("[ShortConv1dStage] Executed: seq_len=" << params_.seq_len
                                                           << " effective_seq_len=" << kernel_seq_len
                                                           << " channels=" << params_.channels
                                                           << " kernel=" << params_.kernel_size

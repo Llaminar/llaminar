@@ -76,7 +76,22 @@ namespace llaminar2
 
         bool success;
         void *stage_stream = gpuStream();
-        if (!params_.stage_name.empty())
+        const bool gpu_stage =
+            params_.device_id.is_gpu() || (ctx && ctx->isGPU());
+        if (gpu_stage)
+        {
+            if (!stage_stream)
+            {
+                LOG_ERROR("FusedAddAllreduceStage: GPU allreduce requires an explicit non-null stream"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " device=" << params_.device_id.toString());
+                return false;
+            }
+            success = params_.tp_ctx->allreduceOnStream(
+                output_tensor, params_.stage_name, effective_count, stage_stream,
+                params_.precision);
+        }
+        else if (!params_.stage_name.empty())
         {
             // When a GPU stream is set, route through the on-stream path
             // so the allreduce is graph-capturable and precision-aware.

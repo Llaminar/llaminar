@@ -145,6 +145,82 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
     EXPECT_FALSE(orchestrator.isSnapshotCaptureEnabled());
 }
 
+/**
+ * @brief Equivalent snapshot policies preserve a captured graph's topology epoch.
+ *
+ * Parity forwards deliberately restate their phase filter before every token.
+ * That must clear or replace diagnostic values without forcing perpetual graph
+ * recapture. A genuinely different key set still invalidates topology once.
+ */
+TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_SemanticPolicyIsIdempotent)
+{
+    GraphConfig config;
+    config.d_model = 896;
+    config.n_layers = 24;
+    config.n_heads = 14;
+    config.n_kv_heads = 2;
+    config.d_ff = 4864;
+    config.vocab_size = 151936;
+    config.max_seq_len = 2048;
+
+    DeviceGraphOrchestrator orchestrator(std::make_shared<QwenStandardGraph>(config, nullptr));
+
+    const uint64_t initial_epoch =
+        orchestrator.executor().snapshotConfigurationEpoch();
+
+    // Policy may be declared before enable; no graph contains snapshot nodes yet.
+    orchestrator.setSnapshotCaptureFilter(
+        {"layer0_FFN_RESIDUAL", "EMBEDDING", "", "EMBEDDING"});
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        initial_epoch);
+
+    orchestrator.enableSnapshotCapture();
+    const uint64_t enabled_epoch =
+        orchestrator.executor().snapshotConfigurationEpoch();
+    EXPECT_GT(enabled_epoch, initial_epoch);
+
+    // Repeated lifecycle calls and set-equivalent filters are data operations only.
+    orchestrator.enableSnapshotCapture();
+    orchestrator.setSnapshotCaptureFilter(
+        {"EMBEDDING", "layer0_FFN_RESIDUAL", "EMBEDDING"});
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        enabled_epoch);
+
+    // Adding one selected stage changes captured D2D topology exactly once.
+    orchestrator.setSnapshotCaptureFilter(
+        {"EMBEDDING", "layer0_FFN_RESIDUAL", "LM_HEAD"});
+    const uint64_t changed_epoch =
+        orchestrator.executor().snapshotConfigurationEpoch();
+    EXPECT_EQ(changed_epoch, enabled_epoch + 1);
+
+    orchestrator.setSnapshotCaptureFilter(
+        {"LM_HEAD", "layer0_FFN_RESIDUAL", "EMBEDDING", "LM_HEAD"});
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        changed_epoch);
+
+    orchestrator.disableSnapshotCapture();
+    const uint64_t disabled_identity =
+        orchestrator.executor().snapshotConfigurationEpoch();
+    EXPECT_EQ(disabled_identity, initial_epoch)
+        << "The lean graph topology has one stable identity across diagnostic toggles";
+
+    orchestrator.disableSnapshotCapture();
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        disabled_identity);
+
+    // Re-selecting the exact diagnostic inventory must recover its old cache key.
+    orchestrator.setSnapshotCaptureFilter(
+        {"layer0_FFN_RESIDUAL", "LM_HEAD", "EMBEDDING"});
+    orchestrator.enableSnapshotCapture();
+    EXPECT_EQ(
+        orchestrator.executor().snapshotConfigurationEpoch(),
+        changed_epoch);
+}
+
 TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKey)
 {
     GraphConfig config;

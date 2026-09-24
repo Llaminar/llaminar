@@ -19,6 +19,8 @@
 
 #include "../../backends/GlobalDeviceAddress.h"
 #include "../../config/CollectiveBackendType.h"
+#include "../mpi_orchestration/DeviceInventory.h"
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -58,45 +60,19 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Rank Locality
+    // Physical connection projection
     // =========================================================================
 
-    /**
-     * @brief Physical location of an MPI rank
-     *
-     * Populated from MPI_Get_processor_name() during topology construction.
-     * Used by strategy selectors (backend routing, auto TP/PP placement)
-     * to make topology-aware decisions.
-     */
-    struct RankLocality
+    /** @return Diagnostic label for the canonical physical connection kind. */
+    inline const char *pipelineConnectionName(RankConnectionLocality locality)
     {
-        int rank = -1;              ///< MPI rank index
-        std::string hostname;       ///< Hostname from MPI_Get_processor_name()
-        int node_id = -1;           ///< Derived: ranks with same hostname get same node_id
-    };
-
-    /**
-     * @brief Locality of an inter-stage transfer
-     */
-    enum class TransferLocality
-    {
-        INTRA_NODE,  ///< Both sender and receiver are on the same physical node
-        INTER_NODE,  ///< Sender and receiver are on different physical nodes
-        UNKNOWN,     ///< Locality not yet determined (no rank localities provided)
-    };
-
-    /**
-     * @brief Convert TransferLocality to string
-     */
-    inline const char *transferLocalityName(TransferLocality loc)
-    {
-        switch (loc)
+        switch (locality)
         {
-        case TransferLocality::INTRA_NODE: return "INTRA_NODE";
-        case TransferLocality::INTER_NODE: return "INTER_NODE";
-        case TransferLocality::UNKNOWN:    return "UNKNOWN";
-        default:                           return "UNKNOWN";
+        case RankConnectionLocality::SameRank: return "SAME_RANK";
+        case RankConnectionLocality::SameNode: return "SAME_NODE";
+        case RankConnectionLocality::CrossNode: return "CROSS_NODE";
         }
+        throw std::invalid_argument("Invalid pipeline physical connection kind");
     }
 
     // =========================================================================
@@ -220,7 +196,25 @@ namespace llaminar2
         int sender_rank = -1;    ///< MPI rank that sends, or local handoff rank
         int receiver_rank = -1;  ///< MPI rank that receives, or local handoff rank
         int mpi_tag = 0;         ///< Unique MPI tag for this transfer
-        TransferLocality locality = TransferLocality::UNKNOWN; ///< Physical locality of this transfer
+        /** Inventory-authored membership; absent only in a structural, unbound plan. */
+        std::optional<RankConnectionTopology> connection;
+
+        /**
+         * @return Inventory-owned physical identity for these exact endpoints.
+         * @throws std::logic_error if this is an unbound or subsequently edited edge.
+         *
+         * Transport preparation must use this checked view, never a hostname,
+         * rank-number heuristic or a missing-observation default.
+         */
+        [[nodiscard]] const RankConnectionTopology &physicalConnection() const
+        {
+            if (!connection || connection->sourceRank() != sender_rank ||
+                connection->destinationRank() != receiver_rank ||
+                (kind != GlobalPPTransferKind::MPI && kind != GlobalPPTransferKind::LOCAL_HANDOFF) ||
+                ((kind == GlobalPPTransferKind::LOCAL_HANDOFF) != (sender_rank == receiver_rank)))
+                throw std::logic_error("Pipeline transfer has no matching physical inventory binding");
+            return *connection;
+        }
 
         /** @brief Check if this transfer is a legacy MPI no-op */
         bool isNoop() const { return kind == GlobalPPTransferKind::MPI && sender_rank == receiver_rank; }
@@ -234,7 +228,7 @@ namespace llaminar2
     // =========================================================================
 
     /**
-     * @brief Full pipeline topology for one machine (across MPI ranks)
+     * @brief Full pipeline topology in one local or cross-host MPI rank namespace
      *
      * Created from CLI/YAML configuration and broadcast to all ranks.
      * Each rank uses this to derive its own GlobalPPRankPlan.
@@ -253,7 +247,6 @@ namespace llaminar2
         std::vector<GlobalPPTransfer> transfers;     ///< Inter-stage transfers (derived)
         int total_layers = 0;                        ///< Total transformer layers in model
         int world_size = 0;                          ///< Number of MPI ranks
-        std::vector<RankLocality> rank_localities;    ///< Physical location of each rank (optional)
 
         // =====================================================================
         // Factory
@@ -262,8 +255,10 @@ namespace llaminar2
         /**
          * @brief Build topology from stage specs and derive transfers
          *
-         * Sets up transfer records between adjacent stages based on ownership.
-         * Validates the topology and returns errors if invalid.
+         * Sets up structural transfer records between adjacent stages. This
+         * geometry-only overload does not bind physical membership; callers
+         * inspect validate() for structural errors. Production construction
+         * uses the inventory overload below to validate and bind together.
          *
          * @param specs Stage specifications (will be sorted by stage_id)
          * @param total_layers Total number of transformer layers in the model
@@ -274,14 +269,18 @@ namespace llaminar2
                                       int total_layers, int world_size);
 
         /**
-         * @brief Build topology with rank locality information
+         * @brief Bind structural topology to the canonical discovery/execution inventory.
          *
-         * Same as build() but also populates TransferLocality on each transfer
-         * based on whether sender and receiver are co-located.
+         * Each edge retains an immutable membership projection. The topology
+         * neither owns another inventory nor independently groups hostnames.
+         * @param specs Complete model-stage declarations.
+         * @param total_layers Number of main-model layers covered by the stages.
+         * @param inventory Exact communicator namespace used by every stage.
+         * @return Topology with authenticated physical identity on every edge.
+         * @throws std::invalid_argument for incomplete or malformed rank membership.
          */
         static GlobalPPTopology build(std::vector<GlobalPPStageSpec> specs,
-                                      int total_layers, int world_size,
-                                      std::vector<RankLocality> localities);
+                                      int total_layers, const ClusterInventory &inventory);
 
         // =====================================================================
         // Queries
@@ -298,15 +297,6 @@ namespace llaminar2
 
         /** @brief Get transfer record between two adjacent stages (nullptr if not found) */
         const GlobalPPTransfer *transferBetween(int from_stage, int to_stage) const;
-
-        /** @brief Check if two ranks are on the same physical node */
-        bool areColocated(int rank_a, int rank_b) const;
-
-        /** @brief Get all ranks on a given node */
-        std::vector<int> ranksOnNode(int node_id) const;
-
-        /** @brief Number of distinct physical nodes */
-        int nodeCount() const;
 
         /** @brief Number of stages */
         int numStages() const { return static_cast<int>(stages.size()); }

@@ -4,6 +4,8 @@
  *
  * Tests factory methods for creating LOCAL and GLOBAL tensor parallelism contexts.
  * Uses MPI_COMM_SELF for single-rank tests.
+ * Explicit resolved-scope regressions prevent backend names or hostname aliases
+ * from replacing compiled rank membership during context construction.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -59,6 +61,7 @@ protected:
         plan.global_tp_domain_id = domain_id;
         plan.global_tp_rank_in_domain = rank_in_domain;
         plan.global_tp_domain_size = domain_size;
+        plan.primary_device = GlobalDeviceAddress::cpu(7, "test-host");
 
         return plan;
     }
@@ -198,7 +201,7 @@ TEST_F(Test__TPContextFactory, CreateGlobal_ValidParams)
         MPI_COMM_SELF, // Single rank for testing
         /*domain_id=*/42,
         /*color=*/0,
-        /*key=*/0);
+        /*key=*/0, GlobalDeviceAddress::cpu(7, "test-host"));
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_EQ(ctx->degree(), 1); // MPI_COMM_SELF has size 1
@@ -214,7 +217,7 @@ TEST_F(Test__TPContextFactory, CreateGlobal_NullComm)
         MPI_COMM_NULL,
         /*domain_id=*/0,
         /*color=*/0,
-        /*key=*/0);
+        /*key=*/0, GlobalDeviceAddress::cpu(7, "test-host"));
 
     EXPECT_EQ(ctx, nullptr);
 }
@@ -270,6 +273,9 @@ TEST_F(Test__TPContextFactory, Create_GlobalTPTakesPrecedence)
     plan.global_tp_domain_size = 2;
 
     // Global should take precedence
+    // This is a factory-selection fixture, not cross-rank GPU execution.
+    // Its selected GlobalTP authority has an explicit CPU endpoint.
+    plan.primary_device = GlobalDeviceAddress::cpu(7, "test-host");
     auto ctx = TPContextFactory::create(plan, MPI_COMM_SELF);
 
     ASSERT_NE(ctx, nullptr);
@@ -320,7 +326,7 @@ TEST_F(Test__TPContextFactory, CreateFromDomain_LocalDomain)
 {
     auto domain = createLocalDomain(2);
 
-    auto ctx = TPContextFactory::createFromDomain(domain, MPI_COMM_SELF);
+    auto ctx = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::RANK_LOCAL, MPI_COMM_SELF);
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_TRUE(ctx->isLocal());
@@ -334,41 +340,41 @@ TEST_F(Test__TPContextFactory, CreateFromDomain_EmptyDomain)
     domain.domain_name = "empty";
     // No devices
 
-    auto ctx = TPContextFactory::createFromDomain(domain, MPI_COMM_SELF);
+    auto ctx = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::AUTO, MPI_COMM_SELF);
 
     EXPECT_EQ(ctx, nullptr);
 }
 
-TEST_F(Test__TPContextFactory, CreateFromDomain_UPIBackendIsGlobal)
+TEST_F(Test__TPContextFactory, CreateFromDomain_ResolvedNodeScopeUsesRankContext)
 {
     TPDomainParticipation domain;
     domain.domain_id = 1;
     domain.domain_name = "upi_domain";
-    domain.devices = {GlobalDeviceAddress::cpu()};
+    domain.devices = {GlobalDeviceAddress::cpu(7)};
     domain.my_index_in_domain = 0;
-    domain.backend = CollectiveBackendType::UPI; // UPI implies cross-rank
+    domain.backend = CollectiveBackendType::UPI;
 
-    auto ctx = TPContextFactory::createFromDomain(domain, MPI_COMM_SELF);
+    auto ctx = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::NODE_LOCAL, MPI_COMM_SELF);
 
     ASSERT_NE(ctx, nullptr);
-    // UPI backend creates GlobalTPContext; single-rank auto-detects NODE_LOCAL
+    // Resolved scope creates the rank context; actual MPI membership is node-local.
     EXPECT_FALSE(ctx->isLocal());
     EXPECT_TRUE(ctx->isNodeLocal());
 }
 
-TEST_F(Test__TPContextFactory, CreateFromDomain_MPIBackendIsGlobal)
+TEST_F(Test__TPContextFactory, CreateFromDomain_ResolvedGlobalScopeUsesRankContext)
 {
     TPDomainParticipation domain;
     domain.domain_id = 2;
     domain.domain_name = "mpi_domain";
-    domain.devices = {GlobalDeviceAddress::cpu()};
+    domain.devices = {GlobalDeviceAddress::cpu(7)};
     domain.my_index_in_domain = 0;
-    domain.backend = CollectiveBackendType::MPI; // MPI implies cross-rank
+    domain.backend = CollectiveBackendType::MPI;
 
-    auto ctx = TPContextFactory::createFromDomain(domain, MPI_COMM_SELF);
+    auto ctx = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::GLOBAL, MPI_COMM_SELF);
 
     ASSERT_NE(ctx, nullptr);
-    // MPI backend creates GlobalTPContext; single-rank auto-detects NODE_LOCAL
+    // The declared rank context still observes its actual single-node membership.
     EXPECT_FALSE(ctx->isLocal());
     EXPECT_TRUE(ctx->isNodeLocal());
 }
@@ -385,7 +391,7 @@ TEST_F(Test__TPContextFactory, CreateFromDomain_WithWeights)
     domain.my_index_in_domain = 0;
     domain.backend = CollectiveBackendType::HOST;
 
-    auto ctx = TPContextFactory::createFromDomain(domain, MPI_COMM_SELF);
+    auto ctx = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::RANK_LOCAL, MPI_COMM_SELF);
 
     ASSERT_NE(ctx, nullptr);
     EXPECT_TRUE(ctx->isLocal());
@@ -394,6 +400,31 @@ TEST_F(Test__TPContextFactory, CreateFromDomain_WithWeights)
     auto *local_ctx = dynamic_cast<ILocalTPContext *>(ctx.get());
     ASSERT_NE(local_ctx, nullptr);
     EXPECT_EQ(local_ctx->weights().size(), 2);
+}
+
+/** @test Host aliases do not replace the compiler's rank-local execution scope. */
+TEST_F(Test__TPContextFactory, CreateFromDomain_HostnameAliasesDoNotInferRankScope)
+{
+    auto domain = createLocalDomain(2);
+    domain.devices[0].hostname = "physical-host";
+    domain.devices[1].hostname = "physical-host-alias";
+    const auto context = TPContextFactory::createFromDomain(domain, ExecutionDomainScope::RANK_LOCAL, MPI_COMM_SELF);
+    ASSERT_NE(context, nullptr);
+    EXPECT_TRUE(context->isLocal());
+    EXPECT_EQ(context->degree(), 2);
+}
+
+/** @test No backend is permission to reconstruct an unresolved scope. */
+TEST_F(Test__TPContextFactory, CreateFromDomain_UnresolvedScopeCannotBeInferredFromBackend)
+{
+    auto domain = createLocalDomain(2);
+    for (const auto backend : {CollectiveBackendType::HOST, CollectiveBackendType::UPI, CollectiveBackendType::MPI})
+    {
+        domain.backend = backend;
+        EXPECT_THROW(TPContextFactory::createFromDomain(domain, ExecutionDomainScope::AUTO, MPI_COMM_SELF), std::invalid_argument);
+        EXPECT_THROW(TPContextFactory::createFromDomain(domain, static_cast<ExecutionDomainScope>(99), MPI_COMM_SELF), std::invalid_argument);
+        EXPECT_THROW(TPContextFactory::createFromDomain(domain, ExecutionDomainScope::SINGLE, MPI_COMM_SELF), std::invalid_argument);
+    }
 }
 
 // =============================================================================
@@ -428,8 +459,8 @@ TEST_F(Test__TPContextFactory, CreateLocal_MixedDevices)
 TEST_F(Test__TPContextFactory, CreateGlobal_DifferentDomainIds)
 {
     // Create two contexts with different domain IDs
-    auto ctx1 = TPContextFactory::createGlobal(MPI_COMM_SELF, 1, 0, 0);
-    auto ctx2 = TPContextFactory::createGlobal(MPI_COMM_SELF, 2, 0, 0);
+    auto ctx1 = TPContextFactory::createGlobal(MPI_COMM_SELF, 1, 0, 0, GlobalDeviceAddress::cpu(7));
+    auto ctx2 = TPContextFactory::createGlobal(MPI_COMM_SELF, 2, 0, 0, GlobalDeviceAddress::cpu(7));
 
     ASSERT_NE(ctx1, nullptr);
     ASSERT_NE(ctx2, nullptr);

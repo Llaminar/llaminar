@@ -36,6 +36,7 @@
 
 #pragma once
 
+#include <span>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,20 @@ namespace llaminar2
     // Forward declarations
     class DeviceWorkspaceManager;
     struct WorkspaceRequirements;
+
+    /**
+     * @brief Where a prepared operation receives its execution scratch.
+     *
+     * GPU engines retain capture-stable bindings. Immutable CPU engines may
+     * serve independent participants concurrently and therefore receive the
+     * participant's workspace as an invocation argument instead. This policy
+     * describes ownership, not whether a kernel happens to need zero bytes.
+     */
+    enum class WorkspaceBindingPolicy
+    {
+        PreparedEngine,
+        Invocation,
+    };
 
     /**
      * @brief Interface for kernels that consume centralized workspace buffers
@@ -62,6 +77,12 @@ namespace llaminar2
     public:
         virtual ~IWorkspaceConsumer() = default;
 
+        /** @return Binding authority; ordinary capture-bound engines retain their existing policy. */
+        virtual WorkspaceBindingPolicy workspaceBindingPolicy() const noexcept
+        {
+            return WorkspaceBindingPolicy::PreparedEngine;
+        }
+
         // =========================================================================
         // Workspace Requirements Declaration
         // =========================================================================
@@ -78,25 +99,95 @@ namespace llaminar2
          * @param k Number of input features (may be 0 if kernel-specific)
          * @return WorkspaceRequirements describing all needed buffers
          *
-         * @note Dimensions are typically the MAXIMUM expected values to avoid
-         *       re-allocation during inference. For variable-length sequences,
-         *       pass the maximum sequence length used in KV cache.
+         * @note Family setup queries every retained geometry before publishing
+         *       storage. M is this operation's row count, never KV context
+         *       capacity; live rebinding must not grow published scratch.
          *
          * @note If n and k are 0, kernel uses its internal N_ and K_ dimensions.
          */
         virtual WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const = 0;
 
+        /**
+         * @brief Append scratch required by one fused projection transaction.
+         *
+         * Ordinary per-kernel requirements describe a projection that executes
+         * by itself.  A first-class fused GEMM may additionally keep several
+         * projection partials live at once.  The stage that owns that bundle
+         * calls this method exactly once on its anchor kernel with the complete
+         * ordered output-width inventory.  This prevents a large singleton,
+         * such as an LM head, from being mistaken for a maximum-width fused
+         * bundle while still letting a backend declare its exact concurrent
+         * layout.
+         *
+         * The default implementation is intentionally empty: backends whose
+         * fused implementation does not need extra simultaneous scratch retain
+         * only their ordinary per-kernel requirements.
+         *
+         * @param requirements Aggregate requirements owned by the calling stage.
+         * @param m Maximum rows represented by the captured fused transaction.
+         * @param projection_columns Ordered output width of every projection in
+         *        the transaction. Repeated widths are significant.
+         * @param k Shared input width for the fused transaction.
+         */
+        virtual void appendFusedProjectionWorkspaceRequirements(
+            WorkspaceRequirements &requirements,
+            int m,
+            std::span<const int> projection_columns,
+            int k) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)projection_columns;
+            (void)k;
+        }
+
+        /**
+         * @brief Declare storage for preserving the output addend of a beta epilogue.
+         * @param requirements Calling stage's admitted named-buffer requirements.
+         * @param m Maximum simultaneously live product rows.
+         * @param n Product/output columns, not the input reduction width.
+         *
+         * Call only when beta is nonzero. Backends that accumulate directly
+         * need no additional storage; CPU NativeVNNI preserves the prior output
+         * while its unchanged GEMM writes a separate complete product.
+         */
+        virtual void appendOutputAccumulationWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, int n) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)n;
+        }
+
         // =========================================================================
         // Workspace Binding
         // =========================================================================
 
         /**
+         * @brief Add the intermediate required by a selected SwiGLU/down operation.
+         * @param requirements Stage-owned aggregate of simultaneously live buffers.
+         * @param m Maximum rows, including grouped verification.
+         * @param k Down-projection input width, not output width.
+         *
+         * Plain projections do not request this transform. Backends that fuse
+         * it entirely in registers need no additional storage.
+         */
+        virtual void appendSwiGLUWorkspaceRequirements(
+            WorkspaceRequirements &requirements, int m, int k) const
+        {
+            (void)requirements;
+            (void)m;
+            (void)k;
+        }
+
+        /**
          * @brief Bind a workspace manager to this kernel
          *
-         * After binding, the kernel uses buffers from the workspace manager.
-         * The workspace manager must have allocated all required buffers returned
-         * by getWorkspaceRequirements() for the maximum expected dimensions.
+         * Prepared-engine policy retains a borrowed binding. Invocation policy
+         * retains no kernel-global pointer; the owning stage supplies its arena
+         * with every call. In either case, the manager must have allocated the
+         * declared requirements before execution.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
          *                  Pass nullptr to unbind during allocator rebuilds.
@@ -107,10 +198,11 @@ namespace llaminar2
         virtual void bindWorkspace(DeviceWorkspaceManager *workspace) = 0;
 
         /**
-         * @brief Unbind workspace and return to legacy mode
+         * @brief End a prepared-engine binding before its arena retires.
          *
-         * Equivalent to bindWorkspace(nullptr). Capture-sensitive kernels should
-         * fail execution while unbound.
+         * Invocation-owned engines have no persistent pointer to clear. An
+         * absent required workspace is an execution error, never permission to
+         * construct replacement buffers in the hot path.
          */
         virtual void unbindWorkspace()
         {
@@ -152,7 +244,7 @@ namespace llaminar2
         constexpr const char *QUANT_A = "gemm_quant_a";                       ///< [M × K] INT8 quantized activations
         constexpr const char *SCALES_A = "gemm_scales_a";                     ///< [M] FP32 per-row activation scales (row-wise mode)
         constexpr const char *SCALES_A_BLOCKWISE = "gemm_scales_a_blockwise"; ///< [M × blocks_per_row] FP32 per-block activation scales (blockwise mode)
-        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< [M × blocks_per_row] INT32 per-block activation sums
+        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< M * blocks_per_row INT32 sums; CUDA block-major, ROCm row-major
         constexpr const char *ACC_INT32 = "gemm_acc_int32";                   ///< [M × N] INT32 accumulator
 
         // FP32 temporary buffers
@@ -185,14 +277,12 @@ namespace llaminar2
         constexpr const char *CUDA_FP32_MAPPED_REDIRECT = "cuda_fp32_mapped_redirect"; ///< [batch × M × N] HBM redirect for mapped FP32 outputs
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
-        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
-        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< per-side-stream [kpar × M × max_N] FP32 GEMV partials
+        constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × bounded verifier rows × N] FP32 serial/grouped reduction arena
+        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< aligned side-stream [kpar × bounded rows × stream_N] FP32 GEMV partials
 
-        // CUDA NativeVNNI prefill scratch. These buffers are intentionally
-        // workspace-owned so split-K and stream-K cannot grow hidden VRAM
-        // allocations behind graph capture / workspace planning.
-        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS = "cuda_native_vnni_prefill_splitk_partials"; ///< serial [split_k × M × N], concurrent [slot × split_k × M × max_N] FP32 partials
-        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP = "cuda_native_vnni_prefill_streamk_fixup";       ///< serial [tiles × BM × BN], concurrent [slot × tiles × BM × BN] FP32 stream-K fixup
+        // CUDA NativeVNNI public-M1 K-partition scratch. This persistent arena
+        // is sized before capture and shared only across non-concurrent graphs.
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_CANONICAL_KPART_PARTIALS = "cuda_native_vnni_prefill_canonical_kpart_partials"; ///< serial [kpart × M × N], concurrent [slot × kpart × M × max_N] FP32 partials
         constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
     }
 
@@ -208,8 +298,7 @@ namespace llaminar2
      */
     namespace EmbeddingWorkspaceBuffers
     {
-        constexpr const char *TOKEN_IDS = "embed_token_ids";    ///< [max_seq_len] INT32 token IDs
-        constexpr const char *EMBED_TABLE = "embed_table_temp"; ///< [vocab_size × d_model] FP32 temp for non-GPU embed tables
+        constexpr const char *TOKEN_IDS = "embed_token_ids"; ///< [max_seq_len] INT32 token IDs
     }
 
     /**
@@ -221,7 +310,7 @@ namespace llaminar2
     namespace RoPEWorkspaceBuffers
     {
         constexpr const char *POSITION_IDS = "rope_position_ids";   ///< [max_seq_len] INT32 position IDs
-        constexpr const char *INV_FREQ = "rope_inv_freq";           ///< [head_dim/2] FP32 inverse frequency table
+        constexpr const char *INV_FREQ = "rope_inv_freq";           ///< Fixed slots of immutable [head_dim/2] FP32 frequency tables
         constexpr const char *DEVICE_PARAMS = "rope_device_params"; ///< RoPEDeviceParams struct for graph capture
     }
 

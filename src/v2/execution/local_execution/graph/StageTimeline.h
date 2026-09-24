@@ -22,6 +22,7 @@
 #include <iostream>
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../compute_stages/IComputeStage.h"
+#include "../../../utils/Logger.h"
 
 namespace llaminar2
 {
@@ -179,32 +180,33 @@ namespace llaminar2
         /**
          * @brief Synchronize and collect all GPU event timings
          *
-         * Syncs on the last recorded stop event (single GPU sync), then
-         * queries elapsed time for all recorded event pairs.
+         * Syncs recorded stop events in schedule order, then queries elapsed
+         * time for all recorded event pairs. Synchronizing in order preserves
+         * useful attribution for asynchronous GPU faults: the first failed stop
+         * event names the stage that first observes the backend error.
          *
          * @param gpu_ctx GPU context with eventElapsedTime support
          */
         void collect(IWorkerGPUContext *gpu_ctx)
         {
-            // Synchronize the last valid stop event on every stream. A single
-            // "last stage" event is only sufficient when all stages used one
-            // ordered stream; graph-replay boundaries and collectives can use
-            // distinct explicit streams.
-            std::unordered_map<void *, void *> last_stop_by_stream;
-            for (auto &rec : records_)
-            {
-                if (rec.valid && rec.event_stop)
-                {
-                    last_stop_by_stream[rec.event_stream] = rec.event_stop;
-                }
-            }
-
-            if (last_stop_by_stream.empty())
+            if (!hasValidRecords())
                 return;
 
-            for (const auto &[_, stop_event] : last_stop_by_stream)
+            for (size_t i = 0; i < records_.size(); ++i)
             {
-                gpu_ctx->synchronizeEvent(stop_event);
+                const auto &rec = records_[i];
+                if (!rec.valid || !rec.event_stop)
+                    continue;
+
+                if (!gpu_ctx->synchronizeEventChecked(rec.event_stop))
+                {
+                    LOG_ERROR("[StageTimeline] GPU stage timing sync failed at stage index "
+                              << i << " name='" << rec.name << "' type="
+                              << computeStageTypeName(rec.type)
+                              << " stream=" << rec.event_stream
+                              << " device_ordinal=" << gpu_ctx->deviceOrdinal());
+                    return;
+                }
             }
 
             // Query all elapsed times (CPU-only after sync, no GPU waits)

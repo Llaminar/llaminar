@@ -1,151 +1,308 @@
 /**
  * @file Test__OrchestrationRunnerModelValidation.cpp
- * @brief Unit tests for OrchestrationRunner model file validation.
+ * @brief Unit tests for OrchestrationRunner model and retirement lifecycles.
  *
- * Verifies that buildExecutionPlan() (called from initialize()) hard-fails
- * when the model file does not exist or is not valid GGUF, instead of silently
- * falling back to defaults.
+ * Exercises the runner's shared metadata reader without starting MPI or
+ * hardware discovery. Distributed runner initialization and propagation of
+ * these errors belong to Test__RankInitializationLifecycleMPI, not Unit.
+ * Terminal-policy regressions distinguish ordinary disposal from an exported
+ * prepared-model reuse obligation without loading a model or starting a GPU.
  */
 
 #include <gtest/gtest.h>
-#include <fstream>
 #include <filesystem>
+#include <cstdio>
+#include <unistd.h>
 
-#include "execution/runner/OrchestrationRunner.h"
-#include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
-#include "config/OrchestrationConfig.h"
+#include "planning/PlanningModelMetadata.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "execution/runner/ModelContextRetirement.h"
+#include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "execution/local_execution/device/ReusableExecutionWorkspace.h"
+#include "loaders/ModelContext.h"
 
 using namespace llaminar2;
 
 namespace
 {
 
-    // =========================================================================
-    // Stub plan builder — never reached in failure tests
-    // =========================================================================
-
-    class StubPlanBuilder : public IExecutionPlanBuilder
+    /** @brief Own a unique invalid GGUF without sharing a fixed /tmp pathname. */
+    class InvalidModelFile final
     {
     public:
-        std::vector<RankExecutionPlan> buildAllPlans(
-            const OrchestrationConfig &,
-            const ModelConfig &,
-            const ClusterInventory &) override
+        /** @brief Create a tiny invalid input, never any tensor payload. */
+        InvalidModelFile()
         {
-            return {};
+            char pattern[] = "/tmp/llaminar-invalid-model-XXXXXX";
+            const int descriptor = mkstemp(pattern);
+            if (descriptor < 0) throw std::runtime_error("Cannot create invalid model fixture");
+            close(descriptor);
+            path_ = pattern;
         }
-
-        RankExecutionPlan buildPlanForRank(
-            const OrchestrationConfig &,
-            const ModelConfig &model_config,
-            const ClusterInventory &,
-            int) override
-        {
-            // Record model config so we can verify defaults path
-            last_model_config_ = model_config;
-            return RankExecutionPlan{};
-        }
-
-        std::vector<std::string> validateConfig(
-            const OrchestrationConfig &,
-            const ModelConfig &,
-            const ClusterInventory &) override
-        {
-            return {}; // No errors
-        }
-
-        ModelConfig last_model_config_{};
+        /** @brief Remove only this fixture's recoverable, empty test input. */
+        ~InvalidModelFile() { std::remove(path_.c_str()); }
+        InvalidModelFile(const InvalidModelFile &) = delete;
+        InvalidModelFile &operator=(const InvalidModelFile &) = delete;
+        /** @return Exact path used for error-provenance assertions. */
+        const std::string &path() const noexcept { return path_; }
+    private:
+        std::string path_;
     };
 
-    // =========================================================================
-    // Test Fixture
-    // =========================================================================
-
-    class Test__OrchestrationRunnerModelValidation : public ::testing::Test
+    /** @brief Require a metadata failure and preserve its diagnostic for assertions. */
+    std::string metadataError(const std::string &path)
     {
-    protected:
-        OrchestrationConfig makeConfig(const std::string &model_path)
+        try
         {
-            OrchestrationConfig config = OrchestrationConfig::defaults();
-            config.model_path = model_path;
-            config.tp_degree = 1;
-            config.pp_degree = 1;
-            return config;
+            (void)readPlanningModelMetadata(path);
+            ADD_FAILURE() << "Invalid model unexpectedly supplied planning metadata: " << path;
         }
-    };
-
-    // =========================================================================
-    // Tests
-    // =========================================================================
-
-    TEST_F(Test__OrchestrationRunnerModelValidation, FailsWhenModelFileDoesNotExist)
-    {
-        auto config = makeConfig("/nonexistent/path/to/model.gguf");
-        auto builder = std::make_unique<StubPlanBuilder>();
-
-        OrchestrationRunner runner(std::move(config), std::move(builder));
-        EXPECT_FALSE(runner.initialize());
-        EXPECT_NE(runner.lastError().find("Model file not found"), std::string::npos)
-            << "Error was: " << runner.lastError();
+        catch (const std::runtime_error &error)
+        {
+            return error.what();
+        }
+        return {};
     }
 
-    TEST_F(Test__OrchestrationRunnerModelValidation, FailsWhenModelFileIsInvalidGGUF)
+    TEST(Test__OrchestrationRunnerModelValidation, FailsWhenModelFileDoesNotExist)
     {
-        // Create a temp file with garbage content (not valid GGUF)
-        auto tmp_path = std::filesystem::temp_directory_path() / "invalid_model_test.gguf";
-        {
-            std::ofstream out(tmp_path, std::ios::binary);
-            out << "this is not a valid GGUF file";
-        }
-
-        auto config = makeConfig(tmp_path.string());
-        auto builder = std::make_unique<StubPlanBuilder>();
-
-        OrchestrationRunner runner(std::move(config), std::move(builder));
-        EXPECT_FALSE(runner.initialize());
-        // Should mention the file path in the error
-        EXPECT_NE(runner.lastError().find(tmp_path.string()), std::string::npos)
-            << "Error was: " << runner.lastError();
-        // Should NOT say "Model file not found" — it exists but is invalid
-        EXPECT_EQ(runner.lastError().find("Model file not found"), std::string::npos)
-            << "Error was: " << runner.lastError();
-
-        std::filesystem::remove(tmp_path);
+        const std::string path = "/nonexistent/path/to/model.gguf";
+        const auto error = metadataError(path);
+        EXPECT_NE(error.find(path), std::string::npos) << error;
     }
 
-    TEST_F(Test__OrchestrationRunnerModelValidation, SucceedsWithEmptyPathUsingDefaults)
+    TEST(Test__OrchestrationRunnerModelValidation, FailsWhenModelFileIsInvalidGGUF)
     {
-        // Empty model_path is the testing-only path that uses defaults
-        auto config = makeConfig("");
-        auto builder_raw = new StubPlanBuilder();
-        auto builder = std::unique_ptr<IExecutionPlanBuilder>(builder_raw);
-
-        OrchestrationRunner runner(std::move(config), std::move(builder));
-
-        // initialize() should get past buildExecutionPlan() without error
-        // (it may fail later on graph construction, but the plan phase succeeds)
-        // We just verify it doesn't fail with a model-related error
-        bool result = runner.initialize();
-        if (!result)
-        {
-            // If it failed, it should NOT be due to model file validation
-            EXPECT_EQ(runner.lastError().find("Model file not found"), std::string::npos)
-                << "Error was: " << runner.lastError();
-            EXPECT_EQ(runner.lastError().find("Failed to read model metadata"), std::string::npos)
-                << "Error was: " << runner.lastError();
-        }
+        const InvalidModelFile input;
+        ASSERT_TRUE(std::filesystem::exists(input.path()));
+        const auto error = metadataError(input.path());
+        EXPECT_NE(error.find(input.path()), std::string::npos) << error;
     }
 
-    TEST_F(Test__OrchestrationRunnerModelValidation, ErrorMessageIncludesFilePath)
+    TEST(Test__OrchestrationRunnerModelValidation, EmptyPathCannotInventModelDefaults)
+    {
+        EXPECT_THROW((void)readPlanningModelMetadata(""), std::invalid_argument);
+    }
+
+    TEST(Test__OrchestrationRunnerModelValidation, ErrorMessageIncludesFilePath)
     {
         const std::string path = "/some/specific/path/mymodel.gguf";
-        auto config = makeConfig(path);
-        auto builder = std::make_unique<StubPlanBuilder>();
+        const auto error = metadataError(path);
+        EXPECT_NE(error.find(path), std::string::npos) << error;
+    }
 
-        OrchestrationRunner runner(std::move(config), std::move(builder));
-        EXPECT_FALSE(runner.initialize());
-        EXPECT_NE(runner.lastError().find(path), std::string::npos)
-            << "Error should contain the file path. Error was: " << runner.lastError();
+    /** Disposal cannot manufacture an absent prepared-context consumer. */
+    TEST(Test__ModelContextRetirement, UnexportedModelNeverRestoresExpertPlacement)
+    {
+        for (const auto mode : {MoERebalanceRuntimeMode::Off,
+                                MoERebalanceRuntimeMode::Observe,
+                                MoERebalanceRuntimeMode::Dynamic})
+        {
+            EXPECT_EQ(modelContextOverlayDrainIntent(nullptr, mode),
+                      MoEOverlayDeviceControllerDrainIntent::ReleaseResources);
+        }
+    }
+
+    /** Both entry points to retained teardown preserve its physical obligation. */
+    TEST(Test__ModelContextRetirement, RetainedDynamicModelRequiresRestoration)
+    {
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        for (int phase = 0; phase < 2; ++phase)
+        {
+            EXPECT_EQ(modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Dynamic),
+                      MoEOverlayDeviceControllerDrainIntent::RestorePreparedContext);
+            for (const auto mode : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Observe})
+                EXPECT_EQ(modelContextOverlayDrainIntent(authority, mode),
+                          MoEOverlayDeviceControllerDrainIntent::ReleaseResources);
+            if (phase == 0)
+                ASSERT_TRUE(authority->beginSealing());
+        }
+        // Reading the policy cannot certify or mutate the retained context.
+        EXPECT_EQ(authority->state(), ModelContextReuseAuthority::State::Sealing);
+        EXPECT_FALSE(authority->sealedDeviceMemoryRetention().has_value());
+    }
+
+    /** Invalid policy/state must fail, not masquerade as ordinary disposal. */
+    TEST(Test__ModelContextRetirement, OverlayDrainRejectsUnownedContextAndInvalidPolicy)
+    {
+        auto authority = std::make_shared<ModelContextReuseAuthority>();
+        ASSERT_TRUE(authority->beginSealing());
+        ASSERT_TRUE(authority->publishReusable({}));
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Dynamic),
+                     std::logic_error);
+        authority->invalidate("test retirement failure");
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(authority, MoERebalanceRuntimeMode::Off),
+                     std::logic_error);
+        EXPECT_THROW((void)modelContextOverlayDrainIntent(nullptr, static_cast<MoERebalanceRuntimeMode>(99)),
+                     std::logic_error);
+    }
+
+    TEST(Test__ModelContextReuseAuthority, PublishesFinalRetentionOnlyAtReusableSeal)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        EXPECT_FALSE(authority.sealedDeviceMemoryRetention(&error).has_value());
+        EXPECT_NE(error.find("no sealed"), std::string::npos) << error;
+
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        const std::vector<ModelDeviceMemoryRetention> retention{
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::rocm(0),
+                .prepared_weight_bytes = 1024u,
+                .reusable_workspace_bytes = 256u,
+            },
+        };
+        ASSERT_TRUE(authority.publishReusable(retention, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_EQ(*sealed, retention);
+
+        ASSERT_TRUE(authority.acquireRunnerExclusive(&error)) << error;
+        EXPECT_FALSE(authority.sealedDeviceMemoryRetention(&error).has_value())
+            << "A new runner must not inherit a prior generation's retirement BOM";
+    }
+
+    TEST(Test__ModelContextReuseAuthority, AcceptsWeightsOnlyParticipantRetention)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+
+        const std::vector<ModelDeviceMemoryRetention> retention{
+            ModelDeviceMemoryRetention{
+                .device = DeviceId::rocm(0),
+                .prepared_weight_bytes = 4096u,
+                .reusable_workspace_bytes = 0u,
+            },
+        };
+        ASSERT_TRUE(authority.publishReusable(retention, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_EQ(*sealed, retention);
+    }
+
+    TEST(Test__ModelContextReuseAuthority, RejectsInvalidOrDuplicateRetentionRows)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        EXPECT_FALSE(authority.publishReusable(
+            {
+                ModelDeviceMemoryRetention{
+                    .device = DeviceId::cuda(0),
+                    .prepared_weight_bytes = 10u,
+                    .reusable_workspace_bytes = 1u,
+                },
+                ModelDeviceMemoryRetention{
+                    .device = DeviceId::cuda(0),
+                    .prepared_weight_bytes = 20u,
+                    .reusable_workspace_bytes = 2u,
+                },
+            },
+            &error));
+        EXPECT_NE(error.find("duplicate"), std::string::npos) << error;
+        EXPECT_EQ(authority.state(), ModelContextReuseAuthority::State::Sealing);
+    }
+
+    TEST(Test__ModelContextReuseAuthority, CpuOnlySealPublishesAnExplicitEmptyBom)
+    {
+        ModelContextReuseAuthority authority;
+        std::string error;
+        ASSERT_TRUE(authority.beginSealing(&error)) << error;
+        ASSERT_TRUE(authority.publishReusable({}, &error)) << error;
+        const auto sealed = authority.sealedDeviceMemoryRetention(&error);
+        ASSERT_TRUE(sealed.has_value()) << error;
+        EXPECT_TRUE(sealed->empty());
+    }
+
+    TEST(Test__ModelContextRetirement,
+         RejectsAnIncompleteContractBeforeChangingOwnership)
+    {
+        ModelContextReuseContract contract;
+        contract.reuse_authority =
+            std::make_shared<ModelContextReuseAuthority>();
+
+        EXPECT_THROW(
+            (void)retireExclusiveModelContextReuseContract(contract),
+            std::invalid_argument);
+        EXPECT_NE(contract.reuse_authority, nullptr)
+            << "Validation failure must leave the caller's lifecycle authority intact";
+        EXPECT_EQ(
+            contract.reuse_authority->state(),
+            ModelContextReuseAuthority::State::RunnerExclusive);
+    }
+
+    TEST(Test__ModelContextRetirement,
+         RetiresACompleteCpuOnlyContractWithoutInventingAGpuTransaction)
+    {
+        auto reuse_authority =
+            std::make_shared<ModelContextReuseAuthority>();
+        std::string error;
+        ASSERT_TRUE(reuse_authority->beginSealing(&error)) << error;
+        ASSERT_TRUE(reuse_authority->publishReusable({}, &error)) << error;
+
+        ModelContextReuseContract contract;
+        contract.context = ModelContext::createForTesting(
+            "cpu-only-retirement.gguf");
+        contract.reuse_authority = std::move(reuse_authority);
+        contract.reusable_execution_workspaces =
+            std::make_shared<ReusableExecutionWorkspaceRegistry>();
+        PhysicalMemoryPlanBuilder memory_plan;
+        memory_plan.add(
+            PhysicalMemoryResource{
+                .world_rank = 0,
+                .device = DeviceId::cpu(),
+                .total_bytes = 1024u,
+                .admission_available_bytes = 1024u,
+            },
+            PhysicalMemoryOwner::ModelSourcePayload,
+            1u);
+        const auto memory_admission = std::make_shared<
+            const PhysicalMemoryPlanAdmissionCertificate>(
+            memory_plan.build());
+        contract.physical_memory_authority =
+            std::make_shared<PhysicalMemoryAuthority>(
+                memory_admission, 0);
+
+        const ModelContextRetirementReceipt receipt =
+            retireExclusiveModelContextReuseContract(contract);
+
+        EXPECT_EQ(receipt.retiredDeviceCount(), 0u);
+        EXPECT_EQ(contract.context, nullptr);
+        EXPECT_EQ(contract.reuse_authority, nullptr);
+        EXPECT_EQ(contract.reusable_execution_workspaces, nullptr);
+        EXPECT_EQ(contract.physical_memory_authority, nullptr);
+    }
+
+    TEST(Test__ModelContextRetirement,
+         TypedCpuOnlyPlanNeverEntersTheGpuBatchAPI)
+    {
+        PendingExclusiveModelRetirement pending =
+            PendingExclusiveModelRetirement::begin({});
+        EXPECT_EQ(
+            pending.kind(),
+            PendingExclusiveModelRetirement::Kind::HostOnly);
+        EXPECT_EQ(pending.pendingDeviceCount(), 0u);
+
+        const ModelContextRetirementReceipt receipt = pending.complete();
+        EXPECT_EQ(receipt.retiredDeviceCount(), 0u);
+        EXPECT_THROW((void)pending.complete(), std::logic_error)
+            << "The typed ownership boundary must be consumed exactly once";
+    }
+
+    TEST(OrchestrationRunnerModelValidation,
+         AutomaticIntentCannotReachRunnerConstructionOrReadAModel)
+    {
+        OrchestrationConfig config;
+        config.model_path = "/__factory_must_not_search__/missing.gguf";
+        config.planning_mode = OrchestrationPlanningMode::Automatic;
+        // No MPI/backend initialization exists in this Unit process. An
+        // apply-only factory must reject before attempting either discovery
+        // or model parsing; only frontend publication may authorize selection.
+        auto factory = createOrchestrationRunnerFactory();
+        ASSERT_NE(factory, nullptr);
+        EXPECT_EQ(factory->createFromOrchestrationConfig(config), nullptr);
     }
 
 } // namespace
