@@ -214,11 +214,19 @@ after the PR workflow has emitted its checks. A manual-dispatch workflow
 run cannot satisfy a required PR check, so the diagnostic workflows below are
 not substitutes for this gate.
 
-After the certified PR is squash-merged, `.github/workflows/release.yml`
+After the certified PR is squash-merged, the trusted
+`pull_request_target: closed` event starts `.github/workflows/release.yml`
+only for a merged, same-repository `develop` PR into `master`. This event is
+not suppressed when a squash message happens to quote GitHub's CI-skip marker.
+The workflow also permits an explicit `workflow_dispatch` on `master` to
+recover a missed event; it is not a second certification route. Its publisher
 validates that the resulting **master tree** equals the tested develop image
-tree. Its publisher revalidates both E2E reports, both complete benchmark
-reports, the exact image pair and the successful PR workflow before making any
-registry change. It creates a dated GitHub release such as `2026-09-23.1`,
+tree. GitHub's commit-to-PR association may lag a new squash commit, so the
+publisher also searches closed PR metadata for the exact
+`merge_commit_sha`; it never infers PR identity from a commit title. It
+revalidates both E2E reports, both complete benchmark reports, the exact
+image pair and the successful PR workflow before making any registry change.
+It creates a dated GitHub release such as `2026-09-23.1`,
 then `.2` if another merge releases that UTC day. The first release has concise
 bootstrap notes; later releases list commits since the previous release. The
 release attaches the E2E receipts/reports, benchmark JSON and SVG chart. It

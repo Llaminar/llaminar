@@ -863,6 +863,25 @@ class PublishedImageSuiteTests(unittest.TestCase):
                          "ghcr.io/llaminar/llaminar:master-avx2-" + master,
                          "ghcr.io/llaminar/llaminar:master-avx2"))
 
+    def test_master_release_finds_squash_pr_when_commit_index_is_empty(self):
+        """A squash merge may be visible on the PR before GitHub's commit index."""
+        master = "d" * 40
+        pr = {"number": 9, "merged_at": "2026-09-24T08:03:08Z",
+              "merge_commit_sha": master,
+              "head": {"ref": "develop", "repo": {"full_name": "Llaminar/llaminar"}},
+              "base": {"ref": "master"}}
+        unrelated = {**pr, "merge_commit_sha": "e" * 40}
+        with patch.object(master_release, "github_json",
+                          side_effect=[[], [unrelated, pr]]) as github:
+            self.assertEqual(master_release.merged_develop_pr("Llaminar/llaminar", master), pr)
+        self.assertEqual(github.call_count, 2)
+        self.assertEqual(github.call_args_list[1].args[0],
+                         "repos/Llaminar/llaminar/pulls")
+        with patch.object(master_release, "github_json",
+                          side_effect=[[], [unrelated]]):
+            with self.assertRaisesRegex(ValueError, "not one merged"):
+                master_release.merged_develop_pr("Llaminar/llaminar", master)
+
     def test_master_release_never_rewrites_conflicting_immutable_image(self):
         image = {"id": "sha256:" + "a" * 64,
                  "registry_ref": "ghcr.io/llaminar/llaminar@sha256:" + "b" * 64}
@@ -987,12 +1006,17 @@ class PublishedImageSuiteTests(unittest.TestCase):
         import yaml
         workflow = yaml.load((ROOT / ".github/workflows/release.yml").read_text(),
                              Loader=yaml.BaseLoader)
-        self.assertEqual(workflow["on"]["push"]["branches"], ["master"])
+        self.assertEqual(set(workflow["on"]), {"pull_request_target", "workflow_dispatch"})
+        self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["master"])
+        self.assertEqual(workflow["on"]["pull_request_target"]["types"], ["closed"])
         self.assertEqual(set(workflow["jobs"]), {"promote", "high_water"})
         self.assertEqual(workflow["jobs"]["promote"]["concurrency"]["group"],
                          "llaminar-develop-image-gate")
         self.assertEqual(workflow["jobs"]["high_water"]["needs"], "promote")
         text = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("github.event.pull_request.merged == true", text)
+        self.assertIn("github.event.pull_request.merge_commit_sha", text)
+        self.assertIn("github.ref == 'refs/heads/master'", text)
         self.assertIn("scripts/ci/publish_master_release.py", text)
         self.assertIn("scripts/ci/publish_pr_high_water.py", text)
         self.assertNotIn("release-please", text)

@@ -4,8 +4,15 @@ name: Master release — promote PR-certified images
 # checks passed. The merge is normally squashed, so the release validates the
 # resulting tree against the tested develop image rather than equating SHAs.
 on:
-  push:
+  # A squash message can contain GitHub's CI-skip marker in quoted prose.
+  # The trusted post-merge event still fires in that case; publish only the
+  # already-merged, same-repository develop PR's master commit.
+  pull_request_target:
+    types: [closed]
     branches: [master]
+  # Recovery for a missed merge event. The publisher independently proves the
+  # current master commit, its exact develop PR, both image IDs and artifacts.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,6 +27,14 @@ concurrency:
 jobs:
   promote:
     name: Promote exact images and publish dated GitHub release
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'pull_request_target' &&
+         github.event.pull_request.merged == true &&
+         github.event.pull_request.head.ref == 'develop' &&
+         github.event.pull_request.head.repo.full_name == github.repository)
+      }}
     runs-on: [llaminar-xeon-host]
     timeout-minutes: 90
     concurrency:
@@ -44,7 +59,7 @@ jobs:
           fi
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           fetch-tags: true
           submodules: false
@@ -69,7 +84,7 @@ jobs:
       - name: Authenticate PR evidence and promote the exact runtime bytes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MASTER_SHA: ${{ github.sha }}
+          MASTER_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
@@ -81,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: master-release-${{ github.sha }}
+          name: master-release-${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           path: |
             ${{ runner.temp }}/llaminar-master-release-${{ github.run_id }}/master-release.json
             ${{ runner.temp }}/llaminar-master-release-${{ github.run_id }}/release-notes.md
@@ -100,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           submodules: false
           lfs: false
@@ -115,7 +130,7 @@ jobs:
       - name: Commit upward-only benchmark marks and numbers after merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MASTER_SHA: ${{ github.sha }}
+          MASTER_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
@@ -127,7 +142,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr-high-water-${{ github.sha }}
+          name: pr-high-water-${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           path: ${{ runner.temp }}/llaminar-pr-high-water-${{ github.run_id }}/high-water-publication.json
           if-no-files-found: warn
           retention-days: 90
