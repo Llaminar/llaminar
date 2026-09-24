@@ -245,6 +245,55 @@ of the successful release job. The evidence-only `[skip ci]` commit is not a
 new release candidate by itself: wait for the next ordinary develop source
 commit and its exact-ref image build before opening another master PR.
 
+## Public documentation and release archive
+
+Author general documentation as Markdown under `docs/public/`; the root page
+is deliberately a small landing page while the user guides grow. Add authored
+pages to `mkdocs.public.yml`. Do not put private project notes or generated
+results in that directory. `releases/` is reserved for generated pages.
+
+`.github/workflows/docs.yml` builds and deploys the site at
+`https://llaminar.github.io/llaminar/` using GitHub Pages' Actions deployment
+mode. It runs on a GitHub-hosted CPU runner, without the inference host,
+Docker, model files, or a `gh-pages` branch. Public documentation changes on
+master trigger it; `workflow_dispatch` also supports rebuilding the site alone.
+The release workflow calls it as a dependent reusable workflow after successful
+image/release publication. This explicit call matters: a release created by
+`GITHUB_TOKEN` does not trigger another release-event workflow.
+
+`scripts/ci/build_public_docs.py` reads every published dated GitHub release,
+downloads only the canonical compact assets named by the release publisher,
+and validates their image identities, matrix coverage, receipt digests, and
+per-ISA report relationships. It presents the recorded certificates; it does
+not rerun certification or compare historical results against today's
+high-water marks. A missing, incomplete, or mismatched report fails the site
+build, leaving the previous deployment available.
+
+Each `releases/YYYY-MM-DD.N/` page includes release notes, E2E certificates,
+benchmark certificates, and the unchanged SVG/JSON downloads. Every rebuild
+includes the complete archive, so publishing a new release retains older
+pages. `releases/latest/` is a copy of the release selected by GitHub's latest
+pointer. Drafts, prereleases, and standalone benchmark runs cannot advance it.
+The README embeds `releases/latest/assets/benchmarks.svg` and uses stable
+release-page links; it needs no source commit when new results are released.
+
+Build the same site locally with GitHub CLI authenticated for read access:
+
+```bash
+python3 -m venv /tmp/llaminar-docs-venv
+/tmp/llaminar-docs-venv/bin/pip install -r scripts/ci/requirements-public-docs.txt
+/tmp/llaminar-docs-venv/bin/python scripts/ci/build_public_docs.py \
+  --output /tmp/llaminar-public-docs --site-url http://127.0.0.1:8000/
+python3 -m http.server 8000 --directory /tmp/llaminar-public-docs/site
+```
+
+Use a fresh output directory for each build. Generated content and downloads
+stay outside the source tree. The site-tool dependencies are pinned separately
+from inference dependencies. Documentation proof/archival regressions are in
+`test_published_image_suite.py`, already registered in both the canonical Unit
+and `ProductionTestPreflight` gates. A site update needs these device-free
+checks and a strict MkDocs build, not another multi-hour image certification.
+
 ## Manual published-image workflows
 
 Two separate **manual-dispatch-only** workflows consume the branch's existing

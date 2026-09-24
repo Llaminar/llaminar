@@ -103,6 +103,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 90
 
+  documentation:
+    name: Publish release documentation and certificates
+    needs: promote
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/docs.yml
+
   high_water:
     name: Persist PR-certified high water on develop
     needs: promote

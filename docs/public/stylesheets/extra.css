@@ -1,0 +1,4 @@
+/* Keep long model names and immutable image references readable on phones. */
+.md-typeset table:not([class]) td {
+  overflow-wrap: anywhere;
+}

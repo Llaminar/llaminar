@@ -218,10 +218,8 @@ def release_notes(tag: str, previous_tag: str | None, changes: list[str],
     return "\n".join(lines)
 
 
-def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
-    """Copy only compact authenticated receipts, reports and numbers."""
-    assets = output / "assets"
-    assets.mkdir()
+def release_asset_sources(e2e: Path, benchmarks: Path) -> dict[str, Path]:
+    """Name the public evidence once for release upload and documentation."""
     sources = {
         "image-pair.json": e2e / "images.json",
         "matrix.json": e2e / "manifest.json",
@@ -232,6 +230,14 @@ def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
     for isa in suite.ISAS:
         sources[f"e2e-{isa.lower()}.json"] = e2e / isa.lower() / "e2e.json"
         sources[f"benchmark-{isa.lower()}.json"] = benchmarks / isa.lower() / "benchmarks.json"
+    return sources
+
+
+def release_assets(e2e: Path, benchmarks: Path, output: Path) -> list[Path]:
+    """Copy only compact authenticated receipts, reports and numbers."""
+    assets = output / "assets"
+    assets.mkdir()
+    sources = release_asset_sources(e2e, benchmarks)
     for name, source in sources.items():
         shutil.copyfile(source, assets / name)
     return list(assets.iterdir())

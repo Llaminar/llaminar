@@ -1,0 +1,74 @@
+name: Public documentation and release certificates
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - docs/public/**
+      - mkdocs.public.yml
+      - scripts/ci/build_public_docs.py
+      - scripts/ci/requirements-public-docs.txt
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+  # The release workflow calls this directly. Releases created with the
+  # workflow token do not trigger a separate release-published workflow.
+  workflow_call:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: llaminar-public-docs
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          submodules: false
+          lfs: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install documentation tools
+        run: python -m pip install -r scripts/ci/requirements-public-docs.txt
+      - name: Check release and documentation contracts
+        run: python tests/v2/unit/scripts/test_published_image_suite.py
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build public docs from the complete published release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SITE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          python scripts/ci/build_public_docs.py \
+            --repository "$REPOSITORY" \
+            --site-url "$SITE_URL" \
+            --output "$RUNNER_TEMP/llaminar-public-docs-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Upload website
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/llaminar-public-docs-${{ github.run_id }}-${{ github.run_attempt }}/site
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Retain the documentation publication receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llaminar-public-docs-${{ github.run_id }}-${{ github.run_attempt }}/publication.json
+          if-no-files-found: warn
+          retention-days: 90
