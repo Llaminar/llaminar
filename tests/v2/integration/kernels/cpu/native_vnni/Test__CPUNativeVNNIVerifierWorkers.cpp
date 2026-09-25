@@ -10,6 +10,8 @@
  * Complete FFN transactions preserve every intermediate output byte. A second
  * process registration disables kernel diagnostics and audits C++ allocations
  * only during warmed execution, independently of weight/workspace preparation.
+ * Mixed-format transactions cycle the entire codebook registry through each
+ * projection role: a GGUF file label must never imply uniform FFN weights.
  */
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "utils/NativeVNNITestPartialStorage.h"
@@ -231,8 +233,18 @@ TEST(CPUNativeVNNIVerifierWorkers, DenseProjectionUsesResolvedTeamAndPreservesRo
             proveVerifierWorkers(format, 2048, 2048);
 }
 
-/** @brief Prove real FFN and router-Q8 bytes, auditing allocations when collection is disabled. */
-void proveExpertTransaction()
+/** @brief Whether projection roles share a source format or cover distinct codebooks. */
+enum class ExpertFormatLayout
+{
+    Uniform, ///< Existing same-format oracle and allocation gate.
+    Mixed, ///< Every registry format occupies each of the three projection roles.
+};
+
+/**
+ * @brief Prove FFN/router bytes and audit warmed execution when diagnostics are off.
+ * @param layout Select uniform or independent per-projection source formats.
+ */
+void proveExpertTransaction(ExpertFormatLayout layout = ExpertFormatLayout::Uniform)
 {
     VerifierWorkerScope restore;
     constexpr int width = 256, max_rows = 31;
@@ -245,13 +257,20 @@ void proveExpertTransaction()
     std::vector<float> expected_gate(gate.size()), expected_up(gate.size()), expected_down(gate.size());
     std::array<float, width> activated{};
 
-    for (const auto &format : quantizedVerifierFormats())
+    const auto &formats = layout == ExpertFormatLayout::Mixed
+        ? quantizedMoEVerifierFormats() : quantizedVerifierFormats();
+    for (size_t index = 0; index < formats.size(); ++index)
     {
-        SCOPED_TRACE(format.label);
+        const auto &format = formats[index];
+        const auto &up_format = layout == ExpertFormatLayout::Mixed
+            ? formats[(index + 1) % formats.size()] : format;
+        const auto &down_format = layout == ExpertFormatLayout::Mixed
+            ? formats[(index + 2) % formats.size()] : format;
+        SCOPED_TRACE(std::string(format.label) + '/' + up_format.label + '/' + down_format.label);
         omp_set_num_threads(1);
         auto gate_weight = format.create({width, width}, 7109);
-        auto up_weight = format.create({width, width}, 7117);
-        auto down_weight = format.create({width, width}, 7121);
+        auto up_weight = up_format.create({width, width}, 7117);
+        auto down_weight = down_format.create({width, width}, 7121);
         CPUNativeVNNIGemmKernel gate_kernel(gate_weight.get(), 0, -1, policy);
         CPUNativeVNNIGemmKernel up_kernel(up_weight.get(), 0, -1, policy);
         CPUNativeVNNIGemmKernel down_kernel(down_weight.get(), 0, -1, policy);
@@ -260,19 +279,21 @@ void proveExpertTransaction()
         const std::vector<ITensorGemm::TensorProjectionDesc> router_projection{
             {&gate_kernel, &router_output, width, nullptr, "router_gate"}};
         quantize_activations_to_q8_1(input->data(), q8.data(), max_rows, width, blocks, policy);
-        NativeVNNITestPartialStorage serial_partials(gate_kernel.packedWeights(), 1);
+        NativeVNNITestPartialStorage gate_partials(gate_kernel.packedWeights(), 1);
+        NativeVNNITestPartialStorage up_partials(up_kernel.packedWeights(), 1);
+        NativeVNNITestPartialStorage down_partials(down_kernel.packedWeights(), 1);
         for (int row = 0; row < max_rows; ++row)
         {
             gemv_native_vnni_preq(gate_kernel.packedWeights(), q8.data() + row * blocks,
-                expected_gate.data() + row * width, serial_partials.span());
+                expected_gate.data() + row * width, gate_partials.span());
             gemv_native_vnni_preq(up_kernel.packedWeights(), q8.data() + row * blocks,
-                expected_up.data() + row * width, serial_partials.span());
+                expected_up.data() + row * width, up_partials.span());
             primitives::compute_swiglu_gpu_aligned_expert_serial(expected_gate.data() + row * width,
                 expected_up.data() + row * width, activated.data(), width);
             quantize_activations_to_q8_1(activated.data(), expected_q8.data() + row * blocks,
                 1, width, blocks, policy);
             gemv_native_vnni_preq(down_kernel.packedWeights(), expected_q8.data() + row * blocks,
-                expected_down.data() + row * width, serial_partials.span());
+                expected_down.data() + row * width, down_partials.span());
         }
         for (int workers : {1, 3, 7})
         for (int rows : {2, 3, 15, max_rows})
@@ -366,6 +387,13 @@ TEST(CPUNativeVNNIVerifierWorkers, ExpertTransactionPreservesAllFormats)
 {
     ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
     proveExpertTransaction();
+}
+
+/** @test Mixed source codebooks preserve every intermediate and allocate no hot scratch. */
+TEST(CPUNativeVNNIVerifierWorkers, MixedFormatExpertTransactionPreservesEveryProjection)
+{
+    ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("kernel"));
+    proveExpertTransaction(ExpertFormatLayout::Mixed);
 }
 
 /** @test Disabled collection must not allocate before the collector rejects a record. */

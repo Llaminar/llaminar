@@ -2,8 +2,11 @@
 
 ## Objective and baseline
 
-The active target is **50 generated tokens/s with dynamic MTP on both CPU
-sockets**. The preceding prefill checkpoint, `047bddf22`, passes 668 Unit
+The requested target was **50 generated tokens/s with dynamic MTP on both CPU
+sockets**. On September 25 the user accepted the approximately 42 tok/s result
+as good enough and asked to wrap up this tuning slice. The 50 tok/s target was
+not achieved; further performance exploration is stopped, not certified as
+complete. The preceding prefill checkpoint, `047bddf22`, passes 668 Unit
 and 369 ProductionTestPreflight tests. That functional evidence does not
 establish this new performance target.
 
@@ -26,19 +29,315 @@ benchmark prompt, not a natural-language acceptance or accuracy certificate.
   and dynamic expert maintenance unchanged. No profiler in timing runs.
 - Dynamic measurements complete 10, 20 and 20 within-tier expert moves.
 
+Reproduce the final default-dynamic lane from a Release AVX512 build:
+
+```bash
+./build_v2_release/llaminar2 benchmark \
+  -m /mnt/llaminar-production-parity/cache/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf \
+  --only-backends cpu --auto-device-counts cpu=2 -c 8192 \
+  --prompt "$(printf ' test%.0s' {1..512})" \
+  -n 256 --temperature 0 --seed 42 --mtp --mtp-depth-policy dynamic \
+  --benchmark-json-output /tmp/qwen36-cpu2-dynamic.json
+```
+
+This intentionally uses the production auto planner and defaults, including
+the CPU vocabulary-sharded head and 28 physical workers per socket. Clear
+profiling and ISA/thread diagnostic overrides before timing. For the matched
+prefill checkpoint, omit the MTP options and use `-n 16`; do not compare that
+short-output checkpoint with the different residency history of the 256-token
+dynamic run. The repetitive prompt is a stable performance fixture, not an
+application-quality or long-context certificate.
+
 Local diagnostic artifacts are under `/tmp/llaminar-cpu-mtp.FtIQja/`; they
 are not committed corpus payloads or durable certification artifacts.
 
+## September 25: retain CPU expert workspace through replay
+
+The `5d12abcc8` checkpoint is committed locally. Subsequent clean fixed-depth
+controls on that binary give 28.72/36.45/42.24/39.62/34.60 tok/s at depths
+1/2/3/4/5. Depths 1–3 accept every draft on this repetitive prompt; depths 4/5
+accept 84.91%/77.25%. All measured streams match the dynamic control. Dynamic
+remains adaptive over 1–15; these controls are not sufficient evidence to
+install a CPU policy for other workloads.
+
+Reducing the physical worker budget is not profitable: 14/20/28 workers per
+socket give 32.70/38.10/39.14 tok/s in matched dynamic runs. Prepared anonymous
+memory is local to each rank's socket; the observed remote anonymous residency
+is below 0.3 MiB. No worker/default-placement override is retained.
+
+The endpoint profile identifies a redundant setup operation: every CPU packet
+calls `MoEExpertComputeStage::bindWorkspace()`, which walks the full prepared
+gate/up/down inventory and performs RTTI/virtual dispatch. Production CPU
+engines have invocation-owned scratch, so those per-engine binds store nothing.
+The retained stage already receives the correct workspace during graph setup.
+CPU replay now checks that retained binding instead, just as retained GPU
+replay does. Newly installed expert engines receive the same stage workspace
+as an explicit invocation argument; movement does not rebind scratch.
+
+```mermaid
+flowchart LR
+    S[Setup: bind admitted workspace] --> R[Retained CPU stage]
+    P[Packet: live rows and residency epoch] --> R
+    E[New immutable expert bank] --> R
+    R --> V[Validate retained workspace identity]
+    V --> C[Execute current engines with invocation-owned scratch]
+    C --> O[Publish canonical expert rows]
+```
+
+Across 7,872 endpoint calls in three measured requests, the separately profiled
+`stage_setup_and_transfers` total falls from **648.42 ms to 42.43 ms** (93.5%).
+Total endpoint service falls from 4.546 s to 3.744 s, but its nested compute
+time also varies, so the entire difference must not be attributed to binding.
+These instrumented runs are attribution evidence, not throughput certificates.
+
+Two clean dynamic-MTP runs measure **39.93** and **40.84 tok/s**. The latter's
+three requests are 40.77/40.83/40.93 tok/s. All per-request token streams match
+the checkpoint control; acceptance remains 87.05%, final depth 4, with no
+profiling enabled. The exact matched MTP-off 512-prompt/16-output prefill check
+is **351.04 tok/s**, versus the checkpoint's 352.93. No weight, activation,
+workspace-capacity, dispatch-policy or MTP-depth-policy change is involved.
+The **50 tok/s goal remains unmet**.
+
+The focused regression fails on the previous implementation's repeated binds
+and passes with retained binding. It replays 20 packets, installs a different
+expert engine bank halfway through, checks the new numerical signature, and
+checks both zero replay-time binds and the workspace actually supplied to
+each numerical invocation. Its named integration registration,
+`V2_Integration_CPUExpertWorkspaceReplay`, belongs to ProductionTestPreflight.
+
+Post-fix validation passes **670/670 Unit tests in 75.91 s** and **99/99
+CPU-tagged ProductionTestPreflight tests in 223.92 s**. That CPU projection
+includes all-format CPU-to-CUDA/ROCm ticket ingress, native and forced AVX2,
+and quantized plus FP16/BF16/FP32 movable experts. The two native GPU ticket
+registrations also pass a separate 2/2 check in 12.74 s. The true AVX2 build
+passes both the prepared-weight unit fixture and the focused workspace
+preflight entry (2/2). The authenticated driver interval is complete and clean,
+with zero new kernel records or driver findings. This is a focused CPU slice,
+not recertification of the previously recorded unrelated GPU-only issues.
+
+Additional grouped-kernel diagnostics retain candidate evidence without
+installing an override. At eight IQ2_S experts/20 route rows, Auto/Pairwise
+medians across three independent runs are 211.18/193.32 us for the complete
+persistent FFN.
+At four experts/20 rows, Auto is 194.69 us versus Pairwise 197.31 us and WideRows
+201.30 us. WideRows deliberately rejects the eight-expert layout's two-row
+members. The mixed results require canonical workload/ISA/all-format dispatch
+training, not a blanket policy change. Local evidence for this entire slice is
+`/tmp/llaminar-cpu-depth.Oo8oK9/`; no result payloads are committed.
+
 ## Investigation order
 
-1. Measure fixed depths 1, 2 and 3 against the same serial control before
-   changing depth policy.
-2. Collect a separate rank-specific CPU-stage and MTP timing profile.
-   Attribute verifier, draft head, state publication, sampling and collective
-   costs; do not infer a kernel bottleneck from overall throughput alone.
-3. Isolate the largest measured cost, preserve serial-row byte equivalence,
+### Vocabulary communication and CPU greedy selection follow-up
+
+The production row-strided MPI exchange was isolated on the same two sockets.
+For 124,160 FP32 logits per rank, median exchange time is about 121 us for one
+row, 478 us for two, 1,216 us for five and 4,048 us for sixteen. Retaining the
+derived datatype only saves a few microseconds. It does not explain the
+whole-model gap, and no transport/datatype-cache change is installed. Stage
+all-gather timing also includes peer arrival; it is not pure wire time. Greedy
+sampling could avoid full-logit materialization, but that requires an explicit
+publication contract spanning stochastic requests and retained graph identity,
+not silently skipping an existing collective.
+
+CPU greedy sampling did a serial vocabulary scan with unconditional runner-up
+tracking even when margin diagnostics were disabled. It now uses the existing
+ISA-dispatched `select_topk(..., 1)` primitive. Explicit margin diagnostics keep
+their previous second-best semantics. This changes no model arithmetic, head
+sharding, request policy, workspace capacity or GPU sampling path.
+
+The isolated clean scan medians, in microseconds, are:
+
+| Vocabulary width | Previous scan | AVX512 selection | Forced AVX2 selection |
+|---|---:|---:|---:|
+| 124,160 | 134.67 | 8.81 | 20.96 |
+| 248,320 | 270.36 | 21.48 | 42.46 |
+
+The forced-AVX2 timing uses the AVX512 Release binary's runtime AVX2 route;
+it is not mislabeled as an AVX2-only code-generation measurement. Independent
+AVX2-only Integration tests prove the actual narrow build's selection and
+production forward/sampling behavior. The primitive is unchanged; no new
+format-specific kernel or hand-authored dispatch policy is involved.
+
+Four independent unprofiled Release processes in control/change/change/control
+order measure **41.83 / 41.27 / 42.32 / 41.57 tok/s**. Their pair means are
+41.70 versus 41.80, only **0.23%**, inside the observed run-to-run spread: this
+is a clear sampling microbenchmark win, **not a demonstrated whole-model
+decode gain**. All twelve measured 256-token streams match, acceptance remains
+87.05%, adaptive bounds remain 1–15 with final depth 4, and every process
+completes 10/20/20 same-priority moves. The exact MTP-off 512-prompt/16-output
+prefill check is **349.00 tok/s**, preserving the 350-class checkpoint.
+
+Focused tests cover unaligned rows, every relevant SIMD tail, first-winner
+ties, signed zero and non-finite values across scalar/AVX2/AVX512/runtime
+selection. The real two-rank forward test covers full and sharded publications,
+penalties and absence of an extra sampler collective. Native and true-AVX2
+focused checks each pass 4/4. The new primitive checks are explicitly registered
+as `V2_Integration_CPUGreedySelector` and its forced-AVX2 sibling in
+ProductionTestPreflight. Performance measurements remain outside that gate.
+Local artifacts are `/tmp/llaminar-cpu-gather.dEsrJl/`.
+
+The final rebuilt sampling/workspace slice passes **670/670 Unit in 79.20 s**
+and **101/101 CPU-tagged ProductionTestPreflight in 229.22 s**, with native
+and true-AVX2 focused checks each passing 4/4. The authenticated driver interval
+is complete and clean: zero new records and findings. These results do not
+recertify the parked GPU-only issues.
+
+A subsequent `mtp,stage_cpu,kernel` profile preserves the control token stream
+but drops to 27.63 tok/s from the clean 42-class runs. Its heavier diagnostic
+overhead makes it unsuitable as a timing certificate. The root's three
+measured decodes attribute 7.77 s to routed expert stages, 3.08 s to shared
+expert FFNs, 2.90 s to vocabulary projections, and 2.22 s to GDN projections.
+These stage families are inside the 23.32 s verifier / 3.73 s draft totals;
+the nested scopes must not be added together. Draft sampling takes only
+27.20 ms over 672 calls. The remaining target is projection economy, not the
+now-small sampling scan.
+
+The same profile exposes a limitation of the old uniform-format expert
+microbenchmark: the model's gate/up projections are predominantly execution
+codebook 13 (IQ2_S), while down projections are predominantly codebook 4
+(IQ4_NL/IQ4_XS family), not IQ2_S. Smaller layer groups use other formats.
+The diagnostic harness now permits an independently selected down format and
+records it in CSV/profiler evidence; no model weights or runtime policy change.
+Do not treat earlier all-IQ2_S FFN timings as an exact model-workload match.
+
+Reading the local GGUF tensor table, without hashing or reading weight payloads,
+confirms 39/41 gate/up blocks are IQ2_S; one is IQ3_S and one Q2_K. Down is
+IQ4_XS in 37 blocks, Q6_K in three and Q4_K in one. The mixed-format functional
+proof cycles all 21 registry formats through every projection role, unequal
+M, three worker budgets and nested workshares. Native/forced-AVX2 focused gates
+pass 6/6 and the true-AVX2 build passes 3/3. Both ISA registrations are explicit
+ProductionTestPreflight entries, not performance thresholds.
+
+An unsigned-biased lookup-table candidate removed repeated integer XOR work
+from IQ2_S/IQ2_XS/IQ1_M AVX512 dots without changing arithmetic or packing.
+All 11 affected functional groups passed, including the independent scalar
+ordered-partition oracle. However, three fresh interleaved mixed-format runs
+at eight experts / twenty route rows measured complete-FFN medians of
+**146.42 us control versus 146.15 us candidate**: no meaningful win. Other
+layouts were inconsistent too. The candidate was removed, including its extra
+read-only tables. There is no new production kernel or dispatch-policy change.
+Artifacts are `/tmp/llaminar-cpu-grid.O3Fuo3/`; only the improved harness,
+functional coverage and this evidence summary are retained in the worktree.
+
+After removing the candidate and rebuilding the complete gate dependencies,
+the final source passes **670/670 Unit in 76.44 s** and **103/103 CPU-tagged
+ProductionTestPreflight in 226.66 s**. The additional two preflight entries
+are the mixed-format expert-transaction proofs. The authenticated driver
+interval is complete and clean, with zero new records or findings.
+
+### Current depth and ISA controls
+
+On that final source, a fresh unprofiled fixed-depth-3 process measures
+**44.20 tok/s** with 100% draft acceptance. The adjacent default-dynamic
+process measures **41.59 tok/s**, still ending at depth 4 with 87.05%
+acceptance. All generated token IDs agree. The roughly 6.3% fixed-depth lead
+is potential controller headroom on this repetitive prompt, not evidence for
+a universal depth cap or a measured 50 tok/s implementation. The generated
+depth table currently contains GPU rules only; extending it for CPU requires
+the canonical multi-prompt training and holdout workflow.
+
+Forcing runtime AVX2 inside the same AVX512 Release build is slower:
+**31.59 tok/s**, with unchanged output tokens but 85.09% draft acceptance.
+This is a runtime-ISA diagnostic, not an AVX2-only Release certificate. No ISA
+override is retained. An independent eighteen-second hardware-counter interval
+during measured requests includes both prefill and decode: page walks are
+active for 0.59% of sampled cycles, while outstanding-memory stalls account
+for 33.53%. It does not support rewriting allocation around huge pages, nor
+does the aggregate identify one particular kernel's limiting resource.
+These diagnostics are in the same artifact root's `depth/` subdirectory;
+their profiler run is excluded from clean timing evidence.
+
+A second compact-kernel candidate interleaved two independent output vectors
+inside each K traversal. Its first lowering spilled accumulators in the inner
+loop. Bounding activation-broadcast lifetimes removed those inner-loop spills
+for the inspected IQ2_S/IQ1_M variants, while some accumulated partition
+values still used stack storage at partition boundaries. All 11 focused
+functional groups passed. Three interleaved control/candidate processes at
+eight experts / twenty mixed-format routes measured complete-FFN medians of
+172.32 versus 186.66 us, with considerable process-to-process variation.
+There was no reliable win, so the entire experiment was removed. The restored
+Release executable and core library are byte-identical to the preserved
+control; no wider-tile policy or compiler workaround is retained.
+
+OpenMP spin-budget controls do not support changing the worker default.
+`GOMP_SPINCOUNT=1000`, `10000`, and unset measure **38.28 / 41.87 / 41.90
+tok/s**, respectively. All nine measured 256-token streams are identical;
+each process retains 87.05% draft acceptance and 10/20/20 completed moves.
+The very short spin interval hurts this fine-grained workload.
+
+An explicit `--threads 56` experiment uses both SMT siblings of all 28 cores
+on each socket, verified through live worker affinity and CPU observations.
+It measures only **21.45 tok/s**, with unchanged output tokens and 84.72%
+acceptance. This is not evidence for increasing the default worker budget.
+The canonical 28-physical-core team and unset spin count remain unchanged.
+Artifacts are `depth/spin-*`, `depth/smt56.*`, and the captured affinity file
+under the artifact root above. No timing here includes profiler collection.
+
+### Shared-expert SwiGLU/down transaction
+
+The shared-expert verifier still materialized a complete FP32 activation,
+opened another workshare to quantize it, then opened down projection. The
+routed-expert path already supplied an exact fused SwiGLU/Q8 publisher.
+At the shared projection's M=5, N=2048, K=256 Q6 geometry, three fresh
+alternating-path microbenchmarks give median-of-medians of **59.65 us separate
+versus 34.20 us retained-team** on AVX512. Forced AVX2 gives **71.25 versus
+57.79 us**. Every Q8 block and projected output byte agrees with an independent
+serial-row witness. These are isolated timings, not a whole-model certificate.
+
+The experimental unrotated, block-aligned verifier transaction reused that
+publisher and kept one team alive through down projection. It borrowed only
+the existing Q8 and partial banks. The caller's serial TP output geometry was
+explicitly scoped onto each worker and restored afterward. Rotation and
+partial-block inputs retained their distinct stored-FP32 transform contract.
+There were no format, precision, arena-capacity or generated-policy changes.
+
+The focused preflight first failed on the old full-FP32 scratch requirement,
+then passed all 21 formats, both arithmetic policies, every grouped row count
+from 2 through 31, three worker budgets, output tails, and caller/worker
+TP-scope restoration. Native/forced-AVX2 registrations passed 2/2, and a
+true-AVX2 build passed 1/1. The experimental source passed 670/670 Unit and
+105/105 CPU preflight, including observational-counter checks.
+
+Clean Release control/change/change/control runs measured **42.06 / 41.28 /
+41.58 / 40.95 tok/s**. The pair means were **41.50 control versus 41.43
+candidate**: no whole-model improvement. All twelve 256-token streams were
+identical, profiling was disabled, acceptance stayed 87.05%, the dynamic range
+stayed 1–15 with final depth 4, and each process completed 10/20/20 moves.
+The candidate's matched MTP-off prefill was 346.70 tok/s, with per-request
+measurements of 356.47/353.02/331.69. Do not compare its longer dynamic-prefill
+history directly with the short-output prefill checkpoint.
+
+Separate native/forced-AVX2 profiles of only the retained-team Q6 projection
+recorded zero lost samples, 0.36/0.65 IPC and 0.05%/0.04% last-level cache
+reference misses. Native cycle samples were predominantly OpenMP waits and
+Q6 dot work; this does not identify that wait share as removable wall latency.
+The driver interval completed cleanly with zero new records or findings.
+
+Because the production economy gate showed no benefit, the candidate, its
+temporary registration/fixture and its candidate-only microbenchmark were
+removed. The generic prepared-workspace reuse, SIMD greedy sampling, and
+mixed-format expert regressions remain. The restored Release executable and
+core library are byte-identical to the preserved control. Final rebuilt gates
+pass **670/670 Unit in 75.38 s**, **103/103 CPU-tagged
+ProductionTestPreflight in 225.88 s**, and **6/6 focused true-AVX2 checks in
+3.54 s**. The two candidate-only preflight entries were removed with their
+implementation, explaining the return from 105 to 103 entries. The final
+driver interval is complete and clean, with zero new records or findings.
+No new dispatch or depth policy is installed. Raw evidence remains local
+under the artifact root above as `wrap-*` and `shared-*`; no benchmark,
+profiler, build, or test process is left running. This does not renew the full
+cross-backend or image certificate. Further tuning is stopped at the user's
+request, and the 50 tok/s objective remains unachieved.
+
+### Future tuning sequence (not running in this slice)
+
+1. Fixed-depth controls and rank-specific stage attribution are now available.
+   Keep the default dynamic range intact until multi-prompt/holdout evidence
+   supports a generated CPU depth policy.
+2. Target the measured projection costs with the mixed-format FFN harness;
+   preserve serial-row byte equivalence,
    and validate AVX2 and AVX512 behavior for affected formats/geometries.
-4. Repeat clean production timing and verify longer natural-language/code
+3. Repeat clean production timing and verify longer natural-language/code
    output streams. Functional regressions belong in ProductionTestPreflight;
    performance thresholds do not.
 

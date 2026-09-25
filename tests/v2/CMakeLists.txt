@@ -5366,6 +5366,27 @@ add_v2_test(V2_Unit_Sampler
     LABELS "V2;Unit;Sampling;Generation;BasicFeatures;Greedy;Temperature;TopK;TopP"
     MPI_PROCS 1  # Sampler is single-rank only
 )
+# Greedy CPU/MTP sampling reuses the same ISA-dispatched selection primitive.
+# Exact first-winner and tail behavior is a functional gate, never a timing bar.
+add_v2_test(V2_Integration_CPUGreedySelector
+    COMMAND $<TARGET_FILE:v2_test_sampler>
+        --gtest_filter=SamplerTest.CPUGreedySelectorRetainsFirstWinnerAndEverySIMDTail
+    LABELS "V2;Integration;CPU;Sampling;MTP;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+add_v2_test(V2_Integration_CPUGreedySelector_ForcedAVX2
+    COMMAND $<TARGET_FILE:v2_test_sampler>
+        --gtest_filter=SamplerTest.CPUGreedySelectorRetainsFirstWinnerAndEverySIMDTail
+    LABELS "V2;Integration;CPU;Sampling;MTP;AVX2;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+if(TEST V2_Integration_CPUGreedySelector_ForcedAVX2)
+    set_tests_properties(V2_Integration_CPUGreedySelector_ForcedAVX2 PROPERTIES
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
+    )
+endif()
 
 # Test: Deterministic mode policy gates
 add_executable(v2_test_deterministic_mode unit/utils/Test__DeterministicMode.cpp)
@@ -13218,7 +13239,7 @@ foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
     string(TOLOWER "${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_NativeVNNIVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers> --gtest_brief=1
-            --gtest_filter=-CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate
+            --gtest_filter=-CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate:CPUNativeVNNIVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
@@ -13230,6 +13251,14 @@ foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
             --gtest_filter=CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate
             --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
+    add_v2_test(V2_Integration_CPU_NativeVNNIMixedFormatFFN_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+            --gtest_filter=CPUNativeVNNIVerifierWorkers.MixedFormatExpertTransactionPreservesEveryProjection
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;MixedFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
@@ -19420,6 +19449,13 @@ add_v2_test(V2_Unit_MoELocalExpertStage_PreparedWeights
     LABELS "V2;Unit;MoE;Stages;PreparedWeights;RuntimeTable;GraphCapture"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPUExpertWorkspaceReplay
+    COMMAND $<TARGET_FILE:v2_test_moe_local_expert_stage_prepared_weights>
+        --gtest_filter=Test__MoELocalExpertStage_PreparedWeights.CPUWorkspaceIsSetupOwnedAcrossPacketsAndExpertReplacement
+    LABELS "V2;Integration;CPU;MoE;Workspace;Lifecycle;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 120)
 
 add_executable(v2_test_moe_local_expert_stage_params
     unit/execution/compute_stages/Test__MoELocalExpertStage_Params.cpp)
@@ -19955,6 +19991,10 @@ add_v2_test(V2_Integration_FPWeightPipeline
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CPUGreedySelector
+    V2_Integration_CPUGreedySelector_ForcedAVX2
+    V2_Integration_CPUMainSamplingPublication
+    V2_Integration_CPUExpertWorkspaceReplay
     V2_Integration_ExpertOverlayNonblockingDemandAdmission
     V2_Integration_ExpertOverlayPreparedTransactionEconomy
     V2_Integration_BenchmarkPrefillProductionPolicy

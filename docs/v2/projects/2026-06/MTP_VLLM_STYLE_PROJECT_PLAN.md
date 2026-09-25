@@ -2,6 +2,34 @@
 
 ## Objective
 
+2026-09-25 wrap-up: the user accepted approximately **42 tok/s dynamic-MTP
+decode and 350 tok/s prefill** on both CPU sockets as good enough for this
+slice. Further tuning toward 50 tok/s is stopped, not declared achieved.
+The final shared-expert SwiGLU/down candidate passed its numerical gates but
+gave 41.43 versus 41.50 tok/s in the paired production comparison; it and its
+candidate-only tests/harness were removed. The restored Release executable and
+core library are byte-identical to the preserved control. Prepared-workspace
+reuse, SIMD greedy selection and their all-format/ISA regression coverage
+remain. Final restored-source gates pass **670/670 Unit (75.38 s)**,
+**103/103 CPU preflight (225.88 s)** and **6/6 true-AVX2 focused checks
+(3.54 s)**, with zero fresh driver records or findings. No runs remain active.
+This is a CPU tuning handoff, not renewed full cross-backend or release-image
+certification.
+
+2026-09-25, CPU follow-up: retained expert workspace binding removes a full
+prepared-engine walk from each packet (profiled setup 648.42 → 42.43 ms over
+7,872 calls), with 670/670 Unit, 99/99 CPU preflight and true-AVX2 focused
+checks green. Subsequent SIMD greedy selection reduces a sharded-vocabulary
+scan from 135 to 9 us, but its production control/change/change/control
+results are 41.83/41.27/42.32/41.57 tok/s: no material whole-model gain is
+established. The final source, including the new mixed-format expert proofs,
+passes 670/670 Unit and 103/103 CPU preflight, with a clean driver interval.
+A byte-exact compact-codebook lookup-table experiment showed no meaningful
+mixed-format FFN improvement and was removed. All measured tokens agree and
+matched prefill remains 349.00 tok/s. The 50 tok/s dynamic-MTP target is still open. See the current
+[CPU investigation](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md)
+for precise gate scope and isolated-versus-end-to-end evidence.
+
 2026-09-25, latest CPU slice: medium expert-input Q8 publication now amortizes
 team startup against total active rows, instead of charging that cost per
 worker. Clean default dynamic decode measures **39.17/39.44 tok/s**, and the

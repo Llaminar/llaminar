@@ -3446,8 +3446,13 @@ namespace llaminar2
             compute_stage = &*inline_compute_stage;
         }
 
-        if (bound_workspace_ && deferred_replay)
+        if (bound_workspace_ && (deferred_replay || params_.device_id.is_cpu()))
         {
+            // Both retained executors received their arena during setup. CPU
+            // prepared engines borrow scratch with each invocation, including
+            // newly arrived experts, so replay must not walk and rebind every
+            // gate/up/down engine. Only inline GPU construction below needs a
+            // first binding; losing a retained binding is a lifecycle error.
             if (compute_stage->getWorkspace() != bound_workspace_)
             {
                 LOG_ERROR(

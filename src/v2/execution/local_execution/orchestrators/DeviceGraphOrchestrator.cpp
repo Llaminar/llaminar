@@ -70,6 +70,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/common/SamplingMath.h"
+#include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
 #include "../../../models/qwen35moe/Qwen35MoEGraph.h"
 #include "../../compute_stages/stages/RoPEStage.h"
 #include "../../moe/MoERebalanceController.h"
@@ -3157,6 +3158,23 @@ namespace llaminar2
                     {"row", std::to_string(row)}});
         }
 
+        /**
+         * @brief Select the first maximal token from the producer's exact row.
+         *
+         * GPU tensors retain their stream-ordered backend reduction. CPU rows
+         * use the shared ISA-dispatched selector; the optional margin observer
+         * alone needs a second-best logit. Neither path changes row ownership
+         * or coordinates participants: the caller owns that explicit edge.
+         * @param tensor Published logits tensor, not an unpopulated sibling.
+         * @param row Logical row inside the published tensor.
+         * @param token_offset Global vocabulary origin of this participant.
+         * @param argmax_partial_vals Prepared GPU reduction-value scratch.
+         * @param argmax_partial_idxs Prepared GPU reduction-index scratch.
+         * @param argmax_partial_capacity Capacity of both GPU scratch banks.
+         * @param stream Exact GPU producer/consumer stream; unused for CPU.
+         * @param source Diagnostic name of the publication surface.
+         * @return Candidate with global token ID, or an invalid candidate.
+         */
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
             TensorBase *tensor,
             int row,
@@ -3280,6 +3298,24 @@ namespace llaminar2
                 return candidate;
 
             const float *row_data = data + row_offset;
+            if (!greedyMarginStatsEnabled())
+            {
+                // The selector visits lanes in vocabulary order and only
+                // replaces a winner on strict greater-than. SIMD therefore
+                // preserves first-token ties (including signed zero) without
+                // computing unused runner-up diagnostics on every MTP row.
+                if (cpu_sampling::select_topk(
+                        row_data, static_cast<int>(cols), 1,
+                        &max_val, &max_idx) != 1)
+                    return candidate;
+                candidate.value = max_val;
+                candidate.token = token_offset + max_idx;
+                candidate.valid = 1;
+                return candidate;
+            }
+
+            // Keep the explicitly requested margin observation's original
+            // second-best/NaN semantics; it does not label clean timing runs.
             max_idx = 0;
             max_val = row_data[0];
             float second_val = -std::numeric_limits<float>::infinity();

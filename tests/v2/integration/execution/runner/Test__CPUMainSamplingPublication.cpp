@@ -107,6 +107,23 @@ TEST(CPUMainSamplingPublication, PublishedLogitsOwnership)
             const std::vector<LogitPenalty> penalties{{.token_id = winner, .penalty = 10.0f}};
             ASSERT_TRUE(runner.applyPenaltiesOnDevice(penalties, fixture.config.vocab_size));
             EXPECT_FLOAT_EQ(values[winner], original_winner - 10.0f);
+
+            // Exercise the real host sampler after forward publication with
+            // tied maxima across SIMD lanes and at the final vocabulary slot.
+            // A shard still coordinates its global candidate, whereas a full
+            // publication must never introduce a second collective.
+            const GreedyCandidateRecord weaker_peer{-200.0f, columns + 5, 1, 0};
+            peer->setRemoteRecordBytes(&weaker_peer, sizeof(weaker_peer));
+            for (int first : {0, 7, 8, 15, 16, columns - 1})
+            {
+                std::fill_n(values, columns, -100.0f);
+                values[first] = 1.0f;
+                values[columns - 1] = 1.0f;
+                const int previous_calls = peer->allgatherBytesCalls();
+                EXPECT_EQ(runner.sampleGreedyOnDevice(), first);
+                EXPECT_EQ(peer->allgatherBytesCalls() - previous_calls,
+                          graph_gathers ? 0 : 1);
+            }
         }
         runner.clear_cache();
         EXPECT_THROW(runner.sampleGreedyOnDevice(), std::logic_error)

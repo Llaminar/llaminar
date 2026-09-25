@@ -20,10 +20,12 @@
  * tune grouped execution safely. The benchmark measures both the GPU-aligned
  * production expert contract and the otherwise-identical backend-native CPU
  * contract so parity-preserving arithmetic changes carry a visible economy
- * cost. IQ2_S is the default because production
- * PerfStats identify codebook 13 for the routed experts in the active
- * Qwen3.6-35B UD-IQ3_S artifact; the file-level quantization label does not
- * imply that every tensor has the same codebook. Set
+ * cost. IQ2_S remains the default uniform-format diagnostic. The real
+ * Qwen3.6-35B UD-IQ3_S artifact mostly pairs IQ2_S gate/up with IQ4_XS down
+ * weights; its file-level quantization label does not describe each tensor.
+ * Set `LLAMINAR_CPU_MOE_EXPERT_DOWN_FORMAT=IQ4_XS` to measure that mixed
+ * transaction. Both formats are recorded in the timing evidence, and every
+ * intermediate still uses its own independent serial-row oracle. Set
  * `LLAMINAR_CPU_MOE_EXPERT_FORMATS=all` to run the canonical all-format
  * registry, or provide a comma-separated subset. Timed samples execute a
  * configurable transaction batch (`LLAMINAR_CPU_MOE_EXPERT_BATCH_ITERATIONS`)
@@ -57,6 +59,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <omp.h>
@@ -211,6 +214,20 @@ namespace
     }
 
     /**
+     * @brief Resolve an explicit down format from the same canonical inventory.
+     * @param gate_up Default format when the diagnostic requests uniform weights.
+     * @return Stable registry entry; unknown names fail before preparing weights.
+     */
+    const test::QuantizedVerifierFormatCase &selectedDownFormat(
+        const test::QuantizedVerifierFormatCase &gate_up)
+    {
+        const char *raw = std::getenv("LLAMINAR_CPU_MOE_EXPERT_DOWN_FORMAT");
+        if (!raw || !*raw)
+            return gate_up;
+        return test::quantizedMoEVerifierFormat(raw);
+    }
+
+    /**
      * @brief Build a sparse expert-major row distribution.
      *
      * Every expert receives one row first. Remaining rows are assigned from
@@ -311,10 +328,18 @@ namespace
     }
 
     /**
-     * @brief Prepare all matrices and kernels for one canonical codebook.
+     * @brief Prepare each projection with its explicitly selected source format.
+     * @param format Gate/up source-format owner from the canonical registry.
+     * @param down_format Independently selected down source-format owner.
+     * @param rows_per_expert Active expert-major row counts.
+     * @param d_model Logical hidden width.
+     * @param intermediate Logical FFN width.
+     * @param numerical_policy Shared arithmetic contract, not a weight format.
+     * @return Immutable weights and prepared engines for every active expert.
      */
     std::vector<PreparedExpert> prepareExperts(
         const test::QuantizedVerifierFormatCase &format,
+        const test::QuantizedVerifierFormatCase &down_format,
         const std::vector<int> &rows_per_expert,
         int d_model,
         int intermediate,
@@ -342,7 +367,7 @@ namespace
                 {static_cast<size_t>(intermediate),
                  static_cast<size_t>(d_model)},
                 seed + 2u);
-            expert.down_weights = format.create(
+            expert.down_weights = down_format.create(
                 {static_cast<size_t>(d_model),
                  static_cast<size_t>(intermediate)},
                 seed + 3u);
@@ -374,9 +399,24 @@ namespace
 
     /**
      * @brief Validate and time one production-shaped grouped expert pipeline.
+     * @param format Source format for gate/up weights.
+     * @param down_format Source format for down weights, independently prepared.
+     * @param active_experts Number of expert members in the transaction.
+     * @param local_route_rows Total expert-major activation rows.
+     * @param d_model Logical hidden width.
+     * @param intermediate Logical FFN width.
+     * @param numerical_policy Independent native or GPU-aligned arithmetic contract.
+     * @param verifier_schedule Explicit diagnostic candidate, or production Auto.
+     * @param warmup Untimed batches before measurements.
+     * @param samples Number of independently timed batches.
+     * @param batch_iterations Transactions per timing interval.
+     * @param profile_iterations Isolated profiler iterations; zero selects timing.
+     * @param profile_phase Exactly one operation to repeat in profiler mode.
+     * @return Phase/transaction medians, or an empty record for profiler-only work.
      */
     PipelineTiming runFormat(
         const test::QuantizedVerifierFormatCase &format,
+        const test::QuantizedVerifierFormatCase &down_format,
         int active_experts,
         int local_route_rows,
         int d_model,
@@ -394,6 +434,7 @@ namespace
         std::vector<PreparedExpert> experts =
             prepareExperts(
                 format,
+                down_format,
                 rows_per_expert,
                 d_model,
                 intermediate,
@@ -676,6 +717,7 @@ namespace
                         : grouped_down.front() + grouped_down.back();
             std::cerr
                 << "[CPUMoEExpertProfiler] format=" << format.label
+                << " down_format=" << down_format.label
                 << " phase=" << profile_phase
                 << " iterations=" << profile_iterations
                 << " checksum=" << checksum << '\n';
@@ -766,7 +808,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     {
         csv.open(csv_path, std::ios::trunc);
         ASSERT_TRUE(csv.is_open()) << "Could not open CSV output " << csv_path;
-        csv << "format,isa,d_model,intermediate,active_experts,route_rows,"
+        csv << "format,down_format,isa,d_model,intermediate,active_experts,route_rows,"
                "threads,native_gate_up_us,native_swiglu_q8_us,native_down_us,"
                "native_complete_us,native_persistent_us,"
                "aligned_gate_up_us,aligned_swiglu_q8_us,aligned_down_us,"
@@ -784,7 +826,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         << ", verifier_policy="
         << cpu::native_vnni::verifierRowsPolicyName(verifier_schedule)
         << ")\n"
-        << "format native_persistent_us aligned_persistent_us "
+        << "gate_up_format/down_format native_persistent_us aligned_persistent_us "
            "aligned/native native_speedup aligned_speedup\n";
 
     for (const auto &format : test::quantizedMoEVerifierFormats())
@@ -792,12 +834,14 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         if (!all_formats && requested.count(format.label) == 0u)
             continue;
 
+        const auto &down_format = selectedDownFormat(format);
+
         if (profile_iterations > 0)
         {
             // Do not even prepare the unselected numerical policy: its oracle
             // and setup kernels would belong to a different profiler launch.
             (void)runFormat(
-                format, active_experts, local_route_rows, d_model, intermediate,
+                format, down_format, active_experts, local_route_rows, d_model, intermediate,
                 profile_policy == ProfilePolicy::Aligned
                     ? CPUProjectionNumericalPolicy::GPUAlignedExpert
                     : CPUProjectionNumericalPolicy::BackendNative,
@@ -813,6 +857,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         {
             native = runFormat(
                 format,
+                down_format,
                 active_experts,
                 local_route_rows,
                 d_model,
@@ -831,6 +876,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         {
             aligned = runFormat(
                 format,
+                down_format,
                 active_experts,
                 local_route_rows,
                 d_model,
@@ -865,7 +911,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
         const double slowdown = aligned.persistent_complete_us /
             native.persistent_complete_us;
         std::cout
-            << format.label << ' '
+            << format.label << '/' << down_format.label << ' '
             << native.persistent_complete_us << ' '
             << aligned.persistent_complete_us << ' '
             << slowdown << ' '
@@ -873,7 +919,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
             << aligned_speedup << '\n';
         if (csv)
         {
-            csv << format.label << ','
+            csv << format.label << ',' << down_format.label << ','
                 << isaLevelName(activeISALevel()) << ','
                 << d_model << ',' << intermediate << ','
                 << active_experts << ',' << local_route_rows << ','

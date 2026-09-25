@@ -8,6 +8,32 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-25 wrap-up: **A — accepted as good enough; tuning stopped.** Both CPU
+sockets sustain approximately **42 tok/s dynamic-MTP decode** and **350-class
+prefill**. The requested 50 tok/s was not reached. The last candidate was
+byte-exact but had no production benefit (41.43 versus 41.50 tok/s), so it was
+removed rather than counted as a speedup. The restored executable/core are
+byte-identical to the control. Final gates pass **670/670 Unit**, **103/103
+CPU preflight** and **6/6 true-AVX2 focused checks**, with a complete clean
+driver interval. No tests or tuning runs remain active. Existing cross-backend
+limitations below remain unrecertified. See the
+[CPU wrap-up evidence](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md).
+
+2026-09-25, current CPU follow-up: **A — approximately 42 tok/s dynamic decode;
+50 tok/s remains open.** Setup-owned expert workspace reuse passed 670 Unit,
+99 CPU-tagged preflight and true-AVX2 focused checks. Reusing the existing SIMD
+greedy selector cuts an isolated 124,160-logit scan from 135 to 9 us, but its
+paired whole-model means are 41.70 (control) and 41.80 (change), inside noise.
+All twelve 256-token streams match; default depth remains 1–15, acceptance
+87.05%, and movement remains active. Matched MTP-off prefill is 349.00 tok/s.
+Final gates, including mixed-format expert proofs, pass 670/670 Unit and
+103/103 CPU preflight; the driver interval has zero new records/findings.
+A byte-exact compact-codebook lookup-table experiment had no meaningful
+mixed-format FFN win and was removed.
+Do not report the scan's microbenchmark gain as a decode speedup or claim the
+unrefreshed full cross-backend gate. See the
+[current CPU evidence](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md).
+
 2026-09-25, latest: **A — 350-class prefill retained; 50 tok/s decode open.**
 Medium expert-input publication uses the active team's total work budget.
 Clean default dynamic decode is **39.17/39.44 tok/s**, matched MTP-off prefill
