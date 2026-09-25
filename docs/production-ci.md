@@ -125,10 +125,11 @@ The cache root is an explicit `hostPath`, so it survives ARC pod recreation
 and node-local runner restarts. `run_production_pipeline.py` partitions the
 external Buildx OCI cache only by ISA and imports it only after a complete
 prior export exists. It resets each slot on export, preventing stale manifest
-blobs from growing without bound. For a test-runner/runtime pair, only the
-test-runner imports and exports that external snapshot; the subsequent runtime
-target reuses the already-live host BuildKit worker instead of transferring
-the same large cache a second time. A runtime-only build owns its snapshot.
+blobs from growing without bound. For a test-runner/runtime pair, both targets
+import the snapshot so the runtime can reuse pinned dependency layers even if
+the live BuildKit worker has reclaimed them. Only the test-runner exports it;
+the subsequent runtime target does not transfer the large snapshot a second
+time. A runtime-only build owns its snapshot.
 The Dockerfile's `ccache` mounts are one
 shared `llaminar-ccache` cache in the host Docker daemon's retained
 `llaminar-ci` BuildKit worker; ccache hashes compiler identity and flags, so

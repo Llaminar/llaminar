@@ -3657,7 +3657,9 @@ class ImageIdentityTests(unittest.TestCase):
                 }, clear=False):
                 self.assertEqual(pipeline.persistent_build_cache_arguments(
                     "AVX512", pipeline.ImageRole.RUNTIME,
-                    pipeline.ImageRole.TEST_RUNNER), [])
+                    pipeline.ImageRole.TEST_RUNNER), [
+                    "--cache-from", f"type=local,src={cache_root}/avx512",
+                ])
                 self.assertEqual(pipeline.persistent_build_cache_arguments(
                     "AVX512", pipeline.ImageRole.RUNTIME,
                     pipeline.ImageRole.RUNTIME), [

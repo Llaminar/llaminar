@@ -287,9 +287,10 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
 
     The test-runner build owns the external snapshot when both image roles are
     requested: it contains the expensive compiled test inventory. The sibling
-    runtime build shares the retained host BuildKit worker and must not import
-    and export the same multi-gigabyte OCI cache a second time. A runtime-only
-    build owns its own snapshot.
+    runtime build must still import that snapshot: its pinned GPU dependency
+    layers may not be resident in the worker after garbage collection. It
+    must not export the same multi-gigabyte OCI cache a second time. A
+    runtime-only build owns its own snapshot.
 
     BuildKit intentionally does not export ``RUN --mount=type=cache`` data.
     The Dockerfile names that ccache mount separately and the persistent
@@ -301,8 +302,6 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
         raise ValueError("persistent Buildx cache requires an explicit shipping CPU ISA")
     if not isinstance(role, ImageRole) or not isinstance(external_cache_owner, ImageRole):
         raise TypeError("persistent Buildx cache requires typed image roles")
-    if role is not external_cache_owner:
-        return []
     raw_root = os.environ.get(DOCKER_BUILD_CACHE_ROOT_ENV)
     if raw_root is None:
         return []
@@ -329,13 +328,14 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
         )
     slot = root / cpu_isa.lower()
     slot.mkdir(parents=True, exist_ok=True)
-    cache_to = f"type=local,dest={slot},mode=max,reset=true"
-    arguments = ["--cache-to", cache_to]
+    arguments = []
     # An empty newly-created directory has no OCI index.  Supplying it as an
     # import source turns an ordinary cold start into a Buildx warning/error;
     # export first, then admit it as an input on following runs.
     if (slot / "index.json").is_file():
-        arguments[0:0] = ["--cache-from", f"type=local,src={slot}"]
+        arguments.extend(["--cache-from", f"type=local,src={slot}"])
+    if role is external_cache_owner:
+        arguments.extend(["--cache-to", f"type=local,dest={slot},mode=max,reset=true"])
     return arguments
 
 
