@@ -8,7 +8,7 @@ FROM ${RUNTIME_IMAGE}
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      docker.io curl jq pciutils procps python3-requests python3-yaml \
+      docker.io curl jq pciutils procps util-linux python3-requests python3-yaml \
  && rm -rf /var/lib/apt/lists/*
 LABEL org.llaminar.image_role="suite-driver"
 ENTRYPOINT []

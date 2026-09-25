@@ -1,0 +1,69 @@
+name: Develop PR — Unit and production preflight
+run-name: "develop PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}"
+
+# The pre-merge promise is the pre-commit test scope, inside one full-backend
+# AVX512 image. Reuse the image driver; no second test inventory or model gate.
+# The default checkout tests the PR merge ref against current develop.
+on:
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+# This runner shares physical GPUs and one persistent host BuildKit cache with
+# image publication and the explicit production workflows. Never overlap them.
+concurrency:
+  group: llaminar-develop-image-gate
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prerequisites:
+    # Untrusted forks must not execute against the privileged host Docker
+    # socket. A maintainer can review/import their branch before this gate.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    name: Unit + ProductionTestPreflight (AVX512)
+    runs-on: [llaminar-xeon-host]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
+      - name: Build AVX512 and run only Unit and production preflight inside the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --cpu-isa AVX512 \
+            --output "$RUNNER_TEMP/llaminar-develop-pr-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Bound node-local BuildKit cache
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: bash scripts/ci/prune_docker_build_cache.sh
+      - name: Retain image-bound Unit and preflight evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Logs/receipts only: no source snapshots, images or compiler cache.
+          path: |
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/develop-image-gate.json
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx512/build-*.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx512/build-timeline.jsonl
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx512/prerequisites.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx512/prerequisites.process.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx512/prerequisites/**
+          if-no-files-found: warn
+          retention-days: 30

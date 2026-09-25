@@ -675,6 +675,32 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
 }
 
 /**
+ * @brief Resolve the flattened token and route capacities of a sparse graph.
+ * @param profile Source of the graph's routing multiplicity.
+ * @param geometry Explicit compact family or ordinary batch/bucket geometry.
+ * @return Token rows and top-k-expanded route rows, both representable by kernels.
+ * @throws std::invalid_argument for a non-positive explicit capacity or top-k.
+ * @throws std::runtime_error when either capacity exceeds integer geometry.
+ */
+std::pair<int, int> compactRoutedExpertWorkspaceRows(
+    const ModelMemoryProfile& profile, const WorkspaceMemoryGeometry& geometry)
+{
+    if (profile.expert_used_count <= 0 ||
+        (geometry.compact_routed_expert_token_rows &&
+         *geometry.compact_routed_expert_token_rows <= 0))
+        throw std::invalid_argument("Compact expert workspace requires positive token rows and top-k");
+    const size_t tokens = geometry.compact_routed_expert_token_rows
+        ? static_cast<size_t>(*geometry.compact_routed_expert_token_rows)
+        : checkedMultiply(static_cast<size_t>(std::max(1, geometry.batch_size)),
+              static_cast<size_t>(std::max(1, geometry.resident_graph_rows)),
+              "compact expert token rows");
+    const size_t routes = checkedMultiply(tokens, static_cast<size_t>(profile.expert_used_count),
+        "compact expert route rows");
+    return {checkedWorkspaceDimension(tokens, "compact expert token rows"),
+        checkedWorkspaceDimension(routes, "compact expert route rows")};
+}
+
+/**
  * @brief Admit the same participant-local CPU activation storage declared by stages.
  *
  * Source down matrices identify K without a format multiplier or guessed FFN
@@ -694,6 +720,11 @@ size_t exactCPUProjectionWorkspaceBytes(
     const int rows = checkedWorkspaceDimension(checkedMultiply(
         static_cast<size_t>(std::max(1, geometry.batch_size)),
         static_cast<size_t>(std::max(1, geometry.resident_graph_rows)), "CPU SwiGLU rows"), "CPU SwiGLU rows");
+    // Local ExpertOverlay work remains sparse even on the continuation. Its
+    // per-route bank is merged by name with dense scratch, never added as an
+    // independently guessed reserve. Explicit capacities are already batched.
+    const int compact_expert_rows = geometry.compact_routed_expert_token_rows
+        ? compactRoutedExpertWorkspaceRows(profile, geometry).second : 0;
     for (const auto &tensor : profile.tensors)
     {
         if (workspaceOwnsTensor(tensor, profile, geometry))
@@ -717,7 +748,8 @@ size_t exactCPUProjectionWorkspaceBytes(
             const auto serial_shape = localWorkspaceMatrixShape(tensor, profile, geometry, *sharding, false);
             requirements.merge(CPUProjectionWorkspaceContract::sourceNative(tensor.quant_type,
                 {.rows = isRoutedExpertWeight(tensor.name)
-                     ? std::max(execution_rows, profile.expert_used_count) : execution_rows,
+                     ? (compact_expert_rows > 0 ? compact_expert_rows
+                          : std::max(execution_rows, profile.expert_used_count)) : execution_rows,
                  .n = shape.output_columns, .k = shape.input_columns,
                  .serial_n = isTerminalProjectionWeight(tensor.name) ? serial_shape.output_columns : 0,
                  .workers = geometry.device_compute_units, .execution = geometry.cpu_execution,
@@ -735,8 +767,10 @@ size_t exactCPUProjectionWorkspaceBytes(
         if (!shape.valid())
             throw std::runtime_error("CPU SwiGLU admission requires a complete down-projection shape");
         requirements.merge(cpuSwiGLUWorkspaceRequirements(
-            isRetainedMTPSidecarLayer(tensor, profile, geometry)
-                ? std::max(1, geometry.mtp_target_query_rows) : rows,
+            isRoutedExpertWeight(tensor.name) && compact_expert_rows > 0
+                ? compact_expert_rows
+                : (isRetainedMTPSidecarLayer(tensor, profile, geometry)
+                    ? std::max(1, geometry.mtp_target_query_rows) : rows),
             shape.input_columns));
     }
     if (!has_terminal && tied_embedding)
@@ -2021,22 +2055,7 @@ size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
             "Routed-expert participant workspace requires complete MoE geometry");
     }
 
-    const size_t batches =
-        static_cast<size_t>(std::max(1, geometry.batch_size));
-    const size_t rows =
-        static_cast<size_t>(std::max(1, geometry.resident_graph_rows));
-    const size_t top_k = static_cast<size_t>(profile.expert_used_count);
-    if (rows > static_cast<size_t>(std::numeric_limits<int>::max()) /
-                   batches ||
-        rows * batches >
-            static_cast<size_t>(std::numeric_limits<int>::max()) / top_k)
-    {
-        throw std::runtime_error(
-            "Routed-expert participant compact-row envelope exceeds integer geometry");
-    }
-
-    const int direct_rows = static_cast<int>(rows * batches);
-    const int compact_rows = static_cast<int>(rows * batches * top_k);
+    const auto [direct_rows, compact_rows] = compactRoutedExpertWorkspaceRows(profile, geometry);
     if (geometry.device.is_cpu())
     {
         auto requirements = cpuSwiGLUWorkspaceRequirements(compact_rows, profile.expert_feed_forward_length);

@@ -9,6 +9,51 @@ develop-branch GitHub Actions job described below.
 The shared [Llaminar testing workflow](../.agents/llaminar-testing/SKILL.md)
 routes local development checks, model diagnostics, and this full image gate.
 
+## Feature PRs into develop
+
+`.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
+`develop`. It builds only the AVX512 full-backend image pair and executes the
+complete Unit and `ProductionTestPreflight` transaction **inside its installed
+test-runner image**. This is the pre-commit test scope in a reproducible image,
+not release certification. The checkout is the PR merge ref, so the tests
+include the proposed integration with `develop`.
+
+The active `develop` ruleset requires this exact GitHub Actions check, an
+up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
+are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
+auto-merge for same-repository, non-draft PRs. It runs on the trusted base
+branch, does not check out PR code, and cannot merge before the required
+image-bound check succeeds. Fork PRs cannot run on the privileged host runner;
+import a reviewed branch into this repository before requesting this gate.
+
+The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
+without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
+HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
+Every repository job that builds an image, runs tests, or prepares the
+self-hosted test toolchain shares `llaminar-develop-image-gate` with
+`queue: max` and `cancel-in-progress: false`. The ARC scale set also has
+`maxRunners: 1`. Thus separate PRs and certification runs wait their turn;
+GitHub must neither overlap their hardware work nor replace an older pending
+run with a newer one. Read-only policy, source-admission, and documentation
+publication jobs do not occupy that hardware queue.
+No registry-write permission or login is granted. Untrusted fork PRs do not
+acquire the privileged host runner; review/import them onto a repository branch
+before running this gate. Branch protection is configured independently.
+
+The PR uses the same host Docker daemon, retained `llaminar-ci` BuildKit worker,
+bounded local compiler cache and accelerator concurrency group as develop
+publication. Only build logs, image/test receipts and CTest/JUnit evidence are
+uploaded to GitHub, never cache contents. Run the equivalent locally with:
+
+```bash
+python3 scripts/ci/run_develop_image_gate.py \
+  --cpu-isa AVX512 --output parity-results/develop-pr-gate
+```
+
+After merge, the ordinary develop push workflow below builds/tests **both**
+shipping ISA images and publishes them. Master PR certification remains a
+separate, broader gate.
+
 ## Develop branch image gate
 
 `.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
@@ -80,7 +125,12 @@ The cache root is an explicit `hostPath`, so it survives ARC pod recreation
 and node-local runner restarts. `run_production_pipeline.py` partitions the
 external Buildx OCI cache only by ISA and imports it only after a complete
 prior export exists. It resets each slot on export, preventing stale manifest
-blobs from growing without bound. The Dockerfile's `ccache` mounts are one
+blobs from growing without bound. For a test-runner/runtime pair, both targets
+import the snapshot so the runtime can reuse pinned dependency layers even if
+the live BuildKit worker has reclaimed them. Only the test-runner exports it;
+the subsequent runtime target does not transfer the large snapshot a second
+time. A runtime-only build owns its snapshot.
+The Dockerfile's `ccache` mounts are one
 shared `llaminar-ccache` cache in the host Docker daemon's retained
 `llaminar-ci` BuildKit worker; ccache hashes compiler identity and flags, so
 the two ISA lanes cannot collide. `CCACHE_MAXSIZE=50G` is the hard
@@ -202,13 +252,18 @@ The branch-policy check admits only `develop`.
 
 `scripts/ci/apply_master_ruleset.py` installs the four required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also activates the existing develop deletion and
-force-push guard, so GitHub's auto-delete-on-merge setting cannot remove the
-persistent source branch. This guard does not add a PR, status-check, or
-linear-history requirement to develop: the post-squash publisher must record
-the certified master commit as a second parent of its fast-forward evidence
-commit, making the next develop PR up-to-date with master without rewriting
-either branch.
+squash-only merge. It also installs the `develop` PR and AVX512 prerequisite
+check requirements, while retaining deletion and force-push protection.
+`develop` deliberately does not require linear history: after a certified
+master squash merge, the release publisher records that exact master commit as
+the second parent of its fast-forward evidence commit, making the next master
+PR up to date without rewriting either branch. The publisher's dedicated
+`llaminar-release-evidence` writable deploy key is the sole ruleset bypass;
+the installer refuses any other writable deploy key. The general GitHub
+Actions app must never bypass the `develop` ruleset, because the auto-merge
+workflow also runs under that app. Release automation supplies the private key
+through the `RELEASE_DEVELOP_DEPLOY_KEY` Actions secret only in the post-release
+evidence job; ordinary PRs cannot access it.
 Run the installer without `--apply` to inspect both proposals; only apply
 after the PR workflow has emitted its checks. A manual-dispatch workflow
 run cannot satisfy a required PR check, so the diagnostic workflows below are
@@ -365,6 +420,25 @@ unchanged published runtime. This avoids a duplicate ramdisk or changing cache
 ownership merely because the GitHub runner has a different UID. The driver
 also supplies GPU memory-telemetry tools missing from the runner pod. Its
 distinct image role cannot be mistaken for a tested runtime or a release.
+
+Every HTTP/token-generation server lifecycle also brackets the serving host's
+kernel log. New AMDGPU/NVIDIA warnings, Xid errors, IH-ring overflows, GPU
+faults/resets and driver workqueue warnings fail the cell even when all HTTP
+checks pass. Each `*.driver-diagnostics.json` retains the new records and
+offending messages. Older warnings are excluded by a boot-qualified log
+cursor; a reboot, cleared/wrapped log, missing permissions or incomplete
+observation fails closed. Direct local runs require readable `dmesg --json
+--decode` or noninteractive sudo for that read-only command. Published-image
+runs grant `SYSLOG` and read-only `/dev/kmsg` access only to the existing
+suite-driver tools container; the cache-owning user delegates the read to a
+root exec in that same container. The device mount also avoids the legacy
+`dmesg` syslog reader's expensive JSON expansion on the tools image.
+The read authenticates the shared kernel boot. No inference-image privileges,
+kernel settings, driver settings or test precision are changed. Run GPU cells
+without unrelated accelerator workloads: a shared kernel warning is unsafe
+certification evidence even when its originating process is unclear. Current
+cross-host cells use remote CPU workers; a future remote GPU cell must obtain
+equivalent driver-health evidence on that physical host as well.
 
 The same orchestration is available locally:
 
@@ -653,6 +727,11 @@ benchmark selection. The pipeline supplies its full report automatically and
 never interleaves benchmarks with unfinished E2E tests. Diagnostic benchmark
 reports cannot certify an image even if they happen to cover every cell.
 The certifying pipeline deliberately has no cell/backend skip switches.
+Local Release runs use `--diagnostic --diagnostic-binary PATH` instead of
+`--image`. They authenticate the build type and actual AVX2/AVX512 ISA through
+the same build-cache contract as local HTTP E2E. Diagnostic status remains
+separate provenance, so the correct hardware/workload/ISA high-water comparison
+still detects regressions; it must not manufacture a new "diagnostic" ISA key.
 
 ### Azure resources for cross-host E2E
 
@@ -892,6 +971,17 @@ Neither control acquisition nor a one-off comparison can certify an image.
 
 ## Benchmark workload and ratchet
 
+Benchmarks select the same model/topology candidates as HTTP E2E, but **do not
+inherit its stress policy**. The typed matrix exports a separate `benchmark`
+projection with `policy: production_defaults`. It preserves context, activation
+and KV precision, automatic topology constraints, and the selected MTP/movement
+mode. The production runtime chooses depth initialization/adaptation, movement
+economics, transfer slots, graph capacity, prefill buckets and cache defaults.
+In particular, correctness-test settings that start at depth 15 or force frequent
+expert movement belong only in the correctness projection. No runner strips
+flags from HTTP arguments or recreates a topology; stale exports missing the
+benchmark projection must be rebuilt.
+
 `benchmarks/production/workload.json` owns the shared workload: fixed prompt
 bytes, output length, sampling seed/policy, one warmup and three measured
 requests. The prompt is 512 repetitions of ` test`; the actual tokenizer's
@@ -909,6 +999,17 @@ tolerance fails and cannot update any marks. New keys are explicitly recorded
 as `new_baseline`, not claimed as improvements. Old unrelated workloads are
 preserved in `legacy_high_water.json`; they are never relabeled as comparable
 measurements. Tolerance/workload changes are ordinary reviewed source changes.
+Changing from legacy E2E-stress timing to production-default timing therefore
+creates a distinct series. Preserve published stress measurements as historical
+evidence; do not label a policy change as a measured implementation improvement
+or silently copy those marks onto the new identities. A regression claim across
+that boundary requires remeasuring the old implementation with the same new
+production-default intent.
+An explicit image `--diagnostic` can retime an older immutable Release image
+against the current manifest; its report records the manifest's `source_revision`
+and the image's separate `runtime_source_revision`. That cross-revision run is
+non-certifying. Ordinary certification still requires matching source and full
+same-image E2E evidence.
 
 ## Evidence, commits and image identity
 

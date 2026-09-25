@@ -274,8 +274,9 @@ def require_image_pair(images: dict, source: dict, isa: str, *,
         raise ValueError("test-runner/runtime roles require distinct immutable image identities")
 
 
-def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
-    """Return one isolated durable Buildx cache contract for a shipping lane.
+def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
+                                     external_cache_owner: ImageRole) -> list[str]:
+    """Snapshot one expensive target per ISA; siblings reuse the live worker.
 
     The runner process is ephemeral, whereas its configured hostPath survives
     pod replacement. A cache is therefore scoped by ISA; BuildKit's own graph
@@ -283,6 +284,13 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
     directory is an OCI layout owned by the runner, not a second Docker graph
     store. ``reset=true`` bounds each slot to the most recent complete cache
     manifest instead of silently accumulating superseded blobs forever.
+
+    The test-runner build owns the external snapshot when both image roles are
+    requested: it contains the expensive compiled test inventory. The sibling
+    runtime build must still import that snapshot: its pinned GPU dependency
+    layers may not be resident in the worker after garbage collection. It
+    must not export the same multi-gigabyte OCI cache a second time. A
+    runtime-only build owns its own snapshot.
 
     BuildKit intentionally does not export ``RUN --mount=type=cache`` data.
     The Dockerfile names that ccache mount separately and the persistent
@@ -292,6 +300,8 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
     """
     if cpu_isa not in SHIPPING_ISAS:
         raise ValueError("persistent Buildx cache requires an explicit shipping CPU ISA")
+    if not isinstance(role, ImageRole) or not isinstance(external_cache_owner, ImageRole):
+        raise TypeError("persistent Buildx cache requires typed image roles")
     raw_root = os.environ.get(DOCKER_BUILD_CACHE_ROOT_ENV)
     if raw_root is None:
         return []
@@ -318,13 +328,14 @@ def persistent_build_cache_arguments(cpu_isa: str) -> list[str]:
         )
     slot = root / cpu_isa.lower()
     slot.mkdir(parents=True, exist_ok=True)
-    cache_to = f"type=local,dest={slot},mode=max,reset=true"
-    arguments = ["--cache-to", cache_to]
+    arguments = []
     # An empty newly-created directory has no OCI index.  Supplying it as an
     # import source turns an ordinary cold start into a Buildx warning/error;
     # export first, then admit it as an input on following runs.
     if (slot / "index.json").is_file():
-        arguments[0:0] = ["--cache-from", f"type=local,src={slot}"]
+        arguments.extend(["--cache-from", f"type=local,src={slot}"])
+    if role is external_cache_owner:
+        arguments.extend(["--cache-to", f"type=local,dest={slot},mode=max,reset=true"])
     return arguments
 
 
@@ -368,6 +379,8 @@ def build(args, source: dict, directory: Path, *,
         snapshot(source["tree"], context)
     timeline = directory / "build-timeline.jsonl"
     images = {}
+    external_cache_owner = (ImageRole.TEST_RUNNER if ImageRole.TEST_RUNNER in roles
+                            else roles[0])
     for role in roles:
         target = role.value
         tag = source_image_tag(source, args.cpu_isa, role,
@@ -383,7 +396,8 @@ def build(args, source: dict, directory: Path, *,
                    "--build-arg", f"LLAMINAR_TEST_UID={os.getuid()}",
                    "--build-arg", f"LLAMINAR_TEST_GID={os.getgid()}",
                    "--build-arg", f"LLAMINAR_CPU_ISA={args.cpu_isa}",
-                   *persistent_build_cache_arguments(args.cpu_isa), str(context)]
+                   *persistent_build_cache_arguments(args.cpu_isa, role,
+                                                     external_cache_owner), str(context)]
         started = time.monotonic()
         append_build_timeline_event(timeline, "started", role, log, started)
         print(f"[production-ci] BUILD target={target} log={log} timeline={timeline}", flush=True)

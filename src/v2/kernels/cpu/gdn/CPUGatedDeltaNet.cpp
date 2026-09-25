@@ -9,9 +9,9 @@
  *    Per-head: S = exp(g)*S, kv = S*k, delta = (v - kv)*beta, S += outer(k, delta), o = S*q
  *
  * 2. Chunk-forward (prefill, seq_len>1):
- *    Strictly ordered recurrence parallelized across independent heads. The
- *    useful team is capped by the local head count because splitting one head's
- *    value columns duplicates Q/K traffic and is slower on measured hardware.
+ *    Strictly ordered recurrence parallelized across independent heads. Normal
+ *    heads retain whole-head ownership; subnormal-gated heads may distribute
+ *    independent value columns to spare workers without changing any reduction.
  *
  * The kernel owns ALL preprocessing:
  * - L2 normalization of Q and K (when use_qk_l2norm is true)
@@ -30,10 +30,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -889,13 +891,70 @@ namespace llaminar2
     //      where S resides (L1 if S fits, L2 otherwise), based on runtime
     //      cache detection via CPUFeatures.h.
     //
-    // Why NO d_v tiling: each output column is mathematically independent, but
-    // splitting a head duplicates its Q/K stream and makes multiple cores walk
-    // adjacent state rows. Measured Qwen 3.6 d_k=d_v=128 latency regresses as
-    // soon as a second worker shares one head. Whole-head ownership therefore
-    // remains both byte-exact and economical; the launch team is capped to the
-    // useful local head count instead of manufacturing dominated work.
+    // Normal heads retain whole-head ownership: indiscriminate value tiling
+    // duplicates Q/K traffic and reduces instruction-level parallelism. A
+    // subnormal decay factor is different: hardware gradual-underflow assists
+    // make that one head dominate the whole team's barrier. Split only those
+    // heads, and only when the team has more workers than heads. This preserves
+    // gradual underflow instead of changing arithmetic with FTZ/DAZ.
     // =========================================================================
+
+    /** @brief A disjoint value-column interval with unchanged full state stride. */
+    struct GDNValueTile
+    {
+        int first; ///< First value column, aligned to a sixteen-float boundary.
+        int count; ///< Positive number of independent columns owned by the task.
+    };
+
+    /**
+     * @brief Assign spare workers only to subnormal-gated recurrence heads.
+     * @param gates Immutable decay factors published by the preprocessing barrier.
+     * @param rows Number of strictly ordered recurrence timesteps.
+     * @param heads Physical local head count and gate row stride.
+     * @param head Head whose independent columns are being assigned.
+     * @param width Full value width, never changed by tiling.
+     * @param slot Candidate value-column task within the head.
+     * @param slots One for whole-head work, otherwise the number of cache-line tiles.
+     * @return Owned interval, or no work for an unused slot of a normal head.
+     *
+     * Classification reads exact FP32 bits, including under fast-math builds.
+     * Zero decay is cheap and does not qualify. A normal head remains one task;
+     * scanning its small, already-hot gate vector avoids allocating a second
+     * per-head policy buffer or adding another preprocessing barrier. Only
+     * independent columns move between workers: token and key reduction order,
+     * snapshot ownership, and the gradual-underflow arithmetic are unchanged.
+     */
+    static std::optional<GDNValueTile> gdnValueTile(
+        const float *gates, int rows, int heads, int head,
+        int width, int slot, int slots)
+    {
+        bool has_subnormal_gate = false;
+        if (slots > 1)
+        {
+            for (int row = 0; row < rows; ++row)
+            {
+                const uint32_t magnitude = std::bit_cast<uint32_t>(
+                    gates[static_cast<size_t>(row) * heads + head]) & 0x7fffffffu;
+                if (magnitude != 0 && magnitude < 0x00800000u)
+                {
+                    has_subnormal_gate = true;
+                    break;
+                }
+            }
+        }
+        if (!has_subnormal_gate)
+            return slot == 0 ? std::optional<GDNValueTile>{{0, width}} : std::nullopt;
+
+        // Whole cache-line columns also preserve the SIMD/scalar tail boundary
+        // of the serial kernel. No two tasks write the same state/output lane.
+        constexpr int line_floats = 64 / sizeof(float);
+        const int tile_width = ((width + slots - 1) / slots + line_floats - 1) /
+                               line_floats * line_floats;
+        const int first = slot * tile_width;
+        if (first >= width)
+            return std::nullopt;
+        return GDNValueTile{first, std::min(tile_width, width - first)};
+    }
 
 // Prefetch to L1 or L2 depending on runtime bool (GCC 14 requires
 // compile-time constant for _mm_prefetch hint parameter).
@@ -912,7 +971,8 @@ namespace llaminar2
 
 #if defined(__AVX512F__)
     /**
-     * @brief Advance one complete d_v=128 GDN head with ZMM-resident vectors.
+     * @brief Advance independent columns of a d_v=128 head with ZMM-resident vectors.
+     * @tparam VectorCount Eight vectors for a whole head or one for a split head.
      *
      * @param q_scratch Canonically normalized/scaled Q rows.
      * @param k_scratch Canonically normalized K rows.
@@ -925,19 +985,26 @@ namespace llaminar2
      * @param n_heads Number of local value heads.
      * @param d_k Key width and state-row count.
      * @param head Local head owned by this task.
+     * @param first_column First value column exclusively owned by this task.
      * @param value_row_stride Distance between source V rows in FP32 elements.
      * @param prefetch_rows Number of future state rows to prefetch.
      * @param prefetch_to_l1 Whether state geometry fits the detected L1 policy.
      * @param state_snapshots Optional full-head snapshot storage.
      * @param snapshot_stride_floats Distance between snapshot rows.
      *
-     * The eight value vectors remain in ZMM registers through both reductions,
-     * while every lane preserves the serial-decode `j=0..d_k-1` accumulation
-     * order. When snapshots are requested, row zero is written directly from
-     * @p state into snapshot zero and every later row advances its predecessor
-     * into the next snapshot. This makes snapshots the recurrence destination,
-     * eliminating state clones and post-row copies without changing arithmetic.
+     * The value vectors remain in ZMM registers, while every lane preserves
+     * the serial-decode `j=0..d_k-1` accumulation order. After the first decay
+     * pass, a token's state update also computes the next token's decay/key
+     * reduction. This removes one full state read/write walk per later token,
+     * not any arithmetic. The ordinary mutable state temporarily holds the
+     * next decayed row; its final value is the undecayed terminal state.
+     *
+     * With snapshots, the updated state is additionally saved in the current
+     * snapshot before its decayed value is written into the next destination.
+     * Every completed snapshot remains immutable, including when input state
+     * must be preserved for MTP acceptance. No extra state buffer is needed.
      */
+    template <int VectorCount>
     static void gdnChunkForwardAVX512DV128(
         const float *q_scratch,
         const float *k_scratch,
@@ -950,13 +1017,14 @@ namespace llaminar2
         int n_heads,
         int d_k,
         int head,
+        int first_column,
         int value_row_stride,
         int prefetch_rows,
         bool prefetch_to_l1,
         float *state_snapshots,
         int snapshot_stride_floats)
     {
-        constexpr int VectorCount = 8;
+        static_assert(VectorCount == 1 || VectorCount == 8);
         constexpr int kVectorWidth = 16;
         constexpr int kValueWidth = 128;
         const int qk_stride = n_heads * d_k;
@@ -964,7 +1032,33 @@ namespace llaminar2
         const size_t head_state_floats =
             static_cast<size_t>(d_k) * kValueWidth;
         float *input_head_state =
-            state + static_cast<size_t>(head) * head_state_floats;
+            state + static_cast<size_t>(head) * head_state_floats + first_column;
+
+        // Seed the first token exactly as serial decode does. Later key
+        // reductions are produced while updating the preceding token below.
+        float *decayed_head_state = state_snapshots
+            ? state_snapshots + static_cast<size_t>(head) * head_state_floats + first_column
+            : input_head_state;
+        __m512 kv[VectorCount];
+#pragma GCC unroll 8
+        for (int vector = 0; vector < VectorCount; ++vector)
+            kv[vector] = _mm512_setzero_ps();
+        const __m512 first_decay = _mm512_set1_ps(gate_scratch[head]);
+        const float *first_key = k_scratch + static_cast<size_t>(head) * d_k;
+        for (int row = 0; row < d_k; ++row)
+        {
+            const __m512 key = _mm512_set1_ps(first_key[row]);
+#pragma GCC unroll 8
+            for (int vector = 0; vector < VectorCount; ++vector)
+            {
+                const size_t offset = static_cast<size_t>(row) * kValueWidth +
+                                      vector * kVectorWidth;
+                const __m512 decayed = _mm512_mul_ps(
+                    _mm512_loadu_ps(input_head_state + offset), first_decay);
+                _mm512_storeu_ps(decayed_head_state + offset, decayed);
+                kv[vector] = _mm512_fmadd_ps(decayed, key, kv[vector]);
+            }
+        }
 
         for (int token = 0; token < seq_len; ++token)
         {
@@ -976,63 +1070,10 @@ namespace llaminar2
                              static_cast<size_t>(head) * d_k;
             const float *v = values +
                              static_cast<size_t>(token) * value_row_stride +
-                             static_cast<size_t>(head) * kValueWidth;
+                             static_cast<size_t>(head) * kValueWidth + first_column;
             float *o = output +
                        static_cast<size_t>(token) * output_stride +
-                       static_cast<size_t>(head) * kValueWidth;
-            const float *source_head_state = input_head_state;
-            float *destination_head_state = input_head_state;
-            if (state_snapshots)
-            {
-                if (token > 0)
-                {
-                    source_head_state =
-                        state_snapshots +
-                        static_cast<size_t>(token - 1) * snapshot_stride_floats +
-                        static_cast<size_t>(head) * head_state_floats;
-                }
-                destination_head_state =
-                    state_snapshots +
-                    static_cast<size_t>(token) * snapshot_stride_floats +
-                    static_cast<size_t>(head) * head_state_floats;
-            }
-
-            __m512 kv[VectorCount];
-#pragma GCC unroll 8
-            for (int vector = 0; vector < VectorCount; ++vector)
-                kv[vector] = _mm512_setzero_ps();
-
-            const __m512 decay = _mm512_set1_ps(
-                gate_scratch[static_cast<size_t>(token) * n_heads + head]);
-            for (int row = 0; row < d_k; ++row)
-            {
-                if (row + prefetch_rows < d_k)
-                {
-                    GDN_PREFETCH_S(
-                        source_head_state +
-                            static_cast<size_t>(row + prefetch_rows) * kValueWidth,
-                        prefetch_to_l1);
-                }
-
-                const __m512 key = _mm512_set1_ps(k[row]);
-                const float *source_state_row =
-                    source_head_state + static_cast<size_t>(row) * kValueWidth;
-                float *destination_state_row =
-                    destination_head_state +
-                    static_cast<size_t>(row) * kValueWidth;
-#pragma GCC unroll 8
-                for (int vector = 0; vector < VectorCount; ++vector)
-                {
-                    const float *source_segment =
-                        source_state_row + vector * kVectorWidth;
-                    float *destination_segment =
-                        destination_state_row + vector * kVectorWidth;
-                    const __m512 decayed = _mm512_mul_ps(
-                        _mm512_loadu_ps(source_segment), decay);
-                    _mm512_storeu_ps(destination_segment, decayed);
-                    kv[vector] = _mm512_fmadd_ps(decayed, key, kv[vector]);
-                }
-            }
+                       static_cast<size_t>(head) * kValueWidth + first_column;
 
             const __m512 beta = _mm512_set1_ps(
                 beta_scratch[static_cast<size_t>(token) * n_heads + head]);
@@ -1051,34 +1092,71 @@ namespace llaminar2
             for (int vector = 0; vector < VectorCount; ++vector)
                 accumulated_output[vector] = _mm512_setzero_ps();
 
-            for (int row = 0; row < d_k; ++row)
+            if (token + 1 < seq_len)
             {
-                if (row + prefetch_rows < d_k)
-                {
-                    GDN_PREFETCH_S(
-                        destination_head_state +
-                            static_cast<size_t>(row + prefetch_rows) * kValueWidth,
-                        prefetch_to_l1);
-                }
-
-                const __m512 key = _mm512_set1_ps(k[row]);
-                const __m512 query = _mm512_set1_ps(q[row]);
-                float *state_row =
-                    destination_head_state +
-                    static_cast<size_t>(row) * kValueWidth;
+                __m512 next_kv[VectorCount];
 #pragma GCC unroll 8
                 for (int vector = 0; vector < VectorCount; ++vector)
+                    next_kv[vector] = _mm512_setzero_ps();
+                const float *next_key = k + qk_stride;
+                const __m512 next_decay = _mm512_set1_ps(
+                    gate_scratch[static_cast<size_t>(token + 1) * n_heads + head]);
+                float *next_head_state = state_snapshots
+                    ? decayed_head_state + snapshot_stride_floats : decayed_head_state;
+
+                // The current output and next key sum have independent
+                // accumulators. Interleave them, but retain ascending key-row
+                // order and the same rounded multiply/FMA for every lane.
+                for (int row = 0; row < d_k; ++row)
                 {
-                    float *segment = state_row + vector * kVectorWidth;
-                    const __m512 updated = _mm512_fmadd_ps(
-                        key,
-                        kv[vector],
-                        _mm512_loadu_ps(segment));
-                    _mm512_storeu_ps(segment, updated);
-                    accumulated_output[vector] = _mm512_fmadd_ps(
-                        updated,
-                        query,
-                        accumulated_output[vector]);
+                    if (row + prefetch_rows < d_k)
+                        GDN_PREFETCH_S(
+                            decayed_head_state + static_cast<size_t>(row + prefetch_rows) * kValueWidth,
+                            prefetch_to_l1);
+                    const __m512 key = _mm512_set1_ps(k[row]);
+                    const __m512 query = _mm512_set1_ps(q[row]);
+                    const __m512 following_key = _mm512_set1_ps(next_key[row]);
+#pragma GCC unroll 8
+                    for (int vector = 0; vector < VectorCount; ++vector)
+                    {
+                        const size_t offset = static_cast<size_t>(row) * kValueWidth +
+                                              vector * kVectorWidth;
+                        const __m512 updated = _mm512_fmadd_ps(
+                            key, kv[vector], _mm512_loadu_ps(decayed_head_state + offset));
+                        accumulated_output[vector] = _mm512_fmadd_ps(
+                            updated, query, accumulated_output[vector]);
+                        if (state_snapshots)
+                            _mm512_storeu_ps(decayed_head_state + offset, updated);
+                        const __m512 next_decayed = _mm512_mul_ps(updated, next_decay);
+                        next_kv[vector] = _mm512_fmadd_ps(
+                            next_decayed, following_key, next_kv[vector]);
+                        _mm512_storeu_ps(next_head_state + offset, next_decayed);
+                    }
+                }
+                decayed_head_state = next_head_state;
+#pragma GCC unroll 8
+                for (int vector = 0; vector < VectorCount; ++vector)
+                    kv[vector] = next_kv[vector];
+            }
+            else
+            {
+                // Publish an ordinary, fully updated terminal state. There is
+                // no speculative next decay after the last requested token.
+                for (int row = 0; row < d_k; ++row)
+                {
+                    const __m512 key = _mm512_set1_ps(k[row]);
+                    const __m512 query = _mm512_set1_ps(q[row]);
+#pragma GCC unroll 8
+                    for (int vector = 0; vector < VectorCount; ++vector)
+                    {
+                        float *segment = decayed_head_state +
+                            static_cast<size_t>(row) * kValueWidth + vector * kVectorWidth;
+                        const __m512 updated = _mm512_fmadd_ps(
+                            key, kv[vector], _mm512_loadu_ps(segment));
+                        _mm512_storeu_ps(segment, updated);
+                        accumulated_output[vector] = _mm512_fmadd_ps(
+                            updated, query, accumulated_output[vector]);
+                    }
                 }
             }
 
@@ -1646,9 +1724,12 @@ namespace llaminar2
         const int active_or_requested_workers = omp_in_parallel()
                                                     ? omp_get_num_threads()
                                                     : omp_get_max_threads();
-        const int useful_worker_count = std::max(
+        const int whole_head_worker_count = std::max(
             1,
             std::min(active_or_requested_workers, n_heads));
+        const int value_task_slots =
+            active_or_requested_workers > n_heads && d_v >= 64 && seq_len > 1
+                ? (d_v + 15) / 16 : 1;
 
         if (capture_state_snapshots)
         {
@@ -1664,9 +1745,9 @@ namespace llaminar2
                  {"d_v", std::to_string(d_v)},
                  {"snapshot_rows", std::to_string(seq_len)},
                  {"input_layout", input.layout_name},
-                 {"parallel_axis", "head"},
+                 {"parallel_axis", "head_or_subnormal_value_columns"},
                  {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
-                 {"useful_worker_count", std::to_string(useful_worker_count)},
+                 {"whole_head_worker_count", std::to_string(whole_head_worker_count)},
                  {"execution_policy", "head_grouped_recurrence"},
                  {"kernel_variant", "canonical_chunk_forward"},
                  {"snapshot_materialization", "direct_row_destination"},
@@ -1685,9 +1766,9 @@ namespace llaminar2
                  {"d_k", std::to_string(d_k)},
                  {"d_v", std::to_string(d_v)},
                  {"input_layout", input.layout_name},
-                 {"parallel_axis", "head"},
+                 {"parallel_axis", "head_or_subnormal_value_columns"},
                  {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
-                 {"useful_worker_count", std::to_string(useful_worker_count)},
+                 {"whole_head_worker_count", std::to_string(whole_head_worker_count)},
                  {"arithmetic_order", "serial_decode_per_head"}});
         }
 
@@ -1742,36 +1823,55 @@ namespace llaminar2
             }
             // implicit barrier between omp-for regions
 
-            // Phase 2: fused recurrence across independent heads. Token order
-            // remains serial inside each head. Whole-head ownership avoids the
-            // measured Q/K duplication and adjacent-state contention of value
-            // column splitting.
-#pragma omp for schedule(static)
-            for (int head = 0; head < n_heads; ++head)
+            // Phase 2: whole heads for ordinary gates, disjoint value columns
+            // for assist-bound heads. Interleave heads before column slots.
+            // Dynamic task ownership prevents one worker from receiving two
+            // assist-bound tiles while other workers have only empty slots;
+            // ownership never changes a column's arithmetic or token order.
+#pragma omp for schedule(dynamic, 1)
+            for (int64_t task = 0; task < static_cast<int64_t>(n_heads) * value_task_slots; ++task)
             {
-                const int column_count = d_v;
+                const int head = static_cast<int>(task % n_heads);
+                const int slot = static_cast<int>(task / n_heads);
+                const auto tile = gdnValueTile(
+                    gate_scratch_.data(), seq_len, n_heads, head, d_v, slot, value_task_slots);
+                if (!tile)
+                    continue;
+                const int column_count = tile->count;
                 const size_t head_state_floats =
                     static_cast<size_t>(d_k) * d_v;
                 float *input_head_state =
-                    state + static_cast<size_t>(head) * head_state_floats;
+                    state + static_cast<size_t>(head) * head_state_floats + tile->first;
+
+                if (slot == 0 && column_count < d_v)
+                    PerfStatsCollector::addCounter(
+                        "kernel", "cpu_gdn_subnormal_head_column_tasks",
+                        static_cast<double>((d_v + column_count - 1) / column_count),
+                        capture_state_snapshots ? "verifier" : "prefill", "cpu",
+                        {{"rows", std::to_string(seq_len)}, {"head", std::to_string(head)},
+                         {"d_v", std::to_string(d_v)}, {"columns_per_task", std::to_string(column_count)}});
 
 #if defined(__AVX512F__)
-                if (d_v == 128)
+                if (d_v == 128 && activeISALevel() == ISALevel::AVX512)
                 {
-                    gdnChunkForwardAVX512DV128(
-                        q_scratch_.data(), k_scratch_.data(), input.v,
-                        gate_scratch_.data(), beta_sig_scratch_.data(),
-                        output, state, seq_len, n_heads, d_k, head,
-                        input.v_row_stride,
-                        pf_rows_ahead, pf_to_l1,
-                        state_snapshots,
-                        snapshot_stride_floats);
+                    const auto advance = [&]<int Vectors>() {
+                        gdnChunkForwardAVX512DV128<Vectors>(
+                            q_scratch_.data(), k_scratch_.data(), input.v,
+                            gate_scratch_.data(), beta_sig_scratch_.data(),
+                            output, state, seq_len, n_heads, d_k, head, tile->first,
+                            input.v_row_stride, pf_rows_ahead, pf_to_l1,
+                            state_snapshots, snapshot_stride_floats);
+                    };
+                    if (column_count == 128)
+                        advance.template operator()<8>();
+                    else
+                        advance.template operator()<1>();
                     continue;
                 }
 #endif
 
-                // Generic AVX2/scalar whole-head implementation. Scratch is
-                // private to the OpenMP head owner.
+                // Generic AVX2/scalar column-range implementation. Scratch is
+                // private to this task, including when a head has many owners.
                 alignas(64) float kv_mem[512];
                 alignas(64) float delta[512];
                 for (int token = 0; token < seq_len; ++token)
@@ -1784,10 +1884,10 @@ namespace llaminar2
                                      static_cast<size_t>(head) * d_k;
                     const float *v = input.v +
                                      static_cast<size_t>(token) * input.v_row_stride +
-                                     static_cast<size_t>(head) * d_v;
+                                     static_cast<size_t>(head) * d_v + tile->first;
                     float *o = output +
                                static_cast<size_t>(token) * v_stride +
-                               static_cast<size_t>(head) * d_v;
+                               static_cast<size_t>(head) * d_v + tile->first;
                     const float decay = gate_scratch_[
                         static_cast<size_t>(token) * n_heads + head];
                     const float beta = beta_sig_scratch_[
@@ -1802,12 +1902,12 @@ namespace llaminar2
                                 state_snapshots +
                                 static_cast<size_t>(token - 1) *
                                     snapshot_stride_floats +
-                                static_cast<size_t>(head) * head_state_floats;
+                                static_cast<size_t>(head) * head_state_floats + tile->first;
                         }
                         destination_head_state =
                             state_snapshots +
                             static_cast<size_t>(token) * snapshot_stride_floats +
-                            static_cast<size_t>(head) * head_state_floats;
+                            static_cast<size_t>(head) * head_state_floats + tile->first;
                     }
 
 #if defined(__AVX2__)

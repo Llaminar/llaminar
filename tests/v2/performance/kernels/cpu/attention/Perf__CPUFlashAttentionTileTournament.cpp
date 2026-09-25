@@ -1202,6 +1202,9 @@ namespace
             {AttentionRegime::GroupedVerifier, 15, 8192 + 15},
             {AttentionRegime::Prefill, 32, 8192 + 32},
             {AttentionRegime::Prefill, 128, 8192 + 128},
+            // A fresh causal bucket has triangular row cost. A prefix-heavy
+            // tournament alone hides worker imbalance in query-sequence work.
+            {AttentionRegime::Prefill, 512, 512},
         };
     }
 
@@ -1563,4 +1566,44 @@ TEST(Perf__CPUFlashAttentionTileTournament,
      FullQwenTPAllFormatByteTotality)
 {
     runFullQwenTPByteTotality();
+}
+
+/**
+ * @brief Whole-row worker assignment is byte-exact for a fresh causal bucket.
+ *
+ * This test performs no timings. Native K/V codecs, an unaligned row tail,
+ * underfilled/odd teams, and the production-sized socket team all compare to
+ * one-worker execution. Cache tiling and canonical summary boundaries remain
+ * unchanged while the physical worker owning each row changes.
+ */
+TEST(Perf__CPUFlashAttentionTileTournament, CausalPrefillWorkerOwnershipByteExact)
+{
+    prepareBenchmarkCPUBackend();
+    const auto catalog = buildDistinctParticipantGeometries();
+    const auto participant = std::find_if(catalog.begin(), catalog.end(), [](const auto &geometry) {
+        return geometry.n_heads == 8 && geometry.n_kv_heads == 1 && geometry.head_dim == 256;
+    });
+    ASSERT_NE(participant, catalog.end());
+    const int previous_threads = omp_get_max_threads();
+    ScopedOpenMPThreadLimit restore_threads(previous_threads);
+    for (const auto format : kNativeKVFormats)
+    for (const int rows : {31, 512})
+    {
+        SCOPED_TRACE(std::string(formatName(format)) + " M=" + std::to_string(rows));
+        PreparedAttentionInvocation invocation(*participant, format,
+            {AttentionRegime::Prefill, rows, rows},
+            llaminar2::attention::AttentionPrefillParallelAxis::QuerySequence);
+        ASSERT_TRUE(invocation.ready()) << invocation.error();
+        invocation.configureKVTileCandidate(256);
+        omp_set_num_threads(1);
+        ASSERT_TRUE(invocation.runOnce());
+        const auto reference = invocation.copyOutputBytes();
+        for (int workers : {2, 3, 4, 5, 6, 7, 8, 16, 28, 31})
+        {
+            SCOPED_TRACE(workers);
+            omp_set_num_threads(workers);
+            ASSERT_TRUE(invocation.runOnce());
+            EXPECT_EQ(invocation.copyOutputBytes(), reference);
+        }
+    }
 }

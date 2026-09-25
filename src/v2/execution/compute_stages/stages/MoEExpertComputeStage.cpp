@@ -5207,6 +5207,12 @@ namespace llaminar2
                 down_projection_descriptors = {};
             int gate_up_projection_count = 0;
             int down_projection_count = 0;
+            // Routing may make a prompt batch as small as one row or an MTP
+            // verifier batch unusually large. Carry the graph's typed purpose
+            // rather than guessing scheduling intent from the expert's M.
+            const auto projection_purpose = purpose == CPUGroupedRowsPurpose::OrdinaryPrefill
+                ? cpu::native_vnni::ProjectionRowsPurpose::Prefill
+                : cpu::native_vnni::ProjectionRowsPurpose::Decode;
             float *gate_rows = grouped_scratch_gate->mutable_data();
             float *up_rows = grouped_scratch_up->mutable_data();
             float *down_rows = grouped_scratch_out->mutable_data();
@@ -5262,6 +5268,7 @@ namespace llaminar2
                     .rows = expert_rows,
                     .n = intermediate,
                     .ldc = intermediate,
+                    .purpose = projection_purpose,
                 };
                 gate_up_projection_descriptors[
                     static_cast<size_t>(gate_up_projection_count++)] = {
@@ -5274,6 +5281,7 @@ namespace llaminar2
                     .rows = expert_rows,
                     .n = intermediate,
                     .ldc = intermediate,
+                    .purpose = projection_purpose,
                 };
                 down_projection_descriptors[
                     static_cast<size_t>(down_projection_count++)] = {
@@ -5288,6 +5296,7 @@ namespace llaminar2
                     .rows = expert_rows,
                     .n = d_model,
                     .ldc = d_model,
+                    .purpose = projection_purpose,
                 };
             }
 

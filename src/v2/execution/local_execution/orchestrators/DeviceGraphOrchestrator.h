@@ -2759,19 +2759,27 @@ namespace llaminar2
             bool allow_padded_execution) override;
 
         /**
-         * @brief GPU-side greedy argmax for single-device inference
+         * @brief Sample the current producer-published main logits greedily.
          *
-         * Uses IBackend::argmaxF32() on the logits tensor's GPU buffer,
-         * transferring only 8 bytes (float value + int index) instead of
-         * the full vocab row (~600 KB for 152K vocab).
+         * CPU and GPU use the exact published row and layout. Only a genuinely
+         * shard-local output requires candidate coordination; gathered CPU
+         * logits never enter a second vocabulary collective. GPU work joins
+         * the producer's event on its explicit sampler stream.
          *
-         * @return Token ID (>= 0) on success, -1 if not GPU or backend unavailable
+         * @return Global token ID, or -1 on a backend sampling failure.
+         * @throws std::logic_error if no current scalar main row is published.
          */
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
         int sampleOnDeviceAtLogicalPosition(
             const SamplingParams &params,
             int logical_position) override;
+        /**
+         * @brief Match worker participation to the published sampler output.
+         * @param params Current sampling policy, including greedy penalties.
+         * @return True only for a distributed shard-local greedy candidate join.
+         * @throws std::logic_error if greedy sampling has no current main row.
+         */
         bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
         bool publishMainLogitsBatchSamplesToDeviceResidentState(
             int request_count,
@@ -2779,7 +2787,11 @@ namespace llaminar2
             const uint64_t *stochastic_position_seeds = nullptr) override;
 
         /**
-         * @brief Apply sparse logit penalties on device
+         * @brief Mutate the same published main row that sampling consumes.
+         * @param penalties Global token IDs and additive penalties.
+         * @param vocab_size Complete model vocabulary size.
+         * @return True on successful CPU or explicitly ordered GPU mutation.
+         * @throws std::logic_error if nonempty penalties have no published row.
          */
         bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                     int vocab_size) override;

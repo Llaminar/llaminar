@@ -32,7 +32,21 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-The enabled `develop` GitHub workflow is intentionally narrower than that
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build one
+AVX512 full-backend image pair and run only complete Unit and
+ProductionTestPreflight inside its test runner. This is the pre-commit scope,
+not certification: no AVX2, models, E2E, benchmarks or publication. It calls the
+existing image driver with `--cpu-isa AVX512` and no `--publish`, using the same
+host-only cache and shared accelerator concurrency group. See
+`docs/production-ci.md` for its same-repository trust boundary and local command.
+The `develop` ruleset requires that exact check on an up-to-date PR and rejects
+direct human pushes. The trusted base-branch auto-merge workflow arms native
+squash auto-merge only for non-draft same-repository PRs; it never runs PR code.
+The sole direct-push exception is the dedicated release-evidence deploy key for
+the certified post-squash high-water/ancestry commit. Never grant the general
+GitHub Actions app bypass, since it also owns PR auto-merge.
+
+The enabled `develop` push workflow is intentionally narrower than that
 routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
 build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
 Unit and ProductionTestPreflight transaction inside each builder, and publish
@@ -129,6 +143,14 @@ substitute for the production path.
 - For complete AVX512/AVX2 image and benchmark certification, use
   `scripts/ci/run_production_pipeline.py` and `docs/production-ci.md`. Both full
   E2E server suites precede benchmarks; one-off benchmarks cannot certify images.
+  Benchmarks consume the canonical `benchmark` production-default projection,
+  not HTTP `server_args`: depth-15 initialization, forced movement and other
+  correctness stress overrides must not enter timing. Preserve model/topology,
+  context and precision, and let the runtime resolve performance defaults.
+  Old stress-configured release scores are a different series; remeasure the
+  old implementation with matched intent before claiming a code speedup or
+  absence of regressions. See `docs/production-ci.md`, “Benchmark workload and
+  ratchet,” for policy identity and explicit cross-revision diagnostics.
 - Before publishing a changed benchmark runtime, use
   `run_model_parity_benchmarks.py --diagnostic --diagnostic-binary PATH` with
   the complete exported typed E2E manifest. This local Release run preserves
@@ -182,6 +204,15 @@ Use the mature `tests/v2/e2e/server/long_context_checks.py` needle primitive
 when a live server fix needs a sustained correctness/lifetime proof. This is a
 focused stress diagnostic, not a replacement for the complete eight-check E2E
 certificate and not permission to maintain another model/topology matrix.
+
+Bracket the server lifetime with `tests/v2/e2e/server/gpu_driver_diagnostics.py`
+`begin --state PATH` before startup and `finish --state PATH --report PATH`
+after teardown. The ordinary HTTP/generation harness does this automatically;
+an ad hoc stress loop must retain the same evidence. New AMDGPU/NVIDIA driver
+warnings or an unreadable/lost kernel-log interval fail the cell even if all
+responses are correct. Do not clear historical logs or skip the observer.
+Use the access setup in `docs/production-ci.md`; extra log-reading privileges
+belong to the tools container, not the certified inference image.
 
 Start the stress clock only after the Release server publishes `ServerReady`.
 First run one `run_needle_check` for each of `beginning`, `middle`, and `end` so

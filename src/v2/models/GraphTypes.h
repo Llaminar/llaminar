@@ -200,13 +200,14 @@ namespace llaminar2
         /**
          * @brief Resolve the participant-local MTP terminal-logits ownership.
          * @return Typed full-vocabulary or vocabulary-shard layout.
+         * @throws std::logic_error if frontend automatic intent was not compiled.
          *
          * This is the sole model-graph authority for interpreting
          * `mtp.terminal_head_policy` together with
          * `lm_head_column_parallel`. Runtime code must query this method rather
          * than rebuilding the two-axis decision ad hoc.
          */
-        [[nodiscard]] MTPTerminalLogitsLayout mtpTerminalLogitsLayout() const noexcept
+        [[nodiscard]] MTPTerminalLogitsLayout mtpTerminalLogitsLayout() const
         {
             return resolveMTPTerminalLogitsLayout(
                 lm_head_column_parallel,
@@ -216,8 +217,9 @@ namespace llaminar2
         /**
          * @brief Return whether each participant owns complete MTP logits.
          * @return True when no terminal vocabulary collective is required.
+         * @throws std::logic_error if frontend automatic intent was not compiled.
          */
-        [[nodiscard]] bool mtpParticipantOwnsFullVocabulary() const noexcept
+        [[nodiscard]] bool mtpParticipantOwnsFullVocabulary() const
         {
             return mtpTerminalLogitsLayout() ==
                    MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
@@ -227,15 +229,16 @@ namespace llaminar2
          * @brief Return whether MTP replaces a sharded primary head with a mirror.
          * @return True when this participant must bind the replicated terminal
          *         norm and full-vocabulary LM-head weight set.
+         * @throws std::logic_error if frontend automatic intent was not compiled.
          *
          * Single-device graphs also own full-vocabulary logits, but they use
          * the primary model weights and therefore return false here. This
          * distinction keeps weight planning separate from output ownership.
          */
-        [[nodiscard]] bool mtpUsesMirroredTerminalHeadBinding() const noexcept
+        [[nodiscard]] bool mtpUsesMirroredTerminalHeadBinding() const
         {
-            return lm_head_column_parallel &&
-                   mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
+            const bool mirrored = mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
+            return lm_head_column_parallel && mirrored;
         }
 
         /**

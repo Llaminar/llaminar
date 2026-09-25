@@ -12,11 +12,14 @@
  * route tensors may be stage-private or supplied by a serial graph-family
  * arena; the latter is immutable-address storage shared only after the graph
  * builder has established a non-concurrent execution contract.
+ * Host route publication partitions independent rows across the socket's team;
+ * its joined count publication never changes the canonical numerical fold.
  */
 
 #include "MoELocalExpertStage.h"
 
 #include "MoEExpertComputeStage.h"
+#include "execution/moe/MoEOverlayHostRowWork.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../backends/IWorkerGPUContext.h"
@@ -3443,8 +3446,13 @@ namespace llaminar2
             compute_stage = &*inline_compute_stage;
         }
 
-        if (bound_workspace_ && deferred_replay)
+        if (bound_workspace_ && (deferred_replay || params_.device_id.is_cpu()))
         {
+            // Both retained executors received their arena during setup. CPU
+            // prepared engines borrow scratch with each invocation, including
+            // newly arrived experts, so replay must not walk and rebind every
+            // gate/up/down engine. Only inline GPU construction below needs a
+            // first binding; losing a retained binding is a lifecycle error.
             if (compute_stage->getWorkspace() != bound_workspace_)
             {
                 LOG_ERROR(
@@ -3776,15 +3784,14 @@ namespace llaminar2
                     input.original_route_slots_host[route.input_entry] < 0)
                     return fail_completed_packet();
             const size_t width = static_cast<size_t>(params_.d_model);
-            for (size_t entry = 0; entry < active_routes_.size(); ++entry)
-            {
+            forEachMoEOverlayHostRow(active_routes_.size(), width * sizeof(float), [&](size_t entry) {
                 const auto &route = active_routes_[entry];
                 output.row_ids_host[entry] = input.original_route_slots_host[route.input_entry];
                 const size_t source_slot = route.compact_row *
                     static_cast<size_t>(compact_execution_top_k_) + route.route_offset;
                 std::copy_n(compact_result + source_slot * width, width,
                             output.output_rows_fp32 + entry * width);
-            }
+            });
             output.layout = params_.return_layout;
         }
         else if (publishes_canonical_routes)

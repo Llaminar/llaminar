@@ -8,9 +8,12 @@
  *   3. validatePreparedWeights() succeeds with slab-refs pointing to a registered store.
  *   4. validatePreparedWeights() fails when a slab is not in the store (empty mask).
  *   5. Params has only the allowed MoE runtime-table hook, not runner/peer fields.
+ *   6. CPU replay and expert replacement retain the setup-owned workspace;
+ *      prepared CPU engines receive scratch through invocation, never rebinding.
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -23,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -121,7 +125,7 @@ namespace
      * projection publishes an expert-specific FP32 row, making the expected
      * original-slot and router-weight mapping exact and easy to inspect.
      */
-    class CanonicalRouteTestGemm final : public ITensorGemm
+    class CanonicalRouteTestGemm final : public ITensorGemm, public IWorkspaceConsumer
     {
     public:
         CanonicalRouteTestGemm(int expert_id, bool down_projection)
@@ -139,9 +143,10 @@ namespace
             const TensorBase * = nullptr,
             const IMPIContext * = nullptr,
             int = -1,
-            DeviceWorkspaceManager * = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr,
             int = 0) override
         {
+            last_invocation_workspace_ = workspace;
             if (!output || m <= 0 || n <= 0)
                 return false;
             float *const values = output->mutable_data();
@@ -158,8 +163,9 @@ namespace
             const TensorBase *, const TensorBase *, TensorBase *output,
             int m, int n, int,
             float = 1.0f, float = 0.0f,
-            DeviceWorkspaceManager * = nullptr) override
+            DeviceWorkspaceManager *workspace = nullptr) override
         {
+            last_invocation_workspace_ = workspace;
             if (!down_projection_ || !output || m <= 0 || n <= 0)
                 return false;
             float *const values = output->mutable_data();
@@ -210,9 +216,37 @@ namespace
 
         bool weights_converted() const override { return true; }
 
+        /** @return No scratch is required by this numerical wiring double. */
+        WorkspaceRequirements getWorkspaceRequirements(int, int = 0, int = 0) const override
+        {
+            return {};
+        }
+
+        /** @return The production CPU ownership contract: scratch belongs to each call. */
+        WorkspaceBindingPolicy workspaceBindingPolicy() const noexcept override
+        {
+            return WorkspaceBindingPolicy::Invocation;
+        }
+
+        /** @brief Count attempted bindings without retaining a shared mutable pointer. */
+        void bindWorkspace(DeviceWorkspaceManager *) override { ++binding_calls_; }
+        /** @return CPU prepared engines never retain a workspace. */
+        bool hasWorkspace() const override { return false; }
+        /** @return No implicit scratch; production callers pass the stage's workspace. */
+        DeviceWorkspaceManager *getWorkspace() const override { return nullptr; }
+        /** @return Setup/replay binding attempts, including redundant no-op calls. */
+        size_t bindingCalls() const noexcept { return binding_calls_; }
+        /** @return Scratch actually supplied by the last numerical invocation. */
+        DeviceWorkspaceManager *lastInvocationWorkspace() const noexcept
+        {
+            return last_invocation_workspace_;
+        }
+
     private:
         int expert_id_ = -1;
         bool down_projection_ = false;
+        size_t binding_calls_ = 0;
+        DeviceWorkspaceManager *last_invocation_workspace_ = nullptr;
     };
 
     /**
@@ -660,6 +694,126 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
             EXPECT_FLOAT_EQ(
                 canonical_rows[untouched_slot * kDModel + col],
                 kUntouched);
+        }
+    }
+}
+
+/**
+ * @brief CPU packets change data and prepared weights, never the scratch binding.
+ *
+ * A counting invocation-owned engine exposes redundant binding even though the
+ * real CPU adapter makes it a no-op. The replacement bank changes expert zero's
+ * numerical signature, so retaining the workspace cannot hide stale weights.
+ */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUWorkspaceIsSetupOwnedAcrossPacketsAndExpertReplacement)
+{
+    constexpr int width = 8;
+    constexpr int experts = 2;
+    constexpr int rows = 2;
+    MoEOverlayCollectiveWorkspace packets;
+    packets.ensureCapacity(rows, rows, width, 1, DeviceId::cpu());
+    auto input = packets.localExpertInput(0, 0);
+    auto output = packets.localExpertOutput(0, 0);
+    input.residency_epoch = 1;
+    input.live_row_count = rows;
+    input.live_entry_count = rows;
+    for (int row = 0; row < rows; ++row)
+    {
+        input.row_ids_host[row] = row;
+        input.entry_offsets_host[row] = row;
+        input.expert_ids_host[row] = row;
+        input.route_weights_host[row] = 1.0f;
+        std::fill_n(input.hidden_rows_fp32 + row * width, width, 1.0f);
+    }
+    input.entry_offsets_host[rows] = rows;
+
+    std::array<std::shared_ptr<CanonicalRouteTestGemm>, experts * 3> engines;
+    std::array<std::shared_ptr<CanonicalRouteTestGemm>, 3> replacement;
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.graph_row_capacity = rows;
+    params.num_experts = experts;
+    params.top_k = 1;
+    params.d_model = width;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 0;
+    params.expert_mask.assign(experts, true);
+    for (int expert = 0; expert < experts; ++expert)
+    {
+        for (int projection = 0; projection < 3; ++projection)
+            engines[expert * 3 + projection] =
+                std::make_shared<CanonicalRouteTestGemm>(expert, projection == 2);
+        params.prepared_gate_gemm.push_back(engines[expert * 3].get());
+        params.prepared_up_gemm.push_back(engines[expert * 3 + 1].get());
+        params.prepared_down_gemm.push_back(engines[expert * 3 + 2].get());
+    }
+    for (int projection = 0; projection < 3; ++projection)
+        replacement[projection] =
+            std::make_shared<CanonicalRouteTestGemm>(3, projection == 2);
+
+    auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+        MoEOverlayParticipantResidency::Config{
+            .participant_id = 0, .device = DeviceId::cpu(),
+            .num_layers = 1, .num_experts = experts});
+    MoEOverlayParticipantResidencyBank bank{
+        .epoch = 1, .participant_id = 0, .device = DeviceId::cpu(),
+        .layers = {{std::vector<bool>(experts, false),
+                    std::vector<MoEOverlayPreparedExpertTriplet>(experts)}}};
+    for (int expert = 0; expert < experts; ++expert)
+        bank.layers[0].setResidentExpert(expert,
+            {engines[expert * 3], engines[expert * 3 + 1], engines[expert * 3 + 2]});
+    auto ready = residency->prepareReadyBank(std::move(bank));
+    ASSERT_TRUE(ready.has_value());
+    ASSERT_EQ(residency->installReadyBank(std::move(*ready)),
+        MoEOverlayParticipantBankInstallStatus::Installed);
+    params.overlay_participant_residency = residency;
+
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 4096);
+    MoELocalExpertStage stage(params);
+    stage.bindWorkspace(&workspace);
+    auto unbind = [](MoELocalExpertStage *value) { value->unbindWorkspace(); };
+    std::unique_ptr<MoELocalExpertStage, decltype(unbind)> binding(&stage, unbind);
+    std::array<size_t, experts * 3> setup_bindings;
+    for (size_t i = 0; i < engines.size(); ++i)
+        setup_bindings[i] = engines[i]->bindingCalls();
+    llaminar2::testing::MockDeviceContext context(DeviceId::cpu(), ComputeBackendType::CPU);
+
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        SCOPED_TRACE(replay);
+        if (replay == 10)
+        {
+            // A new immutable epoch replaces prepared engines, not the arena.
+            auto next = residency->cloneCandidate(1, 2);
+            next.layers[0].setResidentExpert(0,
+                {replacement[0], replacement[1], replacement[2]});
+            auto prepared = residency->prepareReadyBank(std::move(next));
+            ASSERT_TRUE(prepared.has_value());
+            ASSERT_EQ(residency->installReadyBank(std::move(*prepared)),
+                MoEOverlayParticipantBankInstallStatus::Installed);
+            ASSERT_TRUE(residency->retire(1));
+            input.residency_epoch = 2;
+        }
+        ASSERT_TRUE(stage.execute(&context));
+        EXPECT_EQ(stage.getWorkspace(), &workspace);
+        ASSERT_EQ(output.live_row_count, rows);
+        for (int row = 0; row < rows; ++row)
+            for (int col = 0; col < width; ++col)
+                EXPECT_FLOAT_EQ(output.output_rows_fp32[row * width + col],
+                    static_cast<float>(((replay >= 10 && row == 0 ? 3 : row) + 1) * 16 + col));
+        for (size_t i = 0; i < engines.size(); ++i)
+        {
+            EXPECT_EQ(engines[i]->bindingCalls(), setup_bindings[i]);
+            EXPECT_EQ(engines[i]->lastInvocationWorkspace(), &workspace);
+        }
+        for (const auto &engine : replacement)
+        {
+            EXPECT_EQ(engine->bindingCalls(), 0u);
+            EXPECT_EQ(engine->lastInvocationWorkspace(), replay >= 10 ? &workspace : nullptr);
         }
     }
 }

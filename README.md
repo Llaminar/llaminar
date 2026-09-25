@@ -224,6 +224,11 @@ depth adapts how many it proposes. Prefix caching, which reuses work from
 previous prompts, is enabled by default. If you expose the server to other
 machines, use a trusted network or an authenticated proxy.
 
+Head placement is automatic too: CPU tensor-parallel execution splits the
+vocabulary projection across participants; CUDA and ROCm keep a mirrored head.
+For experiments, `--mtp-terminal-head-policy vocabulary-sharded` or
+`--mtp-terminal-head-policy mirrored-full-vocabulary` overrides that choice.
+
 Wait for the server to become ready, then use another terminal:
 
 ```bash

@@ -8,6 +8,120 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-25 wrap-up: **A — accepted as good enough; tuning stopped.** Both CPU
+sockets sustain approximately **42 tok/s dynamic-MTP decode** and **350-class
+prefill**. The requested 50 tok/s was not reached. The last candidate was
+byte-exact but had no production benefit (41.43 versus 41.50 tok/s), so it was
+removed rather than counted as a speedup. The restored executable/core are
+byte-identical to the control. Final gates pass **670/670 Unit**, **103/103
+CPU preflight** and **6/6 true-AVX2 focused checks**, with a complete clean
+driver interval. No tests or tuning runs remain active. Existing cross-backend
+limitations below remain unrecertified. See the
+[CPU wrap-up evidence](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md).
+
+2026-09-25, current CPU follow-up: **A — approximately 42 tok/s dynamic decode;
+50 tok/s remains open.** Setup-owned expert workspace reuse passed 670 Unit,
+99 CPU-tagged preflight and true-AVX2 focused checks. Reusing the existing SIMD
+greedy selector cuts an isolated 124,160-logit scan from 135 to 9 us, but its
+paired whole-model means are 41.70 (control) and 41.80 (change), inside noise.
+All twelve 256-token streams match; default depth remains 1–15, acceptance
+87.05%, and movement remains active. Matched MTP-off prefill is 349.00 tok/s.
+Final gates, including mixed-format expert proofs, pass 670/670 Unit and
+103/103 CPU preflight; the driver interval has zero new records/findings.
+A byte-exact compact-codebook lookup-table experiment had no meaningful
+mixed-format FFN win and was removed.
+Do not report the scan's microbenchmark gain as a decode speedup or claim the
+unrefreshed full cross-backend gate. See the
+[current CPU evidence](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md).
+
+2026-09-25, latest: **A — 350-class prefill retained; 50 tok/s decode open.**
+Medium expert-input publication uses the active team's total work budget.
+Clean default dynamic decode is **39.17/39.44 tok/s**, matched MTP-off prefill
+**350.52 tok/s**, with unchanged output streams. Gates: **670/670 Unit**,
+**96/96 CPU-tagged ProductionTestPreflight**, clean fresh driver logs, and
+focused AVX2-only numerical tests. The full cross-backend gate is not refreshed;
+the GPU-only findings below remain open. Wider movement budgets and starting
+dynamic MTP at depth 3 fail to improve this workload, so defaults are unchanged.
+The common fused-projection completion simplification passes all 17 affected
+numerical groups and three true-AVX2 gates. Release decode is **39.33/39.59
+tok/s**, versus a paired 38.88 control; matched prefill is **352.93 tok/s**,
+with exact tokens. A finer ordinary-head GDN partition was byte-exact but
+slower and is removed. Final gates pass **670/670 Unit** and **98/98 CPU
+preflight**, with zero new driver records. Both completion ISA registrations
+pass twenty consecutive processes; the 50 tok/s target remains open.
+
+2026-09-25: **A/R — CPU prefill preserved; GPU driver warning under diagnosis.**
+An exact compile-time half-scale reciprocal lookup and direct AVX2/AVX512 byte
+packing reduce isolated expert input publication by another 28%/40%, without
+changing activation precision, formats or arithmetic results. Whole-model
+dynamic decode is **37.51/38.99/38.43 tok/s**: the spread is larger than the
+small median improvement, so no new decode win is certified. All twelve
+compared 256-token streams match, with the same draft acceptance and movement
+counts. The matched MTP-off prefill is **351.84 tok/s**, preserving the earlier
+350-class result. The rebuilt full Unit gate passes **669/669 in 76.17s**;
+the full preflight passes **375/375 assertions in 1006.90s**, but emits fresh
+AMDGPU IH-ring-overflow warnings. A driver-guarded split reproduces them in
+the all-device source-free planning probes; individual GPU probes are clean
+in three repeats. This is not a clean driver-health certificate. The earlier
+mixed-GPU capture setup/cleanup failure below remains unexplained despite
+forty passing isolated repeats and its passing latest full-gate rerun.
+The 50 tok/s dynamic-decode goal remains unmet.
+
+The subsequent shared-descriptor experiment was removed: neither its original
+nor copy-free form improved the production-aligned expert timing. A smaller
+fix removes **25 dormant-diagnostic C++ allocations per expert FFN**, verified
+red-before/green-after across all 21 formats and three ISA regimes; six focused
+preflight entries pass. Latest unprofiled Release results are **38.62 tok/s
+dynamic decode** and **348.79 tok/s matched MTP-off prefill**, with unchanged
+tokens. This preserves the roughly 350 tok/s prefill result; it is not a new
+whole-model speedup. Rebuilt gates pass **669/669 Unit in 76.01s** and all ten
+affected CPU integration entries plus their fixture in 57.49s; two additional
+AVX2-only entries also pass. The full 377-entry cross-backend preflight is not
+recertified by this focused refresh; the GPU issues above remain open.
+
+2026-09-24: **A — CPU correctness gates green; decode target remains open.**
+Removing an M=2 single-worker bypass improves fixed-depth-1 Release decode
+from 17.78 to 26.13 tok/s with unchanged tokens. Default dynamic MTP remains
+32.92 tok/s versus the initial 32.71; an explicit sharded terminal-head
+experiment measures 35.72–36.57 tok/s. The matched workload has 512 prompt
+and 256 generated tokens, real movement, and the default 1–15 depth range.
+The active 50 tok/s target remains unmet. Q6 instruction scheduling is under
+evaluation without changing precision or generated dispatch. All 668 Unit
+tests and all 372 production-preflight tests pass for the worker/Q6 slice.
+The CPU-only sharded-head default now measures 36.11/36.38 tok/s versus a
+32.45 mirrored control (+11–12%), with identical tokens. Five focused groups
+and the rebuilt 668-Unit/373-preflight gates pass. Its latest
+333.79 tok/s prefill is comparable to the prior dynamic-MTP baseline of 335.49,
+not the 350 tok/s MTP-off/16-output-token checkpoint. The exact recheck exposed
+a non-MTP sampler deadlock: CPU sampling inferred a shard from its allocation
+instead of consuming the graph's published full row. A two-rank focused
+regression reproduces the wrong row, extra candidate collective, and misplaced
+penalties; CPU sampler/penalty/participation consumers now share the existing
+typed publication. The repaired focused regression passes 20/20 fresh MPI
+runs, and the rebuilt Unit gate passes 668/668. Matched MTP-off prefills are
+348.50/348.91 tok/s versus the committed 349.57/351.44; dynamic decode repeats
+at 36.89 tok/s with identical tokens/acceptance and live movement. The full
+post-fix gates pass: 668 Unit tests in 75.92 seconds and 374 production-preflight
+tests in 1007.23 seconds. See the
+[CPU decode investigation](../2026-09/2026-09-24-qwen36-dual-cpu-mtp-decode.md).
+Before the register-rounding change below, the fixed-depth-3 control reaches
+40.14 tok/s with identical tokens; dynamic at 36.89 is 91.9% of it. A separate
+restricted CPU-stage profile places about
+80% of transaction time in verification, with routed experts the largest
+stage family. The next isolated fix replaces volatile scalar FP32 rounding
+stores with opaque x86 register dependencies, retaining the exact Newton tree
+and GPU arithmetic. Exhaustive half-scale, general FP32 and Q8-tail oracles
+pass in AVX2 and AVX512 builds. Quantization micro-latency falls about 30–32%;
+default dynamic decode repeats at **38.02/38.29 tok/s** with identical token
+streams and acceptance/movement counts. Matched MTP-off prefill remains
+**348.14 tok/s**. The rebuilt Unit gate passes **669/669 in 76.06 seconds**;
+the full production preflight finishes 374/375 and has one unresolved ordinary
+ROCm2→CUDA2 pipeline setup timeout (RCCL reports an invalid HIP launch
+configuration before capture, followed by a cleanup stall). Its previous
+full-gate run passed; causality is not established. No
+depth policy, precision, weight format or topology change was made, and
+50 tok/s remains open.
+
 2026-09-15, 05:27 UTC: **A — cross-host speedup measured; long E2E pending.**
 Real full-image Azure requests improve 5.35x/6.43x for 32/64 output tokens,
 with identical request/response messages. Both rank files pass remote expert

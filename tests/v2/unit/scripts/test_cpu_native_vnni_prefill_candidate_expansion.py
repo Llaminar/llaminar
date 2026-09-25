@@ -108,7 +108,7 @@ class CPUNativeVNNIPrefillCandidateExpansionTest(unittest.TestCase):
                             "threads": 28,
                         })
 
-    def test_plan_adds_only_five_pair_grid_candidates(self) -> None:
+    def test_plan_adds_only_missing_row_grid_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source.csv"
@@ -131,11 +131,12 @@ class CPUNativeVNNIPrefillCandidateExpansionTest(unittest.TestCase):
             self.assertEqual(len(plan.records), 3)
             self.assertEqual({record.m_values for record in plan.records}, {(2, 15)})
             self.assertEqual({record.threads for record in plan.records}, {28})
-            self.assertEqual(len(plan.expansion_candidate_ids), 5)
-            self.assertTrue(all(
-                ".two_row_pair_grid." in candidate
-                for candidate in plan.expansion_candidate_ids
-            ))
+            self.assertEqual(set(plan.expansion_candidate_ids), {
+                *(f"cpu.nvnni.prefill.two_row_pair_grid.nbc{nbc}.full_k"
+                  for nbc in (1, 2, 4, 8, 16)),
+                *(f"cpu.nvnni.prefill.four_row_grid.nbc{nbc}.full_k"
+                  for nbc in (1, 2, 4, 8)),
+            })
             self.assertEqual(
                 set(plan.source_candidate_ids).union(plan.expansion_candidate_ids),
                 {entry.candidate_id for entry in cpu_native_vnni_prefill_registry().entries},

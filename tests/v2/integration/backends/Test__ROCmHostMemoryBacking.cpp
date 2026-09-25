@@ -6,12 +6,18 @@
  * threshold. Anonymous USERPTR backing can enter unbounded huge-page compaction
  * when a large model fragments RAM. Native KFD/GTT backing must also retain the
  * exact-stream, byte-correct upload/download contract of TransferEngine.
+ * Caller-owned registrations must use explicit pinned buffer objects as well,
+ * rather than silently retaining demand-paged HMM ranges after unregistration.
  */
 
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 #include "transfer/TransferEngine.h"
+
+#include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+#include <dlfcn.h>
 
 #include <gtest/gtest.h>
 
@@ -43,6 +49,21 @@ namespace
         }
         return {};
     }
+}
+
+TEST(ROCmHostMemoryBacking, RegistrationUsesExplicitOwnershipNotHmmRanges)
+{
+    // Inspect the live runtime, not just getenv(): the environment could have
+    // been changed after HSA initialized. Backend admission initializes HIP.
+    ASSERT_NE(getBackendFor(DeviceId::rocm(0)), nullptr);
+    const auto query = reinterpret_cast<decltype(&hsa_system_get_info)>(
+        dlsym(RTLD_DEFAULT, "hsa_system_get_info"));
+    ASSERT_NE(query, nullptr);
+    bool svm_enabled = true;
+    ASSERT_EQ(query(static_cast<hsa_system_info_t>(HSA_AMD_SYSTEM_INFO_SVM_SUPPORTED),
+        &svm_enabled), HSA_STATUS_SUCCESS);
+    EXPECT_FALSE(svm_enabled)
+        << "Explicit host pin/unpin must not enter deferred HMM range ownership";
 }
 
 TEST(ROCmHostMemoryBacking, NativeSlabUsesDriverPagesAndTransfersExactBytes)

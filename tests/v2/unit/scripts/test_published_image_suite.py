@@ -32,6 +32,7 @@ import run_model_parity_e2e as e2e
 import published_benchmark_chart as chart
 import build_public_docs as public_docs
 from production_artifacts import digest, ratchet, write_json
+from test_gpu_driver_diagnostics import clean_evidence as clean_driver_evidence
 
 
 def image_pair():
@@ -310,9 +311,11 @@ class PublishedImageSuiteTests(unittest.TestCase):
             outcomes = iter((1, 124, 0))
 
             def run_cell(_command, environment, _log, *, budget):
-                """Successful shell fixtures must retain the new tool evidence too."""
+                """Successful shell fixtures retain tool and driver-health evidence."""
                 code = next(outcomes)
                 if code == 0:
+                    write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "cell.driver-diagnostics.json",
+                               clean_driver_evidence())
                     write_json(Path(environment["LLAMINAR_E2E_LOG_DIR"]) / "tool_calling_results.json",
                                {"schema": 1, "complete": True,
                                 "results": [row_for(probe) for probe in tools.PROBES]})
@@ -767,6 +770,10 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertIn((lane, str(lane), False), mounts)
             command = run.call_args.args[0]
             self.assertEqual(command[-3:], ["tools-image", "python3", "runner.py"])
+            self.assertIn("SYSLOG", command)
+            self.assertIn("/dev/kmsg:/dev/kmsg:r", command)
+            driver_name = command[command.index("--name") + 1]
+            self.assertIn(f"LLAMINAR_E2E_KERNEL_READER_CONTAINER={driver_name}", command)
             self.assertEqual(lane.stat().st_mode & 0o007, 0o005)
             repair = next(call.args[0] for call in cleanup.call_args_list
                           if call.args[0][:2] == ["docker", "run"])
@@ -1133,7 +1140,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertEqual([check["context"] for check in checks], list(master_ruleset.REQUIRED_CHECKS))
         self.assertTrue(all(check["integration_id"] == 15368 for check in checks))
 
-    def test_develop_guard_prevents_deletion_and_admits_the_master_ancestry_join(self):
+    def test_develop_guard_requires_pr_and_only_dedicated_release_key_bypasses(self):
         current = {"name": "develop", "target": "branch", "enforcement": "disabled",
                    "conditions": {"ref_name": {"include": ["refs/heads/develop"], "exclude": []}},
                    "bypass_actors": [], "rules": [{"type": "deletion"},
@@ -1142,11 +1149,43 @@ class PublishedImageSuiteTests(unittest.TestCase):
         proposed = master_ruleset.proposed_develop_ruleset(current)
         self.assertEqual(proposed["enforcement"], "active")
         self.assertEqual({rule["type"] for rule in proposed["rules"]},
-                         {"deletion", "non_fast_forward"})
+                         {"deletion", "non_fast_forward", "pull_request",
+                          "required_status_checks"})
+        self.assertEqual(proposed["bypass_actors"], [
+            {"actor_id": None, "actor_type": "DeployKey", "bypass_mode": "always"}])
+        checks = next(rule for rule in proposed["rules"]
+                      if rule["type"] == "required_status_checks")["parameters"]
+        self.assertTrue(checks["strict_required_status_checks_policy"])
+        self.assertEqual(checks["required_status_checks"], [
+            {"context": "Unit + ProductionTestPreflight (AVX512)",
+             "integration_id": 15368}])
         self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)
-        current["rules"].append({"type": "required_status_checks"})
-        with self.assertRaisesRegex(ValueError, "unrelated PR or status-check"):
+        current["rules"].append({"type": "creation"})
+        with self.assertRaisesRegex(ValueError, "unknown or missing guard"):
             master_ruleset.proposed_develop_ruleset(current)
+        proposed["bypass_actors"] = [
+            {"actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always"}]
+        with self.assertRaisesRegex(ValueError, "unrelated bypass actor"):
+            master_ruleset.proposed_develop_ruleset(proposed)
+
+    def test_release_bypass_rejects_any_other_writable_deploy_key(self):
+        with patch.object(master_ruleset, "github_json", return_value=[
+                {"title": master_ruleset.RELEASE_DEPLOY_KEY_TITLE,
+                 "read_only": False, "enabled": True}]):
+            master_ruleset.require_dedicated_release_key("Llaminar/llaminar")
+        with patch.object(master_ruleset, "github_json", return_value=[
+                {"title": master_ruleset.RELEASE_DEPLOY_KEY_TITLE,
+                 "read_only": False, "enabled": True},
+                {"title": "other-writer", "read_only": False, "enabled": True}]):
+            with self.assertRaisesRegex(ValueError, "exactly one writable deploy key"):
+                master_ruleset.require_dedicated_release_key("Llaminar/llaminar")
+
+    def test_high_water_cli_requires_exact_release_ssh_push_target(self):
+        with self.assertRaises(SystemExit) as error:
+            high_water.main(["--repository", "Llaminar/llaminar",
+                             "--master-sha", "a" * 40, "--output", "/tmp/unused",
+                             "--push-url", "origin"])
+        self.assertEqual(error.exception.code, 2)
 
     def test_obsolete_policy_installers_cannot_restore_the_old_master_check(self):
         for name in ("apply-rulesets.sh", "apply-branch-protection.sh"):
@@ -1171,6 +1210,9 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/master'", text)
         self.assertIn("scripts/ci/publish_master_release.py", text)
         self.assertIn("scripts/ci/publish_pr_high_water.py", text)
+        self.assertIn("secrets.RELEASE_DEVELOP_DEPLOY_KEY", text)
+        self.assertIn("gh api meta --jq '.ssh_keys[]'", text)
+        self.assertIn('--push-url "git@github.com:${REPOSITORY}.git"', text)
         self.assertNotIn("release-please", text)
 
     def test_pr_workflow_run_title_pins_number_and_exact_source(self):
@@ -1288,8 +1330,10 @@ class PublishedImageSuiteTests(unittest.TestCase):
                  patch.object(master_release, "download_proof",
                               return_value=(root / "e2e", benchmark_directory)), \
                  patch.object(master_release, "validate_proof", return_value=evidence):
-                first = high_water.publish("Llaminar/llaminar", master, root / "proof")
-                second = high_water.publish("Llaminar/llaminar", master, root / "proof-retry")
+                first = high_water.publish("Llaminar/llaminar", master, root / "proof",
+                                           str(remote))
+                second = high_water.publish("Llaminar/llaminar", master, root / "proof-retry",
+                                            str(remote))
             self.assertFalse(first["reused"])
             self.assertTrue(second["reused"])
             self.assertEqual(first["develop_sha"], second["develop_sha"])

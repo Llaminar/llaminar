@@ -5445,84 +5445,12 @@ namespace llaminar2
                 {
                     try
                     {
-                        const auto binding =
-                            config_.device_controller_fabric
-                                ->participantBinding(
-                                    endpoint->participant_id);
-                        const auto load32 = [](std::uint32_t &value)
-                        {
-                            return std::atomic_ref<std::uint32_t>(value)
-                                .load(std::memory_order_acquire);
-                        };
-                        const auto load64 = [](std::uint64_t &value)
-                        {
-                            return std::atomic_ref<std::uint64_t>(value)
-                                .load(std::memory_order_acquire);
-                        };
-                        if (binding.controller && binding.command)
-                        {
-                            auto &controller = *binding.controller;
-                            auto &command = *binding.command;
-                            out << ",controller={state="
-                                << load32(controller.state)
-                                << ",kind="
-                                << load32(controller.transaction_kind)
-                                << ",error="
-                                << load32(controller.error_code)
-                                << ",transaction="
-                                << load64(controller.transaction_id)
-                                << ",base_epoch="
-                                << load64(controller.base_epoch)
-                                << ",candidate_epoch="
-                                << load64(controller.candidate_epoch)
-                                << ",durable_epoch="
-                                << load64(controller.current_durable_epoch)
-                                << ",admission_transaction="
-                                << load64(controller.admission_transaction)
-                                << ",completed_transaction="
-                                << load64(controller.completed_transaction)
-                                << ",placement_layer_cursor="
-                                << load32(controller.placement_layer_cursor)
-                                << ",admission_epoch="
-                                << load64(controller.admission_epoch)
-                                << ",command_transaction="
-                                << load64(controller.command_transaction)
-                                << ",commit_transaction="
-                                << load64(controller.commit_transaction)
-                                << ",commands="
-                                << load32(command.command_count) << "}";
-                        }
-                        if (binding.local_participant_record)
-                        {
-                            auto &record =
-                                *binding.local_participant_record;
-                            out << ",controller_participant={status="
-                                << load32(record.status_code)
-                                << ",snapshot="
-                                << load64(record.snapshot_transaction)
-                                << ",prepared="
-                                << load64(record.prepared_transaction)
-                                << ",published="
-                                << load64(record.published_transaction)
-                                << ",retirement_ready="
-                                << load64(record.retirement_ready_epoch)
-                                << ",retired="
-                                << load64(record.retired_epoch) << "}";
-                        }
-                        if (binding.local_group)
-                        {
-                            auto &group = *binding.local_group;
-                            out << ",controller_group={status="
-                                << load32(group.status_code)
-                                << ",snapshot="
-                                << load64(group.snapshot_transaction)
-                                << ",prepared="
-                                << load64(group.prepared_transaction)
-                                << ",published="
-                                << load64(group.published_transaction)
-                                << ",retired="
-                        << load64(group.retired_epoch) << "}";
-                        }
+                        // Failure diagnostics use the fabric's explicit host
+                        // view. Participant bindings contain GPU-only aliases;
+                        // dereferencing them can crash while reporting the
+                        // original failure when host and device VAs differ.
+                        out << ',' << config_.device_controller_fabric
+                            ->describeInferenceEpochBarrier();
                     }
                     catch (const std::exception &diagnostic_error)
                     {

@@ -14,6 +14,7 @@
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
 #include <cstddef>
+#include <optional>
 
 namespace llaminar2
 {
@@ -73,6 +74,18 @@ struct WorkspaceMemoryGeometry
     /** Terminal projection ownership retained by the MTP graph family. */
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =
         MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    /**
+     * @brief Flattened token capacity of a retained local sparse-expert graph.
+     *
+     * Presence declares compact-route execution alongside the continuation,
+     * independently of tensor sharding or weight placement. Each token can
+     * produce top-k expert rows. The value already includes request batches
+     * and may differ from the dense prefill bucket; never multiply it by batch
+     * size again. Absence leaves an ordinary continuation's direct MoE rows
+     * unchanged. Expert-only endpoints derive their token capacity from the
+     * ordinary graph geometry when no explicit compact capacity is supplied.
+     */
+    std::optional<int> compact_routed_expert_token_rows;
 };
 
 class WorkspaceMemoryEstimator

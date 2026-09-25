@@ -7,6 +7,8 @@
  * Serial M=1 rows are a diagnostic oracle only. Timing alternates path order
  * and publishes raw samples after complete byte checks. This is a standalone
  * economy diagnostic, not part of production preflight or a policy installer.
+ * The native-Q6 serial-tile experiment similarly compares existing physical
+ * register geometries without modifying the production selector.
  */
 
 #include "../../../../utils/NativeVNNITestPartialStorage.h"
@@ -190,6 +192,110 @@ namespace
         ::testing::ValuesIn(quantizedVerifierFormats()),
         [](const ::testing::TestParamInfo<QuantizedVerifierFormatCase> &info)
         { return std::string(info.param.label); });
+
+    /**
+     * @test Compare existing native-Q6 serial register tiles without changing dispatch.
+     *
+     * Each candidate owns the same complete 64-column chunk and visits every
+     * K block in order. Only the number of column vectors kept in registers
+     * together differs. The current four-vector primitive is the byte oracle;
+     * this diagnostic does not install a generated policy or change packing.
+     */
+    TEST(CPUQ6SerialTile, RegisterGeometry)
+    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        const int n = dimension("LLAMINAR_CPU_FUSED_VERIFIER_N_A", 2048);
+        const int k = dimension("LLAMINAR_CPU_FUSED_VERIFIER_K", 2048);
+        ASSERT_EQ(k % 256, 0);
+        auto source = TestTensorFactory::createQ6_KRandom(
+            {static_cast<size_t>(n), static_cast<size_t>(k)}, 4251);
+        CPUNativeVNNIGemmKernel kernel(source.get());
+        ASSERT_TRUE(kernel.isValid());
+        const auto &packed = kernel.packedWeights();
+        auto input = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(k)}, -1.0f, 1.0f, 4252);
+        std::vector<Q8_1Block> quantized(packed.blocks_per_row);
+        quantize_activations_to_q8_1(input->data(), quantized.data(),
+            1, k, packed.blocks_per_row);
+        const std::array<int, 3> spans = {1, 2, 4};
+        std::array<std::vector<float>, 3> outputs;
+        for (auto &output : outputs)
+            output.resize(packed.N_padded);
+
+        // Persistent output storage and the production worksharing scope keep
+        // allocation, packing and team setup identical across the candidates.
+        const auto run = [&](int candidate)
+        {
+            auto compute = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+                {
+                    const std::array<const Q8_1Block *, 1> activation = {quantized.data()};
+                    const std::array<float *, 1> output = {outputs[candidate].data() + chunk * 64};
+                    switch (spans[candidate])
+                    {
+                    case 1:
+                        q6k_detail::rowsChunkAVX512<1, 1>(packed, activation,
+                            output, chunk, 0, packed.blocks_per_row, false);
+                        break;
+                    case 2:
+                        q6k_detail::rowsChunkAVX512<1, 2>(packed, activation,
+                            output, chunk, 0, packed.blocks_per_row, false);
+                        break;
+                    case 4:
+                        q6k_detail::rowsChunkAVX512<1, 4>(packed, activation,
+                            output, chunk, 0, packed.blocks_per_row, false);
+                        break;
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(compute);
+        };
+        for (int candidate = 0; candidate < 3; ++candidate)
+            run(candidate);
+        for (int candidate = 0; candidate < 2; ++candidate)
+            ASSERT_EQ(std::memcmp(outputs[candidate].data(), outputs[2].data(),
+                static_cast<size_t>(packed.N_padded) * sizeof(float)), 0);
+
+        if (std::getenv("LLAMINAR_CPU_Q6_SERIAL_PROFILE_ZSPAN"))
+        {
+            const int span = dimension("LLAMINAR_CPU_Q6_SERIAL_PROFILE_ZSPAN", 4);
+            const auto found = std::find(spans.begin(), spans.end(), span);
+            ASSERT_NE(found, spans.end());
+            const int candidate = static_cast<int>(found - spans.begin());
+            const int iterations = dimension("LLAMINAR_CPU_FUSED_VERIFIER_ITERS", 1000);
+            for (int iteration = 0; iteration < iterations; ++iteration)
+                run(candidate);
+            return;
+        }
+
+        // Give every tile an equal sustained warmup; tiny projections otherwise
+        // finish their first samples while the CPU is still changing frequency.
+        for (int candidate = 0; candidate < 3; ++candidate)
+        {
+            const auto until = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(250);
+            do { run(candidate); } while (std::chrono::steady_clock::now() < until);
+        }
+        std::cout << "format,m,n,k,threads,sample,zspan,microseconds\n";
+        for (int sample = 0; sample < 12; ++sample)
+            for (int order = 0; order < 3; ++order)
+            {
+                const int candidate = (sample + order) % 3;
+                constexpr int repetitions = 16;
+                const auto start = std::chrono::steady_clock::now();
+                for (int repeat = 0; repeat < repetitions; ++repeat)
+                    run(candidate);
+                const double elapsed = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - start).count() / repetitions;
+                std::cout << "Q6_K,1," << n << ',' << k << ',' << omp_get_max_threads()
+                          << ',' << sample << ',' << spans[candidate] << ',' << elapsed << '\n';
+            }
+#else
+        GTEST_SKIP() << "The native AVX512 register-tile diagnostic requires an AVX512 build";
+#endif
+    }
 
     /** Narrow real-model projections retain FP32 activations for every weight dtype. */
     class CPUFloatingVerifier : public ::testing::TestWithParam<TensorType> {};

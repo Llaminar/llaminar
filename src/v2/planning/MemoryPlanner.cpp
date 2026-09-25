@@ -798,6 +798,24 @@ MemoryPlan MemoryPlanner::plan(
             retained_additional_weight_bytes = additional_weight_bytes;
         }
 
+        // The same compact expert graph can be hosted by a continuation or a
+        // follower. Resolve its flattened capacity once; dense TP and request
+        // batch geometry must not reinterpret the serial packet declaration.
+        std::optional<int> compact_routed_expert_token_rows;
+        if (cfg.weight_residency.selectsRoutedExperts() ||
+            cfg.execution_role == DeviceExecutionMemoryRole::RoutedExpertParticipant)
+        {
+            if (cfg.serial_routed_expert_compact_rows < 0)
+                throw std::invalid_argument("Compact expert token rows cannot be negative");
+            const size_t token_rows = cfg.serial_routed_expert_compact_rows > 0
+                ? static_cast<size_t>(cfg.serial_routed_expert_compact_rows)
+                : checkedMultiply(static_cast<size_t>(std::max(1, cfg.batch_size)),
+                      static_cast<size_t>(activation_seq), "compact expert token rows");
+            if (token_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw std::overflow_error("Compact expert token rows exceed integer geometry");
+            compact_routed_expert_token_rows = static_cast<int>(token_rows);
+        }
+
         /*
          * Cache planning follows the actual hybrid layer inventory. Full
          * attention contributes sequence-length-scaled KV storage; GDN and
@@ -1186,14 +1204,11 @@ MemoryPlan MemoryPlanner::plan(
                         replicated_dense_decode
                             ? MTPTerminalLogitsLayout::FullVocabularyPerParticipant
                             : cfg.mtp_terminal_logits_layout,
+                    .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
                 });
         }
         else
         {
-            const int participant_graph_rows =
-                cfg.serial_routed_expert_compact_rows > 0
-                    ? cfg.serial_routed_expert_compact_rows
-                    : activation_seq;
             activation_bytes = routedParticipantActivationBytes(
                 profile,
                 cfg,
@@ -1208,7 +1223,7 @@ MemoryPlan MemoryPlanner::plan(
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
                     .batch_size = cfg.batch_size,
-                        .resident_graph_rows = participant_graph_rows,
+                        .resident_graph_rows = activation_seq,
                         .max_context_rows = max_seq,
                         .owns_embedding = false,
                         .shard_index = cfg.shard_index,
@@ -1241,6 +1256,7 @@ MemoryPlan MemoryPlanner::plan(
                         .last_layer = last_layer,
                         .total_shards = cfg.total_shards,
                         .apportioned_routed_experts = true,
+                        .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
                     });
         }
 

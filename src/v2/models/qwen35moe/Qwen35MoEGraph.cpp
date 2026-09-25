@@ -9,6 +9,8 @@
  * ROCm, and CPU/NUMA endpoints can share one production model topology.
  * Native-capture ownership follows every declared service boundary: portable
  * inter-host MPI and colocated CPU work share the typed ticket lifecycle.
+ * Independent rank-batch sends and colocated expert compute share a fork;
+ * ordered return publication is the join, not a prerequisite for local compute.
  */
 
 #include "Qwen35MoEGraph.h"
@@ -9960,6 +9962,9 @@ namespace llaminar2
 
                 for (size_t tier_index = 0; tier_index < overlay_plan->routed_tiers.size(); ++tier_index)
                 {
+                    const std::string rank_batch_entry = last_return_reduce;
+                    std::vector<MoEOverlayRankBatchGraphLane> rank_batch_lanes;
+                    std::vector<MoEOverlayLocalExpertGraphLane> rank_local_lanes;
                     const auto &tier = overlay_plan->routed_tiers[tier_index];
                     auto tier_mask = expertMaskForTier(*overlay_placement,
                                                        config_.moe.num_experts,
@@ -10314,8 +10319,6 @@ namespace llaminar2
                         // Previous tiers may own the shared return destination.
                         // Freeze that entry edge: a later peer in this tier must
                         // never inherit the preceding peer's blocking return.
-                        const std::string rank_batch_entry = last_return_reduce;
-                        std::vector<MoEOverlayRankBatchGraphLane> rank_batch_lanes;
                         for (const auto &[target_world_rank, participants] :
                              rank_groups)
                         {
@@ -10634,10 +10637,12 @@ namespace llaminar2
                             last_return_reduce = tier_terminal;
                             first_return_scatter = false;
                         }
-                        if (!rank_batch_lanes.empty())
-                            wireMoEOverlayRankBatchForkJoin(graph, rank_batch_lanes);
                         if (local_rank_participants.empty())
+                        {
+                            if (!rank_batch_lanes.empty())
+                                wireMoEOverlayRankBatchForkJoin(graph, rank_batch_lanes);
                             continue;
+                        }
 
                         /*
                          * Remote rank batches and mapped lanes have now been
@@ -10692,9 +10697,11 @@ namespace llaminar2
                             "_p" + std::to_string(target_participant);
 
                         auto target_dispatch_inbound = std::make_shared<MoEOverlaySparseRows>(
-                            participant_workspaces[static_cast<size_t>(target_participant)]->dispatchReceive(
-                                layer_idx,
-                                static_cast<int>(tier_index)));
+                            direct_rank_local_protocol && target_participant == continuation_root_participant
+                                ? participant_workspaces[static_cast<size_t>(target_participant)]->localExpertInput(
+                                      layer_idx, static_cast<int>(tier_index))
+                                : participant_workspaces[static_cast<size_t>(target_participant)]->dispatchReceive(
+                                      layer_idx, static_cast<int>(tier_index)));
                         const MoEOverlayCollectiveKey dispatch_key = graphNativeMoEKey(
                             layer_idx,
                             static_cast<int>(tier_index),
@@ -10832,18 +10839,18 @@ namespace llaminar2
                                                 previous_dispatch_node.empty()
                                                     ? dispatch_dependency
                                                     : previous_dispatch_node);
-                            /*
-                             * MPI collectives form one globally ordered
-                             * protocol across independently materialized rank
-                             * graphs.  Make that order a graph edge rather than
-                             * relying on unordered topological-sort tie breaks:
-                             * every participant completes the previous target's
-                             * return before entering the next dispatch.
-                             */
-                            if (!last_return_reduce.empty())
+                            // True collective lanes retain globally ordered
+                            // dispatch/return pairing. A colocated endpoint next
+                            // to independent rank-batch channels instead declares
+                            // private work in the common fork. The shared helper
+                            // joins all returns without serializing CPU sockets.
+                            const auto &dispatch_predecessor =
+                                direct_rank_local_protocol && !rank_batch_lanes.empty()
+                                    ? rank_batch_entry : last_return_reduce;
+                            if (!dispatch_predecessor.empty())
                                 graph.addDependency(
                                     sparse_dispatch_name,
-                                    last_return_reduce);
+                                    dispatch_predecessor);
                             previous_dispatch_node = sparse_dispatch_name;
                             if (distributed_overlay ||
                                 source_participant == target_participant)
@@ -11212,10 +11219,15 @@ namespace llaminar2
                                         static_cast<int>(tier_index)));
                             }
 
-                            auto inbound_lifetime = std::make_shared<MoEOverlayReturnRows>(
-                                participant_workspaces[static_cast<size_t>(source_participant)]->returnReceive(
-                                    layer_idx,
-                                    static_cast<int>(tier_index)));
+                            // A rank-local edge already owns stable host rows.
+                            // Alias that participant-private output until the
+                            // ordered gather consumes it, rather than copying
+                            // the entire route matrix to another local bank.
+                            auto inbound_lifetime = direct_rank_local_protocol
+                                ? local_output_lifetime
+                                : std::make_shared<MoEOverlayReturnRows>(
+                                      participant_workspaces[static_cast<size_t>(source_participant)]->returnReceive(
+                                          layer_idx, static_cast<int>(tier_index)));
 
                             MoESparseReturnReduceStage::Params return_params;
                             return_params.device_id = DeviceId::cpu();
@@ -11317,6 +11329,12 @@ namespace llaminar2
 
                         if (!root_return_node.empty())
                         {
+                            if (direct_rank_local_protocol && !rank_batch_lanes.empty())
+                                rank_local_lanes.push_back({
+                                    .dispatch = target_dispatch_node,
+                                    .compute = local_name,
+                                    .returned = root_return_node,
+                                });
                             std::string tier_terminal = root_return_node;
                             const bool final_ticket_return =
                                 final_host_sparse_return.has_value() &&
@@ -11415,6 +11433,8 @@ namespace llaminar2
                             first_return_scatter = false;
                         }
                     }
+                    if (!rank_batch_lanes.empty())
+                        wireMoEOverlayRankBatchForkJoin(graph, rank_batch_lanes, rank_local_lanes);
                 }
 
                 if (!pending_canonical_ticket_consumes.empty())
