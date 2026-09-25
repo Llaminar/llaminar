@@ -3,8 +3,11 @@
  * @brief Shared production-runtime projection of every canonical model cell.
  *
  * GoogleTest parameter discovery publishes machine-readable metadata without
- * loading weights. Generation regression and tagged E2E consume these records,
- * never test-name fragments or a second model/topology table. Arguments remain an argv vector
+ * loading weights. Generation regression, tagged E2E and benchmarks consume
+ * these records, never test-name fragments or a second model/topology table.
+ * Correctness projections retain adversarial policies; benchmark projections
+ * retain only cell intent and leave tuning to production defaults.
+ * Arguments remain an argv vector
  * all the way to the existing HTTP harness; they are never shell-evaluated.
  */
 #pragma once
@@ -172,6 +175,76 @@ namespace llaminar2::test::parity
     }
 
     /**
+     * @brief Share automatic placement intent between HTTP and benchmarks.
+     * @param cell Sole model/topology declaration supplying counts and strategy.
+     * @return CLI constraints, without performance or correctness overrides.
+     * @throws std::invalid_argument for a non-projectable topology.
+     *
+     * Counts prevent a multi-device cell from quietly measuring one device.
+     * Endpoint identities, rank ownership, layer splits and tier capacities
+     * remain choices for the real production planner, not this exporter.
+     */
+    inline std::vector<std::string> modelParityAutomaticPlacementArguments(const ModelParityCase &cell)
+    {
+        std::string backends, cardinality;
+        for (const auto &[backend, count] : modelParityAutomaticDeviceCounts(cell))
+        {
+            backends += (backends.empty() ? "" : ",") + backend;
+            cardinality += (cardinality.empty() ? "" : ",") + backend + "=" + std::to_string(count);
+        }
+        std::vector<std::string> args{
+            "--auto", "--only-backends", backends, "--auto-device-counts", cardinality,
+            "--only-strategies", std::string(orchestrationStrategyName(modelParityAutomaticStrategy(cell)))};
+        if (cell.expert_overlay)
+            args.insert(args.end(), {"--moe-routed-expert-owner-order",
+                cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random"});
+        return args;
+    }
+
+    /**
+     * @brief Project an E2E candidate onto production-default benchmark policy.
+     * @param cell Tagged model/topology and semantic precision/MTP/movement axes.
+     * @return Arguments excluding executable, workload, model and context.
+     * @throws std::invalid_argument if the case is not eligible for E2E.
+     *
+     * Do not clone numerical/HTTP arguments and strip known stress flags: new
+     * stress knobs would silently leak into timing again. Only semantic intent
+     * is emitted here. Runtime defaults own depth initialization/adaptation,
+     * graph capacity, movement economics, transfer slots, prefix storage,
+     * collectives and prefill buckets. Explicit fixed-depth/static cases still
+     * retain those selected modes rather than being mislabeled as dynamic.
+     */
+    inline std::vector<std::string> modelParityBenchmarkArguments(const ModelParityCase &cell)
+    {
+        if (!cell.e2e_certification)
+            throw std::invalid_argument("benchmark projection requires an E2E-tagged case");
+        const auto config = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+        std::vector<std::string> args;
+        if (cell.topology.mpi_ranks > 1)
+            args.insert(args.end(), {"--mpi-procs", std::to_string(cell.topology.mpi_ranks)});
+        args.insert(args.end(), {"--activation-precision", config.activation_precision,
+                                 "--kv-cache-precision", config.kv_cache_precision});
+        const auto placement = modelParityAutomaticPlacementArguments(cell);
+        args.insert(args.end(), placement.begin(), placement.end());
+        if (cell.mtpEnabled())
+        {
+            args.insert(args.end(), {"--mtp", "--mtp-depth-policy",
+                                     cell.usesDynamicMTPDepth() ? "dynamic" : "fixed"});
+            if (!cell.usesDynamicMTPDepth())
+                args.insert(args.end(), {"--mtp-draft-tokens", std::to_string(cell.requestedMTPDraftDepth())});
+        }
+        if (cell.expert_overlay)
+        {
+            const bool dynamic = cell.expert_overlay->movement == ModelParityExpertMovement::Dynamic;
+            // Maintenance is public automatic-planning intent. A residency
+            // declaration instead belongs to an authored placement plan;
+            // emitting one here would accidentally construct a partial plan.
+            args.insert(args.end(), {"--moe-residency-maintenance", dynamic ? "dynamic" : "off"});
+        }
+        return args;
+    }
+
+    /**
      * @brief Project any canonical case onto the Release server's public CLI.
      * @param cell Existing expanded parity configuration, not a new matrix.
      * @param placement Keep declared placement or request the tagged remote overlay.
@@ -233,22 +306,8 @@ namespace llaminar2::test::parity
         }
         else if (!declared)
         {
-            // This is a search constraint, not a prebuilt apply document. Auto
-            // retains endpoint, rank, layer-split, domain and tier-role choices.
-            // Requiring counts prevents a two-device E2E cell silently passing
-            // as a faster single-device candidate on a larger machine.
-            args.push_back("--auto");
-            std::string backends, cardinality;
-            for (const auto &[backend, count] : modelParityAutomaticDeviceCounts(cell))
-            {
-                backends += (backends.empty() ? "" : ",") + backend;
-                cardinality += (cardinality.empty() ? "" : ",") + backend + "=" + std::to_string(count);
-            }
-            add("--only-backends", backends);
-            add("--auto-device-counts", cardinality);
-            add("--only-strategies", orchestrationStrategyName(modelParityAutomaticStrategy(cell)));
-            if (cell.expert_overlay)
-                add("--moe-routed-expert-owner-order", cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random");
+            const auto constraints = modelParityAutomaticPlacementArguments(cell);
+            args.insert(args.end(), constraints.begin(), constraints.end());
         }
         else if (cell.topology.isExpertOverlay())
         {
@@ -488,7 +547,7 @@ namespace llaminar2::test::parity
         *out << "]},\"cross_host_e2e\":";
         writeModelParityCrossHostE2E(cell, *out);
         *out << ",\"e2e\":";
-        if (!cell.e2e_certification) { *out << "null}"; return; }
+        if (!cell.e2e_certification) { *out << "null,\"benchmark\":null}"; return; }
         const auto &profile = *cell.e2e_certification;
         *out << "{\"context_length\":" << profile.context_length
              << ",\"minimum_prompt_tokens\":" << profile.minimum_prompt_tokens
@@ -534,6 +593,11 @@ namespace llaminar2::test::parity
         const auto automatic_args = modelParityServerArguments(cell, ModelParityRuntimePlacementProjection::AutomaticCell);
         for (std::size_t i = 0; i < automatic_args.size(); ++i)
             *out << (i ? "," : "") << modelParityJsonString(automatic_args[i]);
+        *out << "]},\"benchmark\":{\"schema\":1,\"policy\":\"production_defaults\",\"context_length\":"
+             << profile.context_length << ",\"args\":[";
+        const auto benchmark_args = modelParityBenchmarkArguments(cell);
+        for (std::size_t i = 0; i < benchmark_args.size(); ++i)
+            *out << (i ? "," : "") << modelParityJsonString(benchmark_args[i]);
         *out << "]}}";
     }
 } // namespace llaminar2::test::parity

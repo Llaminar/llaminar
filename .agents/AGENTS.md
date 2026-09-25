@@ -332,6 +332,19 @@ or serialize independent graph builders to hide an unfixed system HIP runtime.
 `V2_Integration_HIPConcurrentGraphIdentity` is the focused preflight proof that
 every operation survives concurrent construction and replay.
 
+`ROCmRuntimeStartup` also prepares the process-wide explicit host-memory ABI
+before HIP/HSA initialization: native driver-backed host allocations and pinned
+buffer-object registration (`HSA_USERPTR_FOR_PAGED_MEM=0`, `HSA_USE_SVM=0`).
+Callers do not set these as tuning flags or substitute HMM-managed host ranges
+for TransferEngine ownership. Conflicting or late setup fails ROCm admission;
+CPU-only startup must not initialize a GPU to prepare this policy.
+ROCm registration also isolates its first/last base pages from neighbouring
+huge-page reclaim through `HostRegistrationPageBoundary`. Do not replace this
+storage-boundary contract with a global THP setting or a driver-warning
+allowlist; interior huge pages remain eligible and TransferEngine retains
+registration ownership. Its geometry and captured-replay regressions belong
+to `ProductionTestPreflight`.
+
 Full-backend binaries also run on CPU-only cluster members. Keep CUDA Driver
 API binding in `CUDADriverApi`, prepared before CUDA graph recording; do not
 restore a public `CUDA::cuda_driver` dependency or inject toolkit stubs into
@@ -734,7 +747,13 @@ commit or publish implicitly. See `docs/production-ci.md`. Do not
 add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
 
-The enabled `develop` GitHub workflow is deliberately smaller: it invokes
+Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml`: build
+one AVX512 full-backend image pair and run only complete Unit and
+`ProductionTestPreflight` inside its test-runner image. This is the pre-commit
+test scope, not model or image certification. It reuses the existing image
+driver without publication; no AVX2, models, E2E or benchmarks run on this PR.
+
+The enabled `develop` push workflow is deliberately smaller than certification: it invokes
 `scripts/ci/run_develop_image_gate.py` to build AVX512 and AVX2 full-backend
 images, run only the complete Unit and `ProductionTestPreflight` gates inside
 each builder, and publish the two tested `develop` runtime tags. It does not

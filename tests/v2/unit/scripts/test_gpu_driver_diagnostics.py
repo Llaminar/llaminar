@@ -57,6 +57,8 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
         for message in (
             "amdgpu 0000:8c:00.0: amdgpu: ih2 ring buffer overflow (0x80000)",
             "workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us",
+            "workqueue: amdgpu_amdkfd_restore_userptr_worker [amdgpu] hogged CPU for >10000us 35 times",
+            "workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 259 times, consider switching to WQ_UNBOUND",
             "vega20_ih_get_wptr: 156 callbacks suppressed",
             "amdgpu: [gfxhub] page fault (src_id:0 ring:0 vmid:1 pasid:123)",
             "amdgpu: ring gfx timeout, signaled seq=14, emitted seq=15",
@@ -135,7 +137,12 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
     def test_complete_lifecycle_passes_and_teardown_warning_fails(self):
         """Use the public CLI lifecycle to reject a fault after successful HTTP."""
         old = record("amdgpu: old overflow", "err")
-        for tail in ((), (record("NVRM: Xid 79, GPU has fallen off the bus", timestamp=20),)):
+        for tail in (
+            (),
+            (record("NVRM: Xid 79, GPU has fallen off the bus", timestamp=20),),
+            (record("workqueue: kfd_process_wq_release [amdgpu] hogged CPU for >10000us 259 times",
+                    "warn", timestamp=20),),
+        ):
             with self.subTest(tail=tail), tempfile.TemporaryDirectory() as directory:
                 state = Path(directory) / "cell.driver-checkpoint.json"
                 report = Path(directory) / "cell.driver-diagnostics.json"

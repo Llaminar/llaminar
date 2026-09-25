@@ -831,6 +831,69 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid shared UID", result.stderr)
 
+    def test_persistent_tmpfs_setup_without_shared_uid_is_idempotent(self) -> None:
+        """Optional ARC sharing must not fail ordinary local setup or reuse.
+
+        Execute the actual shell entrypoint for creation, adoption and reuse.
+        Only privileged filesystem commands are replaced; a second invocation
+        must leave the cache and the mount-call history unchanged.
+        """
+        for initial_state in ("create", "adopt", "reuse"):
+            with self.subTest(initial_state=initial_state), tempfile.TemporaryDirectory(
+                prefix="llaminar-tmpfs-local-"
+            ) as raw:
+                root = Path(raw)
+                destination = root / "canonical"
+                destination.mkdir()
+                fake_bin = root / "bin"
+                fake_bin.mkdir()
+                calls = root / "calls"
+
+                def fake(name: str, body: str) -> None:
+                    """Keep the process boundary real without mount privileges."""
+                    path = fake_bin / name
+                    path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body,
+                                    encoding="utf-8")
+                    path.chmod(0o755)
+
+                fake("mountpoint", '[[ "${LLAMINAR_TEST_STATE}" == reuse ]]\n')
+                fake("findmnt",
+                     'if [[ "$*" == *"-rn -t tmpfs -o TARGET,SOURCE"* ]]; then\n'
+                     '  if [[ "${LLAMINAR_TEST_STATE}" == adopt ]]; then\n'
+                     '    printf "%s llaminar-production-parity\\n" "${LLAMINAR_TEST_EXISTING}"\n'
+                     '  fi\n  exit 0\nfi\n'
+                     'case "$*" in\n'
+                     '  *"-o FSTYPE"*) printf "tmpfs\\n" ;;\n'
+                     '  *"-o SOURCE"*) printf "llaminar-production-parity\\n" ;;\n'
+                     '  *"-o OPTIONS"*) printf "rw,nosuid,nodev\\n" ;;\n'
+                     '  *) exit 2 ;;\nesac\n')
+                fake("mount", 'printf "%s\\n" "$*" >> "${LLAMINAR_TEST_CALLS}"\n')
+                fake("setfacl", "exit 97\n")
+                fake("df", "exit 0\n")
+                fake("sudo", 'exec "$@"\n')
+                environment = os.environ | {
+                    "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"],
+                    "LLAMINAR_TEST_STATE": initial_state,
+                    "LLAMINAR_TEST_EXISTING": str(root / "exported"),
+                    "LLAMINAR_TEST_CALLS": str(calls),
+                }
+                command = ["bash", str(TMPFS_SETUP_SCRIPT), "--mount-point", str(destination)]
+                first = subprocess.run(command, env=environment, capture_output=True,
+                                       text=True, timeout=10)
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                published = destination / "cache" / "retained.gguf"
+                published.write_bytes(b"existing immutable model")
+                identity = published.stat()
+                mounts = calls.read_text() if calls.exists() else ""
+                self.assertEqual(len(mounts.splitlines()), 0 if initial_state == "reuse" else 1)
+                second = subprocess.run(command, env=environment | {"LLAMINAR_TEST_STATE": "reuse"},
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+                self.assertEqual(calls.read_text() if calls.exists() else "", mounts)
+                self.assertEqual(published.read_bytes(), b"existing immutable model")
+                self.assertEqual(published.stat().st_ino, identity.st_ino)
+                self.assertEqual(published.stat().st_mtime_ns, identity.st_mtime_ns)
+
     def test_persistent_tmpfs_setup_adopts_one_named_mount_without_new_pages(self) -> None:
         """Host adoption is one bind of the named tmpfs, never a second tmpfs."""
         with tempfile.TemporaryDirectory(prefix="llaminar-tmpfs-adoption-") as raw:

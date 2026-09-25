@@ -9,6 +9,36 @@ develop-branch GitHub Actions job described below.
 The shared [Llaminar testing workflow](../.agents/llaminar-testing/SKILL.md)
 routes local development checks, model diagnostics, and this full image gate.
 
+## Feature PRs into develop
+
+`.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
+`develop`. It builds only the AVX512 full-backend image pair and executes the
+complete Unit and `ProductionTestPreflight` transaction **inside its installed
+test-runner image**. This is the pre-commit test scope in a reproducible image,
+not release certification. The checkout is the PR merge ref, so the tests
+include the proposed integration with `develop`.
+
+The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
+without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
+HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
+No registry-write permission or login is granted. Untrusted fork PRs do not
+acquire the privileged host runner; review/import them onto a repository branch
+before running this gate. Branch protection is configured independently.
+
+The PR uses the same host Docker daemon, retained `llaminar-ci` BuildKit worker,
+bounded local compiler cache and accelerator concurrency group as develop
+publication. Only build logs, image/test receipts and CTest/JUnit evidence are
+uploaded to GitHub, never cache contents. Run the equivalent locally with:
+
+```bash
+python3 scripts/ci/run_develop_image_gate.py \
+  --cpu-isa AVX512 --output parity-results/develop-pr-gate
+```
+
+After merge, the ordinary develop push workflow below builds/tests **both**
+shipping ISA images and publishes them. Master PR certification remains a
+separate, broader gate.
+
 ## Develop branch image gate
 
 `.github/workflows/ci.yml` is enabled only for pushes to `develop`. It runs
@@ -672,6 +702,11 @@ benchmark selection. The pipeline supplies its full report automatically and
 never interleaves benchmarks with unfinished E2E tests. Diagnostic benchmark
 reports cannot certify an image even if they happen to cover every cell.
 The certifying pipeline deliberately has no cell/backend skip switches.
+Local Release runs use `--diagnostic --diagnostic-binary PATH` instead of
+`--image`. They authenticate the build type and actual AVX2/AVX512 ISA through
+the same build-cache contract as local HTTP E2E. Diagnostic status remains
+separate provenance, so the correct hardware/workload/ISA high-water comparison
+still detects regressions; it must not manufacture a new "diagnostic" ISA key.
 
 ### Azure resources for cross-host E2E
 
@@ -911,6 +946,17 @@ Neither control acquisition nor a one-off comparison can certify an image.
 
 ## Benchmark workload and ratchet
 
+Benchmarks select the same model/topology candidates as HTTP E2E, but **do not
+inherit its stress policy**. The typed matrix exports a separate `benchmark`
+projection with `policy: production_defaults`. It preserves context, activation
+and KV precision, automatic topology constraints, and the selected MTP/movement
+mode. The production runtime chooses depth initialization/adaptation, movement
+economics, transfer slots, graph capacity, prefill buckets and cache defaults.
+In particular, correctness-test settings that start at depth 15 or force frequent
+expert movement belong only in the correctness projection. No runner strips
+flags from HTTP arguments or recreates a topology; stale exports missing the
+benchmark projection must be rebuilt.
+
 `benchmarks/production/workload.json` owns the shared workload: fixed prompt
 bytes, output length, sampling seed/policy, one warmup and three measured
 requests. The prompt is 512 repetitions of ` test`; the actual tokenizer's
@@ -928,6 +974,17 @@ tolerance fails and cannot update any marks. New keys are explicitly recorded
 as `new_baseline`, not claimed as improvements. Old unrelated workloads are
 preserved in `legacy_high_water.json`; they are never relabeled as comparable
 measurements. Tolerance/workload changes are ordinary reviewed source changes.
+Changing from legacy E2E-stress timing to production-default timing therefore
+creates a distinct series. Preserve published stress measurements as historical
+evidence; do not label a policy change as a measured implementation improvement
+or silently copy those marks onto the new identities. A regression claim across
+that boundary requires remeasuring the old implementation with the same new
+production-default intent.
+An explicit image `--diagnostic` can retime an older immutable Release image
+against the current manifest; its report records the manifest's `source_revision`
+and the image's separate `runtime_source_revision`. That cross-revision run is
+non-certifying. Ordinary certification still requires matching source and full
+same-image E2E evidence.
 
 ## Evidence, commits and image identity
 

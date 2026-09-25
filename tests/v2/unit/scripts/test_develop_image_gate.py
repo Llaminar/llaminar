@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Device-free contract tests for the narrow develop image build/publish gate."""
+"""Device-free contracts for model-free develop PR and image-publication gates.
+
+The PR workflow consumes the same image driver with one ISA and no publication.
+Its actual command is parsed and exercised here so adding a second ISA, model
+phase or registry write cannot silently expand the inexpensive pre-merge gate.
+"""
 from __future__ import annotations
 
 from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -13,6 +19,8 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
@@ -199,6 +207,109 @@ class DevelopImageGateTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         self.assertIn("if: ${{ !cancelled() }}", workflow)
+
+    def test_develop_pr_builds_one_isa_and_runs_only_installed_prerequisites(self):
+        """Exercise the real PR command, not a separately invented argument set."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"pull_request"})
+        self.assertEqual(workflow["on"]["pull_request"]["branches"], ["develop"])
+        self.assertEqual(set(workflow["on"]["pull_request"]["types"]),
+                         {"opened", "synchronize", "reopened", "ready_for_review"})
+        self.assertEqual(workflow["permissions"], {"contents": "read"})
+        self.assertEqual(workflow["concurrency"], {
+            "group": "llaminar-develop-image-gate", "cancel-in-progress": "false"})
+        self.assertEqual(set(workflow["jobs"]), {"prerequisites"})
+        job = workflow["jobs"]["prerequisites"]
+        self.assertEqual(job["runs-on"], ["llaminar-xeon-host"])
+        # Fork code must not acquire this privileged, persistent host runner.
+        self.assertEqual(job["if"],
+                         "github.event.pull_request.head.repo.full_name == github.repository")
+        steps = job["steps"]
+        actions = {step["uses"] for step in steps if "uses" in step}
+        self.assertEqual(actions, {"actions/checkout@v6", "docker/setup-buildx-action@v4",
+                                   "actions/upload-artifact@v4"})
+        checkout = next(step for step in steps if step.get("uses") == "actions/checkout@v6")
+        self.assertEqual(checkout["with"], {
+            "submodules": "false", "lfs": "false", "persist-credentials": "false"})
+        buildx = next(step for step in steps if step.get("uses") == "docker/setup-buildx-action@v4")
+        for key, value in {"name": "llaminar-ci", "driver": "docker-container",
+                           "keep-state": "true", "cleanup": "false",
+                           "cache-binary": "false"}.items():
+            self.assertEqual(buildx["with"][key], value)
+        commands = [step["run"] for step in steps if "run" in step]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[1], "bash scripts/ci/prune_docker_build_cache.sh")
+        command = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
+        self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
+        arguments = command[2:]
+        policy = gate.parse_arguments(arguments)
+        self.assertEqual(policy.cpu_isas, ["AVX512"])
+        self.assertFalse(policy.publish)
+        self.assertIsNone(policy.image)
+
+        source = {"revision": "a" * 40, "tree": "merge-tree", "dirty": False}
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "output"
+            arguments[arguments.index("--output") + 1] = str(output)
+
+            def build(args, admitted, directory, *, test_inventory):
+                self.assertEqual(admitted, source)
+                self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
+                events.append(("build", args.cpu_isa))
+                return images(args.cpu_isa)
+
+            def prerequisites(built, directory):
+                events.append(("prerequisites", built["test-runner"]["id"]))
+                return prerequisite_report()
+
+            with patch.object(gate, "source_identity", return_value=source), \
+                 patch.object(gate, "device_lease", side_effect=lambda: nullcontext()), \
+                 patch.object(gate, "build", side_effect=build), \
+                 patch.object(gate, "require_image_pair"), \
+                 patch.object(gate, "run_prerequisites", side_effect=prerequisites), \
+                 patch.object(gate, "publish_runtime") as publish:
+                self.assertEqual(gate.main(arguments), 0)
+            publish.assert_not_called()
+            self.assertEqual(events, [("build", "AVX512"),
+                                     ("prerequisites", "test-runner-avx512")])
+            receipt = json.loads((output / "develop-image-gate.json").read_text())
+            self.assertTrue(receipt["complete"])
+            self.assertFalse(receipt["published"])
+            self.assertEqual(set(receipt["variants"]), {"AVX512"})
+
+    def test_prerequisites_execute_in_exact_test_image_without_model_mounts(self):
+        """A PR must test its built image, not a host checkout or older runtime."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+
+            def run(command, log):
+                self.assertEqual(command[:3], ["docker", "run", "--rm"])
+                start = command.index("test-runner-avx512")
+                invocation = command[start + 1:]
+                # The log wrapper receives the real canonical prerequisite
+                # command as positional arguments, retaining its exit status.
+                self.assertEqual(invocation[-8:], [
+                    "python3", "scripts/ci/run_production_prerequisites.py",
+                    "--build-dir", "build_v2_integration",
+                    "--installed-build-receipt", "/src/installed-tests.json",
+                    "--output", "/ci-results/prerequisites"])
+                gate.write_json(directory / "prerequisites/prerequisites.json",
+                                prerequisite_report())
+
+            with patch.object(gate.docker_paths, "device_args", return_value=[]) as devices, \
+                 patch.object(gate.docker_paths, "mounts", return_value=[]) as mounts, \
+                 patch.object(gate, "run", side_effect=run), \
+                 patch.object(gate.subprocess, "run") as retire:
+                self.assertEqual(gate.run_prerequisites(images("AVX512"), directory),
+                                 prerequisite_report())
+            self.assertEqual(devices.call_args.args, ("test-runner-avx512", "CPU+CUDA+ROCm"))
+            mounts.assert_called_once_with([(directory, "/ci-results", False)])
+            retirement = retire.call_args.args[0]
+            self.assertEqual(retirement[:3], ["docker", "rm", "-f"])
+            self.assertEqual(len(retirement), 4)
+            self.assertTrue(retirement[3].startswith("llaminar-develop-prerequisites-"))
 
 
 if __name__ == "__main__":

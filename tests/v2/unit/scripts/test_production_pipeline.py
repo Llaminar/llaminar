@@ -65,6 +65,12 @@ def cell(name="cell"):
             "model_files": ["/src/models/model-1.gguf", "/src/models/model-2.gguf"],
             "configuration": {"model_parity_schema": 1, "id": name,
                 "cross_host_e2e": [], "runtime": runtime,
+                "benchmark": {"schema": 1, "policy": "production_defaults",
+                    "context_length": 8192,
+                    "args": ["--auto", "--only-backends", "cuda,rocm",
+                             "--auto-device-counts", "cuda=2,rocm=4",
+                             "--only-strategies", "expert-overlay",
+                             "--mtp", "--mtp-depth-policy", "dynamic"]},
                 "model": "/src/models/model-1.gguf", "e2e": {"context_length": 8192,
                     "server_args": ["--define-domain", "arbitrary;devices=rocm:0,cuda:0", "--mtp"]}}}
 
@@ -1593,6 +1599,101 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
+    def test_cross_revision_image_is_diagnostic_only(self):
+        """Historical implementations can be retimed, never silently certified."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts.write_json(root / "manifest.json", manifest())
+            artifacts.write_json(root / "e2e.json", e2e_report())
+            argv = ["--manifest", str(root / "manifest.json"), "--source-revision", "revision",
+                    "--image", "immutable-old-image", "--report", str(root / "report.json")]
+            runtime = {"id": "old-runtime", "labels": {
+                "org.opencontainers.image.revision": "old-revision", "org.llaminar.cpu_isa": "AVX512"}}
+            with patch.object(benchmark, "image_identity", return_value=runtime), \
+                 patch.object(benchmark, "hardware_identity", side_effect=RuntimeError("diagnostic admitted")) as hardware:
+                with self.assertRaisesRegex(ValueError, "wrong source revision"):
+                    benchmark.main([*argv, "--e2e-report", str(root / "e2e.json")])
+                hardware.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "diagnostic admitted"):
+                    benchmark.main([*argv, "--diagnostic"])
+                hardware.assert_called_once()
+
+    def test_local_release_identity_matches_isa_ratchet_without_certifying(self):
+        """A native diagnostic must detect regressions against its actual ISA.
+
+        Keep manifest admission, Release/ISA discovery, measurement validation
+        and ratcheting real. Replace only device execution and model staging;
+        a second, slower measurement must fail, not become a new ISA baseline.
+        """
+        for isa in ("AVX2", "AVX512"):
+            with self.subTest(isa=isa), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "llaminar2"
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                binary.chmod(0o755)
+                (root / "CMakeCache.txt").write_text(
+                    f"CMAKE_BUILD_TYPE:STRING=Release\nLLAMINAR_CPU_ISA:STRING={isa}\n")
+                model = root / "model.gguf"
+                model.write_bytes(b"device-free model identity")
+                inventory = manifest()
+                inventory["cells"][0]["configuration"]["model"] = str(model)
+                inventory["cells"][0]["model_files"] = [str(model)]
+                artifacts.write_json(root / "manifest.json", inventory)
+                baseline = root / "baseline.json"
+                artifacts.write_json(baseline, {
+                    "schema": 1, "regression_threshold_pct": 10, "entries": {}})
+                report_path = root / "report.json"
+                argv = ["--manifest", str(root / "manifest.json"),
+                        "--source-revision", "revision", "--diagnostic",
+                        "--diagnostic-binary", str(binary), "--baseline", str(baseline),
+                        "--report", str(report_path)]
+                workspace = Mock(models=root, persistent=True)
+                staged = argparse.Namespace(source_path=str(model), filename=model.name)
+                with patch.object(benchmark, "hardware_identity", return_value={"fixture": "host"}), \
+                     patch.object(benchmark.e2e.parity, "model_staging_workspace") as staging, \
+                     patch.object(benchmark.e2e.parity, "stage_models_in_ramdisk", return_value=([staged], 0)), \
+                     patch.object(benchmark, "run_cell", return_value=measurement()) as run, \
+                     patch.object(benchmark, "image_identity") as inspect:
+                    staging.return_value.__enter__.return_value = workspace
+                    self.assertEqual(benchmark.main(argv), 0)
+                    report = json.loads(report_path.read_text())
+                    self.assertEqual(report["cells"][0]["identity"]["cpu_isa"], isa)
+                    self.assertTrue(report["diagnostic"])
+                    self.assertFalse(report["complete"])
+                    self.assertIsNone(report["runtime_source_revision"])
+                    artifacts.write_json(baseline, report["proposed_high_water"])
+                    slower = measurement()
+                    for row in slower["iterations"]:
+                        for phase in row["throughput_tokens_per_sec"]:
+                            row["throughput_tokens_per_sec"][phase] *= 0.5
+                    run.return_value = slower
+                    self.assertEqual(benchmark.main(argv), 1)
+                    regressed = json.loads(report_path.read_text())
+                    self.assertFalse(regressed["passed"])
+                    self.assertEqual([item["status"] for item in regressed["comparisons"]],
+                                     ["regressed", "regressed"])
+                    inspect.assert_not_called()
+
+    def test_local_binary_rejects_unverified_build_before_staging(self):
+        """An executable alone cannot prove Release optimization or CPU ISA."""
+        for build_type, isa in (("Debug", "AVX512"), ("Integration", "AVX2"),
+                                ("Release", "UNKNOWN")):
+            with self.subTest(build_type=build_type, isa=isa), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / "llaminar2"
+                binary.write_text("#!/bin/sh\nexit 0\n")
+                binary.chmod(0o755)
+                (root / "CMakeCache.txt").write_text(
+                    f"CMAKE_BUILD_TYPE:STRING={build_type}\nLLAMINAR_CPU_ISA:STRING={isa}\n")
+                artifacts.write_json(root / "manifest.json", manifest())
+                with patch.object(benchmark, "hardware_identity") as hardware:
+                    with self.assertRaisesRegex(ValueError, "Release|ISA"):
+                        benchmark.main(["--manifest", str(root / "manifest.json"),
+                                        "--source-revision", "revision", "--diagnostic",
+                                        "--diagnostic-binary", str(binary),
+                                        "--report", str(root / "out.json")])
+                    hardware.assert_not_called()
+
     def test_e2e_admission_requires_full_same_image_evidence(self):
         inventory = manifest()
         inventory["cells"].append(cell("second"))
@@ -1649,12 +1750,14 @@ class BenchmarkPolicyTests(unittest.TestCase):
                 hardware.assert_not_called()
 
     def test_local_binary_requires_diagnostic_and_never_inspects_an_image(self):
+        """Native runs require diagnostic provenance and the canonical ISA check."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             artifacts.write_json(path / "manifest.json", manifest())
             argv = ["--manifest", str(path / "manifest.json"), "--source-revision", "revision",
                     "--diagnostic-binary", sys.executable, "--report", str(path / "out.json")]
             with patch.object(benchmark, "image_identity") as inspect, \
+                 patch.object(benchmark.e2e, "release_binary_cpu_isa", return_value=artifacts.CPUISA.AVX512) as isa, \
                  patch.object(benchmark, "hardware_identity", side_effect=RuntimeError("admitted")):
                 with self.assertRaises(SystemExit) as error:
                     benchmark.main(argv)
@@ -1662,6 +1765,7 @@ class BenchmarkPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "admitted"):
                     benchmark.main([*argv, "--diagnostic"])
                 inspect.assert_not_called()
+                isa.assert_called_once_with(Path(sys.executable).resolve())
 
     def test_local_binary_uses_canonical_argv_without_docker_and_keeps_output_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1719,13 +1823,37 @@ class BenchmarkPolicyTests(unittest.TestCase):
             self.assertEqual(environment, ["LLAMINAR_BENCHMARK_ITERATIONS=3",
                                            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1"])
 
-    def test_benchmarks_reuse_canonical_argv_verbatim(self):
+    def test_benchmarks_use_typed_production_policy_not_e2e_stress(self):
+        """The producer owns policy; HTTP's forced movement/depth stays in HTTP."""
         record = cell()["configuration"]
+        record["e2e"]["server_args"] += ["--mtp-initial-draft-tokens", "15",
+            "--moe-residency-maintenance-window", "1", "--moe-migration-transfer-slots", "49"]
         args = benchmark.benchmark_arguments(record, "/tmp/model", "/tmp/out", workload())
-        canonical = record["e2e"]["server_args"]
+        canonical = record["benchmark"]["args"]
         self.assertEqual(args[1:1 + len(canonical)], canonical)
+        for flag in ("--mtp-initial-draft-tokens", "--moe-residency-maintenance-window",
+                     "--moe-migration-transfer-slots", "--define-domain"):
+            self.assertNotIn(flag, args)
+        self.assertEqual(args[args.index("--context-length") + 1], "8192")
         self.assertNotIn("--perf-stats", args)
         self.assertNotIn("--deterministic", args)
+
+    def test_stale_or_invalid_benchmark_policy_never_reuses_http_arguments(self):
+        """Old exports must be rebuilt, not silently retimed as stress tests."""
+        for mutate in (lambda r: r.pop("benchmark"),
+                       lambda r: r.update(benchmark=None),
+                       lambda r: r["benchmark"].update(schema=True),
+                       lambda r: r["benchmark"].update(policy="e2e_stress"),
+                       lambda r: r["benchmark"].update(context_length=4096),
+                       lambda r: r["benchmark"].update(args=[]),
+                       lambda r: r["benchmark"].update(args=["--auto", None]),
+                       lambda r: r["benchmark"].update(args=["--auto\x00"]),
+                       lambda r: r.update(e2e=None)):
+            with self.subTest(mutate=mutate):
+                record = cell()["configuration"]
+                mutate(record)
+                with self.assertRaisesRegex(ValueError, "benchmark|E2E"):
+                    benchmark.benchmark_arguments(record, "/tmp/model", "/tmp/out", workload())
 
     def test_untagged_empty_duplicate_and_stale_manifests_are_rejected(self):
         for mutate in (lambda m: m.update(cells=[]),

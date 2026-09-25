@@ -6,7 +6,8 @@
  * declaration order, continuation roots, and integer priorities. They prove
  * that controller ownership follows the declared continuation root and live
  * device state rather than the words hot/warm/cold or one machine-specific
- * CUDA/ROCm/socket arrangement.
+ * CUDA/ROCm/socket arrangement. Inaccessible alias pages also prove that host
+ * capture setup never dereferences a GPU pointer, independently of hardware.
  */
 
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
@@ -15,7 +16,10 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <type_traits>
 #include <vector>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace llaminar2::test
 {
@@ -398,5 +402,76 @@ namespace llaminar2::test
             (void)MoEOverlayNodeLocalDeviceControllerFabric::planLayout(
                 topology, 48u, 256u, 0u),
             std::invalid_argument);
+    }
+
+    /**
+     * @test GPU aliases are opaque while the host assembles capture arguments.
+     *
+     * PROT_NONE makes any accidental dereference fail deterministically even on
+     * CPU-only builders. No driver, device, stream or model is initialized. The
+     * real mixed-vendor preflight separately proves execution of these aliases.
+     */
+    TEST(Test__MoEOverlayDeviceControllerTopology,
+         CaptureBindingNeverDereferencesDeviceAliases)
+    {
+        const auto page_size = ::sysconf(_SC_PAGESIZE);
+        ASSERT_GT(page_size, 0);
+        const auto bytes = static_cast<std::size_t>(page_size);
+        void *const page = ::mmap(nullptr, bytes, PROT_NONE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        ASSERT_NE(page, MAP_FAILED);
+        const std::shared_ptr<void> guard(page, [bytes](void *address) {
+            ::munmap(address, bytes);
+        });
+
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(device.toString());
+            MoEOverlayDeviceControllerParticipantBinding binding;
+            binding.device = device;
+            binding.participant_id = 1;
+            binding.group_id = 0;
+            binding.capture_metadata = {
+                .topology_fingerprint = 0x123456789u,
+                .group_collected_state_words = 64u,
+                .role_flags = static_cast<std::uint32_t>(
+                    MoEOverlayDeviceControllerParticipantFlags::GroupRoot),
+            };
+            binding.group_root = true;
+            binding.mapped_bytes = bytes;
+            binding.lifetime = guard;
+            // Every address is deliberately inaccessible, but suitably aligned
+            // and non-null. Export may copy it, never inspect its pointee.
+            const auto opaque_aliases = [&](auto &...pointers) {
+                ((pointers = static_cast<std::remove_reference_t<
+                      decltype(pointers)>>(page)), ...);
+            };
+            opaque_aliases(
+                binding.mapped_base_device, binding.layout, binding.participants,
+                binding.groups, binding.controller, binding.inference_epoch_record,
+                binding.command, binding.command_entries, binding.payload_bytes_per_layer,
+                binding.initial_owner_participants, binding.demand_history,
+                binding.economy, binding.economy_service_costs,
+                binding.economy_migration_costs, binding.economy_last_moved,
+                binding.local_group, binding.local_transport,
+                binding.group_participant_records, binding.local_participant_record,
+                binding.group_collected_state, binding.participant_collected_state,
+                binding.service_telemetry_publication);
+            ASSERT_TRUE(binding.valid());
+            const auto captured = binding.deviceBinding();
+            EXPECT_EQ(captured.mapped_base, binding.mapped_base_device);
+            EXPECT_EQ(captured.layout, binding.layout);
+            EXPECT_EQ(captured.participants, binding.participants);
+            EXPECT_EQ(captured.topology_fingerprint,
+                      binding.capture_metadata.topology_fingerprint);
+            EXPECT_EQ(captured.role_flags, binding.capture_metadata.role_flags);
+            EXPECT_EQ(captured.participant_id, 1u);
+            EXPECT_EQ(captured.group_id, 0u);
+
+            // Incomplete setup must fail before any attempt to inspect aliases.
+            binding.capture_metadata.topology_fingerprint = 0u;
+            EXPECT_FALSE(binding.valid());
+            EXPECT_THROW((void)binding.deviceBinding(), std::logic_error);
+        }
     }
 } // namespace llaminar2::test

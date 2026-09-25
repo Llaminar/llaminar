@@ -32,7 +32,15 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-The enabled `develop` GitHub workflow is intentionally narrower than that
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build one
+AVX512 full-backend image pair and run only complete Unit and
+ProductionTestPreflight inside its test runner. This is the pre-commit scope,
+not certification: no AVX2, models, E2E, benchmarks or publication. It calls the
+existing image driver with `--cpu-isa AVX512` and no `--publish`, using the same
+host-only cache and shared accelerator concurrency group. See
+`docs/production-ci.md` for its same-repository trust boundary and local command.
+
+The enabled `develop` push workflow is intentionally narrower than that
 routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
 build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
 Unit and ProductionTestPreflight transaction inside each builder, and publish
@@ -129,6 +137,14 @@ substitute for the production path.
 - For complete AVX512/AVX2 image and benchmark certification, use
   `scripts/ci/run_production_pipeline.py` and `docs/production-ci.md`. Both full
   E2E server suites precede benchmarks; one-off benchmarks cannot certify images.
+  Benchmarks consume the canonical `benchmark` production-default projection,
+  not HTTP `server_args`: depth-15 initialization, forced movement and other
+  correctness stress overrides must not enter timing. Preserve model/topology,
+  context and precision, and let the runtime resolve performance defaults.
+  Old stress-configured release scores are a different series; remeasure the
+  old implementation with matched intent before claiming a code speedup or
+  absence of regressions. See `docs/production-ci.md`, “Benchmark workload and
+  ratchet,” for policy identity and explicit cross-revision diagnostics.
 - Before publishing a changed benchmark runtime, use
   `run_model_parity_benchmarks.py --diagnostic --diagnostic-binary PATH` with
   the complete exported typed E2E manifest. This local Release run preserves

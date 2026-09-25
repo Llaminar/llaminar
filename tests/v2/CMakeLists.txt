@@ -1032,6 +1032,12 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDeviceControllerTopology
     unit/execution/moe/Test__MoEOverlayDeviceControllerTopology.cpp
 )
+add_v2_test(V2_Integration_MoEOverlayDeviceAliasHostBoundary
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_device_controller_topology>
+        --gtest_filter=Test__MoEOverlayDeviceControllerTopology.CaptureBindingNeverDereferencesDeviceAliases
+    LABELS "V2;Integration;ExpertOverlay;DeviceAlias;CaptureIdentity;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
+)
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_device_controller_protocol
     V2_Unit_MoEOverlayDeviceControllerProtocol
@@ -3060,6 +3066,15 @@ set_tests_properties(V2_Unit_ProductionPipeline PROPERTIES
     LABELS "V2;Unit;BuildSystem;Parity;E2E;Benchmark;Certification;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_BenchmarkRuntimeIdentity
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+            BenchmarkPolicyTests
+)
+set_tests_properties(V2_Integration_BenchmarkRuntimeIdentity PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Certification;Regression"
+    TIMEOUT 30
+)
 add_test(NAME V2_Integration_DockerBindMountIdentity
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
@@ -3106,6 +3121,16 @@ add_test(NAME V2_Integration_DevelopImageGateCancellation
 )
 set_tests_properties(V2_Integration_DevelopImageGateCancellation PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;Cancellation;Regression"
+    TIMEOUT 15
+)
+add_test(NAME V2_Integration_DevelopPRGateContract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
+            DevelopImageGateTests.test_develop_pr_builds_one_isa_and_runs_only_installed_prerequisites
+            DevelopImageGateTests.test_prerequisites_execute_in_exact_test_image_without_model_mounts
+)
+set_tests_properties(V2_Integration_DevelopPRGateContract PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;PullRequest;Regression"
     TIMEOUT 15
 )
 
@@ -3286,6 +3311,16 @@ set_tests_properties(V2_Integration_ModelStagingCapacity PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;CampaignFramework;Memory;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_ModelStagingTmpfsSetup
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_persistent_tmpfs_setup_without_shared_uid_is_idempotent
+            ProductionParityCampaignTest.test_persistent_tmpfs_setup_adopts_one_named_mount_without_new_pages
+)
+set_tests_properties(V2_Integration_ModelStagingTmpfsSetup PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CampaignFramework;Memory;Regression"
+    TIMEOUT 30
+)
 
 add_test(NAME V2_Unit_PreCommitHook
     COMMAND ${Python3_EXECUTABLE}
@@ -3351,6 +3386,7 @@ add_v2_test(V2_Unit_ParityReferenceCache
 add_executable(v2_test_model_parity_definition
     unit/parity/Test__ModelParityDefinition.cpp
     unit/parity/Test__ModelParityCrossHostE2E.cpp
+    unit/parity/Test__ModelParityBenchmarkProjection.cpp
 )
 target_link_libraries(v2_test_model_parity_definition
     llaminar2_core
@@ -3372,6 +3408,16 @@ add_v2_test(V2_Integration_E2EAutomaticMatrix
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=ModelParityDefinition.E2EAutomaticProjectionPreservesPoliciesWithoutAuthoredPlacement:ModelParityDefinition.DenseQwen38MultiDeviceMatrixHasFiveDistinctE2ETopologies
     LABELS "V2;Integration;ProductionTestPreflight;E2E;Planning;TP;PP;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MODELS
+)
+
+# Production timing must never inherit short-trace correctness stress policy.
+add_v2_test(V2_Integration_BenchmarkProductionDefaults
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=ModelParityBenchmarkProjection.*
+    LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Planning;Regression"
     MPI_PROCS 1
     TIMEOUT 30
     NO_MODELS
@@ -10293,6 +10339,23 @@ add_v2_test(V2_Unit_BackendStartupConfig
     NO_MODELS
 )
 
+add_executable(v2_unit_host_registration_page_boundary
+    unit/memory/Test__HostRegistrationPageBoundary.cpp)
+target_link_libraries(v2_unit_host_registration_page_boundary llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_HostRegistrationPageBoundary
+    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_boundary>
+    LABELS "V2;Unit;Memory;Transfer;Regression"
+    MPI_PROCS 1
+    NO_MPI NO_MODELS
+)
+add_v2_test(V2_Integration_HostRegistrationPageBoundary
+    COMMAND $<TARGET_FILE:v2_unit_host_registration_page_boundary>
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;Transfer;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MPI NO_MODELS
+)
+
 add_executable(v2_unit_rocm_runtime_startup unit/backends/Test__ROCmRuntimeStartup.cpp)
 target_link_libraries(v2_unit_rocm_runtime_startup llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_ROCmRuntimeStartup
@@ -10324,9 +10387,26 @@ if(HAVE_ROCM)
     # diagnostic override from a developer's shell or CI environment.
     if(TEST V2_Integration_ROCmHostMemoryBacking)
         set_property(TEST V2_Integration_ROCmHostMemoryBacking APPEND PROPERTY
-            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:")
+            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:" "HSA_USE_SVM=unset:")
     endif()
 endif()
+
+# Symmetric byte-level proof for tensor and external-channel host registration.
+# The ROCm runtime policy is installed by production startup, never the test env.
+add_v2_gpu_backend_test(
+    v2_integration_gpu_host_registration_lifetime
+    integration/backends/Test__GPUHostRegistrationLifetime.cpp
+    V2_Integration_GPUHostRegistrationLifetime
+    V2 Integration ProductionTestPreflight Backends Transfer Memory Regression
+)
+foreach(backend IN ITEMS CUDA ROCm)
+    if(TEST V2_Integration_GPUHostRegistrationLifetime_${backend})
+        set_tests_properties(V2_Integration_GPUHostRegistrationLifetime_${backend}
+            PROPERTIES TIMEOUT 30)
+        set_property(TEST V2_Integration_GPUHostRegistrationLifetime_${backend} APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:" "HSA_USE_SVM=unset:")
+    endif()
+endforeach()
 
 # Test: GPUDeviceContext - GPU device context infrastructure (pool, worker threads, streams/events)
 # Tests IGPUDeviceContext interface, NvidiaDeviceContext, AMDDeviceContext, GPUDeviceContextPool singleton
@@ -20073,6 +20153,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayRankBatchLocalWork
     V2_Integration_MoEOverlayCPUForkJoinGraph
     V2_Integration_MoEOverlayHostPayloadPublication
+    V2_Integration_MoEOverlayDeviceAliasHostBoundary
     V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
     ${V2_PREPARED_EXPERT_SERVICE_PREFLIGHT_TESTS}
     V2_Integration_MoEOverlayActivationProgressLifecycle
@@ -20202,6 +20283,9 @@ if(HAVE_ROCM)
     V2_Integration_ROCm_MoEAsyncHistogramBorrowedStreamRetirement
     V2_Integration_ROCmFloatingExpertRetirement
     V2_Integration_ROCmHostMemoryBacking
+    V2_Integration_HostRegistrationPageBoundary
+    V2_Integration_GPUHostRegistrationLifetime_CUDA
+    V2_Integration_GPUHostRegistrationLifetime_ROCm
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_ROCm
     V2_Integration_DeviceGenerationController_ROCm

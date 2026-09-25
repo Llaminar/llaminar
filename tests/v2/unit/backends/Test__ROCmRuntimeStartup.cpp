@@ -11,25 +11,40 @@
 
 using namespace llaminar2;
 
-TEST(ROCmRuntimeStartup, MissingPolicyIsInstalledOnlyBeforeRuntimeInitialization)
+TEST(ROCmRuntimeStartup, MissingEitherPolicyRequiresAnUninitializedRuntime)
 {
-    EXPECT_EQ(selectROCmHostBackingAction(std::nullopt, ROCmRuntimeState::Uninitialized),
-        ROCmHostBackingAction::InstallDriverBacking);
-    EXPECT_EQ(selectROCmHostBackingAction(std::nullopt, ROCmRuntimeState::Initialized),
-        ROCmHostBackingAction::RejectLatePreparation);
+    using Value = std::optional<std::string_view>;
+    for (const auto &userptr : std::array{Value{}, Value{"0"}})
+        for (const auto &svm : std::array{Value{}, Value{"0"}})
+        {
+            if (userptr && svm) continue;
+            EXPECT_EQ(selectROCmHostMemoryAction(userptr, svm, ROCmRuntimeState::Uninitialized),
+                ROCmHostMemoryAction::InstallExplicitOwnership);
+            EXPECT_EQ(selectROCmHostMemoryAction(userptr, svm, ROCmRuntimeState::Initialized),
+                ROCmHostMemoryAction::RejectLatePreparation);
+        }
 }
 
 TEST(ROCmRuntimeStartup, DriverOwnedBackingIsIdempotentAcrossInitialization)
 {
     for (const auto state : {ROCmRuntimeState::Uninitialized, ROCmRuntimeState::Initialized})
-        EXPECT_EQ(selectROCmHostBackingAction("0", state),
-            ROCmHostBackingAction::DriverBackingConfigured);
+        EXPECT_EQ(selectROCmHostMemoryAction("0", "0", state),
+            ROCmHostMemoryAction::ExplicitOwnershipConfigured);
 }
 
 TEST(ROCmRuntimeStartup, EveryOtherVendorValueIsRejectedWithoutSubstitution)
 {
     for (const auto value : std::array{"", "1", "false", "00", " 0", "0suffix"})
         for (const auto state : {ROCmRuntimeState::Uninitialized, ROCmRuntimeState::Initialized})
-            EXPECT_EQ(selectROCmHostBackingAction(value, state),
-                ROCmHostBackingAction::RejectUserPointerBacking) << value;
+        {
+            EXPECT_EQ(selectROCmHostMemoryAction(value, "0", state),
+                ROCmHostMemoryAction::RejectUserPointerBacking) << value;
+            EXPECT_EQ(selectROCmHostMemoryAction("0", value, state),
+                ROCmHostMemoryAction::RejectSvmRegistration) << value;
+            // A conflict must win even when the other half is unspecified.
+            EXPECT_EQ(selectROCmHostMemoryAction(value, std::nullopt, state),
+                ROCmHostMemoryAction::RejectUserPointerBacking) << value;
+            EXPECT_EQ(selectROCmHostMemoryAction(std::nullopt, value, state),
+                ROCmHostMemoryAction::RejectSvmRegistration) << value;
+        }
 }
