@@ -3,9 +3,10 @@
  * @brief Integration tests for CPU NativeVNNI GEMV/GEMM correctness.
  *
  * Tests all supported formats against a CPU FP32 reference (double-precision
- * accumulation). Validates using cosine similarity with per-format thresholds.
- *
- * Shapes tested: Qwen 0.5B, 1.5B, 3B model dimensions (Attention, FFN, LM_Head).
+ * accumulation). General projections retain their per-format numerical gates;
+ * grouped MTP and ExpertOverlay additionally require serial-row byte identity.
+ * Compact-format ordered reductions have an independent scalar decoder oracle
+ * for one-block, multi-block and trailing-empty partitions on both CPU ISAs.
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeVNNI_GEMV
  */
@@ -1355,7 +1356,7 @@ namespace
                 format.source_codebook_id != 17)
                 continue;
             SCOPED_TRACE(format.label);
-            for (const int k : {256, 768, 2048})
+            for (const int k : {256, 512, 768, 2048})
             {
                 SCOPED_TRACE(k);
                 auto weights = format.create({64u, static_cast<size_t>(k)}, 0xC013u + k);
@@ -1366,9 +1367,7 @@ namespace
                 const auto &packed = kernel.packedWeights();
                 ASSERT_TRUE(packed.usesCompactMultiScale());
                 const int blocks = packed.blocks_per_row;
-                const int partitions = MoEProjectionNumericalContract::ordered_k_partitions;
-                const int span = (blocks + partitions - 1) / partitions;
-                std::vector<Q8_1Block> activation(static_cast<size_t>(blocks) * 2);
+                std::vector<Q8_1Block> activation(static_cast<size_t>(blocks) * 4);
                 for (size_t block = 0; block < activation.size(); ++block)
                 {
                     auto &a = activation[block];
@@ -1380,42 +1379,66 @@ namespace
                         a.sum_qs += a.qs[lane];
                     }
                 }
-                std::array<float, 128> expected{}, actual{};
-                for (int row = 0; row < 2; ++row)
-                for (int column = 0; column < 64; ++column)
+                // Exercise the one-block tree and the general tree,
+                // including its empty tail when there are fewer than 16 blocks.
+                for (const int partitions :
+                     {blocks, MoEProjectionNumericalContract::ordered_k_partitions})
                 {
-                    float total = 0;
-                    for (int partition = 0; partition < partitions; ++partition)
+                    SCOPED_TRACE(partitions);
+                    const int span = (blocks + partitions - 1) / partitions;
+                    std::array<float, 256> expected{}, actual{};
+                    for (int row = 0; row < 4; ++row)
+                    for (int column = 0; column < 64; ++column)
                     {
-                        float partial = 0;
-                        for (int block = partition * span;
-                             block < std::min((partition + 1) * span, blocks); ++block)
-                            partial += multi_scale::scalarReferenceBlock(
-                                packed, activation[static_cast<size_t>(row) * blocks + block],
-                                0, block, column);
-                        total = partition == 0 ? partial : total + partial;
+                        float total = 0;
+                        for (int partition = 0; partition < partitions; ++partition)
+                        {
+                            float partial = 0;
+                            for (int block = partition * span;
+                                 block < std::min((partition + 1) * span, blocks); ++block)
+                                partial += multi_scale::scalarReferenceBlock(
+                                    packed, activation[static_cast<size_t>(row) * blocks + block],
+                                    0, block, column);
+                            total = partition == 0 ? partial : total + partial;
+                        }
+                        expected[row * 64 + column] = total;
                     }
-                    expected[row * 64 + column] = total;
-                }
-                multi_scale::dispatchOrdered<8, 2>(packed,
-                    {activation.data(), activation.data() + blocks},
-                    {actual.data(), actual.data() + 64}, 0, blocks, partitions, span);
-                expectBitwiseEqualFloatRows(format.label, actual.data(), expected.data(), 128, 64);
+                    const auto prove_rows = [&]<size_t Rows>() {
+                        SCOPED_TRACE(Rows);
+                        std::array<const Q8_1Block *, Rows> inputs;
+                        std::array<float *, Rows> outputs;
+                        for (size_t row = 0; row < Rows; ++row)
+                        {
+                            inputs[row] = activation.data() + row * blocks;
+                            outputs[row] = actual.data() + row * 64;
+                        }
+                        actual.fill(-12345.0f);
+                        multi_scale::dispatchOrdered<8, Rows>(packed, inputs, outputs,
+                            0, blocks, partitions, span);
+                        expectBitwiseEqualFloatRows(format.label,
+                            actual.data(), expected.data(), Rows * 64, 64);
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                multi_scale::dispatchOrdered<16, 2>(packed,
-                    {activation.data(), activation.data() + blocks},
-                    {actual.data(), actual.data() + 64}, 0, blocks, partitions, span);
-                expectBitwiseEqualFloatRows(format.label, actual.data(), expected.data(), 128, 64);
+                        actual.fill(-12345.0f);
+                        multi_scale::dispatchOrdered<16, Rows>(packed, inputs, outputs,
+                            0, blocks, partitions, span);
+                        expectBitwiseEqualFloatRows(format.label,
+                            actual.data(), expected.data(), Rows * 64, 64);
 #endif
-                const auto invalid = [&](int length, int count, int width) {
-                    multi_scale::dispatchOrdered<8, 2>(packed,
-                        {activation.data(), activation.data() + blocks},
-                        {actual.data(), actual.data() + 64}, 0, length, count, width);
-                };
-                EXPECT_THROW(invalid(blocks, 0, span), std::invalid_argument);
-                EXPECT_THROW(invalid(blocks, partitions, 0), std::invalid_argument);
-                EXPECT_THROW(invalid(blocks + 1, partitions, span), std::invalid_argument);
-                EXPECT_THROW(invalid(blocks, 1, 1), std::invalid_argument);
+                    };
+                    prove_rows.template operator()<1>();
+                    prove_rows.template operator()<2>();
+                    prove_rows.template operator()<3>();
+                    prove_rows.template operator()<4>();
+                    const auto invalid = [&](int length, int count, int width) {
+                        multi_scale::dispatchOrdered<8, 2>(packed,
+                            {activation.data(), activation.data() + blocks},
+                            {actual.data(), actual.data() + 64}, 0, length, count, width);
+                    };
+                    EXPECT_THROW(invalid(blocks, 0, span), std::invalid_argument);
+                    EXPECT_THROW(invalid(blocks, partitions, 0), std::invalid_argument);
+                    EXPECT_THROW(invalid(blocks + 1, partitions, span), std::invalid_argument);
+                    EXPECT_THROW(invalid(blocks, 1, 1), std::invalid_argument);
+                }
             }
         }
     }

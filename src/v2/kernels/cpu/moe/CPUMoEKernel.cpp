@@ -2,8 +2,12 @@
  * @file CPUMoEKernel.cpp
  * @brief CPU implementation of MoE kernel operations
  *
- * Extracted from MoEExpertComputeStage.cpp to enable device-agnostic stage wiring.
- * Uses ISA-dispatched vector primitives for all compute-bound operations.
+ * Owns CPU routing, placement-epoch operations and canonical Q8 input
+ * publication. Ordinary and transported expert inputs share the same exact
+ * block arithmetic; worksharing changes row ownership, never numerical order.
+ * Publication provenance is revoked before mutation and becomes visible only
+ * after the complete row workshare has joined. Optional worker diagnostics
+ * observe completed work without controlling execution or allocating when off.
  */
 
 #include "CPUMoEKernel.h"
@@ -640,14 +644,15 @@ namespace llaminar2
         router_q8_hidden_rows_ = rows;
         router_q8_hidden_d_model_ = d_model;
         router_q8_hidden_valid_ = true;
-        PerfStatsCollector::addCounter(
-            "kernel",
-            "cpu_moe_router_q8_hidden_publication_calls",
-            1.0,
-            "moe",
-            "cpu",
-            {{"rows", std::to_string(rows)},
-             {"d_model", std::to_string(d_model)}});
+        if (PerfStatsCollector::isDomainEnabled("kernel"))
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_moe_router_q8_hidden_publication_calls",
+                1.0,
+                "moe",
+                "cpu",
+                {{"rows", std::to_string(rows)},
+                 {"d_model", std::to_string(d_model)}});
         return true;
     }
 
@@ -692,14 +697,13 @@ namespace llaminar2
 
         /*
          * Every row is arithmetically independent, so distributing complete
-         * rows cannot change a Q8_1 byte. Keep MTP-sized publications serial:
-         * there is too little work to repay an OpenMP fork. A transported
-         * prefill packet can contain hundreds of rows, however, and the old
-         * serial loop left the other physical cores idle before every CPU
-         * expert layer. Require at least 16384 FP32 values (64 KiB) per useful
-         * worker before opening a team; this derives the crossover from both
-         * runtime geometry and the configured physical-core budget instead of
-         * baking in one model-specific row threshold.
+         * rows cannot change a Q8_1 byte. Opening a team is a team-wide cost,
+         * not a cost charged once per useful worker. Requiring 64 KiB per
+         * worker kept a twenty-row verifier publication serial even though
+         * the production-entrypoint benchmark measures roughly 42 us serial
+         * versus 12 us parallel. Keep tiny publications serial and amortize
+         * the launch over total active input bytes, never reserved capacity.
+         * The threshold is independent of model, codebook and MTP depth.
          */
         const bool rows_are_block_aligned = (d_model % Q8_1Block::BLOCK_SIZE) == 0;
         auto quantize_row = [&](int output_row)
@@ -739,23 +743,38 @@ namespace llaminar2
             }
         };
 
-        constexpr size_t kMinimumValuesPerWorker = 16384u;
+        constexpr size_t kMinimumValuesForTeam = 16384u;
         const int useful_workers =
             std::min(output_rows, omp_get_max_threads());
         const size_t total_values =
             static_cast<size_t>(output_rows) * static_cast<size_t>(d_model);
-        const bool use_parallel_rows =
-            useful_workers > 1 &&
-            total_values >=
-                static_cast<size_t>(useful_workers) *
-                    kMinimumValuesPerWorker;
+        const bool use_parallel_rows = useful_workers > 1 &&
+                                       total_values >= kMinimumValuesForTeam;
+        const bool observe_workers = PerfStatsCollector::isDomainEnabled("kernel");
+        const auto publish_worker_rows = [&](int completed_rows)
+        {
+            if (observe_workers && completed_rows > 0)
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_moe_router_q8_worker_rows",
+                    completed_rows, "moe", "cpu",
+                    {{"rows", std::to_string(output_rows)},
+                     {"d_model", std::to_string(d_model)},
+                     {"worker", std::to_string(omp_get_thread_num())},
+                     {"workers", std::to_string(omp_get_num_threads())},
+                     {"layout", source_row_indices ? "indexed" : "contiguous"}});
+        };
         if (use_parallel_rows)
         {
             auto quantize_rows = [&]()
             {
+                int completed_rows = 0;
 #pragma omp for schedule(static)
                 for (int row = 0; row < output_rows; ++row)
+                {
                     quantize_row(row);
+                    ++completed_rows;
+                }
+                publish_worker_rows(completed_rows);
             };
             OMP_WORKSHARE_REGION(quantize_rows);
         }
@@ -763,6 +782,7 @@ namespace llaminar2
         {
             for (int row = 0; row < output_rows; ++row)
                 quantize_row(row);
+            publish_worker_rows(output_rows);
         }
         return true;
     }
@@ -814,7 +834,7 @@ namespace llaminar2
             static_cast<int>(expert_major_source_rows.size()),
             destination.data(),
             destination.size());
-        if (published)
+        if (published && PerfStatsCollector::isDomainEnabled("kernel"))
         {
             PerfStatsCollector::addCounter(
                 "kernel",

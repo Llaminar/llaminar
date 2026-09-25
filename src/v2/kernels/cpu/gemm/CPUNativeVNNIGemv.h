@@ -5676,6 +5676,15 @@ namespace llaminar2::cpu::native_vnni
      * row preserves the exact GEMV chunk and reduction order used by
      * gemv_native_vnni_preq().
      *
+     * @param packed Immutable prepared matrix and numerical contract.
+     * @param A_q8_all Prequantized rows, each containing blocks_per_row blocks.
+     * @param C Caller-owned destination with M rows and ldc row stride.
+     * @param partial_storage Admitted scratch for the serial arithmetic K tree.
+     * @param M Positive grouped row count, at least two.
+     * @param ldc Physical destination stride, at least packed.N floats.
+     * @param isa_path Explicit diagnostic ISA or production runtime selection.
+     * @param verifier_policy_override Explicit candidate or generated Auto policy.
+     * @param publish_verifier_route Enable observational schedule/worker counters.
      * @param full_k_n_block_chunks_override Exact N-chunk granularity for an
      *        explicitly selected full-K pair-grid prefill candidate. Zero
      *        retains the serial-decode-derived verifier geometry. A nonzero
@@ -6285,31 +6294,38 @@ namespace llaminar2::cpu::native_vnni
             }
         };
 
-        /*
-         * MoE expert verifier projections are small enough that OpenMP
-         * fork/join and barrier cost can dominate the M=2 compute.  Serial
-         * decode already has a direct path for these shapes; keep grouped M=2
-         * on the same footing by running the exact same 2-row chunk kernel
-         * directly when the scheduler would create only a small number of
-         * blocks.  This is still the grouped/economical kernel, not a hidden
-         * fallback to serial row-by-row GEMV.
-         */
-        const bool direct_small_m2 =
-            M == 2 && !omp_in_parallel() &&
-            total_tasks <= std::max(1, num_threads * 2) &&
-            K_blocks <= 64;
-        if (direct_small_m2)
-        {
-            for (int task = 0; task < total_tasks; ++task)
-                process_pair_task(task);
-            return;
-        }
-
+        // The resolved row/N task grid is also the execution contract. A
+        // second shape test must not turn an advertised multi-worker launch
+        // into one-thread work (the former M=2 shortcut did exactly that).
+        // Reuse an existing team or enter the admitted team once; each output
+        // tile still owns the complete, unchanged serial K arithmetic.
+        // Observe actual task ownership, not merely the requested team width.
+        // Thread ids are bounded by the admitted CPU worker geometry; no token,
+        // request, or pointer identity enters the diagnostic aggregation key.
+        const bool observe_workers = publish_verifier_route &&
+            PerfStatsCollector::isDomainEnabled("kernel");
         auto do_rows = [&]()
         {
+            int completed_tasks = 0;
 #pragma omp for schedule(static)
             for (int task = 0; task < total_tasks; ++task)
+            {
                 process_pair_task(task);
+                ++completed_tasks;
+            }
+            if (observe_workers && completed_tasks > 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_native_vnni_verifier_worker_tasks",
+                    completed_tasks, "gemm", "cpu",
+                    {{"m", std::to_string(M)},
+                     {"n", std::to_string(N)},
+                     {"k", std::to_string(K)},
+                     {"codebook", std::to_string(packed.codebook_id)},
+                     {"worker", std::to_string(omp_get_thread_num())},
+                     {"workers", std::to_string(omp_get_num_threads())},
+                     {"route", verifierRowsExecutionRouteName(schedule.route)}});
+            }
         };
         OMP_WORKSHARE_REGION(do_rows);
     }
@@ -6890,6 +6906,50 @@ namespace llaminar2::cpu::native_vnni
                 total_output_rows;
         }
 
+        const bool has_bias = std::any_of(
+            descs, descs + num_descs,
+            [](const FusedVerifierRowsDesc &descriptor)
+            {
+                return descriptor.bias != nullptr;
+            });
+        /*
+         * A bias consumer needs the complete projection row, which may have
+         * several column owners. Only that consumer requires a separate
+         * producer barrier. Bias-free bundles have no epilogue work at all.
+         * Each layer-wide scheduler below ends its last workshare with
+         * nowait; OMP_WORKSHARE_REGION_SYNC owns the single completion edge
+         * both inside an existing team and at a standalone team's join.
+         */
+        const auto publish_layer_bias = [&]()
+        {
+            if (!has_bias)
+                return;
+#pragma omp barrier
+#pragma omp for schedule(static) nowait
+            for (long long global_row = 0;
+                 global_row < static_cast<long long>(total_output_rows);
+                 ++global_row)
+            {
+                const size_t row_index = static_cast<size_t>(global_row);
+                const auto projection_it = std::lower_bound(
+                    output_row_ends.begin(),
+                    output_row_ends.begin() + num_descs,
+                    row_index + 1u);
+                const int projection = static_cast<int>(
+                    projection_it - output_row_ends.begin());
+                const auto &descriptor = descs[projection];
+                if (!descriptor.bias)
+                    continue;
+                const size_t prior_rows = projection == 0
+                    ? 0u
+                    : output_row_ends[static_cast<size_t>(projection - 1)];
+                addNativeVNNIBiasRow(
+                    descriptor.output + (row_index - prior_rows) *
+                        static_cast<size_t>(descriptor.ldc),
+                    descriptor.bias, descriptor.N, use_avx512);
+            }
+        };
+
         if (all_full_k)
         {
             // Keep at least one workshare chunk per available worker. Sparse
@@ -6983,7 +7043,7 @@ namespace llaminar2::cpu::native_vnni
                  * disjoint output row and N chunk. Dense row bundles use the
                  * cache-sharing chunk computed above, not one-task striping.
                  */
-#pragma omp for schedule(static, workshare_chunk)
+#pragma omp for schedule(static, workshare_chunk) nowait
                 for (long long global_task = 0;
                      global_task <
                          static_cast<long long>(total_full_k_tasks);
@@ -7294,38 +7354,10 @@ namespace llaminar2::cpu::native_vnni
                     }
                 }
 
-#pragma omp for schedule(static)
-                for (long long global_row = 0;
-                     global_row < static_cast<long long>(total_output_rows);
-                     ++global_row)
-                {
-                    const size_t row_index =
-                        static_cast<size_t>(global_row);
-                    const auto projection_it = std::lower_bound(
-                        output_row_ends.begin(),
-                        output_row_ends.begin() + num_descs,
-                        row_index + 1u);
-                    const int projection = static_cast<int>(
-                        projection_it - output_row_ends.begin());
-                    const size_t prior_rows = projection == 0
-                        ? 0u
-                        : output_row_ends[
-                              static_cast<size_t>(projection - 1)];
-                    const auto &descriptor = descs[projection];
-                    if (!descriptor.bias)
-                        continue;
-                    const size_t local_row = row_index - prior_rows;
-                    addNativeVNNIBiasRow(
-                        descriptor.output +
-                            local_row *
-                                static_cast<size_t>(descriptor.ldc),
-                        descriptor.bias,
-                        descriptor.N,
-                        use_avx512);
-                }
+                publish_layer_bias();
             };
 
-            OMP_WORKSHARE_REGION(execute_layer_full_k);
+            OMP_WORKSHARE_REGION_SYNC(execute_layer_full_k);
             return true;
         }
 
@@ -7681,7 +7713,7 @@ namespace llaminar2::cpu::native_vnni
                  */
                 auto execute_layer_local_ordered_tree = [&]()
                 {
-#pragma omp for schedule(static, 1)
+#pragma omp for schedule(static, 1) nowait
                     for (long long global_task = 0;
                          global_task <
                              static_cast<long long>(total_local_tree_tasks);
@@ -8045,38 +8077,10 @@ namespace llaminar2::cpu::native_vnni
                         }
                     }
 
-#pragma omp for schedule(static)
-                    for (long long global_row = 0;
-                         global_row <
-                             static_cast<long long>(total_output_rows);
-                         ++global_row)
-                    {
-                        const size_t row_index =
-                            static_cast<size_t>(global_row);
-                        const auto projection_it = std::lower_bound(
-                            output_row_ends.begin(),
-                            output_row_ends.begin() + num_descs,
-                            row_index + 1u);
-                        const int projection = static_cast<int>(
-                            projection_it - output_row_ends.begin());
-                        const auto &descriptor = descs[projection];
-                        if (!descriptor.bias)
-                            continue;
-                        const size_t prior_rows = projection == 0
-                            ? 0u
-                            : output_row_ends[
-                                  static_cast<size_t>(projection - 1)];
-                        addNativeVNNIBiasRow(
-                            descriptor.output +
-                                (row_index - prior_rows) *
-                                    static_cast<size_t>(descriptor.ldc),
-                            descriptor.bias,
-                            descriptor.N,
-                            use_avx512);
-                    }
+                    publish_layer_bias();
                 };
 
-                OMP_WORKSHARE_REGION(execute_layer_local_ordered_tree);
+                OMP_WORKSHARE_REGION_SYNC(execute_layer_local_ordered_tree);
                 return true;
             }
 
@@ -8152,7 +8156,7 @@ namespace llaminar2::cpu::native_vnni
                         /*local_partial_sums=*/nullptr);
                 }
 
-#pragma omp for schedule(static)
+#pragma omp for schedule(static) nowait
                 for (long long global_task = 0;
                      global_task <
                          static_cast<long long>(total_reduction_tasks);
@@ -8194,38 +8198,10 @@ namespace llaminar2::cpu::native_vnni
                         use_avx512);
                 }
 
-#pragma omp for schedule(static)
-                for (long long global_row = 0;
-                     global_row < static_cast<long long>(total_output_rows);
-                     ++global_row)
-                {
-                    const size_t row_index =
-                        static_cast<size_t>(global_row);
-                    const auto projection_it = std::lower_bound(
-                        output_row_ends.begin(),
-                        output_row_ends.begin() + num_descs,
-                        row_index + 1u);
-                    const int projection = static_cast<int>(
-                        projection_it - output_row_ends.begin());
-                    const auto &descriptor = descs[projection];
-                    if (!descriptor.bias)
-                        continue;
-                    const size_t prior_rows = projection == 0
-                        ? 0u
-                        : output_row_ends[
-                              static_cast<size_t>(projection - 1)];
-                    const size_t local_row = row_index - prior_rows;
-                    addNativeVNNIBiasRow(
-                        descriptor.output +
-                            local_row *
-                                static_cast<size_t>(descriptor.ldc),
-                        descriptor.bias,
-                        descriptor.N,
-                        use_avx512);
-                }
+                publish_layer_bias();
             };
 
-            OMP_WORKSHARE_REGION(execute_layer_k_partitioned);
+            OMP_WORKSHARE_REGION_SYNC(execute_layer_k_partitioned);
             return true;
         }
 

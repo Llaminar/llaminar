@@ -246,6 +246,10 @@ namespace llaminar2::cpu::native_vnni
                         }
                     }
 
+                    // Unlike the named two-/wide-row kernels, this four-vector
+                    // serial tile spills decoded weights when GCC unrolls its
+                    // array-shaped dot chains. Retain the compact group loop;
+                    // only the measured spill-free specializations unroll it.
 #if defined(__clang__)
 #pragma clang loop unroll(disable)
 #elif defined(__GNUC__)
@@ -448,10 +452,15 @@ namespace llaminar2::cpu::native_vnni
                     __m512i dot_low11 = _mm512_setzero_si512();
                     __m512i dot_high11 = _mm512_setzero_si512();
 
+                    // As in wide-row Q6, unroll only the four
+                    // integer groups. A rolled group loop creates redundant
+                    // moves between the eight named dot chains; exposing the
+                    // fixed groups removes that back-edge register shuffle.
+                    // Do not unroll/reassociate the floating-point K reduction.
 #if defined(__clang__)
-#pragma clang loop unroll(disable)
+#pragma clang loop unroll(full)
 #elif defined(__GNUC__)
-#pragma GCC unroll 1
+#pragma GCC unroll 4
 #endif
                     for (int group = 0; group < 4; ++group)
                     {

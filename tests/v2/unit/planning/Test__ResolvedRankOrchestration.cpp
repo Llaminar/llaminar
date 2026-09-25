@@ -114,6 +114,9 @@ TEST(ResolvedRankOrchestration, SingleDevicePreservesRealMainIntervalAndServingP
         EXPECT_TRUE(plan.runtime.mtp.enabled);
         EXPECT_EQ(plan.runtime.mtp.graph_capacity_draft_tokens, 15);
         EXPECT_EQ(resolved.config().mtp.depth_defaults_profile, plan.runtime.mtp.depth_defaults_profile);
+        EXPECT_EQ(resolved.config().mtp.terminal_head_policy, plan.runtime.mtp.terminal_head_policy);
+        EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, backend == DeviceType::CPU
+            ? MTPTerminalHeadPolicy::VocabularySharded : MTPTerminalHeadPolicy::MirroredFullVocabulary);
         EXPECT_FALSE(resolved.overlayExecution());
         EXPECT_EQ(resolved.overlayOrigin(), MoEExpertOverlayAuthorityPlanDisposition::NotApplicable);
     }
@@ -165,6 +168,11 @@ TEST(ResolvedRankOrchestration, ImplicitMoELocalTPSealsOneAuthorityWithoutMutati
                 EXPECT_EQ(overlay.routed_tiers.size(), 1u);
                 EXPECT_EQ(resolved.rankPlan().local_tp_devices.size(), 2u);
                 EXPECT_TRUE(resolved.overlayExecution()->ownsContinuationGraph());
+                EXPECT_EQ(resolved.config().mtp.terminal_head_policy, backend == DeviceType::CPU
+                    ? MTPTerminalHeadPolicy::VocabularySharded : MTPTerminalHeadPolicy::MirroredFullVocabulary);
+                EXPECT_EQ(resolved.config().mtp.terminal_head_policy,
+                    resolved.rankPlan().runtime.mtp.terminal_head_policy);
+                EXPECT_EQ(config.mtp.terminal_head_policy, MTPTerminalHeadPolicy::Automatic);
                 EXPECT_EQ(resolved.overlayOrigin(), MoEExpertOverlayAuthorityPlanDisposition::SynthesizedLocalTP);
                 const auto repeated = resolve(resolved.config(), cluster, 0, true);
                 EXPECT_EQ(repeated.overlayOrigin(), MoEExpertOverlayAuthorityPlanDisposition::ExplicitPlan);
@@ -199,6 +207,8 @@ TEST(ResolvedRankOrchestration, CompactOverlayUsesObservedOwnerAndKeepsFollowerO
                 EXPECT_EQ(resolved.config().mtp.depth_defaults_profile, backend == DeviceType::CUDA
                     ? MTPDepthDefaultsProfile::CUDARTX3090 : MTPDepthDefaultsProfile::ROCmMI50);
                 EXPECT_NE(resolved.config().moe_routed_expert_plan.get(), original.get());
+                EXPECT_EQ(resolved.config().mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+                EXPECT_EQ(resolved.rankPlan().runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
             }
             for (const auto &domain : original->domains)
             {
@@ -223,6 +233,8 @@ TEST(ResolvedRankOrchestration, NodeTPContinuationPreservesShardAndSparseCPUIden
         EXPECT_EQ(resolved.rankPlan().weight_shard.total_shards, 2);
         EXPECT_EQ(resolved.rankPlan().weight_shard.shard_index, rank);
         EXPECT_EQ(resolved.rankPlan().numa_node, 7 - rank * 3);
+        EXPECT_EQ(resolved.config().mtp.terminal_head_policy, MTPTerminalHeadPolicy::VocabularySharded);
+        EXPECT_EQ(resolved.rankPlan().runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::VocabularySharded);
     }
 }
 

@@ -1123,7 +1123,9 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            if (team_observer)
+            // Guard before constructing strings/maps: addCounter's own guard
+            // cannot prevent allocations while evaluating its arguments.
+            if (perf_enabled)
             {
                 recordVerifierTiming(
                     "cpu_native_vnni_batched_preq_decode_equivalent",
@@ -1281,7 +1283,8 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            if (!omp_in_parallel() || omp_get_thread_num() == 0)
+            if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
+                PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
@@ -1435,16 +1438,19 @@ namespace llaminar2::cpu::native_vnni
                 /*n=*/0,
                 k,
                 static_cast<int>(projections.size()));
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls",
-                1.0,
-                "gemm",
-                "cpu",
-                {{"m", std::to_string(m)},
-                 {"k", std::to_string(k)},
-                 {"projections", std::to_string(projections.size())},
-                 {"path", m == 1 ? "decode" : "grouped_rows"}});
+            if (perf_enabled)
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    {{"m", std::to_string(m)},
+                     {"k", std::to_string(k)},
+                     {"projections", std::to_string(projections.size())},
+                     {"path", m == 1 ? "decode" : "grouped_rows"}});
+            }
             return true;
         }
 

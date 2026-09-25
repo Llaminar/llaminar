@@ -2235,7 +2235,9 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
             /*mtp_draft_tokens=*/3);
         EXPECT_EQ(
             runtime_config.mtp.terminal_head_policy,
-            MTPTerminalHeadPolicy::MirroredFullVocabulary);
+            MTPTerminalHeadPolicy::Automatic)
+            << "Authoring retains auto intent; MTPHardwareDefaults proves that "
+               "GPU continuation compiles it to a mirrored terminal head.";
         EXPECT_EQ(
             runtime_config.moe_hot_expert_cache.kind,
             MoEHotExpertCacheConfig::Kind::Off);

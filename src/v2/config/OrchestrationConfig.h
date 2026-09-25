@@ -498,7 +498,14 @@ namespace llaminar2
         // =========================================================================
 
         PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
-        MTPRuntimeConfig mtp;                  ///< Disabled-by-default multi-token prediction settings
+        /**
+         * @brief Disabled-by-default MTP with topology-selected terminal weights.
+         *
+         * Authoring preserves automatic versus explicit intent. Rank compilation
+         * replaces Automatic with one concrete policy before physical admission;
+         * low-level runtime and graph objects must never consume this sentinel.
+         */
+        MTPRuntimeConfig mtp{.terminal_head_policy = MTPTerminalHeadPolicy::Automatic};
 
         // =========================================================================
         // Weight Sharding

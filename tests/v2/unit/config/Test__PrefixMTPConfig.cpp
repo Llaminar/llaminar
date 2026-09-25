@@ -114,9 +114,9 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_EQ(
         config.mtp.terminal_head_policy,
-        MTPTerminalHeadPolicy::MirroredFullVocabulary)
-        << "LocalTP MTP defaults to mirrored verifier heads; disabled MTP "
-           "configurations simply never activate the flag.";
+        MTPTerminalHeadPolicy::Automatic)
+        << "Public authoring leaves terminal weights to topology compilation; "
+           "CPU and GPU continuation domains have different defaults.";
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
     EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
     EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);

@@ -28,8 +28,11 @@
  * registry, or provide a comma-separated subset. Timed samples execute a
  * configurable transaction batch (`LLAMINAR_CPU_MOE_EXPERT_BATCH_ITERATIONS`)
  * so sub-millisecond OpenMP wake-up jitter cannot masquerade as a kernel
- * regression. Profiler launches isolate one policy selected by
- * `LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY=native|aligned`.
+ * regression. After setup and byte validation, profiler launches repeat only
+ * one format and phase under the policy selected by
+ * `LLAMINAR_CPU_MOE_EXPERT_PROFILE_POLICY=native|aligned`. They never collect
+ * timing samples or run the other policy afterward; profiler overhead must
+ * not enter a canonical timing CSV.
  */
 
 #include "../../../utils/NativeVNNITestPartialStorage.h"
@@ -676,6 +679,9 @@ namespace
                 << " phase=" << profile_phase
                 << " iterations=" << profile_iterations
                 << " checksum=" << checksum << '\n';
+            // Profiling and paired timing are disjoint executions. Returning
+            // here also prevents later phases from polluting the hot samples.
+            return {};
         }
 
         PipelineTiming timing;
@@ -744,13 +750,22 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
 
     const std::set<std::string> requested = selectedFormats();
     const bool all_formats = requested.count("all") != 0u;
-    std::ofstream csv;
-    if (const char *path =
-            std::getenv("LLAMINAR_CPU_MOE_EXPERT_POLICY_CSV");
-        path && *path)
+    const char *csv_path = std::getenv("LLAMINAR_CPU_MOE_EXPERT_POLICY_CSV");
+    if (profile_iterations > 0)
     {
-        csv.open(path, std::ios::trunc);
-        ASSERT_TRUE(csv.is_open()) << "Could not open CSV output " << path;
+        // One process is one physical profiling experiment. Reject ambiguous
+        // collection before creating weights or opening an output file.
+        ASSERT_FALSE(all_formats);
+        ASSERT_EQ(requested.size(), 1u)
+            << "Profiler mode requires exactly one source format";
+        ASSERT_FALSE(csv_path && *csv_path)
+            << "Profiler mode cannot publish canonical timing CSV evidence";
+    }
+    std::ofstream csv;
+    if (csv_path && *csv_path)
+    {
+        csv.open(csv_path, std::ios::trunc);
+        ASSERT_TRUE(csv.is_open()) << "Could not open CSV output " << csv_path;
         csv << "format,isa,d_model,intermediate,active_experts,route_rows,"
                "threads,native_gate_up_us,native_swiglu_q8_us,native_down_us,"
                "native_complete_us,native_persistent_us,"
@@ -776,6 +791,21 @@ TEST(Perf_CPUMoEExpertVerifierRows, ProductionGeometryByteExactAndEconomical)
     {
         if (!all_formats && requested.count(format.label) == 0u)
             continue;
+
+        if (profile_iterations > 0)
+        {
+            // Do not even prepare the unselected numerical policy: its oracle
+            // and setup kernels would belong to a different profiler launch.
+            (void)runFormat(
+                format, active_experts, local_route_rows, d_model, intermediate,
+                profile_policy == ProfilePolicy::Aligned
+                    ? CPUProjectionNumericalPolicy::GPUAlignedExpert
+                    : CPUProjectionNumericalPolicy::BackendNative,
+                verifier_schedule, warmup, samples, batch_iterations,
+                profile_iterations, profile_phase);
+            ++executed;
+            continue;
+        }
 
         PipelineTiming native;
         PipelineTiming aligned;

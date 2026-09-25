@@ -1270,6 +1270,16 @@ objects and device events. `MTPDepthController` selects a permitted draft depth;
 forwards. Production grouped verification must preserve serial-row byte
 equivalence while publishing accepted state without row replay.
 
+Terminal-head authoring defaults to `auto`. `ExecutionPlanBuilder` seals it
+before admission: CPU continuation domains use vocabulary shards; accelerator
+continuation domains retain full-vocabulary mirrors. Expert-only tiers do not
+participate in that decision, and pipelines use the final domain. Explicit
+policies survive unchanged. `ResolvedRankOrchestration` publishes the same
+concrete policy to the saved configuration and rank runtime, so graph layout,
+costing and `PhysicalMemoryAuthority` weight-set inputs cannot select separate
+defaults. Lower-level graph and weight-accounting consumers reject unresolved
+automatic intent.
+
 Stochastic admission distinguishes full-model collective peers from expert-only
 transaction followers through `MTPRankParticipation`. An installed overlay
 coordinator owns the continuation's sampling transaction; remote expert services

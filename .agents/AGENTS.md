@@ -643,6 +643,13 @@ comparing its value with an old default. Other expert tiers cannot select the
 continuation policy. Request admission resolves the profile into the existing
 device-controller ABI without changing MTP enablement, mode, or graph capacity.
 
+`--mtp-terminal-head-policy auto` is the public default: CPU continuation
+domains use vocabulary-sharded heads, while CUDA/ROCm retain mirrored full
+heads. Expert-only tiers do not change that choice. Explicit
+`vocabulary-sharded` or `mirrored-full-vocabulary` overrides are preserved.
+The rank compiler seals the policy before memory admission; graph construction,
+saved plans, and physical-weight accounting consume that same resolved value.
+
 ## Benchmarking
 
 Use a Release binary and a fixed model, device, prompt bytes, decode length,

@@ -167,6 +167,7 @@ namespace llaminar2
             rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
         }
         config.mtp.depth_defaults_profile = rank_plan.runtime.mtp.depth_defaults_profile;
+        config.mtp.terminal_head_policy = rank_plan.runtime.mtp.terminal_head_policy;
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution;
         if (config.moe_routed_expert_plan && config.moe_routed_expert_plan->usesExpertOverlayAuthority())
         {

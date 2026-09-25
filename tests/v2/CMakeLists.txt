@@ -1269,6 +1269,30 @@ add_v2_test(V2_Integration_MoEOverlayHostDispatchRows
     MPI_PROCS 1
     NO_MODELS)
 
+# Canonical Q8 publication is shared by all quantized expert formats. Keep its
+# serial-byte and real worker-ownership proof separate from noisy perf timing.
+add_executable(v2_test_cpu_router_q8_publication
+    unit/execution/moe/Test__CPURouterQ8Publication.cpp)
+target_link_libraries(v2_test_cpu_router_q8_publication PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPURouterQ8Publication
+    COMMAND $<TARGET_FILE:v2_test_cpu_router_q8_publication>
+        --gtest_filter=-CPURouterQ8Publication.PhysicalWorkerBudgetsPublishEveryRow
+    LABELS "V2;Unit;CPU;MoE;Quantization;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI
+    ENVIRONMENT "LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_moe_router_q8_worker_rows")
+foreach(V2_ROUTER_Q8_ISA AVX2 AVX512)
+    if(V2_ROUTER_Q8_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_ROUTER_Q8_ISA}" V2_ROUTER_Q8_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPURouterQ8Publication_${V2_ROUTER_Q8_ISA}
+        COMMAND $<TARGET_FILE:v2_test_cpu_router_q8_publication> --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MTP;AllFormats;${V2_ROUTER_Q8_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ROUTER_Q8_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_moe_router_q8_worker_rows")
+endforeach()
+
 # Test: fixed-slot serial/MTP ExpertOverlay transaction scheduling protocol
 add_executable(v2_unit_moe_overlay_inference_transaction
     unit/execution/moe/Test__MoEOverlayInferenceTransaction.cpp
@@ -4640,6 +4664,16 @@ add_v2_test(V2_Unit_AVX2VNNIParity
     LABELS "V2;Unit;Kernels;GEMM;GEMV;AVX2;Parity;VNNI"
     MPI_PROCS 1
 )
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    # The unchanged AVX2 arithmetic is an independent byte oracle for Q6
+    # loop/code-generation tuning, including every grouped runtime row count.
+    add_v2_test(V2_Integration_CPU_NativeQ6Arithmetic
+        COMMAND $<TARGET_FILE:v2_test_avx2_vnni_parity>
+            --gtest_filter=AVX2VNNIParity.Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;Q6_K;MTP;AVX2;AVX512;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS)
+endif()
 
 # Test: AVX2 Fallback Parity (all non-GEMM AVX2 fallback functions)
 add_executable(v2_test_avx2_fallback_parity unit/kernels/Test__AVX2FallbackParity.cpp)
@@ -10371,6 +10405,13 @@ add_v2_test(V2_Unit_MTPHardwareDefaults
     LABELS "V2;Unit;Config;MTP;Topology;CLI;YAML"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_MTPTerminalHeadDefaults
+    COMMAND $<TARGET_FILE:v2_test_mtp_hardware_defaults>
+    LABELS "V2;Integration;ProductionTestPreflight;Config;MTP;Topology;CPU;CUDA;ROCm;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MODELS
+)
 
 # Test: Prefix cache fingerprint key material
 add_executable(v2_test_prefix_cache_fingerprint unit/prefix_cache/Test__PrefixCacheFingerprint.cpp)
@@ -10742,6 +10783,26 @@ add_v2_test(V2_Unit_MTPGraphConstruction
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
     LABELS "V2;Unit;MTP;Graph;PrefixCache"
     MPI_PROCS 1
+)
+# CPU and GPU samplers must obey the graph's published logits ownership, not
+# infer it from an allocated LM-head shard. The scripted peer makes the CPU
+# MPI collective mismatch a fast failure instead of a stalled real-model run.
+add_executable(v2_integration_cpu_main_sampling_publication
+    integration/execution/runner/Test__CPUMainSamplingPublication.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_integration_cpu_main_sampling_publication PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_integration_cpu_main_sampling_publication
+    llaminar2_core GTest::gtest
+)
+add_v2_test(V2_Integration_CPUMainSamplingPublication
+    COMMAND $<TARGET_FILE:v2_integration_cpu_main_sampling_publication>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Sampling;MPI;TypedOwnership;Regression"
+    MPI_PROCS 2
+    NO_MODELS
+    TIMEOUT 30
 )
 # Replicated sidecar placement and the primary model's TP prefill layout coexist
 # in one production graph builder. Keep the exact shifted-cache ownership
@@ -13144,6 +13205,55 @@ foreach(V2_CPU_WORKSPACE_ISA IN LISTS V2_CPU_PROJECTION_WORKSPACE_ISAS)
 endforeach()
 
 # Integration Test: CPU NativeVNNI GEMV/GEMM Correctness (Q4_0, IQ4_NL)
+add_executable(v2_integration_cpu_native_vnni_verifier_workers
+    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIVerifierWorkers.cpp)
+target_link_libraries(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
+    if(V2_VERIFIER_WORKER_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPU_NativeVNNIVerifierWorkers_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers> --gtest_brief=1
+            --gtest_filter=-CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_native_vnni_verifier_worker_tasks")
+    # The same all-format FFN proof runs without kernel collection. This catches
+    # dormant diagnostic strings/maps allocating before the collector's guard.
+    add_v2_test(V2_Integration_CPU_NativeVNNIDisabledDiagnostics_${V2_VERIFIER_WORKER_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
+            --gtest_filter=CPUNativeVNNIVerifierWorkers.DisabledDiagnosticsDoNotAllocate
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_VERIFIER_WORKER_ISA};ByteExact;NoAllocation;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_VERIFIER_WORKER_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=moe")
+endforeach()
+
+add_executable(v2_integration_cpu_native_vnni_fused_completion
+    integration/kernels/cpu/native_vnni/Test__CPUNativeVNNIFusedCompletion.cpp)
+target_link_libraries(v2_integration_cpu_native_vnni_fused_completion PRIVATE
+    llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_integration_cpu_native_vnni_fused_completion PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
+    if(V2_FUSED_COMPLETION_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_FUSED_COMPLETION_ISA}" V2_FUSED_COMPLETION_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPU_NativeVNNIFusedCompletion_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion> --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}")
+endforeach()
+
 add_executable(v2_integration_cpu_native_vnni_gemv integration/kernels/cpu/native_vnni/Test__CPUNativeVNNI_GEMV.cpp)
 target_link_libraries(v2_integration_cpu_native_vnni_gemv
     llaminar2_core
@@ -13664,6 +13774,35 @@ add_v2_test(V2_Perf_CPUGatedDeltaNetVerifierRows
     MPI_PROCS 1
     TIMEOUT 120
 )
+
+# The scalar FP32 publication ABI is device-free and header-only. Keep this
+# focused proof independent of the backend libraries for inexpensive feedback.
+add_executable(v2_test_cpu_explicit_rounding_contract
+    unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
+target_include_directories(v2_test_cpu_explicit_rounding_contract PRIVATE
+    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(v2_test_cpu_explicit_rounding_contract PRIVATE cxx_std_20)
+target_link_libraries(v2_test_cpu_explicit_rounding_contract PRIVATE
+    GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CPUExplicitRoundingContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
+    LABELS "V2;Unit;CPU;Numerics;ByteExact"
+    NO_MODELS NO_MPI MPI_PROCS 1)
+add_v2_test(V2_Integration_CPUExplicitRoundingContract
+    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Numerics;MoE;AllFormats;ByteExact;Regression"
+    NO_MODELS NO_MPI MPI_PROCS 1)
+
+# Performance evidence remains separate from the functional preflight proof.
+add_executable(v2_perf_cpu_expert_q8_publication
+    performance/kernels/moe/Perf__CPUExpertQ8Publication.cpp)
+target_include_directories(v2_perf_cpu_expert_q8_publication PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(v2_perf_cpu_expert_q8_publication PRIVATE cxx_std_20)
+target_link_libraries(v2_perf_cpu_expert_q8_publication PRIVATE llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CPUExpertQ8Publication
+    COMMAND $<TARGET_FILE:v2_perf_cpu_expert_q8_publication>
+    LABELS "V2;Performance;CPU;MoE;Quantization"
+    NO_MODELS NO_MPI MPI_PROCS 1)
 
 # Performance Test: production-shaped CPU MoE grouped router
 add_executable(v2_perf_cpu_moe_router_verifier_rows

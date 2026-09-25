@@ -14,6 +14,7 @@
 
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "PreparedHalfReciprocal.h"
 #include "tensors/BlockStructures.h"
 #include "utils/CPUFeatures.h"
 
@@ -118,12 +119,13 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
         const float maximum = maximumAbsoluteValue(source, valid_elements);
         const float block_scale =
             device_q8_activation_contract::scale(maximum);
-        const float inverse_scale =
-            device_fp32_contract::reciprocalPositive(block_scale);
         destination.d = canonicalPreparedHalfBits(block_scale);
+        // Persisted scale words have a finite normalized domain. This lookup
+        // returns the identical five-step reciprocal without repeating that
+        // scalar dependency chain for every expert activation block.
+        const float inverse_scale =
+            prepared_half_reciprocal::reciprocal(destination.d);
 
-        alignas(64) std::int32_t quantized[Q8_1Block::BLOCK_SIZE] = {};
-        bool vectorized = false;
         if (valid_elements == static_cast<int>(Q8_1Block::BLOCK_SIZE))
         {
 #if defined(__AVX512F__)
@@ -132,7 +134,7 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
                 const __m512 inverse = _mm512_set1_ps(inverse_scale);
                 const __m512 minimum = _mm512_set1_ps(-127.0f);
                 const __m512 maximum_value = _mm512_set1_ps(127.0f);
-                for (int offset = 0; offset < 32; offset += 16)
+                const auto quantize_vector = [&](int offset)
                 {
                     __m512 scaled = _mm512_mul_ps(
                         _mm512_loadu_ps(source + offset), inverse);
@@ -141,20 +143,30 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
                     const __m512 rounded = _mm512_roundscale_ps(
                         scaled,
                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    _mm512_store_si512(
-                        quantized + offset,
-                        _mm512_cvttps_epi32(rounded));
-                }
-                vectorized = true;
+                    return _mm512_cvttps_epi32(rounded);
+                };
+                const __m512i first = quantize_vector(0);
+                const __m512i second = quantize_vector(16);
+                // All values are already in [-127,127]. Narrowing is exact,
+                // and the integer sum cannot overflow in any reduction order.
+                // Publish bytes directly instead of constructing a 128-byte
+                // INT32 scratch row and walking it again to pack and sum.
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(destination.qs),
+                                _mm512_cvtepi32_epi8(first));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(destination.qs + 16),
+                                _mm512_cvtepi32_epi8(second));
+                destination.sum_qs = static_cast<std::int16_t>(
+                    _mm512_reduce_add_epi32(_mm512_add_epi32(first, second)));
+                return;
             }
 #endif
 #if defined(__AVX2__)
-            if (!vectorized && cpu_supports_avx2())
+            if (cpu_supports_avx2())
             {
                 const __m256 inverse = _mm256_set1_ps(inverse_scale);
                 const __m256 minimum = _mm256_set1_ps(-127.0f);
                 const __m256 maximum_value = _mm256_set1_ps(127.0f);
-                for (int offset = 0; offset < 32; offset += 8)
+                const auto quantize_vector = [&](int offset)
                 {
                     __m256 scaled = _mm256_mul_ps(
                         _mm256_loadu_ps(source + offset), inverse);
@@ -163,31 +175,38 @@ namespace llaminar2::cpu::gpu_aligned_expert_q8
                     const __m256 rounded = _mm256_round_ps(
                         scaled,
                         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                    _mm256_store_si256(
-                        reinterpret_cast<__m256i *>(quantized + offset),
-                        _mm256_cvttps_epi32(rounded));
-                }
-                vectorized = true;
+                    return _mm256_cvttps_epi32(rounded);
+                };
+                const __m256i q0 = quantize_vector(0);
+                const __m256i q1 = quantize_vector(8);
+                const __m256i q2 = quantize_vector(16);
+                const __m256i q3 = quantize_vector(24);
+                const __m256i packed = _mm256_packs_epi16(
+                    _mm256_packs_epi32(q0, q1), _mm256_packs_epi32(q2, q3));
+                // AVX2 packs within each 128-bit lane. Restore the original
+                // groups of four bytes before publishing the complete row.
+                const __m256i ordered = _mm256_permutevar8x32_epi32(
+                    packed, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(destination.qs), ordered);
+                const __m256i lanes = _mm256_add_epi32(
+                    _mm256_add_epi32(q0, q1), _mm256_add_epi32(q2, q3));
+                __m128i sum = _mm_add_epi32(
+                    _mm256_castsi256_si128(lanes), _mm256_extracti128_si256(lanes, 1));
+                sum = _mm_hadd_epi32(sum, sum);
+                sum = _mm_hadd_epi32(sum, sum);
+                destination.sum_qs = static_cast<std::int16_t>(_mm_cvtsi128_si32(sum));
+                return;
             }
 #endif
-        }
-
-        if (!vectorized)
-        {
-            for (int element = 0; element < valid_elements; ++element)
-            {
-                quantized[element] =
-                    device_q8_activation_contract::quantize(
-                        source[element], block_scale);
-            }
         }
 
         std::int32_t sum = 0;
         for (int element = 0; element < valid_elements; ++element)
         {
-            destination.qs[element] = static_cast<std::int8_t>(
-                quantized[element]);
-            sum += quantized[element];
+            const std::int32_t quantized = device_q8_activation_contract::quantize(
+                source[element], block_scale);
+            destination.qs[element] = static_cast<std::int8_t>(quantized);
+            sum += quantized;
         }
         std::memset(
             destination.qs + valid_elements,

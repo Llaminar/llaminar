@@ -762,8 +762,8 @@ namespace llaminar2
         /**
          * Keep the model's vocabulary-sharded final norm and LM-head layout.
          *
-         * This is an explicit diagnostic/economy policy. It is never selected
-         * implicitly from the TP scope when mirrored ownership was requested.
+         * CPU continuation domains select this policy automatically. Explicit
+         * mirrored ownership is never replaced by a topology-derived default.
          */
         VocabularySharded,
 
@@ -774,6 +774,12 @@ namespace llaminar2
          * a global MPI rank; scope does not alter the ownership policy.
          */
         MirroredFullVocabulary,
+
+        /**
+         * Frontend intent only: resolve from the complete terminal/continuation
+         * domain before memory admission. Never legal in an executable graph.
+         */
+        Automatic,
     };
 
     /**
@@ -790,6 +796,8 @@ namespace llaminar2
             return "vocabulary-sharded";
         case MTPTerminalHeadPolicy::MirroredFullVocabulary:
             return "mirrored-full-vocabulary";
+        case MTPTerminalHeadPolicy::Automatic:
+            return "auto";
         }
         return "unknown";
     }
@@ -803,6 +811,8 @@ namespace llaminar2
         const std::string &value)
     {
         const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "auto")
+            return MTPTerminalHeadPolicy::Automatic;
         if (normalized == "vocabulary-sharded")
             return MTPTerminalHeadPolicy::VocabularySharded;
         if (normalized == "mirrored-full-vocabulary")
@@ -814,11 +824,19 @@ namespace llaminar2
      * @brief Return whether a policy binds a complete terminal head locally.
      * @param policy Typed terminal-head placement policy.
      * @return True only for the full-vocabulary mirrored policy.
+     * @throws std::logic_error if unresolved frontend intent reaches a consumer.
      */
     inline bool mtpTerminalHeadIsMirrored(
-        MTPTerminalHeadPolicy policy) noexcept
+        MTPTerminalHeadPolicy policy)
     {
-        return policy == MTPTerminalHeadPolicy::MirroredFullVocabulary;
+        switch (policy)
+        {
+        case MTPTerminalHeadPolicy::VocabularySharded: return false;
+        case MTPTerminalHeadPolicy::MirroredFullVocabulary: return true;
+        case MTPTerminalHeadPolicy::Automatic:
+            throw std::logic_error("MTP terminal-head auto policy must be resolved by topology compilation before admission or graph construction");
+        }
+        throw std::logic_error("Invalid MTP terminal-head policy");
     }
 
     /**
@@ -847,6 +865,7 @@ namespace llaminar2
      *        terminal projection is vocabulary-column sharded.
      * @param policy Explicit MTP terminal-head ownership policy.
      * @return The exact tensor ownership produced by every participant.
+     * @throws std::logic_error if the policy has not been topology-resolved.
      *
      * A model without a column-parallel primary head already owns a complete
      * vocabulary projection, irrespective of the requested MTP policy. When
@@ -855,10 +874,11 @@ namespace llaminar2
      */
     inline MTPTerminalLogitsLayout resolveMTPTerminalLogitsLayout(
         bool primary_lm_head_column_parallel,
-        MTPTerminalHeadPolicy policy) noexcept
+        MTPTerminalHeadPolicy policy)
     {
+        const bool mirrored = mtpTerminalHeadIsMirrored(policy);
         return primary_lm_head_column_parallel &&
-                       !mtpTerminalHeadIsMirrored(policy)
+                       !mirrored
                    ? MTPTerminalLogitsLayout::VocabularyShardPerParticipant
                    : MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
     }
@@ -968,10 +988,11 @@ namespace llaminar2
         /**
          * @brief Placement of the verifier's final norm and LM-head weights.
          *
-         * Tensor-parallel MTP defaults to a complete mirrored terminal head
-         * because a tiny per-draft vocabulary collective is generally less
-         * economical than duplicating this terminal projection. The policy has
-         * identical meaning for local, node-local, and global TP scopes.
+         * Low-level runtime construction starts with a concrete mirrored policy.
+         * The public OrchestrationConfig instead starts with Automatic intent;
+         * ExecutionPlanBuilder resolves it once to vocabulary shards for CPU
+         * continuation and mirrors otherwise, before admission. This runtime
+         * value then owns both graph layout and physical-weight accounting.
          */
         MTPTerminalHeadPolicy terminal_head_policy =
             MTPTerminalHeadPolicy::MirroredFullVocabulary;
