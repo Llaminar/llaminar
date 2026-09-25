@@ -1,0 +1,29 @@
+name: Arm develop PR auto-merge
+
+# This trusted base-branch workflow only enables GitHub's native auto-merge.
+# It never checks out or executes PR code. The develop ruleset, not this job,
+# decides whether the required image-bound Unit/preflight check has passed.
+on:
+  pull_request_target:
+    branches: [develop]
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  arm:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Squash-merge automatically after the required check succeeds
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash

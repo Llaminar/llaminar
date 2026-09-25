@@ -39,6 +39,12 @@ not certification: no AVX2, models, E2E, benchmarks or publication. It calls the
 existing image driver with `--cpu-isa AVX512` and no `--publish`, using the same
 host-only cache and shared accelerator concurrency group. See
 `docs/production-ci.md` for its same-repository trust boundary and local command.
+The `develop` ruleset requires that exact check on an up-to-date PR and rejects
+direct human pushes. The trusted base-branch auto-merge workflow arms native
+squash auto-merge only for non-draft same-repository PRs; it never runs PR code.
+The sole direct-push exception is the dedicated release-evidence deploy key for
+the certified post-squash high-water/ancestry commit. Never grant the general
+GitHub Actions app bypass, since it also owns PR auto-merge.
 
 The enabled `develop` push workflow is intentionally narrower than that
 routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to

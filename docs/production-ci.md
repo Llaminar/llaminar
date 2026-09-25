@@ -18,9 +18,24 @@ test-runner image**. This is the pre-commit test scope in a reproducible image,
 not release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
+The active `develop` ruleset requires this exact GitHub Actions check, an
+up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
+are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
+auto-merge for same-repository, non-draft PRs. It runs on the trusted base
+branch, does not check out PR code, and cannot merge before the required
+image-bound check succeeds. Fork PRs cannot run on the privileged host runner;
+import a reviewed branch into this repository before requesting this gate.
+
 The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
 without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
 HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
+Every repository job that builds an image, runs tests, or prepares the
+self-hosted test toolchain shares `llaminar-develop-image-gate` with
+`queue: max` and `cancel-in-progress: false`. The ARC scale set also has
+`maxRunners: 1`. Thus separate PRs and certification runs wait their turn;
+GitHub must neither overlap their hardware work nor replace an older pending
+run with a newer one. Read-only policy, source-admission, and documentation
+publication jobs do not occupy that hardware queue.
 No registry-write permission or login is granted. Untrusted fork PRs do not
 acquire the privileged host runner; review/import them onto a repository branch
 before running this gate. Branch protection is configured independently.
@@ -110,7 +125,11 @@ The cache root is an explicit `hostPath`, so it survives ARC pod recreation
 and node-local runner restarts. `run_production_pipeline.py` partitions the
 external Buildx OCI cache only by ISA and imports it only after a complete
 prior export exists. It resets each slot on export, preventing stale manifest
-blobs from growing without bound. The Dockerfile's `ccache` mounts are one
+blobs from growing without bound. For a test-runner/runtime pair, only the
+test-runner imports and exports that external snapshot; the subsequent runtime
+target reuses the already-live host BuildKit worker instead of transferring
+the same large cache a second time. A runtime-only build owns its snapshot.
+The Dockerfile's `ccache` mounts are one
 shared `llaminar-ccache` cache in the host Docker daemon's retained
 `llaminar-ci` BuildKit worker; ccache hashes compiler identity and flags, so
 the two ISA lanes cannot collide. `CCACHE_MAXSIZE=50G` is the hard
@@ -232,13 +251,18 @@ The branch-policy check admits only `develop`.
 
 `scripts/ci/apply_master_ruleset.py` installs the four required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also activates the existing develop deletion and
-force-push guard, so GitHub's auto-delete-on-merge setting cannot remove the
-persistent source branch. This guard does not add a PR, status-check, or
-linear-history requirement to develop: the post-squash publisher must record
-the certified master commit as a second parent of its fast-forward evidence
-commit, making the next develop PR up-to-date with master without rewriting
-either branch.
+squash-only merge. It also installs the `develop` PR and AVX512 prerequisite
+check requirements, while retaining deletion and force-push protection.
+`develop` deliberately does not require linear history: after a certified
+master squash merge, the release publisher records that exact master commit as
+the second parent of its fast-forward evidence commit, making the next master
+PR up to date without rewriting either branch. The publisher's dedicated
+`llaminar-release-evidence` writable deploy key is the sole ruleset bypass;
+the installer refuses any other writable deploy key. The general GitHub
+Actions app must never bypass the `develop` ruleset, because the auto-merge
+workflow also runs under that app. Release automation supplies the private key
+through the `RELEASE_DEVELOP_DEPLOY_KEY` Actions secret only in the post-release
+evidence job; ordinary PRs cannot access it.
 Run the installer without `--apply` to inspect both proposals; only apply
 after the PR workflow has emitted its checks. A manual-dispatch workflow
 run cannot satisfy a required PR check, so the diagnostic workflows below are

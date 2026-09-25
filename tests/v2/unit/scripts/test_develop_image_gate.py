@@ -218,7 +218,8 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(workflow["concurrency"], {
-            "group": "llaminar-develop-image-gate", "cancel-in-progress": "false"})
+            "group": "llaminar-develop-image-gate", "cancel-in-progress": "false",
+            "queue": "max"})
         self.assertEqual(set(workflow["jobs"]), {"prerequisites"})
         job = workflow["jobs"]["prerequisites"]
         self.assertEqual(job["runs-on"], ["llaminar-xeon-host"])
@@ -278,6 +279,46 @@ class DevelopImageGateTests(unittest.TestCase):
             self.assertTrue(receipt["complete"])
             self.assertFalse(receipt["published"])
             self.assertEqual(set(receipt["variants"]), {"AVX512"})
+
+    def test_develop_auto_merge_waits_for_protected_pr_gate(self):
+        """Only trusted, non-draft PRs arm native auto-merge; no PR code runs."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-auto-merge.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"pull_request_target"})
+        self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["develop"])
+        self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
+                         {"opened", "reopened", "synchronize", "ready_for_review"})
+        self.assertEqual(workflow["permissions"],
+                         {"contents": "read", "pull-requests": "write"})
+        self.assertEqual(set(workflow["jobs"]), {"arm"})
+        job = workflow["jobs"]["arm"]
+        self.assertIn("head.repo.full_name == github.repository", job["if"])
+        self.assertIn("!github.event.pull_request.draft", job["if"])
+        self.assertEqual(len(job["steps"]), 1)
+        step = job["steps"][0]
+        self.assertEqual(step["env"]["PR_NUMBER"],
+                         "${{ github.event.pull_request.number }}")
+        self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" '
+                      '--auto --squash', step["run"])
+        self.assertNotIn("checkout", str(job))
+
+    def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):
+        """Separate PRs and certification jobs cannot contend for this host's GPUs."""
+        values = yaml.load((ROOT / "scripts/ci/arc/llaminar-xeon-host-docker-values.yaml")
+                           .read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(values["maxRunners"], "1")
+        expected = {"group": "llaminar-develop-image-gate",
+                    "cancel-in-progress": "false", "queue": "max"}
+        admitted = []
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            for name, job in workflow.get("jobs", {}).items():
+                if job.get("runs-on") not in (["llaminar-xeon-host"], "self-hosted"):
+                    continue
+                admitted.append(f"{path.name}:{name}")
+                self.assertEqual(job.get("concurrency", workflow.get("concurrency")),
+                                 expected, admitted[-1])
+        self.assertGreaterEqual(len(admitted), 7)
 
     def test_prerequisites_execute_in_exact_test_image_without_model_mounts(self):
         """A PR must test its built image, not a host checkout or older runtime."""

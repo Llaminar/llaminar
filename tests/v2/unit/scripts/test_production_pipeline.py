@@ -3632,14 +3632,13 @@ class ImageIdentityTests(unittest.TestCase):
                 pipeline.build(args, source, root)
             commands = [call.args[0] for call in execute.call_args_list]
             self.assertEqual(len(commands), 2)
-            for command in commands:
-                self.assertIn("--cache-to", command)
-                specification = command[command.index("--cache-to") + 1]
-                self.assertEqual(
-                    specification,
-                    f"type=local,dest={cache_root}/avx512,mode=max,reset=true",
-                )
-                self.assertNotIn("--cache-from", command)
+            test_runner, runtime = commands
+            self.assertIn("--cache-to", test_runner)
+            self.assertEqual(test_runner[test_runner.index("--cache-to") + 1],
+                             f"type=local,dest={cache_root}/avx512,mode=max,reset=true")
+            self.assertNotIn("--cache-from", test_runner)
+            self.assertNotIn("--cache-to", runtime)
+            self.assertNotIn("--cache-from", runtime)
 
             # A prior complete OCI export is the only admissible cache input.
             (cache_root / "avx512" / "index.json").write_text("{}")
@@ -3647,11 +3646,25 @@ class ImageIdentityTests(unittest.TestCase):
                     pipeline.DOCKER_BUILD_CACHE_ROOT_ENV: str(cache_root),
                 }, clear=False):
                 arguments = pipeline.persistent_build_cache_arguments(
-                    "AVX512")
+                    "AVX512", pipeline.ImageRole.TEST_RUNNER,
+                    pipeline.ImageRole.TEST_RUNNER)
             self.assertEqual(arguments, [
                 "--cache-from", f"type=local,src={cache_root}/avx512",
                 "--cache-to", f"type=local,dest={cache_root}/avx512,mode=max,reset=true",
             ])
+            with patch.dict(pipeline.os.environ, {
+                    pipeline.DOCKER_BUILD_CACHE_ROOT_ENV: str(cache_root),
+                }, clear=False):
+                self.assertEqual(pipeline.persistent_build_cache_arguments(
+                    "AVX512", pipeline.ImageRole.RUNTIME,
+                    pipeline.ImageRole.TEST_RUNNER), [])
+                self.assertEqual(pipeline.persistent_build_cache_arguments(
+                    "AVX512", pipeline.ImageRole.RUNTIME,
+                    pipeline.ImageRole.RUNTIME), [
+                    "--cache-from", f"type=local,src={cache_root}/avx512",
+                    "--cache-to",
+                    f"type=local,dest={cache_root}/avx512,mode=max,reset=true",
+                ])
 
 
 class InfrastructureTests(unittest.TestCase):
