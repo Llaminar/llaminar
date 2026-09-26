@@ -14,6 +14,9 @@
  * byte proof for the historical tile alone cannot certify another launch grid.
  * BK256 additionally exercises the public launch bridge on every device before
  * any resource query can accidentally configure its context-local attributes.
+ * An analytic signed-extreme case independently checks shared activation
+ * corrections: zero weight scales and unit minima must yield the exact row sum,
+ * including padded tiles, odd K halves, and every staging schedule.
  */
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDiagnostics.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
@@ -415,6 +418,102 @@ void verifyCodebook()
         }
 }
 } // namespace
+
+/** @brief Shared correction producers retain signed range and padded-slot ownership. */
+TEST(CUDANativeVNNIPrefillStaging, SharedActivationCorrectionsMatchExactRowSums)
+{
+    check(cudaSetDevice(0));
+    constexpr int m = 129, n = 129, k = 1056;
+    const int blocks = n * (k / 32);
+    const int outputs = m * n;
+    Buffer<int8_t> activation(m * k);
+    Buffer<int32_t> activation_block_sums(m * k / 32);
+    Buffer<float> activation_scales(m * k / 32), output(outputs + 8);
+    Buffer<uint16_t> scales(blocks), minima(blocks);
+    std::vector<int8_t> host_activation(m * k);
+    std::vector<int32_t> host_block_sums(activation_block_sums.count, 0);
+    std::vector<float> expected(m), actual(outputs + 8);
+    const std::vector<float> host_activation_scales(activation_scales.count, 1);
+    const std::vector<uint16_t> host_scales(scales.count, 0);
+    const std::vector<uint16_t> host_minima(minima.count, 0x3c00);
+    for (int row = 0; row < m; ++row)
+        for (int column = 0; column < k; ++column)
+        {
+            const int value = ((row + column / 8) % 3 == 0) ? -128 : 127;
+            host_activation[row * k + column] = value;
+            host_block_sums[(column / 32) * m + row] += value;
+            expected[row] += value;
+        }
+    // Zero unsigned payload and zero scale leave only the additive unit
+    // minimum. The answer is exact even across the serial partition fold.
+    for (uint8_t codebook : {uint8_t{5}, uint8_t{7}})
+    {
+        const auto *format = llaminar2::native_vnni_formats::forSourceIdentity(codebook, false);
+        ASSERT_NE(format, nullptr);
+        Buffer<uint8_t> payload(blocks * format->payload_bytes);
+        const std::vector<uint8_t> host_payload(payload.count, 0);
+        for (int tile : {3, 5})
+            for (int mode = 0; mode < 4; ++mode)
+                for (const bool supplied_sums : {false, true})
+                {
+                    SCOPED_TRACE(::testing::Message() << "CB=" << int(codebook)
+                        << " tile=" << tile << " staging=" << mode
+                        << " supplied_sums=" << supplied_sums);
+                    Session session;
+                    activation.upload(host_activation, session.stream);
+                    // Exercise both the quantizer-owned block-major sums and
+                    // exact on-load sums; neither may use padded-tile strides.
+                    activation_block_sums.upload(host_block_sums, session.stream);
+                    activation_scales.upload(host_activation_scales, session.stream);
+                    payload.upload(host_payload, session.stream);
+                    scales.upload(host_scales, session.stream);
+                    minima.upload(host_minima, session.stream);
+                    check(cudaStreamSynchronize(session.stream));
+                    CUDADensePrefillKernelResources primary{}, auxiliary{};
+                    ASSERT_TRUE(cudaNativeVNNIPrefill_queryCandidateResources(
+                        codebook, tile, 0, 0, 0, &primary, &auxiliary,
+                        static_cast<llaminar2::cuda::prefill::PrefillStagingSchedule>(mode)));
+                    ASSERT_EQ(primary.local_memory_bytes_per_thread, 0u);
+                    uint32_t *emins = nullptr;
+                    int32_t *activation_sums = supplied_sums
+                        ? activation_block_sums.data : nullptr;
+                    float *prior = nullptr, *bias = nullptr;
+                    float alpha = 1, beta = 0;
+                    llaminar2::cuda::prefill::CanonicalM1PartitionGeometry partitions{3, 11};
+                    int ordered = 1;
+                    // CUDA copies these immutable dimensions at capture; it never
+                    // retains a pointer to the host's scalar argument array.
+                    int rows = m, columns = n, reduction = k;
+                    void *arguments[]{&activation.data, &payload.data, &scales.data,
+                        &minima.data, &emins, &output.data, &activation_scales.data,
+                        &activation_sums, &prior, &bias, &rows, &columns, &reduction,
+                        &alpha, &beta, &partitions, &ordered};
+                    check(cudaStreamBeginCapture(session.stream, cudaStreamCaptureModeThreadLocal));
+                    const int tile_rows = tile == 5 ? 128 : 64;
+                    check(cudaLaunchKernel(primary.kernel_symbol,
+                        dim3((m + tile_rows - 1) / tile_rows, (n + 127) / 128),
+                        dim3(primary.threads_per_block), arguments, 0, session.stream));
+                    check(cudaStreamEndCapture(session.stream, &session.graphs[0]));
+                    check(cudaGraphInstantiate(&session.execs[0], session.graphs[0], nullptr, nullptr, 0));
+                    for (int replay = 0; replay < 20; ++replay)
+                    {
+                        check(cudaMemsetAsync(output.data, 0x7e, output.count * sizeof(float), session.stream));
+                        check(cudaGraphLaunch(session.execs[0], session.stream));
+                        check(cudaMemcpyAsync(actual.data(), output.data, output.count * sizeof(float),
+                            cudaMemcpyDeviceToHost, session.stream));
+                        check(cudaStreamSynchronize(session.stream));
+                        for (int i = 0; i < outputs; ++i)
+                            ASSERT_EQ(actual[i], expected[i / n]);
+                        for (int i = outputs; i < outputs + 8; ++i)
+                        {
+                            uint32_t bits;
+                            std::memcpy(&bits, &actual[i], sizeof(bits));
+                            ASSERT_EQ(bits, 0x7e7e7e7eu);
+                        }
+                    }
+                }
+    }
+}
 
 /** @brief Device switches cannot reuse another CUDA context's function opt-in. */
 TEST(CUDANativeVNNIPrefillStaging, BK256CapturedLaunchOwnsEveryDeviceContext)

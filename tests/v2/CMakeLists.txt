@@ -7485,6 +7485,19 @@ if(HAVE_ROCM)
 endif()
 
 if(HAVE_CUDA)
+    # Resource queries and exact-output proofs are functional gates, not timing
+    # tournaments. The image build separately compiles every shipped SM target.
+    add_v2_test(V2_Integration_CUDAMoEPrefillCompilerResourcesAllCodebooks
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=Perf__MoEVerifierPrefill.CUDA_AllFormatProductionPrefillCandidatesAreSpillFree
+        LABELS "V2;Integration;CUDA;MoE;Prefill;AllFormats;Resources;NoSpills;Regression"
+        MPI_PROCS 1 NO_MODELS RESOURCE_LOCK cuda_gpu_0 TIMEOUT 30)
+    add_v2_test(V2_Integration_CUDAMoEPairedGateUpRegisterLifetimeAllFormats
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=Perf__MoEVerifierPrefill.CUDA_PairedGateUpRegisterLifetimeAllFormats
+        LABELS "V2;Integration;CUDA;MoE;Prefill;AllFormats;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS RESOURCE_LOCK cuda_gpu_0 TIMEOUT 120)
+
     # Exercise both CUDA metadata-reuse specializations under production graph
     # capture and power-law routing. Compare every output byte with serial-row
     # publication so economy changes cannot alter grouped arithmetic or leave
@@ -7791,7 +7804,7 @@ if(HAVE_CUDA)
         llaminar2_core GTest::gtest_main CUDA::cudart)
     add_v2_test(V2_Integration_CUDAFlashAttentionRegisterLifetime
         COMMAND $<TARGET_FILE:v2_integration_cuda_attention_register_lifetime>
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;Attention;GraphCapture;ByteExact;FP32;FP16;BF16;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;Attention;GraphCapture;ByteExact;FP32;FP16;BF16;Q8_1;Regression"
         MPI_PROCS 1 NO_MODELS RESOURCE_LOCK cuda_gpu_0 TIMEOUT 60)
     target_link_libraries(v2_integration_cuda_activation_block_sums PRIVATE
         llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
@@ -20463,6 +20476,8 @@ if(HAVE_CUDA)
     V2_Integration_CUDARequestBatchResidentKVAttention
     V2_Integration_CUDA_NativeVNNI_PrefillBucketMInvariantAllFormats
     V2_Integration_CUDANativeVNNIPrefillCompilerResourcesAllCodebooks
+    V2_Integration_CUDAMoEPrefillCompilerResourcesAllCodebooks
+    V2_Integration_CUDAMoEPairedGateUpRegisterLifetimeAllFormats
     V2_Integration_CUDA_DeviceCountedVerifierRows
     V2_Integration_CUDAFloatingExpertRetirement
     V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle

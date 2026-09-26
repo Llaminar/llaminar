@@ -318,6 +318,12 @@ The model-free `GPUSpillCompilation` preflight tests prove spilling kernels and
 device helpers fail, while register-only moves and deliberate-local-memory
 kernels pass with the actual compilers.
 
+Spill results are architecture-specific. Before publishing GPU kernel or
+compiler-resource changes, compile the complete architecture set declared by
+the canonical image build, not only the locally installed GPU's target. Record
+the target set with the validation evidence. Passing native-device runtime
+tests does not prove register allocation on the other shipped targets.
+
 Use an out-of-tree Ninja build and unrestricted build parallelism. The
 container image and workspace environment pin the same Ninja release. Resolve
 that active executable once when configuring, record it in

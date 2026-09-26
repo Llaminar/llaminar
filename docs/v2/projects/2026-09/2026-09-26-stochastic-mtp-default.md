@@ -803,3 +803,82 @@ proxy, not browser rendering or unrelated UI tasks. Evidence is in
 generated workload is not used for a complete-response speedup claim.
 The servers remain available for manual use; older containers are retained
 stopped. No local validation image is advertised as a release certificate.
+
+## PR compiler-target follow-up
+
+The first PR #11 image gate caught spills in CUDA targets absent from the
+local SM86-only build. The image compiles SM80, SM86, SM89 and SM90. SM80
+exposed paired IQ2_S gate/up and Q8 attention register pressure; SM80/SM90
+also exposed wide dense-prefill candidates. The fatal guard worked, but the
+local validation scope was incomplete. Integration now compiles the complete
+shipped target set, and AGENTS documents this prerequisite for publishing
+compiler-resource changes. The guard and its failure policy remain unchanged.
+
+The follow-up preserves the production kernels and exact arithmetic:
+
+- Dense BK64 prefill uses one zero-padded operand walk for interior and border
+  tiles. Copy owners compute exact INT16-sized activation correction sums once
+  in shared memory; consumers retain only the current row's corrections.
+  Asymmetric formats also reuse the quantizer's block-major sums when present.
+  Each output keeps the same ascending block/partition fold. The shorter live
+  ranges permit the ordinary partition cursor for IQ1_M too, removing its
+  per-block remainder. There is no global scratch or extra launch.
+- The already-staged paired-MoE schedule overlaps the two low-half MMAs and
+  retires one high-half result at a time. Zero-padded shared metadata needs no
+  inner semantic bounds predicate. The direct-metadata schedule retains its
+  original element-interleaved gate/up fold and bounds checks. Serializing
+  every projection was rejected after a measured 4–9% slowdown.
+- Q8 attention specializes all supported head widths from 32 through 256,
+  making accumulator indices static. Bounded dot-product unrolling and an
+  unexpanded epilogue retain throughput without spilling. The reduction,
+  split geometry and output arithmetic are unchanged. Removing dot-loop
+  unrolling completely was rejected: it nearly doubled the widest-head cost.
+
+All three complete production translation units compile with fatal spill
+warnings for all four shipped targets. The final Integration dependency build
+also covers that target set. Runtime measurements below use the available
+SM86 hardware; they do not claim measured SM80/89/90 performance.
+
+Focused captured preflight passed five tests in 41.15 seconds: dense all-format
+M/bucket serial-byte equivalence, dense staging, paired-MoE all-format byte
+equivalence, paired compiler resources, and attention lifetime. The additional
+dense signed-extreme test passes with both supplied and on-load activation
+sums, partial tiles and odd K halves (complete staging fixture: 8.64 seconds).
+Q8 attention covers every head width, logical KV tails and twenty poisoned
+replays against an independent FP64 oracle. A separate before/after production
+bridge probe produced identical output bytes for all 24 head-width/KV shapes.
+The new MoE regressions are explicitly registered in ProductionTestPreflight;
+the attention and dense additions extend existing preflight fixtures.
+
+Same-session Release comparisons against the preserved pre-follow-up core:
+
+| Focused workload | Before | After | Interpretation |
+|---|---:|---:|---|
+| Dense Q4_1, M512/N8192/K2048 | 333.824 us | 339.936 us | 1.8% longer; check model impact |
+| Dense Q6_K, same shape | 406.528 us | 397.312 us | 2.3% shorter |
+| Dense IQ2_S, same shape | 363.520 us | 362.464 us | Essentially unchanged |
+| Dense IQ1_M, same shape | 761.856 us | 630.784 us | 17.2% shorter |
+| Paired MoE IQ2_S/IQ4_XS, C32/D32, M512 | 1963.26 us | 1856.00 us | 5.5% shorter |
+| Paired MoE, C64/D32 | 2143.23 us | 2131.71 us | Within 1% |
+| Paired MoE, C128/D32 | 2213.89 us | 2191.76 us | Within 1% |
+| Q8 attention, head256/KV8192 | 362.05 us | 360.60 us | Essentially unchanged |
+
+Dense values are the median of three alternating runs with 1,000 timing
+iterations each. MoE uses the production candidate trainer's captured pipeline
+medians, with unchanged parallel candidates as controls and zero output-bit
+mismatches. These are kernel diagnostics, not replacement model certificates.
+
+Separate final Nsight profiles report zero local spilling requests. Dense Q4_1
+uses 122 registers, 31.49% achieved occupancy and 71.59% SM throughput; paired
+IQ2_S uses 64 registers, 64.24% occupancy and 63.92% SM throughput; head256 Q8
+attention uses 79 registers, 44.03% occupancy and 58.00% SM throughput. Artifacts
+are under `/tmp/llaminar-cuda-paired-compile.ar5pvK/`.
+
+The profiling interval is again **not driver-clean**: the observer retained
+18 `pSmIssueThrottleCtrl` NVIDIA assertions at the three Nsight launches. This
+is the same profiling-associated failure previously reproduced on the control
+core; it is not suppressed or counted as a healthy inference certificate.
+`/tmp/llaminar-cuda-ci-spill-driver-report.json` preserves the failed interval.
+The final unprofiled Unit/preflight and model checks require a fresh, separate
+strict driver observation before publication. PR completion remains conditional
+on the remote image gate and auto-merge, not these focused results alone.

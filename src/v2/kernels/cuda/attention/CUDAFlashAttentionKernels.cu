@@ -2016,7 +2016,31 @@ namespace
     };
     static_assert(sizeof(GpuQ8_1BlockInline) == 36, "GpuQ8_1BlockInline must be 36 bytes");
 
-    __global__ __launch_bounds__(256, 4) void flash_decoding_q8kv_kernel(
+    /**
+     * @brief Decode one Q8_1 attention split with statically indexed accumulators.
+     *
+     * @tparam HeadDim Head width, one through eight complete Q8_1 blocks.
+     * @param Q FP32 query rows, laid out as [batch,heads,HeadDim].
+     * @param K_cache Block-quantized keys in physical KV-row order.
+     * @param V_cache Block-quantized values with the same physical geometry.
+     * @param O_partial Per-split unnormalized FP32 output vectors.
+     * @param m_partial Per-split online-softmax maxima.
+     * @param l_partial Per-split online-softmax normalization sums.
+     * @param kv_len Admitted KV capacity when device parameters are absent.
+     * @param n_heads Number of query heads in this participant.
+     * @param n_kv_heads Number of resident KV heads.
+     * @param num_splits Captured maximum split count and partial-buffer stride.
+     * @param softmax_scale Query-key scaling factor.
+     * @param device_params Optional device-owned logical KV length and stride.
+     * @param head_start Global query-head origin for a tensor-parallel shard.
+     * @param gqa_n_rep Global query-head replication ratio, or zero to derive it.
+     *
+     * Compile-time head width gives each output component one scalar register;
+     * dynamic array indices otherwise force private storage and register spills
+     * on SM80. Splits, KV traversal and the ordered warp fold are unchanged.
+     */
+    template <int HeadDim>
+    __global__ __launch_bounds__(256, HeadDim == 256 ? 3 : 4) void flash_decoding_q8kv_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K_cache,
         const void *__restrict__ V_cache,
@@ -2026,13 +2050,17 @@ namespace
         int kv_len,
         int n_heads,
         int n_kv_heads,
-        int head_dim,
         int num_splits,
         float softmax_scale,
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
         int head_start = 0,
         int gqa_n_rep = 0)
     {
+        static_assert(HeadDim > 0 && HeadDim <= 256 && HeadDim % 32 == 0);
+        constexpr int head_dim = HeadDim;
+        // Eight live value components need a larger register budget than
+        // narrower heads. Keep the same CTA geometry and avoid forcing SM80
+        // to spill that state merely to promise a fourth resident CTA.
         // Q8_1 block addressing constants
         constexpr int Q8_BS = 32;
 
@@ -2070,7 +2098,7 @@ namespace
         // early-exit output address across the complete K/V traversal.
 
         const int tid = threadIdx.x;
-        const int num_threads = blockDim.x;
+        constexpr int num_threads = 256;
         const int warp_id = tid / WARP_SIZE;
         const int lane_id = tid % WARP_SIZE;
         const int num_warps = num_threads / WARP_SIZE;
@@ -2085,7 +2113,7 @@ namespace
         }
         __syncthreads();
 
-        constexpr int MAX_DIMS_PER_LANE = 8;
+        constexpr int MAX_DIMS_PER_LANE = HeadDim / WARP_SIZE;
         float O_lane[MAX_DIMS_PER_LANE] = {0};
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
@@ -2106,6 +2134,9 @@ namespace
                 K_base + kv_pos * row_byte_stride);
 
             float partial_dot = 0.0f;
+            // Expose a bounded number of independent key loads. Full unroll
+            // spills on SM80; no unroll loses long-context memory parallelism.
+#pragma unroll (HeadDim == 256 ? 4 : 2)
             for (int d = lane_id; d < head_dim; d += WARP_SIZE)
             {
                 const int bi = d / Q8_BS;
@@ -2128,9 +2159,10 @@ namespace
             const GpuQ8_1BlockInline *Vq = reinterpret_cast<const GpuQ8_1BlockInline *>(
                 V_base + kv_pos * row_byte_stride);
 
-            int o_idx = 0;
-            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+#pragma unroll
+            for (int o_idx = 0; o_idx < MAX_DIMS_PER_LANE; ++o_idx)
             {
+                const int d = lane_id + o_idx * WARP_SIZE;
                 const int bi = d / Q8_BS;
                 const int bo = d % Q8_BS;
                 __half h_scale;
@@ -2153,9 +2185,10 @@ namespace
             block_l[warp_id] = l_local;
         }
         {
-            int o_idx = 0;
-            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+#pragma unroll
+            for (int o_idx = 0; o_idx < MAX_DIMS_PER_LANE; ++o_idx)
             {
+                const int d = lane_id + o_idx * WARP_SIZE;
                 block_O[warp_id * head_dim + d] = O_lane[o_idx];
             }
         }
@@ -2168,6 +2201,7 @@ namespace
             float final_l = block_l[0];
             warp_scales[0] = 1.0f;
 
+#pragma unroll 1
             for (int w = 1; w < num_warps; w++)
             {
                 float other_m = block_m[w];
@@ -2177,6 +2211,7 @@ namespace
                 float scale_self = __expf(final_m - m_new);
                 float scale_other = __expf(other_m - m_new);
 
+#pragma unroll 1
                 for (int prev = 0; prev < w; prev++)
                     warp_scales[prev] *= scale_self;
                 warp_scales[w] = scale_other;
@@ -4273,6 +4308,10 @@ extern "C"
         int head_start,
         int gqa_n_rep)
     {
+        // Each public width maps to a compiled accumulator geometry; reject
+        // malformed block geometry before either captured phase is submitted.
+        if (!stream || head_dim <= 0 || head_dim > 256 || head_dim % 32 != 0)
+            return -1;
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
@@ -4284,12 +4323,27 @@ extern "C"
             int block_size = 256;
             size_t smem_size = head_dim * sizeof(float);
 
-            flash_decoding_q8kv_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
-                Q, K_cache_q8, V_cache_q8,
-                O_partial, m_partial, l_partial,
-                kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params,
-                head_start, gqa_n_rep);
+            const auto launch = [&]<int HeadDim>()
+            {
+                flash_decoding_q8kv_kernel<HeadDim>
+                    <<<grid, block_size, smem_size, cuda_stream>>>(
+                        Q, K_cache_q8, V_cache_q8,
+                        O_partial, m_partial, l_partial,
+                        kv_len, n_heads, n_kv_heads,
+                        num_splits, softmax_scale, device_params,
+                        head_start, gqa_n_rep);
+            };
+            switch (head_dim)
+            {
+            case 32: launch.template operator()<32>(); break;
+            case 64: launch.template operator()<64>(); break;
+            case 96: launch.template operator()<96>(); break;
+            case 128: launch.template operator()<128>(); break;
+            case 160: launch.template operator()<160>(); break;
+            case 192: launch.template operator()<192>(); break;
+            case 224: launch.template operator()<224>(); break;
+            case 256: launch.template operator()<256>(); break;
+            }
         }
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
