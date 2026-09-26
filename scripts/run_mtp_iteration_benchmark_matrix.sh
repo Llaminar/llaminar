@@ -16,8 +16,10 @@ Default matrix:
   modes:      greedy,stochastic
   variants:   baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
 
-The dynamic variant starts at depth 1, keeps depth 1 as the normal adaptive
-floor, and may probe/promote back up to the configured max depth 3.
+The dynamic variant uses the installed learned startup policy and the production
+adaptive range. Fixed variants may name any supported depth (fixed_d1..fixed_d15).
+The CPU2 lane asks the auto planner for two CPU endpoints and tensor parallelism;
+the planner owns rank placement and the MoE ExpertOverlay domain definition.
 
 Options:
   --binary PATH          llaminar2 binary (default: build_v2_release/llaminar2)
@@ -31,7 +33,7 @@ Options:
                          Used only by the single topology.
   --models LIST          Comma list: dense,moe
   --modes LIST           Comma list: greedy,stochastic
-  --variants LIST        Comma list: baseline,fixed_d1,fixed_d2,fixed_d3,dynamic
+  --variants LIST        Comma list: baseline,fixed_d1..fixed_d15,dynamic
   --allow-partial-variants
                          Permit diagnostic variant subsets. Without this,
                          dynamic requires baseline plus fixed d1/d2/d3.
@@ -331,12 +333,14 @@ describe_topology() {
       ;;
     nodelocaltp_cpu2)
       topology_device_label="cpu:0+cpu:1"
+      # Express topology intent through the production authority. A device map
+      # plus an implicit TP degree cannot describe the cross-rank MoE domain;
+      # auto resolves that domain for MoE and the ordinary TP plan for dense.
       topology_args=(
         --mpi-procs 2
-        --device-map "0=cpu:0,1=cpu:1"
-        --tensor-parallelism-degree 2
-        --tp-scope node_local
-        --backend upi
+        --only-backends cpu
+        --auto-device-counts cpu=2
+        --only-strategies tp
       )
       ;;
     routed_expert_tiered_rocm2_hot)
@@ -401,19 +405,17 @@ describe_variant() {
     baseline)
       return
       ;;
-    fixed_d1)
-      variant_args=(--mtp --mtp-draft-tokens 1 --mtp-depth-policy fixed)
-      ;;
-    fixed_d2)
-      variant_args=(--mtp --mtp-draft-tokens 2 --mtp-depth-policy fixed)
-      ;;
-    fixed_d3)
-      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy fixed)
+    fixed_d*)
+      local depth="${variant#fixed_d}"
+      if [[ ! "${depth}" =~ ^([1-9]|1[0-5])$ ]]; then
+        echo "error: fixed MTP depth must be in [1, 15], got '${variant}'" >&2
+        exit 2
+      fi
+      variant_args=(--mtp --mtp-draft-tokens "${depth}" --mtp-depth-policy fixed)
       ;;
     dynamic)
       variant_args=(
         --mtp
-        --mtp-draft-tokens 3
         --mtp-depth-policy dynamic
         --mtp-min-draft-tokens 1
       )
@@ -486,6 +488,19 @@ zero_perf_summary() {
   "${perf_summary_script}"
 }
 
+# One decoder statistic owns both the recorded lane and its baseline ratio.
+# Existing single-sample documents remain readable; current benchmark repeats
+# use the median and exclude the first token produced during prefill.
+benchmark_decode_tps() {
+  jq -r '
+    if ((.iterations // []) | length) > 0 then
+      [.iterations[].throughput_tokens_per_sec.decode_after_prefill] | sort |
+      if length % 2 == 1 then .[length / 2 | floor]
+      else (.[length / 2 - 1] + .[length / 2]) / 2 end
+    else (.throughput_tokens_per_sec.decode_after_prefill // .throughput_tokens_per_sec.decode // 0) end
+  ' "$1"
+}
+
 append_summary() {
   local topology="$1"
   local device="$2"
@@ -504,6 +519,7 @@ append_summary() {
     --arg mode "${mode}" \
     --arg variant "${variant}" \
     --argjson baseline_decode_tps "${baseline_decode_tps}" \
+    --argjson decode_tps "$(benchmark_decode_tps "${json_path}")" \
     '[
       $topology,
       $device,
@@ -511,8 +527,8 @@ append_summary() {
       $mode,
       $variant,
       (.success // false),
-      (.throughput_tokens_per_sec.decode // 0),
-      (if $baseline_decode_tps > 0 then ((.throughput_tokens_per_sec.decode // 0) / $baseline_decode_tps) else 0 end),
+      $decode_tps,
+      (if $baseline_decode_tps > 0 then ($decode_tps / $baseline_decode_tps) else 0 end),
       (.throughput_tokens_per_sec.overall // 0),
       (.tokens.prefill // 0),
       (.tokens.decode // 0),
@@ -531,7 +547,9 @@ append_summary() {
       (.mtp.accepted_tokens // 0),
       (.mtp.rejected_tokens // 0),
       (.mtp.rollbacks // 0),
-      (((.mtp.acceptance_rate // 0) * 100)),
+      (if (.mtp.draft_steps // 0) > 0 then
+         100 * (.mtp.accepted_tokens // 0) / .mtp.draft_steps
+       else ((.mtp.acceptance_rate // 0) * 100) end),
       (.mtp.verifier_runs // 0),
       (.mtp.verifier_token_count // 0)
     ] | @tsv' "${json_path}")"
@@ -722,7 +740,7 @@ for model in $(split_csv "${models}"); do
         fi
 
         lane_key="${topology}|${device}|${model}|${mode}"
-        decode_tps="$(jq -r '(.throughput_tokens_per_sec.decode // 0)' "${json_path}")"
+        decode_tps="$(benchmark_decode_tps "${json_path}")"
         baseline_decode_tps="${baseline_decode_tps_by_lane[${lane_key}]:-0}"
         if [[ "${variant}" == "baseline" ]]; then
           baseline_decode_tps="${decode_tps}"

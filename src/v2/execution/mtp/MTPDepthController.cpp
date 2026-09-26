@@ -3,10 +3,12 @@
  * @brief Deterministic rolling-window MTP depth decisions for host execution.
  *
  * Configuration resolves automatic thresholds before any window is evaluated.
- * GPU callers seal the same topology-bound values into the device ABI instead
- * of consulting this host controller for live device-owned decisions.
+ * GPU callers seal the same topology-bound values and trained initial depth
+ * into the device ABI instead of consulting this host controller for live
+ * device-owned decisions. Startup policy is resolved here once for both owners.
  */
 #include "MTPDepthController.h"
+#include "MTPDepthLearnedPolicy.h"
 
 #include <algorithm>
 #include <optional>
@@ -16,29 +18,7 @@ namespace llaminar2
 {
     namespace
     {
-        /**
-         * @brief One row in the generated dynamic-depth policy table.
-         *
-         * The table is produced offline from benchmark summaries.  Runtime only
-         * evaluates simple numeric predicates so the controller stays
-         * deterministic and cheap.
-         */
-        struct MTPGeneratedDepthPolicyRule
-        {
-            MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
-            MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
-            MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
-            int current_depth = 1;
-            double min_acceptance_rate = 0.0;
-            double max_acceptance_rate = 1.0;
-            double max_zero_accept_rate = 1.0;
-            double min_full_accept_rate = 0.0;
-            int depth_delta = 0;
-            const char *label = "";
-        };
-
-#include "MTPDepthPolicyGenerated.inc"
-
+        /** @brief Host diagnostic projection of the shared learned match. */
         struct MTPGeneratedDepthPolicyMatch
         {
             int target_depth = 1;
@@ -56,62 +36,35 @@ namespace llaminar2
             const MTPDepthPolicyConfig &config,
             MTPVerifyMode verify_mode,
             int current_depth,
-            double acceptance_rate,
-            double zero_accept_rate,
-            double full_accept_rate)
+            const MTPDepthWindow &window)
         {
-            if (!config.use_generated_policy ||
-                config.mode != MTPDepthPolicyMode::Dynamic)
-            {
+            const auto match = matchMTPLearnedDepthPolicy(
+                {.enabled = config.use_generated_policy && config.mode == MTPDepthPolicyMode::Dynamic,
+                 .backend = config.backend, .model_class = config.model_class,
+                 .verify_mode = verify_mode},
+                current_depth,
+                {.attempted = window.attempted_draft_tokens,
+                 .accepted = window.accepted_draft_tokens, .runs = window.verifier_runs,
+                 .zero_accepts = window.zero_accepts, .full_accepts = window.full_accepts});
+            if (!match.matched)
                 return std::nullopt;
-            }
-
-            for (const auto &rule : kMTPGeneratedDepthPolicyRules)
-            {
-                if (rule.verify_mode != verify_mode)
-                    continue;
-                if (rule.backend != MTPDepthPolicyBackend::Any &&
-                    rule.backend != config.backend)
-                    continue;
-                if (rule.model_class != MTPDepthPolicyModelClass::Any &&
-                    rule.model_class != config.model_class)
-                    continue;
-                if (rule.current_depth != current_depth)
-                    continue;
-                if (acceptance_rate < rule.min_acceptance_rate ||
-                    acceptance_rate > rule.max_acceptance_rate ||
-                    zero_accept_rate > rule.max_zero_accept_rate ||
-                    full_accept_rate < rule.min_full_accept_rate)
-                {
-                    continue;
-                }
-
-                const int target = std::clamp(
-                    current_depth + rule.depth_delta,
-                    config.min_depth,
-                    config.max_depth);
-                return MTPGeneratedDepthPolicyMatch{
-                    .target_depth = target,
-                    .reason = rule.depth_delta > 0
-                                  ? MTPDepthDecisionReason::GeneratedPolicyPromote
-                                  : (rule.depth_delta < 0
-                                         ? MTPDepthDecisionReason::GeneratedPolicyDemote
-                                         : MTPDepthDecisionReason::GeneratedPolicyHold),
-                };
-            }
-
-            return std::nullopt;
+            return MTPGeneratedDepthPolicyMatch{
+                .target_depth = std::clamp(current_depth + match.depth_delta,
+                                          config.min_depth, config.max_depth),
+                .reason = match.depth_delta > 0 ? MTPDepthDecisionReason::GeneratedPolicyPromote
+                    : match.depth_delta < 0 ? MTPDepthDecisionReason::GeneratedPolicyDemote
+                                           : MTPDepthDecisionReason::GeneratedPolicyHold};
         }
 
         /**
-         * @brief Return the learned best fixed-depth lane for this request class.
+         * @brief Return the explicit measured warm start for this request class.
          *
-         * The generated trainer emits a delta-zero hold row for the fixed-depth
-         * lane that won a benchmark group.  Dynamic mode can use that row as a
-         * warm start so short generations do not spend their first windows
-         * rediscovering the same profitable depth through noisy local
-         * acceptance.  If no generated hold row matches, callers keep the
-         * handwritten default.
+         * A depth-four hold on one prompt does not make depth four a better
+         * starting point than depth three across the training workload. The
+         * trainer owns that separate economic decision. Do not infer it from
+         * the deepest transition row. Explicit caller bounds still apply; an
+         * untrained domain uses the ordinary portable controller initialization.
+         * @return The measured startup depth, or -1 if no bounded choice exists.
          */
         int resolveGeneratedInitialDepth(
             const MTPDepthPolicyConfig &config,
@@ -123,28 +76,25 @@ namespace llaminar2
                 return -1;
             }
 
-            int best_depth = -1;
-            for (const auto &rule : kMTPGeneratedDepthPolicyRules)
+            for (const auto &choice : kMTPGeneratedDepthPolicyStartups)
             {
-                if (rule.depth_delta != 0 ||
-                    rule.verify_mode != verify_mode)
-                {
+                if (choice.verify_mode != verify_mode)
                     continue;
-                }
-                if (rule.backend != MTPDepthPolicyBackend::Any &&
-                    rule.backend != config.backend)
+                if (choice.backend != MTPDepthPolicyBackend::Any &&
+                    choice.backend != config.backend)
                     continue;
-                if (rule.model_class != MTPDepthPolicyModelClass::Any &&
-                    rule.model_class != config.model_class)
+                if (choice.model_class != MTPDepthPolicyModelClass::Any &&
+                    choice.model_class != config.model_class)
                     continue;
-                if (rule.current_depth < config.min_depth ||
-                    rule.current_depth > config.max_depth)
+                if (choice.initial_depth < config.min_depth ||
+                    choice.initial_depth > config.max_depth)
                     continue;
-                best_depth = std::max(best_depth, rule.current_depth);
+                return choice.initial_depth;
             }
-            return best_depth;
+            return -1;
         }
 
+        /** @brief Whether the live depth is the measured admission winner. */
         bool isGeneratedBestDepth(
             const MTPDepthPolicyConfig &config,
             MTPVerifyMode verify_mode,
@@ -153,6 +103,33 @@ namespace llaminar2
             return resolveGeneratedInitialDepth(config, verify_mode) == current_depth;
         }
     } // namespace
+
+    int resolveMTPDepthPolicyInitialDepth(
+        const MTPDepthPolicyConfig &config,
+        int configured_draft_tokens,
+        MTPVerifyMode verify_mode)
+    {
+        if (config.mode == MTPDepthPolicyMode::Fixed)
+            return configured_draft_tokens;
+        if (config.initial_depth > 0)
+            return config.initial_depth;
+        if (config.min_depth == 0)
+            return 0;
+
+        // A zero authored ceiling means automatic capacity, not an empty
+        // learned-policy search interval. Preserve that intent in the caller.
+        auto bounded = config;
+        if (bounded.max_depth <= 0)
+            bounded.max_depth = defaultMTPAdaptiveMaximumDraftDepth();
+        if (bounded.min_depth < 0 || bounded.max_depth < bounded.min_depth)
+            return -1; // Let the owning admission contract reject invalid bounds.
+        const int trained = resolveGeneratedInitialDepth(bounded, verify_mode);
+        if (trained > 0)
+            return trained;
+        return verify_mode == MTPVerifyMode::SpeculativeSampling
+            ? config.min_depth
+            : std::clamp(2, config.min_depth, bounded.max_depth);
+    }
 
     const char *toString(MTPDepthDecisionReason reason)
     {
@@ -229,15 +206,8 @@ namespace llaminar2
         }
         if (config.initial_depth <= 0)
         {
-            config.initial_depth = resolveGeneratedInitialDepth(config, verify_mode_);
-            if (config.initial_depth <= 0)
-            {
-                config.initial_depth =
-                    resolveMTPDepthPolicyInitialDepth(
-                        config,
-                        configured_draft_tokens,
-                        verify_mode_);
-            }
+            config.initial_depth = resolveMTPDepthPolicyInitialDepth(
+                config, configured_draft_tokens, verify_mode_);
         }
         if (config.min_depth < 0)
             throw std::invalid_argument("MTP depth policy min_depth must be >= 0");
@@ -372,10 +342,7 @@ namespace llaminar2
                 config_,
                 verify_mode_,
                 current_depth_,
-                acceptance_rate,
-                zero_accept_rate,
-                static_cast<double>(window_.full_accepts) /
-                    static_cast<double>(window_.verifier_runs)))
+                window_))
         {
             /*
              * Generated promote/demote rows may evaluate after the smaller
@@ -409,8 +376,8 @@ namespace llaminar2
             window_.verifier_runs < static_cast<uint64_t>(config_.window_size))
         {
             /*
-             * A generated best-depth lane is selected from full fixed-depth
-             * benchmark evidence.  Do not let one small noisy window evict it;
+             * The generated startup lane is selected from complete training
+             * requests. Do not let one small noisy window evict it;
              * wait for the ordinary full window unless the partial window is
              * completely unproductive.
              */
@@ -473,9 +440,7 @@ namespace llaminar2
                 config_,
                 verify_mode_,
                 current_depth_,
-                decision.acceptance_rate,
-                decision.zero_accept_rate,
-                decision.full_accept_rate))
+                window_))
         {
             decision.reason = generated->reason;
             decision.recommended_depth = generated->target_depth;
@@ -512,8 +477,8 @@ namespace llaminar2
         if (generated_best_depth_grace)
         {
             /*
-             * The generated policy warm-starts at the fixed-depth lane that
-             * won whole-request benchmarks.  A single noisy full window can be
+             * The generated policy warm-starts at the measured request-wide
+             * winner. A single noisy full window can be
              * much worse than the request average, especially at MoE depth 3.
              * Give the learned winner one grace window unless zero-accept
              * pressure is catastrophic; a second consecutive bad window still

@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "execution/config/MTPDepthDefaults.h"
+#include "execution/mtp/MTPDepthLearnedPolicy.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -526,6 +527,7 @@ namespace llaminar2::sampling_math
         int promote_full_accept_rate_ppm = kRateScale;
         int demote_zero_accept_rate_ppm = 300'000;
         int demote_acceptance_rate_ppm = 550'000;
+        MTPLearnedDepthPolicyContext learned;
 
         /**
          * @brief Construct a hard-pinned policy for tests and fixed-depth lanes.
@@ -606,7 +608,7 @@ namespace llaminar2::sampling_math
                        promote_consecutive_windows == 0 &&
                        promote_full_accept_rate_ppm == 0 &&
                        demote_zero_accept_rate_ppm == 0 &&
-                       demote_acceptance_rate_ppm == 0;
+                       demote_acceptance_rate_ppm == 0 && !learned.enabled && learned.valid();
             }
             const bool mode_valid =
                 mode == DeviceGenerationPolicyMode::Fixed ||
@@ -619,7 +621,8 @@ namespace llaminar2::sampling_math
                 demote_zero_accept_rate_ppm <= kRateScale &&
                 demote_acceptance_rate_ppm >= 0 &&
                 demote_acceptance_rate_ppm <= kRateScale;
-            return mode_valid && minimum_depth > 0 &&
+            return mode_valid && learned.valid() &&
+                   (!learned.enabled || mode == DeviceGenerationPolicyMode::Dynamic) && minimum_depth > 0 &&
                    maximum_depth >= minimum_depth &&
                    maximum_depth <= kMaximumSupportedDraftDepth &&
                    initial_depth >= minimum_depth &&
@@ -705,7 +708,14 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 44,
         /** Number of MoE layers that executed rows away from their static owner. */
         kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 45,
-        kDeviceGenerationControlCount = 46,
+        /** Immutable learned policy keys; observations remain device-owned. */
+        kDeviceGenerationControlLearnedDepthEnabled = 46,
+        kDeviceGenerationControlLearnedDepthBackend = 47,
+        kDeviceGenerationControlLearnedDepthModelClass = 48,
+        kDeviceGenerationControlLearnedDepthVerifyMode = 49,
+        /** Proof that generated rules, including holds, controlled live windows. */
+        kDeviceGenerationControlLearnedDepthMatchedWindows = 50,
+        kDeviceGenerationControlCount = 51,
     };
 
     /**
@@ -1179,6 +1189,10 @@ namespace llaminar2::sampling_math
             depth_policy.cooldown_steps;
         control[kDeviceGenerationControlDepthLastRecommendedDepth] =
             depth_policy.initial_depth;
+        control[kDeviceGenerationControlLearnedDepthEnabled] = depth_policy.learned.enabled ? 1 : 0;
+        control[kDeviceGenerationControlLearnedDepthBackend] = static_cast<int>(depth_policy.learned.backend);
+        control[kDeviceGenerationControlLearnedDepthModelClass] = static_cast<int>(depth_policy.learned.model_class);
+        control[kDeviceGenerationControlLearnedDepthVerifyMode] = static_cast<int>(depth_policy.learned.verify_mode);
         return true;
     }
 
@@ -1702,9 +1716,6 @@ namespace llaminar2::sampling_math
                     control[kDeviceGenerationControlDepthMinimumSamples]
                 ? control[kDeviceGenerationControlDepthWindowSize]
                 : control[kDeviceGenerationControlDepthMinimumSamples];
-        if (verifier_runs < required_samples)
-            return true;
-
         int recommended = current;
         int promotion_streak =
             control[kDeviceGenerationControlDepthPromotionStreak];
@@ -1720,7 +1731,37 @@ namespace llaminar2::sampling_math
         const int full_accepts =
             control[kDeviceGenerationControlDepthWindowFullAccepts];
 
-        if (cooldown_complete && current > minimum &&
+        // The generated table is the same one used by the CPU owner. A learned
+        // hold must suppress generic promotion/demotion, not look like a miss.
+        const MTPLearnedDepthPolicyContext learned_context{
+            .enabled = control[kDeviceGenerationControlLearnedDepthEnabled] != 0,
+            .backend = static_cast<MTPDepthPolicyBackend>(control[kDeviceGenerationControlLearnedDepthBackend]),
+            .model_class = static_cast<MTPDepthPolicyModelClass>(control[kDeviceGenerationControlLearnedDepthModelClass]),
+            .verify_mode = static_cast<MTPVerifyMode>(control[kDeviceGenerationControlLearnedDepthVerifyMode])};
+        if (!learned_context.valid())
+            return fail_device_generation_control(control, DeviceGenerationError::InvalidDepthPolicy);
+        const auto learned = matchMTPLearnedDepthPolicy(
+            learned_context, current,
+            {.attempted = static_cast<uint64_t>(attempted), .accepted = static_cast<uint64_t>(accepted),
+             .runs = static_cast<uint64_t>(verifier_runs), .zero_accepts = static_cast<uint64_t>(zero_accepts),
+             .full_accepts = static_cast<uint64_t>(full_accepts)});
+        const int learned_target = current + learned.depth_delta < minimum ? minimum
+            : current + learned.depth_delta > maximum ? maximum : current + learned.depth_delta;
+        // As on CPU, a learned move can use the minimum-sample window. Holds
+        // retain evidence until the full window instead of resetting it early.
+        const bool learned_move_ready = cooldown_complete && learned.matched &&
+            learned_target != current &&
+            verifier_runs >= control[kDeviceGenerationControlDepthMinimumSamples];
+        if (verifier_runs < required_samples && !learned_move_ready)
+            return true;
+
+        if (cooldown_complete && learned.matched)
+        {
+            recommended = learned_target;
+            promotion_streak = 0;
+            ++control[kDeviceGenerationControlLearnedDepthMatchedWindows];
+        }
+        else if (cooldown_complete && current > minimum &&
             device_generation_rate_at_least(
                 zero_accepts,
                 verifier_runs,

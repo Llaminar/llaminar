@@ -3,21 +3,29 @@
 
 /**
  * @file ROCmMoEGroupedPrefillRoutePolicy.h
- * @brief Typed capture-time route strategy for ROCm grouped MoE prefill.
+ * @brief Typed capture capacity and live route strategy for grouped MoE.
  *
  * Route-owned projections minimize directory and publication overhead for
  * sparse verifier buckets. Expert-tiled projections amortize weight decode
  * when many rows reuse an expert. The crossover depends on the complete MoE
  * topology, not M alone, so measured production exceptions are represented as
  * exact immutable keys while the conservative generic policy remains total.
- * This header is device-free so unit tests can lock the capture decision
- * without occupying a GPU.
+ * Capture retains all reachable families; the ordered device group plan
+ * admits exactly one on replay. The arithmetic is also host-callable so unit
+ * tests can prove policy totality without occupying a GPU.
  */
 
 #pragma once
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
+
+#if defined(__HIPCC__)
+#define LLAMINAR_MOE_ROUTE_HD __host__ __device__
+#else
+#define LLAMINAR_MOE_ROUTE_HD
+#endif
 
 namespace llaminar2::rocm
 {
@@ -41,7 +49,7 @@ namespace llaminar2::rocm
         std::int32_t rows = 0;
 
         /** @return true only when every capture-identity field is equal. */
-        [[nodiscard]] constexpr bool operator==(
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr bool operator==(
             const ROCmMoEGroupedPrefillRouteKey& other) const noexcept
         {
             return gateup_codebook == other.gateup_codebook &&
@@ -61,7 +69,7 @@ namespace llaminar2::rocm
         bool exact = false; ///< Whether a measured full-key entry selected it.
 
         /** @return true when the decision names an executable graph topology. */
-        [[nodiscard]] constexpr bool valid() const noexcept
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr bool valid() const noexcept
         {
             return strategy != ROCmMoEGroupedPrefillRouteStrategy::Invalid;
         }
@@ -113,6 +121,28 @@ namespace llaminar2::rocm
         }};
 
     /**
+     * @brief Match immutable exact keys without a host-table device pointer.
+     * @tparam Index Compile-time table position; the small table is unrolled.
+     * @param key Complete execution geometry, with live rather than padded rows.
+     * @return Exact strategy, or Invalid when generic selection owns this key.
+     */
+    template <std::size_t Index = 0>
+    [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr
+        ROCmMoEGroupedPrefillRouteStrategy
+    matchROCmMoEGroupedPrefillExactRoute(
+        const ROCmMoEGroupedPrefillRouteKey& key) noexcept
+    {
+        if constexpr (Index < kROCmMoEGroupedPrefillExactRoutePolicies.size())
+        {
+            constexpr auto entry = kROCmMoEGroupedPrefillExactRoutePolicies[Index];
+            if (entry.key == key)
+                return entry.strategy;
+            return matchROCmMoEGroupedPrefillExactRoute<Index + 1>(key);
+        }
+        return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+    }
+
+    /**
      * @brief Select the graph topology for one complete grouped-MoE identity.
      *
      * Exact measured entries take precedence. The total generic policy keeps
@@ -122,7 +152,7 @@ namespace llaminar2::rocm
      * @param key Complete immutable graph identity.
      * @return Executable strategy and whether an exact measured entry won.
      */
-    [[nodiscard]] inline constexpr ROCmMoEGroupedPrefillRouteDecision
+    [[nodiscard]] LLAMINAR_MOE_ROUTE_HD inline constexpr ROCmMoEGroupedPrefillRouteDecision
     selectROCmMoEGroupedPrefillRouteStrategy(
         const ROCmMoEGroupedPrefillRouteKey& key) noexcept
     {
@@ -133,11 +163,9 @@ namespace llaminar2::rocm
             return {};
         }
 
-        for (const auto& policy : kROCmMoEGroupedPrefillExactRoutePolicies)
-        {
-            if (policy.key == key)
-                return {.strategy = policy.strategy, .exact = true};
-        }
+        const auto exact = matchROCmMoEGroupedPrefillExactRoute(key);
+        if (exact != ROCmMoEGroupedPrefillRouteStrategy::Invalid)
+            return {.strategy = exact, .exact = true};
 
         return {
             .strategy = key.rows <= 8
@@ -146,6 +174,107 @@ namespace llaminar2::rocm
             .exact = false,
         };
     }
+
+    /**
+     * @brief Replay-time route admission from the already published group plan.
+     *
+     * A captured matrix's row count is capacity, not the amount of expert work.
+     * Padding and participant-local masks can leave only a few valid routes in
+     * that matrix. The final exclusive offset plus its expert count is the
+     * canonical active-route count; borrowing those two words creates no new
+     * ledger, readback, allocation, or synchronization edge.
+     *
+     * Both projection families use this same immutable predicate. Exactly one
+     * may write scratch/output on a replay. The current measured selector is
+     * evaluated on the ceiling of active routes / top-k, preserving its full
+     * key and every existing exact exception. Physical grids and strides never
+     * change. Fully populated graphs make exactly the previous decision.
+     */
+    class ROCmMoEGroupedRouteAdmission final
+    {
+    public:
+        /**
+         * @brief Borrow the ordered group publication before graph capture.
+         * @param key Physical capacity and immutable weight/topology geometry.
+         * @param counts Device expert counts, in ascending expert-id order.
+         * @param offsets Device exclusive prefix offsets in that same order.
+         * @throws std::invalid_argument For missing publication or geometry.
+         */
+        ROCmMoEGroupedRouteAdmission(ROCmMoEGroupedPrefillRouteKey key,
+                                    const int* counts, const int* offsets)
+            : key_(key), counts_(counts), offsets_(offsets)
+        {
+            if (!counts || !offsets ||
+                !selectROCmMoEGroupedPrefillRouteStrategy(key).valid())
+                throw std::invalid_argument("MoE route admission requires a complete group publication");
+        }
+
+        /**
+         * @brief Resolve the pure policy from a validated active-slot count.
+         * @param slots Sum of all expert counts, never the allocated slot count.
+         * @return Chosen strategy, or Invalid for a corrupt publication.
+         */
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr
+            ROCmMoEGroupedPrefillRouteStrategy strategyForSlots(int slots) const noexcept
+        {
+            if (slots < 0 || static_cast<std::int64_t>(slots) >
+                    static_cast<std::int64_t>(key_.rows) * key_.top_k)
+                return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+            // An empty participant still uses the compact publisher to zero
+            // its output; it performs no expert dot products.
+            auto live = key_;
+            live.rows = slots == 0 ? 1 : 1 + (slots - 1) / key_.top_k;
+            return selectROCmMoEGroupedPrefillRouteStrategy(live).strategy;
+        }
+
+        /**
+         * @brief Decide which families must exist in the retained graph.
+         * @param strategy Candidate family to include.
+         * @return Whether any admitted live route count can select this family.
+         *
+         * This walks immutable geometry only. Capture must not inspect counts.
+         */
+        [[nodiscard]] bool maySelect(ROCmMoEGroupedPrefillRouteStrategy strategy) const noexcept
+        {
+            for (int rows = 1; rows <= key_.rows; ++rows)
+            {
+                auto live = key_;
+                live.rows = rows;
+                if (selectROCmMoEGroupedPrefillRouteStrategy(live).strategy == strategy)
+                    return true;
+            }
+            return false;
+        }
+
+#if defined(__HIPCC__)
+        /**
+         * @brief Admit one uniform workgroup before any barrier or weight load.
+         * @param strategy This kernel's physical projection/publication family.
+         * @return True only for the unique selected family on this replay.
+         */
+        [[nodiscard]] __device__ __forceinline__ bool allows(
+            ROCmMoEGroupedPrefillRouteStrategy strategy) const
+        {
+            const int last = key_.expert_count - 1;
+            const int offset = __builtin_amdgcn_readfirstlane(offsets_[last]);
+            const int count = __builtin_amdgcn_readfirstlane(counts_[last]);
+            if (offset < 0 || count < 0 ||
+                static_cast<std::int64_t>(offset) + count > INT32_MAX)
+                __builtin_trap();
+            const auto selected = strategyForSlots(offset + count);
+            if (selected == ROCmMoEGroupedPrefillRouteStrategy::Invalid)
+                __builtin_trap();
+            return selected == strategy;
+        }
+#endif
+
+    private:
+        ROCmMoEGroupedPrefillRouteKey key_; ///< Complete immutable capture key.
+        const int* counts_; ///< Borrowed ordered group-plan publication.
+        const int* offsets_; ///< Exclusive prefixes owned by the same producer.
+    };
 } // namespace llaminar2::rocm
+
+#undef LLAMINAR_MOE_ROUTE_HD
 
 #endif // LLAMINAR2_KERNELS_ROCM_GEMM_ROCMMOEGROUPEDPREFILLROUTEPOLICY_H

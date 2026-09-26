@@ -177,6 +177,24 @@ uint32_t mixed(uint32_t x) {
 /** @brief Explicit final-output arithmetic covered independently of staging. */
 enum class Epilogue { Identity, AffineBias };
 
+/**
+ * @brief Independently describe the four already-rejected staging identities.
+ * @tparam CB Physical packed codebook.
+ * @tparam Canonical Whether this is the partitioned arithmetic family.
+ * @tparam Mode Requested operand-staging specialization.
+ * @param tile Output geometry under test.
+ * @return Whether production must expose a spill-free compiled symbol.
+ *
+ * Previously the diagnostic query exposed these symbols with local memory and
+ * this fixture declined to capture them. Build enforcement now excludes them
+ * altogether; every other staged identity must still be present and replayed.
+ */
+template<int CB, bool Canonical, int Mode>
+constexpr bool expectedStagingSymbol(int tile)
+{
+    return !((CB == 5 || CB == 7) && !Canonical && tile == 2 && Mode >= 2);
+}
+
 /** @brief Compare the production query with the independently named symbol.
  * @tparam CB Actual packed codebook, including asymmetric metadata variants.
  * @tparam Canonical Whether this symbol publishes disjoint partition partials.
@@ -195,8 +213,15 @@ void verifyResourceIdentity(std::set<const void *> &symbols)
     SCOPED_TRACE(::testing::Message() << "codebook=" << CB
         << " canonical=" << Canonical << " staging=" << Mode);
     CUDADensePrefillKernelResources primary{}, auxiliary{};
-    ASSERT_TRUE(cudaNativeVNNIPrefill_queryCandidateResources(
-        CB, tile, Canonical ? 1 : 0, 0, 0, &primary, &auxiliary, staging));
+    const bool available = cudaNativeVNNIPrefill_queryCandidateResources(
+        CB, tile, Canonical ? 1 : 0, 0, 0, &primary, &auxiliary, staging);
+    ASSERT_EQ(available, (expectedStagingSymbol<CB, Canonical, Mode>(tile)));
+    if (!available)
+    {
+        EXPECT_EQ(primary.kernel_symbol, nullptr);
+        EXPECT_EQ(auxiliary.kernel_symbol, nullptr);
+        return;
+    }
     ASSERT_NE(primary.kernel_symbol, nullptr);
     // A wrong visitor branch must not let two candidate identities inspect
     // and capture the same symbol under different schedule names.
@@ -308,18 +333,19 @@ void run(int m,int n,int k,int kb,Epilogue epilogue,int tile_id=CB==7?2:5) {
         // payload staging and the selected shared metadata view differ.
         constexpr auto staging = static_cast<llaminar2::cuda::prefill::PrefillStagingSchedule>(Mode);
         CUDADensePrefillKernelResources primary{}, auxiliary{};
-        if (!cudaNativeVNNIPrefill_queryCandidateResources(
+        const bool available = cudaNativeVNNIPrefill_queryCandidateResources(
                 CB, tile_id, Canonical ? 1 : 0, 0, 0,
-                &primary, &auxiliary, staging) || !primary.kernel_symbol)
-            throw std::runtime_error("production candidate symbol is missing");
-        admitted[Mode]=primary.local_memory_bytes_per_thread==0 && primary.max_active_blocks_per_sm>0;
-        if(!admitted[Mode]) {
-            // Some asymmetric specializations have compiler-spill exclusions.
-            // Never capture them; the symmetric target family must stay total.
-            if constexpr (Mode <= 1 || CB == 0 || CB == 4 || CB == 6)
-                throw std::runtime_error("required staging symbol failed resource admission");
+                &primary, &auxiliary, staging);
+        if (!expectedStagingSymbol<CB, Canonical, Mode>(tile_id)) {
+            if (available || primary.kernel_symbol || auxiliary.kernel_symbol)
+                throw std::runtime_error("resource-excluded staging symbol was compiled");
             return;
         }
+        if (!available || !primary.kernel_symbol)
+            throw std::runtime_error("production candidate symbol is missing");
+        admitted[Mode]=primary.local_memory_bytes_per_thread==0 && primary.max_active_blocks_per_sm>0;
+        if(!admitted[Mode])
+            throw std::runtime_error("required staging symbol failed resource admission");
         // Arguments use the same public partition ABI as the production body.
         // cudaLaunchKernel copies their values into the captured node; all
         // pointed-to storage outlives graph replay and the terminal join.
@@ -484,7 +510,9 @@ TEST(CUDANativeVNNIPrefillStaging, ResourceQueriesNameExactStagingSymbols)
     verifyCodebookResources<5>(symbols);
     verifyCodebookResources<6>(symbols);
     verifyCodebookResources<7>(symbols);
-    EXPECT_EQ(symbols.size(), 40u);
+    // The Q5_1 direct tile-2 family excludes AsyncWeight/AsyncAll. Every other
+    // codebook, arithmetic family and staging schedule has its own symbol.
+    EXPECT_EQ(symbols.size(), 40u - 2u);
     using llaminar2::cuda::prefill::PrefillStagingSchedule;
     CUDADensePrefillKernelResources primary{}, auxiliary{};
     // BK256 has no staged-nibble specialization, and tile 1 lacks a copy

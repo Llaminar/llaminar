@@ -31,6 +31,8 @@
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/DeviceRowRange.h"
+#include "kernels/rocm/moe/ROCmMoEKernelResources.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../gemm/ROCmNativeVNNIDecodeEquivalentMath.h"
@@ -6488,7 +6490,8 @@ namespace
         }
     }
 
-    __global__ void device_rebalance_dynamic_ownership_controller_kernel(
+    // The public bridge always launches exactly one expert-width workgroup.
+    __global__ __launch_bounds__(kDeviceMoEMaxExperts) void device_rebalance_dynamic_ownership_controller_kernel(
         DeviceMoELayerRuntimeView *runtime_layers,
         const unsigned long long *gathered_histograms,
         DeviceMoERebalanceStatusView *status,
@@ -7947,7 +7950,8 @@ namespace
         return entry;
     }
 
-    __global__ void pack_rebalance_directory_kernel(
+    // Directory/source packing uses 256 lanes in the canonical bridge.
+    __global__ __launch_bounds__(256) void pack_rebalance_directory_kernel(
         const DeviceMoELayerRuntimeView *runtime_layers,
         DeviceMoEExpertDirectoryEntryView *local_directory,
         DeviceMoERebalanceConfigView config)
@@ -9204,7 +9208,7 @@ namespace
         return true;
     }
 
-    __global__ void project_rebalance_domain_commands_kernel(
+    __global__ __launch_bounds__(256) void project_rebalance_domain_commands_kernel(
         const DeviceMoERebalancePlanEntryView *gathered_plan_entries,
         const DeviceMoERebalanceCommandBufferHeaderView *gathered_command_headers,
         uint32_t plan_capacity,
@@ -10439,7 +10443,7 @@ namespace
     }
     }
 
-    __global__ void pack_rebalance_source_descriptors_kernel(
+    __global__ __launch_bounds__(256) void pack_rebalance_source_descriptors_kernel(
         const DeviceMoELayerRuntimeView *runtime_layers,
         const DeviceMoERebalancePlanEntryView *plan_entries,
         const DeviceMoERebalanceCommandBufferHeaderView *command_headers,
@@ -11474,7 +11478,7 @@ namespace
         return changed_layers;
     }
 
-    __global__ void apply_rebalance_arrivals_kernel(
+    __global__ __launch_bounds__(kDeviceMoERebalanceApplyThreads) void apply_rebalance_arrivals_kernel(
         DeviceMoELayerRuntimeView *runtime_layers,
         const DeviceMoERebalancePlanEntryView *plan_entries,
         const uint32_t *plan_count,
@@ -14407,7 +14411,8 @@ __global__ void rocm_moe_gate_logits_grouped_decode_router_rows_kernel(
 // decode histogram in one launch.
 // =========================================================================
 
-__global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
+// Runtime router bridges use the same 256-lane expert reduction geometry.
+__global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_decode_runtime_kernel(
     float *__restrict__ logits,                       // [num_experts] IN/OUT (probabilities)
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
@@ -14576,7 +14581,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
  * layer.
  */
 template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance>
-__global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
+__global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     float *__restrict__ logits,                       // [num_experts] IN logits, OUT probabilities
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
@@ -15018,7 +15023,7 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
     }
 }
 
-__global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
+__global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     const float *__restrict__ partials,                // [num_experts, k_partitions]
     float *__restrict__ router_probabilities,          // [num_experts] OUT
     DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -15166,7 +15171,8 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
 // decode kernels consume runtime top-k directly.
 // =========================================================================
 
-__global__ void rocm_moe_decode_route_select_runtime_kernel(
+// The bridge launches 32 lanes, not HIP's default 1024-lane maximum.
+__global__ __launch_bounds__(32) void rocm_moe_decode_route_select_runtime_kernel(
     const int *__restrict__ expert_indices,       // [top_k]
     const float *__restrict__ expert_weights,     // [top_k]
     DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -19250,6 +19256,13 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     }
 }
 
+/**
+ * @brief Publish singleton shared-expert routes from the device-owned live prefix.
+ *
+ * The whole captured capacity is initialized on every replay. Inactive inverse
+ * entries stay invalid, so both compact and tiled consumers skip padded work
+ * even when a preceding replay admitted a larger MTP depth.
+ */
 __global__ void rocm_moe_prepare_shared_expert_group_kernel(
     int *__restrict__ expert_offsets,
     int *__restrict__ expert_counts,
@@ -19257,20 +19270,21 @@ __global__ void rocm_moe_prepare_shared_expert_group_kernel(
     int *__restrict__ original_to_grouped,
     float *__restrict__ grouped_weights,
     int *__restrict__ active_expert_ids,
-    int seq_len)
+    llaminar2::DeviceRowRange rows)
 {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int active_rows = rows.activeRows();
     if (idx == 0)
     {
         expert_offsets[0] = 0;
-        expert_counts[0] = seq_len;
-        active_expert_ids[0] = 0;
+        expert_counts[0] = active_rows;
+        active_expert_ids[0] = active_rows > 0 ? 0 : -1;
     }
-    if (idx < seq_len)
+    if (idx < rows.physicalRows())
     {
         grouped_token_indices[idx] = idx;
-        original_to_grouped[idx] = idx;
-        grouped_weights[idx] = 1.0f;
+        original_to_grouped[idx] = idx < active_rows ? idx : -1;
+        grouped_weights[idx] = idx < active_rows ? 1.0f : 0.0f;
     }
 }
 
@@ -19481,7 +19495,12 @@ __device__ __forceinline__ void rocm_scan_runtime_small_group_experts(
  *         active-expert publication for the immediately following compute.
  */
 template <bool PublishRouterInputs, bool PublishCompletePlan = false>
-__global__ void rocm_moe_prefill_group_small_runtime_kernel(
+// The public launch and validation below require exactly this workgroup size.
+// Leaving HIP's default 1024-thread bound makes LLVM reserve registers for a
+// launch that is invalid here, forcing otherwise register-resident values into
+// private scratch. Publish the real contract to register allocation as well.
+__global__ __launch_bounds__(kActiveExpertThreads)
+void rocm_moe_prefill_group_small_runtime_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     const float *__restrict__ routing_indices,
     const float *__restrict__ routing_weights,
@@ -19911,6 +19930,46 @@ __global__ void rocm_moe_prefill_group_small_runtime_kernel(
         }
     }
 
+}
+
+/** @copydoc llaminar2::queryROCmRuntimeGroupResources */
+std::optional<llaminar2::ROCmRuntimeGroupResources>
+llaminar2::queryROCmRuntimeGroupResources(ROCmRuntimeGroupVariant variant)
+{
+    // Resolve the compiled function, not a source-level estimate: a compiler
+    // change can introduce spills even when its launch geometry is unchanged.
+    const void *function = nullptr;
+    switch (variant)
+    {
+    case ROCmRuntimeGroupVariant::RouterRoutes:
+        function = reinterpret_cast<const void *>(rocm_moe_prefill_group_small_runtime_kernel<true, false>);
+        break;
+    case ROCmRuntimeGroupVariant::AssignedRoutes:
+        function = reinterpret_cast<const void *>(rocm_moe_prefill_group_small_runtime_kernel<false, false>);
+        break;
+    case ROCmRuntimeGroupVariant::RouterCompletePlan:
+        function = reinterpret_cast<const void *>(rocm_moe_prefill_group_small_runtime_kernel<true, true>);
+        break;
+    case ROCmRuntimeGroupVariant::AssignedCompletePlan:
+        function = reinterpret_cast<const void *>(rocm_moe_prefill_group_small_runtime_kernel<false, true>);
+        break;
+    default:
+        return std::nullopt;
+    }
+    hipFuncAttributes attributes{};
+    int resident_blocks = 0;
+    if (hipFuncGetAttributes(&attributes, function) != hipSuccess ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &resident_blocks, function, kActiveExpertThreads, 0) != hipSuccess)
+        return std::nullopt;
+    return ROCmRuntimeGroupResources{
+        .registers_per_thread = attributes.numRegs,
+        .private_bytes_per_thread = attributes.localSizeBytes,
+        .shared_bytes_per_block = attributes.sharedSizeBytes,
+        .launch_threads = kActiveExpertThreads,
+        .maximum_threads_per_block = attributes.maxThreadsPerBlock,
+        .resident_blocks_per_multiprocessor = resident_blocks,
+    };
 }
 
 __global__ void rocm_moe_prefill_group_cast_count_kernel(
@@ -20701,7 +20760,9 @@ __device__ __forceinline__ bool rocm_moe_prefill_llep_assignment_ready(
     return true;
 }
 
-__global__ void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_kernel(
+// All three bridges use the same 256-lane expert-span workgroup. An accurate
+// bound also keeps the fatal diagnostic branch from spilling live registers.
+__global__ __launch_bounds__(256) void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     int current_slots,
     int max_slots,
@@ -21005,7 +21066,7 @@ __global__ void rocm_moe_prefill_llep_assign_routes_from_current_batch_spans_ker
  * grouped decode passes no active-list destination and retains descriptor-only
  * publication through the same kernel.
  */
-__global__ void rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel(
+__global__ __launch_bounds__(kActiveExpertThreads) void rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     DeviceNativeVNNIMatrixDescView *__restrict__ gate_descs,
     DeviceNativeVNNIMatrixDescView *__restrict__ up_descs,
@@ -21824,10 +21885,11 @@ bool hipMoE_prepare_shared_expert_group(
     int *original_to_grouped,
     float *grouped_weights,
     int *active_expert_ids,
-    int seq_len,
+    llaminar2::DeviceRowRange rows,
     int device_idx,
     void *stream)
 {
+    const int seq_len = rows.physicalRows();
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
@@ -21846,7 +21908,7 @@ bool hipMoE_prepare_shared_expert_group(
         dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
         expert_offsets, expert_counts,
         grouped_token_indices, original_to_grouped, grouped_weights,
-        active_expert_ids, seq_len);
+        active_expert_ids, rows);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)

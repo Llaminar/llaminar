@@ -27,6 +27,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "kernels/cuda/gemm/CUDACanonicalKpartFold.h"
+#include "kernels/cuda/gemm/GroupedDp4aLaunchGeometry.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "backends/BackendManager.h"
@@ -2187,29 +2188,7 @@ namespace
 #endif
     }
 
-    /**
-     * @brief Compile-time physical launch geometry for grouped DP4A tiles.
-     *
-     * One logical N tile has no shared state or synchronization with another,
-     * so low-register row depths can pack several tiles into one CTA. This
-     * avoids the one-warp-block occupancy ceiling without changing the number,
-     * order, or ownership of any dot product. Deeper row tiles retain smaller
-     * blocks so their larger accumulator arrays remain launchable without
-     * register spilling.
-     */
-    template <int ROWS_PER_TILE, int TILE_N, int CPT>
-    struct GroupedDp4aLaunchGeometry
-    {
-        static constexpr int threads_per_n_tile = TILE_N / CPT;
-        static constexpr int n_tiles_per_block =
-            threads_per_n_tile == 32
-                ? (ROWS_PER_TILE <= 8 ? 4 : (ROWS_PER_TILE <= 16 ? 2 : 1))
-                : (threads_per_n_tile == 64 && ROWS_PER_TILE <= 8 ? 2 : 1);
-        static constexpr int threads_per_block =
-            threads_per_n_tile * n_tiles_per_block;
-        static constexpr int columns_per_block =
-            TILE_N * n_tiles_per_block;
-    };
+    using llaminar2::cuda::GroupedDp4aLaunchGeometry;
 
     /**
      * @brief Runtime-row K-parallel verifier kernel with bounded register use.
@@ -2227,6 +2206,10 @@ namespace
         int CPT,
         uint8_t CB,
         bool PUBLISH_SINGLE_PARTITION = false>
+    // The geometry bounds live row accumulators directly. Do not tighten ptxas's
+    // maximum-CTA hint to the actual launch width: for these memory-bound tiles
+    // that lets it inflate registers even at shallow depths, reducing occupancy.
+    // The compile-time spill guard still rejects every memory-spilling variant.
     __global__ void nativeVnniGemv_kpar_small_m(
         const int8_t *__restrict__ d_A_int8,
         const uint8_t *__restrict__ d_payload,
@@ -2246,16 +2229,10 @@ namespace
             !PUBLISH_SINGLE_PARTITION || ROWS_PER_TILE >= 2,
             "Direct grouped publication requires a grouped row tile");
         using Geometry = GroupedDp4aLaunchGeometry<ROWS_PER_TILE, TILE_N, CPT>;
-        const int n_tile_in_block =
-            threadIdx.x / Geometry::threads_per_n_tile;
-        const int n_tile_thread =
-            threadIdx.x % Geometry::threads_per_n_tile;
-        const int n_tile =
-            static_cast<int>(blockIdx.x) * Geometry::n_tiles_per_block +
-            n_tile_in_block;
-        const int n_base = n_tile * TILE_N + n_tile_thread * CPT;
+        constexpr int ROWS_PER_LANE = Geometry::rows_per_lane;
+        const int n_base = Geometry::columnBase(blockIdx.x, threadIdx.x);
         const int split_idx = blockIdx.y;
-        const int row_base = blockIdx.z * ROWS_PER_TILE;
+        const int row_base = Geometry::rowBase(blockIdx.z, threadIdx.x);
         const int active_m = rows.activeRows();
         // Admission is logical; partial indexing below must keep physical M.
         if (row_base >= active_m || n_base >= N)
@@ -2266,9 +2243,9 @@ namespace
         const int blk_begin = split_idx * blocks_per_split;
         const int blk_end = min(blocks_per_row, blk_begin + blocks_per_split);
 
-        float acc[ROWS_PER_TILE][CPT];
+        float acc[ROWS_PER_LANE][CPT];
 #pragma unroll
-        for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+        for (int tile_row = 0; tile_row < ROWS_PER_LANE; ++tile_row)
         {
 #pragma unroll
             for (int c = 0; c < CPT; ++c)
@@ -2316,7 +2293,7 @@ namespace
             }
 
 #pragma unroll
-            for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+            for (int tile_row = 0; tile_row < ROWS_PER_LANE; ++tile_row)
             {
                 const int row = row_base + tile_row;
                 if (row >= active_m)
@@ -2368,7 +2345,7 @@ namespace
             if (n < N)
             {
 #pragma unroll
-                for (int tile_row = 0; tile_row < ROWS_PER_TILE; ++tile_row)
+                for (int tile_row = 0; tile_row < ROWS_PER_LANE; ++tile_row)
                 {
                     const int row = row_base + tile_row;
                     if (row >= active_m)
@@ -2570,7 +2547,7 @@ namespace
             const int tile_m = std::min(workspace_tile_rows, M - row_base);
             const auto tile_rows = rows.slice(row_base, tile_m);
             const int row_tiles =
-                (tile_m + ROWS_PER_TILE - 1) / ROWS_PER_TILE;
+                (tile_m + Geometry::rows_per_block - 1) / Geometry::rows_per_block;
             const dim3 grid(launch_grid_n, kb_capped, row_tiles);
 
             const int8_t *tile_a =

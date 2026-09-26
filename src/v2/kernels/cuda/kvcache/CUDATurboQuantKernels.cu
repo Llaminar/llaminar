@@ -233,7 +233,7 @@ namespace llaminar2
     /**
      * @brief Warp-level reduction for sum.
      */
-    __device__ inline float warp_reduce_sum(float val)
+    __device__ __forceinline__ float warp_reduce_sum(float val)
     {
         for (int offset = warpSize / 2; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xffffffff, val, offset);
@@ -248,12 +248,14 @@ namespace llaminar2
      * barrier is intentional: encoders reuse the same shared array for source
      * dot-product and centroid-norm reductions back to back, so no wave may
      * overwrite a slot while wave zero still consumes the prior reduction.
+     * Inline this tiny barrier helper: an out-of-line device call otherwise
+     * spills the caller's live state around each reduction on CUDA.
      *
      * @param val Calling thread's contribution.
      * @param shared Workspace covering at least the block's warp count.
      * @return Complete sum in thread zero.
      */
-    __device__ float block_reduce_sum(float val, float *shared)
+    __device__ __forceinline__ float block_reduce_sum(float val, float *shared)
     {
         const int lane = threadIdx.x % warpSize;
         const int warp_id = threadIdx.x / warpSize;

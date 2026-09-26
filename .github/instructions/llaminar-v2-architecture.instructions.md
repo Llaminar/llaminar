@@ -1263,6 +1263,14 @@ harvest, promotion/demotion, and device rehydration are explicit lifecycle
 operations. Cache fingerprints include model/graph policy needed to reject an
 incompatible state image.
 
+Terminal-logit archival binds the latest ordered producer to the archive's
+logical vocabulary interval through `PrefixTerminalLogitsSlice`. A gathered
+full row and a local shard are different physical surfaces for the same token
+interval. Copies and diagnostic hashes consume the same checked slice; restore
+retains the existing participant-local publication and required TP collective.
+Incompatible persisted arithmetic/layout contracts are rejected through the
+canonical fingerprint version, without deleting prior archive files.
+
 Prefix payload ownership follows the participant's actual cache role. A
 pipeline follower archives its main-model state, not the tail's shifted MTP
 cache. `PrefixPayloadLayout` distinguishes attention-block chains from complete

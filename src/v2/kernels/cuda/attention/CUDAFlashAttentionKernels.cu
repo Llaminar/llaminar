@@ -645,7 +645,10 @@ namespace
               int TILE_KV,
               NativeKVType KV_TYPE = NativeKVType::FP32,
               bool WRITE_CONTEXT_PARTIAL = false>
-    __global__ void flash_attention_2_pipelined_kernel(
+    // Launchers may omit query groups, but never exceed this producer/consumer
+    // geometry. Publish the bound so register allocation sees the real CTA.
+    __global__ __launch_bounds__((FA2_PRODUCER_WARPS + MAX_Q_WARP_GROUPS * PV_WARPS_PER_Q_GROUP) * WARP_SIZE)
+    void flash_attention_2_pipelined_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
         const void *__restrict__ V,
@@ -1111,9 +1114,13 @@ namespace
                             max(0, actual_tile_kv_len - reduction_start));
                     float m_ij = -FLT_MAX;
 
-                    // Every stripe warp reconstructs the same row maximum from
-                    // the published score bytes in canonical key order.
-                    if (owns_row && lane_pair_index == 0)
+                    // Both lanes owning a row reconstruct the same maximum.
+                    // They execute the same SIMD instructions and shared-memory
+                    // addresses broadcast, so no extra instruction pass is needed.
+                    // A shuffle here becomes an out-of-line helper in relocatable
+                    // CUDA code, forcing live P@V accumulators across its call ABI
+                    // and spilling the one-warp HD256 variant to local memory.
+                    if (owns_row)
                     {
                         const int local_q_row =
                             q_warp_group * WMMA_M + row_in_warp;
@@ -1126,9 +1133,6 @@ namespace
                                 m_ij = fmaxf(m_ij, my_scores[j]);
                         }
                     }
-
-                    // All lanes participate, including inactive tail-row lanes.
-                    m_ij = __shfl_sync(0xFFFFFFFF, m_ij, row_in_warp);
 
                     /*
                      * A causal/window partition can be wholly invisible to an

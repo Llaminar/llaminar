@@ -220,7 +220,9 @@ You can add these options to the command when you need them:
 | Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
 
 MTP lets the model propose and verify several output tokens at a time. Dynamic
-depth adapts how many it proposes. Prefix caching, which reuses work from
+depth adapts how many it proposes. It works with both ordinary temperature-based
+chat sampling and greedy requests; you do not need an extra verification flag.
+Prefix caching, which reuses work from
 previous prompts, is enabled by default. If you expose the server to other
 machines, use a trusted network or an authenticated proxy.
 
@@ -975,6 +977,8 @@ creating the plan if you intend to benchmark it.
 
 The examples use `--temperature 0 --seed 42` for greedy sampling. Avoid adding
 `--deterministic` just for a benchmark: it also changes kernel selection.
+For sampled generation, set `--temperature`, `--top-k`, and `--top-p` explicitly;
+the same sampling settings apply with MTP on or off.
 Leave profiling and debug options off while measuring throughput.
 
 For comparisons with other engines, the JSON field

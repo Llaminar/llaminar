@@ -183,6 +183,8 @@ namespace
             int prompt_token_count) override
         {
             ++harvest_calls;
+            harvested_frontiers.push_back(prompt_token_count);
+            harvested_positions.push_back(position);
             harvested_fingerprint = admission.fingerprint_key;
             harvested_tokens = tokens;
             harvested_prompt_token_count = prompt_token_count;
@@ -479,6 +481,8 @@ namespace
         int lookup_calls = 0;
         int populate_calls = 0;
         int harvest_calls = 0;
+        std::vector<int> harvested_frontiers;
+        std::vector<int> harvested_positions;
         int restore_terminal_calls = 0;
         int restore_live_calls = 0;
         int last_mtp_condition_token = -1;
@@ -652,6 +656,107 @@ namespace
         return runner;
     }
 } // namespace
+
+/**
+ * @brief Archive a real recurrent frontier before a chat's replaceable tail.
+ *
+ * Thinking chat templates replace their generation suffix in the next turn.
+ * A terminal-only archive therefore misses even when nearly all tokens agree.
+ * The public prefill lifecycle must archive the preceding complete block while
+ * that state is live, then consume the tail exactly once. Exercise both MTP
+ * policies without turning a freshly computed frontier into a reported hit.
+ */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixArchivesReusableBoundaryBeforeTail)
+{
+    for (const bool mtp : {false, true})
+    {
+        SCOPED_TRACE(mtp);
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        auto *observed = mock.get();
+        mock->lookup_result.supported = true;
+        mock->lookup_result.cache_enabled = true;
+        mock->lookup_result.block_size = 64;
+        mock->lookup_result.fingerprint_key = 17;
+        mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+        auto runner = makeRunner(std::move(mock), mtp, 1,
+            RoutedExpertAssignmentPolicy::StaticOwner, 64);
+        ASSERT_TRUE(runner->prefill(std::vector<int32_t>(365, 2))) << runner->lastError();
+        EXPECT_THAT(observed->harvested_frontiers, ElementsAre(320, 365));
+        EXPECT_THAT(observed->harvested_positions, ElementsAre(320, 365));
+        ASSERT_EQ(observed->forward_token_batches.size(), 2u);
+        EXPECT_EQ(observed->forward_token_batches[0].size(), 320u);
+        EXPECT_EQ(observed->forward_token_batches[1].size(), 45u);
+        EXPECT_EQ(observed->harvested_fingerprint, 17u);
+        EXPECT_EQ(runner->prefixStateProbe().prefix_request.matched_tokens, 0);
+    }
+}
+
+/** @brief A newly archived frontier with one remaining token uses serial MTP math. */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixOneTokenTailUsesDecodeBridge)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *observed = mock.get();
+    mock->lookup_result.supported = true;
+    mock->lookup_result.cache_enabled = true;
+    mock->lookup_result.block_size = 64;
+    mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    auto runner = makeRunner(std::move(mock), true, 1,
+        RoutedExpertAssignmentPolicy::StaticOwner, 64);
+    ASSERT_TRUE(runner->prefill(std::vector<int32_t>(129, 2))) << runner->lastError();
+    EXPECT_THAT(observed->harvested_frontiers, ElementsAre(128, 129));
+    EXPECT_EQ(observed->restored_prefix_bridge_calls, 1);
+    EXPECT_EQ(observed->position, 129);
+    EXPECT_EQ(observed->shifted_mtp_rows, 128);
+}
+
+/** @brief Failed checkpoint publication stops before later state can overwrite it. */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixCheckpointFailureStopsBeforeTail)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *observed = mock.get();
+    mock->lookup_result.supported = true;
+    mock->lookup_result.cache_enabled = true;
+    mock->lookup_result.block_size = 64;
+    mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    mock->harvest_ok = false;
+    auto runner = makeRunner(std::move(mock), false, 1,
+        RoutedExpertAssignmentPolicy::StaticOwner, 64);
+    EXPECT_FALSE(runner->prefill(std::vector<int32_t>(365, 2)));
+    EXPECT_EQ(observed->position, 320);
+    EXPECT_THAT(observed->harvested_frontiers, ElementsAre(320));
+}
+
+/** @brief Existing hits are reused, and short prompts cannot create an empty checkpoint. */
+TEST(Test__PrefixCachePrefillFlow, HybridPrefixDoesNotRecomputeRestoredOrEmptyFrontiers)
+{
+    for (const int restored : {0, 320, 365})
+    {
+        SCOPED_TRACE(restored);
+        auto mock = std::make_unique<PrefixFlowMockRunner>();
+        auto *observed = mock.get();
+        mock->lookup_result.supported = mock->lookup_result.cache_enabled = true;
+        mock->lookup_result.block_size = 64;
+        mock->lookup_result.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+        mock->lookup_result.cached_tokens = restored;
+        mock->lookup_result.has_terminal_hidden = mock->lookup_result.has_terminal_logits = true;
+        // The full-hit witness makes coordination retain a partial terminal block.
+        if (restored == 365)
+        {
+            PrefixBlockHandle terminal;
+            terminal.key.token_start = 320;
+            terminal.key.token_count = 45;
+            terminal.has_terminal_hidden = terminal.has_terminal_logits = true;
+            mock->lookup_result.blocks.push_back(terminal);
+        }
+        auto runner = makeRunner(std::move(mock), true, 1,
+            RoutedExpertAssignmentPolicy::StaticOwner, 64);
+        const int prompt_tokens = restored == 0 ? 64 : 365;
+        ASSERT_TRUE(runner->prefill(std::vector<int32_t>(prompt_tokens, 2))) << runner->lastError();
+        EXPECT_THAT(observed->harvested_frontiers, ElementsAre(prompt_tokens));
+        EXPECT_EQ(observed->forward_calls, restored == 365 ? 0 : 1);
+        EXPECT_EQ(observed->position, prompt_tokens);
+    }
+}
 
 TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
 {

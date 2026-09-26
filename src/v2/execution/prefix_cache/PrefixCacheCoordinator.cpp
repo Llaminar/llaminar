@@ -138,6 +138,7 @@ namespace llaminar2
         participant.device = device;
         participant.placement_epochs = hit.placement_epochs;
         participant.fingerprint_key = hit.fingerprint_key;
+        participant.checkpoint_policy = hit.checkpoint_policy;
         participant.fingerprint_policy = fingerprint_policy;
         participant.supported = hit.supported;
         participant.cache_enabled = hit.cache_enabled;
@@ -179,6 +180,7 @@ namespace llaminar2
         }
 
         bool local_any_cache_enabled = false;
+        bool local_any_reusable_checkpoint = false;
         bool local_all_supported = true;
         bool local_any_terminal_logits_required = false;
         bool local_any_terminal_hidden_required = false;
@@ -197,6 +199,8 @@ namespace llaminar2
         for (const auto &participant : result.participants)
         {
             local_any_cache_enabled = local_any_cache_enabled || participant.cache_enabled;
+            local_any_reusable_checkpoint = local_any_reusable_checkpoint ||
+                participant.checkpoint_policy == PrefixCheckpointPolicy::ReusableBoundary;
             local_all_supported = local_all_supported && participant.supported;
 
             const int participant_tokens = participant.supported ? nonNegative(participant.matched_tokens) : 0;
@@ -242,6 +246,7 @@ namespace llaminar2
         uint64_t global_max_fingerprint = local_max_fingerprint;
         PrefixPlacementEpochSpan global_placement_epochs = local_placement_epochs;
         bool global_any_cache_enabled = local_any_cache_enabled;
+        bool global_any_reusable_checkpoint = local_any_reusable_checkpoint;
         bool global_all_supported = local_all_supported;
         bool global_any_terminal_logits_required = local_any_terminal_logits_required;
         bool global_any_terminal_hidden_required = local_any_terminal_hidden_required;
@@ -256,6 +261,8 @@ namespace llaminar2
                 !domain_coordinator->allMaxUInt64(local_max_fingerprint, &global_max_fingerprint) ||
                 !domain_coordinator->allPlacementEpochs(local_placement_epochs, &global_placement_epochs) ||
                 !domain_coordinator->allOrBool(local_any_cache_enabled, &global_any_cache_enabled) ||
+                !domain_coordinator->allOrBool(local_any_reusable_checkpoint,
+                                              &global_any_reusable_checkpoint) ||
                 !domain_coordinator->allOrBool(local_any_terminal_logits_required,
                                                &global_any_terminal_logits_required) ||
                 !domain_coordinator->allOrBool(local_any_terminal_hidden_required,
@@ -273,6 +280,11 @@ namespace llaminar2
 
         result.cache_enabled = global_any_cache_enabled;
         result.supported = global_all_supported;
+        // Even a cold miss needs the same future archive boundary on every
+        // rank. A recurrent PP shard therefore constrains attention-only peers.
+        result.checkpoint_policy = global_any_reusable_checkpoint
+            ? PrefixCheckpointPolicy::ReusableBoundary
+            : PrefixCheckpointPolicy::TerminalOnly;
         result.placement_epochs = global_placement_epochs;
         result.common_terminal_logits_required = global_any_terminal_logits_required;
         result.common_terminal_hidden_required = global_any_terminal_hidden_required;
@@ -332,6 +344,7 @@ namespace llaminar2
         result.block_size = block_size;
         result.fingerprint_key = coordination.fingerprint_key;
         result.placement_epochs = coordination.placement_epochs;
+        result.checkpoint_policy = coordination.checkpoint_policy;
         result.requires_terminal_logits = coordination.common_terminal_logits_required;
         result.requires_terminal_hidden = coordination.common_terminal_hidden_required;
 

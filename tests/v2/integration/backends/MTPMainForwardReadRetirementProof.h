@@ -9,6 +9,8 @@
  * that submission returns while the reader is still pending on another stream.
  * Metadata observation must retain that publication for a later mailbox writer;
  * waiting on an unrelated metadata stream is not ownership of the write frontier.
+ * The same single test peer can seed terminal logits on an exact owned surface;
+ * prefix tests then exercise production archive, diagnostic and restore operations.
  */
 #pragma once
 
@@ -35,6 +37,61 @@ namespace llaminar2
     /** @brief Inject only the device/publication needed by the real prelude. */
     struct DeviceGraphOrchestratorLiveStateTestAccess
     {
+        /**
+         * @brief Seed one exact producer surface; archive/restore remain production operations.
+         * @param runner Participant owning the arena and its explicit device stream.
+         * @param values Row-zero FP32 values, retained by the caller through archive completion.
+         * @param surface Canonical or all-position, full or participant-local storage.
+         * @return Whether the real tensor write and scalar publication succeeded.
+         */
+        static bool publishTerminalRow(DeviceGraphOrchestrator &runner,
+            const std::vector<float> &values, ForwardLogitsStorageSurface surface)
+        {
+            TensorBase *tensor = nullptr;
+            if (surface == ForwardLogitsStorageSurface::AllPositionFull ||
+                surface == ForwardLogitsStorageSurface::AllPositionLocal)
+            {
+                TensorBase *full = nullptr, *local = nullptr;
+                // Prepare the real two-row storage outside capture. Scalar
+                // prefix bridges publish row zero, not the unused final row.
+                if (!runner.bindAllPositionLogitsOutputs(ForwardExecutionRole::MainInference,
+                    2, full, local)) return false;
+                tensor = surface == ForwardLogitsStorageSurface::AllPositionFull ? full : local;
+            }
+            else if (surface == ForwardLogitsStorageSurface::CanonicalFull)
+                tensor = runner.state_.logits.get();
+            else if (surface == ForwardLogitsStorageSurface::CanonicalLocal)
+                tensor = runner.state_.logits_local.get();
+            if (!tensor || tensor->native_type() != TensorType::FP32 ||
+                tensor->cols() != values.size()) return false;
+            const auto device = runner.state_.device_id;
+            if (device.is_gpu())
+            {
+                void *stream = runner.explicitGPUStreamForOperation("prefix_terminal_test_producer");
+                // The model-free fixture has no compute-stage preparation to
+                // materialize this output yet. Prepare it once, before any
+                // archive/replay, on the same explicit producer stream.
+                if (!stream || (!tensor->gpu_data_ptr() && !tensor->allocateOnDevice(device, stream)) ||
+                    !getBackendFor(device)->hostToDeviceOnStream(
+                    tensor->gpu_data_ptr(), values.data(), values.size() * sizeof(float),
+                    device.gpu_ordinal(), stream)) return false;
+                TransferEngine::publishDeviceWrite(tensor, device, stream);
+            }
+            else
+            {
+                auto *destination = static_cast<float *>(tensor->raw_mutable_data());
+                if (!destination) return false;
+                std::copy(values.begin(), values.end(), destination);
+                TransferEngine::publishHostWrite(tensor);
+            }
+            return runner.publishCurrentMainLogits(tensor,
+                {.execution_role = ForwardExecutionRole::MainInference,
+                 .logical_all_position_logits = false,
+                 .storage_surface = surface},
+                DeviceGraphOrchestrator::MainLogitsPublicationSource::ForwardGraph,
+                "model_free_terminal_producer");
+        }
+
         /** @return Exact last-forward producer for terminal-only device assertions. */
         static void *mainForwardProducerStream(DeviceGraphOrchestrator &runner)
         {

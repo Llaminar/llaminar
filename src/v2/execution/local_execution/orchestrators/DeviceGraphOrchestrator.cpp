@@ -29960,16 +29960,55 @@ namespace llaminar2
         return publication.tensor;
     }
 
-    TensorBase *DeviceGraphOrchestrator::currentPrefixArchiveLogits() const noexcept
+    std::optional<DeviceGraphOrchestrator::PrefixArchiveLogitsView>
+    DeviceGraphOrchestrator::currentPrefixArchiveLogits() const
     {
         const auto &publication = current_main_logits_publication_;
         if (!publication.valid || !publication.tensor ||
             publication.session_epoch != session_epoch_ ||
-            !publication.descriptor.supportsScalarMainConsumer())
+            !publication.descriptor.supportsScalarMainConsumer() ||
+            prefix_layout_.terminal_logits_bytes == 0)
         {
-            return nullptr;
+            return std::nullopt;
         }
-        return publication.tensor;
+        if (!graph_builder_ || publication.tensor->native_type() != TensorType::FP32 ||
+            prefix_layout_.terminal_logits_bytes % sizeof(float) != 0)
+            throw std::logic_error("Prefix terminal logits require an owned FP32 vocabulary row");
+
+        const auto &config = graph_builder_->config();
+        const int local_start = localLogitsVocabOffset();
+        if (config.vocab_size <= 0 || local_start < 0)
+            throw std::logic_error("Prefix terminal logits have invalid vocabulary ownership");
+        const size_t full_columns = static_cast<size_t>(config.vocab_size);
+        const size_t archive_columns = prefix_layout_.terminal_logits_bytes / sizeof(float);
+        const PrefixLogitsVocabularyRange full{0, full_columns};
+        const PrefixLogitsVocabularyRange local{static_cast<size_t>(local_start),
+            config.vocab_local > 0 ? static_cast<size_t>(config.vocab_local) : 0};
+        const PrefixLogitsVocabularyRange archive = archive_columns == full_columns ? full : local;
+        if (archive_columns != archive.token_count)
+            throw std::logic_error("Prefix terminal-logit layout disagrees with its vocabulary shard");
+
+        PrefixLogitsVocabularyRange source = full;
+        switch (publication.descriptor.storage_surface)
+        {
+        case ForwardLogitsStorageSurface::CanonicalFull:
+        case ForwardLogitsStorageSurface::AllPositionFull:
+            break;
+        case ForwardLogitsStorageSurface::CanonicalLocal:
+        case ForwardLogitsStorageSurface::AllPositionLocal:
+            source = local;
+            break;
+        default:
+            throw std::logic_error("Prefix terminal logits have no owned publication surface");
+        }
+        // The immutable archive width, not the current decode/prefill phase,
+        // selects its vocabulary interval. The published surface selects the
+        // physical source. A gathered CPU row therefore starts at this rank's
+        // vocab offset; a local CPU/GPU row starts at byte zero.
+        const size_t full_row_bytes = fp32LogitsRowBytes(state_.logits.get());
+        (void)PrefixTerminalLogitsSlice::resolve(full, archive, full_row_bytes);
+        return PrefixArchiveLogitsView{publication.tensor,
+            PrefixTerminalLogitsSlice::resolve(source, archive, fp32LogitsRowBytes(publication.tensor))};
     }
 
     TensorBase *DeviceGraphOrchestrator::resolveDeviceLogitsTensor(
@@ -44277,7 +44316,8 @@ namespace llaminar2
                     size_t *reported_bytes,
                     uint64_t *reported_hash,
                     std::vector<float> *reported_fp32_values,
-                    const char *name)
+                    const char *name,
+                    size_t source_byte_offset = 0)
             {
                 if (!tensor || bytes == 0)
                     return;
@@ -44286,7 +44326,8 @@ namespace llaminar2
                 if (state_.device_id.is_gpu())
                 {
                     IBackend *backend = getBackendFor(state_.device_id);
-                    const void *source = tensor->gpu_data_ptr();
+                    const auto *base = static_cast<const uint8_t *>(tensor->gpu_data_ptr());
+                    const void *source = base ? base + source_byte_offset : nullptr;
                     if (!backend || !probe_stream || !source ||
                         !backend->deviceToHostFast(
                             payload.data(),
@@ -44303,7 +44344,8 @@ namespace llaminar2
                 }
                 else
                 {
-                    const void *source = tensor->raw_data();
+                    const auto *base = static_cast<const uint8_t *>(tensor->raw_data());
+                    const void *source = base ? base + source_byte_offset : nullptr;
                     if (!source)
                     {
                         throw std::runtime_error(
@@ -44357,21 +44399,20 @@ namespace llaminar2
              * row zero of the preplanned all-position surface; the dormant
              * canonical LOGITS allocation still contains the prompt row.
              */
-            const TensorBase *terminal_logits =
-                currentPrefixArchiveLogits();
-            if (terminal_logits &&
-                prefix_layout_.terminal_logits_bytes > 0)
+            const auto terminal_logits = currentPrefixArchiveLogits();
+            if (terminal_logits)
             {
                 hash_terminal_tensor(
-                    terminal_logits,
-                    prefix_layout_.terminal_logits_bytes,
+                    terminal_logits->tensor,
+                    terminal_logits->slice.byteCount(),
                     &snapshot.terminal_logits_hash_available,
                     &snapshot.terminal_logits_bytes,
                     &snapshot.terminal_logits_hash,
                     capture_policy.capture_terminal_logits_values
                         ? &snapshot.terminal_logits_values
                         : nullptr,
-                    "logits row");
+                    "logits row",
+                    terminal_logits->slice.byteOffset());
             }
 
             /*
@@ -46551,6 +46592,9 @@ namespace llaminar2
         result.supported = true;
         result.block_size = prefix_layout_.block_size;
         result.fingerprint_key = prefix_identity_.key;
+        result.checkpoint_policy = prefix_layout_.includes_hybrid_state
+            ? PrefixCheckpointPolicy::ReusableBoundary
+            : PrefixCheckpointPolicy::TerminalOnly;
         result.placement_epochs = PrefixPlacementEpochSpan::at(
             prefix_identity_.placement_epoch);
         result.requires_terminal_logits = prefix_layout_.includes_terminal_logits;
@@ -48294,9 +48338,9 @@ namespace llaminar2
                 }
             }
 
-            TensorBase *terminal_logits_tensor = currentPrefixArchiveLogits();
+            const auto terminal_logits = currentPrefixArchiveLogits();
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
-                !terminal_logits_tensor)
+                !terminal_logits)
             {
                 LOG_ERROR(
                     "[DeviceGraphOrchestrator] Prefix harvest has no current "
@@ -48304,21 +48348,23 @@ namespace llaminar2
                 ok = false;
             }
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
-                terminal_logits_tensor && handle.terminal_logits)
+                terminal_logits && handle.terminal_logits)
             {
-                if (fp32LogitsRowBytes(terminal_logits_tensor) < prefix_layout_.terminal_logits_bytes)
-                {
-                    ok = false;
-                }
+                // Slice the actual producer, not a dormant local allocation.
+                // This is the same checked interval used by prefix diagnostics.
+                TensorBase *terminal_logits_tensor = terminal_logits->tensor;
+                const size_t logits_offset = terminal_logits->slice.byteOffset();
+                const size_t logits_bytes = terminal_logits->slice.byteCount();
                 if (state_.device_id.is_gpu())
                 {
-                    const void *logits_device =
-                        terminal_logits_tensor->gpu_data_ptr();
+                    const auto *logits_base = static_cast<const uint8_t *>(
+                        terminal_logits_tensor->gpu_data_ptr());
+                    const void *logits_device = logits_base ? logits_base + logits_offset : nullptr;
                     if (!logits_device ||
                         !prefix_backend->deviceToHostOnStream(
                             handle.terminal_logits,
                             logits_device,
-                            prefix_layout_.terminal_logits_bytes,
+                            logits_bytes,
                             state_.device_id.gpu_ordinal(),
                             stream) ||
                         (device_hot_handle.valid() &&
@@ -48326,7 +48372,7 @@ namespace llaminar2
                           !prefix_backend->deviceCopyAsync(
                               device_hot_handle.deviceTerminalLogitsData(),
                               logits_device,
-                              prefix_layout_.terminal_logits_bytes,
+                              logits_bytes,
                               state_.device_id.gpu_ordinal(),
                               stream))))
                     {
@@ -48339,14 +48385,15 @@ namespace llaminar2
                 }
                 else
                 {
-                    const float *logits =
-                        ok ? terminal_logits_tensor->fp32_data() : nullptr;
+                    const auto *logits_base = static_cast<const uint8_t *>(
+                        terminal_logits_tensor->raw_data());
+                    const void *logits = logits_base ? logits_base + logits_offset : nullptr;
                     if (ok && logits)
                     {
                         std::memcpy(
                             handle.terminal_logits,
                             logits,
-                            prefix_layout_.terminal_logits_bytes);
+                            logits_bytes);
                         handle.has_terminal_logits = true;
                     }
                     else if (ok)
@@ -53338,7 +53385,9 @@ namespace llaminar2
                  {"pending_window_tokens",
                   std::to_string(depth_window_attempted_tokens)},
                  {"evaluated_windows",
-                  std::to_string(depth_evaluated_windows)}});
+                  std::to_string(depth_evaluated_windows)},
+                 {"learned_matched_windows", std::to_string(
+                      control[kDeviceGenerationControlLearnedDepthMatchedWindows])}});
             parsed.requests.push_back(std::move(request_result));
         }
 

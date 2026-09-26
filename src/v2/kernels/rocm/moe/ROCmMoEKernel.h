@@ -985,7 +985,8 @@ namespace llaminar2
             const uint8_t *expert_mask,
             int num_experts) override;
 
-        bool prepareSharedExpertPrefillGroup(int seq_len) override;
+        /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
+        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
 
         /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
         bool bindRouterQ8HiddenPublication(

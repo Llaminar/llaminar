@@ -225,3 +225,59 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch,
         ROCmMoEGroupedPrefillRouteStrategy::Invalid);
     EXPECT_FALSE(decision.valid());
 }
+
+/** A retained envelope must use its live route publication, not its capacity. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveRouteAdmissionCoversEveryFormatAndSlot)
+{
+    using namespace llaminar2::rocm;
+    int unread_device_storage = -999;
+    for (uint8_t gateup : kExecutionCodebooks)
+    {
+        for (uint8_t down : kExecutionCodebooks)
+        {
+            for (int top_k : {1, 2, 8, 16})
+            {
+                const ROCmMoEGroupedPrefillRouteKey key{
+                    .gateup_codebook = gateup, .down_codebook = down,
+                    .hidden_size = 2048, .expert_width = 512,
+                    .expert_count = 256, .top_k = top_k, .rows = 32};
+                const ROCmMoEGroupedRouteAdmission admission(
+                    key, &unread_device_storage, &unread_device_storage);
+                EXPECT_TRUE(admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned));
+                EXPECT_TRUE(admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled));
+                for (int slots = 0; slots <= key.rows * top_k; ++slots)
+                {
+                    auto live = key;
+                    live.rows = slots == 0 ? 1 : 1 + (slots - 1) / top_k;
+                    EXPECT_EQ(admission.strategyForSlots(slots),
+                              selectROCmMoEGroupedPrefillRouteStrategy(live).strategy);
+                }
+                EXPECT_EQ(admission.strategyForSlots(-1), ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+                EXPECT_EQ(admission.strategyForSlots(key.rows * top_k + 1),
+                          ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+            }
+        }
+    }
+    EXPECT_EQ(unread_device_storage, -999)
+        << "capture-time admission must not read or rewrite the device publication";
+}
+
+/** Exact exceptions remain exact even when a wider graph contains their work. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveAdmissionPreservesExactKeysAndRejectsMissingOwners)
+{
+    using namespace llaminar2::rocm;
+    int storage = 0;
+    ROCmMoEGroupedPrefillRouteKey key{
+        .gateup_codebook = 19, .down_codebook = 19,
+        .hidden_size = 3072, .expert_width = 1024,
+        .expert_count = 256, .top_k = 1, .rows = 64};
+    const ROCmMoEGroupedRouteAdmission admission(key, &storage, &storage);
+    for (int rows : {16, 32})
+        EXPECT_EQ(admission.strategyForSlots(rows), ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
+    for (int rows : {9, 15, 17, 31, 33, 64})
+        EXPECT_EQ(admission.strategyForSlots(rows), ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
+    EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, nullptr, &storage)), std::invalid_argument);
+    EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, nullptr)), std::invalid_argument);
+    key.rows = 0;
+    EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
+}

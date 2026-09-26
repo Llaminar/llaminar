@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import subprocess
 import tempfile
 import unittest
@@ -85,6 +87,27 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("dry-run:", result.stdout)
 
+    def test_fixed_depth_sweep_covers_the_production_range(self) -> None:
+        """The offline economics sweep must not silently stop at depth three."""
+        for depth in range(1, 16):
+            with self.subTest(depth=depth):
+                result = self.run_matrix(f"fixed_d{depth}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"--mtp-draft-tokens {depth} ", result.stdout)
+                self.assertIn("--mtp-depth-policy fixed", result.stdout)
+        for depth in (0, 16, -1):
+            result = self.run_matrix(f"fixed_d{depth}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fixed MTP depth must be in [1, 15]", result.stderr)
+
+    def test_dynamic_uses_the_learned_start_and_production_capacity(self) -> None:
+        """Timing an authored small envelope would not measure dynamic defaults."""
+        result = self.run_matrix("dynamic", allow_partial=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for override in ("--mtp-draft-tokens", "--mtp-max-draft-tokens",
+                         "--mtp-initial-draft-tokens"):
+            self.assertNotIn(override, result.stdout)
+
     def test_partial_variant_escape_is_explicit(self) -> None:
         result = self.run_matrix("baseline,dynamic", allow_partial=True)
 
@@ -121,7 +144,8 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         self.assertIn("--pp-stage 1=stage1:32-63", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
-    def test_nodelocaltp_topology_uses_mpi_device_map(self) -> None:
+    def test_nodelocaltp_topology_uses_auto_inventory_constraints(self) -> None:
+        """The planner owns rank/domain wiring for the requested two CPU endpoints."""
         result = self.run_matrix(
             "baseline",
             topologies="nodelocaltp_cpu2",
@@ -130,13 +154,15 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--mpi-procs 2", result.stdout)
-        self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
-        self.assertIn("--tp-scope node_local", result.stdout)
-        self.assertIn("--backend upi", result.stdout)
+        self.assertIn("--only-backends cpu", result.stdout)
+        self.assertIn("--auto-device-counts cpu=2", result.stdout)
+        self.assertIn("--only-strategies tp", result.stdout)
+        self.assertNotIn("--device-map", result.stdout)
+        self.assertNotIn("--backend", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
     def test_nodelocaltp_topology_accepts_moe_models(self) -> None:
-        """CPU2 MoE is a production lane, not a dense-only topology."""
+        """MoE needs the planner's explicit domain, not retired implicit cross-rank TP."""
         result = self.run_matrix(
             "baseline",
             topologies="nodelocaltp_cpu2",
@@ -144,8 +170,11 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--device-map 0=cpu:0\\,1=cpu:1", result.stdout)
-        self.assertIn("--backend upi", result.stdout)
+        self.assertIn("--only-backends cpu", result.stdout)
+        self.assertIn("--auto-device-counts cpu=2", result.stdout)
+        self.assertIn("--only-strategies tp", result.stdout)
+        self.assertNotIn("--device-map", result.stdout)
+        self.assertNotIn("--tensor-parallelism-degree", result.stdout)
         self.assertIn("moe.gguf", result.stdout)
 
     def test_tiered_routed_expert_topology_uses_explicit_policy_flags(self) -> None:
@@ -338,6 +367,43 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
             self.assertEqual(row[header.index("last_depth_reason")], "")
             self.assertEqual(row[header.index("generated_policy")], "false")
             self.assertEqual(row[header.index("request_batch")], "1")
+
+    def test_policy_features_match_live_controller_denominators(self) -> None:
+        """Do not train on tested-token acceptance or include TTFT in decode."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            model.write_text("fixture")
+            fake = root / "llaminar2"
+            result_json = {
+                "success": True,
+                "throughput_tokens_per_sec": {"decode": 999, "overall": 888},
+                "tokens": {"decode": 256, "prefill": 512},
+                "mtp": {"draft_steps": 100, "accepted_tokens": 60,
+                        "rejected_tokens": 5, "acceptance_rate": 60 / 65},
+                "iterations": [
+                    {"throughput_tokens_per_sec": {"decode_after_prefill": rate}}
+                    for rate in (200, 100, 300)
+                ],
+            }
+            fake.write_text("#!/usr/bin/env python3\nimport json, sys\n"
+                "from pathlib import Path\n"
+                "output = sys.argv[sys.argv.index('--benchmark-json-output') + 1]\n"
+                f"Path(output).write_text({json.dumps(json.dumps(result_json))})\n")
+            fake.chmod(0o755)
+            result = subprocess.run([
+                str(SCRIPT), "--binary", str(fake), "--moe-model", str(model),
+                "--devices", "rocm:0", "--models", "moe", "--modes", "stochastic",
+                "--variants", "baseline,fixed_d1", "--output-dir", str(root / "out"),
+            ], cwd=REPO_ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (root / "out/summary.tsv").open() as stream:
+                rows = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertEqual(float(row["decode_tps"]), 200)
+                self.assertEqual(float(row["acceptance_pct"]), 60)
+                self.assertEqual(float(row["speedup_vs_baseline"]), 1)
 
     def test_perfstats_rows_emit_ranked_stage_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -104,6 +104,27 @@ TEST(Test__PrefixCacheCoordinatorMPI, ReducesPlacementEpochAcrossRanks)
     EXPECT_EQ(result.placement_epochs, PrefixPlacementEpochSpan::covering(11, 19));
 }
 
+/** @brief A recurrent shard imposes its cold-prefill checkpoint on every rank. */
+TEST(Test__PrefixCacheCoordinatorMPI, ReusableCheckpointPolicySurvivesColdNestedCoordination)
+{
+    ASSERT_GE(mpiWorldSize(), 2);
+    for (int recurrent_rank = 0; recurrent_rank < mpiWorldSize(); ++recurrent_rank)
+    {
+        auto participant = rankParticipant(mpiWorldRank(), 0, false, false, 0xabcdu);
+        participant.checkpoint_policy = mpiWorldRank() == recurrent_rank
+            ? PrefixCheckpointPolicy::ReusableBoundary
+            : PrefixCheckpointPolicy::TerminalOnly;
+        const auto local = makePrefixLookupResult(coordinatePrefixLookups({participant}), 64);
+        MPIPrefixCollectiveCoordinator coordinator(MPI_COMM_WORLD);
+        const auto global = makePrefixLookupResult(coordinatePrefixLookups({
+            makePrefixParticipantLookup(mpiWorldRank(), DeviceId::cpu(), local)
+        }, &coordinator), 64);
+        EXPECT_EQ(global.cached_tokens, 0);
+        EXPECT_EQ(global.checkpoint_policy, PrefixCheckpointPolicy::ReusableBoundary);
+        EXPECT_EQ(global.reusablePrefillCheckpoint(365, 0), 320);
+    }
+}
+
 /** @brief Preserve a stale child admission through local and real-MPI nesting. */
 TEST(Test__PrefixCacheCoordinatorMPI, NestedAdmissionsRetainMovementAcrossLookups)
 {

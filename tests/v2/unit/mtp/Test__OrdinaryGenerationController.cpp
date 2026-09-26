@@ -431,10 +431,10 @@ TEST(OrdinaryGenerationController, HistoryAdmissionAndCommitAreExclusiveAndFailu
     }
 }
 
-TEST(OrdinaryGenerationController, PolicyIsExplicitAndKeepsTheSameStorageABI)
+TEST(OrdinaryGenerationController, PolicyIsExplicitAndSharesTheResidentStorageABI)
 {
-    static_assert(kDeviceGenerationControlCount == 46);
-    static_assert(sizeof(DeviceGenerationPolicy) == 11 * sizeof(int));
+    static_assert(kDeviceGenerationControlCount == 51);
+    static_assert(sizeof(DeviceGenerationPolicy) == 15 * sizeof(int));
     EXPECT_FALSE(DeviceGenerationPolicy::fixed(0).valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().valid());
     EXPECT_TRUE(DeviceGenerationPolicy::ordinary().isOrdinary());
@@ -724,6 +724,20 @@ TEST(OrdinaryGenerationController, TerminalContractAuthenticatesEverySpeculative
         ++forged[kDeviceGenerationControlDepthWindowSize];
         EXPECT_EQ(validateDeviceGenerationTerminal(forged, admission, response.size(), 0, 0),
             DeviceGenerationTerminalError::ChangedPolicy);
+        for (const int key : {kDeviceGenerationControlLearnedDepthEnabled,
+                              kDeviceGenerationControlLearnedDepthBackend,
+                              kDeviceGenerationControlLearnedDepthModelClass,
+                              kDeviceGenerationControlLearnedDepthVerifyMode})
+        {
+            forged = control;
+            ++forged[key];
+            EXPECT_EQ(validateDeviceGenerationTerminal(forged, admission, response.size(), 0, 0),
+                DeviceGenerationTerminalError::ChangedPolicy);
+        }
+        forged = control;
+        forged[kDeviceGenerationControlLearnedDepthMatchedWindows] = 1;
+        EXPECT_EQ(validateDeviceGenerationTerminal(forged, admission, response.size(), 0, 0),
+            DeviceGenerationTerminalError::InvalidDepthStatistics);
         forged = control;
         forged[kDeviceGenerationControlTransactionCount] = std::numeric_limits<int>::max();
         EXPECT_EQ(validateDeviceGenerationTerminal(forged, admission, response.size(), 0, 0),

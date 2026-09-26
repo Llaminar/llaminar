@@ -7,6 +7,7 @@
  * - CPU decode samples from host logits as the CPU implementation
  * - GPU decode must fail hard when device sampling fails
  * - Exported hardware defaults and explicit policy intent match the runtime
+ * - Serial and speculative benchmarks deliver the same requested sampling law
  */
 
 #include <gtest/gtest.h>
@@ -371,6 +372,21 @@ namespace
     public:
         bool supportsDecodeStep() const override { return true; }
 
+        /** @brief Select a reported endpoint without initializing any device. */
+        void setDevice(DeviceId device) { device_ = device; }
+        /** @return The endpoint used to test backend-neutral request admission. */
+        DeviceId primaryDeviceId() const override { return device_; }
+        /** @brief Record whether admission already owned the request policy. */
+        bool forward(const int *tokens, int seq_len) override
+        {
+            prefills_owned_sampling_ = prefills_owned_sampling_ && sampling_params_set_;
+            return MockCPUInferenceRunner::forward(tokens, seq_len);
+        }
+        /** @return True because this device-free fixture completes synchronously. */
+        bool waitForLastInferenceCompletionForBenchmark() override { return true; }
+        /** @return Whether every prefill observed an already-published policy. */
+        bool prefillsOwnedSampling() const { return prefills_owned_sampling_; }
+
         bool configureMTPRequestStopTokens(
             const std::vector<int32_t> &stop_tokens) override
         {
@@ -436,6 +452,8 @@ namespace
         }
 
     private:
+        DeviceId device_ = DeviceId::cpu();
+        bool prefills_owned_sampling_ = true;
         std::vector<int32_t> configured_stop_tokens_;
         int decode_step_budget_ = 0;
         int decode_step_calls_ = 0;
@@ -593,6 +611,7 @@ namespace
         bool prefillBatchForBenchmark(
             const std::vector<std::vector<int>> &token_batches) override
         {
+            prefills_owned_sampling_ = prefills_owned_sampling_ && sampling_params_set_;
             ++batch_prefill_calls_;
             last_prefill_batch_ = static_cast<int>(token_batches.size());
             return !token_batches.empty();
@@ -677,9 +696,12 @@ namespace
         int lastRequestBatch() const { return last_request_batch_; }
         bool samplingParamsSet() const { return sampling_params_set_; }
         const SamplingParams &lastSamplingParams() const { return last_sampling_params_; }
+        /** @return Whether every batched prefill saw its sampling policy. */
+        bool prefillsOwnedSampling() const { return prefills_owned_sampling_; }
 
     private:
         static constexpr int max_request_batch_ = 8;
+        bool prefills_owned_sampling_ = true;
         int decode_step_budget_ = 0;
         int batch_prefill_calls_ = 0;
         int single_decode_step_calls_ = 0;
@@ -1038,6 +1060,7 @@ TEST(Test__BenchmarkRunnerCPU, DoesNotSkipLogitsGatherOnCPU)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f; // This low-level fixture deliberately measures argmax.
     config.prompt = "Hello world";
     config.n_predict = 3;
 
@@ -1067,6 +1090,7 @@ TEST(Test__BenchmarkRunnerCPU, EnablesSkipLogitsGatherOnGPU)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f; // Explicit greedy probe, not production sampled decode.
     config.prompt = "Hello world";
     config.n_predict = 3;
 
@@ -1128,6 +1152,7 @@ TEST(Test__BenchmarkRunnerCPU, CPUDecodeSucceedsWithHostArgmax)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f;
     config.prompt = "Hello world";
     config.n_predict = 5;
 
@@ -1153,6 +1178,7 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f;
     config.prompt = "Hello world";
     config.n_predict = 5;
 
@@ -1486,6 +1512,7 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f;
     config.prompt = "Hello world";
     config.n_predict = 5;
 
@@ -1559,6 +1586,9 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     config.prompt = "Hello world";
     config.n_predict = 3;
     config.mtp.enabled = true;
+    // The runner must preserve the caller's sampling policy, not force greedy
+    // sampling merely because grouped MTP decode is available.
+    config.temperature = 0.37f;
 
     auto result = bench.run(config);
 
@@ -1576,7 +1606,7 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     EXPECT_THAT(result.generated_token_ids, ::testing::ElementsAre(14, 10, 11))
         << "Benchmark JSON should report the final measured iteration, not warmup output";
     EXPECT_TRUE(runner->samplingParamsSet());
-    EXPECT_EQ(runner->lastTemperature(), 0.0f);
+    EXPECT_EQ(runner->lastTemperature(), config.temperature);
     EXPECT_GT(runner->decodeStepCalls(), 0);
     EXPECT_GT(runner->maintenanceCalls(), 0);
     EXPECT_EQ(runner->maintenanceTokens(), runner->decodedTokensReturned())
@@ -1900,6 +1930,7 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
     EXPECT_EQ(runner->singleDecodeStepCalls(), 0)
         << "max_request_batch > 1 must not silently fall through to single-request decode";
     ASSERT_TRUE(runner->samplingParamsSet());
+    EXPECT_TRUE(runner->prefillsOwnedSampling());
     EXPECT_EQ(runner->lastSamplingParams().temperature, 0.7f);
     EXPECT_EQ(runner->lastSamplingParams().top_k, 32);
     EXPECT_EQ(runner->lastSamplingParams().top_p, 0.9f);
@@ -2116,6 +2147,80 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestedSamplingParamsForSpeculativeMTPBench
     EXPECT_EQ(params.seed, 123u);
 }
 
+/**
+ * @test An MTP toggle or backend must not silently change the sampling law.
+ *
+ * The serial control used to force temperature zero while exporting the
+ * requested nonzero temperature. That made a matched benchmark look like a
+ * verifier parity failure. Inspect the request delivered to the production
+ * decode surface, not just the configuration echoed into the JSON artifact.
+ */
+TEST(Test__BenchmarkRunnerCPU, SerialAndMTPSamplingMatchRequestedPolicyOnEveryBackend)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const bool mtp_enabled : {false, true})
+    for (const auto verify : {MTPVerifyMode::Greedy, MTPVerifyMode::SpeculativeSampling})
+    for (const float temperature : {0.0f, 0.6f})
+    {
+        SCOPED_TRACE(::testing::Message() << device.to_string()
+            << " mtp=" << mtp_enabled << " verify=" << static_cast<int>(verify)
+            << " temperature=" << temperature);
+        auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+        runner->setDevice(device);
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+        OrchestrationConfig config;
+        config.prompt = "Explicit sampling policy";
+        config.n_predict = 3;
+        config.seed = 123;
+        config.temperature = temperature;
+        config.top_k = 20;
+        config.top_p = 0.95f;
+        config.mtp.enabled = mtp_enabled;
+        config.mtp.verify_mode = verify;
+
+        const auto result = benchmark.run(config);
+        ASSERT_TRUE(result.success) << result.failure_reason;
+        ASSERT_TRUE(runner->samplingParamsSet());
+        EXPECT_TRUE(runner->prefillsOwnedSampling());
+        const auto &actual = runner->lastSamplingParams();
+        EXPECT_FLOAT_EQ(actual.temperature, config.temperature);
+        EXPECT_EQ(actual.top_k, config.top_k);
+        EXPECT_FLOAT_EQ(actual.top_p, config.top_p);
+        EXPECT_EQ(actual.seed, static_cast<unsigned int>(config.seed));
+
+        const auto document = nlohmann::json::parse(
+            benchmarkResultToJsonString(result, &config));
+        const auto &reported = document.at("config").at("sampling");
+        EXPECT_EQ(reported.at("temperature").get<float>(), actual.temperature);
+        EXPECT_EQ(reported.at("top_k").get<int>(), actual.top_k);
+        EXPECT_EQ(reported.at("top_p").get<float>(), actual.top_p);
+        EXPECT_EQ(reported.at("seed").get<unsigned int>(), actual.seed);
+    }
+}
+
+/** @test A low-level greedy probe cannot stand in for stochastic inference. */
+TEST(Test__BenchmarkRunnerCPU, NonOrchestratedStochasticRunnerFailsBeforePrefill)
+{
+    for (const bool gpu : {false, true})
+    {
+        SCOPED_TRACE(gpu);
+        const std::shared_ptr<IInferenceRunner> runner = gpu
+            ? std::static_pointer_cast<IInferenceRunner>(std::make_shared<MockGPUInferenceRunner>())
+            : std::static_pointer_cast<IInferenceRunner>(std::make_shared<MockCPUInferenceRunner>());
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+        OrchestrationConfig config;
+        config.prompt = "Requested stochastic generation";
+        config.n_predict = 3;
+        config.temperature = 0.6f;
+        const auto result = benchmark.run(config);
+        EXPECT_FALSE(result.success);
+        EXPECT_FALSE(result.prefill_success);
+        EXPECT_EQ(result.decode_tokens, 0);
+        EXPECT_NE(result.failure_reason.find("requires the production decode-step surface"),
+                  std::string::npos) << result.failure_reason;
+    }
+}
+
 TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
 {
     auto runner = std::make_shared<MockMeasuredMTPStatsRunner>();
@@ -2260,6 +2365,7 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f;
     config.prompt = "Hello world";
     config.n_predict = 1;
 
@@ -2855,6 +2961,7 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
     BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
+    config.temperature = 0.0f;
     config.prompt = "Hello world";
     config.n_predict = 1;
 

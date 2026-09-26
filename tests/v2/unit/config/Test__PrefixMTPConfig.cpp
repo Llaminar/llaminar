@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <array>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,8 @@
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "execution/mtp/MTPDeviceGenerationPolicy.h"
+#include "execution/mtp/MTPDepthController.h"
+#include "execution/mtp/MTPRequestSamplingPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "models/GraphTypes.h"
 #include "utils/DebugEnv.h"
@@ -111,7 +114,7 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_EQ(config.mtp.draft_tokens, 1);
     EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 0);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
-    EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
+    EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(
         config.mtp.terminal_head_policy,
         MTPTerminalHeadPolicy::Automatic)
@@ -130,6 +133,164 @@ TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
     EXPECT_FALSE(config.mtp.depth_policy.demote_zero_accept_rate.has_value());
     EXPECT_DOUBLE_EQ(resolveMTPZeroAcceptDemotionRate(config.mtp), 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
+}
+
+/** @test Public default admits non-greedy sampling without a verification flag. */
+TEST(Test__PrefixMTPConfig, DefaultMTPAdmitsStochasticSampling)
+{
+    ArgvHelper args({"llaminar2", "--mtp", "--mtp-depth-policy", "dynamic"});
+    const auto config = createOrchestrationConfigParser()->parseArgs(args.argc(), args.argv());
+    SamplingParams sampling;
+    sampling.temperature = 0.7f;
+    sampling.top_k = 40;
+    sampling.top_p = 0.9f;
+    const auto active = resolveMTPSamplingRequestConfig(
+        config.mtp, makeMTPRequestPolicy(config.mtp), sampling);
+    EXPECT_EQ(MTPRequestPolicy{}.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_EQ(active.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_TRUE(active.enabled);
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(active), 15);
+    EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(active).initial_depth, 1);
+}
+
+/** @test Argmax specialization preserves intent, capacity and greedy economics. */
+TEST(Test__PrefixMTPConfig, DefaultMTPGreedySpecializationPreservesPhysicalEnvelope)
+{
+    MTPRuntimeConfig retained;
+    retained.enabled = true;
+    retained.graph_capacity_draft_tokens = 15;
+    retained.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    const auto requested = makeMTPRequestPolicy(retained);
+    for (const auto sampling : {
+             SamplingParams{.temperature = 0.0f},
+             SamplingParams{.temperature = 0.8f, .top_k = 1, .top_p = 1.0f}})
+    {
+        const auto active = resolveMTPSamplingRequestConfig(retained, requested, sampling);
+        EXPECT_EQ(active.verify_mode, MTPVerifyMode::Greedy);
+        EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(active).initial_depth, 2);
+        EXPECT_EQ(active.graph_capacity_draft_tokens, 15);
+        EXPECT_EQ(resolveMTPRetainedDraftCapacity(active), resolveMTPRetainedDraftCapacity(retained));
+        EXPECT_EQ(active.terminal_head_policy, retained.terminal_head_policy);
+        EXPECT_EQ(active.sidecar_dense_policy, retained.sidecar_dense_policy);
+    }
+    EXPECT_EQ(retained.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_EQ(requested.verify_mode, MTPVerifyMode::SpeculativeSampling);
+
+    // Greedy-only is an explicit restriction, not automatic stochastic intent.
+    auto restricted = requested;
+    restricted.verify_mode = MTPVerifyMode::Greedy;
+    EXPECT_EQ(resolveMTPSamplingRequestConfig(retained, restricted, SamplingParams{}).verify_mode,
+              MTPVerifyMode::Greedy);
+}
+
+/** @test Initial-depth economics cannot diverge between host and device owners. */
+TEST(Test__PrefixMTPConfig, MTPInitialDepthHasOneHostAndDeviceAuthority)
+{
+    for (const auto backend : {MTPDepthPolicyBackend::CPU, MTPDepthPolicyBackend::CUDA, MTPDepthPolicyBackend::ROCm})
+    for (const auto model : {MTPDepthPolicyModelClass::Dense, MTPDepthPolicyModelClass::MoE})
+    for (const auto mode : {MTPVerifyMode::Greedy, MTPVerifyMode::SpeculativeSampling})
+    for (const bool generated : {false, true})
+    for (const int explicit_initial : {0, 1, 3, 15})
+    {
+        MTPRuntimeConfig active;
+        active.enabled = true;
+        active.verify_mode = mode;
+        active.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        active.depth_policy.backend = backend;
+        active.depth_policy.model_class = model;
+        active.depth_policy.use_generated_policy = generated;
+        active.depth_policy.initial_depth = explicit_initial;
+        MTPDepthController host(resolveMTPDepthPolicyConfig(active), active.draft_tokens, mode);
+        const auto device = resolveMTPDeviceGenerationDepthPolicy(active);
+        ASSERT_TRUE(device.valid());
+        EXPECT_EQ(device.initial_depth, host.currentDepth());
+        if (explicit_initial > 0)
+            EXPECT_EQ(device.initial_depth, explicit_initial);
+    }
+
+    // This installed learned CUDA lane exposed the original 3-versus-1 split.
+    MTPRuntimeConfig learned;
+    learned.enabled = true;
+    learned.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    learned.depth_policy.backend = MTPDepthPolicyBackend::CUDA;
+    learned.depth_policy.model_class = MTPDepthPolicyModelClass::MoE;
+    EXPECT_EQ(resolveMTPDeviceGenerationDepthPolicy(learned).initial_depth, 3);
+}
+
+/** @test Learned window decisions survive host-to-device policy admission. */
+TEST(Test__PrefixMTPConfig, LearnedMTPWindowsAgreeAcrossExecutionOwners)
+{
+    using namespace sampling_math;
+    int learned_windows = 0;
+    for (const auto backend : {MTPDepthPolicyBackend::CPU, MTPDepthPolicyBackend::CUDA, MTPDepthPolicyBackend::ROCm})
+    for (const auto model : {MTPDepthPolicyModelClass::Dense, MTPDepthPolicyModelClass::MoE})
+    for (const auto mode : {MTPVerifyMode::Greedy, MTPVerifyMode::SpeculativeSampling})
+    for (int depth = 1; depth <= 15; ++depth)
+    for (int accepted = 0; accepted <= depth; ++accepted)
+    {
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        config.verify_mode = mode;
+        auto &policy = config.depth_policy;
+        policy.mode = MTPDepthPolicyMode::Dynamic;
+        policy.backend = backend;
+        policy.model_class = model;
+        policy.initial_depth = depth;
+        policy.window_size = policy.min_samples = 16;
+        policy.cooldown_steps = 0;
+        MTPDepthController host(policy, config.draft_tokens, mode);
+        const auto device_policy = resolveMTPDeviceGenerationDepthPolicy(config);
+        std::array<int, kDeviceGenerationControlCount> device{};
+        ASSERT_TRUE(initialize_device_generation_control(1024, 1024, device_policy, device.data()));
+        for (int step = 0; step < 16; ++step)
+        {
+            host.recordStep({.requested_depth = depth, .effective_depth = depth,
+                .accepted_speculative_prefix = accepted, .rollback = accepted < depth});
+            ASSERT_TRUE(record_device_generation_depth_observation(accepted, accepted < depth, false, device.data()));
+        }
+        const auto reason = host.lastDecision().reason;
+        if (reason == MTPDepthDecisionReason::GeneratedPolicyHold ||
+            reason == MTPDepthDecisionReason::GeneratedPolicyPromote ||
+            reason == MTPDepthDecisionReason::GeneratedPolicyDemote)
+        {
+            ++learned_windows;
+            EXPECT_EQ(device[kDeviceGenerationControlLearnedDepthMatchedWindows], 1);
+            EXPECT_EQ(device[kDeviceGenerationControlCurrentDraftDepth], host.currentDepth());
+        }
+        else
+            EXPECT_EQ(device[kDeviceGenerationControlLearnedDepthMatchedWindows], 0);
+    }
+    EXPECT_GT(learned_windows, 0);
+}
+
+/** @test The existing CUDA/ROCm learned holds beat conflicting generic promotion. */
+TEST(Test__PrefixMTPConfig, LearnedMTPHoldsAreNotMissingRecommendations)
+{
+    using namespace sampling_math;
+    for (const auto backend : {MTPDepthPolicyBackend::CUDA, MTPDepthPolicyBackend::ROCm})
+    for (const bool generated : {false, true})
+    {
+        MTPRuntimeConfig config;
+        config.enabled = true;
+        auto &policy = config.depth_policy;
+        policy.mode = MTPDepthPolicyMode::Dynamic;
+        policy.backend = backend;
+        policy.model_class = MTPDepthPolicyModelClass::MoE;
+        policy.use_generated_policy = generated;
+        // Both installed MoE sampling domains now learn a depth-three hold.
+        // An explicit initial value isolates hold-vs-miss semantics from the
+        // separate startup-resolution test above.
+        policy.initial_depth = 3;
+        policy.window_size = policy.min_samples = 1;
+        policy.cooldown_steps = 0;
+        policy.promote_consecutive_windows = 1;
+        std::array<int, kDeviceGenerationControlCount> device{};
+        ASSERT_TRUE(initialize_device_generation_control(1024, 1024,
+            resolveMTPDeviceGenerationDepthPolicy(config), device.data()));
+        ASSERT_TRUE(record_device_generation_depth_observation(policy.initial_depth, false, false, device.data()));
+        EXPECT_EQ(device[kDeviceGenerationControlCurrentDraftDepth], policy.initial_depth + (generated ? 0 : 1));
+        EXPECT_EQ(device[kDeviceGenerationControlLearnedDepthMatchedWindows], generated ? 1 : 0);
+    }
 }
 
 TEST(Test__PrefixMTPConfig, CommandLineCanExplicitlyDisableDefaultPrefixRestore)

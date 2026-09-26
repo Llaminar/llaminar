@@ -59,6 +59,7 @@
 #include "../../prefix_cache/PrefixCacheFingerprint.h"
 #include "../../prefix_cache/PrefixCacheStats.h"
 #include "../../prefix_cache/PrefixStorageBackend.h"   // PrefixBlockHandle restore-source ownership
+#include "../../prefix_cache/PrefixTerminalLogitsSlice.h"
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
 #include "../../mtp/MTPGraphOwnerPlan.h"
@@ -7539,6 +7540,13 @@ namespace llaminar2
             DeviceLogitsSource source,
             const char *consumer_name) const;
 
+        /** @brief Borrowed ordered producer and its checked participant-owned row slice. */
+        struct PrefixArchiveLogitsView
+        {
+            TensorBase *tensor;
+            PrefixTerminalLogitsSlice slice;
+        };
+
         /**
          * @brief Resolve the exact scalar main row eligible for prefix archival.
          *
@@ -7549,10 +7557,17 @@ namespace llaminar2
          * is the sole authority for that physical choice; inferring it again
          * from configured TP policy can select an allocated but stale tensor.
          *
-         * @return Current scalar main-model logits tensor, or nullptr when no
-         *         compatible producer has published in this request epoch.
+         * A CPU TP allgather publishes a full vocabulary even though the
+         * archive owns only the participant's shard. Physical tensor identity
+         * and logical vocabulary ownership are checked together; neither an
+         * allocated local buffer nor byte zero of a full row implies ownership.
+         *
+         * @return Producer and vocabulary slice, or no value if this request
+         *         has no compatible scalar publication or no terminal archive.
+         * @throws std::logic_error For inconsistent published/layout geometry.
+         * @throws std::invalid_argument For an archive outside its source row.
          */
-        [[nodiscard]] TensorBase *currentPrefixArchiveLogits() const noexcept;
+        [[nodiscard]] std::optional<PrefixArchiveLogitsView> currentPrefixArchiveLogits() const;
 
         /** Resolve any sampling source while preserving main publication rules. */
         [[nodiscard]] TensorBase *resolveDeviceLogitsTensor(

@@ -2,6 +2,86 @@
 
 ## Objective
 
+2026-09-26 final acceptance: the stochastic-default goal reaches both requested
+performance passes. Final matched Release medians are **278.33 CUDA / 146.82
+ROCm / 44.94 CPU tok/s**, versus old controls **254.93 / 86.68 / 41.34**.
+The learned policy, 1–15 bounds, precision and weight formats are preserved.
+Ordinary Ornith/OpenWebUI non-greedy requests retain real stochastic MTP and
+exact prefix replay; each HTTP surface passes twenty cached repeats. The
+service proof uncovered a vocabulary-shard archive bug, now fixed by one
+checked copy/hash slice and a v3 cache compatibility identity. Its TP1–8
+CPU/CUDA/ROCm regressions pass twenty repetitions each, followed by the full
+673-test Unit and 419-test preflight gate without skips. A subsequent HTTP
+connection-lifetime regression removes the five-second idle-connection queue
+penalty while retaining the stable inference worker and complete SSE delivery.
+It has its own twenty-run preflight proof. Publication proceeds through a new
+feature PR and the normal complete Unit/preflight image gate. This is not a
+full model/image E2E certificate, and the remaining ROCm best-fixed-depth gap
+and historical profiler-associated NVIDIA assertions are not declared fixed.
+The progress entries below are chronological; this acceptance supersedes their
+earlier pending CPU and ordinary-service work.
+
+2026-09-26 follow-up: make stochastic verification the production default,
+preserve greedy specialization, and tune all three backends to at least 75%
+of the captured old-default controls before a second pass targeting 100%.
+Then verify the local OpenWebUI service keeps MTP active for non-greedy chat.
+The user retained learned policy rather than a manual depth-3 default, and now
+requests fresh ROCm training. Shared initialization/live interpretation and
+live-row runtime fixes are implemented with focused device gates passing.
+Relearn from fresh fixed-depth controls and independent prompt holdouts while
+preserving unmeasured backend domains and the 1–15 adaptive range. Separately
+retain the remaining dynamic-versus-fixed graph-cost investigation; a learned
+depth change is not proof that padded work is gone. Refresh the full gates
+after this coherent slice, then complete CPU and OpenWebUI acceptance. The
+installed ROCm refresh improves all eight measured requests by 20–54%, retaining
+exact output tokens and adaptive bounds. It does not close the dynamic/fixed
+runtime gap; investigate the additional steady-depth acceptance discrepancy
+on the held-out seed-123 repetitive prompt after the gates.
+The intervening compiler-spill slice now enforces memory-spill rejection in
+Release/Integration without rejecting proven register-bank moves. Both builds
+pass; the first Unit/preflight gate is 673/673 and 413/413, without skips.
+Whole-model comparison subsequently caught and corrected a CUDA shallow-tile
+occupancy regression. Final paired medians preserve CUDA decode (279.21 →
+279.43 tok/s) and ROCm (146.30 → 147.20) with exact tokens. The post-correction
+gate now passes **673/673 Unit and 413/413 preflight**, with no skips. Fresh
+post-gate pairs confirm unchanged CUDA decode and preserved ROCm throughput,
+with exact tokens and MTP counts. The complete unprofiled gate/model-check
+interval has zero new driver records/findings. Retain the earlier
+profiling-associated NVIDIA assertion evidence as unresolved; isolated kernel
+wins and profiler completion do not certify driver health. CPU/controller work
+and service acceptance remain the next outstanding goal work.
+The fresh CPU baseline is 40.01 tok/s; fixed d3 reaches 45.10, whereas the
+generic controller settles at d4 (fixed d4: 39.03). Collect CPU fixed-depth
+economics and independent holdouts before installing any generated CPU rules.
+Keep the 1–15 range and all other backend/model domains intact. The canonical
+CPU2 training wrapper now uses automatic topology constraints because its old
+implicit cross-rank MoE TP invocation was rejected before inference; its
+focused Unit/preflight regressions are green.
+Before fitting CPU rows, the prose control exposed a separate benchmark defect:
+non-MTP requests silently used greedy sampling while JSON reported stochastic
+intent. Preserve the original greedy controls and the valid MTP-to-MTP timings,
+but replace those mislabeled serial controls. The corrected sampling/admission
+contract and its explicit preflight regression pass the focused gate. Release
+replay now confirms identical serial/fixed-d1/dynamic outputs for the exact
+64-token prose reproducer; refresh the gates and restart CPU training in a
+separate evidence series. GPU policies were
+fit from fixed MTP rows, not these serial controls, so this does not erase their
+measured learned-policy evidence.
+The corrected CPU corpus is now complete and token-correct across all eight
+training/holdout requests and six variants. The trainer now emits an explicit
+measured startup independently of acceptance-window rules; a declared 5%
+near-best band avoids fitting tiny per-prompt timing differences. Classification
+gates remain at 75% and numerical/output gates are unchanged. The generated CPU
+candidate passes six focused entries, preserves all GPU domains and the 1–15
+range, and its real after control reaches 44.94 tok/s (old target 41.34).
+All eight after cases now improve by 6.7–28.7%, with exact serial token
+agreement. The complete refresh passes **673/673 Unit** and **414/414
+ProductionTestPreflight**, without skips. Finish the fresh GPU sampling check
+and the non-greedy OpenWebUI service proof.
+The [current experiment](../2026-09/2026-09-26-stochastic-mtp-default.md)
+owns measurements, focused regressions and remaining work. Earlier CPU tuning
+wrap-ups below do not close this newly requested scope.
+
 2026-09-25 wrap-up: the user accepted approximately **42 tok/s dynamic-MTP
 decode and 350 tok/s prefill** on both CPU sockets as good enough for this
 slice. Further tuning toward 50 tok/s is stopped, not declared achieved.

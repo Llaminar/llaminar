@@ -16,6 +16,7 @@
 #include "../../utils/Logger.h"
 #include "RoutedExpertPolicy.h"
 #include "MTPDepthDefaults.h"
+#include "MTPDepthPolicyTypes.h"
 #include "../mtp/MTPConditionForwardPurpose.h"
 #include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
@@ -481,12 +482,6 @@ namespace llaminar2
         PrefixCacheMoEPolicy moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
     };
 
-    enum class MTPVerifyMode
-    {
-        Greedy,
-        SpeculativeSampling,
-    };
-
     inline const char *mtpVerifyModeToString(MTPVerifyMode mode)
     {
         switch (mode)
@@ -543,39 +538,6 @@ namespace llaminar2
             return MTPDepthPolicyMode::Dynamic;
         return std::nullopt;
     }
-
-    /**
-     * @brief Coarse execution backend used by the generated MTP depth policy.
-     *
-     * The online controller intentionally avoids clocks and backend-specific
-     * performance probes.  The offline trainer can still learn that CUDA,
-     * ROCm, and CPU prefer different speculative depths by keying generated
-     * rules on this small backend class.
-     */
-    enum class MTPDepthPolicyBackend
-    {
-        Any,
-        CPU,
-        CUDA,
-        ROCm,
-    };
-
-    /**
-     * @brief Coarse model family used by the generated MTP depth policy.
-     *
-     * Dynamic-depth economics differ between dense and MoE graphs even when
-     * token acceptance looks similar: MoE verifier cost, routed expert work,
-     * and condition-forward replay can make a depth profitable or unprofitable
-     * at different acceptance rates.  Keep this intentionally small so the
-     * runtime remains deterministic and the offline trainer can learn separate
-     * tables without depending on model-specific strings.
-     */
-    enum class MTPDepthPolicyModelClass
-    {
-        Any,
-        Dense,
-        MoE,
-    };
 
     /** @brief Request-selected depth policy, retaining automatic threshold intent. */
     struct MTPDepthPolicyConfig
@@ -643,34 +605,21 @@ namespace llaminar2
     /**
      * @brief Resolve the effective initial MTP draft depth.
      *
-     * Fixed mode pins to the configured fixed depth.  Greedy dynamic/observe
-     * starts at depth 2 when available because recent dense lanes show that as
-     * a cheap warm start below the risky deepest lane.  Stochastic
-     * dynamic/observe starts at depth 1: rejection sampling cannot legally
-     * produce ready logits after residual corrections, so a bad first window
-     * at depth 2 has an outsized condition-forward tax.  An explicit
-     * depth-zero bypass range still starts at zero so operators can force a
-     * conservative adaptive warmup.
+     * CPU controllers and GPU request admission share this single resolver.
+     * Explicit initial depth and fixed mode retain their authored values;
+     * adaptive mode uses its trained backend/model winner when available.
+     * Otherwise greedy starts at depth 2 and stochastic at the minimum. An
+     * explicit depth-zero range starts at zero. Resolution is admission-time
+     * only: live GPU adaptation remains entirely device-owned.
+     * @param config Request policy, including backend/model class and bounds.
+     * @param configured_draft_tokens Fixed execution depth.
+     * @param verify_mode Effective sampling specialization for this request.
+     * @return Starting depth without changing retained capacity or user intent.
      */
-    inline int resolveMTPDepthPolicyInitialDepth(
+    [[nodiscard]] int resolveMTPDepthPolicyInitialDepth(
         const MTPDepthPolicyConfig &config,
         int configured_draft_tokens,
-        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
-    {
-        const int effective_max_depth =
-            config.max_depth > 0
-                ? config.max_depth
-                : defaultMTPAdaptiveMaximumDraftDepth();
-        if (config.initial_depth > 0)
-            return config.initial_depth;
-        if (config.mode == MTPDepthPolicyMode::Fixed)
-            return configured_draft_tokens;
-        if (config.min_depth == 0)
-            return 0;
-        if (verify_mode == MTPVerifyMode::SpeculativeSampling)
-            return config.min_depth;
-        return std::clamp(2, config.min_depth, effective_max_depth);
-    }
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy);
 
     /**
      * @enum MTPSidecarDensePolicy
@@ -973,7 +922,13 @@ namespace llaminar2
          * wires the corresponding scheduler execution.
          */
         int max_request_batch = 1;
-        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        /**
+         * @brief Admit stochastic requests by default, including greedy specialization.
+         *
+         * Request admission specializes the execution/depth policy for an
+         * argmax sampler without changing this retained capability or capacity.
+         */
+        MTPVerifyMode verify_mode = MTPVerifyMode::SpeculativeSampling;
         /**
          * @brief Placement of the predictor block's dense/shared weights.
          *
@@ -1164,7 +1119,7 @@ namespace llaminar2
     {
         bool enabled = false; ///< Whether the next request executes MTP.
         int draft_tokens = 1; ///< Fixed execution depth; adaptive bounds are separate.
-        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        MTPVerifyMode verify_mode = MTPVerifyMode::SpeculativeSampling;
         bool require_terminal_hidden_for_full_hit = true;
         MTPDepthPolicyConfig depth_policy;
     };

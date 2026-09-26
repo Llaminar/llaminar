@@ -1,12 +1,22 @@
+/**
+ * @file Test__PrefixStateSnapshot.cpp
+ * @brief Device-free proofs of restorable archive boundaries and checkpoint ownership.
+ *
+ * Payload metadata must describe the selected frontier, not a later terminal
+ * record. Boundary planning never invents a rewind of recurrent model state.
+ */
 #include <gtest/gtest.h>
+#include <limits>
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
+#include "execution/prefix_cache/PrefixTerminalLogitsSlice.h"
 
 namespace llaminar2
 {
 namespace
 {
 
+    /** @brief Construct a small owned archive with explicit state availability. */
     PrefixBlockHandle makeBlock(int index,
                                 int start,
                                 int count,
@@ -41,6 +51,110 @@ namespace
     }
 
 } // namespace
+
+/** @brief Full and local producers select identical, possibly uneven TP intervals. */
+TEST(PrefixTerminalLogitsSlice, FullAndLocalSourcesAgreeThroughTP8)
+{
+    for (size_t degree = 1; degree <= 8; ++degree)
+        for (const size_t vocabulary : {size_t{257}, size_t{248320}})
+            for (size_t rank = 0; rank < degree; ++rank)
+            {
+                const size_t begin = vocabulary * rank / degree;
+                const size_t end = vocabulary * (rank + 1) / degree;
+                const PrefixLogitsVocabularyRange shard{begin, end - begin};
+                const auto full = PrefixTerminalLogitsSlice::resolve(
+                    {0, vocabulary}, shard, vocabulary * sizeof(float));
+                const auto local = PrefixTerminalLogitsSlice::resolve(
+                    shard, shard, (shard.token_count + 16) * sizeof(float));
+                EXPECT_EQ(full.byteOffset(), begin * sizeof(float));
+                EXPECT_EQ(local.byteOffset(), 0u);
+                EXPECT_EQ(full.byteCount(), shard.token_count * sizeof(float));
+                EXPECT_EQ(local.byteCount(), full.byteCount());
+            }
+}
+
+/** @brief An archive can select a strict subinterval of a nonzero-origin producer. */
+TEST(PrefixTerminalLogitsSlice, NestedVocabularyIntervalExcludesPadding)
+{
+    const auto slice = PrefixTerminalLogitsSlice::resolve({37, 29}, {43, 11}, 64 * sizeof(float));
+    EXPECT_EQ(slice.byteOffset(), 6 * sizeof(float));
+    EXPECT_EQ(slice.byteCount(), 11 * sizeof(float));
+}
+
+/** @brief Misowned, missing, overflowing or physically truncated rows fail closed. */
+TEST(PrefixTerminalLogitsSlice, InvalidVocabularyOrStorageIsRejected)
+{
+    const auto reject = [](PrefixLogitsVocabularyRange source, PrefixLogitsVocabularyRange archive,
+                           size_t bytes)
+    { EXPECT_THROW(PrefixTerminalLogitsSlice::resolve(source, archive, bytes), std::invalid_argument); };
+    reject({0, 0}, {0, 1}, 4);
+    reject({0, 4}, {0, 0}, 16);
+    reject({4, 4}, {3, 1}, 16);
+    reject({4, 4}, {8, 1}, 16);
+    reject({4, 4}, {6, 3}, 16);
+    reject({0, 4}, {0, 4}, 15);
+    reject({0, 4}, {0, 4}, 12);
+    constexpr size_t max = std::numeric_limits<size_t>::max();
+    reject({max, 1}, {max, 1}, 4);
+    reject({0, 8}, {max, 2}, 32);
+    reject({0, max / sizeof(float) + 1}, {0, 1}, max - max % sizeof(float));
+}
+
+/** @brief One pre-tail frontier preserves cache/routing alignment without overflow. */
+TEST(Test__PrefixStateSnapshot, ReusableCheckpointRespectsLiveAndStableBoundaries)
+{
+    PrefixLookupResult admission;
+    admission.supported = admission.cache_enabled = true;
+    admission.block_size = 64;
+    admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    EXPECT_EQ(admission.reusablePrefillCheckpoint(365, 0), 320);
+    EXPECT_EQ(admission.reusablePrefillCheckpoint(128, 0), 64);
+    EXPECT_EQ(admission.reusablePrefillCheckpoint(129, 64), 128);
+    EXPECT_EQ(admission.reusablePrefillCheckpoint(365, 0, 128), 256);
+    EXPECT_EQ(admission.reusablePrefillCheckpoint(365, 0, 96), 192);
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 320));
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 365));
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(64, 0));
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(0, 0));
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 0, 512));
+    admission.block_size = std::numeric_limits<int>::max() - 1;
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(
+        std::numeric_limits<int>::max(), 0, std::numeric_limits<int>::max()));
+}
+
+/** @brief Disabled, unsupported, and attention-only caches retain one terminal harvest. */
+TEST(Test__PrefixStateSnapshot, ReusableCheckpointRequiresRecurrentCacheAdmission)
+{
+    PrefixLookupResult admission;
+    admission.block_size = 64;
+    admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 0));
+    admission.supported = true;
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 0));
+    admission.cache_enabled = true;
+    ASSERT_TRUE(admission.reusablePrefillCheckpoint(365, 0));
+    admission.checkpoint_policy = PrefixCheckpointPolicy::TerminalOnly;
+    EXPECT_FALSE(admission.reusablePrefillCheckpoint(365, 0));
+}
+
+/** @brief An earlier recurrent image owns its own terminal row when ranks clamp. */
+TEST(Test__PrefixStateSnapshot, ClampedToRetainsEarlierCheckpointTerminalState)
+{
+    PrefixLookupResult hit;
+    hit.supported = hit.cache_enabled = true;
+    hit.block_size = 4;
+    hit.cached_tokens = 9;
+    hit.has_terminal_hidden = hit.has_terminal_logits = true;
+    hit.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    hit.blocks.push_back(makeBlock(0, 0, 4, false, true, false, false));
+    hit.blocks.push_back(makeBlock(1, 4, 4, true, true, true, true));
+    hit.blocks.push_back(makeBlock(2, 8, 1, true, true, true, true));
+    const auto clamped = hit.clampedTo(8);
+    ASSERT_EQ(clamped.cached_tokens, 8);
+    EXPECT_TRUE(clamped.has_terminal_hidden);
+    EXPECT_TRUE(clamped.has_terminal_logits);
+    EXPECT_EQ(clamped.checkpoint_policy, PrefixCheckpointPolicy::ReusableBoundary);
+}
 
 TEST(Test__PrefixStateSnapshot, ClampedToKeepsTerminalPartialBlock)
 {
