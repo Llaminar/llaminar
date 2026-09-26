@@ -882,3 +882,44 @@ core; it is not suppressed or counted as a healthy inference certificate.
 The final unprofiled Unit/preflight and model checks require a fresh, separate
 strict driver observation before publication. PR completion remains conditional
 on the remote image gate and auto-merge, not these focused results alone.
+
+### Shipped-target completion and test-image dependency follow-up
+
+Commit `0a9e26db0` passed the complete local gate: 673 Unit tests in 74.87
+seconds and 422 production-preflight tests in 1,084.09 seconds. Separate
+unprofiled driver observation reported zero new GPU driver findings. Against
+the preserved `559aadbe2` Release core, the final 512-token/256-generation
+CUDA cohort measured 1,713.17 → 1,746.43 tok/s prefill and 279.37 → 278.74
+tok/s decode. All 2,304 compared token IDs agreed across the before/after,
+serial/dynamic and retained prose-control comparisons. Both Integration and
+Release complete kernel translation units compiled for SM80/86/89/90.
+
+PR #11's next image attempt (`36259886704`) failed before compilation because
+the newly admitted MoE preflight harness links ROCTX. The full developer SDK
+contained that package; the minimal image did not. This is a test dependency
+failure, not another kernel spill or inference regression. Both annotation
+consumers now use the required CMake imported package rather than an unchecked
+absolute DSO path. A shared test-only installer supplies the small annotation
+package to both builder and test runner, after the expensive toolchain layers;
+the serving image is unchanged.
+
+The two packaging policy checks were first observed red, then green. A native
+annotation API regression is also explicitly in production preflight. A
+diagnostic container from the existing minimal AVX512 test image reproduced
+both missing-package configuration failure and missing-DSO startup failure;
+the actual installer then made configuration and native execution pass. Only
+the 259-kB ROCTX package was downloaded (1.6 MB installed); its registration
+dependency was already present. This proof does not replace the next full
+image gate. `/tmp/llaminar-roctx-image-proof.log` retains its output.
+
+The follow-up audit caught a second image-boundary issue before another CI
+attempt: the new negative compiler probes were registered as runtime tests,
+but the installed runner intentionally strips SDKs. Their compilation now
+belongs to CMake's preflight dependency graph. All 33 real compiler outcomes
+per backend are retained in source-bound proofs; installed preflight checks
+identity, complete case coverage, expected diagnostics, exit status and object
+retirement. Missing SDKs do not trigger an alternate execution path. The
+compiler-less minimal-image diagnostic verified both actual proofs, and the
+unit/preflight evidence suite rejects stale, incomplete and wrong-failure
+proofs. The local full gate was stopped intentionally after this audit, not
+reported as passed. It must be refreshed for the finished slice.

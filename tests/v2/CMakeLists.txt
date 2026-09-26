@@ -5,6 +5,14 @@
 
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
+# The profiling annotations belong only to test/tuning executables. Use the
+# package's imported target so missing headers/libraries fail during configure,
+# rather than handing Ninja an unchecked SDK filename. A serving-only Release
+# build does not enter this directory and has no annotation dependency.
+if(HAVE_ROCM)
+    find_package(rocprofiler-sdk-roctx CONFIG REQUIRED)
+endif()
+
 # =============================================================================
 # Linker Workaround for Circular Static Library Dependencies
 # =============================================================================
@@ -3110,6 +3118,29 @@ set_tests_properties(V2_Integration_HIPRuntimePackaging PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;ROCm;Regression"
     TIMEOUT 30
 )
+add_test(NAME V2_Integration_ROCmAnnotationPackaging
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+            InfrastructureTests.test_rocm_test_dependency_installer_declares_only_annotation_package
+            InfrastructureTests.test_rocm_annotation_dependency_is_test_only_and_shared_with_builder
+)
+set_tests_properties(V2_Integration_ROCmAnnotationPackaging PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;ROCm;Regression"
+    TIMEOUT 30
+)
+if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
+    # Exercise the actual ELF dependency in installed images, without requiring
+    # a profiler, GPU initialization or a performance measurement.
+    add_executable(v2_integration_rocm_annotation_runtime
+        integration/packaging/Test__ROCmAnnotationRuntime.cpp)
+    target_link_libraries(v2_integration_rocm_annotation_runtime PRIVATE
+        GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
+    add_v2_test(V2_Integration_ROCmAnnotationRuntime
+        COMMAND $<TARGET_FILE:v2_integration_rocm_annotation_runtime>
+        LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;ROCm;Regression"
+        NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30
+    )
+endif()
 
 add_test(NAME V2_Unit_DevelopImageGate
     COMMAND ${Python3_EXECUTABLE}
@@ -3354,15 +3385,39 @@ set_tests_properties(V2_Integration_GPUSpillEvidence PROPERTIES
 )
 foreach(V2_SPILL_LANGUAGE CUDA HIP)
     if(CMAKE_${V2_SPILL_LANGUAGE}_COMPILER)
-        add_test(NAME V2_Integration_GPUSpillCompilation_${V2_SPILL_LANGUAGE}
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/integration/build/test_gpu_spill_compilation.py
+        set(V2_SPILL_PROOF "${CMAKE_CURRENT_BINARY_DIR}/v2_gpu_spill_compilation_${V2_SPILL_LANGUAGE}.json")
+        set(V2_SPILL_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/integration/build/test_gpu_spill_compilation.py")
+        # Compiler probes are build work. Runtime-derived installed test images
+        # have no SDK, so preflight verifies their complete source-bound proof.
+        # Changes to policy, probe, compiler or target set rerun the real probes.
+        add_custom_command(OUTPUT "${V2_SPILL_PROOF}"
+            COMMAND ${Python3_EXECUTABLE} "${V2_SPILL_SCRIPT}" compile
+                --report "${V2_SPILL_PROOF}"
                 --language ${V2_SPILL_LANGUAGE}
                 --compiler ${CMAKE_${V2_SPILL_LANGUAGE}_COMPILER}
                 --architectures "${CMAKE_${V2_SPILL_LANGUAGE}_ARCHITECTURES}"
-                --cmake ${CMAKE_COMMAND}
-                --ninja ${CMAKE_MAKE_PROGRAM}
+                --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
+            DEPENDS "${V2_SPILL_SCRIPT}"
+                integration/build/CMakeLists.txt
+                integration/build/gpu_spill_probe.cu
+                integration/build/gpu_spill_probe.hip
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/GpuSpillGuard.cmake
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/build/gpu_spill_guard.py
+                ${CMAKE_${V2_SPILL_LANGUAGE}_COMPILER}
+            VERBATIM
         )
+        add_custom_target(v2_gpu_spill_compilation_${V2_SPILL_LANGUAGE}
+            DEPENDS "${V2_SPILL_PROOF}")
+        add_test(NAME V2_Integration_GPUSpillCompilation_${V2_SPILL_LANGUAGE}
+            COMMAND ${Python3_EXECUTABLE}
+                "${V2_SPILL_SCRIPT}" verify --report "${V2_SPILL_PROOF}"
+                --language ${V2_SPILL_LANGUAGE}
+                --compiler ${CMAKE_${V2_SPILL_LANGUAGE}_COMPILER}
+                --architectures "${CMAKE_${V2_SPILL_LANGUAGE}_ARCHITECTURES}"
+        )
+        set_property(GLOBAL PROPERTY
+            V2_TEST_BUILD_TARGETS_V2_Integration_GPUSpillCompilation_${V2_SPILL_LANGUAGE}
+            v2_gpu_spill_compilation_${V2_SPILL_LANGUAGE})
         set_tests_properties(V2_Integration_GPUSpillCompilation_${V2_SPILL_LANGUAGE} PROPERTIES
             LABELS "V2;Integration;ProductionTestPreflight;Build;Regression"
             TIMEOUT 120
@@ -7419,7 +7474,7 @@ if(HAVE_CUDA)
 endif()
 if(HAVE_ROCM)
     target_link_libraries(v2_perf_moe_verifier_prefill
-        ${ROCM_PATH}/lib/librocprofiler-sdk-roctx.so)
+        rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
 endif()
 add_v2_test(V2_Perf_MoEVerifierPrefill
     COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
@@ -15362,7 +15417,7 @@ if(HAVE_ROCM)
         GTest::gtest_main
         OpenMP::OpenMP_CXX
         roc::hipblas
-        ${ROCM_PATH}/lib/librocprofiler-sdk-roctx.so
+        rocprofiler-sdk-roctx::rocprofiler-sdk-roctx
     )
     target_include_directories(v2_perf_native_vnni_throughput PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)

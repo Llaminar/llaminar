@@ -171,6 +171,22 @@ archives, or duplicate Release build. Building it first imports the runtime
 layers which the later publication target reuses. These are compact diagnostics,
 not a cache upload; no BuildKit or ccache payload is sent to GitHub.
 
+Native kernel harnesses also need the lightweight ROCTX annotation ABI even
+when preflight selects only functional checks. The builder and test runner
+use `scripts/docker/install-rocm-test-deps.sh` for that same small package
+closure. Its layer follows the expensive toolchain cache boundary; neither the
+serving image nor its inference dependency set acquires a profiler. CMake
+validates the imported package before compilation, and the annotation runtime
+preflight test calls the actual installed shared library without a GPU.
+
+Adversarial spill-compiler probes execute as dependencies of the preflight
+build target in the compiler stage. Their source-bound JSON proofs retain all
+Release, Integration, Debug, and rebuild outcomes. The installed preflight
+revalidates that complete evidence against its own source, configured compiler
+identity and architecture set; it never attempts to invoke stripped SDK tools
+or treats missing evidence as a skipped test. These small proofs are part of
+the same sealed test-workspace inventory as the executable regressions.
+
 The workflow deliberately selects Buildx's `docker-container` driver rather
 than the default Docker driver: the latter cannot export the local cache
 backend at all. `llaminar-ci` is the only CI BuildKit worker and remains on the

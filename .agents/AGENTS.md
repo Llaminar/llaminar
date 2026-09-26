@@ -314,15 +314,25 @@ call frames are distinct from register spills; Debug is not a performance gate.
 Integration retains symbols but disables HIP's debug-unwind-only register saves,
 which otherwise introduce scratch traffic absent from optimized Release code.
 Full intrusive device call-frame unwinding remains available in Debug.
-The model-free `GPUSpillCompilation` preflight tests prove spilling kernels and
-device helpers fail, while register-only moves and deliberate-local-memory
-kernels pass with the actual compilers.
+The model-free `GPUSpillCompilation` build dependencies prove spilling kernels
+and device helpers fail, while register-only moves and deliberate-local-memory
+kernels pass with the actual compilers. Preflight verifies the complete
+source/compiler/architecture-bound proof, including every rebuild outcome.
+Missing or stale evidence fails; installed test runners never need to carry a
+compiler SDK or silently skip compilation-policy coverage.
 
 Spill results are architecture-specific. Before publishing GPU kernel or
 compiler-resource changes, compile the complete architecture set declared by
 the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
+
+ROCm test/tuning builds also require the lightweight `rocprofiler-sdk-roctx`
+annotation package. `scripts/docker/install-rocm-test-deps.sh` installs that
+closure from the configured ROCm repository in both the compiler builder and
+the installed test runner. A full development SDK already provides it. CMake
+requires the package's imported target; do not hard-code an unchecked library
+filename or add the profiler toolchain to the production serving image.
 
 Use an out-of-tree Ninja build and unrestricted build parallelism. The
 container image and workspace environment pin the same Ninja release. Resolve

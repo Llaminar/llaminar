@@ -2,6 +2,8 @@
 """Device-free tests of strict GPU spill evidence and compiler-output ownership."""
 
 import importlib.util
+import argparse
+import copy
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +17,10 @@ SPEC = importlib.util.spec_from_file_location("gpu_spill_guard", ROOT / "scripts
 guard = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = guard
 SPEC.loader.exec_module(guard)
+PROOF_SPEC = importlib.util.spec_from_file_location(
+    "gpu_spill_compilation", ROOT / "tests/v2/integration/build/test_gpu_spill_compilation.py")
+proof = importlib.util.module_from_spec(PROOF_SPEC)
+PROOF_SPEC.loader.exec_module(proof)
 
 
 def metadata(name="kernel", sgpr="0", vgpr="0", private="0", dynamic="false"):
@@ -208,6 +214,71 @@ class AllocationTest(unittest.TestCase):
                      self.record(slots=[("Spill", -1)])):
             with self.subTest(text=text), self.assertRaises(guard.SpillGuardError):
                 guard.allocation_evidence(text)
+
+
+class CompilerProofTest(unittest.TestCase):
+    """Installed preflight verifies compiler evidence without needing SDKs."""
+
+    @staticmethod
+    def report(language="HIP"):
+        """Synthetic evidence tests admission only, never certifies a compiler."""
+        observations = []
+        for config, variant, attempt in proof.cases():
+            rejected = config != "Debug" and variant in ("spill", "helper")
+            observations.append({
+                "config": config, "variant": variant, "attempt": attempt,
+                "returncode": 1 if rejected else 0,
+                "objects_present": not rejected,
+                "diagnostic": ("register spills are forbidden; Registers are spilled" if rejected
+                               else "scalar-to-vector register moves; no memory spill"),
+            })
+        return {"schema": 1, "language": language, "compiler": "/absent/compiler",
+                "architectures": "a;b", "compiler_version": "fixture compiler",
+                "sources": proof.source_identity(), "observations": observations}
+
+    def test_installed_verification_never_invokes_missing_compilers(self):
+        for language in ("CUDA", "HIP"):
+            with self.subTest(language=language), patch.object(
+                    proof.subprocess, "run", side_effect=AssertionError("must not compile")), \
+                    patch.object(proof.subprocess, "check_output",
+                                 side_effect=AssertionError("must not probe compiler")):
+                proof.verify_report(self.report(language), language, "/absent/compiler", "a;b")
+
+    def test_missing_stale_foreign_and_partial_evidence_fail(self):
+        original = self.report()
+        changes = [(key, value) for key, value in (
+            ("schema", 0), ("language", "CUDA"), ("compiler", "/other/compiler"),
+            ("architectures", "a"), ("compiler_version", ""), ("sources", {}),
+            ("observations", original["observations"][:-1]),
+            ("observations", original["observations"] + original["observations"][:1]))]
+        for key, value in changes:
+            report = {**original, key: value}
+            with self.subTest(key=key), self.assertRaises(RuntimeError):
+                proof.verify_report(report, "HIP", "/absent/compiler", "a;b")
+
+    def test_wrong_rejection_or_retained_object_cannot_pass(self):
+        original = self.report()
+        failed_index = next(i for i, row in enumerate(original["observations"])
+                            if row["returncode"] != 0)
+        for index, key, value in ((0, "returncode", 1), (0, "objects_present", False),
+                                  (failed_index, "diagnostic", "compiler missing"),
+                                  (failed_index, "objects_present", True),
+                                  (failed_index, "returncode", 0)):
+            report = copy.deepcopy(original)
+            report["observations"][index][key] = value
+            with self.subTest(index=index, key=key), self.assertRaises(RuntimeError):
+                proof.verify_report(report, "HIP", "/absent/compiler", "a;b")
+
+    def test_rebuild_failure_retires_old_successful_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "proof.json"
+            path.write_text("old successful proof")
+            args = argparse.Namespace(report=path, language="HIP", compiler="missing",
+                                      architectures="gfx906")
+            with patch.object(proof.subprocess, "check_output", side_effect=FileNotFoundError), \
+                    self.assertRaises(FileNotFoundError):
+                proof.compile_report(args)
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":
