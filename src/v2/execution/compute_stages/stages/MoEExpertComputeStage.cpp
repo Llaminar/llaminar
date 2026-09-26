@@ -7009,7 +7009,10 @@ namespace llaminar2
          * routing decisions.  This is still a grouped implementation: one device
          * grouping setup and one grouped prefill pipeline cover all verifier rows.
          */
-        if (!kernel->prepareSharedExpertPrefillGroup(seq_len))
+        if (!kernel->prepareSharedExpertPrefillGroup(
+                params_.active_row_count_device
+                    ? DeviceRowRange::deviceCounted(seq_len, params_.active_row_count_device)
+                    : DeviceRowRange::fullyActive(seq_len)))
         {
             LOG_ERROR("[MoEExpertComputeStage::executeSafeCombinedSharedVerifierComposite] "
                       "shared grouped verifier setup failed");
@@ -10280,7 +10283,10 @@ namespace llaminar2
                       << " intermediate=" << intermediate);
             return false;
         }
-        if (!kernel->prepareSharedExpertPrefillGroup(params_.seq_len))
+        if (!kernel->prepareSharedExpertPrefillGroup(
+                params_.active_row_count_device
+                    ? DeviceRowRange::deviceCounted(params_.seq_len, params_.active_row_count_device)
+                    : DeviceRowRange::fullyActive(params_.seq_len)))
         {
             LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert verifier group"
                       << " device=" << params_.device_id.to_string()
@@ -10571,7 +10577,10 @@ namespace llaminar2
                     kernel, params_.d_model, params_.intermediate) ||
                 !ensureSharedGroupedDownDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
-                !kernel->prepareSharedExpertPrefillGroup(params_.seq_len))
+                !kernel->prepareSharedExpertPrefillGroup(
+                    params_.active_row_count_device
+                        ? DeviceRowRange::deviceCounted(params_.seq_len, params_.active_row_count_device)
+                        : DeviceRowRange::fullyActive(params_.seq_len)))
             {
                 LOG_ERROR("[SharedExpertFFNStage] Failed to prepare the fixed "
                           "grouped verifier launch state before graph capture");

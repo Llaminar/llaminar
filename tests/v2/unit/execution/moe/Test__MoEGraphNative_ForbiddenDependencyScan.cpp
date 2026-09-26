@@ -2140,9 +2140,9 @@ namespace llaminar2::test
         ASSERT_FALSE(shared_kernel.empty()) << cuda_kernels_path;
         EXPECT_NE(shared_kernel.find("int *__restrict__ original_to_grouped"),
                   std::string::npos);
-        EXPECT_NE(shared_kernel.find("original_to_grouped[idx] = idx;"),
+        EXPECT_NE(shared_kernel.find("original_to_grouped[idx] = idx < active_rows ? idx : -1;"),
                   std::string::npos)
-            << "CUDA shared verifier grouping must publish the same identity map ROCm uses";
+            << "CUDA shared verifier grouping must map live rows identically and invalidate padded rows";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -3749,15 +3749,15 @@ namespace llaminar2::test
             << "ROCm decode apply poll counter must be gated by CollectLoadStats.";
 
         const size_t cuda_apply_kernel =
-            cuda_kernel_impl.find("__global__ void apply_rebalance_arrivals_kernel(");
+            cuda_kernel_impl.find("void apply_rebalance_arrivals_kernel(");
         const size_t rocm_apply_kernel =
-            rocm_kernel_impl.find("__global__ void apply_rebalance_arrivals_kernel(");
+            rocm_kernel_impl.find("void apply_rebalance_arrivals_kernel(");
         ASSERT_NE(cuda_apply_kernel, std::string::npos);
         ASSERT_NE(rocm_apply_kernel, std::string::npos);
         const size_t cuda_next_kernel =
-            cuda_kernel_impl.find("__global__ void", cuda_apply_kernel + 1);
+            cuda_kernel_impl.find("__global__", cuda_apply_kernel + 1);
         const size_t rocm_next_kernel =
-            rocm_kernel_impl.find("__global__ void", rocm_apply_kernel + 1);
+            rocm_kernel_impl.find("__global__", rocm_apply_kernel + 1);
         ASSERT_NE(cuda_next_kernel, std::string::npos);
         ASSERT_NE(rocm_next_kernel, std::string::npos);
         const std::string cuda_apply_body =
@@ -6941,7 +6941,7 @@ namespace llaminar2::test
             const std::string preplan = contents.substr(
                 preplan_begin, publisher_begin - preplan_begin);
             const size_t publisher_end = contents.find(
-                "__global__ void device_rebalance_dynamic_ownership_controller_kernel(",
+                "void device_rebalance_dynamic_ownership_controller_kernel(",
                 publisher_begin);
             ASSERT_NE(publisher_end, std::string::npos) << path;
             const std::string publisher = contents.substr(
@@ -7060,7 +7060,7 @@ namespace llaminar2::test
         {
             const size_t begin = contents.find("DeviceMoEExpertDirectoryEntryView make_rebalance_source_entry(");
             ASSERT_NE(begin, std::string::npos) << backend << " source entry helper missing";
-            const size_t end = contents.find("__global__ void pack_rebalance_directory_kernel", begin);
+            const size_t end = contents.find("void pack_rebalance_directory_kernel", begin);
             ASSERT_NE(end, std::string::npos) << backend << " source entry helper end marker missing";
             const std::string body = contents.substr(begin, end - begin);
 
@@ -8805,7 +8805,7 @@ namespace llaminar2::test
         auto require_projected_commands =
             [](const std::string &contents, const char *backend)
         {
-            const size_t begin = contents.find("__global__ void pack_rebalance_source_descriptors_kernel(");
+            const size_t begin = contents.find("void pack_rebalance_source_descriptors_kernel(");
             ASSERT_NE(begin, std::string::npos) << backend << " compact source descriptor kernel missing";
             // Inlining/launch annotations are implementation details. Delimit
             // by the next function's name so compiler tuning cannot hide the

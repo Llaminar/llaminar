@@ -91,8 +91,10 @@ namespace llaminar2
         // Arithmetic is part of restart compatibility, not just physical layout.
         // V1 could persist chunk-mean AQ8 bases (and downstream states), which
         // cannot certify the request-partition-invariant first-input contract.
-        // Retain old archives on disk, but never admit them under the new key.
-        hash = fnvUpdateString(hash, "prefix-cache-v2");
+        // V2 could also persist rank-zero terminal logits in every TP shard
+        // after a full-vocabulary publication. V3 archives the owned vocabulary
+        // interval. Retain old files, but never admit their corrupted rows.
+        hash = fnvUpdateString(hash, "prefix-cache-v3");
 
         const std::array<std::pair<const char *, uint64_t>, 7> ordered_parts{{
             {"model", parts.model},

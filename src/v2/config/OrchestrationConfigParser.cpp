@@ -2686,7 +2686,7 @@ namespace llaminar2
             .long_name = "--mtp-verify-mode",
             .category = "MTP",
             .value_label = "<mode>",
-            .description = "MTP verification mode: greedy, speculative-sampling",
+            .description = "MTP verification mode: speculative-sampling (default; includes greedy requests), greedy (greedy requests only)",
             .valid_values = {"greedy", "speculative-sampling"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)

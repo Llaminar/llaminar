@@ -4637,8 +4637,10 @@ __global__ void rocm_prepare_device_generation_transaction_budget_kernel(
  * One lane owns one request transaction.  Combining response-ledger commit
  * with publication derivation removes a dispatch from every MTP transaction
  * and makes the serial-visible response/state boundary indivisible.
+ * The launcher uses one 64-lane wave per batch tile; advertise that exact
+ * bound so the compiler need not budget registers for 1024 work items.
  */
-__global__ void
+__global__ __launch_bounds__(64) void
 rocm_commit_device_generation_and_derive_speculative_publication_metadata_kernel(
     const int32_t *__restrict__ compact_tokens,
     int output_token_stride,

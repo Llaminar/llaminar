@@ -48,6 +48,9 @@
 #include "ROCmMoEProductionPrefillOverlayGenerated.inc"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
 
+using llaminar2::rocm::ROCmMoEGroupedRouteAdmission;
+using llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy;
+
 // Local copy of DeviceNativeVNNIMatrixDesc to avoid pulling in x86-only headers
 // Must stay in sync with src/v2/tensors/TensorKernels.h
 struct DeviceNativeVNNIMatrixDesc
@@ -1476,8 +1479,12 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
-    const uint32_t* __restrict__ adaptive_tile_count)
+    const uint32_t* __restrict__ adaptive_tile_count,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    // Uniform device-owned admission precedes all barriers and weight reads.
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
+        return;
     static_assert(TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
                   "grouped-prefill gate/up supports row tiles 4/8/12/16");
@@ -1547,6 +1554,30 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
 
     __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
     __shared__ float staged_scales[TILE_M];
+    __shared__ int source_rows[TILE_M];
+
+    // Route ownership is immutable for this projection. Resolve it once, not
+    // twice per K block: besides avoiding repeated directory reads/divisions,
+    // this ends the lifetime of the route-table pointer and addressing policy
+    // before the long dot-product loop. Each participating row has one writer.
+    if (threadIdx.x < rows_in_tile)
+    {
+        const int grouped_slot = first_grouped_slot + threadIdx.x;
+        const int source_index = input_is_original_rows
+                                     ? group_token_indices[grouped_slot]
+                                     : grouped_slot;
+        const int input_row = input_is_original_rows && grouped_indices_are_route_slots
+                                  ? source_index / top_k
+                                  : source_index;
+        if (input_row < 0 ||
+            input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
+        {
+            moe_prefill_fail_fast_invalid_grouped_index();
+            return;
+        }
+        source_rows[threadIdx.x] = input_row;
+    }
+    __syncthreads();
     float totals[TILE_M] = {};
     const int blocks_per_partition =
         (blocks_per_row + k_partitions - 1) / k_partitions;
@@ -1577,21 +1608,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
             {
                 const int local_row = word >> 3;
                 const int group = word & 7;
-                const int grouped_slot = first_grouped_slot + local_row;
-                int input_row = grouped_slot;
-                if (input_is_original_rows)
-                {
-                    const int source_index = group_token_indices[grouped_slot];
-                    input_row = grouped_indices_are_route_slots
-                                    ? (source_index / top_k)
-                                    : source_index;
-                }
-                if (input_row < 0 ||
-                    input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
-                {
-                    moe_prefill_fail_fast_invalid_grouped_index();
-                    return;
-                }
+                const int input_row = source_rows[local_row];
                 const int32_t* input_words = reinterpret_cast<const int32_t*>(
                     A_int8 + static_cast<size_t>(input_row) * static_cast<size_t>(K) +
                     static_cast<size_t>(b) * 32u);
@@ -1601,21 +1618,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
                  local_row < rows_in_tile;
                  local_row += blockDim.x)
             {
-                const int grouped_slot = first_grouped_slot + local_row;
-                int input_row = grouped_slot;
-                if (input_is_original_rows)
-                {
-                    const int source_index = group_token_indices[grouped_slot];
-                    input_row = grouped_indices_are_route_slots
-                                    ? (source_index / top_k)
-                                    : source_index;
-                }
-                if (input_row < 0 ||
-                    input_row >= (input_is_original_rows ? seq_len : INT32_MAX))
-                {
-                    moe_prefill_fail_fast_invalid_grouped_index();
-                    return;
-                }
+                const int input_row = source_rows[local_row];
                 staged_scales[local_row] = scales_A_blockwise[
                     static_cast<size_t>(input_row) * static_cast<size_t>(blocks_per_row) +
                     static_cast<size_t>(b)];
@@ -1709,8 +1712,11 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     int N,
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
-    int num_experts)
+    int num_experts,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned))
+        return;
     static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
                   "route-owned grouped gate/up supports measured gfx906 column tiles");
     static_assert(!STAGE_IQ2_S_GRID || FMT == NVNNI_PF_IQ2_S,
@@ -1910,7 +1916,8 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     int N,
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
-    int num_experts)
+    int num_experts,
+    ROCmMoEGroupedRouteAdmission admission)
 {
     constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
     constexpr bool kStageActivation = K_LANES > 1;
@@ -1944,7 +1951,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
         N,
         K,
         k_partition_policy,
-        num_experts);
+        num_experts, admission);
 }
 
 /**
@@ -1975,7 +1982,8 @@ void launch_moe_grouped_gate_up_route_owned(
     int N,
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
-    int num_experts)
+    int num_experts,
+    ROCmMoEGroupedRouteAdmission admission)
 {
     if constexpr (FMT == NVNNI_PF_IQ2_S)
     {
@@ -1985,7 +1993,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, k_partition_policy, num_experts);
+                N, K, k_partition_policy, num_experts, admission);
         }
         else
         {
@@ -1993,7 +2001,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, k_partition_policy, num_experts);
+                N, K, k_partition_policy, num_experts, admission);
         }
     }
     else if constexpr (FMT == NVNNI_PF_Q6_K)
@@ -2002,7 +2010,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, k_partition_policy, num_experts);
+            N, K, k_partition_policy, num_experts, admission);
     }
     else
     {
@@ -2010,7 +2018,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, k_partition_policy, num_experts);
+            N, K, k_partition_policy, num_experts, admission);
     }
 }
 
@@ -2095,8 +2103,11 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     int K,
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
-    const uint32_t* __restrict__ adaptive_tile_count)
+    const uint32_t* __restrict__ adaptive_tile_count,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
+        return;
     static_assert(TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
                   "grouped-prefill down supports row tiles 4/8/12/16");
@@ -2272,8 +2283,12 @@ void moe_grouped_down_partials_ordered_publish_prefill_kernel(
     float* __restrict__ output,
     int seq_len,
     int top_k,
-    int d_model)
+    int d_model,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    // The unselected publisher must not overwrite the selected family's bytes.
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
+        return;
     constexpr int TILE_N = 64;
     const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
     const int token = static_cast<int>(blockIdx.y);
@@ -2473,8 +2488,11 @@ void moe_grouped_down_publish_original_token_ordered_prefill_kernel(
     int N,
     int K,
     int num_experts,
-    MoEPrefillSerialM1KPartitionPolicy k_partition_policy)
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned))
+        return;
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int token = blockIdx.y;
@@ -2540,8 +2558,11 @@ void moe_grouped_down_publish_canonical_routes_prefill_kernel(
     int N,
     int K,
     int num_experts,
-    MoEPrefillSerialM1KPartitionPolicy k_partition_policy)
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned))
+        return;
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int original_slot = blockIdx.y;
@@ -2587,8 +2608,11 @@ void moe_grouped_down_partials_canonical_publish_prefill_kernel(
     const float* __restrict__ grouped_weights,
     float* __restrict__ route_output,
     int total_slots,
-    int d_model)
+    int d_model,
+    ROCmMoEGroupedRouteAdmission admission)
 {
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
+        return;
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int original_slot = blockIdx.y;
@@ -3398,8 +3422,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         moe_prefill_single_codebook(gateup_codebook_mask);
     const int down_codebook =
         moe_prefill_single_codebook(down_codebook_mask);
-    const auto route_decision =
-        llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy({
+    const llaminar2::rocm::ROCmMoEGroupedPrefillRouteKey route_key{
             .gateup_codebook = static_cast<uint8_t>(gateup_codebook),
             .down_codebook = static_cast<uint8_t>(down_codebook),
             .hidden_size = d_model,
@@ -3407,12 +3430,21 @@ bool rocmMoE_grouped_prefill_pipeline(
             .expert_count = num_experts,
             .top_k = top_k,
             .rows = seq_len,
-        });
+        };
+    const auto route_decision =
+        llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy(route_key);
     if (!route_decision.valid())
         return false;
+    // Retain every family reachable by the device's group publication. A
+    // padded M=16 verifier with four live rows must not inherit the M=16
+    // prefill schedule. Both families borrow one predicate and one scratch
+    // arena; only the selected family writes on each replay.
+    const ROCmMoEGroupedRouteAdmission admission(
+        route_key, d_group_counts, d_group_offsets);
+    const bool use_route_owned =
+        admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
     const bool use_expert_row_tiles =
-        route_decision.strategy ==
-        llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled;
+        admission.maySelect(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
     const MoEPrefillPairConfig pair_config =
         use_expert_row_tiles && has_uniform_codebook_pair
             ? moe_prefill_select_pair_config(
@@ -3640,7 +3672,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     d_original_to_grouped, d_original_expert_ids, gate_descs, up_descs, \
                     d_scratch_gate, d_scratch_up, total_slots, seq_len, top_k, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy, num_experts); \
+                    gateup_k_partition_policy, num_experts, admission); \
             } while (0)
         #define LAUNCH_GATEUP_ADAPTIVE(FMT, TN) \
             do { \
@@ -3666,7 +3698,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     1, intermediate, d_model, \
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
-                        kMoEPrefillAdaptiveTile12CountWord); \
+                        kMoEPrefillAdaptiveTile12CountWord, admission); \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                     tile16_grid, expert_block, 0, hip_stream, \
@@ -3679,7 +3711,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     1, intermediate, d_model, \
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
-                        kMoEPrefillAdaptiveTile16CountWord); \
+                        kMoEPrefillAdaptiveTile16CountWord, admission); \
             } while (0)
         #define LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, TN) \
             do { \
@@ -3698,7 +3730,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy, num_experts, nullptr); \
+                    gateup_k_partition_policy, num_experts, nullptr, admission); \
             } while (0)
 
         #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
@@ -3734,9 +3766,10 @@ bool rocmMoE_grouped_prefill_pipeline(
         #define LAUNCH_GATEUP_IF_PRESENT(FMT) \
             do { \
                 if (gateup_codebook_mask & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
-                    if (!use_expert_row_tiles) { \
+                    if (use_route_owned) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
-                    } else { \
+                    } \
+                    if (use_expert_row_tiles) { \
                         const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
                             ? pair_config.gateup \
                             : moe_prefill_select_tile_config( \
@@ -3804,7 +3837,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         const auto* down_descs =
             static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
 
-        if (!use_expert_row_tiles)
+        if (use_route_owned)
         {
             /*
              * The codebook mask is immutable graph identity. A one-bit mask
@@ -3823,7 +3856,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                             d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
                             d_original_to_grouped, d_original_expert_ids, d_group_weights, \
                             d_canonical_route_contributions, total_slots, d_model, \
-                            intermediate, num_experts, down_k_partition_policy); \
+                            intermediate, num_experts, down_k_partition_policy, admission); \
                     } else { \
                         dim3 grid((d_model + TILE_N - 1) / TILE_N, seq_len); \
                         hipLaunchKernelGGL( \
@@ -3832,7 +3865,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                             d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
                             d_original_to_grouped, d_original_expert_ids, d_group_weights, \
                             d_output, seq_len, top_k, d_model, intermediate, num_experts, \
-                            down_k_partition_policy); \
+                            down_k_partition_policy, admission); \
                     } \
                 } while (0)
 
@@ -3876,7 +3909,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             #undef LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT
             #undef LAUNCH_ROUTE_OWNED_DOWN
         }
-        else
+        if (use_expert_row_tiles)
         {
             bool launched_down = false;
             #define LAUNCH_DOWN_EXPERT_TILED(FMT, TM, TN) \
@@ -3893,7 +3926,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_group_counts, d_group_offsets, \
                             reinterpret_cast<const uint32_t*>(d_group_work_directory), \
                             d_scratch_gate, candidate_directory_capacity, d_model, intermediate, \
-                            down_k_partition_policy, num_experts, nullptr); \
+                            down_k_partition_policy, num_experts, nullptr, admission); \
                 } while (0)
             #define LAUNCH_DOWN_ADAPTIVE(FMT, TN) \
                 do { \
@@ -3916,7 +3949,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_scratch_gate, adaptive_directory.tile12_capacity, d_model, intermediate, \
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
-                            kMoEPrefillAdaptiveTile12CountWord); \
+                            kMoEPrefillAdaptiveTile12CountWord, admission); \
                     hipLaunchKernelGGL( \
                         HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                         tile16_grid, expert_block, 0, hip_stream, \
@@ -3926,7 +3959,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_scratch_gate, adaptive_directory.tile16_capacity, d_model, intermediate, \
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
-                            kMoEPrefillAdaptiveTile16CountWord); \
+                            kMoEPrefillAdaptiveTile16CountWord, admission); \
                 } while (0)
 
             #define DISPATCH_DOWN_TILE_N(FMT, TM, CONFIG) \
@@ -4015,7 +4048,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     d_group_weights,
                     d_canonical_route_contributions,
                     total_slots,
-                    d_model);
+                    d_model, admission);
             }
             else
             {
@@ -4026,7 +4059,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     moe_grouped_down_partials_ordered_publish_prefill_kernel,
                     publish_grid, block, 0, hip_stream,
                     d_scratch_gate, d_original_to_grouped, d_group_weights,
-                    d_output, seq_len, top_k, d_model);
+                    d_output, seq_len, top_k, d_model, admission);
             }
         }
     }

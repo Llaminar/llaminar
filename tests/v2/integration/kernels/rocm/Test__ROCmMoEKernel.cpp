@@ -24171,7 +24171,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGroupedPrefillMatchesSequentialPath)
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel, seq_len, d_model, intermediate, num_experts, top_k);
-    ASSERT_TRUE(moe_kernel.prepareSharedExpertPrefillGroup(seq_len));
+    ASSERT_TRUE(moe_kernel.prepareSharedExpertPrefillGroup(DeviceRowRange::fullyActive(seq_len)));
     const int gateup_table = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
         &gate_desc, &up_desc, num_experts, d_model, intermediate);
     ASSERT_GE(gateup_table, 0);
@@ -25203,7 +25203,7 @@ void runSharedExpertVerifierPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         auto grouped_output = TestTensorFactory::createFP32(
             {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
         ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream));
-        ASSERT_TRUE(moe_kernel.prepareSharedExpertPrefillGroup(seq_len));
+        ASSERT_TRUE(moe_kernel.prepareSharedExpertPrefillGroup(DeviceRowRange::fullyActive(seq_len)));
         ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
             hidden.get(),
             grouped_output.get(),

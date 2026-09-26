@@ -1127,6 +1127,10 @@ namespace llaminar2
 
     std::pair<bool, double> BenchmarkRunner::runPrefill(const std::vector<int> &tokens)
     {
+        // Request admission resolves the MTP verification/depth policy during
+        // prefill. Publish sampling first, as serving does, so the first request
+        // and every warmed/reset request use the same immutable sampling law.
+        runner_->setDecodeSamplingParams(decode_sampling_params_);
         /*
          * Throughput benchmarks have a fixed `-n` response contract and every
          * decode invocation below deliberately ignores model stop tokens.  That
@@ -1221,7 +1225,6 @@ namespace llaminar2
         bool ignore_stop_tokens)
     {
         (void)eos_token_id;
-        Sampler sampler(42); // Fixed seed for reproducibility
         DecodeRunResult result;
         result.generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
         result.generated_token_ids.reserve(static_cast<size_t>(std::max(0, n_tokens)));
@@ -1276,7 +1279,6 @@ namespace llaminar2
         if (decode_request_batch_ > 1)
         {
             const int request_batch = decode_request_batch_;
-            runner_->setDecodeSamplingParams(decode_sampling_params_);
 
             if (!runner_->supportsDecodeStepBatchForBenchmark(request_batch))
             {
@@ -1458,8 +1460,6 @@ namespace llaminar2
 
         if (runner_->supportsDecodeStep())
         {
-            runner_->setDecodeSamplingParams(decode_sampling_params_);
-
             while (tokens_generated < n_tokens)
             {
                 const auto step_start = std::chrono::high_resolution_clock::now();
@@ -1852,19 +1852,31 @@ namespace llaminar2
         runner_->setSkipLogitsGatherDecode(has_gpu);
 
         decode_sampling_params_ = SamplingParams{};
-        decode_sampling_params_.temperature = 0.0f;
+        // Sampling is request intent, independent of whether speculation is
+        // enabled. Replacing the serial control with greedy sampling both
+        // changes its workload and makes the exported configuration untrue.
+        // The production runner owns verification-mode compatibility checks.
+        decode_sampling_params_.temperature = config.temperature;
+        decode_sampling_params_.top_k = config.top_k;
+        decode_sampling_params_.top_p = config.top_p;
         decode_sampling_params_.seed = config.seed >= 0
                                            ? static_cast<unsigned int>(config.seed)
                                            : 42u;
         decode_request_batch_ = config.mtp.enabled
                                     ? std::max(1, config.mtp.max_request_batch)
                                     : 1;
-        if (config.mtp.enabled &&
-            config.mtp.verify_mode == MTPVerifyMode::SpeculativeSampling)
+        if (n_decode > 0 && !decode_sampling_params_.is_greedy() &&
+            !runner_->supportsDecodeStep())
         {
-            decode_sampling_params_.temperature = config.temperature;
-            decode_sampling_params_.top_k = config.top_k;
-            decode_sampling_params_.top_p = config.top_p;
+            // Low-level kernel fixtures expose only the explicit greedy probe
+            // below. They cannot certify a stochastic production request by
+            // silently taking argmax. Public application adapters implement
+            // the complete decode surface for both ordinary and MTP requests.
+            last_failure_reason_ =
+                "stochastic benchmark sampling requires the production decode-step surface; "
+                "this low-level runner only supports an explicit greedy benchmark";
+            LOG_ERROR(last_failure_reason_);
+            return capture_and_return();
         }
 
         // ========================================================================

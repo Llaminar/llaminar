@@ -8,6 +8,7 @@
  */
 
 #include "execution/moe/MoEOverlayDeviceControllerProtocol.h"
+#include "execution/moe/MoEOverlayDeviceControllerDispatch.h"
 #include "execution/moe/MoEOverlayWorkerDrainProtocol.h"
 
 #include <gtest/gtest.h>
@@ -19,6 +20,60 @@
 
 namespace llaminar2::test
 {
+
+    /** Each graph action selects itself exactly once; no runtime policy runs here. */
+    TEST(Test__MoEOverlayDeviceControllerProtocol, CapturedActionDispatchIsExact)
+    {
+        using Action = MoEOverlayDeviceControllerAction;
+        constexpr std::array actions{
+            Action::BeginTransaction,
+            Action::PublishGroupSnapshot,
+            Action::PublishCommand,
+            Action::AcknowledgePrepared,
+            Action::BeginCommit,
+            Action::AcknowledgePublished,
+            Action::PublishAdmission,
+            Action::BeginDynamicRetirement,
+            Action::AcknowledgeRetired,
+            Action::CompleteDynamicRetirement,
+            Action::BeginLLEPRestore,
+            Action::AcknowledgeLLEPRestored,
+            Action::CompleteLLEPRestore,
+            Action::AuthorStaticPolicy,
+            Action::AwaitTransactionComplete,
+            Action::AuthorDynamicPolicy,
+            Action::PublishParticipantSnapshot,
+            Action::ApplyRuntimeCandidate,
+            Action::PublishRuntimeCandidate,
+            Action::PublishRuntimeRetirement,
+            Action::AwaitRuntimeCommit,
+            Action::AwaitRuntimeRetirement,
+            Action::PublishRuntimeRetirementReadiness,
+            Action::CompleteEmptyDynamicDecision,
+            Action::AuthorPreparedContextRestore,
+        };
+        for (const auto expected : actions)
+        {
+            int calls = 0;
+            EXPECT_TRUE(dispatchMoEOverlayControllerAction(
+                expected, [&]<Action Actual>()
+                {
+                    ++calls;
+                    EXPECT_EQ(Actual, expected);
+                    return true;
+                }));
+            EXPECT_EQ(calls, 1);
+            EXPECT_FALSE(dispatchMoEOverlayControllerAction(
+                expected, []<Action>() { return false; }));
+        }
+        for (const auto invalid : {Action::Invalid, static_cast<Action>(0xffffffffu)})
+        {
+            int calls = 0;
+            EXPECT_FALSE(dispatchMoEOverlayControllerAction(
+                invalid, [&]<Action>() { ++calls; return true; }));
+            EXPECT_EQ(calls, 0);
+        }
+    }
     namespace
     {
         /** Own one pristine shared record family and its bound protocol. */

@@ -311,6 +311,16 @@ RUN case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}:${LLAMINAR_TEST_RUNNER_INVENTO
         *) echo "Invalid test-runner inventory: matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}, inventory=${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
     esac
 
+# Some preflight regressions reuse the native kernel tuning harness. Its
+# ROCTX annotation dependency is test tooling, not an inference dependency.
+# Install it after the expensive toolchain cache boundary and use this same
+# small package closure in the installed test runner below.
+COPY scripts/docker/install-rocm-test-deps.sh /tmp/install-rocm-test-deps.sh
+RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+        bash /tmp/install-rocm-test-deps.sh; \
+    fi \
+ && rm /tmp/install-rocm-test-deps.sh
+
 COPY src ./src
 COPY tests ./tests
 COPY CMakeLists.txt ./CMakeLists.txt
@@ -626,6 +636,14 @@ RUN apt-get update \
       git \
       jq \
  && rm -rf /var/lib/apt/lists/*
+
+# The compiler-stage annotations must also resolve when sealed test binaries
+# execute here. This layer does not enter the production runtime image.
+COPY scripts/docker/install-rocm-test-deps.sh /tmp/install-rocm-test-deps.sh
+RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+        bash /tmp/install-rocm-test-deps.sh; \
+    fi \
+ && rm /tmp/install-rocm-test-deps.sh
 
 # CTest's sealed registration names the workspace-pinned Ninja by its absolute
 # /usr/local path. Copy that tiny exact executable rather than substituting the

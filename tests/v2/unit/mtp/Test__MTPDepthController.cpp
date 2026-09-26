@@ -1,11 +1,22 @@
+/**
+ * @file Test__MTPDepthController.cpp
+ * @brief Device-free proofs of depth admission and measured-policy transitions.
+ *
+ * Synthetic observations exercise bounds, budget truncation, hysteresis and
+ * generated policy independently of model execution. Learned startup tests
+ * retain the complete adaptive capacity: an economical initial depth is not
+ * an implicit ceiling. Captured backend tests prove the matching device ABI.
+ */
 #include <gtest/gtest.h>
 
 #include "execution/mtp/MTPDepthController.h"
+#include "execution/mtp/MTPDepthLearnedPolicy.h"
 
 using namespace llaminar2;
 
 namespace
 {
+    /** @brief Build an explicit, untrained policy for transition unit tests. */
     MTPDepthPolicyConfig dynamicConfig(
         int initial_depth,
         int max_depth,
@@ -28,6 +39,7 @@ namespace
         return config;
     }
 
+    /** @brief Create one untruncated transaction with an accepted-prefix count. */
     MTPDepthObservation observation(int depth, int accepted_prefix)
     {
         return MTPDepthObservation{
@@ -167,7 +179,7 @@ TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthUsesLearnedMoEGreedyLa
            "mode should warm-start there instead of probing through d2 first";
 }
 
-TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthKeepsROCmMoEStochasticAtDepthOne)
+TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthUsesRelearnedROCmMoEStochasticWinner)
 {
     MTPDepthPolicyConfig config;
     config.mode = MTPDepthPolicyMode::Dynamic;
@@ -175,7 +187,7 @@ TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthKeepsROCmMoEStochastic
     config.backend = MTPDepthPolicyBackend::ROCm;
     config.model_class = MTPDepthPolicyModelClass::MoE;
     config.min_depth = 1;
-    config.max_depth = 3;
+    config.max_depth = 0;
     config.initial_depth = 0;
     config.window_size = 16;
     config.min_samples = 4;
@@ -186,9 +198,69 @@ TEST(Test__MTPDepthController, GeneratedPolicyInitialDepthKeepsROCmMoEStochastic
         /*configured_draft_tokens=*/3,
         MTPVerifyMode::SpeculativeSampling);
 
-    EXPECT_EQ(controller.currentDepth(), 1)
-        << "the same generated warm-start path must respect stochastic lanes "
-           "whose fixed-depth evidence says d1 is the safest winner";
+    EXPECT_EQ(controller.currentDepth(), 3)
+        << "fresh fixed-depth evidence replaces the stale depth-one hold; "
+           "this is learned startup, not an authored depth override";
+    EXPECT_EQ(controller.minDepth(), 1);
+    EXPECT_EQ(controller.maxDepth(), 15);
+}
+
+/** @test Admission follows measured startup, without replacing explicit intent. */
+TEST(Test__MTPDepthController, LearnedStartupSelectionHonorsTableAndExplicitBounds)
+{
+    for (const auto &choice : kMTPGeneratedDepthPolicyStartups)
+    {
+        MTPDepthPolicyConfig config;
+        config.mode = MTPDepthPolicyMode::Dynamic;
+        config.use_generated_policy = true;
+        config.backend = choice.backend;
+        config.model_class = choice.model_class;
+        config.min_depth = 1;
+        config.max_depth = 0;
+        config.initial_depth = 0;
+        MTPDepthController automatic(config, 1, choice.verify_mode);
+        EXPECT_EQ(automatic.currentDepth(), choice.initial_depth);
+        EXPECT_EQ(automatic.minDepth(), 1);
+        EXPECT_EQ(automatic.maxDepth(), 15);
+
+        // Authored initialization and fixed execution remain separate intents.
+        config.initial_depth = 15;
+        MTPDepthController authored(config, 1, choice.verify_mode);
+        EXPECT_EQ(authored.currentDepth(), 15);
+        config.mode = MTPDepthPolicyMode::Fixed;
+        MTPDepthController fixed(config, 2, choice.verify_mode);
+        EXPECT_EQ(fixed.currentDepth(), 2);
+        EXPECT_EQ(fixed.maxDepth(), 2);
+
+        // A learned startup outside an authored interval must never escape it.
+        config.mode = MTPDepthPolicyMode::Dynamic;
+        config.initial_depth = 0;
+        config.min_depth = 5;
+        config.max_depth = 7;
+        MTPDepthController bounded(config, 1, choice.verify_mode);
+        EXPECT_GE(bounded.currentDepth(), 5);
+        EXPECT_LE(bounded.currentDepth(), 7);
+        EXPECT_EQ(bounded.maxDepth(), 7);
+    }
+}
+
+/** @test Healthy stochastic windows follow the learned winner, not a d1 trap. */
+TEST(Test__MTPDepthController, RelearnedROCmStochasticPolicyPromotesAndHoldsWithoutCappingCapacity)
+{
+    for (const int initial : {1, 2, 3})
+    {
+        auto config = dynamicConfig(initial, 15);
+        config.use_generated_policy = true;
+        config.backend = MTPDepthPolicyBackend::ROCm;
+        config.model_class = MTPDepthPolicyModelClass::MoE;
+        MTPDepthController controller(config, 1, MTPVerifyMode::SpeculativeSampling);
+        controller.recordStep(observation(initial, initial));
+        const auto decision = controller.recordStep(observation(initial, initial));
+        EXPECT_EQ(controller.currentDepth(), 3) << initial;
+        EXPECT_EQ(decision.reason, initial == 3 ? MTPDepthDecisionReason::GeneratedPolicyHold
+                                               : MTPDepthDecisionReason::GeneratedPolicyPromote);
+        EXPECT_EQ(controller.maxDepth(), 15);
+    }
 }
 
 TEST(Test__MTPDepthController, DynamicDefaultInitialDepthPreservesDepthZeroBypass)

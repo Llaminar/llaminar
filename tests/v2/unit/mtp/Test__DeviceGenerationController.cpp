@@ -687,17 +687,15 @@ TEST(Test__DeviceGenerationController,
 }
 
 TEST(Test__DeviceGenerationController,
-     CurrentBatchLLEPEvidenceFieldsAreContiguousTerminalControlWords)
+     CurrentBatchLLEPEvidenceFieldsAreContiguousControlWords)
 {
     using namespace llaminar2::sampling_math;
 
     EXPECT_EQ(
         kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount + 1,
         kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount);
-    EXPECT_EQ(
-        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount +
-            1,
-        kDeviceGenerationControlCount);
+    EXPECT_LT(kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount,
+              kDeviceGenerationControlCount);
 }
 
 TEST(Test__DeviceGenerationController, DynamicPolicyPromotesAndDemotesAcrossEveryDepth)

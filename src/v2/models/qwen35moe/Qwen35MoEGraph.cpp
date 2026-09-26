@@ -13215,6 +13215,12 @@ namespace llaminar2
             shared_params.up_scratch =
                 buffers.get(buffers.idFor(BufferId::MOE_UP_SCRATCH));
             shared_params.seq_len = total_tokens;
+            // Shared and routed experts consume the same resident live prefix.
+            // Capture capacity is not permission to evaluate padded rows.
+            shared_params.active_row_count_device =
+                shared_device.is_gpu() && batch_size == 1
+                    ? sequence_lengths_device
+                    : nullptr;
             shared_params.d_model = config_.d_model;
             shared_params.intermediate = shared_intermediate;
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);

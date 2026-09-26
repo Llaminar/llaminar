@@ -16,6 +16,16 @@
 
 using namespace llaminar2;
 
+/** @brief Persisted unsliced-vocabulary archives must miss after this fix is installed. */
+TEST(Test__PrefixCacheFingerprint, LegacyUnslicedTerminalArchivesAreIncompatible)
+{
+    const PrefixFingerprintParts parts{.model = 1, .tokenizer = 2, .runtime = 3,
+        .topology = 4, .hybrid = 5, .moe = 6, .mtp = 7};
+    // Frozen output from the original v2 serializer, not the current builder.
+    constexpr uint64_t old_unsliced_archive_key = 0x212b6fe0db14eb16ULL;
+    EXPECT_NE(combinePrefixFingerprintParts(parts), old_unsliced_archive_key);
+}
+
 namespace
 {
     PrefixFingerprintMaterial makeMaterial()

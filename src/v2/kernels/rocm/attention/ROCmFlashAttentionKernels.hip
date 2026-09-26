@@ -964,9 +964,13 @@ namespace
          * Four lanes cooperate through HD128 and sixteen lanes above it; each
          * thread therefore owns only the output values that can be live for its
          * compiled geometry, keeping the array in VGPRs instead of scratch.
+         * The generic four-lane launcher only admits heads through 128;
+         * wider heads always use sixteen lanes. Its bound must express that
+         * contract instead of retaining another 32 unreachable accumulators.
          */
         constexpr int COMPILED_HEAD_DIM =
-            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM : 256;
+            STATIC_HEAD_DIM > 0 ? STATIC_HEAD_DIM
+                               : (THREADS_PER_ROW == 4 ? 128 : 256);
         constexpr int OUTPUTS_PER_THREAD =
             (COMPILED_HEAD_DIM + THREADS_PER_ROW - 1) /
             THREADS_PER_ROW;

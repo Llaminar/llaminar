@@ -8,6 +8,38 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-26: **G — stochastic-default performance target reached.** Matched
+Qwen3.6 MoE IQ3_S Release medians on the 512/256 workload are **278.33 CUDA /
+146.82 ROCm / 44.94 dual-socket CPU tok/s**, above the old-default controls
+of **254.93 / 86.68 / 41.34**. Both the 75% first pass and 100% second pass
+are complete. Learned startup/adaptation remains authoritative, with bounds
+1–15. Corrected CPU training proves 30,720 serial-matching MTP token IDs;
+after-policy CPU checks add 6,144 and fresh GPU prose checks add 1,536.
+Non-MTP benchmark controls now honor the same requested sampling law.
+
+Optimized CUDA/HIP builds reject memory spills, including cached objects and
+HIP device callees, while reporting proven register-only moves. Spill cleanup
+preserves all-format byte equivalence and measured model speed; isolated CUDA
+attention improves 14.4%. The live Ornith Q8_0 CPU2 service also exposed a prefix
+archive defect: a gathered row was copied from token zero on every vocabulary
+shard. A checked logical/physical slice now owns copy and diagnostic geometry;
+the persisted cache ABI is v3. CPU/CUDA/ROCm TP1–8 regressions pass 20 runs each
+(8,640 surface cases). The complete gate after that fix passes **673/673 Unit
+and 419/419 preflight**, with no skips and no GPU driver-warning findings.
+Both direct HTTP and OpenWebUI pass 20 exact cached replays each, non-greedy
+stochastic MTP, separate streaming reasoning, and the 1–15 adaptive contract.
+
+The matched service check additionally found idle HTTP keep-alive connections
+holding the sole stable worker for five seconds. One complete response per
+connection preserves the worker/OpenMP team and releases it promptly; ordinary
+and SSE regressions pass 20 repetitions and join production preflight.
+Normal pre-commit and image-bound PR gates cover the complete resulting tree.
+Remaining independent limitations: ROCm dynamic is 76.8–87.2% of best fixed
+depth on the earlier holdout set, and the earlier Nsight-associated NVIDIA
+assertions remain unresolved. Neither is hidden by the old-default target win.
+See the [current experiment](../2026-09/2026-09-26-stochastic-mtp-default.md).
+The older CPU wrap-up below remains historical, not this goal's completion.
+
 2026-09-25 wrap-up: **A — accepted as good enough; tuning stopped.** Both CPU
 sockets sustain approximately **42 tok/s dynamic-MTP decode** and **350-class
 prefill**. The requested 50 tok/s was not reached. The last candidate was

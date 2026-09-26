@@ -12388,20 +12388,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GpuMoERebalanceProjectionRequiresPhysic
             removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
         const auto root_projection = sliceBetween(
             source,
-            "__global__ void project_rebalance_domain_commands_kernel(",
-            "__global__ void project_prefill_llep_domain_commands_kernel(");
+            "void project_rebalance_domain_commands_kernel(",
+            "void project_prefill_llep_domain_commands_kernel(");
         const auto compact_root_projection =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(root_projection));
         const auto prefill_projection = sliceBetween(
             source,
-            "__global__ void project_prefill_llep_domain_commands_kernel(",
-            "__global__ void materialize_prefill_llep_transfer_commands_kernel(");
+            "void project_prefill_llep_domain_commands_kernel(",
+            "void materialize_prefill_llep_transfer_commands_kernel(");
         const auto compact_prefill_projection =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(prefill_projection));
         const auto materialize_transfers = sliceBetween(
             source,
-            "__global__ void materialize_prefill_llep_transfer_commands_kernel(",
-            "__global__ void pack_rebalance_source_descriptors_kernel(");
+            "void materialize_prefill_llep_transfer_commands_kernel(",
+            "void pack_rebalance_source_descriptors_kernel(");
         const auto compact_materialize =
             removeAsciiWhitespace(stripCommentsAndStringLiterals(materialize_transfers));
         const auto source_entry_ready = sliceBetween(

@@ -1079,7 +1079,7 @@ extern "C"
         int *original_to_grouped,
         float *grouped_weights,
         int *active_expert_ids,
-        int seq_len,
+        llaminar2::DeviceRowRange rows,
         int device_idx,
         void *stream);
 
@@ -11206,8 +11206,9 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
+    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
         if (!setMoEDevice(device_ordinal_, "prepareSharedExpertPrefillGroup"))
@@ -11282,7 +11283,7 @@ namespace llaminar2
                 d_group_original_to_grouped_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
-                seq_len,
+                rows,
                 device_ordinal_,
                 getStream()))
         {
@@ -11716,6 +11717,10 @@ namespace llaminar2
                     {"down_tile_n", policy.down.tile_n},
                     {"policy_source", policy.source},
                     {"row_tile", common_row_tile},
+                    // These tags describe the captured envelope, not a host
+                    // observation of mutable device-owned live row counts.
+                    {"geometry_role", "physical_capacity"},
+                    {"route_admission", "device_group_plan"},
                     {"grouping", "static"}});
         }
         return true;
@@ -12056,6 +12061,8 @@ namespace llaminar2
                     {"down_tile_n", policy.down.tile_n},
                     {"policy_source", policy.source},
                     {"row_tile", common_row_tile},
+                    {"geometry_role", "physical_capacity"},
+                    {"route_admission", "device_group_plan"},
                     {"grouping", "runtime"}});
         }
         return true;

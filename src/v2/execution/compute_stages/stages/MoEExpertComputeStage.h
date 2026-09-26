@@ -1995,6 +1995,15 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
             /**
+             * @brief Borrow the resident live-row publication for padded work.
+             *
+             * A shared expert participates in every live row, not every slot
+             * of a retained verifier graph. This is the same count consumed by
+             * routed experts; no host-side copy or second owner is permitted.
+             * Null denotes an unpadded, fully active physical matrix.
+             */
+            const int32_t *active_row_count_device = nullptr;
+            /**
              * @brief Optional binding for required router-owned GPU Q8 rows.
              *
              * This object exposes only immutable capture-time row addresses;

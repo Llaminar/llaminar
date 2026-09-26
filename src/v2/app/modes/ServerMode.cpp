@@ -15,6 +15,8 @@
  * Every rank publishes its immutable membership in PerfStats so an external
  * certificate can require complete participant evidence without steering
  * inference or adding a diagnostic collective to the execution lifecycle.
+ * A stable worker retains CPU/OpenMP locality; connections end after each
+ * complete response so an idle HTTP client cannot retain that worker.
  */
 
 #include "app/modes/ServerMode.h"
@@ -402,9 +404,18 @@ namespace llaminar2
         return config.serve_mode;
     }
 
-    std::unique_ptr<httplib::TaskQueue> createSerializedInferenceTaskQueue()
+    void configureSerializedInferenceHttpServer(httplib::Server &server)
     {
-        return std::make_unique<httplib::ThreadPool>(1);
+        server.new_task_queue = [] {
+            return std::make_unique<httplib::ThreadPool>(1).release();
+        };
+        // httplib schedules sockets, not individual requests. With one stable
+        // worker, HTTP keep-alive would reserve the inference executor for an
+        // idle client until the library's five-second timeout. End ownership at
+        // the response boundary instead: httplib sends Connection: close and
+        // closes only after the entire body/SSE stream has been delivered. This
+        // preserves the stable OpenMP team without another scheduler or pool.
+        server.set_keep_alive_max_count(1);
     }
 
     int ServerMode::execute(AppContext &ctx)
@@ -513,8 +524,7 @@ namespace llaminar2
         // Inference is serialized on a single model instance. Keep HTTP handling
         // on one stable worker so OpenMP does not initialize per-request teams
         // on a large rotating httplib thread pool.
-        svr.new_task_queue = []
-        { return createSerializedInferenceTaskQueue().release(); };
+        configureSerializedInferenceHttpServer(svr);
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);

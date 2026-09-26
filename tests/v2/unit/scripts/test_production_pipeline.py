@@ -3319,8 +3319,8 @@ class ImageIdentityTests(unittest.TestCase):
 
         Runtime equivalence is intentional: the gate's binaries resolve CUDA,
         ROCm and MPI exactly as the published image does.  CTest and the
-        archived workspace are the only additional contracts, which keeps the
-        loadable gate image smaller than the transient compiler stage.
+        archived workspace and test-only annotations are the extra contracts,
+        keeping the loadable gate smaller than the transient compiler stage.
         """
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
         test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
@@ -3952,6 +3952,50 @@ class InfrastructureTests(unittest.TestCase):
                     else:
                         self.assertIn("rocm-llvm-dev", packages)
                         self.assertIn("libglvnd-dev", packages)
+
+    def test_rocm_test_dependency_installer_declares_only_annotation_package(self):
+        """The test closure needs ROCTX, not the complete profiling toolchain.
+
+        Intercept the real apt boundary without allowing any package or network
+        mutation. In particular, this exercises the shared installer rather
+        than duplicating its package selection in the image workflow.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            apt = Path(directory) / "apt-get"
+            apt.write_text(
+                '#!/bin/sh\ncase " $* " in\n'
+                '  *" install "*) printf "%s\\n" "$@"; exit 77;;\n'
+                '  *) exit 0;;\nesac\n', encoding="utf-8")
+            apt.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", str(ROOT / "scripts/docker/install-rocm-test-deps.sh")],
+                env={**os.environ, "PATH": directory},
+                text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 77, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "install", "-y", "--no-install-recommends", "rocprofiler-sdk-roctx"])
+
+    def test_rocm_annotation_dependency_is_test_only_and_shared_with_builder(self):
+        """Both test image stages use one installer; serving has no profiler.
+
+        The dependency belongs after the cached inference toolchain: changing
+        an annotation API must not rebuild CUDA, HIP, RCCL, or oneDNN.
+        """
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        toolchain, tail = dockerfile.split("FROM toolchain AS builder", 1)
+        builder, tail = tail.split("FROM ubuntu:24.04 AS runtime", 1)
+        runtime, test_runner = tail.split("FROM runtime AS test-runner", 1)
+        installer = "scripts/docker/install-rocm-test-deps.sh"
+        invocation = "bash /tmp/install-rocm-test-deps.sh"
+        self.assertNotIn(installer, toolchain)
+        self.assertNotIn(installer, runtime)
+        self.assertNotIn("rocprofiler-sdk-roctx", runtime)
+        for role, stage in (("builder", builder), ("test-runner", test_runner)):
+            with self.subTest(role=role):
+                self.assertIn(f"COPY {installer} /tmp/install-rocm-test-deps.sh", stage)
+                self.assertIn(invocation, stage)
+                self.assertIn('if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]', stage)
+        self.assertLess(builder.index(invocation), builder.index("COPY src ./src"))
 
     def test_build_planning_never_probes_docker(self):
         with tempfile.TemporaryDirectory() as directory:

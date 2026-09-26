@@ -91,6 +91,10 @@ namespace llaminar2
             rate_to_ppm(*depth.demote_zero_accept_rate);
         policy.demote_acceptance_rate_ppm =
             rate_to_ppm(depth.demote_acceptance_rate);
+        policy.learned = {
+            .enabled = depth.use_generated_policy && depth.mode == MTPDepthPolicyMode::Dynamic,
+            .backend = depth.backend, .model_class = depth.model_class,
+            .verify_mode = mtp.verify_mode};
         return policy;
     }
 }
