@@ -1008,7 +1008,7 @@ results. Each configuration's AVX512 result sets the scale for its pair of bars.
 
 ![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)
 
-Tested image source: [`ff61316f3184`](https://github.com/Llaminar/llaminar/commit/ff61316f3184a2846201445833c6fd4687d4142e). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
+Tested image source: [`557f0f97d15d`](https://github.com/Llaminar/llaminar/commit/557f0f97d15d447850b77b7ce4e91bb0663331b3). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
 [Exact configurations, image digests and samples](benchmarks/production/published/results.json). This is E2E/benchmark evidence, not full production-image certification.
 
 <!-- published-benchmarks:end -->

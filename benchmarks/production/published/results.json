@@ -4,18 +4,18 @@
   "full_image_certification": false,
   "images": {
     "AVX2": {
-      "id": "sha256:8210eb6785ad3d547370e6578d73efdabadb2c40c30dfce471b2e0b06a787f15",
+      "id": "sha256:00607abbbb9a00d15c35225ca65496c709cff92b75da2ae4dfcf2728b0dc581a",
       "labels": {
         "org.llaminar.build_type": "Release",
         "org.llaminar.cpu_isa": "AVX2",
         "org.llaminar.cuda": "ON",
         "org.llaminar.image_role": "runtime",
         "org.llaminar.rocm": "ON",
-        "org.llaminar.source_tree": "7e3568911e5e3aaeebe59a280feac075162df054",
+        "org.llaminar.source_tree": "c241952773356d2d294843f3b281a3eed49f9897",
         "org.opencontainers.image.created": "",
         "org.opencontainers.image.description": "High-performance LLM inference engine (CUDA + ROCm)",
         "org.opencontainers.image.licenses": "AGPL-3.0-only",
-        "org.opencontainers.image.revision": "ff61316f3184a2846201445833c6fd4687d4142e",
+        "org.opencontainers.image.revision": "557f0f97d15d447850b77b7ce4e91bb0663331b3",
         "org.opencontainers.image.source": "https://github.com/llaminar/llaminar",
         "org.opencontainers.image.title": "Llaminar",
         "org.opencontainers.image.version": "dev"
@@ -27,29 +27,29 @@
         "sha256:812c698b3f361211e5aa3c123942b21b36fe68cff8a46d1ce07b557e9d6d9e7d",
         "sha256:a9414d9628fbdf7696f687b6c50706008bb9dd2f690e1d6e3358bba7e3524951",
         "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
-        "sha256:fdc6c5cb267f5e3a361a16267ce2fd70d4f419e8594cd874a1b1d49b3be57ac9",
-        "sha256:0be6f05ffec5dbdaf830c6ad08577229181f101969ce0946b13c3a270b5cd4de",
-        "sha256:2e4479e474b488288c52066431724355e1abc1141088593be8951c417521163c",
-        "sha256:df5da7a076dcdcc7442b5f9c44ea198b2247c89d6ea9f8a156cdfe8578ba8364",
-        "sha256:e6637bfa214fbb83d529f8d155ce42ddaf2a5d25d288112eb907ef1033082f57",
+        "sha256:559ed36805472f888b5e0e37c853e4b8a39cd348a248ee56256841a02f8167a9",
+        "sha256:528725efcf41be3c0ba1b92125f8f21ac69a7377641ff9ab964754e146a89303",
+        "sha256:b02630a6d04434941c3ea9ab22c4dbe0d49cdba5534b47776d6c97d7807b4b63",
+        "sha256:437c9fef3e9c7e22b89348f30f7be4a80e4c51ef253657077299d9d68c6d4d88",
+        "sha256:ed5e0f3e1867197ef2ab6498e04a0d27aaf50381409c7c68982e59658cae1204",
         "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
       ],
-      "registry_ref": "ghcr.io/llaminar/llaminar@sha256:d676030020165def24f1c72489d534e46c02b17ab4a34787d7c4785f44509edc",
-      "tag": "ghcr.io/llaminar/llaminar:develop-ff61316f3184a2846201445833c6fd4687d4142e-avx2"
+      "registry_ref": "ghcr.io/llaminar/llaminar@sha256:e53daf9f4ca28deacafb921fd8b5f252f655ab8df48d762eee862866d51e312f",
+      "tag": "ghcr.io/llaminar/llaminar:develop-557f0f97d15d447850b77b7ce4e91bb0663331b3-avx2"
     },
     "AVX512": {
-      "id": "sha256:a68444c62bfdbe2740f5bb12e19e7c070ab3319d2556d512d13a4c44a4c3629e",
+      "id": "sha256:872c2dd9c7bd2d3e1023bf297152d1a527ce9d4873842621f4f744ab3c2a7c78",
       "labels": {
         "org.llaminar.build_type": "Release",
         "org.llaminar.cpu_isa": "AVX512",
         "org.llaminar.cuda": "ON",
         "org.llaminar.image_role": "runtime",
         "org.llaminar.rocm": "ON",
-        "org.llaminar.source_tree": "7e3568911e5e3aaeebe59a280feac075162df054",
+        "org.llaminar.source_tree": "c241952773356d2d294843f3b281a3eed49f9897",
         "org.opencontainers.image.created": "",
         "org.opencontainers.image.description": "High-performance LLM inference engine (CUDA + ROCm)",
         "org.opencontainers.image.licenses": "AGPL-3.0-only",
-        "org.opencontainers.image.revision": "ff61316f3184a2846201445833c6fd4687d4142e",
+        "org.opencontainers.image.revision": "557f0f97d15d447850b77b7ce4e91bb0663331b3",
         "org.opencontainers.image.source": "https://github.com/llaminar/llaminar",
         "org.opencontainers.image.title": "Llaminar",
         "org.opencontainers.image.version": "dev"
@@ -61,27 +61,27 @@
         "sha256:812c698b3f361211e5aa3c123942b21b36fe68cff8a46d1ce07b557e9d6d9e7d",
         "sha256:a9414d9628fbdf7696f687b6c50706008bb9dd2f690e1d6e3358bba7e3524951",
         "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
-        "sha256:dfdaf3ec0176cdce8cdb6b263fa36c03d0e7923afe05a77198f7450fa1e09b4a",
-        "sha256:73e3198e2775ba125b1bfae0184170bc5855f6411fe7572175c75845b07d178e",
-        "sha256:7bf693ed0b76b980c65d1714eae9fd3b0b47baebbf81b598db55bafc41f21cf5",
-        "sha256:af66d9411f01b0e0d803572a1a0725295a82068d01666f8c08abd1cc321617ea",
-        "sha256:4a065869c012f4efe56ecdc9dd989057a962dbcbe3d992ec5284fbc9025b826f",
+        "sha256:7f5f5c09bb91904810a46d06a6d3adc96261b1b918a3d154cbdffa15a273b7ce",
+        "sha256:fa7a6a197791a57da48d0c5df6304b72bbe6b8a2752e7b95c6bbb1a4813e6d0d",
+        "sha256:930ebeb25fc9d9693ecafd48344f4d643a83c8884fd2a9c6480db6287f1d348c",
+        "sha256:b2b6e33d921d283bd6e803a82d757af992ae1811a3153ad49df4c845fe851bcd",
+        "sha256:d810a87a02219a253b55bd82a64b476e7b75c69f73e377b84d5d667719cfe11a",
         "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
       ],
-      "registry_ref": "ghcr.io/llaminar/llaminar@sha256:d26fd0cec839ef9e15e36f0518bae4e039258fab8d87b0fdbc2b9052633956c9",
-      "tag": "ghcr.io/llaminar/llaminar:develop-ff61316f3184a2846201445833c6fd4687d4142e"
+      "registry_ref": "ghcr.io/llaminar/llaminar@sha256:3c36fe3adb98e68ffe76ab7bf57c329fc04a4e5452c82bbd635b906c65623c37",
+      "tag": "ghcr.io/llaminar/llaminar:develop-557f0f97d15d447850b77b7ce4e91bb0663331b3"
     }
   },
   "passed": true,
-  "recorded_at_utc": "2026-09-24T07:50:37.993107+00:00",
+  "recorded_at_utc": "2026-09-27T06:50:27.047059+00:00",
   "regression_threshold_pct": 10,
   "repository": "Llaminar/llaminar",
   "schema": 1,
   "scope": "full-http-e2e-and-benchmarks",
   "source": {
     "dirty": false,
-    "revision": "ff61316f3184a2846201445833c6fd4687d4142e",
-    "tree": "7e3568911e5e3aaeebe59a280feac075162df054"
+    "revision": "557f0f97d15d447850b77b7ce4e91bb0663331b3",
+    "tree": "c241952773356d2d294843f3b281a3eed49f9897"
   },
   "variants": {
     "AVX2": {
@@ -91,6 +91,33 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu",
+                  "--auto-device-counts",
+                  "cpu=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -500,19 +527,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              7.9275457648454735,
-              7.9308279816720875,
-              7.930389709956855
+              27.970070921544718,
+              27.82492673118197,
+              27.963787981970885
             ],
             "prefill": [
-              79.42671903969374,
-              23.774473449585926,
-              24.779098862361145
+              110.69682212849453,
+              111.85195310440837,
+              111.6925154473672
             ]
           },
           "tokens_per_second": {
-            "decode": 7.930389709956855,
-            "prefill": 24.779098862361145
+            "decode": 27.963787981970885,
+            "prefill": 111.6925154473672
           }
         },
         {
@@ -520,6 +547,33 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu",
+                  "--auto-device-counts",
+                  "cpu=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -929,19 +983,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              9.937121109840042,
-              9.905135247928463,
-              9.944090833880772
+              32.06036035979572,
+              32.19967995460208,
+              32.274360459265786
             ],
             "prefill": [
-              92.31054852587542,
-              19.568318492707977,
-              21.780330677769904
+              123.05934585384385,
+              124.34957576109406,
+              124.78734572862774
             ]
           },
           "tokens_per_second": {
-            "decode": 9.937121109840042,
-            "prefill": 21.780330677769904
+            "decode": 32.19967995460208,
+            "prefill": 124.34957576109406
           }
         },
         {
@@ -949,6 +1003,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,cuda",
+                  "--auto-device-counts",
+                  "cpu=2,cuda=2",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -1360,19 +1441,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              13.12851734554861,
-              12.800266035428464,
-              13.166744658277986
+              13.874989699574925,
+              13.893436997053376,
+              13.862548125871031
             ],
             "prefill": [
-              107.83009393892841,
-              102.24081450755128,
-              107.18740983349812
+              79.71676755798522,
+              79.63019896107099,
+              84.7881306598229
             ]
           },
           "tokens_per_second": {
-            "decode": 13.12851734554861,
-            "prefill": 107.18740983349812
+            "decode": 13.874989699574925,
+            "prefill": 79.71676755798522
           }
         },
         {
@@ -1380,6 +1461,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,cuda,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,cuda=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -1796,19 +1904,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              18.111143202644275,
-              18.557927393239577,
-              18.579263031764235
+              19.49194227540058,
+              19.66726932725284,
+              19.74574674777924
             ],
             "prefill": [
-              157.83733454470197,
-              156.51183606729217,
-              155.335050574453
+              122.65918766452351,
+              124.93735943990396,
+              124.61742732755283
             ]
           },
           "tokens_per_second": {
-            "decode": 18.557927393239577,
-            "prefill": 156.51183606729217
+            "decode": 19.66726932725284,
+            "prefill": 124.61742732755283
           }
         },
         {
@@ -1816,6 +1924,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,rocm=2",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -2227,19 +2362,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              20.100777950855253,
-              23.301743251386814,
-              25.3782896412883
+              20.511585826316395,
+              20.881290335133617,
+              21.229999682589856
             ],
             "prefill": [
-              106.89909757495971,
-              106.54027766891733,
-              133.09010849133148
+              99.01013664463989,
+              102.1496137270215,
+              106.725029760582
             ]
           },
           "tokens_per_second": {
-            "decode": 23.301743251386814,
-            "prefill": 106.89909757495971
+            "decode": 20.881290335133617,
+            "prefill": 102.1496137270215
           }
         },
         {
@@ -2247,6 +2382,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -2658,19 +2820,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              23.002514273134526,
-              23.71424740542691,
-              24.82323316766965
+              26.234970678210328,
+              26.83361584714674,
+              27.285694937863656
             ],
             "prefill": [
-              165.16500179328708,
-              164.7739027843635,
-              165.46899197638402
+              141.85599618268174,
+              146.9811945266633,
+              155.15006337005855
             ]
           },
           "tokens_per_second": {
-            "decode": 23.71424740542691,
-            "prefill": 165.16500179328708
+            "decode": 26.83361584714674,
+            "prefill": 146.9811945266633
           }
         },
         {
@@ -2678,6 +2840,31 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -3085,19 +3272,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              106.32276867621776,
-              106.23033114435016,
-              110.56242534751875
+              139.64509797454622,
+              139.29970176676784,
+              139.3162602596735
             ],
             "prefill": [
-              1064.8550708850833,
-              1061.6540846004602,
-              1057.9857678060084
+              887.0883659405561,
+              887.8439089392327,
+              889.9658665585563
             ]
           },
           "tokens_per_second": {
-            "decode": 106.32276867621776,
-            "prefill": 1061.6540846004602
+            "decode": 139.3162602596735,
+            "prefill": 887.8439089392327
           }
         },
         {
@@ -3105,6 +3292,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -3484,19 +3692,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              224.11069849343374,
-              223.93902504622136,
-              224.004855399235
+              287.0802547386263,
+              287.0899166958844,
+              287.0160419073676
             ],
             "prefill": [
-              2577.4088633134083,
-              2602.149910486551,
-              2579.05073856684
+              1752.7420185408955,
+              1760.9705550693034,
+              1763.2433748833598
             ]
           },
           "tokens_per_second": {
-            "decode": 224.004855399235,
-            "prefill": 2579.05073856684
+            "decode": 287.0802547386263,
+            "prefill": 1760.9705550693034
           }
         },
         {
@@ -3504,6 +3712,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "tp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -3879,19 +4108,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              50.72211110311647,
-              50.82061748055889,
-              50.864396769476734
+              50.35706054916215,
+              50.327024035111855,
+              50.28606408785884
             ],
             "prefill": [
-              740.3416578134987,
-              740.1659063953292,
-              740.817521246509
+              468.70927029727784,
+              470.268896779258,
+              469.42453704426146
             ]
           },
           "tokens_per_second": {
-            "decode": 50.82061748055889,
-            "prefill": 740.3416578134987
+            "decode": 50.327024035111855,
+            "prefill": 469.42453704426146
           }
         },
         {
@@ -3899,6 +4128,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -4291,19 +4541,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              49.097459500670524,
-              50.848721869308825,
-              50.8357340249564
+              40.31915464549371,
+              39.8461318647918,
+              40.31356272301949
             ],
             "prefill": [
-              1121.6923185833066,
-              1120.9744185733937,
-              1123.0202116023197
+              757.9576399710418,
+              762.826615166017,
+              760.6795019248906
             ]
           },
           "tokens_per_second": {
-            "decode": 50.8357340249564,
-            "prefill": 1121.6923185833066
+            "decode": 40.31356272301949,
+            "prefill": 760.6795019248906
           }
         },
         {
@@ -4311,6 +4561,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -4686,19 +4957,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              62.684841295849935,
-              62.651316534594386,
-              62.62617210471401
+              62.23518302694091,
+              62.20860738139935,
+              62.18983807505286
             ],
             "prefill": [
-              915.6397312539447,
-              915.5347521899913,
-              914.6360852375092
+              703.5667598592601,
+              703.1167063856882,
+              703.430721342884
             ]
           },
           "tokens_per_second": {
-            "decode": 62.651316534594386,
-            "prefill": 915.5347521899913
+            "decode": 62.20860738139935,
+            "prefill": 703.430721342884
           }
         },
         {
@@ -4706,6 +4977,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda,rocm",
+                  "--auto-device-counts",
+                  "cuda=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -5117,19 +5415,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              23.965856197678132,
-              23.915347211240505,
-              23.932803932846475
+              24.498790133013703,
+              25.582171777666233,
+              24.811728390907824
             ],
             "prefill": [
-              197.92146709980216,
-              198.72221507033564,
-              195.6757029442583
+              153.91657678489716,
+              155.22949920620863,
+              156.25732522972348
             ]
           },
           "tokens_per_second": {
-            "decode": 23.932803932846475,
-            "prefill": 197.92146709980216
+            "decode": 24.811728390907824,
+            "prefill": 155.22949920620863
           }
         },
         {
@@ -5137,6 +5435,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda,rocm",
+                  "--auto-device-counts",
+                  "cuda=2,rocm=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -5530,19 +5849,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              36.7344753158017,
-              36.69303383326814,
-              36.605704813052
+              32.14287653932743,
+              32.261702905686136,
+              32.23586820221577
             ],
             "prefill": [
-              502.15098827737734,
-              501.0873507429361,
-              502.66546462205855
+              303.80561906981893,
+              302.80645726371966,
+              303.0929133510278
             ]
           },
           "tokens_per_second": {
-            "decode": 36.69303383326814,
-            "prefill": 502.15098827737734
+            "decode": 32.23586820221577,
+            "prefill": 303.0929133510278
           }
         },
         {
@@ -5550,6 +5869,31 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -5957,19 +6301,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              64.71385987751042,
-              65.95849151892149,
-              68.26813931948233
+              102.8145963040658,
+              102.1232806508951,
+              102.842005011795
             ],
             "prefill": [
-              1058.1286377111487,
-              1034.8876577197846,
-              1041.4879321491442
+              777.6756030509387,
+              778.5301918973068,
+              777.3523872039368
             ]
           },
           "tokens_per_second": {
-            "decode": 65.95849151892149,
-            "prefill": 1041.4879321491442
+            "decode": 102.8145963040658,
+            "prefill": 777.6756030509387
           }
         },
         {
@@ -5977,6 +6321,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [
                 {
                   "frontend": "plan-apply",
@@ -6857,19 +7222,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              74.13113640057263,
-              74.14288405485492,
-              74.1271588311548
+              148.57787524307713,
+              148.55425573941247,
+              148.5711868756553
             ],
             "prefill": [
-              1153.8264576679508,
-              1161.6876748050663,
-              1156.2675572143037
+              834.4446155436186,
+              837.81538381946,
+              835.3788081087642
             ]
           },
           "tokens_per_second": {
-            "decode": 74.13113640057263,
-            "prefill": 1156.2675572143037
+            "decode": 148.5711868756553,
+            "prefill": 835.3788081087642
           }
         },
         {
@@ -6877,6 +7242,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -7256,19 +7642,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              100.3547549244637,
-              100.43791411078794,
-              100.36239447700564
+              165.95244778907076,
+              165.88333854535531,
+              166.0061188800792
             ],
             "prefill": [
-              1163.7761040520577,
-              1164.860663963116,
-              1164.5138036144087
+              817.941377981686,
+              815.2307666167885,
+              817.8227511571085
             ]
           },
           "tokens_per_second": {
-            "decode": 100.36239447700564,
-            "prefill": 1164.5138036144087
+            "decode": 165.95244778907076,
+            "prefill": 817.8227511571085
           }
         },
         {
@@ -7276,6 +7662,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "tp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -7651,19 +8058,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              38.485648373537025,
-              38.58733774555621,
-              38.55847379584908
+              39.15675394770643,
+              39.08898115602566,
+              39.15493494068524
             ],
             "prefill": [
-              371.14495047265996,
-              372.33649723023603,
-              372.2239901044252
+              247.51709426897233,
+              247.37986313419174,
+              247.47950988805977
             ]
           },
           "tokens_per_second": {
-            "decode": 38.55847379584908,
-            "prefill": 372.2239901044252
+            "decode": 39.15493494068524,
+            "prefill": 247.47950988805977
           }
         },
         {
@@ -7671,6 +8078,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -8063,19 +8491,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              28.100019421587387,
-              28.078160053657616,
-              28.06507126966859
+              20.163039813813167,
+              21.64080870437626,
+              21.63834653562228
             ],
             "prefill": [
-              272.10046071454786,
-              271.651958034259,
-              271.7582374262199
+              186.4007281459019,
+              185.69590379386534,
+              185.24978783254966
             ]
           },
           "tokens_per_second": {
-            "decode": 28.078160053657616,
-            "prefill": 271.7582374262199
+            "decode": 21.63834653562228,
+            "prefill": 185.69590379386534
           }
         },
         {
@@ -8083,6 +8511,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 32768,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -8458,26 +8907,26 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              36.606306352029726,
-              36.599983572032784,
-              36.605326585942485
+              39.21009094478446,
+              39.21991305022794,
+              39.21409296716583
             ],
             "prefill": [
-              270.8098043403977,
-              270.78121357997634,
-              270.5121973363317
+              182.33258211181794,
+              182.05432166006833,
+              181.82005276976886
             ]
           },
           "tokens_per_second": {
-            "decode": 36.605326585942485,
-            "prefill": 270.78121357997634
+            "decode": 39.21409296716583,
+            "prefill": 182.05432166006833
           }
         }
       ],
       "comparisons": [
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 24.779098862361145,
+          "current": 111.6925154473672,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8485,7 +8934,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 7.930389709956855,
+          "current": 27.963787981970885,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8493,7 +8942,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 21.780330677769904,
+          "current": 124.34957576109406,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8501,7 +8950,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 9.937121109840042,
+          "current": 32.19967995460208,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8509,7 +8958,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 107.18740983349812,
+          "current": 79.71676755798522,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8517,7 +8966,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 13.12851734554861,
+          "current": 13.874989699574925,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8525,7 +8974,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 156.51183606729217,
+          "current": 124.61742732755283,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8533,7 +8982,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 18.557927393239577,
+          "current": 19.66726932725284,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8541,7 +8990,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 106.89909757495971,
+          "current": 102.1496137270215,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8549,7 +8998,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.301743251386814,
+          "current": 20.881290335133617,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8557,7 +9006,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 165.16500179328708,
+          "current": 146.9811945266633,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8565,7 +9014,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.71424740542691,
+          "current": 26.83361584714674,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8573,7 +9022,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1061.6540846004602,
+          "current": 887.8439089392327,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8581,7 +9030,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 106.32276867621776,
+          "current": 139.3162602596735,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8589,7 +9038,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 2579.05073856684,
+          "current": 1760.9705550693034,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8597,7 +9046,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 224.004855399235,
+          "current": 287.0802547386263,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8605,7 +9054,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 740.3416578134987,
+          "current": 469.42453704426146,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8613,7 +9062,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 50.82061748055889,
+          "current": 50.327024035111855,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8621,7 +9070,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1121.6923185833066,
+          "current": 760.6795019248906,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8629,7 +9078,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 50.8357340249564,
+          "current": 40.31356272301949,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8637,7 +9086,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 915.5347521899913,
+          "current": 703.430721342884,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8645,7 +9094,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 62.651316534594386,
+          "current": 62.20860738139935,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8653,7 +9102,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 197.92146709980216,
+          "current": 155.22949920620863,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8661,7 +9110,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.932803932846475,
+          "current": 24.811728390907824,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8669,7 +9118,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 502.15098827737734,
+          "current": 303.0929133510278,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8677,7 +9126,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 36.69303383326814,
+          "current": 32.23586820221577,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8685,7 +9134,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1041.4879321491442,
+          "current": 777.6756030509387,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8693,7 +9142,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 65.95849151892149,
+          "current": 102.8145963040658,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8701,7 +9150,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1156.2675572143037,
+          "current": 835.3788081087642,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8709,7 +9158,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 74.13113640057263,
+          "current": 148.5711868756553,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8717,7 +9166,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1164.5138036144087,
+          "current": 817.8227511571085,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8725,7 +9174,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 100.36239447700564,
+          "current": 165.95244778907076,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8733,7 +9182,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 372.2239901044252,
+          "current": 247.47950988805977,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8741,7 +9190,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 38.55847379584908,
+          "current": 39.15493494068524,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8749,7 +9198,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 271.7582374262199,
+          "current": 185.69590379386534,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8757,7 +9206,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 28.078160053657616,
+          "current": 21.63834653562228,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -8765,7 +9214,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 270.78121357997634,
+          "current": 182.05432166006833,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -8773,14 +9222,14 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 36.605326585942485,
+          "current": 39.21409296716583,
           "high_water": null,
           "passed": true,
           "phase": "decode",
           "status": "new_baseline"
         }
       ],
-      "e2e_report_digest": "19c400af6c16920e399c789ab4815288aa959b640d65b7859753706962359a77",
+      "e2e_report_digest": "9985848fb4f422fcd5ec99c363da25363e297e727f3dd4af223e0e8a61580aa3",
       "hardware": {
         "accelerators": [
           "0000:03:00.0 VGA compatible controller [0300]: ASPEED Technology, Inc. ASPEED Graphics Family [1a03:2000] (rev 41)",
@@ -8803,7 +9252,7 @@
           "Thread(s) per core:": "2"
         }
       },
-      "report_digest": "4a0155c685a8f2d0d4ff5dde7687659d912ffbb4876713a789c77a0722767a9c",
+      "report_digest": "a96e151804f1b61cb357d0bbb98879664f8534c4d4eb7e0535bee6c4caf6e648",
       "workload": {
         "decode_tokens": 256,
         "measurement_iterations": 3,
@@ -8824,6 +9273,33 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu",
+                  "--auto-device-counts",
+                  "cpu=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -9233,19 +9709,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              10.367831908297742,
-              10.340143831600201,
-              10.355586031421655
+              36.94747511771963,
+              37.00911391591542,
+              37.08819613386773
             ],
             "prefill": [
-              138.62459769395406,
-              17.32480755880639,
-              20.28354405534331
+              291.02381034552144,
+              294.6870673512179,
+              296.0125425787014
             ]
           },
           "tokens_per_second": {
-            "decode": 10.355586031421655,
-            "prefill": 20.28354405534331
+            "decode": 37.00911391591542,
+            "prefill": 294.6870673512179
           }
         },
         {
@@ -9253,6 +9729,33 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu",
+                  "--auto-device-counts",
+                  "cpu=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -9662,19 +10165,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              13.200224474258672,
-              13.169966102155822,
-              13.186409175011416
+              41.844563275506765,
+              42.009006192223886,
+              42.09271361106392
             ],
             "prefill": [
-              192.4930327175005,
-              17.533770904553858,
-              20.337960600812707
+              351.50169191288893,
+              352.3774183487581,
+              356.70730548001336
             ]
           },
           "tokens_per_second": {
-            "decode": 13.186409175011416,
-            "prefill": 20.337960600812707
+            "decode": 42.009006192223886,
+            "prefill": 352.3774183487581
           }
         },
         {
@@ -9682,6 +10185,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,cuda",
+                  "--auto-device-counts",
+                  "cpu=2,cuda=2",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -10093,19 +10623,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              13.29879525712062,
-              13.43092379434832,
-              13.500943684911405
+              13.868461365158778,
+              14.0495421473084,
+              14.19889636288354
             ],
             "prefill": [
-              180.0340591246084,
-              171.73492130461227,
-              171.78716459573582
+              123.83924792649192,
+              124.92697548586702,
+              139.41480347608703
             ]
           },
           "tokens_per_second": {
-            "decode": 13.43092379434832,
-            "prefill": 171.78716459573582
+            "decode": 14.0495421473084,
+            "prefill": 124.92697548586702
           }
         },
         {
@@ -10113,6 +10643,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,cuda,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,cuda=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -10529,19 +11086,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              18.917098517405876,
-              18.931604540267262,
-              18.950308940138854
+              19.936387565610904,
+              20.119436376706723,
+              20.190882723957102
             ],
             "prefill": [
-              160.11895817834292,
-              160.39882576555937,
-              159.86386363058404
+              125.38222468146287,
+              124.55144778685616,
+              123.75526441419514
             ]
           },
           "tokens_per_second": {
-            "decode": 18.931604540267262,
-            "prefill": 160.11895817834292
+            "decode": 20.119436376706723,
+            "prefill": 124.55144778685616
           }
         },
         {
@@ -10549,6 +11106,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,rocm=2",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -10960,19 +11544,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              20.570252593527517,
-              23.476599194913522,
-              24.93940506249011
+              22.198659479782584,
+              22.61551433948939,
+              22.86258636287532
             ],
             "prefill": [
-              179.06813172979375,
-              194.96005702712657,
-              222.7738489482335
+              159.25788795368555,
+              164.72968452054434,
+              186.98197128743703
             ]
           },
           "tokens_per_second": {
-            "decode": 23.476599194913522,
-            "prefill": 194.96005702712657
+            "decode": 22.61551433948939,
+            "prefill": 164.72968452054434
           }
         },
         {
@@ -10980,6 +11564,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cpu,rocm",
+                  "--auto-device-counts",
+                  "cpu=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -11391,19 +12002,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              23.56462344818059,
-              23.977668262696053,
-              24.644628992274782
+              26.817618536046155,
+              27.70187307336983,
+              27.478068326425486
             ],
             "prefill": [
-              228.82780111047663,
-              136.07505497335214,
-              232.03150001273747
+              170.4709809819457,
+              177.17048901615635,
+              170.75167157290525
             ]
           },
           "tokens_per_second": {
-            "decode": 23.977668262696053,
-            "prefill": 228.82780111047663
+            "decode": 27.478068326425486,
+            "prefill": 170.75167157290525
           }
         },
         {
@@ -11411,6 +12022,31 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -11818,19 +12454,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              106.13195442414022,
-              105.96545440915237,
-              110.3007726670775
+              139.729164680686,
+              139.71622483036936,
+              139.59433601291687
             ],
             "prefill": [
-              1052.3645241407407,
-              1043.3587984135575,
-              1049.8208089157213
+              888.4597844075287,
+              887.3892595832347,
+              885.9310189987751
             ]
           },
           "tokens_per_second": {
-            "decode": 106.13195442414022,
-            "prefill": 1049.8208089157213
+            "decode": 139.71622483036936,
+            "prefill": 887.3892595832347
           }
         },
         {
@@ -11838,6 +12474,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -12217,19 +12874,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              225.45250592356788,
-              225.49289596790183,
-              225.3690661060658
+              283.04951141125537,
+              283.0466586455166,
+              283.0233576613219
             ],
             "prefill": [
-              2608.5045154232107,
-              2584.1748132483235,
-              2617.0787224742485
+              1738.708065740389,
+              1726.2538010625199,
+              1737.5849757108697
             ]
           },
           "tokens_per_second": {
-            "decode": 225.45250592356788,
-            "prefill": 2608.5045154232107
+            "decode": 283.0466586455166,
+            "prefill": 1737.5849757108697
           }
         },
         {
@@ -12237,6 +12894,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "tp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -12612,19 +13290,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              50.79544412546185,
-              50.82111207409147,
-              50.795149228103874
+              50.35203454147674,
+              50.37873541979683,
+              50.479057939312376
             ],
             "prefill": [
-              742.3220962281732,
-              741.2825365537096,
-              741.814167950231
+              467.83973789395645,
+              468.26279619662506,
+              468.1480895375244
             ]
           },
           "tokens_per_second": {
-            "decode": 50.79544412546185,
-            "prefill": 741.814167950231
+            "decode": 50.37873541979683,
+            "prefill": 468.1480895375244
           }
         },
         {
@@ -12632,6 +13310,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -13024,19 +13723,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              49.12602682014782,
-              50.85818506347143,
-              50.841412557820846
+              40.104571547381795,
+              39.5760944123509,
+              40.045097658297664
             ],
             "prefill": [
-              1124.5985474219508,
-              1129.5021240452897,
-              1122.5444430747111
+              743.7303214331563,
+              745.03230141383,
+              743.118349620533
             ]
           },
           "tokens_per_second": {
-            "decode": 50.841412557820846,
-            "prefill": 1124.5985474219508
+            "decode": 40.045097658297664,
+            "prefill": 743.7303214331563
           }
         },
         {
@@ -13044,6 +13743,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda",
+                  "--auto-device-counts",
+                  "cuda=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -13419,19 +14139,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              62.71012916227748,
-              62.68582453693845,
-              62.65735109867021
+              62.74931544169534,
+              62.76201538530717,
+              62.73668388875897
             ],
             "prefill": [
-              916.0961951962806,
-              913.2216789387578,
-              912.065106114482
+              718.360566494653,
+              717.7246164886172,
+              719.6645117456079
             ]
           },
           "tokens_per_second": {
-            "decode": 62.68582453693845,
-            "prefill": 913.2216789387578
+            "decode": 62.74931544169534,
+            "prefill": 718.360566494653
           }
         },
         {
@@ -13439,6 +14159,33 @@
           "identity": {
             "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--mpi-procs",
+                  "2",
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda,rocm",
+                  "--auto-device-counts",
+                  "cuda=2,rocm=4",
+                  "--only-strategies",
+                  "expert-overlay",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -13850,19 +14597,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              23.069191123317804,
-              23.064137838425122,
-              23.037522096699057
+              24.535875253499142,
+              25.721946133499852,
+              25.029439150278442
             ],
             "prefill": [
-              189.09486871059983,
-              188.45564886434377,
-              188.60407047787703
+              151.83135185269106,
+              153.59136216002435,
+              155.46959784544305
             ]
           },
           "tokens_per_second": {
-            "decode": 23.064137838425122,
-            "prefill": 188.60407047787703
+            "decode": 25.029439150278442,
+            "prefill": 153.59136216002435
           }
         },
         {
@@ -13870,6 +14617,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "cuda,rocm",
+                  "--auto-device-counts",
+                  "cuda=2,rocm=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -14263,19 +15031,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              36.66734180925033,
-              36.69869714849975,
-              36.64396822828219
+              31.994631354057706,
+              32.17514397243227,
+              31.945179490323
             ],
             "prefill": [
-              500.61712647386634,
-              499.10448372969495,
-              497.9857347531642
+              301.367589759008,
+              301.66045284430544,
+              302.3965242297808
             ]
           },
           "tokens_per_second": {
-            "decode": 36.66734180925033,
-            "prefill": 499.10448372969495
+            "decode": 31.994631354057706,
+            "prefill": 301.66045284430544
           }
         },
         {
@@ -14283,6 +15051,31 @@
           "identity": {
             "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "tp",
+                  "--moe-routed-expert-owner-order",
+                  "ordinal",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic",
+                  "--moe-residency-maintenance",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -14690,19 +15483,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              64.77496859402159,
-              65.86842074212554,
-              67.99657179417433
+              101.99609599742959,
+              101.96936322324409,
+              101.81157763906045
             ],
             "prefill": [
-              1060.4872099039048,
-              1038.283495772854,
-              1042.598072944804
+              775.0034046792638,
+              775.5705469201858,
+              775.307896003185
             ]
           },
           "tokens_per_second": {
-            "decode": 65.86842074212554,
-            "prefill": 1042.598072944804
+            "decode": 101.96936322324409,
+            "prefill": 775.307896003185
           }
         },
         {
@@ -14710,6 +15503,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [
                 {
                   "frontend": "plan-apply",
@@ -15590,19 +16404,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              74.88162171448818,
-              74.74124845774841,
-              74.74634169419531
+              148.50967120487607,
+              148.51387996045443,
+              148.5540181803134
             ],
             "prefill": [
-              1160.3351389636287,
-              1162.276033125657,
-              1158.1200142806151
+              830.9007604621221,
+              828.8342405773975,
+              831.5052074215399
             ]
           },
           "tokens_per_second": {
-            "decode": 74.74634169419531,
-            "prefill": 1160.3351389636287
+            "decode": 148.51387996045443,
+            "prefill": 830.9007604621221
           }
         },
         {
@@ -15610,6 +16424,27 @@
           "identity": {
             "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -15989,19 +16824,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              100.25978395186648,
-              100.25525069389815,
-              100.25917835062656
+              166.16601941928573,
+              166.2539517716767,
+              166.2487332156208
             ],
             "prefill": [
-              1160.4324307937136,
-              1160.4951012090557,
-              1162.1313137839572
+              821.0518686961728,
+              822.0823126614099,
+              821.7761947393609
             ]
           },
           "tokens_per_second": {
-            "decode": 100.25917835062656,
-            "prefill": 1160.4951012090557
+            "decode": 166.2487332156208,
+            "prefill": 821.7761947393609
           }
         },
         {
@@ -16009,6 +16844,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "tp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -16384,19 +17240,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              38.44873899810933,
-              38.688402028390435,
-              38.57434307115455
+              39.13832092204711,
+              39.08806322210646,
+              39.13709618663582
             ],
             "prefill": [
-              373.38332531560707,
-              373.4242383295714,
-              373.37619213630813
+              247.11624882009409,
+              247.06009500897653,
+              247.27092584783452
             ]
           },
           "tokens_per_second": {
-            "decode": 38.57434307115455,
-            "prefill": 373.38332531560707
+            "decode": 39.13709618663582,
+            "prefill": 247.11624882009409
           }
         },
         {
@@ -16404,6 +17260,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=2",
+                  "--only-strategies",
+                  "pp",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 8192,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -16796,19 +17673,19 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              28.042796778592628,
-              28.03878419499903,
-              28.017400868459507
+              22.37423908293724,
+              22.97847757078171,
+              22.35537398965376
             ],
             "prefill": [
-              272.0724797259971,
-              271.57458793856495,
-              271.7670659763699
+              185.1882273814017,
+              184.82723917284244,
+              184.6876131883468
             ]
           },
           "tokens_per_second": {
-            "decode": 28.03878419499903,
-            "prefill": 271.7670659763699
+            "decode": 22.37423908293724,
+            "prefill": 184.82723917284244
           }
         },
         {
@@ -16816,6 +17693,27 @@
           "identity": {
             "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
             "configuration": {
+              "benchmark": {
+                "args": [
+                  "--activation-precision",
+                  "fp32",
+                  "--kv-cache-precision",
+                  "fp16",
+                  "--auto",
+                  "--only-backends",
+                  "rocm",
+                  "--auto-device-counts",
+                  "rocm=1",
+                  "--only-strategies",
+                  "single",
+                  "--mtp",
+                  "--mtp-depth-policy",
+                  "dynamic"
+                ],
+                "context_length": 32768,
+                "policy": "production_defaults",
+                "schema": 1
+              },
               "cross_host_e2e": [],
               "e2e": {
                 "cell_timeout_seconds": {
@@ -17191,26 +18089,26 @@
           "prefill_tokens": 512,
           "samples": {
             "decode": [
-              36.63009703562651,
-              36.63497872892538,
-              36.633569902727835
+              39.22580948320973,
+              39.22056699586427,
+              39.2208238918095
             ],
             "prefill": [
-              274.7144418360207,
-              274.23588195316137,
-              273.7940902528497
+              180.56340115386962,
+              180.2537655956029,
+              179.9474201300204
             ]
           },
           "tokens_per_second": {
-            "decode": 36.633569902727835,
-            "prefill": 274.23588195316137
+            "decode": 39.2208238918095,
+            "prefill": 180.2537655956029
           }
         }
       ],
       "comparisons": [
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 20.28354405534331,
+          "current": 294.6870673512179,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17218,7 +18116,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 10.355586031421655,
+          "current": 37.00911391591542,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17226,7 +18124,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 20.337960600812707,
+          "current": 352.3774183487581,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17234,7 +18132,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 13.186409175011416,
+          "current": 42.009006192223886,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17242,7 +18140,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 171.78716459573582,
+          "current": 124.92697548586702,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17250,7 +18148,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 13.43092379434832,
+          "current": 14.0495421473084,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17258,7 +18156,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 160.11895817834292,
+          "current": 124.55144778685616,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17266,7 +18164,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 18.931604540267262,
+          "current": 20.119436376706723,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17274,7 +18172,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 194.96005702712657,
+          "current": 164.72968452054434,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17282,7 +18180,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.476599194913522,
+          "current": 22.61551433948939,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17290,7 +18188,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 228.82780111047663,
+          "current": 170.75167157290525,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17298,7 +18196,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.977668262696053,
+          "current": 27.478068326425486,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17306,7 +18204,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1049.8208089157213,
+          "current": 887.3892595832347,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17314,7 +18212,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 106.13195442414022,
+          "current": 139.71622483036936,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17322,7 +18220,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 2608.5045154232107,
+          "current": 1737.5849757108697,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17330,7 +18228,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 225.45250592356788,
+          "current": 283.0466586455166,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17338,7 +18236,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 741.814167950231,
+          "current": 468.1480895375244,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17346,7 +18244,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 50.79544412546185,
+          "current": 50.37873541979683,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17354,7 +18252,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1124.5985474219508,
+          "current": 743.7303214331563,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17362,7 +18260,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 50.841412557820846,
+          "current": 40.045097658297664,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17370,7 +18268,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 913.2216789387578,
+          "current": 718.360566494653,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17378,7 +18276,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 62.68582453693845,
+          "current": 62.74931544169534,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17386,7 +18284,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 188.60407047787703,
+          "current": 153.59136216002435,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17394,7 +18292,7 @@
         },
         {
           "case": "Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 23.064137838425122,
+          "current": 25.029439150278442,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17402,7 +18300,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 499.10448372969495,
+          "current": 301.66045284430544,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17410,7 +18308,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 36.66734180925033,
+          "current": 31.994631354057706,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17418,7 +18316,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1042.598072944804,
+          "current": 775.307896003185,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17426,7 +18324,7 @@
         },
         {
           "case": "Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 65.86842074212554,
+          "current": 101.96936322324409,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17434,7 +18332,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1160.3351389636287,
+          "current": 830.9007604621221,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17442,7 +18340,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 74.74634169419531,
+          "current": 148.51387996045443,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17450,7 +18348,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 1160.4951012090557,
+          "current": 821.7761947393609,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17458,7 +18356,7 @@
         },
         {
           "case": "Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 100.25917835062656,
+          "current": 166.2487332156208,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17466,7 +18364,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 373.38332531560707,
+          "current": 247.11624882009409,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17474,7 +18372,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 38.57434307115455,
+          "current": 39.13709618663582,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17482,7 +18380,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 271.7670659763699,
+          "current": 184.82723917284244,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17490,7 +18388,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 28.03878419499903,
+          "current": 22.37423908293724,
           "high_water": null,
           "passed": true,
           "phase": "decode",
@@ -17498,7 +18396,7 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 274.23588195316137,
+          "current": 180.2537655956029,
           "high_water": null,
           "passed": true,
           "phase": "prefill",
@@ -17506,14 +18404,14 @@
         },
         {
           "case": "Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth",
-          "current": 36.633569902727835,
+          "current": 39.2208238918095,
           "high_water": null,
           "passed": true,
           "phase": "decode",
           "status": "new_baseline"
         }
       ],
-      "e2e_report_digest": "cedb8b0d3c79ee230d420cf30bb8dff6015b6ce8b725be9f31be819e24d4e338",
+      "e2e_report_digest": "3c95eedff61447c46ced9e973f95c7fd117de839ddf13eb14e93569c8f95d79e",
       "hardware": {
         "accelerators": [
           "0000:03:00.0 VGA compatible controller [0300]: ASPEED Technology, Inc. ASPEED Graphics Family [1a03:2000] (rev 41)",
@@ -17536,7 +18434,7 @@
           "Thread(s) per core:": "2"
         }
       },
-      "report_digest": "ae6f693bd1706109924d07d31a80476ecb038ead4b8f1ca6e9bc548fb65f2e82",
+      "report_digest": "3f1facf36d132ecc4b30cfca46dc4b88753a6d15297da6ea8541148911e7348e",
       "workload": {
         "decode_tokens": 256,
         "measurement_iterations": 3,
@@ -17551,5 +18449,5 @@
       }
     }
   },
-  "workflow_run": "https://github.com/Llaminar/llaminar/actions/runs/35925362041"
+  "workflow_run": "https://github.com/Llaminar/llaminar/actions/runs/36288780200"
 }

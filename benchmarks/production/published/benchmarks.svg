@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="2560" viewBox="0 0 1280 2560" role="img" aria-labelledby="title description">
 <title id="title">Llaminar published-image benchmarks</title>
-<desc id="description">Both ISA images passed full HTTP E2E. Source ff61316f3184a2846201445833c6fd4687d4142e. Grouped by model size. Exact prefill and decode medians in tokens per second. Each cell and phase is normalized to its own AVX512 result at 100%; bar lengths do not compare different cells.</desc>
+<desc id="description">Both ISA images passed full HTTP E2E. Source 557f0f97d15d447850b77b7ce4e91bb0663331b3. Grouped by model size. Exact prefill and decode medians in tokens per second. Each cell and phase is normalized to its own AVX512 result at 100%; bar lengths do not compare different cells.</desc>
 <style>text{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;fill:#17243b}.muted{fill:#52647b}.small{font-size:13px}.value{font-size:15px;font-weight:650}.label{font-size:17px;font-weight:650}</style>
 <rect width="1280" height="2560" rx="18" fill="#f8fafc"/>
 <path d="M18 0H1262Q1280 0 1280 18V126H0V18Q0 0 18 0" fill="#122238"/>
 <text x="28" y="39" style="fill:white;font-size:27px;font-weight:750">Llaminar · Published-image benchmarks</text>
-<text x="28" y="66" style="fill:#cbd5e1;font-size:14px">Image source ff61316f3184a2846201445833c6fd4687d4142e · 2026-09-24</text>
+<text x="28" y="66" style="fill:#cbd5e1;font-size:14px">Image source 557f0f97d15d447850b77b7ce4e91bb0663331b3 · 2026-09-27</text>
 <text x="28" y="94" style="fill:#cbd5e1;font-size:14px">Full HTTP E2E passed · warmed production inference · median of measured requests</text>
 <rect x="1000" y="80" width="15" height="15" rx="3" fill="#078c86"/><text x="1022" y="93" style="fill:white;font-size:13px">AVX512</text>
 <rect x="1110" y="80" width="15" height="15" rx="3" fill="#5663da"/><text x="1132" y="93" style="fill:white;font-size:13px">AVX2</text>
@@ -24,24 +24,24 @@
 <text x="28" y="334" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="264" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="264" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 1,124.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="276" class="value">1,124.6</text>
+<rect data-isa="AVX512" x="630" y="264" width="200.43" height="12" rx="4" fill="#078c86"><title>AVX512: 743.7 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="276" class="value">743.7</text>
 <text x="845" y="292" class="small muted">100.0%</text>
 <rect x="630" y="304" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="304" width="204.47" height="12" rx="4" fill="#5663da"><title>AVX2: 1,121.7 tok/s · 99.7% of AVX512</title></rect>
-<text x="845" y="316" class="value">1,121.7</text>
-<text x="845" y="332" class="small muted">99.7%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="259" y2="320" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="304" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 760.7 tok/s · 102.3% of AVX512</title></rect>
+<text x="845" y="316" class="value">760.7</text>
+<text x="845" y="332" class="small muted">102.3%</text>
+<line class="reference" x1="830.43" x2="830.43" y1="259" y2="320" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="264" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="264" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 50.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="276" class="value">50.8</text>
+<rect data-isa="AVX512" x="955" y="264" width="203.63" height="12" rx="4" fill="#078c86"><title>AVX512: 40.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="276" class="value">40.0</text>
 <text x="1170" y="292" class="small muted">100.0%</text>
 <rect x="955" y="304" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="304" width="204.98" height="12" rx="4" fill="#5663da"><title>AVX2: 50.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="316" class="value">50.8</text>
-<text x="1170" y="332" class="small muted">100.0%</text>
-<line class="reference" x1="1160.00" x2="1160.00" y1="259" y2="320" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="304" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 40.3 tok/s · 100.7% of AVX512</title></rect>
+<text x="1170" y="316" class="value">40.3</text>
+<text x="1170" y="332" class="small muted">100.7%</text>
+<line class="reference" x1="1158.63" x2="1158.63" y1="259" y2="320" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_ROCm2_TPPP_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="362" width="1256" height="108" rx="8" fill="#edf2f8"/>
@@ -50,24 +50,24 @@
 <text x="28" y="450" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="380" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="380" width="203.76" height="12" rx="4" fill="#078c86"><title>AVX512: 499.1 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="392" class="value">499.1</text>
+<rect data-isa="AVX512" x="630" y="380" width="204.03" height="12" rx="4" fill="#078c86"><title>AVX512: 301.7 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="392" class="value">301.7</text>
 <text x="845" y="408" class="small muted">100.0%</text>
 <rect x="630" y="420" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="420" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 502.2 tok/s · 100.6% of AVX512</title></rect>
-<text x="845" y="432" class="value">502.2</text>
-<text x="845" y="448" class="small muted">100.6%</text>
-<line class="reference" x1="833.76" x2="833.76" y1="375" y2="436" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="420" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 303.1 tok/s · 100.5% of AVX512</title></rect>
+<text x="845" y="432" class="value">303.1</text>
+<text x="845" y="448" class="small muted">100.5%</text>
+<line class="reference" x1="834.03" x2="834.03" y1="375" y2="436" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="380" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="380" width="204.86" height="12" rx="4" fill="#078c86"><title>AVX512: 36.7 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="392" class="value">36.7</text>
+<rect data-isa="AVX512" x="955" y="380" width="203.47" height="12" rx="4" fill="#078c86"><title>AVX512: 32.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="392" class="value">32.0</text>
 <text x="1170" y="408" class="small muted">100.0%</text>
 <rect x="955" y="420" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="420" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 36.7 tok/s · 100.1% of AVX512</title></rect>
-<text x="1170" y="432" class="value">36.7</text>
-<text x="1170" y="448" class="small muted">100.1%</text>
-<line class="reference" x1="1159.86" x2="1159.86" y1="375" y2="436" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="420" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 32.2 tok/s · 100.8% of AVX512</title></rect>
+<text x="1170" y="432" class="value">32.2</text>
+<text x="1170" y="448" class="small muted">100.8%</text>
+<line class="reference" x1="1158.47" x2="1158.47" y1="375" y2="436" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA2_TP_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="478" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -76,24 +76,24 @@
 <text x="28" y="566" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="496" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="496" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 741.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="508" class="value">741.8</text>
+<rect data-isa="AVX512" x="630" y="496" width="204.44" height="12" rx="4" fill="#078c86"><title>AVX512: 468.1 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="508" class="value">468.1</text>
 <text x="845" y="524" class="small muted">100.0%</text>
 <rect x="630" y="536" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="536" width="204.59" height="12" rx="4" fill="#5663da"><title>AVX2: 740.3 tok/s · 99.8% of AVX512</title></rect>
-<text x="845" y="548" class="value">740.3</text>
-<text x="845" y="564" class="small muted">99.8%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="491" y2="552" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="536" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 469.4 tok/s · 100.3% of AVX512</title></rect>
+<text x="845" y="548" class="value">469.4</text>
+<text x="845" y="564" class="small muted">100.3%</text>
+<line class="reference" x1="834.44" x2="834.44" y1="491" y2="552" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="496" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="496" width="204.90" height="12" rx="4" fill="#078c86"><title>AVX512: 50.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="508" class="value">50.8</text>
+<rect data-isa="AVX512" x="955" y="496" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 50.4 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="508" class="value">50.4</text>
 <text x="1170" y="524" class="small muted">100.0%</text>
 <rect x="955" y="536" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="536" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 50.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="548" class="value">50.8</text>
-<text x="1170" y="564" class="small muted">100.0%</text>
-<line class="reference" x1="1159.90" x2="1159.90" y1="491" y2="552" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="536" width="204.79" height="12" rx="4" fill="#5663da"><title>AVX2: 50.3 tok/s · 99.9% of AVX512</title></rect>
+<text x="1170" y="548" class="value">50.3</text>
+<text x="1170" y="564" class="small muted">99.9%</text>
+<line class="reference" x1="1160.00" x2="1160.00" y1="491" y2="552" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_PP_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="594" width="1256" height="108" rx="8" fill="#edf2f8"/>
@@ -102,24 +102,24 @@
 <text x="28" y="682" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="612" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="612" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 271.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="624" class="value">271.8</text>
+<rect data-isa="AVX512" x="630" y="612" width="204.04" height="12" rx="4" fill="#078c86"><title>AVX512: 184.8 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="624" class="value">184.8</text>
 <text x="845" y="640" class="small muted">100.0%</text>
 <rect x="630" y="652" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="652" width="204.99" height="12" rx="4" fill="#5663da"><title>AVX2: 271.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="664" class="value">271.8</text>
-<text x="845" y="680" class="small muted">100.0%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="607" y2="668" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="652" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 185.7 tok/s · 100.5% of AVX512</title></rect>
+<text x="845" y="664" class="value">185.7</text>
+<text x="845" y="680" class="small muted">100.5%</text>
+<line class="reference" x1="834.04" x2="834.04" y1="607" y2="668" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="612" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="612" width="204.71" height="12" rx="4" fill="#078c86"><title>AVX512: 28.0 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="624" class="value">28.0</text>
+<rect data-isa="AVX512" x="955" y="612" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 22.4 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="624" class="value">22.4</text>
 <text x="1170" y="640" class="small muted">100.0%</text>
 <rect x="955" y="652" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="652" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 28.1 tok/s · 100.1% of AVX512</title></rect>
-<text x="1170" y="664" class="value">28.1</text>
-<text x="1170" y="680" class="small muted">100.1%</text>
-<line class="reference" x1="1159.71" x2="1159.71" y1="607" y2="668" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="652" width="198.26" height="12" rx="4" fill="#5663da"><title>AVX2: 21.6 tok/s · 96.7% of AVX512</title></rect>
+<text x="1170" y="664" class="value">21.6</text>
+<text x="1170" y="680" class="small muted">96.7%</text>
+<line class="reference" x1="1160.00" x2="1160.00" y1="607" y2="668" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseMultiDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm2_TP_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="710" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -128,24 +128,24 @@
 <text x="28" y="798" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="728" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="728" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 373.4 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="740" class="value">373.4</text>
+<rect data-isa="AVX512" x="630" y="728" width="204.70" height="12" rx="4" fill="#078c86"><title>AVX512: 247.1 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="740" class="value">247.1</text>
 <text x="845" y="756" class="small muted">100.0%</text>
 <rect x="630" y="768" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="768" width="204.36" height="12" rx="4" fill="#5663da"><title>AVX2: 372.2 tok/s · 99.7% of AVX512</title></rect>
-<text x="845" y="780" class="value">372.2</text>
-<text x="845" y="796" class="small muted">99.7%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="723" y2="784" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="768" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 247.5 tok/s · 100.1% of AVX512</title></rect>
+<text x="845" y="780" class="value">247.5</text>
+<text x="845" y="796" class="small muted">100.1%</text>
+<line class="reference" x1="834.70" x2="834.70" y1="723" y2="784" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="728" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="728" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 38.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="740" class="value">38.6</text>
+<rect data-isa="AVX512" x="955" y="728" width="204.91" height="12" rx="4" fill="#078c86"><title>AVX512: 39.1 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="740" class="value">39.1</text>
 <text x="1170" y="756" class="small muted">100.0%</text>
 <rect x="955" y="768" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="768" width="204.92" height="12" rx="4" fill="#5663da"><title>AVX2: 38.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="780" class="value">38.6</text>
+<rect data-isa="AVX2" x="955" y="768" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 39.2 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="780" class="value">39.2</text>
 <text x="1170" y="796" class="small muted">100.0%</text>
-<line class="reference" x1="1160.00" x2="1160.00" y1="723" y2="784" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<line class="reference" x1="1159.91" x2="1159.91" y1="723" y2="784" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_CUDA0_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="826" width="1256" height="108" rx="8" fill="#edf2f8"/>
@@ -154,23 +154,23 @@
 <text x="28" y="914" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="844" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="844" width="204.48" height="12" rx="4" fill="#078c86"><title>AVX512: 913.2 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="856" class="value">913.2</text>
+<rect data-isa="AVX512" x="630" y="844" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 718.4 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="856" class="value">718.4</text>
 <text x="845" y="872" class="small muted">100.0%</text>
 <rect x="630" y="884" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="884" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 915.5 tok/s · 100.3% of AVX512</title></rect>
-<text x="845" y="896" class="value">915.5</text>
-<text x="845" y="912" class="small muted">100.3%</text>
-<line class="reference" x1="834.48" x2="834.48" y1="839" y2="900" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="884" width="200.74" height="12" rx="4" fill="#5663da"><title>AVX2: 703.4 tok/s · 97.9% of AVX512</title></rect>
+<text x="845" y="896" class="value">703.4</text>
+<text x="845" y="912" class="small muted">97.9%</text>
+<line class="reference" x1="835.00" x2="835.00" y1="839" y2="900" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="844" width="205" height="12" rx="4" fill="#dde5ef"/>
 <rect data-isa="AVX512" x="955" y="844" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 62.7 tok/s · 100.0% of AVX512</title></rect>
 <text x="1170" y="856" class="value">62.7</text>
 <text x="1170" y="872" class="small muted">100.0%</text>
 <rect x="955" y="884" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="884" width="204.89" height="12" rx="4" fill="#5663da"><title>AVX2: 62.7 tok/s · 99.9% of AVX512</title></rect>
-<text x="1170" y="896" class="value">62.7</text>
-<text x="1170" y="912" class="small muted">99.9%</text>
+<rect data-isa="AVX2" x="955" y="884" width="203.23" height="12" rx="4" fill="#5663da"><title>AVX2: 62.2 tok/s · 99.1% of AVX512</title></rect>
+<text x="1170" y="896" class="value">62.2</text>
+<text x="1170" y="912" class="small muted">99.1%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="839" y2="900" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen38Dense/Qwen38DenseSingleDeviceParityTest.ProductionParity/Qwen38Dense_27B_IQ4XS_ROCm0_ActFP32_KVFP16_MTPDynamicDepth</title>
@@ -180,23 +180,23 @@
 <text x="28" y="1030" class="small muted">Context 32,768 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="960" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="960" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 274.2 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="972" class="value">274.2</text>
+<rect data-isa="AVX512" x="630" y="960" width="202.97" height="12" rx="4" fill="#078c86"><title>AVX512: 180.3 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="972" class="value">180.3</text>
 <text x="845" y="988" class="small muted">100.0%</text>
 <rect x="630" y="1000" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1000" width="202.42" height="12" rx="4" fill="#5663da"><title>AVX2: 270.8 tok/s · 98.7% of AVX512</title></rect>
-<text x="845" y="1012" class="value">270.8</text>
-<text x="845" y="1028" class="small muted">98.7%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="955" y2="1016" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1000" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 182.1 tok/s · 101.0% of AVX512</title></rect>
+<text x="845" y="1012" class="value">182.1</text>
+<text x="845" y="1028" class="small muted">101.0%</text>
+<line class="reference" x1="832.97" x2="832.97" y1="955" y2="1016" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="960" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="960" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 36.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="972" class="value">36.6</text>
+<rect data-isa="AVX512" x="955" y="960" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 39.2 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="972" class="value">39.2</text>
 <text x="1170" y="988" class="small muted">100.0%</text>
 <rect x="955" y="1000" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1000" width="204.84" height="12" rx="4" fill="#5663da"><title>AVX2: 36.6 tok/s · 99.9% of AVX512</title></rect>
-<text x="1170" y="1012" class="value">36.6</text>
-<text x="1170" y="1028" class="small muted">99.9%</text>
+<rect data-isa="AVX2" x="955" y="1000" width="204.96" height="12" rx="4" fill="#5663da"><title>AVX2: 39.2 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1012" class="value">39.2</text>
+<text x="1170" y="1028" class="small muted">100.0%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="955" y2="1016" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="model-section"><title>35B models</title>
@@ -210,24 +210,24 @@
 <text x="28" y="1190" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1120" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1120" width="204.29" height="12" rx="4" fill="#078c86"><title>AVX512: 1,160.5 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1132" class="value">1,160.5</text>
+<rect data-isa="AVX512" x="630" y="1120" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 821.8 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1132" class="value">821.8</text>
 <text x="845" y="1148" class="small muted">100.0%</text>
 <rect x="630" y="1160" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1160" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 1,164.5 tok/s · 100.3% of AVX512</title></rect>
-<text x="845" y="1172" class="value">1,164.5</text>
-<text x="845" y="1188" class="small muted">100.3%</text>
-<line class="reference" x1="834.29" x2="834.29" y1="1115" y2="1176" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1160" width="204.01" height="12" rx="4" fill="#5663da"><title>AVX2: 817.8 tok/s · 99.5% of AVX512</title></rect>
+<text x="845" y="1172" class="value">817.8</text>
+<text x="845" y="1188" class="small muted">99.5%</text>
+<line class="reference" x1="835.00" x2="835.00" y1="1115" y2="1176" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1120" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1120" width="204.79" height="12" rx="4" fill="#078c86"><title>AVX512: 100.3 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1132" class="value">100.3</text>
+<rect data-isa="AVX512" x="955" y="1120" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 166.2 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1132" class="value">166.2</text>
 <text x="1170" y="1148" class="small muted">100.0%</text>
 <rect x="955" y="1160" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1160" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 100.4 tok/s · 100.1% of AVX512</title></rect>
-<text x="1170" y="1172" class="value">100.4</text>
-<text x="1170" y="1188" class="small muted">100.1%</text>
-<line class="reference" x1="1159.79" x2="1159.79" y1="1115" y2="1176" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="1160" width="204.63" height="12" rx="4" fill="#5663da"><title>AVX2: 166.0 tok/s · 99.8% of AVX512</title></rect>
+<text x="1170" y="1172" class="value">166.0</text>
+<text x="1170" y="1188" class="small muted">99.8%</text>
+<line class="reference" x1="1160.00" x2="1160.00" y1="1115" y2="1176" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_NCCL_2xCUDA_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="1218" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -236,24 +236,24 @@
 <text x="28" y="1306" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1236" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1236" width="202.72" height="12" rx="4" fill="#078c86"><title>AVX512: 1,049.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1248" class="value">1,049.8</text>
+<rect data-isa="AVX512" x="630" y="1236" width="204.90" height="12" rx="4" fill="#078c86"><title>AVX512: 887.4 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1248" class="value">887.4</text>
 <text x="845" y="1264" class="small muted">100.0%</text>
 <rect x="630" y="1276" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1276" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 1,061.7 tok/s · 101.1% of AVX512</title></rect>
-<text x="845" y="1288" class="value">1,061.7</text>
-<text x="845" y="1304" class="small muted">101.1%</text>
-<line class="reference" x1="832.72" x2="832.72" y1="1231" y2="1292" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1276" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 887.8 tok/s · 100.1% of AVX512</title></rect>
+<text x="845" y="1288" class="value">887.8</text>
+<text x="845" y="1304" class="small muted">100.1%</text>
+<line class="reference" x1="834.90" x2="834.90" y1="1231" y2="1292" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1236" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1236" width="204.63" height="12" rx="4" fill="#078c86"><title>AVX512: 106.1 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1248" class="value">106.1</text>
+<rect data-isa="AVX512" x="955" y="1236" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 139.7 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1248" class="value">139.7</text>
 <text x="1170" y="1264" class="small muted">100.0%</text>
 <rect x="955" y="1276" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1276" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 106.3 tok/s · 100.2% of AVX512</title></rect>
-<text x="1170" y="1288" class="value">106.3</text>
-<text x="1170" y="1304" class="small muted">100.2%</text>
-<line class="reference" x1="1159.63" x2="1159.63" y1="1231" y2="1292" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="1276" width="204.41" height="12" rx="4" fill="#5663da"><title>AVX2: 139.3 tok/s · 99.7% of AVX512</title></rect>
+<text x="1170" y="1288" class="value">139.3</text>
+<text x="1170" y="1304" class="small muted">99.7%</text>
+<line class="reference" x1="1160.00" x2="1160.00" y1="1231" y2="1292" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_LocalTP_RCCL_2xROCm_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="1334" width="1256" height="108" rx="8" fill="#edf2f8"/>
@@ -262,24 +262,24 @@
 <text x="28" y="1422" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1352" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1352" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 1,042.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1364" class="value">1,042.6</text>
+<rect data-isa="AVX512" x="630" y="1352" width="204.38" height="12" rx="4" fill="#078c86"><title>AVX512: 775.3 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1364" class="value">775.3</text>
 <text x="845" y="1380" class="small muted">100.0%</text>
 <rect x="630" y="1392" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1392" width="204.78" height="12" rx="4" fill="#5663da"><title>AVX2: 1,041.5 tok/s · 99.9% of AVX512</title></rect>
-<text x="845" y="1404" class="value">1,041.5</text>
-<text x="845" y="1420" class="small muted">99.9%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="1347" y2="1408" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1392" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 777.7 tok/s · 100.3% of AVX512</title></rect>
+<text x="845" y="1404" class="value">777.7</text>
+<text x="845" y="1420" class="small muted">100.3%</text>
+<line class="reference" x1="834.38" x2="834.38" y1="1347" y2="1408" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1352" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1352" width="204.72" height="12" rx="4" fill="#078c86"><title>AVX512: 65.9 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1364" class="value">65.9</text>
+<rect data-isa="AVX512" x="955" y="1352" width="203.31" height="12" rx="4" fill="#078c86"><title>AVX512: 102.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1364" class="value">102.0</text>
 <text x="1170" y="1380" class="small muted">100.0%</text>
 <rect x="955" y="1392" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1392" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 66.0 tok/s · 100.1% of AVX512</title></rect>
-<text x="1170" y="1404" class="value">66.0</text>
-<text x="1170" y="1420" class="small muted">100.1%</text>
-<line class="reference" x1="1159.72" x2="1159.72" y1="1347" y2="1408" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="1392" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 102.8 tok/s · 100.8% of AVX512</title></rect>
+<text x="1170" y="1404" class="value">102.8</text>
+<text x="1170" y="1420" class="small muted">100.8%</text>
+<line class="reference" x1="1158.31" x2="1158.31" y1="1347" y2="1408" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Ornith15MoE_35B_Q4KM_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="1450" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -288,23 +288,23 @@
 <text x="28" y="1538" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1468" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1468" width="191.42" height="12" rx="4" fill="#078c86"><title>AVX512: 20.3 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1480" class="value">20.3</text>
+<rect data-isa="AVX512" x="630" y="1468" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 352.4 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1480" class="value">352.4</text>
 <text x="845" y="1496" class="small muted">100.0%</text>
 <rect x="630" y="1508" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1508" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 21.8 tok/s · 107.1% of AVX512</title></rect>
-<text x="845" y="1520" class="value">21.8</text>
-<text x="845" y="1536" class="small muted">107.1%</text>
-<line class="reference" x1="821.42" x2="821.42" y1="1463" y2="1524" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1508" width="72.34" height="12" rx="4" fill="#5663da"><title>AVX2: 124.3 tok/s · 35.3% of AVX512</title></rect>
+<text x="845" y="1520" class="value">124.3</text>
+<text x="845" y="1536" class="small muted">35.3%</text>
+<line class="reference" x1="835.00" x2="835.00" y1="1463" y2="1524" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1468" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1468" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 13.2 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1480" class="value">13.2</text>
+<rect data-isa="AVX512" x="955" y="1468" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 42.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1480" class="value">42.0</text>
 <text x="1170" y="1496" class="small muted">100.0%</text>
 <rect x="955" y="1508" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1508" width="154.49" height="12" rx="4" fill="#5663da"><title>AVX2: 9.9 tok/s · 75.4% of AVX512</title></rect>
-<text x="1170" y="1520" class="value">9.9</text>
-<text x="1170" y="1536" class="small muted">75.4%</text>
+<rect data-isa="AVX2" x="955" y="1508" width="157.13" height="12" rx="4" fill="#5663da"><title>AVX2: 32.2 tok/s · 76.6% of AVX512</title></rect>
+<text x="1170" y="1520" class="value">32.2</text>
+<text x="1170" y="1536" class="small muted">76.6%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="1463" y2="1524" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_CUDA0_ActFP32_KVFP16_MTPDynamicDepth</title>
@@ -314,24 +314,24 @@
 <text x="28" y="1654" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1584" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1584" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 2,608.5 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1596" class="value">2,608.5</text>
+<rect data-isa="AVX512" x="630" y="1584" width="202.28" height="12" rx="4" fill="#078c86"><title>AVX512: 1,737.6 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1596" class="value">1,737.6</text>
 <text x="845" y="1612" class="small muted">100.0%</text>
 <rect x="630" y="1624" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1624" width="202.69" height="12" rx="4" fill="#5663da"><title>AVX2: 2,579.1 tok/s · 98.9% of AVX512</title></rect>
-<text x="845" y="1636" class="value">2,579.1</text>
-<text x="845" y="1652" class="small muted">98.9%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="1579" y2="1640" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1624" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 1,761.0 tok/s · 101.3% of AVX512</title></rect>
+<text x="845" y="1636" class="value">1,761.0</text>
+<text x="845" y="1652" class="small muted">101.3%</text>
+<line class="reference" x1="832.28" x2="832.28" y1="1579" y2="1640" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1584" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1584" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 225.5 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1596" class="value">225.5</text>
+<rect data-isa="AVX512" x="955" y="1584" width="202.12" height="12" rx="4" fill="#078c86"><title>AVX512: 283.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1596" class="value">283.0</text>
 <text x="1170" y="1612" class="small muted">100.0%</text>
 <rect x="955" y="1624" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1624" width="203.68" height="12" rx="4" fill="#5663da"><title>AVX2: 224.0 tok/s · 99.4% of AVX512</title></rect>
-<text x="1170" y="1636" class="value">224.0</text>
-<text x="1170" y="1652" class="small muted">99.4%</text>
-<line class="reference" x1="1160.00" x2="1160.00" y1="1579" y2="1640" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="1624" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 287.1 tok/s · 101.4% of AVX512</title></rect>
+<text x="1170" y="1636" class="value">287.1</text>
+<text x="1170" y="1652" class="small muted">101.4%</text>
+<line class="reference" x1="1157.12" x2="1157.12" y1="1579" y2="1640" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoE/Qwen36MoESingleDeviceParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_ROCm0_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="1682" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -340,24 +340,24 @@
 <text x="28" y="1770" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1700" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1700" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 1,160.3 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1712" class="value">1,160.3</text>
+<rect data-isa="AVX512" x="630" y="1700" width="203.90" height="12" rx="4" fill="#078c86"><title>AVX512: 830.9 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1712" class="value">830.9</text>
 <text x="845" y="1728" class="small muted">100.0%</text>
 <rect x="630" y="1740" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1740" width="204.28" height="12" rx="4" fill="#5663da"><title>AVX2: 1,156.3 tok/s · 99.6% of AVX512</title></rect>
-<text x="845" y="1752" class="value">1,156.3</text>
-<text x="845" y="1768" class="small muted">99.6%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="1695" y2="1756" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1740" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 835.4 tok/s · 100.5% of AVX512</title></rect>
+<text x="845" y="1752" class="value">835.4</text>
+<text x="845" y="1768" class="small muted">100.5%</text>
+<line class="reference" x1="833.90" x2="833.90" y1="1695" y2="1756" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1700" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1700" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 74.7 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1712" class="value">74.7</text>
+<rect data-isa="AVX512" x="955" y="1700" width="204.92" height="12" rx="4" fill="#078c86"><title>AVX512: 148.5 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1712" class="value">148.5</text>
 <text x="1170" y="1728" class="small muted">100.0%</text>
 <rect x="955" y="1740" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1740" width="203.31" height="12" rx="4" fill="#5663da"><title>AVX2: 74.1 tok/s · 99.2% of AVX512</title></rect>
-<text x="1170" y="1752" class="value">74.1</text>
-<text x="1170" y="1768" class="small muted">99.2%</text>
-<line class="reference" x1="1160.00" x2="1160.00" y1="1695" y2="1756" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="1740" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 148.6 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1752" class="value">148.6</text>
+<text x="1170" y="1768" class="small muted">100.0%</text>
+<line class="reference" x1="1159.92" x2="1159.92" y1="1695" y2="1756" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.ProductionParity/Qwen36MoE_35B_IQ3S_NodeTP_2xMPI_CPU_ExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="1798" width="1256" height="108" rx="8" fill="#edf2f8"/>
@@ -366,23 +366,23 @@
 <text x="28" y="1886" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1816" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1816" width="167.81" height="12" rx="4" fill="#078c86"><title>AVX512: 20.3 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1828" class="value">20.3</text>
+<rect data-isa="AVX512" x="630" y="1816" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 294.7 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1828" class="value">294.7</text>
 <text x="845" y="1844" class="small muted">100.0%</text>
 <rect x="630" y="1856" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="1856" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 24.8 tok/s · 122.2% of AVX512</title></rect>
-<text x="845" y="1868" class="value">24.8</text>
-<text x="845" y="1884" class="small muted">122.2%</text>
-<line class="reference" x1="797.81" x2="797.81" y1="1811" y2="1872" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="1856" width="77.70" height="12" rx="4" fill="#5663da"><title>AVX2: 111.7 tok/s · 37.9% of AVX512</title></rect>
+<text x="845" y="1868" class="value">111.7</text>
+<text x="845" y="1884" class="small muted">37.9%</text>
+<line class="reference" x1="835.00" x2="835.00" y1="1811" y2="1872" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1816" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1816" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 10.4 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1828" class="value">10.4</text>
+<rect data-isa="AVX512" x="955" y="1816" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 37.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1828" class="value">37.0</text>
 <text x="1170" y="1844" class="small muted">100.0%</text>
 <rect x="955" y="1856" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="1856" width="156.99" height="12" rx="4" fill="#5663da"><title>AVX2: 7.9 tok/s · 76.6% of AVX512</title></rect>
-<text x="1170" y="1868" class="value">7.9</text>
-<text x="1170" y="1884" class="small muted">76.6%</text>
+<rect data-isa="AVX2" x="955" y="1856" width="154.90" height="12" rx="4" fill="#5663da"><title>AVX2: 28.0 tok/s · 75.6% of AVX512</title></rect>
+<text x="1170" y="1868" class="value">28.0</text>
+<text x="1170" y="1884" class="small muted">75.6%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="1811" y2="1872" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="model-section"><title>122B models</title>
@@ -396,23 +396,23 @@
 <text x="28" y="2046" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="1976" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="1976" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 171.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="1988" class="value">171.8</text>
+<rect data-isa="AVX512" x="630" y="1976" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 124.9 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="1988" class="value">124.9</text>
 <text x="845" y="2004" class="small muted">100.0%</text>
 <rect x="630" y="2016" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="2016" width="127.91" height="12" rx="4" fill="#5663da"><title>AVX2: 107.2 tok/s · 62.4% of AVX512</title></rect>
-<text x="845" y="2028" class="value">107.2</text>
-<text x="845" y="2044" class="small muted">62.4%</text>
+<rect data-isa="AVX2" x="630" y="2016" width="130.81" height="12" rx="4" fill="#5663da"><title>AVX2: 79.7 tok/s · 63.8% of AVX512</title></rect>
+<text x="845" y="2028" class="value">79.7</text>
+<text x="845" y="2044" class="small muted">63.8%</text>
 <line class="reference" x1="835.00" x2="835.00" y1="1971" y2="2032" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="1976" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="1976" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 13.4 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="1988" class="value">13.4</text>
+<rect data-isa="AVX512" x="955" y="1976" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 14.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="1988" class="value">14.0</text>
 <text x="1170" y="2004" class="small muted">100.0%</text>
 <rect x="955" y="2016" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="2016" width="200.38" height="12" rx="4" fill="#5663da"><title>AVX2: 13.1 tok/s · 97.7% of AVX512</title></rect>
-<text x="1170" y="2028" class="value">13.1</text>
-<text x="1170" y="2044" class="small muted">97.7%</text>
+<rect data-isa="AVX2" x="955" y="2016" width="202.45" height="12" rx="4" fill="#5663da"><title>AVX2: 13.9 tok/s · 98.8% of AVX512</title></rect>
+<text x="1170" y="2028" class="value">13.9</text>
+<text x="1170" y="2044" class="small muted">98.8%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="1971" y2="2032" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
@@ -422,24 +422,24 @@
 <text x="28" y="2162" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="2092" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="2092" width="195.35" height="12" rx="4" fill="#078c86"><title>AVX512: 188.6 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="2104" class="value">188.6</text>
+<rect data-isa="AVX512" x="630" y="2092" width="202.84" height="12" rx="4" fill="#078c86"><title>AVX512: 153.6 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="2104" class="value">153.6</text>
 <text x="845" y="2120" class="small muted">100.0%</text>
 <rect x="630" y="2132" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="2132" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 197.9 tok/s · 104.9% of AVX512</title></rect>
-<text x="845" y="2144" class="value">197.9</text>
-<text x="845" y="2160" class="small muted">104.9%</text>
-<line class="reference" x1="825.35" x2="825.35" y1="2087" y2="2148" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="2132" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 155.2 tok/s · 101.1% of AVX512</title></rect>
+<text x="845" y="2144" class="value">155.2</text>
+<text x="845" y="2160" class="small muted">101.1%</text>
+<line class="reference" x1="832.84" x2="832.84" y1="2087" y2="2148" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="2092" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="2092" width="197.56" height="12" rx="4" fill="#078c86"><title>AVX512: 23.1 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="2104" class="value">23.1</text>
+<rect data-isa="AVX512" x="955" y="2092" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 25.0 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="2104" class="value">25.0</text>
 <text x="1170" y="2120" class="small muted">100.0%</text>
 <rect x="955" y="2132" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="2132" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 23.9 tok/s · 103.8% of AVX512</title></rect>
-<text x="1170" y="2144" class="value">23.9</text>
-<text x="1170" y="2160" class="small muted">103.8%</text>
-<line class="reference" x1="1152.56" x2="1152.56" y1="2087" y2="2148" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="955" y="2132" width="203.22" height="12" rx="4" fill="#5663da"><title>AVX2: 24.8 tok/s · 99.1% of AVX512</title></rect>
+<text x="1170" y="2144" class="value">24.8</text>
+<text x="1170" y="2160" class="small muted">99.1%</text>
+<line class="reference" x1="1160.00" x2="1160.00" y1="2087" y2="2148" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_CUDA2_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
 <rect x="12" y="2190" width="1256" height="108" rx="8" fill="#ffffff"/>
@@ -448,23 +448,23 @@
 <text x="28" y="2278" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="2208" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="2208" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 160.1 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="2220" class="value">160.1</text>
+<rect data-isa="AVX512" x="630" y="2208" width="204.89" height="12" rx="4" fill="#078c86"><title>AVX512: 124.6 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="2220" class="value">124.6</text>
 <text x="845" y="2236" class="small muted">100.0%</text>
 <rect x="630" y="2248" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="2248" width="200.38" height="12" rx="4" fill="#5663da"><title>AVX2: 156.5 tok/s · 97.7% of AVX512</title></rect>
-<text x="845" y="2260" class="value">156.5</text>
-<text x="845" y="2276" class="small muted">97.7%</text>
-<line class="reference" x1="835.00" x2="835.00" y1="2203" y2="2264" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
+<rect data-isa="AVX2" x="630" y="2248" width="205.00" height="12" rx="4" fill="#5663da"><title>AVX2: 124.6 tok/s · 100.1% of AVX512</title></rect>
+<text x="845" y="2260" class="value">124.6</text>
+<text x="845" y="2276" class="small muted">100.1%</text>
+<line class="reference" x1="834.89" x2="834.89" y1="2203" y2="2264" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="2208" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="2208" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 18.9 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="2220" class="value">18.9</text>
+<rect data-isa="AVX512" x="955" y="2208" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 20.1 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="2220" class="value">20.1</text>
 <text x="1170" y="2236" class="small muted">100.0%</text>
 <rect x="955" y="2248" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="2248" width="200.95" height="12" rx="4" fill="#5663da"><title>AVX2: 18.6 tok/s · 98.0% of AVX512</title></rect>
-<text x="1170" y="2260" class="value">18.6</text>
-<text x="1170" y="2276" class="small muted">98.0%</text>
+<rect data-isa="AVX2" x="955" y="2248" width="200.39" height="12" rx="4" fill="#5663da"><title>AVX2: 19.7 tok/s · 97.8% of AVX512</title></rect>
+<text x="1170" y="2260" class="value">19.7</text>
+<text x="1170" y="2276" class="small muted">97.8%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="2203" y2="2264" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm2_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
@@ -474,23 +474,23 @@
 <text x="28" y="2394" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="2324" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="2324" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 195.0 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="2336" class="value">195.0</text>
+<rect data-isa="AVX512" x="630" y="2324" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 164.7 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="2336" class="value">164.7</text>
 <text x="845" y="2352" class="small muted">100.0%</text>
 <rect x="630" y="2364" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="2364" width="112.40" height="12" rx="4" fill="#5663da"><title>AVX2: 106.9 tok/s · 54.8% of AVX512</title></rect>
-<text x="845" y="2376" class="value">106.9</text>
-<text x="845" y="2392" class="small muted">54.8%</text>
+<rect data-isa="AVX2" x="630" y="2364" width="127.12" height="12" rx="4" fill="#5663da"><title>AVX2: 102.1 tok/s · 62.0% of AVX512</title></rect>
+<text x="845" y="2376" class="value">102.1</text>
+<text x="845" y="2392" class="small muted">62.0%</text>
 <line class="reference" x1="835.00" x2="835.00" y1="2319" y2="2380" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="2324" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="2324" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 23.5 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="2336" class="value">23.5</text>
+<rect data-isa="AVX512" x="955" y="2324" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 22.6 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="2336" class="value">22.6</text>
 <text x="1170" y="2352" class="small muted">100.0%</text>
 <rect x="955" y="2364" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="2364" width="203.47" height="12" rx="4" fill="#5663da"><title>AVX2: 23.3 tok/s · 99.3% of AVX512</title></rect>
-<text x="1170" y="2376" class="value">23.3</text>
-<text x="1170" y="2392" class="small muted">99.3%</text>
+<rect data-isa="AVX2" x="955" y="2364" width="189.28" height="12" rx="4" fill="#5663da"><title>AVX2: 20.9 tok/s · 92.3% of AVX512</title></rect>
+<text x="1170" y="2376" class="value">20.9</text>
+<text x="1170" y="2392" class="small muted">92.3%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="2319" y2="2380" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <g class="benchmark-cell" data-case="Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth"><title>Qwen35_122B_ExpertOverlay/Qwen35MoENodeExpertOverlayParityTest.ProductionParity/Qwen35_122B_ROCm4_CPU2_2xMPI_NodeExpertOverlay_Dynamic_Ordinal_ActFP32_KVFP16_MTPDynamicDepth</title>
@@ -500,23 +500,23 @@
 <text x="28" y="2510" class="small muted">Context 8,192 · Prompt 512 · Decode 256</text>
 <g data-phase="prefill" data-reference="AVX512">
 <rect x="630" y="2440" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="630" y="2440" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 228.8 tok/s · 100.0% of AVX512</title></rect>
-<text x="845" y="2452" class="value">228.8</text>
+<rect data-isa="AVX512" x="630" y="2440" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 170.8 tok/s · 100.0% of AVX512</title></rect>
+<text x="845" y="2452" class="value">170.8</text>
 <text x="845" y="2468" class="small muted">100.0%</text>
 <rect x="630" y="2480" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="630" y="2480" width="147.97" height="12" rx="4" fill="#5663da"><title>AVX2: 165.2 tok/s · 72.2% of AVX512</title></rect>
-<text x="845" y="2492" class="value">165.2</text>
-<text x="845" y="2508" class="small muted">72.2%</text>
+<rect data-isa="AVX2" x="630" y="2480" width="176.46" height="12" rx="4" fill="#5663da"><title>AVX2: 147.0 tok/s · 86.1% of AVX512</title></rect>
+<text x="845" y="2492" class="value">147.0</text>
+<text x="845" y="2508" class="small muted">86.1%</text>
 <line class="reference" x1="835.00" x2="835.00" y1="2435" y2="2496" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 <g data-phase="decode" data-reference="AVX512">
 <rect x="955" y="2440" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX512" x="955" y="2440" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 24.0 tok/s · 100.0% of AVX512</title></rect>
-<text x="1170" y="2452" class="value">24.0</text>
+<rect data-isa="AVX512" x="955" y="2440" width="205.00" height="12" rx="4" fill="#078c86"><title>AVX512: 27.5 tok/s · 100.0% of AVX512</title></rect>
+<text x="1170" y="2452" class="value">27.5</text>
 <text x="1170" y="2468" class="small muted">100.0%</text>
 <rect x="955" y="2480" width="205" height="12" rx="4" fill="#dde5ef"/>
-<rect data-isa="AVX2" x="955" y="2480" width="202.75" height="12" rx="4" fill="#5663da"><title>AVX2: 23.7 tok/s · 98.9% of AVX512</title></rect>
-<text x="1170" y="2492" class="value">23.7</text>
-<text x="1170" y="2508" class="small muted">98.9%</text>
+<rect data-isa="AVX2" x="955" y="2480" width="200.19" height="12" rx="4" fill="#5663da"><title>AVX2: 26.8 tok/s · 97.7% of AVX512</title></rect>
+<text x="1170" y="2492" class="value">26.8</text>
+<text x="1170" y="2508" class="small muted">97.7%</text>
 <line class="reference" x1="1160.00" x2="1160.00" y1="2435" y2="2496" stroke="#52647b" stroke-dasharray="2 3"><title>AVX512 reference: 100%</title></line></g>
 </g>
 <text x="28" y="2553" class="small muted">Phase-specific evidence, not full-image certification. See accompanying JSON for exact policies, image digests, hardware and samples.</text>
