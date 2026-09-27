@@ -1419,8 +1419,7 @@ extern "C"
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
         const float *d_grouped_weights,
-        float *d_grouped_gate,
-        float *d_grouped_up,
+        float *d_grouped_swiglu,
         float *d_output,
         float *d_canonical_route_contributions,
         int seq_len,
@@ -4641,6 +4640,20 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Bind and publish the table-owned gate/up pointer arrays.
+     * @param persistent_descriptor_slot Descriptor lifetime owning this slot.
+     * @param scope Distinct execution use of the descriptor table.
+     * @param top_k Number of active pointers to publish.
+     * @param gate_ptrs Prepared gate output addresses on this device.
+     * @param up_ptrs Prepared up output addresses on this device.
+     * @param d_gate_ptrs Receives the immutable device gate pointer-array address.
+     * @param d_up_ptrs Receives the immutable device up pointer-array address.
+     * @return True when warmup publication or capture-time reuse is complete.
+     *
+     * Pointer publication owns its arena binding, independently of quantized
+     * projection scratch. Capture may only consume an already prepared slot.
+     */
     bool ROCmMoEKernel::stageRuntimeGateUpPointerArrays(
         std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
@@ -4673,8 +4686,19 @@ namespace llaminar2
 
         if (!d_grouped_gate_output_ptrs_ || !d_grouped_up_output_ptrs_)
         {
-            LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Grouped gate/up workspace is not bound");
-            return false;
+            const size_t bytes = kRuntimePointerArrayWorkspaceEntries *
+                                 kRuntimePointerArrayMaxTopK * sizeof(float *);
+            if (capture_active ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gate_output_ptrs_),
+                    MoEWorkspaceBuffers::ROCM_DECODE_GATE_OUTPUT_PTRS, bytes,
+                    "stageRuntimeGateUpPointerArrays(gate)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_up_output_ptrs_),
+                    MoEWorkspaceBuffers::ROCM_DECODE_UP_OUTPUT_PTRS, bytes,
+                    "stageRuntimeGateUpPointerArrays(up)"))
+            {
+                LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Grouped gate/up workspace is not prepared");
+                return false;
+            }
         }
 
         float **slot_gate_ptrs =
@@ -4721,6 +4745,17 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Bind and publish table-owned inputs without requiring Q8 scratch.
+     * @param persistent_descriptor_slot Descriptor lifetime owning this slot.
+     * @param scope Distinct execution use of the descriptor table.
+     * @param top_k Number of active pointers to publish.
+     * @param gate_ptrs Prepared gate inputs on this device.
+     * @param up_ptrs Prepared up inputs on this device.
+     * @param d_gate_ptrs Receives the immutable device gate pointer-array address.
+     * @param d_up_ptrs Receives the immutable device up pointer-array address.
+     * @return True when warmup publication or capture-time reuse is complete.
+     */
     bool ROCmMoEKernel::stageRuntimeDownPointerArrays(
         std::size_t persistent_descriptor_slot,
         RuntimePointerArrayScope scope,
@@ -4753,8 +4788,19 @@ namespace llaminar2
 
         if (!d_grouped_gate_ptrs_ || !d_grouped_up_ptrs_)
         {
-            LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Grouped down workspace is not bound");
-            return false;
+            const size_t bytes = kRuntimePointerArrayWorkspaceEntries *
+                                 kRuntimePointerArrayMaxTopK * sizeof(float *);
+            if (capture_active ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gate_ptrs_),
+                    MoEWorkspaceBuffers::ROCM_DECODE_GATE_PTRS, bytes,
+                    "stageRuntimeDownPointerArrays(gate)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_up_ptrs_),
+                    MoEWorkspaceBuffers::ROCM_DECODE_UP_PTRS, bytes,
+                    "stageRuntimeDownPointerArrays(up)"))
+            {
+                LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Grouped down workspace is not prepared");
+                return false;
+            }
         }
 
         const float **slot_gate_ptrs =
@@ -8201,7 +8247,9 @@ namespace llaminar2
             }
         }
 
-        if (!ensureGroupedGateUpCapacity(
+        // Floating weights have no Q8/K-part intermediate dependency, including
+        // their geometry constraints. Metadata/pointer publication is shared.
+        if (!floating && !ensureGroupedGateUpCapacity(
                 num_active, d_model, intermediate))
             return false;
 
@@ -8988,9 +9036,9 @@ namespace llaminar2
         const int *fixed_gateup_expert_ids = nullptr;
         const int *fixed_down_expert_ids = nullptr;
         const float *fixed_down_expert_weights = nullptr;
-        if (!ensureGroupedGateUpCapacity(
-                num_active, d_model, intermediate) ||
-            !ensureGroupedDecodeCapacity(num_active, intermediate, d_model) ||
+        if ((!floating &&
+             (!ensureGroupedGateUpCapacity(num_active, d_model, intermediate) ||
+              !ensureGroupedDecodeCapacity(num_active, intermediate, d_model))) ||
             !resolveFixedTableGateUpMetadata(
                 gateup_table.workspace_slot,
                 RuntimePointerArrayScope::TableDecode,
@@ -9008,7 +9056,8 @@ namespace llaminar2
         {
             return false;
         }
-        // Preparation publishes metadata addresses; execution consumes them.
+        // Both families publish immutable metadata and pointer arrays. Only
+        // quantized arithmetic above binds Q8/K-part intermediate workspaces.
         (void)fixed_gateup_expert_ids;
         (void)fixed_down_expert_ids;
         (void)fixed_down_expert_weights;
@@ -9534,7 +9583,8 @@ namespace llaminar2
             }
         }
 
-        if (!ensureGroupedDecodeCapacity(num_active, intermediate, d_model))
+        // Table-owned floating inputs bypass quantized activation workspaces.
+        if (!floating && !ensureGroupedDecodeCapacity(num_active, intermediate, d_model))
             return false;
 
         const int *fixed_device_expert_ids = nullptr;
@@ -11307,6 +11357,13 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Resolve preallocated grouped scratch without changing arena size.
+     * @param total_slots Physical routed-row capacity of the captured graph.
+     * @param d_model Hidden projection width, including floating-point tails.
+     * @param intermediate Expert intermediate width.
+     * @return True when every required named arena region has sufficient space.
+     */
     bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate)
     {
         if (!setMoEDevice(device_ordinal_, "ensureGroupedPrefillScratchCapacity"))
@@ -11327,7 +11384,11 @@ namespace llaminar2
         }
 
         const int max_dim = (d_model > intermediate) ? d_model : intermediate;
-        const int max_blocks = max_dim / 32;
+        // Match the workspace BOM and CUDA binding. Floating matrices need not
+        // be multiples of a quantized block; flooring here can request a zero
+        // length binding even though the arena already owns the padded region.
+        const int max_blocks = (max_dim + 31) / 32;
+        const int intermediate_blocks = (intermediate + 31) / 32;
 
         // Hidden-row Q8 data remains live through gate/up, while the exact
         // SwiGLU Q8 rows remain live through down projection. Those lifetimes
@@ -11349,7 +11410,7 @@ namespace llaminar2
                                  "ensureGroupedPrefillScratchCapacity(swiglu_int8)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_swiglu_scales_),
                                  MoEWorkspaceBuffers::PREFILL_SWIGLU_SCALES,
-                                 static_cast<size_t>(total_slots) * (intermediate / 32) * sizeof(float),
+                                 static_cast<size_t>(total_slots) * intermediate_blocks * sizeof(float),
                                  "ensureGroupedPrefillScratchCapacity(swiglu_scales)") ||
             !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_gate_),
                                  MoEWorkspaceBuffers::PREFILL_GATE,
@@ -11535,7 +11596,6 @@ namespace llaminar2
                 d_original_expert_ids_for_pipeline,
                 d_group_weights_,
                 d_prefill_gate_,
-                d_prefill_up_,
                 d_output,
                 d_canonical_route_contributions,
                 seq_len,
@@ -11912,7 +11972,6 @@ namespace llaminar2
                 runtime_host_layer.route_expert_ids,
                 runtime_host_layer.grouped_route_weights,
                 d_prefill_gate_,
-                d_prefill_up_,
                 d_output,
                 d_canonical_route_contributions,
                 seq_len,

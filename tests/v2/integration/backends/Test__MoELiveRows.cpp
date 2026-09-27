@@ -5,7 +5,8 @@
  * Every quantized and floating weight format exercises shared and routed experts. One graph
  * is replayed across empty, short, and full publications without rebinding or
  * recapture. Active output bytes must equal independent serial decode; padded
- * output must be zero. This detects stale scratch, double publication by two
+ * output must be zero even when reusable partials and outputs are poisoned.
+ * This detects stale scratch, double publication by two
  * dispatch families, and shared experts accidentally evaluating padded rows.
  */
 #include "backends/BackendManager.h"
@@ -67,12 +68,17 @@ namespace
      * @brief Exercise one endpoint on its worker's explicit non-default stream.
      * @param device Endpoint whose prepared weights and scratch own the graph.
      * @param context Worker that orders input publication, capture, and replay.
+     * @param formats Canonical formats selected by the owning regression.
+     * @param hidden_size Input/output projection width, including multiple K partitions.
+     * @param width Expert intermediate width with the same serial reduction tree.
      */
-    void proveLiveRows(DeviceId device, IWorkerGPUContext &context)
+    void proveLiveRows(DeviceId device, IWorkerGPUContext &context,
+                       const std::vector<WeightCase> &formats,
+                       int hidden_size = 256, int width = 256)
     {
         context.submitAndWait([&]()
         {
-            constexpr int rows = 16, hidden_size = 256, width = 256;
+            constexpr int rows = 16;
             auto *backend = getBackendFor(device);
             auto *stream = context.defaultStream();
             ASSERT_NE(backend, nullptr);
@@ -106,7 +112,7 @@ namespace
                 hidden_values[index] = 0.019f * static_cast<float>(
                     static_cast<int>((index * 17 + 3) % 47) - 23);
 
-            for (const auto &format : liveRowsFormats())
+            for (const auto &format : formats)
             {
                 SCOPED_TRACE(format.label);
                 // Distinct experts prevent wrong expert-id publication from
@@ -120,8 +126,8 @@ namespace
                     for (int role = 0; role < 3; ++role)
                     {
                         const std::vector<size_t> shape = role == 2
-                            ? std::vector<size_t>{hidden_size, width}
-                            : std::vector<size_t>{width, hidden_size};
+                            ? std::vector<size_t>{static_cast<size_t>(hidden_size), static_cast<size_t>(width)}
+                            : std::vector<size_t>{static_cast<size_t>(width), static_cast<size_t>(hidden_size)};
                         source_weights.push_back(format.create(shape, 68001 + expert * 10 + role));
                         const std::string name = std::string("test.live_rows.") + format.label +
                             "." + std::to_string(expert) + "." + std::to_string(role);
@@ -309,6 +315,8 @@ namespace
                     std::vector<float> actual(serial.size());
                     std::vector<float> reduced(serial.size());
                     const std::vector<float> poison(serial.size(), std::numeric_limits<float>::quiet_NaN());
+                    const std::vector<float> route_poison(rows * top_k * hidden_size,
+                        std::numeric_limits<float>::quiet_NaN());
                     // This permutation crosses the small-M/tiled boundary in
                     // both directions and revisits empty/full publications.
                     for (int replay = 0; replay < 35; ++replay)
@@ -316,18 +324,39 @@ namespace
                         const int active = (replay * 7) % 17;
                         SCOPED_TRACE(::testing::Message() << "replay=" << replay << " live=" << active);
                         auto active_ids = route_ids, active_weights = route_weights;
-                        std::fill(active_ids.begin() + active * top_k, active_ids.end(), -1.0f);
-                        std::fill(active_weights.begin() + active * top_k, active_weights.end(), 0.0f);
+                        const auto row_live = [&](int row) {
+                            // Shared rows are a prefix; routed participants can
+                            // own any sparse subset, including holes in every
+                            // route ballot and live rows beyond an empty tile.
+                            return shared ? row < active : (row * 5 + replay) % rows < active;
+                        };
+                        for (int row = 0; row < rows; ++row)
+                            if (!row_live(row))
+                            {
+                                std::fill_n(active_ids.begin() + row * top_k, top_k, -1.0f);
+                                std::fill_n(active_weights.begin() + row * top_k, top_k, 0.0f);
+                            }
                         ASSERT_TRUE(upload(indices.get(), active_ids.data(), active_ids.size() * sizeof(float)));
                         ASSERT_TRUE(upload(weights.get(), active_weights.data(), active_weights.size() * sizeof(float)));
                         ASSERT_TRUE(upload(live_count.get(), &active, sizeof(active)));
                         ASSERT_TRUE(upload(output.get(), poison.data(), poison.size() * sizeof(float)));
+                        ASSERT_TRUE(upload(reduced_output.get(), poison.data(), poison.size() * sizeof(float)));
+                        ASSERT_TRUE(upload(contributions.get(), route_poison.data(), route_poison.size() * sizeof(float)));
+                        // An absent route owns no intermediate scratch. Poison
+                        // the previous transaction's down partials: consumers
+                        // must reject that route before reading any partial,
+                        // yet still overwrite its public contribution with +0.
+                        // 0xff repeated is a NaN in every FP32 scratch element.
+                        const auto partial_bytes = workspace.getBufferSize(MoEWorkspaceBuffers::DOWN_PARTIALS);
+                        if (partial_bytes != 0)
+                            ASSERT_TRUE(backend->memset(workspace.getBuffer(MoEWorkspaceBuffers::DOWN_PARTIALS),
+                                0xff, partial_bytes, device.ordinal, stream));
                         ASSERT_TRUE(capture->launch());
                         ASSERT_TRUE(observe(output.get(), actual));
                         ASSERT_TRUE(observe(reduced_output.get(), reduced));
                         for (size_t index = 0; index < actual.size(); ++index)
                         {
-                            const float expected = index < static_cast<size_t>(active * hidden_size)
+                            const float expected = row_live(static_cast<int>(index / hidden_size))
                                 ? serial[index] : 0.0f;
                             ASSERT_EQ(std::bit_cast<uint32_t>(actual[index]), std::bit_cast<uint32_t>(expected))
                                 << "row=" << index / hidden_size << " col=" << index % hidden_size;
@@ -354,9 +383,36 @@ namespace
     TEST_P(MoELiveRows, CapturedSharedAndRoutedAllFormats)
     {
         if (GetParam() == "CUDA")
-            proveLiveRows(DeviceId::cuda(0), GPUDeviceContextPool::instance().getNvidiaContext(0));
+            proveLiveRows(DeviceId::cuda(0), GPUDeviceContextPool::instance().getNvidiaContext(0), liveRowsFormats());
         else
-            proveLiveRows(DeviceId::rocm(0), GPUDeviceContextPool::instance().getAMDContext(0));
+            proveLiveRows(DeviceId::rocm(0), GPUDeviceContextPool::instance().getAMDContext(0), liveRowsFormats());
+    }
+
+    /** @test Fused floating intermediates retain serial bytes for every live M. */
+    TEST_P(MoELiveRows, FloatingMultiPartitionGeometry)
+    {
+        auto formats = liveRowsFormats();
+        std::erase_if(formats, [](const WeightCase &format) {
+            return !deviceMoEWeightFormatIsFloating(format.format);
+        });
+        // The production 122B expert geometry traverses four and twelve values
+        // per arithmetic lane. This catches reassociation/fusion mistakes that
+        // a single value per lane (K=256) cannot expose. Both routed outputs and
+        // shared experts keep the independent, unfused serial decode oracle.
+        // Also exercise incomplete K partitions and partial column tiles. A
+        // width-32 subgroup must never read another column or omit tail FMAs.
+        for (const auto [hidden, intermediate] : {std::pair{3072, 1024},
+                 std::pair{259, 263}, std::pair{31, 7}})
+        {
+            SCOPED_TRACE("hidden=" + std::to_string(hidden) +
+                         " intermediate=" + std::to_string(intermediate));
+            if (GetParam() == "CUDA")
+                proveLiveRows(DeviceId::cuda(0), GPUDeviceContextPool::instance().getNvidiaContext(0),
+                              formats, hidden, intermediate);
+            else
+                proveLiveRows(DeviceId::rocm(0), GPUDeviceContextPool::instance().getAMDContext(0),
+                              formats, hidden, intermediate);
+        }
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, MoELiveRows, ::testing::Values("CUDA", "ROCm"),

@@ -31,6 +31,7 @@
 #include "../../execution/compute_stages/stages/QKNormStage.h"
 #include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/mtp/MTPSpecDecodeMetadata.h"
+#include "../../execution/mtp/MTPTerminalGatherGeometry.h"
 #include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
@@ -3912,35 +3913,19 @@ namespace llaminar2
                                     ? config_.vocab_size
                                     : config.local_vocab);
         /*
-         * An explicitly vocabulary-sharded MTP head needs compact gathered
-         * rows for stochastic sampling. Mirrored ownership writes the complete
-         * vocabulary on every TP participant and therefore reserves only the
-         * schema's 1x1 gathered-logits placeholder, irrespective of TP scope.
+         * Condition and verifier graphs bind the complete distribution for
+         * local as well as cross-rank vocabulary shards. Storage must not be
+         * inferred from whether the sidecar owns a GlobalTP collective: local
+         * TP has a different collective owner, but the same output geometry.
+         * This retained union also survives requests that temporarily disable
+         * MTP. Admission consumes this exact geometry through the shared BOM.
          */
-        const bool spans_multiple_global_ranks =
-            (config_.tp_ctx != nullptr &&
-             !config_.tp_ctx->isLocal() &&
-             config_.tp_ctx->degree() > 1) ||
-            (config_.tp_ctx == nullptr &&
-             mpi_ctx_ != nullptr &&
-             mpi_ctx_->world_size() > 1);
-        const bool reserve_global_mtp_gather =
-            resolveMTPTerminalLogitsCollective({
-                .layout = config_.mtpTerminalLogitsLayout(),
-                .sidecar_produces_logits =
-                    retainsMTPGraphCapacity(config_.mtp),
-                .spans_multiple_global_ranks =
-                    spans_multiple_global_ranks,
-            }) ==
-            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
-        config.custom_formulas["mtp_global_gather_rows"] =
-            reserve_global_mtp_gather
-                ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp))
-                : 1ULL;
-        config.custom_formulas["mtp_global_gather_vocab"] =
-            reserve_global_mtp_gather
-                ? static_cast<size_t>(config_.vocab_size)
-                : 1ULL;
+        const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
+            config_.mtpTerminalLogitsLayout(),
+            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp)),
+            static_cast<size_t>(config_.vocab_size));
+        config.custom_formulas["mtp_gather_rows"] = mtp_gather.rows();
+        config.custom_formulas["mtp_gather_vocab"] = mtp_gather.columns();
 
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "

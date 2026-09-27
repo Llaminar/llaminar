@@ -132,6 +132,84 @@ namespace llaminar2::moe_activation_packet_device
         return snapshot;
     }
 
+    /**
+     * @brief Cooperatively snapshot an immutable, acquired protocol record.
+     * @param record Peer record held immutable until the later acknowledgement.
+     * @return The same fresh snapshot in every thread of the calling block.
+     *
+     * All block threads must enter this function. Adjacent lanes fetch adjacent
+     * words in one coalesced system-memory request, then share the result. A
+     * lane-zero loop instead makes a separate cache-volatile PCIe request for
+     * every word while every other warp waits at the validation barrier.
+     * The preceding acquire and following acknowledgement still own lifetime;
+     * shared memory only amortizes reads inside this one kernel invocation.
+     */
+    template <typename Record>
+    __device__ __forceinline__ Record snapshotPeerPublishedBlock(
+        const Record *record) noexcept
+    {
+        static_assert(std::is_trivially_copyable_v<Record>);
+        static_assert(sizeof(Record) % sizeof(std::uint64_t) == 0u);
+        constexpr std::size_t words = sizeof(Record) / sizeof(std::uint64_t);
+        __shared__ std::uint64_t shared_words[words];
+        const auto *source = reinterpret_cast<const std::uint64_t *>(record);
+        for (std::size_t word = threadIdx.x; word < words; word += blockDim.x)
+            shared_words[word] = loadPeerPublished(source + word);
+        __syncthreads();
+        Record snapshot{};
+        __builtin_memcpy(&snapshot, shared_words, sizeof(Record));
+        // Also make repeated calls safe: no warp may replace shared words
+        // while a sibling still copies its snapshot from this invocation.
+        __syncthreads();
+        return snapshot;
+    }
+
+    /**
+     * @brief Copy one acquired FP32 route row without changing any payload bits.
+     * @param source Immutable mapped row owned by the peer publication lease.
+     * @param destination Uniquely owned row in the continuation's device bank.
+     * @param width Exact live hidden width, including non-vector-aligned tails.
+     *
+     * All block threads stripe the row. CUDA aligned rows use 16-byte fresh
+     * loads to reduce dependent PCIe round trips; unaligned geometry uses scalar
+     * fresh loads. HIP retains coalesced scalar wavefront loads, which sustain
+     * higher measured mapped-memory throughput on gfx906 than per-lane vectors.
+     * Neither backend permits cached payloads or rounds arithmetic.
+     * The caller keeps row indices stable until every thread finishes the copy.
+     */
+    __device__ __forceinline__ void copyPeerPublishedRow(
+        const float *__restrict__ source, float *__restrict__ destination, std::size_t width) noexcept
+    {
+        std::size_t copied_columns = 0u;
+#if defined(__CUDA_ARCH__)
+        using Vector = float4;
+        constexpr std::size_t lanes = 4u;
+        const bool aligned =
+            ((reinterpret_cast<std::uintptr_t>(source) |
+              reinterpret_cast<std::uintptr_t>(destination)) & (sizeof(Vector) - 1u)) == 0u;
+        const std::size_t vectors = aligned ? width / lanes : 0u;
+        for (std::size_t vector = threadIdx.x; vector < vectors; vector += 2u * blockDim.x)
+        {
+            // Independent reads are issued before dependent stores. A single
+            // load/store chain otherwise serializes PCIe latency for each of
+            // this lane's vectors even though the immutable row is disjoint
+            // from its uniquely owned destination.
+            const auto first = loadPeerPublished(reinterpret_cast<const Vector *>(source) + vector);
+            const auto next = vector + blockDim.x;
+            Vector second{};
+            if (next < vectors)
+                second = loadPeerPublished(reinterpret_cast<const Vector *>(source) + next);
+            reinterpret_cast<Vector *>(destination)[vector] = first;
+            if (next < vectors)
+                reinterpret_cast<Vector *>(destination)[next] = second;
+        }
+        copied_columns = vectors * lanes;
+#endif
+        for (std::size_t column = copied_columns + threadIdx.x;
+             column < width; column += blockDim.x)
+            destination[column] = loadPeerPublished(source + column);
+    }
+
     /** @return Raw fixed-width value for one strongly typed protocol enum. */
     template <typename Enum>
     __device__ __forceinline__ std::uint32_t raw(Enum value) noexcept
@@ -2028,8 +2106,9 @@ namespace llaminar2::moe_activation_packet_device
      * @brief Publish follower-local expert output directly into mapped pages.
      *
      * Metadata runs first on the same stream and records the validated live-row
-     * prefix in the endpoint-private grant. Every payload thread then performs
-     * one ordered mapped store. The subsequent timeline publication is the only
+     * prefix in the endpoint-private grant. Each block reads the two mapped
+     * route identities once and stripes that row's device-to-mapped stores.
+     * The subsequent timeline publication is the only
      * peer-visible release edge, so a continuation cannot observe a partial
      * return even though metadata and payload use separate kernels.
      */
@@ -2040,6 +2119,7 @@ namespace llaminar2::moe_activation_packet_device
         __shared__ std::uint32_t block_status_code;
         __shared__ std::int32_t block_last_published_stage;
         __shared__ std::uint64_t block_live_entries;
+        __shared__ std::int32_t block_slots[2];
         if (threadIdx.x == 0u)
         {
             block_endpoint_state = launch.grant->state;
@@ -2051,605 +2131,67 @@ namespace llaminar2::moe_activation_packet_device
 
         const auto state = static_cast<MoEOverlayActivationEndpointState>(
             block_endpoint_state);
-        const std::size_t element =
-            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if ((state != MoEOverlayActivationEndpointState::Active &&
              state != MoEOverlayActivationEndpointState::Complete) ||
             block_status_code !=
                 raw(MoEOverlayActivationStatusCode::Success) ||
             block_last_published_stage !=
                 static_cast<std::int32_t>(launch.stage_ordinal) ||
-            block_live_entries >
-                launch.returned.route_slot_capacity ||
-            element >= block_live_entries *
-                           static_cast<std::uint64_t>(
-                               launch.returned.d_model))
+            block_live_entries > launch.returned.route_slot_capacity)
         {
             return;
         }
-        const std::size_t compact_entry =
-            element / static_cast<std::size_t>(launch.returned.d_model);
-        const std::size_t column =
-            element % static_cast<std::size_t>(launch.returned.d_model);
-        const std::int32_t original_slot = loadPeerPublished(
-            launch.dispatch.original_route_slots + compact_entry);
-        const std::int32_t compact_slot = loadPeerPublished(
-            launch.dispatch.compact_route_slots + compact_entry);
         const std::size_t route_slot_limit =
             static_cast<std::size_t>(launch.physical_rows) *
             static_cast<std::size_t>(launch.dispatch.top_k);
-        if (original_slot < 0 || compact_slot < 0 ||
-            static_cast<std::size_t>(original_slot) >= route_slot_limit ||
-            static_cast<std::size_t>(compact_slot) >= route_slot_limit)
+        const auto width = static_cast<std::size_t>(launch.returned.d_model);
+        for (std::size_t entry = blockIdx.x; entry < block_live_entries;
+             entry += gridDim.x)
         {
-            return;
-        }
-        launch.returned.canonical_route_contributions_fp32[
-            static_cast<std::size_t>(original_slot) *
-                static_cast<std::size_t>(launch.returned.d_model) +
-            column] =
-            launch.local_canonical_route_contributions_fp32[
-                static_cast<std::size_t>(compact_slot) *
-                    static_cast<std::size_t>(launch.returned.d_model) +
-                column];
-    }
-
-    /** @brief Validate one participant return before deterministic accumulation. */
-    __device__ __forceinline__ void validateReturn(
-        MoEOverlayActivationReturnConsumeLaunch launch)
-    {
-        auto *control = const_cast<MoEOverlayActivationEpochControl *>(
-            launch.control);
-        constexpr auto endpoint = MoEOverlayActivationEndpoint::Continuation;
-        constexpr auto operation = MoEOverlayActivationOperation::ConsumeReturn;
-        if (!acquireOrValidateGrant(
-                control,
-                launch.grant,
-                endpoint,
-                operation,
-                launch.stage_ordinal,
-                launch.physical_rows))
-        {
-            publishFailure(
-                control,
-                launch.grant,
-                endpoint,
-                operation,
-                MoEOverlayActivationStatusCode::InvalidControl,
-                launch.stage_ordinal,
-                launch.model_layer_index,
-                0u);
-            return;
-        }
-        const std::int32_t expected_previous =
-            launch.stage_ordinal == 0u
-                ? -1
-                : static_cast<std::int32_t>(launch.stage_ordinal - 1u);
-        if (launch.grant->last_published_stage <
-                static_cast<std::int32_t>(launch.stage_ordinal) ||
-            launch.grant->last_consumed_stage != expected_previous)
-        {
-            publishFailure(
-                control,
-                launch.grant,
-                endpoint,
-                operation,
-                MoEOverlayActivationStatusCode::OutOfOrder,
-                launch.stage_ordinal,
-                launch.model_layer_index,
-                0u);
-            return;
-        }
-
-        const std::uint64_t timeline =
-            moeOverlayActivationLeasedTimelineValue(
-                moeOverlayActivationBufferVisit(launch.stage_ordinal));
-        const auto &buffer = control->buffers[
-            moeOverlayActivationBufferIndex(launch.stage_ordinal)];
-        const std::uint64_t return_timeline =
-            loadSystemAcquire64(&buffer.return_signal.value);
-        const auto descriptor = snapshotPeerPublished(
-            &buffer.return_descriptor);
-        bool valid = return_timeline == timeline &&
-                     validDescriptor(
-                         descriptor,
-                         *launch.grant,
-                         launch.stage_ordinal,
-                         launch.model_layer_index,
-                         timeline) &&
-                     descriptor.live_entries ==
-                         launch.grant->live_entries &&
-                     descriptor.live_rows == launch.grant->live_rows &&
-                     descriptor.live_entries <=
-                         launch.returned.route_slot_capacity &&
-                     descriptor.live_entries <=
-                         descriptor.live_rows *
-                             static_cast<std::uint64_t>(
-                                 launch.dispatch.top_k) &&
-                     descriptor.payload_bytes ==
-                         moeOverlayReturnPayloadBytes(
-                             descriptor.live_entries,
-                             static_cast<std::uint32_t>(
-                                 launch.returned.d_model));
-        std::int32_t prior_original_slot = -1;
-        const std::uint64_t route_slot_limit =
-            static_cast<std::uint64_t>(launch.physical_rows) *
-            static_cast<std::uint64_t>(launch.dispatch.top_k);
-        for (std::uint64_t entry = 0u;
-             valid && entry < descriptor.live_entries;
-             ++entry)
-        {
-            const std::int32_t original_slot = loadPeerPublished(
-                launch.dispatch.original_route_slots + entry);
-            const std::int32_t compact_slot = loadPeerPublished(
-                launch.dispatch.compact_route_slots + entry);
-            if (original_slot <= prior_original_slot || original_slot < 0 ||
-                compact_slot < 0 ||
-                static_cast<std::uint64_t>(original_slot) >=
-                    route_slot_limit ||
-                static_cast<std::uint64_t>(compact_slot) >=
-                    route_slot_limit)
+            // Two independent system-memory reads replace two reads for every
+            // output scalar. The dispatch lease pins these identities until
+            // the stream-ordered return publication releases the complete row.
+            if (threadIdx.x < 2u)
             {
-                valid = false;
-            }
-            prior_original_slot = original_slot;
-        }
-        if (!valid)
-        {
-            publishFailure(
-                control,
-                launch.grant,
-                endpoint,
-                operation,
-                MoEOverlayActivationStatusCode::PayloadMismatch,
-                launch.stage_ordinal,
-                launch.model_layer_index,
-                return_timeline);
-            return;
-        }
-        launch.grant->live_rows = descriptor.live_rows;
-        launch.grant->live_entries = descriptor.live_entries;
-        launch.grant->single_row_id =
-            descriptor.live_rows == 1u
-                ? loadPeerPublished(launch.dispatch.row_ids)
-                : -1;
-        publishSuccess(
-            control,
-            launch.grant,
-            endpoint,
-            operation,
-            launch.stage_ordinal,
-            launch.model_layer_index,
-            timeline,
-            /*consumed=*/true,
-            /*published=*/true);
-    }
-
-    /**
-     * @brief Cooperatively validate one multi-row return packet.
-     *
-     * Return row identities are independent evidence after the acquire edge.
-     * Striping them across one block removes another serial mapped-memory walk
-     * while thread zero remains the sole grant/state publication authority.
-     */
-    static __global__ void validateReturnKernel(
-        MoEOverlayActivationReturnConsumeLaunch launch)
-    {
-        if (blockIdx.x != 0u)
-            return;
-
-        __shared__ std::uint32_t block_header_ready;
-        __shared__ std::uint32_t block_valid;
-        __shared__ std::uint64_t block_live_rows;
-        __shared__ std::uint64_t block_timeline;
-        __shared__ std::uint64_t block_return_timeline;
-        auto *control = const_cast<MoEOverlayActivationEpochControl *>(
-            launch.control);
-        constexpr auto endpoint =
-            MoEOverlayActivationEndpoint::Continuation;
-        constexpr auto operation =
-            MoEOverlayActivationOperation::ConsumeReturn;
-        if (threadIdx.x == 0u)
-        {
-            block_header_ready = 0u;
-            block_valid = 0u;
-            block_live_rows = 0u;
-            block_timeline = moeOverlayActivationLeasedTimelineValue(
-                moeOverlayActivationBufferVisit(launch.stage_ordinal));
-            block_return_timeline = 0u;
-            if (!acquireOrValidateGrant(
-                    control,
-                    launch.grant,
-                    endpoint,
-                    operation,
-                    launch.stage_ordinal,
-                    launch.physical_rows))
-            {
-                publishFailure(
-                    control,
-                    launch.grant,
-                    endpoint,
-                    operation,
-                    MoEOverlayActivationStatusCode::InvalidControl,
-                    launch.stage_ordinal,
-                    launch.model_layer_index,
-                    0u);
-            }
-            else
-            {
-                const std::int32_t expected_previous =
-                    launch.stage_ordinal == 0u
-                        ? -1
-                        : static_cast<std::int32_t>(
-                              launch.stage_ordinal - 1u);
-                if (launch.grant->last_published_stage <
-                        static_cast<std::int32_t>(
-                            launch.stage_ordinal) ||
-                    launch.grant->last_consumed_stage !=
-                        expected_previous)
-                {
-                    publishFailure(
-                        control,
-                        launch.grant,
-                        endpoint,
-                        operation,
-                        MoEOverlayActivationStatusCode::OutOfOrder,
-                        launch.stage_ordinal,
-                        launch.model_layer_index,
-                        0u);
-                }
-                else
-                {
-                    const auto &buffer = control->buffers[
-                        moeOverlayActivationBufferIndex(
-                            launch.stage_ordinal)];
-                    block_return_timeline = loadSystemAcquire64(
-                        &buffer.return_signal.value);
-                    const auto descriptor = snapshotPeerPublished(
-                        &buffer.return_descriptor);
-                    block_live_rows = descriptor.live_rows;
-                    block_header_ready = 1u;
-                    block_valid =
-                        block_return_timeline == block_timeline &&
-                                validDescriptor(
-                                    descriptor,
-                                    *launch.grant,
-                                    launch.stage_ordinal,
-                                    launch.model_layer_index,
-                                    block_timeline) &&
-                                descriptor.live_entries ==
-                                    launch.grant->live_entries &&
-                                descriptor.live_rows ==
-                                    launch.grant->live_rows &&
-                                descriptor.live_entries <=
-                                    launch.returned.route_slot_capacity &&
-                                descriptor.live_entries <=
-                                    descriptor.live_rows *
-                                        static_cast<std::uint64_t>(
-                                            launch.dispatch.top_k) &&
-                                descriptor.payload_bytes ==
-                                    moeOverlayReturnPayloadBytes(
-                                        descriptor.live_entries,
-                                        static_cast<std::uint32_t>(
-                                            launch.returned.d_model))
-                            ? 1u
-                            : 0u;
-                }
-            }
-        }
-        __syncthreads();
-
-        if (block_header_ready != 0u && block_valid != 0u)
-        {
-            const std::uint64_t route_slot_limit =
-                static_cast<std::uint64_t>(launch.physical_rows) *
-                static_cast<std::uint64_t>(launch.dispatch.top_k);
-            for (std::uint64_t entry = threadIdx.x;
-                 entry < launch.grant->live_entries;
-                 entry += blockDim.x)
-            {
-                const std::int32_t original_slot = loadPeerPublished(
-                    launch.dispatch.original_route_slots + entry);
-                const std::int32_t compact_slot = loadPeerPublished(
-                    launch.dispatch.compact_route_slots + entry);
-                const std::int32_t prior_original_slot =
-                    entry == 0u
-                        ? -1
-                        : loadPeerPublished(
-                              launch.dispatch.original_route_slots +
-                              entry - 1u);
-                if (original_slot <= prior_original_slot ||
-                    original_slot < 0 || compact_slot < 0 ||
-                    static_cast<std::uint64_t>(original_slot) >=
-                        route_slot_limit ||
-                    static_cast<std::uint64_t>(compact_slot) >=
-                        route_slot_limit)
-                {
-                    atomicExch(&block_valid, 0u);
-                }
-            }
-        }
-        __syncthreads();
-
-        if (threadIdx.x != 0u || block_header_ready == 0u)
-            return;
-        if (block_valid == 0u)
-        {
-            publishFailure(
-                control,
-                launch.grant,
-                endpoint,
-                operation,
-                MoEOverlayActivationStatusCode::PayloadMismatch,
-                launch.stage_ordinal,
-                launch.model_layer_index,
-                block_return_timeline);
-            return;
-        }
-        launch.grant->live_rows = block_live_rows;
-        /* Descriptor equality above authenticated the already-admitted entry
-         * count; retain it as the payload extent for materialization. */
-        launch.grant->single_row_id =
-            block_live_rows == 1u
-                ? loadPeerPublished(launch.dispatch.row_ids)
-                : -1;
-        publishSuccess(
-            control,
-            launch.grant,
-            endpoint,
-            operation,
-            launch.stage_ordinal,
-            launch.model_layer_index,
-            block_timeline,
-            /*consumed=*/true,
-            /*published=*/true);
-    }
-
-    /**
-     * @brief Materialize one authenticated participant's original route rows.
-     *
-     * Each compact entry names one unique original route slot.  The follower
-     * already wrote that slot into the rank-pair shared matrix; this kernel
-     * copies it into continuation VRAM without performing an addition.  The
-     * later canonical reducer consequently sees the same slot tensor for every
-     * placement and owns the only floating-point fold.
-     */
-    static __global__ void materializeMappedCanonicalReturnKernel(
-        MoEOverlayActivationReturnConsumeLaunch launch)
-    {
-        __shared__ std::uint32_t block_endpoint_state;
-        __shared__ std::uint32_t block_status_code;
-        __shared__ std::int32_t block_last_consumed_stage;
-        __shared__ std::uint64_t block_live_entries;
-        if (threadIdx.x == 0u)
-        {
-            block_endpoint_state = launch.grant->state;
-            block_status_code = launch.grant->code;
-            block_last_consumed_stage = launch.grant->last_consumed_stage;
-            block_live_entries = launch.grant->live_entries;
-        }
-        __syncthreads();
-
-        const std::size_t element =
-            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const auto state = static_cast<MoEOverlayActivationEndpointState>(
-            block_endpoint_state);
-        if ((state != MoEOverlayActivationEndpointState::Active &&
-             state != MoEOverlayActivationEndpointState::Complete) ||
-            block_status_code !=
-                raw(MoEOverlayActivationStatusCode::Success) ||
-            block_last_consumed_stage !=
-                static_cast<std::int32_t>(launch.stage_ordinal))
-        {
-            return;
-        }
-        if (block_live_entries >
-                launch.returned.route_slot_capacity ||
-            element >= block_live_entries *
-                           static_cast<std::uint64_t>(
-                               launch.returned.d_model))
-        {
-            return;
-        }
-        const std::size_t compact_entry =
-            element / static_cast<std::size_t>(launch.returned.d_model);
-        const std::size_t column =
-            element % static_cast<std::size_t>(launch.returned.d_model);
-        const std::int32_t original_slot = loadPeerPublished(
-            launch.dispatch.original_route_slots + compact_entry);
-        if (original_slot < 0 ||
-            static_cast<std::size_t>(original_slot) >=
-                launch.returned.route_slot_capacity)
-        {
-            return;
-        }
-        const std::size_t destination =
-            static_cast<std::size_t>(original_slot) *
-                static_cast<std::size_t>(launch.returned.d_model) +
-            column;
-        const float returned_value = loadPeerPublished(
-            launch.returned.canonical_route_contributions_fp32 +
-            destination);
-        launch.canonical_route_contributions_fp32[destination] =
-            returned_value;
-    }
-
-    /**
-     * @brief Wait for one CPU publication without occupying a payload-sized grid.
-     *
-     * Only one thread waits. The following exact-stream materialization node
-     * cannot begin until its acquire succeeds, leaving unrelated maintenance
-     * work runnable while the CPU is still producing the expert contribution.
-     * The producer retains the immutable ticket until the final acknowledgement.
-     */
-    static __global__ void awaitCanonicalRouteTicketKernel(
-        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
-    {
-        if (blockIdx.x != 0u || threadIdx.x != 0u)
-            return;
-        do
-        {
-            const auto consumed = loadSystemAcquire64(&launch.control->consumed_sequence);
-            const auto published = loadSystemAcquire64(&launch.control->published_sequence);
-            if (published > consumed && published - consumed == 1u)
-                return;
-#if defined(__CUDA_ARCH__)
-            __nanosleep(64u);
-#elif defined(__HIP_DEVICE_COMPILE__)
-            __builtin_amdgcn_s_sleep(1u);
-#endif
-        } while (true);
-    }
-
-    /**
-     * @brief Materialize one acquired colocated CPU canonical-route ticket.
-     *
-     * The CPU has already authenticated the sparse packet, computed one raw
-     * expert result per compact route, multiplied each row by its router
-     * weight, and release-published a new sequence. The preceding one-thread
-     * acquisition node has observed that sequence before any payload block runs.
-     * The kernel performs only a route-slot permutation
-     * into continuation VRAM; the following canonical reducer remains the sole
-     * floating-point fold authority.
-     */
-    static __global__ void materializeCanonicalRouteTicketKernel(
-        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
-    {
-        __shared__ std::uint64_t block_live_entries;
-        __shared__ std::uint32_t block_ticket_valid;
-        if (threadIdx.x == 0u)
-        {
-            const auto control = snapshotPeerPublished(launch.control);
-            const auto publication_status =
-                static_cast<MoEOverlayCanonicalRouteTicketStatus>(
-                    control.publication_status);
-            const bool success_payload =
-                publication_status ==
-                MoEOverlayCanonicalRouteTicketStatus::Success;
-            const bool abort_payload =
-                publication_status ==
-                MoEOverlayCanonicalRouteTicketStatus::Aborted;
-            block_ticket_valid =
-                success_payload && control.valid() &&
-                        control.publicationPending() &&
-                        control.residency_epoch != 0u &&
-                        control.route_capacity ==
-                            static_cast<std::int32_t>(
-                                launch.route_capacity) &&
-                        control.d_model == launch.d_model &&
-                        control.live_entry_count <= launch.route_capacity
-                    ? 1u
-                    : 0u;
-            /* An authenticated abort deliberately materializes zero rows. The
-             * following acknowledgement kernel still advances the sequence,
-             * allowing every later wait in a failed retained parent to drain. */
-            block_live_entries =
-                abort_payload && control.valid() &&
-                        control.publicationPending() &&
-                        control.live_entry_count == 0u
-                    ? 0u
-                    : control.live_entry_count;
-        }
-        __syncthreads();
-        if (block_ticket_valid == 0u)
-            return;
-
-        __shared__ std::int32_t original_slot;
-        __shared__ std::int32_t compact_slot;
-        // One block owns a complete route row. The mapped indices are read
-        // once per row, rather than twice per output element across PCIe.
-        // No arithmetic changes: every payload element still has one writer.
-        for (std::size_t compact_entry = blockIdx.x;
-             compact_entry < block_live_entries;
-             compact_entry += gridDim.x)
-        {
-            if (threadIdx.x == 0u)
-            {
-                original_slot = loadPeerPublished(launch.original_route_slots + compact_entry);
-                compact_slot = loadPeerPublished(launch.compact_route_slots + compact_entry);
+                const auto *slots = threadIdx.x == 0u
+                    ? launch.dispatch.original_route_slots
+                    : launch.dispatch.compact_route_slots;
+                block_slots[threadIdx.x] = loadPeerPublished(slots + entry);
             }
             __syncthreads();
+            const auto original_slot = block_slots[0];
+            const auto compact_slot = block_slots[1];
             if (original_slot >= 0 && compact_slot >= 0 &&
-                static_cast<std::size_t>(original_slot) < launch.route_capacity &&
-                static_cast<std::size_t>(compact_slot) < launch.route_capacity)
+                static_cast<std::size_t>(original_slot) < route_slot_limit &&
+                static_cast<std::size_t>(compact_slot) < route_slot_limit)
             {
-                const std::size_t source = static_cast<std::size_t>(compact_slot) * launch.d_model;
-                const std::size_t destination = static_cast<std::size_t>(original_slot) * launch.d_model;
-                for (std::size_t column = threadIdx.x;
-                     column < static_cast<std::size_t>(launch.d_model);
-                     column += blockDim.x)
-                    launch.canonical_route_contributions_fp32[destination + column] =
-                        loadPeerPublished(launch.compact_preweighted_contributions_fp32 + source + column);
+                auto *destination = launch.returned.canonical_route_contributions_fp32 +
+                    static_cast<std::size_t>(original_slot) * width;
+                const auto *source = launch.local_canonical_route_contributions_fp32 +
+                    static_cast<std::size_t>(compact_slot) * width;
+                for (std::size_t column = threadIdx.x; column < width; column += blockDim.x)
+                    destination[column] = source[column];
             }
-            // Do not overwrite shared indices while another warp is still
-            // using them; this also covers rejected rows and odd hidden widths.
+            // A grid-stride iteration may reuse shared identities only once
+            // every warp has finished all stores for the preceding route.
             __syncthreads();
         }
     }
 
     /**
-     * @brief Release-acknowledge a completely materialized CPU route payload.
+     * @brief Authenticate one acquired return using all threads in its block.
+     * @param packet One participant's immutable lane binding and private grant.
      *
-     * Backends enqueue this one-thread kernel immediately after every
-     * @ref materializeCanonicalRouteTicketKernel launch on the same exact
-     * stream. The stream edge guarantees every block has finished reading the
-     * mapped payload and writing continuation VRAM before the acknowledgement
-     * becomes system-visible. Only then may the CPU producer arm and overwrite
-     * the single reusable ticket for another retained graph replay.
+     * The caller's stream/acquire edge pins the peer descriptor and row maps.
+     * Only lane zero transitions the grant. Descriptor words and route identity
+     * checks run cooperatively, so one-row MTP and multi-row prefill execute one
+     * validation protocol without serial per-field/per-route PCIe round trips.
+     * Every thread must enter; callers that consume publication inside this
+     * kernel must meet at a block barrier after the helper returns.
      */
-    static __global__ void acknowledgeCanonicalRouteTicketKernel(
-        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    __device__ __forceinline__ void validateReturnBlock(
+        MoEOverlayActivationReturnConsumeLaunch packet)
     {
-        if (blockIdx.x != 0u || threadIdx.x != 0u)
-            return;
-        const auto control = snapshotPeerPublished(launch.control);
-        const auto publication_status =
-            static_cast<MoEOverlayCanonicalRouteTicketStatus>(
-                control.publication_status);
-        const bool success_payload =
-            publication_status ==
-            MoEOverlayCanonicalRouteTicketStatus::Success;
-        const bool abort_payload =
-            publication_status ==
-            MoEOverlayCanonicalRouteTicketStatus::Aborted;
-        if (!control.valid() || !control.publicationPending() ||
-            control.route_capacity !=
-                static_cast<std::int32_t>(launch.route_capacity) ||
-            control.d_model != launch.d_model ||
-            control.live_entry_count > launch.route_capacity ||
-            (success_payload && control.residency_epoch == 0u) ||
-            (abort_payload &&
-             (control.residency_epoch != 0u ||
-              control.live_entry_count != 0u)) ||
-            (!success_payload && !abort_payload))
-        {
-            return;
-        }
-        storeSystemRelease64(
-            MoEOverlayActivationTimelinePublishDeviceBinding{
-                .signal = &launch.control->consumed_sequence,
-                .value = control.published_sequence,
-            });
-    }
-
-    /**
-     * @brief Authenticate independent multi-row lanes and build dense row maps.
-     *
-     * One block owns one lane, so descriptor arrival and validation never
-     * serialize unrelated participants.  The row lookup is published only
-     * through @ref lane_valid after the complete descriptor has passed the same
-     * checks as @ref validateReturnKernel.  A bad lane can therefore leave
-     * speculative lookup values behind without exposing them to the fold.
-     */
-    static __global__ void validateMultiRowReturnBatchKernel(
-        MoEOverlayActivationMultiRowReturnBatchLaunch launch)
-    {
-        const std::uint32_t lane = blockIdx.x;
-        if (lane >= launch.lane_count)
-            return;
-
-        const auto packet = launch.lanes[lane];
-
         __shared__ std::uint32_t block_header_ready;
         __shared__ std::uint32_t block_valid;
         __shared__ std::uint64_t block_live_rows;
@@ -2664,7 +2206,6 @@ namespace llaminar2::moe_activation_packet_device
             MoEOverlayActivationOperation::ConsumeReturn;
         if (threadIdx.x == 0u)
         {
-            launch.lane_valid[lane] = 0;
             block_header_ready = 0u;
             block_valid = 0u;
             block_live_rows = 0u;
@@ -2718,48 +2259,52 @@ namespace llaminar2::moe_activation_packet_device
                             packet.stage_ordinal)];
                     block_return_timeline = loadSystemAcquire64(
                         &buffer.return_signal.value);
-                    const auto descriptor = snapshotPeerPublished(
-                        &buffer.return_descriptor);
-                    block_live_rows = descriptor.live_rows;
-                    block_live_entries = descriptor.live_entries;
                     block_header_ready = 1u;
-                    block_valid =
-                        block_return_timeline == block_timeline &&
-                                validDescriptor(
-                                    descriptor,
-                                    *packet.grant,
-                                    packet.stage_ordinal,
-                                    packet.model_layer_index,
-                                    block_timeline) &&
-                                descriptor.live_entries ==
-                                    packet.grant->live_entries &&
-                                descriptor.live_rows ==
-                                    packet.grant->live_rows &&
-                                descriptor.live_entries <=
-                                    packet.returned.route_slot_capacity &&
-                                descriptor.live_entries <=
-                                    descriptor.live_rows *
-                                        static_cast<std::uint64_t>(
-                                            packet.dispatch.top_k) &&
-                                descriptor.live_rows <=
-                                    static_cast<std::uint64_t>(
-                                        launch.physical_rows) &&
-                                descriptor.payload_bytes ==
-                                    moeOverlayReturnPayloadBytes(
-                                        descriptor.live_entries,
-                                        static_cast<std::uint32_t>(
-                                            packet.returned.d_model))
-                            ? 1u
-                            : 0u;
                 }
             }
+        }
+        __syncthreads();
+
+        // The acquire above owns visibility and the live lane owns lifetime.
+        // After the block barrier every lane can fetch a different descriptor
+        // word, instead of lane zero issuing eight serial mapped-memory reads.
+        // Invalid grants exit uniformly before entering the cooperative helper.
+        if (block_header_ready == 0u)
+            return;
+        const auto &buffer = control->buffers[
+            moeOverlayActivationBufferIndex(packet.stage_ordinal)];
+        const auto descriptor = snapshotPeerPublishedBlock(
+            &buffer.return_descriptor);
+        if (threadIdx.x == 0u)
+        {
+            block_live_rows = descriptor.live_rows;
+            block_live_entries = descriptor.live_entries;
+            block_valid =
+                block_return_timeline == block_timeline &&
+                        validDescriptor(
+                            descriptor,
+                            *packet.grant,
+                            packet.stage_ordinal,
+                            packet.model_layer_index,
+                            block_timeline) &&
+                        descriptor.live_entries == packet.grant->live_entries &&
+                        descriptor.live_rows == packet.grant->live_rows &&
+                        descriptor.live_entries <= packet.returned.route_slot_capacity &&
+                        descriptor.live_entries <= descriptor.live_rows *
+                            static_cast<std::uint64_t>(packet.dispatch.top_k) &&
+                        descriptor.live_rows <=
+                            static_cast<std::uint64_t>(packet.physical_rows) &&
+                        descriptor.payload_bytes == moeOverlayReturnPayloadBytes(
+                            descriptor.live_entries,
+                            static_cast<std::uint32_t>(packet.returned.d_model))
+                    ? 1u : 0u;
         }
         __syncthreads();
 
         if (block_header_ready != 0u && block_valid != 0u)
         {
             const std::uint64_t route_slot_limit =
-                static_cast<std::uint64_t>(launch.physical_rows) *
+                static_cast<std::uint64_t>(packet.physical_rows) *
                 static_cast<std::uint64_t>(packet.dispatch.top_k);
             for (std::uint64_t entry = threadIdx.x;
                  entry < block_live_entries;
@@ -2819,15 +2364,275 @@ namespace llaminar2::moe_activation_packet_device
             block_timeline,
             /*consumed=*/true,
             /*published=*/true);
-        launch.lane_valid[lane] = 1;
+    }
+
+    /**
+     * @return Whether this exact stage published an authenticated return grant.
+     * @param packet Lane whose device-local grant is already stream ordered.
+     */
+    __device__ __forceinline__ bool returnGrantPublished(
+        const MoEOverlayActivationReturnConsumeLaunch &packet)
+    {
+        const auto state = static_cast<MoEOverlayActivationEndpointState>(packet.grant->state);
+        return (state == MoEOverlayActivationEndpointState::Active ||
+                state == MoEOverlayActivationEndpointState::Complete) &&
+               packet.grant->code == raw(MoEOverlayActivationStatusCode::Success) &&
+               packet.grant->last_consumed_stage == static_cast<std::int32_t>(packet.stage_ordinal);
+    }
+
+    /** @brief Single-lane graph entrypoint for the shared block validator. */
+    static __global__ void validateReturnKernel(
+        MoEOverlayActivationReturnConsumeLaunch launch)
+    {
+        if (blockIdx.x == 0u)
+            validateReturnBlock(launch);
+    }
+
+    /**
+     * @brief Materialize one authenticated participant's original route rows.
+     *
+     * Each compact entry names one unique original route slot.  The follower
+     * already wrote that slot into the rank-pair shared matrix; this kernel
+     * copies it into continuation VRAM without performing an addition.  The
+     * later canonical reducer consequently sees the same slot tensor for every
+     * placement and owns the only floating-point fold.
+     */
+    static __global__ void materializeMappedCanonicalReturnKernel(
+        MoEOverlayActivationReturnConsumeLaunch launch)
+    {
+        __shared__ std::uint32_t block_endpoint_state;
+        __shared__ std::uint32_t block_status_code;
+        __shared__ std::int32_t block_last_consumed_stage;
+        __shared__ std::uint64_t block_live_entries;
+        if (threadIdx.x == 0u)
+        {
+            block_endpoint_state = launch.grant->state;
+            block_status_code = launch.grant->code;
+            block_last_consumed_stage = launch.grant->last_consumed_stage;
+            block_live_entries = launch.grant->live_entries;
+        }
+        __syncthreads();
+
+        const auto state = static_cast<MoEOverlayActivationEndpointState>(
+            block_endpoint_state);
+        if ((state != MoEOverlayActivationEndpointState::Active &&
+             state != MoEOverlayActivationEndpointState::Complete) ||
+            block_status_code !=
+                raw(MoEOverlayActivationStatusCode::Success) ||
+            block_last_consumed_stage !=
+                static_cast<std::int32_t>(launch.stage_ordinal))
+        {
+            return;
+        }
+        if (block_live_entries > launch.returned.route_slot_capacity)
+        {
+            return;
+        }
+        __shared__ std::int32_t original_slot;
+        for (std::size_t compact_entry = blockIdx.x;
+             compact_entry < block_live_entries; compact_entry += gridDim.x)
+        {
+            if (threadIdx.x == 0u)
+                original_slot = loadPeerPublished(
+                    launch.dispatch.original_route_slots + compact_entry);
+            __syncthreads();
+            if (original_slot >= 0 &&
+                static_cast<std::size_t>(original_slot) < launch.returned.route_slot_capacity)
+            {
+                const std::size_t offset =
+                    static_cast<std::size_t>(original_slot) * launch.returned.d_model;
+                copyPeerPublishedRow(
+                    launch.returned.canonical_route_contributions_fp32 + offset,
+                    launch.canonical_route_contributions_fp32 + offset,
+                    launch.returned.d_model);
+            }
+            // A later route must not replace the shared index under another warp.
+            __syncthreads();
+        }
+    }
+
+    /**
+     * @brief Wait for one CPU publication without occupying a payload-sized grid.
+     *
+     * Only one thread waits. The following exact-stream materialization node
+     * cannot begin until its acquire succeeds, leaving unrelated maintenance
+     * work runnable while the CPU is still producing the expert contribution.
+     * The producer retains the immutable ticket until the final acknowledgement.
+     */
+    static __global__ void awaitCanonicalRouteTicketKernel(
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        do
+        {
+            const auto consumed = loadSystemAcquire64(&launch.control->consumed_sequence);
+            const auto published = loadSystemAcquire64(&launch.control->published_sequence);
+            if (published > consumed && published - consumed == 1u)
+                return;
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+            __builtin_amdgcn_s_sleep(1u);
+#endif
+        } while (true);
+    }
+
+    /**
+     * @brief Materialize one acquired colocated CPU canonical-route ticket.
+     *
+     * The CPU has already authenticated the sparse packet, computed one raw
+     * expert result per compact route, multiplied each row by its router
+     * weight, and release-published a new sequence. The preceding one-thread
+     * acquisition node has observed that sequence before any payload block runs.
+     * The kernel performs only a route-slot permutation
+     * into continuation VRAM; the following canonical reducer remains the sole
+     * floating-point fold authority.
+     */
+    static __global__ void materializeCanonicalRouteTicketKernel(
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    {
+        __shared__ std::uint64_t block_live_entries;
+        __shared__ std::uint32_t block_ticket_valid;
+        const auto control = snapshotPeerPublishedBlock(launch.control);
+        if (threadIdx.x == 0u)
+        {
+            const auto publication_status =
+                static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                    control.publication_status);
+            const bool success_payload =
+                publication_status ==
+                MoEOverlayCanonicalRouteTicketStatus::Success;
+            const bool abort_payload =
+                publication_status ==
+                MoEOverlayCanonicalRouteTicketStatus::Aborted;
+            block_ticket_valid =
+                success_payload && control.valid() &&
+                        control.publicationPending() &&
+                        control.residency_epoch != 0u &&
+                        control.route_capacity ==
+                            static_cast<std::int32_t>(
+                                launch.route_capacity) &&
+                        control.d_model == launch.d_model &&
+                        control.live_entry_count <= launch.route_capacity
+                    ? 1u
+                    : 0u;
+            /* An authenticated abort deliberately materializes zero rows. The
+             * following acknowledgement kernel still advances the sequence,
+             * allowing every later wait in a failed retained parent to drain. */
+            block_live_entries =
+                abort_payload && control.valid() &&
+                        control.publicationPending() &&
+                        control.live_entry_count == 0u
+                    ? 0u
+                    : control.live_entry_count;
+        }
+        __syncthreads();
+        if (block_ticket_valid == 0u)
+            return;
+
+        __shared__ std::int32_t original_slot;
+        __shared__ std::int32_t compact_slot;
+        // One block owns a complete route row. The mapped indices are read
+        // once per row, rather than twice per output element across PCIe.
+        // No arithmetic changes: every payload element still has one writer.
+        for (std::size_t compact_entry = blockIdx.x;
+             compact_entry < block_live_entries;
+             compact_entry += gridDim.x)
+        {
+            if (threadIdx.x == 0u)
+            {
+                original_slot = loadPeerPublished(launch.original_route_slots + compact_entry);
+                compact_slot = loadPeerPublished(launch.compact_route_slots + compact_entry);
+            }
+            __syncthreads();
+            if (original_slot >= 0 && compact_slot >= 0 &&
+                static_cast<std::size_t>(original_slot) < launch.route_capacity &&
+                static_cast<std::size_t>(compact_slot) < launch.route_capacity)
+            {
+                const std::size_t source = static_cast<std::size_t>(compact_slot) * launch.d_model;
+                const std::size_t destination = static_cast<std::size_t>(original_slot) * launch.d_model;
+                copyPeerPublishedRow(
+                    launch.compact_preweighted_contributions_fp32 + source,
+                    launch.canonical_route_contributions_fp32 + destination,
+                    launch.d_model);
+            }
+            // Do not overwrite shared indices while another warp is still
+            // using them; this also covers rejected rows and odd hidden widths.
+            __syncthreads();
+        }
+    }
+
+    /**
+     * @brief Release-acknowledge a completely materialized CPU route payload.
+     *
+     * Backends enqueue this one-thread kernel immediately after every
+     * @ref materializeCanonicalRouteTicketKernel launch on the same exact
+     * stream. The stream edge guarantees every block has finished reading the
+     * mapped payload and writing continuation VRAM before the acknowledgement
+     * becomes system-visible. Only then may the CPU producer arm and overwrite
+     * the single reusable ticket for another retained graph replay.
+     */
+    static __global__ void acknowledgeCanonicalRouteTicketKernel(
+        MoEOverlayCanonicalRouteTicketConsumeLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        const auto control = snapshotPeerPublished(launch.control);
+        const auto publication_status =
+            static_cast<MoEOverlayCanonicalRouteTicketStatus>(
+                control.publication_status);
+        const bool success_payload =
+            publication_status ==
+            MoEOverlayCanonicalRouteTicketStatus::Success;
+        const bool abort_payload =
+            publication_status ==
+            MoEOverlayCanonicalRouteTicketStatus::Aborted;
+        if (!control.valid() || !control.publicationPending() ||
+            control.route_capacity !=
+                static_cast<std::int32_t>(launch.route_capacity) ||
+            control.d_model != launch.d_model ||
+            control.live_entry_count > launch.route_capacity ||
+            (success_payload && control.residency_epoch == 0u) ||
+            (abort_payload &&
+             (control.residency_epoch != 0u ||
+              control.live_entry_count != 0u)) ||
+            (!success_payload && !abort_payload))
+        {
+            return;
+        }
+        storeSystemRelease64(
+            MoEOverlayActivationTimelinePublishDeviceBinding{
+                .signal = &launch.control->consumed_sequence,
+                .value = control.published_sequence,
+            });
+    }
+
+    /**
+     * @brief Authenticate independent prefill lanes using the common protocol.
+     *
+     * One block owns one lane. Its following materializer is stream ordered
+     * after every block has either published success or a terminal failure.
+     */
+    static __global__ void validateMultiRowReturnBatchKernel(
+        MoEOverlayActivationMultiRowReturnBatchLaunch launch)
+    {
+        const std::uint32_t lane = blockIdx.x;
+        if (lane >= launch.lane_count)
+            return;
+        const auto packet = launch.lanes[lane];
+        validateReturnBlock(packet);
+        if (threadIdx.x == 0u)
+            launch.lane_valid[lane] = returnGrantPublished(packet) ? 1 : 0;
     }
 
     /**
      * @brief Copy authenticated lane contributions into original route slots.
      *
-     * Grid Y owns a participant lane and grid X stripes that lane's compact
-     * contribution payload. Dynamic placement guarantees one authoritative
-     * participant per original slot, so stores are disjoint and require no
+     * Grid Y owns a participant lane and grid X owns complete route rows. Each
+     * block reads a mapped route index once, not once per FP32 element. Dynamic
+     * placement guarantees one authoritative participant per original slot,
+     * so stores are disjoint and require no
      * atomics or cross-lane ordering.
      */
     static __global__ void materializeMultiRowCanonicalReturnBatchKernel(
@@ -2837,35 +2642,30 @@ namespace llaminar2::moe_activation_packet_device
         if (lane >= launch.lane_count || launch.lane_valid[lane] == 0)
             return;
         const auto packet = launch.lanes[lane];
-        const std::size_t output_elements =
-            static_cast<std::size_t>(packet.grant->live_entries) *
-            static_cast<std::size_t>(launch.d_model);
-        for (std::size_t element =
-                 static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                 threadIdx.x;
-             element < output_elements;
-             element += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+        __shared__ std::int32_t original_slot;
+        for (std::size_t compact_entry = blockIdx.x;
+             compact_entry < packet.grant->live_entries;
+             compact_entry += gridDim.x)
         {
-            const std::size_t compact_entry =
-                element / static_cast<std::size_t>(launch.d_model);
-            const std::size_t column =
-                element % static_cast<std::size_t>(launch.d_model);
-            const std::int32_t original_slot = loadPeerPublished(
-                packet.dispatch.original_route_slots + compact_entry);
+            // This continuation published the immutable route map before
+            // dispatch. Unlike the peer-produced return payload, its own map
+            // may reuse the local cache after the stream-ordered validator.
+            if (threadIdx.x == 0u)
+                original_slot = packet.dispatch.original_route_slots[compact_entry];
+            __syncthreads();
             if (original_slot >= 0 &&
                 static_cast<std::size_t>(original_slot) <
                     packet.returned.route_slot_capacity)
             {
                 const std::size_t destination =
                     static_cast<std::size_t>(original_slot) *
-                        static_cast<std::size_t>(launch.d_model) +
-                    column;
-                launch.canonical_route_contributions_fp32[destination] =
-                    loadPeerPublished(
-                        packet.returned
-                            .canonical_route_contributions_fp32 +
-                        destination);
+                        static_cast<std::size_t>(launch.d_model);
+                copyPeerPublishedRow(
+                    packet.returned.canonical_route_contributions_fp32 + destination,
+                    launch.canonical_route_contributions_fp32 + destination,
+                    launch.d_model);
             }
+            __syncthreads();
         }
     }
 
@@ -3024,6 +2824,7 @@ namespace llaminar2::moe_activation_packet_device
         auto &packet = launch.packet;
         __shared__ std::uint64_t live_entries;
         __shared__ std::uint32_t packet_valid;
+        __shared__ std::int32_t route_slots[2];
         if (threadIdx.x == 0u)
         {
             packReturnMetadata(packet);
@@ -3044,37 +2845,31 @@ namespace llaminar2::moe_activation_packet_device
         }
         __syncthreads();
 
-        for (std::size_t element = threadIdx.x;
-             element <
-                 static_cast<std::size_t>(live_entries) *
-                     static_cast<std::size_t>(packet.returned.d_model);
-             element += blockDim.x)
+        const auto width = static_cast<std::size_t>(packet.returned.d_model);
+        for (std::size_t entry = 0u; entry < live_entries; ++entry)
         {
-            const std::size_t compact_entry =
-                element /
-                static_cast<std::size_t>(packet.returned.d_model);
-            const std::size_t column =
-                element %
-                static_cast<std::size_t>(packet.returned.d_model);
-            const std::int32_t original_slot = loadPeerPublished(
-                packet.dispatch.original_route_slots + compact_entry);
-            const std::int32_t compact_slot = loadPeerPublished(
-                packet.dispatch.compact_route_slots + compact_entry);
+            // The fused publication has one block, so finish each route before
+            // reusing its two shared identities. Neither identity belongs to an
+            // activation element: issuing these PCIe reads per scalar is waste.
+            if (threadIdx.x < 2u)
+                route_slots[threadIdx.x] = loadPeerPublished(
+                    (threadIdx.x == 0u ? packet.dispatch.original_route_slots
+                                      : packet.dispatch.compact_route_slots) + entry);
+            __syncthreads();
+            const auto original_slot = route_slots[0];
+            const auto compact_slot = route_slots[1];
             if (original_slot >= 0 && compact_slot >= 0 &&
                 static_cast<std::size_t>(original_slot) <
                     packet.returned.route_slot_capacity)
             {
-                packet.returned.canonical_route_contributions_fp32[
-                    static_cast<std::size_t>(original_slot) *
-                        static_cast<std::size_t>(
-                            packet.returned.d_model) +
-                    column] =
-                    packet.local_canonical_route_contributions_fp32[
-                        static_cast<std::size_t>(compact_slot) *
-                            static_cast<std::size_t>(
-                                packet.returned.d_model) +
-                        column];
+                auto *destination = packet.returned.canonical_route_contributions_fp32 +
+                    static_cast<std::size_t>(original_slot) * width;
+                const auto *source = packet.local_canonical_route_contributions_fp32 +
+                    static_cast<std::size_t>(compact_slot) * width;
+                for (std::size_t column = threadIdx.x; column < width; column += blockDim.x)
+                    destination[column] = source[column];
             }
+            __syncthreads();
         }
         __syncthreads();
         if (threadIdx.x == 0u)
@@ -3092,10 +2887,14 @@ namespace llaminar2::moe_activation_packet_device
     {
         auto &packet = launch.packet;
         __shared__ std::uint64_t live_entries;
+        __shared__ std::int32_t original_slot;
+        if (threadIdx.x == 0u)
+            waitSystemAcquire64(launch.acquire);
+        __syncthreads();
+        validateReturnBlock(packet);
+        __syncthreads();
         if (threadIdx.x == 0u)
         {
-            waitSystemAcquire64(launch.acquire);
-            validateReturn(packet);
             const auto state = static_cast<MoEOverlayActivationEndpointState>(
                 packet.grant->state);
             const bool valid =
@@ -3109,34 +2908,25 @@ namespace llaminar2::moe_activation_packet_device
         }
         __syncthreads();
 
-        for (std::size_t element = threadIdx.x;
-             element <
-                 static_cast<std::size_t>(live_entries) *
-                     static_cast<std::size_t>(packet.returned.d_model);
-             element += blockDim.x)
+        const auto width = static_cast<std::size_t>(packet.returned.d_model);
+        for (std::size_t entry = 0u; entry < live_entries; ++entry)
         {
-            const std::size_t compact_entry =
-                element /
-                static_cast<std::size_t>(packet.returned.d_model);
-            const std::size_t column =
-                element %
-                static_cast<std::size_t>(packet.returned.d_model);
-            const std::int32_t original_slot = loadPeerPublished(
-                packet.dispatch.original_route_slots + compact_entry);
+            if (threadIdx.x == 0u)
+                original_slot = loadPeerPublished(packet.dispatch.original_route_slots + entry);
+            __syncthreads();
             if (original_slot >= 0 &&
                 static_cast<std::size_t>(original_slot) <
                     packet.returned.route_slot_capacity)
             {
                 const std::size_t destination =
-                    static_cast<std::size_t>(original_slot) *
-                        static_cast<std::size_t>(packet.returned.d_model) +
-                    column;
-                packet.canonical_route_contributions_fp32[destination] =
-                    loadPeerPublished(
-                        packet.returned
-                            .canonical_route_contributions_fp32 +
-                        destination);
+                    static_cast<std::size_t>(original_slot) * width;
+                copyPeerPublishedRow(
+                    packet.returned.canonical_route_contributions_fp32 + destination,
+                    packet.canonical_route_contributions_fp32 + destination, width);
             }
+            // The wait and validation remain fused; all threads finish using
+            // this identity before lane zero starts the next complete row.
+            __syncthreads();
         }
     }
 
@@ -3158,18 +2948,12 @@ namespace llaminar2::moe_activation_packet_device
         const auto lane_launch = launch.lanes[lane];
         auto packet = lane_launch.packet;
         if (threadIdx.x == 0u)
-        {
             waitSystemAcquire64(lane_launch.acquire);
-            validateReturn(packet);
-            const auto state = static_cast<MoEOverlayActivationEndpointState>(
-                packet.grant->state);
-            const bool valid =
-                (state == MoEOverlayActivationEndpointState::Active ||
-                 state == MoEOverlayActivationEndpointState::Complete) &&
-                packet.grant->code ==
-                    raw(MoEOverlayActivationStatusCode::Success) &&
-                packet.grant->last_consumed_stage ==
-                    static_cast<std::int32_t>(packet.stage_ordinal) &&
+        __syncthreads();
+        validateReturnBlock(packet);
+        if (threadIdx.x == 0u)
+        {
+            const bool valid = returnGrantPublished(packet) &&
                 packet.grant->live_rows <= 1u &&
                 (packet.grant->live_rows == 0u ||
                  packet.grant->single_row_id == 0);
@@ -3179,6 +2963,10 @@ namespace llaminar2::moe_activation_packet_device
 
     /**
      * @brief Materialize authenticated one-row lane contributions in parallel.
+     *
+     * Each block owns one original route row, just as the multi-row path does.
+     * This avoids repeated peer metadata reads and keeps byte-identical copying
+     * independent of both expert format and continuation backend.
      */
     static __global__ void materializeSingleRowCanonicalReturnBatchKernel(
         MoEOverlayActivationSingleRowReturnBatchLaunch launch)
@@ -3187,33 +2975,26 @@ namespace llaminar2::moe_activation_packet_device
         if (lane >= launch.lane_count || launch.lane_valid[lane] == 0)
             return;
         const auto packet = launch.lanes[lane].packet;
-        const std::size_t live_elements =
-            static_cast<std::size_t>(packet.grant->live_entries) *
-            static_cast<std::size_t>(launch.d_model);
-        for (std::size_t element =
-                 static_cast<std::size_t>(blockIdx.x) * blockDim.x +
-                 threadIdx.x;
-             element < live_elements;
-             element += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+        __shared__ std::int32_t original_slot;
+        for (std::size_t entry = blockIdx.x; entry < packet.grant->live_entries;
+             entry += gridDim.x)
         {
-            const std::size_t compact_entry =
-                element / static_cast<std::size_t>(launch.d_model);
-            const std::size_t column =
-                element % static_cast<std::size_t>(launch.d_model);
-            const std::int32_t original_slot = loadPeerPublished(
-                packet.dispatch.original_route_slots + compact_entry);
+            // The continuation owns this route map; the peer only writes its
+            // separate return payload, which still requires fresh loads.
+            if (threadIdx.x == 0u)
+                original_slot = packet.dispatch.original_route_slots[entry];
+            __syncthreads();
             if (original_slot >= 0 && original_slot < launch.top_k)
             {
                 const std::size_t destination =
                     static_cast<std::size_t>(original_slot) *
-                        static_cast<std::size_t>(launch.d_model) +
-                    column;
-                launch.canonical_route_contributions_fp32[destination] =
-                    loadPeerPublished(
-                        packet.returned
-                            .canonical_route_contributions_fp32 +
-                        destination);
+                        static_cast<std::size_t>(launch.d_model);
+                copyPeerPublishedRow(
+                    packet.returned.canonical_route_contributions_fp32 + destination,
+                    launch.canonical_route_contributions_fp32 + destination,
+                    launch.d_model);
             }
+            __syncthreads();
         }
     }
 } // namespace llaminar2::moe_activation_packet_device

@@ -2,10 +2,10 @@
  * @file CUDAMoEKernels.cu
  * @brief CUDA launch bridges for MoE routing, grouping, and scatter/gather primitives.
  *
- * These kernels intentionally cover the non-GEMM MoE glue. Expert gate/up/down
- * projections continue to use the dedicated CUDA GEMM kernels. The launch
- * wrappers are C ABI functions consumed by `CUDAMoEKernel.cpp`, matching the
- * split used by the rest of the CUDA backend.
+ * Alongside routing glue, fixed-tree floating expert projections retain the
+ * cross-backend 256-lane arithmetic contract. Their grouped pipeline stores
+ * SwiGLU once per intermediate and reuses existing arena scratch for the down
+ * projection. Launch wrappers are C ABI functions consumed by CUDAMoEKernel.
  */
 
 #include <cuda_runtime.h>
@@ -16,6 +16,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "kernels/common/DeviceSwiGLUNumericalContract.h"
@@ -15657,9 +15658,9 @@ namespace
      *
      * Stable route order is part of MTP correctness. A route thread computes its
      * destination by counting earlier local routes to the same expert, exactly
-     * matching serial traversal. Every output has one writer, no floating-point
-     * reduction is reordered, and atomics participate only in fatal descriptor
-     * readiness validation, never in route ordering or numerical work.
+     * matching serial traversal. Every output has one writer; atomics only
+     * count bounded integers or validate descriptor readiness. No floating-point
+     * reduction or stable route ordering depends on their execution order.
      *
      * @tparam PublishRouterInputs Whether this launch owns initial router-output
      *         conversion (`true`) or post-LLEP regrouping (`false`).
@@ -15774,6 +15775,14 @@ namespace
             return;
         }
 
+        // The exclusive-offset bank first holds exact bounded integer counts.
+        // One local route adds one, avoiding an experts-by-slots shared-memory
+        // scan. At most 256 increments reach a counter, independent of order.
+        const int local_participant = static_cast<int>(runtime->participant_id);
+        if (tid < num_experts)
+            shared_expert_offsets[tid] = 0;
+        __syncthreads();
+
         if (tid < max_slots)
         {
             runtime->grouped_token_ids[tid] = 0;
@@ -15848,6 +15857,9 @@ namespace
             shared_route_experts[tid] = expert_id;
             shared_route_weights[tid] = route_weight;
             shared_route_participants[tid] = participant_id;
+            if (expert_id >= 0 && expert_id < num_experts &&
+                participant_id == local_participant)
+                atomicAdd(&shared_expert_offsets[expert_id], 1);
         }
         __syncthreads();
 
@@ -15885,18 +15897,9 @@ namespace
             }
         }
 
-        const int local_participant = static_cast<int>(runtime->participant_id);
-        int count = 0;
-        if (tid < num_experts)
-        {
-            for (int slot = 0; slot < current_slots; ++slot)
-            {
-                count += shared_route_experts[slot] == tid &&
-                                 shared_route_participants[slot] == local_participant
-                             ? 1
-                             : 0;
-            }
-        }
+        // The publication barrier above completes the integer histogram. The
+        // scan consumes every count before recycling this bank into offsets.
+        const int count = tid < num_experts ? shared_expert_offsets[tid] : 0;
 
         if constexpr (PublishCompletePlan)
         {
@@ -19388,9 +19391,10 @@ namespace
      * @brief Produce one grouped split-K partial per original route slot.
      *
      * The grouped gate/up rows remain expert-major in scratch, but every block
-     * resolves exactly one original `(token, route)` slot. Invalid or remote
-     * routes explicitly write zero so the following allreduce has a complete,
-     * overwrite-only contribution tensor on every participant.
+     * resolves exactly one original `(token, route)` slot. Missing routes own
+     * no partials: their publication kernel writes zero without reading this
+     * scratch. That contract avoids writing and rereading an entire split-K
+     * row for capacity-only or participant-remote slots in a retained graph.
      */
     template <uint8_t CodebookId>
     __global__ void grouped_prefill_down_canonical_kpart_scatter_kernel(
@@ -19424,8 +19428,11 @@ namespace
             static_cast<size_t>(n);
         const int original_slot = original_slot_base + local_route;
         const int grouped_slot = original_to_grouped[original_slot];
+        if (grouped_slot < 0)
+            return;
+
         const int expert_id = original_expert_ids[original_slot];
-        if (grouped_slot < 0 || expert_id < 0 || expert_id >= num_experts)
+        if (expert_id < 0 || expert_id >= num_experts)
         {
             partials[partial_index] = 0.0f;
             return;
@@ -19459,6 +19466,8 @@ namespace
      * Applying the router weight after the ordered K fold is part of the
      * cross-backend arithmetic contract. Multiplying every partial separately
      * is algebraically similar but changes FP32 parenthesization.
+     * Missing routes must be rejected before the scratch fold: their producer
+     * intentionally leaves the previous transaction's partials untouched.
      */
     __global__ void grouped_prefill_down_canonical_kpart_reduce_kernel(
         const float *__restrict__ partials,
@@ -19476,6 +19485,19 @@ namespace
         if (local_route >= tile_route_slots || n >= N)
             return;
 
+        const int original_slot = original_slot_base + local_route;
+        const int grouped_slot = original_to_grouped[original_slot];
+        const size_t output_index =
+            static_cast<size_t>(original_slot) * static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        if (grouped_slot < 0)
+        {
+            // This is public collective input, unlike private split-K scratch.
+            // Every absent route must explicitly replace its old value by +0.
+            route_output[output_index] = 0.0f;
+            return;
+        }
+
         const size_t partial_base =
             static_cast<size_t>(local_route) *
             static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
@@ -19489,14 +19511,7 @@ namespace
                                        static_cast<size_t>(N) +
                     static_cast<size_t>(n)]);
         }
-        const int original_slot = original_slot_base + local_route;
-        const int grouped_slot = original_to_grouped[original_slot];
-        route_output[
-            static_cast<size_t>(original_slot) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] =
-            grouped_slot >= 0
-                ? moe_weight_route_rn(grouped_weights[grouped_slot], sum)
-                : 0.0f;
+        route_output[output_index] = moe_weight_route_rn(grouped_weights[grouped_slot], sum);
     }
 
     /**
@@ -19836,16 +19851,21 @@ namespace
         }
     }
 
-    /** @brief Project all locally grouped prefill routes with floating weights. */
-    __global__ __launch_bounds__(kThreads)
-    void grouped_floating_gate_up_prefill_kernel(
+    /**
+     * @brief Project eight floating columns per block with the exact serial tree.
+     *
+     * Each width-32 subgroup owns one column; its eight register accumulators
+     * retain the 256 logical K partitions. Whole-subgroup tails and absent routes
+     * are safe because no block barrier or cross-column state is used.
+     */
+    __global__ __launch_bounds__(llaminar2::device_moe_floating_warp::threads)
+    void grouped_floating_gate_up_swiglu_prefill_kernel(
         const float *__restrict__ hidden,
         const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ gate_descs,
         const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
-        float *__restrict__ grouped_gate,
-        float *__restrict__ grouped_up,
+        float *__restrict__ grouped_swiglu,
         int total_slots,
         int top_k,
         int intermediate,
@@ -19853,16 +19873,14 @@ namespace
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format)
     {
-        __shared__ float gate_sums[kThreads];
-        __shared__ float up_sums[kThreads];
-        const int n = static_cast<int>(blockIdx.x);
+        namespace warp = llaminar2::device_moe_floating_warp;
+        const int lane = threadIdx.x % warp::width;
+        const int n = blockIdx.x * warp::columns_per_block + threadIdx.x / warp::width;
         const int original_slot = logical_row_from_grid_yz();
         if (original_slot >= total_slots || n >= intermediate)
             return;
         const int grouped_slot = original_to_grouped[original_slot];
-        const int expert = original_expert_ids
-                               ? original_expert_ids[original_slot]
-                               : 0;
+        const int expert = original_expert_ids ? original_expert_ids[original_slot] : 0;
         if (grouped_slot < 0 || expert < 0 || expert >= num_experts)
             return;
 
@@ -19871,62 +19889,51 @@ namespace
         const bool ready = gate.data && up.data &&
                            gate.n == intermediate && gate.k == d_model &&
                            up.n == intermediate && up.k == d_model;
-        float gate_sum = 0.0f;
-        float up_sum = 0.0f;
+        float gate_sums[warp::partitions_per_lane]{};
+        float up_sums[warp::partitions_per_lane]{};
         if (ready)
         {
-            const int token = original_slot / top_k;
-            const float *row = hidden +
-                static_cast<size_t>(token) * static_cast<size_t>(d_model);
-            const size_t weight_base =
-                static_cast<size_t>(n) * static_cast<size_t>(d_model);
-            for (int k = static_cast<int>(threadIdx.x);
-                 k < d_model;
-                 k += kThreads)
+            const float *row = hidden + static_cast<size_t>(original_slot / top_k) * d_model;
+            const size_t weight_base = static_cast<size_t>(n) * d_model;
+            // Register p emulates original thread lane+32*p. Moving between
+            // columns changes scheduling, never that thread's FMA order.
+            for (int base = 0; base < d_model; base += warp::partitions)
             {
-                const float activation = row[k];
-                gate_sum = fmaf(
-                    activation,
-                    load_floating_moe_weight(
-                        gate.data, weight_base + static_cast<size_t>(k), format),
-                    gate_sum);
-                up_sum = fmaf(
-                    activation,
-                    load_floating_moe_weight(
-                        up.data, weight_base + static_cast<size_t>(k), format),
-                    up_sum);
+    #pragma unroll
+                for (int partition = 0; partition < warp::partitions_per_lane; ++partition)
+                {
+                    const int k = base + lane + partition * warp::width;
+                    if (k < d_model)
+                    {
+                        const float activation = row[k];
+                        gate_sums[partition] = fmaf(activation,
+                            load_floating_moe_weight(gate.data, weight_base + k, format), gate_sums[partition]);
+                        up_sums[partition] = fmaf(activation,
+                            load_floating_moe_weight(up.data, weight_base + k, format), up_sums[partition]);
+                    }
+                }
             }
         }
-        gate_sums[threadIdx.x] = gate_sum;
-        up_sums[threadIdx.x] = up_sum;
-        __syncthreads();
-        for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+        const float gate_sum = warp::reduce(gate_sums);
+        const float up_sum = warp::reduce(up_sums);
+        if (lane == 0)
         {
-            if (static_cast<int>(threadIdx.x) < stride)
-            {
-                gate_sums[threadIdx.x] = moe_accumulate_rn(
-                    gate_sums[threadIdx.x], gate_sums[threadIdx.x + stride]);
-                up_sums[threadIdx.x] = moe_accumulate_rn(
-                    up_sums[threadIdx.x], up_sums[threadIdx.x + stride]);
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0)
-        {
-            const size_t index =
-                static_cast<size_t>(grouped_slot) *
-                    static_cast<size_t>(intermediate) +
-                static_cast<size_t>(n);
-            grouped_gate[index] = ready ? gate_sums[0] : 0.0f;
-            grouped_up[index] = ready ? up_sums[0] : 0.0f;
+            const size_t index = static_cast<size_t>(grouped_slot) * intermediate + n;
+            grouped_swiglu[index] = ready ? llaminar2::device_swiglu_contract::swigluValue(gate_sum, up_sum) : 0.0f;
         }
     }
 
-    /** @brief Down-project grouped floating rows and publish canonical order. */
-    __global__ __launch_bounds__(kThreads)
-    void grouped_floating_swiglu_down_prefill_kernel(
-        const float *__restrict__ grouped_gate,
-        const float *__restrict__ grouped_up,
+    /**
+     * @brief Down-project eight columns per block without shared reduction scratch.
+     *
+     * The preceding node already evaluated SwiGLU once. Each subgroup reads those
+     * FP32 bits, emulates the serial 256-partition FMA/tree, and publishes either
+     * one canonical route or the original ordered route sum. Missing routes still
+     * contribute an explicit rounded +0, including signed-zero semantics.
+     */
+    __global__ __launch_bounds__(llaminar2::device_moe_floating_warp::threads)
+    void grouped_floating_down_prefill_kernel(
+        const float *__restrict__ grouped_swiglu,
         const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
@@ -19941,93 +19948,54 @@ namespace
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format)
     {
-        __shared__ float sums[kThreads];
-        const int n = static_cast<int>(blockIdx.x);
+        namespace warp = llaminar2::device_moe_floating_warp;
+        const int lane = threadIdx.x % warp::width;
+        const int n = blockIdx.x * warp::columns_per_block + threadIdx.x / warp::width;
         const int publication_row = logical_row_from_grid_yz();
         const bool canonical = canonical_routes != nullptr;
-        if (n >= d_model ||
-            (canonical ? publication_row >= total_slots
-                       : publication_row >= seq_len))
-        {
+        if (n >= d_model || (canonical ? publication_row >= total_slots : publication_row >= seq_len))
             return;
-        }
 
-        const int route_begin = canonical
-                                    ? publication_row
-                                    : publication_row * top_k;
-        const int route_end = canonical
-                                  ? publication_row + 1
-                                  : route_begin + top_k;
+        const int route_begin = canonical ? publication_row : publication_row * top_k;
+        const int route_end = canonical ? publication_row + 1 : route_begin + top_k;
         float output_sum = 0.0f;
-        for (int original_slot = route_begin;
-             original_slot < route_end;
-             ++original_slot)
+        for (int original_slot = route_begin; original_slot < route_end; ++original_slot)
         {
             const int grouped_slot = original_to_grouped[original_slot];
-            const int expert = original_expert_ids
-                                   ? original_expert_ids[original_slot]
-                                   : 0;
-            const bool valid = grouped_slot >= 0 &&
-                               expert >= 0 && expert < num_experts;
+            const int expert = original_expert_ids ? original_expert_ids[original_slot] : 0;
+            const bool valid = grouped_slot >= 0 && expert >= 0 && expert < num_experts;
             llaminar2::DeviceMoEFloatingMatrixDesc down{};
             if (valid)
                 down = down_descs[expert];
-            const bool ready = valid && down.data &&
-                               down.n == d_model && down.k == intermediate;
-            float sum = 0.0f;
-            if (ready)
+            const bool ready = valid && down.data && down.n == d_model && down.k == intermediate;
+            if (!ready)
             {
-                const size_t row_base =
-                    static_cast<size_t>(grouped_slot) *
-                    static_cast<size_t>(intermediate);
-                const size_t weight_base =
-                    static_cast<size_t>(n) *
-                    static_cast<size_t>(intermediate);
-                for (int k = static_cast<int>(threadIdx.x);
-                     k < intermediate;
-                     k += kThreads)
+                if (lane == 0)
+                    output_sum = moe_accumulate_rn(output_sum, 0.0f);
+                continue;
+            }
+            float sums[warp::partitions_per_lane]{};
+            const size_t row_base = static_cast<size_t>(grouped_slot) * intermediate;
+            const size_t weight_base = static_cast<size_t>(n) * intermediate;
+            for (int base = 0; base < intermediate; base += warp::partitions)
+            {
+    #pragma unroll
+                for (int partition = 0; partition < warp::partitions_per_lane; ++partition)
                 {
-                    const float gate = grouped_gate[row_base + k];
-                    const float up = grouped_up[row_base + k];
-                    const float swiglu =
-                        llaminar2::device_swiglu_contract::swigluValue(
-                            gate, up);
-                    sum = fmaf(
-                        swiglu,
-                        load_floating_moe_weight(
-                            down.data,
-                            weight_base + static_cast<size_t>(k),
-                            format),
-                        sum);
+                    const int k = base + lane + partition * warp::width;
+                    if (k < intermediate)
+                        sums[partition] = fmaf(grouped_swiglu[row_base + k],
+                            load_floating_moe_weight(down.data, weight_base + k, format), sums[partition]);
                 }
             }
-            sums[threadIdx.x] = sum;
-            __syncthreads();
-            for (int stride = kThreads / 2; stride > 0; stride >>= 1)
-            {
-                if (static_cast<int>(threadIdx.x) < stride)
-                {
-                    sums[threadIdx.x] = moe_accumulate_rn(
-                        sums[threadIdx.x], sums[threadIdx.x + stride]);
-                }
-                __syncthreads();
-            }
-            if (threadIdx.x == 0)
-            {
-                const float weighted = ready
-                    ? moe_weight_route_rn(
-                          grouped_weights[grouped_slot], sums[0])
-                    : 0.0f;
-                output_sum = moe_accumulate_rn(output_sum, weighted);
-            }
-            __syncthreads();
+            const float sum = warp::reduce(sums);
+            if (lane == 0)
+                output_sum = moe_accumulate_rn(output_sum,
+                    moe_weight_route_rn(grouped_weights[grouped_slot], sum));
         }
-        if (threadIdx.x == 0)
+        if (lane == 0)
         {
-            const size_t index =
-                static_cast<size_t>(publication_row) *
-                    static_cast<size_t>(d_model) +
-                static_cast<size_t>(n);
+            const size_t index = static_cast<size_t>(publication_row) * d_model + n;
             if (canonical)
                 canonical_routes[index] = output_sum;
             else
@@ -23367,7 +23335,13 @@ extern "C"
             "cudaMoE_grouped_swiglu_down_floating_decode_table");
     }
 
-    /** @brief Launch the fixed-tree floating grouped-prefill pipeline. */
+    /**
+     * @brief Launch fixed-tree gate/up/SwiGLU then down on the exact stream.
+     * @param d_grouped_swiglu Existing exclusive arena FP32 intermediate.
+     *
+     * Fusion retains two captured nodes and serial decode's arithmetic without
+     * changing any weight format, activation precision or allocation requirement.
+     */
     bool cudaMoE_grouped_floating_prefill_pipeline(
         const float *d_hidden,
         const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_descs,
@@ -23376,8 +23350,7 @@ extern "C"
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
         const float *d_grouped_weights,
-        float *d_grouped_gate,
-        float *d_grouped_up,
+        float *d_grouped_swiglu,
         float *d_output,
         float *d_canonical_routes,
         int seq_len,
@@ -23393,7 +23366,7 @@ extern "C"
         if (!d_hidden || !d_gate_descs || !d_up_descs || !d_down_descs ||
             !d_original_to_grouped ||
             (!d_original_expert_ids && num_experts != 1) ||
-            !d_grouped_weights || !d_grouped_gate || !d_grouped_up ||
+            !d_grouped_weights || !d_grouped_swiglu ||
             (!d_output && !d_canonical_routes) || seq_len <= 0 ||
             total_slots != seq_len * top_k || top_k <= 0 || d_model <= 0 ||
             intermediate <= 0 || num_experts <= 0 ||
@@ -23404,9 +23377,10 @@ extern "C"
         if (cudaSetDevice(device_idx) != cudaSuccess)
             return false;
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        grouped_floating_gate_up_prefill_kernel<<<
+        grouped_floating_gate_up_swiglu_prefill_kernel<<<
             make_row_major_grid(
-                static_cast<unsigned int>(intermediate), total_slots),
+                static_cast<unsigned int>((intermediate + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
+                    llaminar2::device_moe_floating_warp::columns_per_block), total_slots),
             kThreads,
             0,
             cuda_stream>>>(
@@ -23415,8 +23389,7 @@ extern "C"
                 d_up_descs,
                 d_original_to_grouped,
                 d_original_expert_ids,
-                d_grouped_gate,
-                d_grouped_up,
+                d_grouped_swiglu,
                 total_slots,
                 top_k,
                 intermediate,
@@ -23426,14 +23399,14 @@ extern "C"
         if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
             return false;
         const int publication_rows = d_canonical_routes ? total_slots : seq_len;
-        grouped_floating_swiglu_down_prefill_kernel<<<
+        grouped_floating_down_prefill_kernel<<<
             make_row_major_grid(
-                static_cast<unsigned int>(d_model), publication_rows),
+                static_cast<unsigned int>((d_model + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
+                    llaminar2::device_moe_floating_warp::columns_per_block), publication_rows),
             kThreads,
             0,
             cuda_stream>>>(
-                d_grouped_gate,
-                d_grouped_up,
+                d_grouped_swiglu,
                 d_down_descs,
                 d_original_to_grouped,
                 d_original_expert_ids,

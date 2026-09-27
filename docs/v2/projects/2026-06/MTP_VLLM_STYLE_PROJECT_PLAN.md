@@ -2,6 +2,20 @@
 
 ## Objective
 
+2026-09-27 six-GPU 122B follow-up: mapped-packet and floating-expert tuning
+reaches 351.49 tok/s prefill and 42.38 decode under unchanged dynamic MTP
+defaults; the updated 43.80 decode target remains open. An explicit GPU
+vocabulary-sharded-head experiment fails during restored-prefix condition
+setup because local TP reserves only a 1x1 gathered-logits placeholder.
+The shared retained geometry fix passes both scope/backend/deep-capacity
+preflight regressions and all three owning Unit groups. A fresh model run gets
+past restored-prefix capture, then correctly rejects participant-local GPU
+verifier outcomes over a vocabulary-sharded head: that separate graph-owned
+sampler surface is not implemented. No head default changes; this is not a
+sharded-head performance result. Continue tuning the existing mirrored path.
+Current measurements and certification scope live in
+[the six-GPU report](../../../../changelog/2026-09-27-six-gpu-expert-overlay-return-packing.md).
+
 2026-09-26 final acceptance: the stochastic-default goal reaches both requested
 performance passes. Final matched Release medians are **278.33 CUDA / 146.82
 ROCm / 44.94 CPU tok/s**, versus old controls **254.93 / 86.68 / 41.34**.

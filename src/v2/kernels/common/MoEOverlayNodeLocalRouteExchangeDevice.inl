@@ -101,12 +101,17 @@ namespace llaminar2::moe_node_local_route_device
             kMoENodeLocalRouteExchangeAbortEpoch);
     }
 
-    /** @return Whether a peer lane already carries a terminal failure. */
+    /**
+     * @return Whether an authenticated peer lane carries a terminal failure.
+     *
+     * The acquire kernel authenticates immutable identity once before polling.
+     * Only the state and status may change while it waits for the next epoch;
+     * rereading five immutable fields each poll adds serial PCIe transactions.
+     */
     __device__ __forceinline__ bool laneAborted(
         const MoENodeLocalRoutePeerDeviceBinding &lane) noexcept
     {
-        return !validControl(lane) ||
-               loadPeerPublished(&lane.control->state) !=
+        return loadPeerPublished(&lane.control->state) !=
                    raw(MoENodeLocalRouteExchangeState::Ready) ||
                loadPeerPublished(&lane.control->code) !=
                    raw(MoENodeLocalRouteExchangeCode::Success);
@@ -194,26 +199,9 @@ namespace llaminar2::moe_node_local_route_device
     {
         __shared__ std::uint32_t lane_ready;
         __shared__ std::uint64_t next_epoch;
-        if (threadIdx.x == 0u)
-        {
-            /*
-             * The preceding stream-ordered begin kernel authenticated the lane
-             * and waited for reuse. Re-reading state and code from every block
-             * would multiply mapped PCIe control traffic by the payload grid.
-             * Each block needs only the stable prior epoch; the finalizer owns
-             * the single mutable terminal-state check before publication.
-             */
-            const std::uint64_t produced = launch.valid()
-                ? loadSystemAcquire64(
-                      &launch.lane.control->produced_epoch)
-                : kMoENodeLocalRouteExchangeAbortEpoch;
-            lane_ready =
-                produced != kMoENodeLocalRouteExchangeAbortEpoch;
-            next_epoch = lane_ready ? produced + 1u : 0u;
-        }
-        __syncthreads();
-        if (lane_ready == 0u)
+        if (!launch.valid())
             return;
+        bool epoch_acquired = false;
         for (std::uint32_t slot = blockIdx.x;
              slot < launch.live_route_slots;
              slot += gridDim.x)
@@ -222,6 +210,27 @@ namespace llaminar2::moe_node_local_route_device
                 launch.lane.producer_participant)
             {
                 continue;
+            }
+            if (!epoch_acquired)
+            {
+                /* The assignment is device-local and block-uniform. Empty
+                 * blocks must not issue a fresh PCIe epoch read: a retained
+                 * verifier envelope often selects only a handful of routes
+                 * on this peer. Acquire once at the first owned row, then
+                 * retain the epoch for all remaining rows of this block.
+                 * The stream-ordered begin/finalizer still authenticate the
+                 * lane, protect reuse and own terminal-state publication. */
+                if (threadIdx.x == 0u)
+                {
+                    const auto produced = loadSystemAcquire64(
+                        &launch.lane.control->produced_epoch);
+                    lane_ready = produced != kMoENodeLocalRouteExchangeAbortEpoch;
+                    next_epoch = lane_ready ? produced + 1u : 0u;
+                }
+                __syncthreads();
+                if (lane_ready == 0u)
+                    return;
+                epoch_acquired = true;
             }
             const std::size_t base =
                 static_cast<std::size_t>(slot) *
@@ -381,13 +390,13 @@ namespace llaminar2::moe_node_local_route_device
             }
             const std::size_t base =
                 static_cast<std::size_t>(slot) * launch.d_model;
-            for (std::uint32_t column = threadIdx.x;
-                 column < launch.d_model;
-                 column += blockDim.x)
-            {
-                lane.route_payload[base + column] = loadPeerPublished(
-                    lane.mapped_route_payload + base + column);
-            }
+            // The release/acquire above owns source visibility. Stripe fresh
+            // vector loads where alignment allows it; the shared copy helper
+            // retains scalar tails and the economical HIP scalar geometry.
+            moe_activation_packet_device::copyPeerPublishedRow(
+                lane.mapped_route_payload + base,
+                lane.route_payload + base,
+                launch.d_model);
         }
     }
 
@@ -442,7 +451,7 @@ namespace llaminar2::moe_node_local_route_device
     }
 
     /**
-     * @brief Select local/mapped route sources and fold top-k in exact order.
+     * @brief Select root-local staged route sources and fold top-k in exact order.
      *
      * Each `(row, hidden-column)` element has one writer.  Remote-tier routes
      * contribute exact +0 here and are added later by their canonical sparse
@@ -490,10 +499,12 @@ namespace llaminar2::moe_node_local_route_device
                 const auto *peer = peerForParticipant(launch, participant);
                 if (peer)
                 {
-                    contribution = loadPeerPublished(
-                        peer->route_payload +
+                    // Root bindings point at root-device scratch, not mapped
+                    // peer memory. The preceding staging kernel supplies the
+                    // stream-ordered write; normal device caching is valid.
+                    contribution = peer->route_payload[
                         static_cast<std::size_t>(slot) * launch.d_model +
-                        column);
+                        column];
                 }
             }
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)

@@ -8,6 +8,16 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-09-27: **A — six-GPU 122B tuning.** Unchanged dynamic-MTP defaults reach
+**351.49 prefill / 42.38 decode tok/s**; the new targets are 345.58 / 43.80.
+An explicit sharded-head comparison exposed missing local-TP gathered-logits
+capacity before inference. The shared schema/admission fix passes five owning
+Unit/preflight groups. Model setup now passes that boundary, then rejects the
+unimplemented participant-local GPU verifier over sharded heads. No GPU head
+default changed; tuning stays on the mirrored path. The combined full gate is
+not yet refreshed. See the
+[six-GPU report](../../../../changelog/2026-09-27-six-gpu-expert-overlay-return-packing.md).
+
 2026-09-26: **G — stochastic-default performance target reached.** Matched
 Qwen3.6 MoE IQ3_S Release medians on the 512/256 workload are **278.33 CUDA /
 146.82 ROCm / 44.94 dual-socket CPU tok/s**, above the old-default controls

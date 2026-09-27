@@ -126,6 +126,53 @@ explicit target).
 - Write `.nsys-rep` and `.ncu-rep` artifacts under `/tmp` or another explicit
   result directory, not in the repository.
 
+### Profiling an automatically planned MPI topology
+
+Freeze an **unprofiled** `llaminar2 plan --output <plan.json>` with the same
+model, context, MTP and placement intent as the benchmark. Apply that document
+only for the diagnostic run. Profiling the automatic search itself perturbs its
+measured costs and can select a different continuation backend. Canonical
+performance measurements must still use their original production invocation.
+
+Resolve the target domain's owner through the saved execution membership:
+
+```bash
+# Domain names come from this plan, not a CUDA/ROCm naming convention.
+jq -r --arg domain '<selected-domain-name>' '
+  .configuration as $c |
+  ($c.domain_definitions[] | select(.name == $domain) | .owner_rank) as $owner |
+  if $c.execution_rank_selection == null then $owner
+  else $c.execution_rank_selection[$owner] end
+' <plan.json>
+```
+
+This result is the original/discovery MPI rank. Compare it with
+`OMPI_COMM_WORLD_RANK` in the per-rank profiler wrapper. `owner_rank` and the
+application's log rank belong to the selected **execution** communicator;
+they are not necessarily the launch rank. For example, membership `[1,0]`
+means execution owner 0 runs in discovery process 1. Profiling launch rank 0
+can collect CUDA startup probes yet miss all CUDA inference after selection.
+The same mistake affects ROCm followers. Never infer ownership from socket
+number, vendor name, or a previous run.
+
+Keep the benchmark's MPI count and physical-core binding. Start the profiler
+inside only the selected rank, then exec `llaminar2 benchmark --config
+<plan.json> --no-mpi-bootstrap` with the original prompt, seed and sampling
+settings; other ranks exec the same command without the profiler. Log both
+rank namespaces and the chosen backend. Use `LLAMINAR_PROFILER_NORMAL_EXIT=1`
+for the diagnostic: ordinary successful CLI exit intentionally uses `_exit`,
+which skips profiler trace-buffer finalizers. Preserve the variable through
+MPI/`sudo -E`, and leave it unset in canonical timing/service commands.
+
+Authenticate the result by finding real model kernels during the measured
+request interval, on the intended devices. Graph-construction events, startup
+projection probes, or a successful profiler exit alone are insufficient. The
+tested `nsys --cuda-graph-trace=node` path traces retained mixed-vendor CUDA
+inference when attached to the resolved owner. Separate startup, prefill and
+decode; summed busy time across devices and persistent wait/service kernels is
+not critical-path latency. Keep profiled throughput separate from the warmed,
+unprofiled benchmark.
+
 ### Prove profiler attachment before a model run
 
 Do not spend a model load on an unproven profiler setup. First profile a focused
@@ -150,7 +197,8 @@ launch instances from the focused test. A report containing
 normally say `CUDA profiling might have not been started correctly` or report
 only graph-node creation. Check privilege first.
 
-CUDA 13 conditional/device-loop graphs expose a second tool boundary on Ampere:
+After confirming the correct process and normal-exit flushing, CUDA 13
+conditional/device-loop graphs can expose a second tool boundary on Ampere:
 the tested Nsight Systems 2025.3 and 2026.1 releases can collect ordinary eager
 and simple captured graphs yet omit all activities from Llaminar's complete
 production conditional graph. Confirm this by comparing the smoke test with the
@@ -244,7 +292,8 @@ only. It does not replace warmed unprofiled Release timing, and it does not
 certify occupancy or spills.
 
 If NCU prints `No kernels were profiled`, first run the profiler-attachment
-smoke above, then inspect the report's `Available Kernels`. Do not switch to
+smoke above, verify the selected execution/discovery-rank mapping for MPI,
+then inspect the report's `Available Kernels`. Do not switch to
 eager execution, segmented graphs, late `cudaProfilerStart()`, or a host-side
 surrogate to make the profiler easier to use; those are different execution
 paths.
@@ -321,11 +370,13 @@ For the Qwen 3.6 35B grouped-prefill path, a proven real-graph selector is
 `SpeedOfLight` supply registers, launch geometry, achieved occupancy, and the
 compute/memory throughput balance.
 
-> 🧹 **MANDATORY CLEANUP after every ncu run** (ncu leaves zombie processes that hold
-> the GPU and corrupt the next run):
-> ```bash
-> sudo pkill -9 -f "llaminar2 oneshot"; sudo pkill -9 -f "ncu --kernel"; sleep 1; nvidia-smi
-> ```
+After each profiler invocation, verify that its process tree exited and released
+the GPU before starting another measurement. A profiler interrupted during replay
+can leave a child holding a device; identify that exact PID and terminate only
+the process tree owned by the diagnostic, first gracefully. Never use broad
+`pkill` patterns that could kill a user's server or another agent's work. Check
+`nvidia-smi` afterward. A normal successful profiler exit does not require killing
+anything.
 
 ### What to read first
 
@@ -643,7 +694,7 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 ## Quick reference — one-liners
 
 ```bash
-# Hotspot ranking (relative only; decode runs eager under profiling)
+# Hotspot ranking (captured production execution; diagnostic event overhead)
 LLAMINAR_PERF_STATS_JSON=/tmp/cuda-profile.json \
 LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
 ./build_v2_release/llaminar2 benchmark -m M.gguf -d cuda:0
@@ -658,8 +709,8 @@ sudo -E /usr/local/cuda/bin/ncu --kernel-name "K" --launch-skip 1 --launch-count
   --section MemoryWorkloadAnalysis --section WarpStateStats --target-processes all \
   -o /tmp/k -f ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m M.gguf -p "x" -n 1
 
-# Cleanup (ALWAYS after ncu)
-sudo pkill -9 -f "llaminar2 oneshot"; sudo pkill -9 -f "ncu --kernel"; sleep 1; nvidia-smi
+# Confirm the profiler-owned process exited and released its GPU.
+nvidia-smi
 
 # Scoped, correctness-gated GEMM A/B
 LLAMINAR_CUDA_NATIVE_GEMM_SHAPES="ShapeA,ShapeB" \

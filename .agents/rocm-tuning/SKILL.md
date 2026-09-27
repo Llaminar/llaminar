@@ -99,6 +99,27 @@ requests. It must never disable graph capture or select eager execution.
   evidence collector. Do not silently substitute `rocprofv3` output for a
   `rocprof`/rocprofiler schema expected by the trainer.
 
+For a planned MPI deployment, follow the shared
+[execution-rank attachment procedure](../cuda-tuning/SKILL.md#profiling-an-automatically-planned-mpi-topology):
+save an unprofiled plan, map its domain `owner_rank` through
+`execution_rank_selection`, and attach to that **discovery** process. Launch
+rank, log rank, socket and continuation/follower role are not interchangeable.
+An incorrectly selected process can expose ROCm startup probes and no inference
+kernels, even though retained HIP graph tracing works. Keep the production MPI
+binding and apply the saved plan for profiling; never let profiler overhead
+alter automatic topology selection.
+
+Use `LLAMINAR_PROFILER_NORMAL_EXIT=1` when profiling the CLI so `_exit` does not
+discard profiler finalizers. The validated whole-model command is
+`rocprofv3 --kernel-trace --stats --output-directory <result-dir> --
+llaminar2 benchmark --config <plan.json> --no-mpi-bootstrap <exact-workload>`
+inside the resolved rank. Check the resulting dispatch records for real MoE
+kernels on the intended agents during inference, not merely startup kernels.
+Current rocprofv3 can emit a ROCPD SQLite database rather than CSV; inspect the
+actual output/schema. Database/report generation after device shutdown is
+profiler overhead, not model loading or inference. Persistent waits and summed
+parallel-agent durations are not a critical-path measurement.
+
 ---
 
 ## Step 0: Architecture facts you must keep in mind (gfx906)

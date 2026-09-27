@@ -1977,8 +1977,7 @@ extern "C"
         const int *d_original_to_grouped,
         const int *d_original_expert_ids,
         const float *d_grouped_weights,
-        float *d_grouped_gate,
-        float *d_grouped_up,
+        float *d_grouped_swiglu,
         float *d_output,
         float *d_canonical_route_contributions,
         int seq_len,
@@ -8638,7 +8637,6 @@ namespace llaminar2
                 d_group_original_expert_ids_,
                 d_group_weights_,
                 d_prefill_gate_,
-                d_prefill_up_,
                 canonical_route_contributions
                     ? nullptr
                     : static_cast<float *>(output->gpu_data_ptr()),
@@ -9109,7 +9107,6 @@ namespace llaminar2
                 runtime_host_layer.route_expert_ids,
                 runtime_host_layer.grouped_route_weights,
                 d_prefill_gate_,
-                d_prefill_up_,
                 canonical_route_contributions
                     ? nullptr
                     : static_cast<float *>(output->gpu_data_ptr()),
@@ -9742,7 +9739,9 @@ namespace llaminar2
                       "mandatory K-part gate/up scratch allocation failed");
             return false;
         }
-        if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model))
+        // Floating descriptors never consume Q8 publications. Requiring their
+        // scratch would incorrectly impose quantized block-width constraints.
+        if (!floating && !ensureGroupedGateUpDecodeCapacity(num_active, d_model))
             return false;
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
@@ -9943,7 +9942,7 @@ namespace llaminar2
         void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromTable");
         const bool capture_active = isCudaMoEDecodeCaptureActive(stream);
         const DeviceId device = deviceId();
-        if (!ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
+        if ((!floating && !ensureGroupedDownDecodeCapacity(num_active, intermediate)) ||
             !setMoEDevice(device_ordinal_, "groupedExpertDownDecodeFromTable"))
             return false;
 
@@ -10746,9 +10745,9 @@ namespace llaminar2
              (!ensureGroupedGateUpKPartScratchCapacity(
                   num_active, gateup_k_partitions, intermediate) ||
               !ensureGroupedDownKPartScratchCapacity(
-                  down_k_partitions, d_model, num_active))) ||
-            !ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
-            !ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
+                  down_k_partitions, d_model, num_active) ||
+              !ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
+              !ensureGroupedDownDecodeCapacity(num_active, intermediate))) ||
             !resolveFixedTableGateUpMetadata(
                 gateup_table.workspace_slot,
                 RuntimePointerArrayScope::TableDecode,
@@ -10766,7 +10765,8 @@ namespace llaminar2
         {
             return false;
         }
-        // Preparation publishes metadata addresses; execution consumes them.
+        // Both families publish immutable metadata and pointer arrays. Only
+        // quantized arithmetic above binds Q8/K-part intermediate workspaces.
         (void)fixed_gateup_expert_ids;
         (void)fixed_down_expert_ids;
         (void)fixed_down_expert_weights;

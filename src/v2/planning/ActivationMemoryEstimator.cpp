@@ -10,6 +10,7 @@
 
 #include "planning/ActivationMemoryEstimator.h"
 #include "execution/mtp/GenerationRequestSeeds.h"
+#include "execution/mtp/MTPTerminalGatherGeometry.h"
 
 #include <algorithm>
 #include <limits>
@@ -417,7 +418,7 @@ size_t ActivationMemoryEstimator::estimate(
             target_rows, mtp_target_columns, "MTP target-row arena"),
         "MTP target-row arena");
 
-    /* Stable selected-row input plus the no-global-gather 1x1 placeholder. */
+    /* Stable selected-row input and the exact retained terminal output bank. */
     bytes = checkedAdd(
         bytes,
         fp32RowBankBytes(1u, d_model, "LM-head selected row"),
@@ -427,7 +428,12 @@ size_t ActivationMemoryEstimator::estimate(
         fp32RowBankBytes(
             target_rows, d_model, "LM-head verifier rows"),
         "LM-head verifier rows");
-    bytes = checkedAdd(bytes, sizeof(float), "MTP gather placeholder");
+    const auto mtp_gather = MTPTerminalGatherGeometry::resolve(
+        geometry.mtp_terminal_logits_layout, target_rows,
+        static_cast<size_t>(profile.vocab_size));
+    bytes = checkedAdd(bytes,
+        fp32RowBankBytes(mtp_gather.rows(), mtp_gather.columns(), "MTP gathered logits"),
+        "MTP gathered logits");
 
     if (profile.expert_count > 0)
     {

@@ -59,9 +59,10 @@ namespace llaminar2
         /**
          * Number of ordered FP32 lanes in every GPU-aligned expert projection.
          *
-         * A CPU tier emulates these logical lanes; CUDA and ROCm map one lane
-         * to one thread. The value is arithmetic identity rather than launch
-         * tuning because changing it changes every dot-product parenthesis.
+         * Backends may map these logical lanes to threads or subgroup-owned
+         * registers, but must retain each lane's FMA sequence and the same
+         * descending binary tree. This is arithmetic identity rather than
+         * launch tuning: changing it changes the dot-product parentheses.
          */
         static constexpr int floating_ordered_k_partitions = 256;
 

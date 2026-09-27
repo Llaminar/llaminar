@@ -45,6 +45,8 @@
 #include "tensors/TensorKernels.h"
 #include "memory/BufferId.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../../mocks/MockLocalTPContext.h"
+#include "../../../mocks/MockMPIContext.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -1663,6 +1665,52 @@ TEST(Test__Qwen35Schema, ResolverConfig_AttnOutputDim_WithTP)
 
     EXPECT_GE(it->second, static_cast<size_t>(1280))
         << "attn_output_dim must also accommodate FA local_qkv_dim";
+}
+
+/**
+ * @brief Local vocabulary shards retain a complete condition/verifier output bank.
+ *
+ * The restored-prefix MTP condition graph binds gathered logits even when its
+ * participants share one rank. Storage ownership follows the output layout,
+ * not the presence of a GlobalTP collective. This device-free test checks the
+ * production resolver for all backends and retained depths without inference.
+ */
+TEST_F(Qwen35GraphBuildTest, ShardedMTPGatherCapacityIsIndependentOfRankScope)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int degree : {2, 4, 8})
+    for (const int depth : {1, 3, 15})
+    for (const bool global : {false, true})
+    for (const bool enabled : {false, true})
+    for (const auto policy : {MTPTerminalHeadPolicy::VocabularySharded,
+                              MTPTerminalHeadPolicy::MirroredFullVocabulary})
+    {
+        SCOPED_TRACE(device.toString() + "/" + std::to_string(degree) + "/" +
+                     std::to_string(depth) + "/" + std::to_string(global) + "/" + std::to_string(enabled));
+        MockLocalTPContext local_tp;
+        std::vector<GlobalDeviceAddress> devices;
+        for (int index = 0; index < degree; ++index)
+            devices.push_back(device.is_cuda() ? GlobalDeviceAddress::cuda(index) :
+                device.is_rocm() ? GlobalDeviceAddress::rocm(index) : GlobalDeviceAddress::cpu(index));
+        local_tp.setDevices(std::move(devices));
+        config_.default_device = device;
+        config_.tp_ctx = global ? nullptr : &local_tp;
+        config_.lm_head_column_parallel = true;
+        config_.vocab_size = 256;
+        config_.vocab_local = config_.vocab_size / degree;
+        config_.mtp.enabled = enabled;
+        config_.mtp.draft_tokens = depth;
+        config_.mtp.graph_capacity_draft_tokens = depth;
+        config_.mtp.terminal_head_policy = policy;
+
+        const auto mpi = std::make_shared<MockMPIContext>(0, global ? degree : 1);
+        const auto resolver = Qwen35Graph(config_, mpi).getResolverConfig(1);
+        const bool sharded = policy == MTPTerminalHeadPolicy::VocabularySharded;
+        EXPECT_EQ(resolver.custom_formulas.at("mtp_gather_rows"),
+                  sharded ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp)) : 1u);
+        EXPECT_EQ(resolver.custom_formulas.at("mtp_gather_vocab"),
+                  sharded ? static_cast<size_t>(config_.vocab_size) : 1u);
+    }
 }
 
 /**

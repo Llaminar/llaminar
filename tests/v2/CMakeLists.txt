@@ -17300,6 +17300,7 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # observing terminal events.
     add_executable(v2_integration_mapped_activation_packet_cuda_rocm
         integration/transfer/Test__MappedActivationPacketCUDAAndROCm.cpp
+        integration/transfer/Test__MoEOverlayReturnValidation.cpp
     )
     target_include_directories(
         v2_integration_mapped_activation_packet_cuda_rocm PRIVATE
@@ -18539,7 +18540,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
     # Small all-format lifecycle fixture kept separate from the large backend
     # MoE suites so changes to this regression retain a fast compile/run loop.
     add_executable(v2_integration_moe_live_rows
-        integration/backends/Test__MoELiveRows.cpp)
+        integration/backends/Test__MoELiveRows.cpp
+        integration/backends/Test__MoERuntimeGrouping.cpp)
+    # Event-timed all-format expert economy is intentionally outside preflight.
+    add_executable(v2_perf_gpu_expert_pipeline
+        performance/kernels/moe/Perf__GPUExpertPipeline.cpp)
+    target_include_directories(v2_perf_gpu_expert_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_perf_gpu_expert_pipeline PRIVATE
+        v2_expert_transfer_parity_support GTest::gtest_main)
     target_include_directories(v2_integration_moe_live_rows PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_integration_moe_live_rows PRIVATE
         v2_expert_transfer_parity_support GTest::gtest_main)
@@ -18558,9 +18566,25 @@ if(HAVE_CUDA OR HAVE_ROCM)
     foreach(_live_rows_backend CUDA ROCm)
         string(TOUPPER "${_live_rows_backend}" _live_rows_backend_upper)
         if(HAVE_${_live_rows_backend_upper})
+            add_v2_test(V2_Integration_MoERuntimeGrouping_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=Backends/MoERuntimeGrouping.*/${_live_rows_backend}
+                LABELS "V2;Integration;${_live_rows_backend};MoE;MTP;GraphCapture;ByteExact;Regression"
+                MPI_PROCS 1
+                NO_MODELS
+                TIMEOUT 30)
+            add_v2_test(V2_Perf_GPUExpertPipeline_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline>
+                    --gtest_filter=ProductionShape/GPUExpertPipeline.CapturedPipeline/${_live_rows_backend}_*
+                LABELS "V2;Performance;${_live_rows_backend};MoE;MTP;ExpertOverlay;AllFormats;Economy"
+                MPI_PROCS 1
+                NO_MODELS
+                # Complete format/row inventory prepares independent real
+                # expert tensors per case; this is not a preflight timeout.
+                TIMEOUT 600)
             add_v2_test(V2_Integration_MoELiveRows_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
-                    --gtest_filter=Backends/MoELiveRows.CapturedSharedAndRoutedAllFormats/${_live_rows_backend}
+                    --gtest_filter=Backends/MoELiveRows.CapturedSharedAndRoutedAllFormats/${_live_rows_backend}:Backends/MoELiveRows.FloatingMultiPartitionGeometry/${_live_rows_backend}
                 LABELS "V2;Integration;${_live_rows_backend};MoE;MTP;AllFormats;AllCodebooks;GraphCapture;ByteExact;Regression"
                 MPI_PROCS 1
                 NO_MODELS
@@ -19257,6 +19281,15 @@ add_v2_test(V2_Unit_Qwen35Schema
     LABELS "V2;Unit;Qwen35;GraphSchema;GDN;PhaseD"
     MPI_PROCS 1
 )
+# Every GPU condition/verifier graph binds the admitted gathered-logits bank.
+# LocalTP must not reserve the GlobalTP-only placeholder for vocabulary shards.
+add_v2_test(V2_Integration_MTPShardedTerminalGatherCapacity
+    COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
+        --gtest_filter=Qwen35GraphBuildTest.ShardedMTPGatherCapacityIsIndependentOfRankScope
+    LABELS "V2;Integration;ProductionTestPreflight;MTP;LocalTP;Memory;Graph;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_PhaseSplitDenseGDNResolverGeometry
     COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
         --gtest_filter=Qwen35GraphBuildTest.PhaseSplitDenseDecodeUsesFullGDNResolverGeometryOnEveryTPRank
@@ -19605,6 +19638,13 @@ add_v2_test(V2_Unit_ActivationMemoryEstimator
     COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
     LABELS "V2;Unit;Planning;ActivationMemoryEstimator;Activations"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MTPShardedTerminalGatherAccounting
+    COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+        --gtest_filter=Test__ActivationMemoryEstimator.Qwen35MoE122BLocalTP_MatchesDeclarativeArenaByteForByte
+    LABELS "V2;Integration;ProductionTestPreflight;MTP;LocalTP;Memory;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: WorkspaceMemoryEstimator — GPU kernel workspace budget estimation
@@ -20366,6 +20406,8 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_LearnedMTPDepthPolicy_ROCm
     V2_Integration_MoELiveRows_CUDA
     V2_Integration_MoELiveRows_ROCm
+    V2_Integration_MoERuntimeGrouping_CUDA
+    V2_Integration_MoERuntimeGrouping_ROCm
     V2_Integration_ROCmMoERuntimeGroupResources
     V2_Integration_MTPDefaultSamplingLifecycle
     V2_Integration_CPUGreedySelector
