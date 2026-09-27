@@ -86,8 +86,13 @@ def commit_payloads(parent: str, master_sha: str,
                    "-m", f"benchmarks: PR #{number} certified high water [skip ci]", env=env)
 
 
-def publish(repository: str, master_sha: str, output: Path) -> dict:
-    """Reauthenticate master proof and advance only the exact merged head."""
+def publish(repository: str, master_sha: str, output: Path,
+            push_url: str) -> dict:
+    """Reauthenticate master proof and advance only the exact merged head.
+
+    The push transport is explicit: production supplies the dedicated release
+    deploy-key SSH URL; local bare-repository tests supply their own remote.
+    """
     if git("rev-parse", "HEAD") != master_sha:
         raise ValueError("high-water checkout is not the released master commit")
     master_tree = git("rev-parse", f"{master_sha}^{{tree}}")
@@ -121,7 +126,7 @@ def publish(repository: str, master_sha: str, output: Path) -> dict:
         return {"schema": 1, "pr": number, "master_sha": master_sha,
                 "develop_sha": current, "source_sha": head, "reused": True}
     committed = commit_payloads(head, master_sha, payloads, number)
-    git("push", "origin", f"{committed}:refs/heads/develop")
+    git("push", push_url, f"{committed}:refs/heads/develop")
     return {"schema": 1, "pr": number, "master_sha": master_sha,
             "develop_sha": committed, "source_sha": head, "reused": False}
 
@@ -132,16 +137,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--master-sha", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--push-url", required=True,
+                        help="Dedicated release deploy-key SSH remote")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("--repository requires OWNER/REPO")
     if not re.fullmatch(r"[0-9a-f]{40}", args.master_sha):
         parser.error("--master-sha requires a full Git SHA")
+    expected_push_url = f"git@github.com:{args.repository}.git"
+    if args.push_url != expected_push_url:
+        parser.error("--push-url must be the exact repository SSH URL")
     args.output = args.output.resolve()
     if args.output.exists():
         raise ValueError("high-water output already exists; preserve evidence and choose a new path")
     args.output.mkdir(parents=True)
-    receipt = publish(args.repository, args.master_sha, args.output)
+    receipt = publish(args.repository, args.master_sha, args.output, args.push_url)
     write_json(args.output / "high-water-publication.json", receipt)
     print(f"[pr-high-water] develop={receipt['develop_sha']} reused={receipt['reused']}", flush=True)
     return 0

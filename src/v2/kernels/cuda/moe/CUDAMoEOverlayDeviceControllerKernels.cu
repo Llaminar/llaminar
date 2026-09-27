@@ -8,6 +8,7 @@
  */
 
 #include "CUDAMoEOverlayDeviceControllerKernels.h"
+#include "execution/moe/MoEOverlayDeviceControllerDispatch.h"
 
 #include <cuda_runtime.h>
 
@@ -48,12 +49,15 @@ extern "C" bool cudaMoEOverlayRunDeviceControllerAction(
     {
         return false;
     }
-    llaminar2::moe_overlay_controller_device::controllerActionKernel
-        <<<1u,
-           llaminar2::moe_overlay_controller_device::kControllerThreads,
-           0u,
-           reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
-    return cudaGetLastError() == cudaSuccess;
+    return llaminar2::dispatchMoEOverlayControllerAction(
+        launch->action, [&]<llaminar2::MoEOverlayDeviceControllerAction Action>()
+        {
+            llaminar2::moe_overlay_controller_device::controllerActionKernel<Action>
+                <<<1u,
+                   llaminar2::moe_overlay_controller_device::kControllerThreads,
+                   0u, reinterpret_cast<cudaStream_t>(stream)>>>(*launch);
+            return cudaGetLastError() == cudaSuccess;
+        });
 }
 
 extern "C" bool cudaMoEOverlayBeginServiceTelemetry(

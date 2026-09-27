@@ -6,6 +6,8 @@
  * shared GPU visibility. Only root opens the tiny source fixture; the loaded
  * reader retires before preparation. Functional assertions prove complete CPU,
  * CUDA and ROCm evidence and collective rejection, not a performance threshold.
+ * Source-free services also run separately across all discovered endpoints so
+ * driver diagnostics can distinguish bandwidth setup from arithmetic setup.
  */
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "planning/PlanningWeightServiceModel.h"
@@ -236,6 +238,57 @@ namespace
         }
         else EXPECT_EQ(prices, 0u);
         EXPECT_TRUE(result.applied.execution_rank_selection);
+    }
+
+    /**
+     * @brief Exercise one source-free service with every discovered CPU/GPU reporter.
+     * @param backend GPU family to include alongside the owned CPU workshares.
+     * @param plan The exact streaming or arithmetic service under investigation.
+     *
+     * Single-device tests do not cover several native GPU contexts in the same
+     * process. Keep these phases independently selectable for driver-log guards
+     * without changing the production collector's placement or sampling order.
+     */
+    template<class Plan>
+    void proveSourceFreeCollection(DeviceType backend, Plan plan)
+    {
+        static_assert(std::is_same_v<Plan, PlanningStreamingServicePlan> ||
+                      std::is_same_v<Plan, PlanningFP32ArithmeticPlan>);
+        const auto mpi = MPIContextFactory::global();
+        const auto inventory = mpi->clusterInventory();
+        ASSERT_GE(mpi->world_size(), 2);
+        const AutomaticOrchestrationRequest selection({.only_backends =
+            std::vector{DeviceType::CPU, backend}});
+        const auto expected = PlanningKernelServiceCatalog::observers(*inventory, selection);
+        const auto catalog = PlanningKernelServiceCatalog::collect(mpi, *inventory, selection, plan);
+        acceptPlanningCostPreparation(mpi, [&] {
+            ASSERT_EQ(catalog.has_value(), mpi->is_root());
+            if (!catalog) return;
+            ASSERT_EQ(catalog->records().size(), expected.size());
+            for (size_t index = 0; index < expected.size(); ++index)
+            {
+                const auto &record = catalog->records()[index];
+                EXPECT_EQ(record.observer, expected[index]);
+                if constexpr (std::is_same_v<Plan, PlanningStreamingServicePlan>)
+                {
+                    const auto &value = std::get<PlanningMemoryBandwidthObservation>(record.observation);
+                    EXPECT_EQ(value.request.device(), record.observer.device());
+                    EXPECT_EQ(value.graph_nodes != 0u, record.observer.device().is_gpu());
+                    EXPECT_GT(value.service.unitsPerSecond(), 0);
+                }
+                else
+                {
+                    const auto &value = std::get<PlanningFP32ArithmeticObservations>(record.observation);
+                    EXPECT_EQ(value.device, record.observer.device());
+                    ASSERT_EQ(value.phases.size(), 2u);
+                    for (const auto &phase : value.phases)
+                    {
+                        EXPECT_EQ(phase.graph_nodes != 0u, value.device.is_gpu());
+                        EXPECT_GT(phase.service.unitsPerSecond(), 0);
+                    }
+                }
+            }
+        });
     }
 
     /** @brief Join real FP32/streaming observations without another sample or model warmup. */
@@ -531,9 +584,13 @@ TEST(PlanningKernelServiceCatalogMPI, CPU_StreamingWorkerFailureIsCollective)
 }
 #ifdef HAVE_CUDA
 TEST(PlanningKernelServiceCatalogMPI, CUDA_StreamingCollection) { proveStreamingCollection(DeviceType::CUDA); }
+TEST(PlanningKernelServiceCatalogMPI, CUDA_SourceFreeStreaming) { proveSourceFreeCollection(DeviceType::CUDA, PlanningStreamingServicePlan{}); }
+TEST(PlanningKernelServiceCatalogMPI, CUDA_SourceFreeArithmetic) { proveSourceFreeCollection(DeviceType::CUDA, PlanningFP32ArithmeticPlan{}); }
 #endif
 #ifdef HAVE_ROCM
 TEST(PlanningKernelServiceCatalogMPI, ROCm_StreamingCollection) { proveStreamingCollection(DeviceType::ROCm); }
+TEST(PlanningKernelServiceCatalogMPI, ROCm_SourceFreeStreaming) { proveSourceFreeCollection(DeviceType::ROCm, PlanningStreamingServicePlan{}); }
+TEST(PlanningKernelServiceCatalogMPI, ROCm_SourceFreeArithmetic) { proveSourceFreeCollection(DeviceType::ROCm, PlanningFP32ArithmeticPlan{}); }
 #endif
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)

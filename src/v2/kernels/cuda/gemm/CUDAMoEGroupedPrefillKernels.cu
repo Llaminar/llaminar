@@ -1519,71 +1519,99 @@ namespace
                     reinterpret_cast<const int *>(shared_up_b),
                     lane);
 
-                int32_t gate_dot_lo[4] = {0, 0, 0, 0};
-                int32_t gate_dot_hi[4] = {0, 0, 0, 0};
-                int32_t up_dot_lo[4] = {0, 0, 0, 0};
-                int32_t up_dot_hi[4] = {0, 0, 0, 0};
-                if constexpr (llaminar2::cuda_native_vnni::
-                                  CodebookTraits<CodebookId>::is_dual_scale)
+                if constexpr (kStageIQ2SMetadata)
                 {
-                    const uint32_t gate_b_lo[2] = {
-                        gate_b_fragment[0], 0u};
-                    const uint32_t gate_b_hi[2] = {
-                        0u, gate_b_fragment[1]};
-                    const uint32_t up_b_lo[2] = {
-                        up_b_fragment[0], 0u};
-                    const uint32_t up_b_hi[2] = {
-                        0u, up_b_fragment[1]};
+                    // Staged metadata has a smaller shared-only contribution
+                    // path. Keep the independent low-half MMAs overlapped and
+                    // retire each high half before evaluating the next one.
+                    int32_t gate_dot_lo[4] = {0, 0, 0, 0};
+                    int32_t up_dot_lo[4] = {0, 0, 0, 0};
+                    const uint32_t gate_b_lo[2] = {gate_b_fragment[0], 0u};
+                    const uint32_t up_b_lo[2] = {up_b_fragment[0], 0u};
                     mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_lo);
-                    mmaM16N8K32(gate_dot_hi, a_fragment, gate_b_hi);
                     mmaM16N8K32(up_dot_lo, a_fragment, up_b_lo);
-                    mmaM16N8K32(up_dot_hi, a_fragment, up_b_hi);
+
+#pragma unroll
+                    for (int projection = 0; projection < 2; ++projection)
+                    {
+                        const uint32_t *shared_scale_pairs = projection == 0
+                            ? shared_gate_scale_pairs : shared_up_scale_pairs;
+                        float *partial =
+                            projection == 0 ? gate_partial : up_partial;
+                        const int32_t *dot_lo =
+                            projection == 0 ? gate_dot_lo : up_dot_lo;
+                        int32_t dot_hi[4] = {0, 0, 0, 0};
+                        const uint32_t b_hi[2] = {
+                            0u, projection == 0
+                                ? gate_b_fragment[1] : up_b_fragment[1]};
+                        mmaM16N8K32(dot_hi, a_fragment, b_hi);
+
+#pragma unroll
+                        for (int element = 0; element < 4; ++element)
+                        {
+                            // Producers zero-pad row and column metadata, so the
+                            // complete shared-only fragment is valid. Keep bounds
+                            // checks at final output publication, not across MMA.
+                            const int local_row = mmaFragmentRow(lane, element);
+                            const int scale_index =
+                                warp * kColumnsPerWarp +
+                                mmaFragmentColumn(lane, element);
+                            partial[element] = __fadd_rn(
+                                partial[element],
+                                contributionFromStagedDualScaleMma<CodebookId>(
+                                    dot_lo[element],
+                                    dot_hi[element],
+                                    shared_activation_scales[local_row],
+                                    shared_scale_pairs[scale_index]));
+                        }
+                    }
                 }
                 else
                 {
-                    mmaM16N8K32(
-                        gate_dot_lo,
-                        a_fragment,
-                        gate_b_fragment);
-                    mmaM16N8K32(
-                        up_dot_lo,
-                        a_fragment,
-                        up_b_fragment);
-                }
-
-#pragma unroll
-                for (int element = 0; element < 4; ++element)
-                {
-                    const int local_row = mmaFragmentRow(lane, element);
-                    const int column =
-                        column_base + mmaFragmentColumn(lane, element);
-                    if (local_row >= active_rows || column >= N)
-                        continue;
-
-                    if constexpr (kStageIQ2SMetadata)
+                    // Direct metadata loads reuse activation scales between
+                    // gate and up, so retain their element-interleaved fold.
+                    int32_t gate_dot_lo[4] = {0, 0, 0, 0};
+                    int32_t gate_dot_hi[4] = {0, 0, 0, 0};
+                    int32_t up_dot_lo[4] = {0, 0, 0, 0};
+                    int32_t up_dot_hi[4] = {0, 0, 0, 0};
+                    if constexpr (llaminar2::cuda_native_vnni::
+                                      CodebookTraits<CodebookId>::is_dual_scale)
                     {
-                        const int scale_index =
-                            warp * kColumnsPerWarp +
-                            mmaFragmentColumn(lane, element);
-                        const float activation_scale =
-                            shared_activation_scales[local_row];
-                        gate_partial[element] = __fadd_rn(
-                            gate_partial[element],
-                            contributionFromStagedDualScaleMma<CodebookId>(
-                                gate_dot_lo[element],
-                                gate_dot_hi[element],
-                                activation_scale,
-                                shared_gate_scale_pairs[scale_index]));
-                        up_partial[element] = __fadd_rn(
-                            up_partial[element],
-                            contributionFromStagedDualScaleMma<CodebookId>(
-                                up_dot_lo[element],
-                                up_dot_hi[element],
-                                activation_scale,
-                                shared_up_scale_pairs[scale_index]));
+                        const uint32_t gate_b_lo[2] = {
+                            gate_b_fragment[0], 0u};
+                        const uint32_t gate_b_hi[2] = {
+                            0u, gate_b_fragment[1]};
+                        const uint32_t up_b_lo[2] = {
+                            up_b_fragment[0], 0u};
+                        const uint32_t up_b_hi[2] = {
+                            0u, up_b_fragment[1]};
+                        mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_lo);
+                        mmaM16N8K32(gate_dot_hi, a_fragment, gate_b_hi);
+                        mmaM16N8K32(up_dot_lo, a_fragment, up_b_lo);
+                        mmaM16N8K32(up_dot_hi, a_fragment, up_b_hi);
                     }
                     else
                     {
+                        mmaM16N8K32(
+                            gate_dot_lo,
+                            a_fragment,
+                            gate_b_fragment);
+                        mmaM16N8K32(
+                            up_dot_lo,
+                            a_fragment,
+                            up_b_fragment);
+                    }
+
+#pragma unroll
+                    for (int element = 0; element < 4; ++element)
+                    {
+                        const int local_row = mmaFragmentRow(lane, element);
+                        const int column =
+                            column_base + mmaFragmentColumn(lane, element);
+                        // Non-staged metadata is read directly from weights
+                        // and activations, so its loads require valid indices.
+                        if (local_row >= active_rows || column >= N)
+                            continue;
                         const int grouped_row = grouped_row_base + local_row;
                         const size_t linear =
                             static_cast<size_t>(block) * N + column;

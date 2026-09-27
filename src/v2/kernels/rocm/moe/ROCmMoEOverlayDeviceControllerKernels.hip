@@ -8,6 +8,7 @@
  */
 
 #include "ROCmMoEOverlayDeviceControllerKernels.h"
+#include "execution/moe/MoEOverlayDeviceControllerDispatch.h"
 
 #include <hip/hip_runtime.h>
 
@@ -63,14 +64,16 @@ extern "C" bool hipMoEOverlayRunDeviceControllerAction(
     {
         return false;
     }
-    hipLaunchKernelGGL(
-        llaminar2::moe_overlay_controller_device::controllerActionKernel,
-        dim3(1u),
-        dim3(llaminar2::moe_overlay_controller_device::kControllerThreads),
-        0u,
-        reinterpret_cast<hipStream_t>(stream),
-        *launch);
-    return hipGetLastError() == hipSuccess;
+    return llaminar2::dispatchMoEOverlayControllerAction(
+        launch->action, [&]<llaminar2::MoEOverlayDeviceControllerAction Action>()
+        {
+            hipLaunchKernelGGL(
+                llaminar2::moe_overlay_controller_device::controllerActionKernel<Action>,
+                dim3(1u),
+                dim3(llaminar2::moe_overlay_controller_device::kControllerThreads),
+                0u, reinterpret_cast<hipStream_t>(stream), *launch);
+            return hipGetLastError() == hipSuccess;
+        });
 }
 
 extern "C" bool hipMoEOverlayBeginServiceTelemetry(

@@ -344,15 +344,40 @@ namespace
                 "auxiliary_max_active_blocks_per_sm,spill_free,staging_schedule\n");
         }
 
+        // These identities were already rejected by production admission.
+        // Compile-time spill enforcement now removes their unreachable kernel
+        // instantiations too: the query must reject them, not certify a known
+        // spilling symbol. Keep this independent inventory to catch accidental
+        // loss of an otherwise supported candidate.
+        std::set<std::tuple<int, int, int, int, int>> expected_rejected;
+        for (int codebook : {8, 9, 13, 14})
+            for (int tile_id : {1, 4})
+                expected_rejected.emplace(codebook, tile_id, 0, 0, 0);
+        for (int codebook : {10, 17})
+            for (int tile_id : {1, 4, 5})
+                for (int canonical_kpart : {0, 1})
+                    expected_rejected.emplace(codebook, tile_id, canonical_kpart, 0, 0);
+        for (int codebook : {5, 7})
+            for (int staging : {2, 3})
+                expected_rejected.emplace(codebook, 2, 0, 0, staging);
+
         size_t queried = 0;
         size_t spilling = 0;
-        std::set<std::tuple<int, int, int, int, int>> observed_spilling;
+        std::set<std::tuple<int, int, int, int, int>> observed_rejected;
         const auto inspect = [&](uint8_t codebook,
                                  int tile_id,
                                  int canonical_kpart,
                                  int ordered_bk256,
                                  PrefillStagingSchedule staging = PrefillStagingSchedule::RegisterDecode)
         {
+            SCOPED_TRACE(::testing::Message()
+                         << "codebook=" << static_cast<int>(codebook)
+                         << " tile=" << tile_id << " canonical=" << canonical_kpart
+                         << " ordered_bk256=" << ordered_bk256
+                         << " staging=" << static_cast<int>(staging));
+            const auto identity = std::make_tuple(
+                static_cast<int>(codebook), tile_id, canonical_kpart,
+                ordered_bk256, static_cast<int>(staging));
             CUDADensePrefillKernelResources primary{};
             CUDADensePrefillKernelResources auxiliary{};
             const bool implemented = cudaNativeVNNIPrefill_queryCandidateResources(
@@ -366,9 +391,13 @@ namespace
                 staging);
             // Inventory every request, including unsupported physical schedules.
             // A missing specialization must not silently become RegisterDecode.
-            const bool expected_implemented =
+            const bool structurally_supported =
                 staging == PrefillStagingSchedule::RegisterDecode ||
                 (staged_codebooks.contains(codebook) && tile_id >= 0 && tile_id != 1);
+            const bool expected_implemented =
+                structurally_supported && !expected_rejected.contains(identity);
+            if (structurally_supported && !implemented)
+                observed_rejected.insert(identity);
             ASSERT_EQ(implemented, expected_implemented);
             if (!implemented)
                 return;
@@ -402,15 +431,7 @@ namespace
                 auxiliary.local_memory_bytes_per_thread == 0;
             ++queried;
             spilling += spill_free ? 0 : 1;
-            if (!spill_free)
-            {
-                observed_spilling.emplace(
-                    static_cast<int>(codebook),
-                    tile_id,
-                    canonical_kpart,
-                    ordered_bk256,
-                    static_cast<int>(staging));
-            }
+            EXPECT_TRUE(spill_free) << "Every compiled candidate must be spill-free";
             if (csv)
             {
                 std::fprintf(
@@ -472,25 +493,10 @@ namespace
             spilling,
             queried - spilling);
         EXPECT_EQ(queried, codebooks.size() * 6u * 2u +
-                           staged_codebooks.size() * 5u * 2u * 3u + 4u);
-        std::set<std::tuple<int, int, int, int, int>> expected_spilling;
-        for (int codebook : {8, 9, 13, 14})
-        {
-            for (int tile_id : {1, 4})
-                expected_spilling.emplace(codebook, tile_id, 0, 0, 0);
-        }
-        for (int codebook : {10, 17})
-        {
-            for (int tile_id : {1, 4, 5})
-            {
-                expected_spilling.emplace(codebook, tile_id, 0, 0, 0);
-                expected_spilling.emplace(codebook, tile_id, 1, 0, 0);
-            }
-        }
-        for (int codebook : {5, 7})
-            for (int staging : {2, 3})
-                expected_spilling.emplace(codebook, 2, 0, 0, staging);
-        EXPECT_EQ(observed_spilling, expected_spilling)
+                           staged_codebooks.size() * 5u * 2u * 3u + 4u -
+                           expected_rejected.size());
+        EXPECT_EQ(spilling, 0u);
+        EXPECT_EQ(observed_rejected, expected_rejected)
             << "Compiler resource drift changed the launchable candidate set";
     }
 

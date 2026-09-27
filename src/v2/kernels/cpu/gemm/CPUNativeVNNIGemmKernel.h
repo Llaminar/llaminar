@@ -1019,6 +1019,8 @@ namespace llaminar2::cpu::native_vnni
              * generated authority.
              */
             VerifierRowsPolicy verifier_schedule = VerifierRowsPolicy::Auto;
+            /** Distinguish prompt work from equally large speculative batches. */
+            ProjectionRowsPurpose purpose = ProjectionRowsPurpose::Decode;
         };
 
         /** Maximum gate/up descriptors for one 256-expert MoE layer. */
@@ -1027,8 +1029,10 @@ namespace llaminar2::cpu::native_vnni
         /**
          * @brief Execute unequal-M pre-quantized projections in one CPU team.
          *
-         * Every descriptor independently resolves the sealed M=1/grouped
-         * decode policy for its codebook, geometry, ISA, and row count. The
+         * Every descriptor independently resolves its typed scheduling purpose:
+         * sealed M=1/grouped decode policy, or the ordinary compact-prefill
+         * policy, for its codebook, geometry, ISA, and row count. Both retain
+         * the same serial-decode arithmetic tree. The
          * underlying launcher shares one persistent OpenMP team across the
          * entire descriptor set, eliminating per-expert team reconstruction.
          * No descriptor is replayed row by row and no alternate arithmetic
@@ -1092,6 +1096,7 @@ namespace llaminar2::cpu::native_vnni
                     .verifier_schedule = source.rows > 1
                         ? source.verifier_schedule
                         : VerifierRowsPolicy::Auto,
+                    .purpose = source.purpose,
                 };
                 total_rows += source.rows;
                 max_rows = std::max(max_rows, source.rows);
@@ -1118,7 +1123,9 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            if (team_observer)
+            // Guard before constructing strings/maps: addCounter's own guard
+            // cannot prevent allocations while evaluating its arguments.
+            if (perf_enabled)
             {
                 recordVerifierTiming(
                     "cpu_native_vnni_batched_preq_decode_equivalent",
@@ -1276,7 +1283,8 @@ namespace llaminar2::cpu::native_vnni
                 return false;
             }
 
-            if (!omp_in_parallel() || omp_get_thread_num() == 0)
+            if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
+                PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
@@ -1430,16 +1438,19 @@ namespace llaminar2::cpu::native_vnni
                 /*n=*/0,
                 k,
                 static_cast<int>(projections.size()));
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls",
-                1.0,
-                "gemm",
-                "cpu",
-                {{"m", std::to_string(m)},
-                 {"k", std::to_string(k)},
-                 {"projections", std::to_string(projections.size())},
-                 {"path", m == 1 ? "decode" : "grouped_rows"}});
+            if (perf_enabled)
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    {{"m", std::to_string(m)},
+                     {"k", std::to_string(k)},
+                     {"projections", std::to_string(projections.size())},
+                     {"path", m == 1 ? "decode" : "grouped_rows"}});
+            }
             return true;
         }
 

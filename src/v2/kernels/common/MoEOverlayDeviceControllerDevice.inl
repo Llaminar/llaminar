@@ -5355,18 +5355,25 @@ namespace llaminar2::moe_overlay_controller_device
     // Both launch bridges use exactly this width. Advertising the default
     // 1024-thread limit needlessly constrains HIP register allocation even
     // though this deterministic controller launches only one 256-thread block.
+    template <MoEOverlayDeviceControllerAction Action>
     static __global__ __launch_bounds__(kControllerThreads) void controllerActionKernel(
-        MoEOverlayDeviceControllerActionLaunch launch)
+        MoEOverlayDeviceControllerActionLaunch incoming)
     {
         if (blockIdx.x != 0u)
             return;
+        // The action is an immutable graph-node property. Validate the ABI
+        // argument before executing its specialized body; never rewrite a
+        // device-authored decision or infer an action from runtime state.
+        auto launch = incoming;
+        launch.action = Action;
         __shared__ std::uint32_t launch_valid;
         __shared__ std::uint32_t runtime_noop;
         __shared__ DynamicPolicyScratch dynamic_policy_scratch;
         if (threadIdx.x == 0u)
         {
             launch_valid =
-                launch.valid() && validIdentity(launch.binding) ? 1u : 0u;
+                incoming.action == Action && launch.valid() &&
+                        validIdentity(launch.binding) ? 1u : 0u;
         }
         __syncthreads();
         if (launch_valid == 0u)

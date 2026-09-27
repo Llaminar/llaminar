@@ -7309,7 +7309,7 @@ namespace
                                                                              bool chained_mtp_support = false,
                                                                              bool sidecar_sample_fusion = false,
                                                                              MTPDepthPolicyConfig depth_policy = {},
-                                                                             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy,
+                                                                             std::optional<MTPVerifyMode> verify_mode = MTPVerifyMode::Greedy,
                                                                              bool local_pp_topology = false,
                                                                              int max_request_batch = 1)
         {
@@ -7349,7 +7349,8 @@ namespace
             config.mtp.enabled = mtp_enabled;
             config.mtp.draft_tokens = mtp_draft_tokens;
             config.mtp.max_request_batch = max_request_batch;
-            config.mtp.verify_mode = verify_mode;
+            if (verify_mode)
+                config.mtp.verify_mode = *verify_mode;
             config.mtp.depth_policy = depth_policy;
 
             /*
@@ -15538,7 +15539,7 @@ namespace
         EXPECT_EQ(restored.cached_tokens, static_cast<int>(prompt.size()));
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPBypassForNonGreedySamplingIsRecordedOncePerRequest)
+    TEST_F(Test__PrefillDecodeTransition, ExplicitGreedyMTPRejectsNonGreedySamplingWithoutBypass)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
 
@@ -15550,20 +15551,96 @@ namespace
         ASSERT_TRUE(runner->prefill(prompt));
 
         GenerationResult step1 = runner->decodeStep();
-        ASSERT_TRUE(step1.success());
+        ASSERT_FALSE(step1.success());
+        EXPECT_THAT(step1.error, HasSubstr("MTP greedy verification requires greedy sampling"));
         EXPECT_EQ(mock->forwardMTPCount(), 0);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_TRUE(probe.mtp_config_enabled);
-        EXPECT_TRUE(probe.mtp_bypassed);
-        EXPECT_NE(probe.mtp_bypass_reason.find("sampling is not greedy"), std::string::npos);
-        EXPECT_EQ(probe.mtp_bypasses, 1u);
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_TRUE(probe.mtp_bypass_reason.empty());
+        EXPECT_EQ(probe.mtp_bypasses, 0u);
         EXPECT_EQ(probe.mtp_draft_steps, 0u);
 
-        GenerationResult step2 = runner->decodeStep();
-        ASSERT_TRUE(step2.success());
-        EXPECT_EQ(mock->forwardMTPCount(), 0);
-        EXPECT_EQ(runner->prefixStateProbe().mtp_bypasses, 1u);
+    }
+
+    /** @test Default verification keeps non-greedy MTP active on every owner. */
+    TEST_F(Test__PrefillDecodeTransition, DefaultMTPKeepsNonGreedyRequestsSpeculative)
+    {
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        {
+            SCOPED_TRACE(device.toString());
+            auto [runner, mock] = createRunner(
+                true, true, {}, nullptr, false, false, device, 1, false,
+                false, {}, std::nullopt);
+            if (device.is_gpu())
+            {
+                mock->enableStochasticDeviceSampling();
+                mock->enableGroupedOutcomeDeviceResidentPublication(4);
+                mock->enableMTPDeviceDraftTokenInput();
+                mock->enableDeviceResidentGeneration(DeviceGenerationTerminalRequestResult{
+                    .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                               MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                    .remaining_token_count = 0,
+                    .model_stopped = false,
+                    .transaction_count = 1,
+                    .accepted_speculative_token_count = 1,
+                    .rejected_transaction_count = 0,
+                    .consumed_verifier_row_count = 1,
+                    .published_state_commit_count = 2,
+                    .attempted_draft_token_count = 1,
+                    .verifier_token_count = 2,
+                    .final_draft_depth = 1,
+                });
+            }
+            SamplingParams sampling;
+            sampling.temperature = 0.8f;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            sampling.seed = 123;
+            runner->setSamplingParams(sampling);
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const auto result = decodeWithBudget(runner, 2);
+            ASSERT_TRUE(result.success()) << result.error;
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_FALSE(probe.mtp_bypassed);
+            EXPECT_EQ(probe.mtp_bypasses, 0u);
+            EXPECT_GT(probe.mtp_draft_steps, 0u);
+            EXPECT_GT(probe.mtp_verifier_runs, 0u);
+            EXPECT_GT(probe.mtp_stochastic_accept_tests, 0u);
+            EXPECT_TRUE(probe.mtp_request.stochastic_verify);
+            EXPECT_EQ(runner->mtpRequestPolicy().verify_mode, MTPVerifyMode::SpeculativeSampling);
+            if (device.is_gpu())
+                EXPECT_EQ(mock->lastDeviceGenerationSamplingMode(), DeviceGenerationSamplingMode::Stochastic);
+        }
+    }
+
+    /** @test A retained service must resolve each request's depth specialization anew. */
+    TEST_F(Test__PrefillDecodeTransition, DefaultMTPAlternatesSamplingWithoutStaleDepthPolicy)
+    {
+        MTPDepthPolicyConfig depth;
+        depth.mode = MTPDepthPolicyMode::Dynamic;
+        depth.max_depth = 3;
+        depth.use_generated_policy = false;
+        auto [runner, mock] = createRunner(
+            true, true, {}, nullptr, false, false, DeviceId::cpu(), 1, true,
+            false, depth, std::nullopt);
+        for (const float temperature : {0.0f, 0.7f, 0.0f, 0.7f})
+        {
+            SCOPED_TRACE(temperature);
+            runner->clearCache();
+            SamplingParams sampling;
+            sampling.temperature = temperature;
+            sampling.top_k = 2;
+            sampling.top_p = 0.95f;
+            runner->setSamplingParams(sampling);
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_current_depth, temperature == 0.0f ? 2 : 1);
+            EXPECT_EQ(probe.mtp_request.stochastic_verify, temperature != 0.0f);
+            EXPECT_EQ(runner->mtpRequestPolicy().verify_mode, MTPVerifyMode::SpeculativeSampling);
+            EXPECT_FALSE(probe.mtp_bypassed);
+        }
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesHostVerifierForCPU)

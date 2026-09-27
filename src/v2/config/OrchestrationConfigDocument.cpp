@@ -64,7 +64,7 @@ namespace
     ENUM(MTPDepthPolicyModelClass, VALUE(Any), VALUE(Dense), VALUE(MoE))
     ENUM(MTPDepthDefaultsProfile, VALUE(Portable), VALUE(CUDARTX3090), VALUE(ROCmMI50))
     ENUM(MTPSidecarDensePolicy, VALUE(TensorParallel), VALUE(ReplicatedPerParticipant))
-    ENUM(MTPTerminalHeadPolicy, VALUE(VocabularySharded), VALUE(MirroredFullVocabulary))
+    ENUM(MTPTerminalHeadPolicy, VALUE(VocabularySharded), VALUE(MirroredFullVocabulary), VALUE(Automatic))
     ENUM(RoutedExpertPlacementTopology, VALUE(SingleDomain), VALUE(TieredOverlay))
     ENUM(RoutedExpertResidencyPolicy, VALUE(Disabled), VALUE(StaticById), VALUE(HistogramTieredCache), VALUE(ExplicitMasks), VALUE(RoutedTierRebalanced))
     ENUM(MoEOverlayAuthorityExecutionKind, VALUE(Unresolved), VALUE(HostResident), VALUE(DeviceResident))

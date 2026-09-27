@@ -40,6 +40,7 @@ jobs:
     concurrency:
       group: llaminar-develop-image-gate
       cancel-in-progress: false
+      queue: max
     steps:
       - uses: docker/login-action@v4
         with:
@@ -139,13 +140,39 @@ jobs:
       - name: Commit upward-only benchmark marks and numbers after merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEVELOP_DEPLOY_KEY }}
           MASTER_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event.pull_request.merge_commit_sha }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$RELEASE_DEPLOY_KEY" || {
+            echo '::error::release evidence deploy key is not configured'
+            exit 1
+          }
+          release_key_dir="$(mktemp -d "$RUNNER_TEMP/llaminar-release-key.XXXXXX")"
+          cleanup_release_key() {
+            if test -f "$release_key_dir/key"; then
+              shred -u -- "$release_key_dir/key"
+            fi
+            if test -f "$release_key_dir/known_hosts"; then
+              shred -u -- "$release_key_dir/known_hosts"
+            fi
+            rmdir -- "$release_key_dir"
+          }
+          trap cleanup_release_key EXIT
+          printf '%s\n' "$RELEASE_DEPLOY_KEY" > "$release_key_dir/key"
+          chmod 600 "$release_key_dir/key"
+          gh api meta --jq '.ssh_keys[]' | awk '{print "github.com " $0}' \
+            > "$release_key_dir/known_hosts"
+          test -s "$release_key_dir/known_hosts" || {
+            echo '::error::GitHub SSH host keys are unavailable'
+            exit 1
+          }
+          export GIT_SSH_COMMAND="ssh -i $release_key_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$release_key_dir/known_hosts -o StrictHostKeyChecking=yes"
           python3 scripts/ci/publish_pr_high_water.py \
             --repository "$REPOSITORY" --master-sha "$MASTER_SHA" \
+            --push-url "git@github.com:${REPOSITORY}.git" \
             --output "$RUNNER_TEMP/llaminar-pr-high-water-$GITHUB_RUN_ID"
       - name: Retain high-water publication receipt
         if: always()

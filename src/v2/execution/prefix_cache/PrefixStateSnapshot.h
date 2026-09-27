@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -50,6 +51,19 @@ namespace llaminar2
     {
         ArchiveLiveState,
         ReuseAdmittedArchive,
+    };
+
+    /**
+     * @brief Archive boundaries required by the participant's live state.
+     *
+     * Attention blocks can reconstruct earlier boundaries independently.
+     * Recurrent state cannot be rewound from a later image, so it also needs
+     * a checkpoint before the mutable final prompt block.
+     */
+    enum class PrefixCheckpointPolicy
+    {
+        TerminalOnly,
+        ReusableBoundary,
     };
 
     /**
@@ -104,6 +118,7 @@ namespace llaminar2
         int block_size = 0;
         uint64_t fingerprint_key = 0;
         PrefixPlacementEpochSpan placement_epochs;
+        PrefixCheckpointPolicy checkpoint_policy = PrefixCheckpointPolicy::TerminalOnly;
         bool requires_terminal_hidden = true;
         bool requires_terminal_logits = true;
         bool has_terminal_hidden = false;
@@ -131,6 +146,36 @@ namespace llaminar2
             const PrefixCacheKey &terminal_key,
             int prompt_token_count) const;
 
+        /**
+         * @brief Select one reusable recurrent checkpoint before the prompt tail.
+         *
+         * A chat template may replace the final generation marker on the next
+         * turn. Save state at the preceding complete cache block while it is
+         * live; a later recurrent image cannot reconstruct that state. The
+         * boundary also respects an optional routed-prefill assignment window.
+         * Exact hits, attention-only participants, and already restored
+         * boundaries need no additional archive.
+         *
+         * @param prompt_token_count Complete incoming prompt length.
+         * @param restored_tokens Actual boundary restored after coordination.
+         * @param stable_segment_tokens Optional immutable routing-window width.
+         * @return A boundary strictly between restored state and the prompt end.
+         */
+        std::optional<int> reusablePrefillCheckpoint(
+            int prompt_token_count,
+            int restored_tokens,
+            int stable_segment_tokens = 0) const;
+
+        /**
+         * @brief Retain only payloads that can restore a boundary at or before a limit.
+         *
+         * Recurrent blocks without a state image cannot become terminal. When
+         * an earlier checkpoint is selected, its own hidden/logit availability
+         * describes the result; later terminal state cannot authenticate it.
+         *
+         * @param token_count Inclusive logical token-count limit from coordination.
+         * @return Owned lookup with complete restorable blocks and terminal metadata.
+         */
         PrefixLookupResult clampedTo(int token_count) const;
     };
 

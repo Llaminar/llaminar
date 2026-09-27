@@ -68,11 +68,12 @@ namespace
         }
 
     private:
-        static constexpr std::array<const char *, 4> names_ = {
+        static constexpr std::array<const char *, 5> names_ = {
             "LLAMINAR_FORCE_CPU_ONLY_STARTUP",
             "LLAMINAR_SKIP_CUDA_STARTUP",
             "LLAMINAR_SKIP_ROCM_STARTUP",
             "HSA_USERPTR_FOR_PAGED_MEM",
+            "HSA_USE_SVM",
         };
         std::array<std::optional<std::string>, names_.size()> saved_{};
     };
@@ -135,10 +136,13 @@ TEST(Test__BackendStartupConfig, VendorHostBackingRequestPreservesExactStartupIn
 {
     ScopedBackendStartupEnvironment environment;
     EXPECT_FALSE(debugEnv().backend_startup.rocm_userptr_for_paged_mem.has_value());
+    EXPECT_FALSE(debugEnv().backend_startup.rocm_use_svm.has_value());
     for (const char *value : {"0", "1", "", "00"})
     {
         environment.set("HSA_USERPTR_FOR_PAGED_MEM", value);
         EXPECT_EQ(debugEnv().backend_startup.rocm_userptr_for_paged_mem, value);
+        environment.set("HSA_USE_SVM", value);
+        EXPECT_EQ(debugEnv().backend_startup.rocm_use_svm, value);
     }
 }
 

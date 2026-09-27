@@ -23290,7 +23290,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
         ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
         ASSERT_TRUE(prefill_output->ensureOnDevice(device, stream_));
 
-        ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len));
+        ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(llaminar2::DeviceRowRange::fullyActive(seq_len)));
         ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k));
@@ -23348,7 +23348,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatch
         ScopedCudaTestGraph graph(
             stream_,
             "runtime-M shared verifier prefill capture");
-        const bool captured_grouping = cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len);
+        const bool captured_grouping = cuda_kernel_->prepareSharedExpertPrefillGroup(llaminar2::DeviceRowRange::fullyActive(seq_len));
         const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
             hidden.get(), prefill_output.get(), gateup_table, down_table,
             seq_len, d_model, intermediate, num_experts, top_k);
@@ -23501,7 +23501,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierPrefillQwen36AllNativeFormatsRun
             ASSERT_TRUE(hidden->ensureOnDevice(device, stream_));
             ASSERT_TRUE(grouped_output->ensureOnDevice(device, stream_));
 
-            ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len));
+            ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(llaminar2::DeviceRowRange::fullyActive(seq_len)));
             ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
                 hidden.get(),
                 grouped_output.get(),

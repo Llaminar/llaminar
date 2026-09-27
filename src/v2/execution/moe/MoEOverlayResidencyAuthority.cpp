@@ -16,6 +16,8 @@
  * only the exact candidate/cohort economy gate can authorize coupled work.
  * Publication and quiescence are distinct: retired banks and aborted transfers
  * retain their event-poll obligation until advanceBackground returns Idle.
+ * Request admission observes the one-shot economy activation atomically; an
+ * active request never joins the background candidate-scoring mutex.
  */
 
 #include "MoEOverlayResidencyAuthority.h"
@@ -23,6 +25,7 @@
 #include "MoEOverlayEconomyCalibrationPlanner.h"
 #include "MoEOverlayDistributedResidencyProtocol.h"
 #include "MoEOverlayTransactionCost.h"
+#include "MoEOverlayPreparedTransactionCost.h"
 
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
@@ -644,6 +647,50 @@ namespace llaminar2
             };
 
             /**
+             * @brief One fixed-layout candidate search retaining invocation boundaries.
+             *
+             * Owning each transaction's derived inputs prevents a later accepted
+             * swap or calibration publication from changing a search in progress.
+             * The next search is constructed from the newly accepted owner map.
+             */
+            class SwapSearch
+            {
+            public:
+                /**
+                 * @brief Price a two-expert exchange in every observed phase.
+                 * @param first First logical expert ID in the complete model.
+                 * @param second Second logical expert ID in the complete model.
+                 * @return Exact sums of independent transaction critical paths.
+                 */
+                Score scoreSwap(std::uint32_t first, std::uint32_t second) const
+                {
+                    Score result;
+                    for (std::size_t phase = 0; phase < transactions_.size(); ++phase)
+                        for (const auto &transaction : transactions_[phase])
+                        {
+                            requireComplete(moe_overlay_economy::appendTransaction(
+                                result.by_phase[phase], moe_overlay_economy::repeatPreparedTransaction(
+                                    transaction.cost.scoreSwap(first, second), transaction.occurrences)));
+                            checkedAddWide(&result.minimum_before_by_phase[phase],
+                                checkedMultiplyWide(transaction.cost.minimumBefore(), transaction.occurrences,
+                                                    "swap source imbalance floor"),
+                                "swap source imbalance floor");
+                        }
+                    return result;
+                }
+
+            private:
+                friend class ObservedTransactionServiceObjective;
+                /** @brief Equal phase-local transactions retain exact multiplicity. */
+                struct Transaction
+                {
+                    moe_overlay_economy::PreparedTransactionSwapSearch cost;
+                    std::uint64_t occurrences;
+                };
+                std::array<std::vector<Transaction>, kExpertHistogramProductionSourceCount> transactions_;
+            };
+
+            /**
              * @brief Borrow one authenticated observation and the certified table.
              * @param observed Real routing sample retained by the proposal.
              * @param topology Reachable and economy-priced phases.
@@ -672,6 +719,48 @@ namespace llaminar2
 
             /** @return Authenticated expert geometry, never inferred from a candidate. */
             int numExperts() const noexcept { return observed_.numExperts(); }
+
+            /** @return Exact observed demand, not smoothed candidate-ranking counts. */
+            std::uint64_t activationCount(int layer, int expert) const
+            {
+                return observed_.activationCount(layer, expert);
+            }
+
+            /**
+             * @brief Prepare exact source work once for all candidate swaps.
+             * @param layer Routed layer whose immutable observations are priced.
+             * @param owners Complete source map for this single search round.
+             * @param selected Participants of the tier being rebalanced.
+             * @return Self-contained search with no live-map or price-table aliases.
+             *
+             * General multi-move admission still uses score(). This narrower
+             * operation is only for the exhaustive two-owner exchange search;
+             * it does not approximate combined movements or pool token batches.
+             */
+            SwapSearch prepareSwapSearch(int layer, std::span<const std::int32_t> owners,
+                                         std::span<const int> selected)
+            {
+                const auto &prepared = prepareLayer(layer);
+                SwapSearch result;
+                for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
+                {
+                    if (prepared.transactions[phase].empty()) continue;
+                    if (!topology_.reachable(layer, phase))
+                        throw std::logic_error("ExpertOverlay swap found demand in an unreachable phase");
+                    if (!topology_.requiresServiceEvidence(layer, phase)) continue;
+                    for (std::size_t participant = 0; participant < prices_.size(); ++participant)
+                        prices_[participant] = rows_[
+                            participant * topology_.layerCount() + static_cast<std::size_t>(layer)]
+                            ->nanoseconds_per_activation[phase];
+                    auto &transactions = result.transactions_[phase];
+                    transactions.reserve(prepared.transactions[phase].size());
+                    for (const auto &[batch, occurrences] : prepared.transactions[phase])
+                        transactions.push_back({
+                            moe_overlay_economy::PreparedTransactionSwapSearch(batch, owners, prices_, selected),
+                            occurrences});
+                }
+                return result;
+            }
 
             /**
              * @brief Price complete before/after maps at the observed invocation boundaries.
@@ -709,8 +798,7 @@ namespace llaminar2
                         throw std::logic_error("ExpertOverlay observed service tier is invalid");
                 }
 
-                const auto &demand = observed_.transactionDemand();
-                const auto batches = demand.layerTransactions(layer);
+                const auto &prepared = prepareLayer(layer);
                 Score result;
                 for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
                 {
@@ -718,10 +806,8 @@ namespace llaminar2
                         prices_[participant] = rows_[
                             participant * topology_.layerCount() + static_cast<std::size_t>(layer)]
                             ->nanoseconds_per_activation[phase];
-                    for (std::size_t batch = 0; batch < batches.size(); ++batch)
+                    for (const auto &[batch, occurrences] : prepared.transactions[phase])
                     {
-                        if (batches[batch].phase != kProductionHistogramSources[phase])
-                            continue;
                         if (!topology_.reachable(layer, phase))
                             throw std::logic_error(
                                 "ExpertOverlay observed service found demand in an unreachable phase");
@@ -729,8 +815,7 @@ namespace llaminar2
                         // without belonging to the declared recurring payoff model.
                         if (!topology_.requiresServiceEvidence(layer, phase))
                             continue;
-                        auto transaction = moe_overlay_economy::scoreTransaction(
-                            demand.routes(layer, batch),
+                        auto transaction = batch.score(
                             {before.data(), after.data(), prices_.data(),
                              static_cast<std::uint32_t>(numExperts()),
                              static_cast<std::uint32_t>(prices_.size())},
@@ -755,9 +840,15 @@ namespace llaminar2
                                 minimum = std::min(minimum, work.before_ns);
                             }
                         }
+                        // Identical invocation histograms have identical costs
+                        // for every candidate. Multiply each already-reduced
+                        // critical path, never pool independent token rows.
                         requireComplete(moe_overlay_economy::appendTransaction(
-                            result.by_phase[phase], transaction));
-                        checkedAddWide(&result.minimum_before_by_phase[phase], minimum,
+                            result.by_phase[phase], moe_overlay_economy::repeatPreparedTransaction(
+                                transaction, occurrences)));
+                        checkedAddWide(&result.minimum_before_by_phase[phase],
+                                       checkedMultiplyWide(minimum, occurrences,
+                                                           "repeated observed imbalance floor"),
                                        "observed transaction imbalance floor");
                     }
                 }
@@ -765,6 +856,49 @@ namespace llaminar2
             }
 
         private:
+            /** @brief Phase-pure equivalent invocations and exact multiplicities. */
+            struct PreparedLayer
+            {
+                int layer;
+                std::array<std::map<moe_overlay_economy::PreparedTransactionCost, std::uint64_t>,
+                           kExpertHistogramProductionSourceCount> transactions;
+            };
+
+            /**
+             * @brief Compact routing once per layer, not once per candidate swap.
+             * @param layer Immutable observation's routed layer index.
+             * @return Equivalent invocation groups retaining every batch's cost.
+             *
+             * Keep only the active layer: a long decode window must not multiply
+             * scratch by the model's layer count. Neither owners nor prices are
+             * cached, because accepted provisional swaps change the former.
+             */
+            const PreparedLayer &prepareLayer(int layer)
+            {
+                if (prepared_layer_ && prepared_layer_->layer == layer)
+                    return *prepared_layer_;
+                const auto &demand = observed_.transactionDemand();
+                const auto batches = demand.layerTransactions(layer);
+                PreparedLayer prepared{.layer = layer, .transactions = {}};
+                for (std::size_t batch = 0; batch < batches.size(); ++batch)
+                {
+                    const auto source = std::find(kProductionHistogramSources.begin(),
+                        kProductionHistogramSources.end(), batches[batch].phase);
+                    if (source == kProductionHistogramSources.end())
+                        throw std::logic_error("ExpertOverlay transaction has an unknown production phase");
+                    auto &groups = prepared.transactions[static_cast<std::size_t>(
+                        source - kProductionHistogramSources.begin())];
+                    auto [entry, inserted] = groups.try_emplace(
+                        moe_overlay_economy::PreparedTransactionCost(
+                            demand.routes(layer, batch), static_cast<std::uint32_t>(numExperts())), 0);
+                    // At most batches.size() observations exist. A size_t
+                    // indexed window cannot overflow this uint64 count.
+                    ++entry->second;
+                }
+                prepared_layer_ = std::move(prepared);
+                return *prepared_layer_;
+            }
+
             /** @brief A partial or saturated cost is never eligible for publication. */
             static void requireComplete(moe_overlay_economy::TransactionCostStatus status)
             {
@@ -782,6 +916,7 @@ namespace llaminar2
             std::span<const MoERoutedParticipantLayerPhaseServiceCost *const> rows_;
             std::vector<std::uint64_t> prices_;
             std::vector<moe_overlay_economy::ServiceCostPair> scratch_;
+            std::optional<PreparedLayer> prepared_layer_;
         };
 
         /**
@@ -850,7 +985,6 @@ namespace llaminar2
             for (int expert = 0; expert < service_objective.numExperts(); ++expert)
                 before_owners[static_cast<std::size_t>(expert)] =
                     complete_ownership.owner(layer_idx, expert);
-            auto after_owners = before_owners;
             const auto baseline = service_objective.score(
                 layer_idx, before_owners, before_owners, tier_participant_ids);
             WideCost before_total = 0;
@@ -870,6 +1004,8 @@ namespace llaminar2
             if (!imbalance_threshold_met || before_total == 0)
                 return choice;
 
+            const auto swap_search = service_objective.prepareSwapSearch(
+                layer_idx, before_owners, tier_participant_ids);
             WideCost best_after_total = ~WideCost{0};
             for (std::size_t first = 0;
                  first < candidate_count;
@@ -902,10 +1038,16 @@ namespace llaminar2
                     // raw-load bookkeeping, but never use them as parallel work.
                     const auto first_expert = static_cast<std::size_t>(tier_expert_ids[first]);
                     const auto second_expert = static_cast<std::size_t>(tier_expert_ids[second]);
-                    std::swap(after_owners.at(first_expert), after_owners.at(second_expert));
-                    const auto measured = service_objective.score(
-                        layer_idx, before_owners, after_owners, tier_participant_ids);
-                    std::swap(after_owners.at(first_expert), after_owners.at(second_expert));
+                    // Swapping two unobserved experts leaves every transaction
+                    // unchanged. Forecast marginals are not this proof: use
+                    // the authenticated current window, independently of any
+                    // historical smoothing used to rank candidates.
+                    if (service_objective.activationCount(layer_idx, static_cast<int>(first_expert)) == 0 &&
+                        service_objective.activationCount(layer_idx, static_cast<int>(second_expert)) == 0)
+                        continue;
+                    const auto measured = swap_search.scoreSwap(
+                        static_cast<std::uint32_t>(first_expert),
+                        static_cast<std::uint32_t>(second_expert));
                     WideCost after_total = 0;
                     bool phase_regressed = false;
                     for (std::size_t phase = 0; phase < kProductionHistogramSources.size(); ++phase)
@@ -2595,6 +2737,25 @@ namespace llaminar2
     MoEOverlayResidencyAuthority::activateOptimizationDemandAtRequestBoundary()
     {
         if (!migrationEnabled())
+            return MoEOverlayDemandActivationResult::NotReady;
+
+        /*
+         * Active is terminal for this authority's lifetime. The release store
+         * which publishes it also publishes the opened histogram bank, so an
+         * acquire read is sufficient for every subsequent request. Taking the
+         * economy lock here would serialize prefill behind the entire swap
+         * search on the maintenance worker, even though nothing needs changing.
+         *
+         * Before certification is published there is likewise no transition to
+         * perform. Only the first boundary observing a complete certificate
+         * takes the lock; recheck below because two callers may reach it.
+         */
+        const auto published =
+            economy_activation_state_.load(std::memory_order_acquire);
+        if (published == EconomyActivationState::Active)
+            return MoEOverlayDemandActivationResult::AlreadyActive;
+        if (published !=
+            EconomyActivationState::CertifiedAwaitingRequestBoundary)
             return MoEOverlayDemandActivationResult::NotReady;
 
         std::lock_guard<std::mutex> lock(economy_mutex_);

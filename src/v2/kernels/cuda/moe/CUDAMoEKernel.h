@@ -578,7 +578,8 @@ namespace llaminar2
             int num_experts) override;
 
         /// @brief Prepare grouped prefill metadata for the always-active shared expert.
-        bool prepareSharedExpertPrefillGroup(int seq_len) override;
+        /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
+        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
 
         /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
         bool bindRouterQ8HiddenPublication(

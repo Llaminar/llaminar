@@ -2211,6 +2211,131 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeBy
 }
 
 /**
+ * @brief Subnormal-head worksharing preserves serial outputs and every snapshot.
+ *
+ * Real Qwen weights can produce a tiny, nonzero decay factor. Keep gradual
+ * underflow enabled and mix such heads with ordinary heads, including a head
+ * that enters underflow only halfway through the request. Sweep SIMD tails,
+ * short verifier and longer prefill lengths, and under/over-filled worker
+ * teams. Independent serial decode is the byte oracle; snapshot padding is a
+ * canary for disjoint column ownership, not part of the recurrent state. The
+ * merged-QKV verifier must also preserve its initial state until acceptance.
+ */
+TEST(Test__GDNKernels, CPUGatedDeltaNetSubnormalHeadsRemainSerialRowByteExact)
+{
+    ScopedPerfStatsEnv perfstats;
+    constexpr int heads = 3;
+    constexpr int dk = 16;
+    constexpr float guard = -54321.0f;
+    for (int dv : {64, 65, 128})
+    for (int rows : {1, 15, 33})
+    for (bool normalize : {false, true})
+    {
+        const int qk_stride = heads * dk;
+        const int v_stride = heads * dv;
+        const int state_size = heads * dk * dv;
+        const int snapshot_stride = state_size + 19;
+        std::vector<float> q(rows * qk_stride), k(q.size()), v(rows * v_stride);
+        std::vector<float> alpha(rows * heads), beta(alpha.size(), 0.17f);
+        const std::array<float, heads> a_log{-133.0f, -133.0f, -0.35f};
+        const std::array<float, heads> dt_bias{};
+        std::vector<float> initial(state_size);
+        for (size_t i = 0; i < q.size(); ++i)
+        {
+            q[i] = 0.0021f * (static_cast<int>(i % 29) - 14);
+            k[i] = -0.0017f * (static_cast<int>(i % 31) - 15);
+        }
+        for (size_t i = 0; i < v.size(); ++i)
+            v[i] = 0.0029f * (static_cast<int>(i % 23) - 11);
+        const int merged_stride = 2 * qk_stride + v_stride + 7;
+        std::vector<float> merged(static_cast<size_t>(rows) * merged_stride, guard);
+        for (int row = 0; row < rows; ++row)
+        {
+            float *destination = merged.data() + row * merged_stride;
+            std::copy_n(q.data() + row * qk_stride, qk_stride, destination);
+            std::copy_n(k.data() + row * qk_stride, qk_stride, destination + qk_stride);
+            std::copy_n(v.data() + row * v_stride, v_stride, destination + 2 * qk_stride);
+        }
+        for (int row = 0; row < rows; ++row)
+        {
+            alpha[row * heads] = 0.0f;
+            alpha[row * heads + 1] = row < rows / 2 ? -6.0f : 0.0f;
+            alpha[row * heads + 2] = -0.17f;
+        }
+        for (int i = 0; i < state_size; ++i)
+            initial[i] = i % 17 == 0 ? std::numeric_limits<float>::denorm_min() * 16
+                                    : 0.0001f * ((i % 43) - 21);
+        ASSERT_EQ(std::fpclassify(std::exp(a_log[0] * std::log1p(std::exp(0.0f)))), FP_SUBNORMAL);
+
+        std::vector<float> serial_state = initial;
+        std::vector<float> serial_output(v.size());
+        std::vector<float> serial_snapshots(rows * snapshot_stride, guard);
+        {
+            llaminar::v2::ThreadCountGuard one_worker(1);
+            CPUGatedDeltaNet oracle;
+            for (int row = 0; row < rows; ++row)
+            {
+                ASSERT_TRUE(oracle.recurrent_step(
+                    q.data() + row * qk_stride, k.data() + row * qk_stride,
+                    v.data() + row * v_stride, alpha.data() + row * heads,
+                    beta.data() + row * heads, a_log.data(), dt_bias.data(),
+                    serial_output.data() + row * v_stride, serial_state.data(),
+                    heads, dk, dv, normalize));
+                std::copy(serial_state.begin(), serial_state.end(),
+                    serial_snapshots.begin() + row * snapshot_stride);
+            }
+        }
+
+        for (int workers : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 28, 31})
+        {
+            SCOPED_TRACE("dv=" + std::to_string(dv) + " M=" + std::to_string(rows) +
+                " workers=" + std::to_string(workers) + " normalize=" + std::to_string(normalize));
+            llaminar::v2::ThreadCountGuard team(workers);
+            CPUGatedDeltaNet kernel;
+            std::vector<float> state = initial;
+            std::vector<float> output(v.size(), guard);
+            ASSERT_TRUE(kernel.chunk_forward(
+                q.data(), k.data(), v.data(), alpha.data(), beta.data(),
+                a_log.data(), dt_bias.data(), output.data(), state.data(),
+                rows, heads, dk, dv, 64, normalize));
+            expectByteExactFP32(output.data(), serial_output.data(), output.size(), "subnormal output");
+            expectByteExactFP32(state.data(), serial_state.data(), state.size(), "subnormal state");
+
+            state = initial;
+            std::fill(output.begin(), output.end(), guard);
+            std::vector<float> snapshots(rows * snapshot_stride, guard);
+            ASSERT_TRUE(kernel.chunkForwardWithStateSnapshots(
+                q.data(), k.data(), v.data(), alpha.data(), beta.data(),
+                a_log.data(), dt_bias.data(), output.data(), state.data(),
+                rows, heads, dk, dv, 64, normalize, snapshots.data(), snapshot_stride, rows));
+            expectByteExactFP32(output.data(), serial_output.data(), output.size(), "subnormal snapshot output");
+            expectByteExactFP32(state.data(), serial_state.data(), state.size(), "subnormal published state");
+            expectByteExactFP32(snapshots.data(), serial_snapshots.data(), snapshots.size(),
+                "subnormal snapshots and padding");
+
+            // The production MTP input stays immutable while the accepted
+            // snapshot is still undecided. Poison every destination again so
+            // successful ordinary recurrence cannot mask an unwritten lane.
+            state = initial;
+            std::fill(output.begin(), output.end(), guard);
+            std::fill(snapshots.begin(), snapshots.end(), guard);
+            ASSERT_TRUE(kernel.chunkForwardMergedQKVWithStateSnapshots(
+                merged.data(), merged_stride, alpha.data(), beta.data(),
+                a_log.data(), dt_bias.data(), output.data(), state.data(),
+                rows, heads, heads, dk, dv, 0, 64, normalize,
+                snapshots.data(), snapshot_stride, rows));
+            expectByteExactFP32(output.data(), serial_output.data(), output.size(),
+                "subnormal merged verifier output");
+            expectByteExactFP32(state.data(), initial.data(), state.size(),
+                "subnormal verifier preserves initial state");
+            expectByteExactFP32(snapshots.data(), serial_snapshots.data(), snapshots.size(),
+                "subnormal merged verifier snapshots and padding");
+        }
+    }
+    ASSERT_FALSE(PerfStatsCollector::snapshot({"kernel.cpu_gdn_subnormal_head_column_tasks"}).empty());
+}
+
+/**
  * @brief Proves direct merged-QKV recurrence is serial-row byte equivalent.
  *
  * The ordinary CPU graph path consumes fused projection rows without

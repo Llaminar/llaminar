@@ -210,7 +210,8 @@ namespace llaminar2
     // Device Helpers
     // =========================================================================
 
-    __device__ inline float hip_warp_reduce_sum(float val)
+    /** @brief Fixed-order wave sum, inlined to avoid a device-call spill frame. */
+    __device__ __forceinline__ float hip_warp_reduce_sum(float val)
     {
         // AMD wavefront is 64-wide
         for (int offset = 32; offset > 0; offset >>= 1)
@@ -225,12 +226,13 @@ namespace llaminar2
      * sum. The final barrier closes the read epoch before a following radial-fit
      * reduction reuses `shared`, preventing a faster wave from overwriting LDS
      * while wave zero still reads the previous result.
+     * Keep the barrier helper inline so live kernel state needs no call frame.
      *
      * @param val Calling work item's contribution.
      * @param shared LDS workspace covering the workgroup's wave count.
      * @return Complete sum in work item zero.
      */
-    __device__ float hip_block_reduce_sum(float val, float *shared)
+    __device__ __forceinline__ float hip_block_reduce_sum(float val, float *shared)
     {
         const int lane = threadIdx.x % 64; // AMD wavefront size
         const int warp_id = threadIdx.x / 64;
@@ -1871,8 +1873,16 @@ namespace llaminar2
     // FP16 Fused Incremental Kernel (decode path — K+V in one launch)
     // =========================================================================
 
+    /**
+     * @brief Decode one compressed KV head with its exact head-width workgroup.
+     * @tparam D Number of head elements and work items, fixed by both launchers.
+     *
+     * The launch bound is an ABI fact, not an occupancy request. Without it HIP
+     * budgets registers for 1024 threads although only 64/128 are ever launched,
+     * spilling the inverse-rotation state unnecessarily.
+     */
     template <int D>
-    __global__ void hip_tq_incremental_fused_kernel(
+    __global__ __launch_bounds__(D) void hip_tq_incremental_fused_kernel(
         const uint8_t *__restrict__ k_cache,
         const uint8_t *__restrict__ v_cache,
         _Float16 *__restrict__ k_output,

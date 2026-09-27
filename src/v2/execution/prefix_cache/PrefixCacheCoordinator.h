@@ -39,6 +39,7 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
         PrefixPlacementEpochSpan placement_epochs;
         uint64_t fingerprint_key = 0;
+        PrefixCheckpointPolicy checkpoint_policy = PrefixCheckpointPolicy::TerminalOnly;
         PrefixFingerprintCoordinationPolicy fingerprint_policy =
             PrefixFingerprintCoordinationPolicy::RequireIdentical;
         bool supported = false;
@@ -59,6 +60,7 @@ namespace llaminar2
         std::string domain_id;
         PrefixPlacementEpochSpan placement_epochs;
         uint64_t fingerprint_key = 0;
+        PrefixCheckpointPolicy checkpoint_policy = PrefixCheckpointPolicy::TerminalOnly;
         bool supported = false;
         bool cache_enabled = false;
         int common_matched_tokens = 0;

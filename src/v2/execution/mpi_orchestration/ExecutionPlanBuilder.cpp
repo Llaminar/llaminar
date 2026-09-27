@@ -103,6 +103,35 @@ namespace llaminar2
             }
             return common.value_or(MTPDepthDefaultsProfile::Portable);
         }
+
+        /**
+         * @brief Seal terminal-head intent using its complete execution domain.
+         * @param requested Automatic intent or an explicit physical policy.
+         * @param devices Terminal/continuation participants, excluding expert-only tiers.
+         * @return CPU vocabulary shards or the existing accelerator mirror default.
+         * @throws std::invalid_argument if automatic intent has no domain to inspect.
+         *
+         * CPU projection work benefits from sharing the vocabulary across sockets.
+         * GPU defaults retain their measured mirror economics. Scope and rank
+         * ordinals never select a policy; all peers receive the same resolved
+         * value, including sparse expert followers with a CPU control endpoint.
+         */
+        MTPTerminalHeadPolicy mtpHeadPolicyForDomain(
+            MTPTerminalHeadPolicy requested,
+            const std::vector<GlobalDeviceAddress> &devices)
+        {
+            if (requested != MTPTerminalHeadPolicy::Automatic)
+            {
+                (void)mtpTerminalHeadIsMirrored(requested); // Reject invalid enum values.
+                return requested;
+            }
+            if (devices.empty())
+                throw std::invalid_argument("MTP terminal-head defaults require a resolved execution domain");
+            return std::all_of(devices.begin(), devices.end(), [](const auto &device)
+                { return device.device_type == DeviceType::CPU; })
+                ? MTPTerminalHeadPolicy::VocabularySharded
+                : MTPTerminalHeadPolicy::MirroredFullVocabulary;
+        }
     }
 
     // =========================================================================
@@ -170,8 +199,26 @@ namespace llaminar2
                 ? mtpProfileForDomain(continuation->devices,
                                       continuation->device_ranks, cluster_inventory)
                 : MTPDepthDefaultsProfile::Portable;
+
+            // In a pipeline, terminal weights belong to the final stage, not
+            // necessarily the first rank's primary device. An overlay instead
+            // uses its declared continuation authority, never expert tiers.
+            const ResolvedDomain *terminal = continuation;
+            if (!terminal && !pp_stages.empty())
+            {
+                const auto &last = *std::max_element(pp_stages.begin(), pp_stages.end(),
+                    [](const auto &left, const auto &right) { return left.stage_id < right.stage_id; });
+                const auto found = std::find_if(domains.begin(), domains.end(),
+                    [&](const auto &domain) { return domain.name == last.domain_name; });
+                if (found != domains.end()) terminal = &*found;
+            }
+            const auto head_policy = mtpHeadPolicyForDomain(config.mtp.terminal_head_policy,
+                terminal ? terminal->devices : std::vector<GlobalDeviceAddress>{});
             for (auto &plan : plans)
+            {
                 plan.runtime.mtp.depth_defaults_profile = profile;
+                plan.runtime.mtp.terminal_head_policy = head_policy;
+            }
         }
         else
         {
@@ -191,6 +238,25 @@ namespace llaminar2
                         devices, std::vector<int>(devices.size(), rank), cluster_inventory);
                 }
             }
+
+            // Include every terminal TP peer before sealing policy. Earlier PP
+            // stages may execute on another backend, but cannot change the head.
+            std::vector<GlobalDeviceAddress> terminal_devices;
+            for (const auto &plan : plans)
+            {
+                if (!plan.has_lm_head) continue;
+                if (!plan.local_pp_devices.empty())
+                    terminal_devices.push_back(plan.local_pp_devices.back());
+                else if (!plan.local_tp_devices.empty())
+                    terminal_devices.insert(terminal_devices.end(),
+                        plan.local_tp_devices.begin(), plan.local_tp_devices.end());
+                else
+                    terminal_devices.push_back(plan.primary_device);
+            }
+            const auto head_policy = mtpHeadPolicyForDomain(
+                config.mtp.terminal_head_policy, terminal_devices);
+            for (auto &plan : plans)
+                plan.runtime.mtp.terminal_head_policy = head_policy;
         }
 
         return plans;

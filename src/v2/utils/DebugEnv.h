@@ -2577,6 +2577,9 @@ namespace llaminar2
         /// Exact vendor backing request; absence lets early ROCr startup install
         /// driver-owned host pages. This is not a hot-path or diagnostic switch.
         std::optional<std::string> rocm_userptr_for_paged_mem;
+        /// Exact vendor registration request. Early startup requires explicit
+        /// pinned ownership instead of demand-paged HMM/SVM range management.
+        std::optional<std::string> rocm_use_svm;
 
         /**
          * @brief Capture the process environment when the configuration is constructed.
@@ -2602,6 +2605,9 @@ namespace llaminar2
             const char *rocm_backing = std::getenv("HSA_USERPTR_FOR_PAGED_MEM");
             rocm_userptr_for_paged_mem = rocm_backing
                 ? std::optional<std::string>{rocm_backing} : std::nullopt;
+            const char *rocm_registration = std::getenv("HSA_USE_SVM");
+            rocm_use_svm = rocm_registration
+                ? std::optional<std::string>{rocm_registration} : std::nullopt;
         }
 
         /**

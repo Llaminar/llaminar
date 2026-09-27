@@ -4085,7 +4085,12 @@ namespace llaminar2
                 alignas(64) float merged[kMaximumAttentionHeadDim];
                 alignas(64) float scores[detail::kMaxKVTile];
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                // Later causal queries see more K/V rows. Contiguous static
+                // ranges can give the last worker almost twice the mean work
+                // in a fresh prefill. Cyclic whole-row ownership balances that
+                // triangle without splitting a reduction: every row still
+                // merges the same canonical summaries in ascending K/V order.
+#pragma omp for schedule(static, 1) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int item = 0; item < work_items; ++item)
                 {
                     const int row = item;

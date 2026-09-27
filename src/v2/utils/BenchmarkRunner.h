@@ -8,7 +8,7 @@
  * - Separate prefill/decode timing
  * - Throughput metrics (tokens/second)
  * - Minimal logging during benchmark for accurate timing
- * - Greedy sampling for deterministic, reproducible results
+ * - Requested sampling policy, shared by serial and speculative decode
  *
  * Usage:
  *   BenchmarkRunner runner(pipeline, tokenizer);
@@ -269,7 +269,7 @@ namespace llaminar2
      *
      * Features:
      * - Clean output with minimal logging during measurement
-     * - Greedy sampling for deterministic results
+     * - Request-owned sampling; use temperature zero for greedy comparisons
      * - Compatible with an MPI-coordinated runner owned by one request controller
      * - Professional formatted output with box drawing
      */
@@ -293,7 +293,9 @@ namespace llaminar2
          * @brief Run the benchmark
          *
          * Executes prefill and decode phases, measuring timing for each.
-         * Uses greedy sampling (temperature=0) for deterministic results.
+         * Preserves the requested temperature, top-k, top-p, and seed across
+         * serial and speculative execution. Request temperature zero for a
+         * greedy comparison; MTP never implicitly changes the sampling law.
          *
          * @param config Parsed orchestration config (prompt, n_predict, etc.)
          * @return Benchmark results with timing metrics

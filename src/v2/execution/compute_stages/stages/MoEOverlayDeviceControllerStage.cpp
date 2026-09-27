@@ -1,6 +1,11 @@
 /**
  * @file MoEOverlayDeviceControllerStage.cpp
  * @brief Captured-stage implementation for mapped ExpertOverlay control.
+ *
+ * Launch construction and traffic estimates consume immutable fabric setup
+ * metadata only. Mapped pointer members belong to the GPU address space; they
+ * may differ from their host aliases and are never dereferenced by this stage.
+ * Mutable epochs, policy and acknowledgements remain device-owned.
  */
 
 #include "MoEOverlayDeviceControllerStage.h"
@@ -166,9 +171,8 @@ namespace llaminar2
         if (params_.action ==
             MoEOverlayDeviceControllerAction::PublishGroupSnapshot)
         {
-            const auto &group = params_.binding.groups[
-                static_cast<std::size_t>(params_.binding.group_id)];
-            bytes += static_cast<size_t>(group.collected_state_words) *
+            bytes += static_cast<size_t>(
+                         params_.binding.capture_metadata.group_collected_state_words) *
                      sizeof(std::uint64_t);
         }
         return bytes;
@@ -238,16 +242,22 @@ namespace llaminar2
                left.device == right.device &&
                left.participant_id == right.participant_id &&
                left.group_id == right.group_id &&
+               left.capture_metadata == right.capture_metadata &&
                left.authority_leader == right.authority_leader &&
                left.group_root == right.group_root &&
+               left.inference_epoch_member == right.inference_epoch_member &&
                left.mapped_base_device == right.mapped_base_device &&
                left.mapped_bytes == right.mapped_bytes &&
                left.layout == right.layout &&
+               left.participants == right.participants &&
+               left.groups == right.groups &&
                left.controller == right.controller &&
+               left.inference_epoch_record == right.inference_epoch_record &&
                left.command == right.command &&
                left.command_entries == right.command_entries &&
                left.payload_bytes_per_layer ==
                    right.payload_bytes_per_layer &&
+               left.initial_owner_participants == right.initial_owner_participants &&
                left.demand_history == right.demand_history &&
                left.economy == right.economy &&
                left.economy_service_costs ==
@@ -263,7 +273,8 @@ namespace llaminar2
                    right.local_participant_record &&
                left.group_collected_state == right.group_collected_state &&
                left.participant_collected_state ==
-                   right.participant_collected_state;
+                   right.participant_collected_state &&
+               left.service_telemetry_publication == right.service_telemetry_publication;
     }
 
     StageDumpInfo MoEOverlayDeviceControllerStage::buildDumpInfoImpl() const

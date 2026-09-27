@@ -335,6 +335,10 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 
+# Register allocation is a build invariant, including standalone test kernels.
+# Install the policy before targets inherit their compiler launchers/options.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/GpuSpillGuard.cmake)
+
 # CUDA backend (separate .cu compilation unit)
 if(HAVE_CUDA)
     # JIT compilation architecture - no precompiled variants needed

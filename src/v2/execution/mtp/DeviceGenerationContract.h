@@ -129,8 +129,18 @@ enum class DeviceGenerationTerminalError
         row[kDeviceGenerationControlDepthPromoteConsecutiveWindows] != policy.promote_consecutive_windows ||
         row[kDeviceGenerationControlDepthPromoteFullAcceptRatePPM] != policy.promote_full_accept_rate_ppm ||
         row[kDeviceGenerationControlDepthDemoteZeroAcceptRatePPM] != policy.demote_zero_accept_rate_ppm ||
-        row[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] != policy.demote_acceptance_rate_ppm)
+        row[kDeviceGenerationControlDepthDemoteAcceptanceRatePPM] != policy.demote_acceptance_rate_ppm ||
+        row[kDeviceGenerationControlLearnedDepthEnabled] != static_cast<int>(policy.learned.enabled) ||
+        row[kDeviceGenerationControlLearnedDepthBackend] != static_cast<int>(policy.learned.backend) ||
+        row[kDeviceGenerationControlLearnedDepthModelClass] != static_cast<int>(policy.learned.model_class) ||
+        row[kDeviceGenerationControlLearnedDepthVerifyMode] != static_cast<int>(policy.learned.verify_mode))
         return Error::ChangedPolicy;
+
+    const int learned_matches = row[kDeviceGenerationControlLearnedDepthMatchedWindows];
+    if (learned_matches < 0 ||
+        learned_matches > row[kDeviceGenerationControlDepthEvaluatedWindows] ||
+        (!policy.learned.enabled && learned_matches != 0))
+        return Error::InvalidDepthStatistics;
 
     const int final_depth = row[kDeviceGenerationControlCurrentDraftDepth];
     const int accepted = row[kDeviceGenerationControlAcceptedSpeculativeTokenCount];

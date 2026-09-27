@@ -8,6 +8,7 @@
  */
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
@@ -19,6 +20,8 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "tensors/TensorKernels.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../backends/MTPMainForwardReadRetirementProof.h"
+#include "config/TensorParallelConfig.h"
 
 namespace llaminar2::test
 {
@@ -57,6 +60,149 @@ protected:
         return config;
     }
 };
+
+/**
+ * @brief Full-row publishers must archive each participant's own vocabulary interval.
+ *
+ * Model-free CPU/CUDA/ROCm state isolates the production archive/restore boundary.
+ * Reassembling the immutable shards must reproduce every logit, not only an
+ * argmax that can conceal duplicated rank-zero values during greedy sampling.
+ */
+TEST_P(PipelinePrefixState, FullVocabularyPublicationArchivesEveryTPShard)
+{
+    initCPUBackend(-1);
+    const auto device = GetParam() == "CPU" ? DeviceId::cpu()
+                      : GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+    const auto prove = [&]
+    {
+    for (int degree = 1; degree <= 8; ++degree)
+    {
+        // One model vocabulary, split at every degree. Backend-owned sampler
+        // capacity remains model-lifetime state; only participant ownership changes.
+        constexpr int vocabulary = 840; // Divisible by every degree from 1 through 8.
+        const int shard_columns = vocabulary / degree;
+        const auto tp = std::make_shared<TensorParallelConfig>(
+            TensorParallelConfig::equalSplit(degree, degree, degree, 64 * degree, vocabulary));
+        std::vector<float> expected(vocabulary);
+        std::array<std::vector<float>, 4> assembled;
+        for (int column = 0; column < vocabulary; ++column)
+            expected[column] = static_cast<float>(column) * 0.03125F;
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            SCOPED_TRACE(::testing::Message() << "degree=" << degree << " rank=" << rank);
+            GraphConfig config;
+            config.d_model = config.gdn.inner_size = 32 * degree;
+            config.d_ff = 64 * degree;
+            config.d_ff_local = 64;
+            config.n_heads = config.n_kv_heads = degree;
+            config.local_n_heads = config.local_n_kv_heads = 1;
+            config.head_dim = config.gdn.state_size = 32;
+            config.gdn.conv_kernel_size = 4;
+            config.gdn.group_count = config.gdn.time_step_rank = degree;
+            config.n_layers = config.total_n_layers = 1;
+            config.layer_types = {"gdn"};
+            config.vocab_size = vocabulary;
+            config.vocab_local = shard_columns;
+            config.lm_head_column_parallel = true;
+            config.tp_config = tp;
+            config.local_rank = rank;
+            config.head_start = rank;
+            config.max_seq_len = 16;
+            config.default_device = device;
+            config.mtp.terminal_head_policy = MTPTerminalHeadPolicy::VocabularySharded;
+            config.prefix_cache.enabled = true;
+            config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+            config.prefix_cache.ram_budget_bytes = 1u << 20;
+            config.prefix_cache.device_budget_bytes = config.prefix_cache.disk_budget_bytes = 0;
+            config.prefix_cache.block_size = 4;
+            ModelMemoryProfile profile;
+            profile.architecture = "qwen35";
+            profile.n_layers = 1;
+            profile.d_model = profile.gdn_inner_size = config.d_model;
+            profile.d_ff = config.d_ff;
+            profile.head_dim = profile.gdn_state_size = 32;
+            profile.n_heads = profile.n_kv_heads = degree;
+            profile.vocab_size = vocabulary;
+            profile.max_seq_len = 16;
+            profile.full_attention_interval = 2; // Layer zero owns recurrence only.
+            profile.gdn_conv_kernel_size = 4;
+            profile.gdn_group_count = profile.gdn_time_step_rank = degree;
+            DevicePlanConfig input;
+            input.world_rank = 0;
+            input.device = device;
+            input.shard_index = rank;
+            input.total_shards = degree;
+            input.device_total_bytes = device.is_gpu()
+                ? getBackendFor(device)->deviceMemoryTotal(0) : 8ull << 30;
+            input.device_free_bytes = device.is_gpu()
+                ? getBackendFor(device)->deviceMemoryFree(0) : 8ull << 30;
+            input.device_compute_units = 128;
+            input.associated_host_memory = PhysicalMemoryResource{.world_rank = 0,
+                .device = DeviceId::cpu(), .total_bytes = 1ull << 30,
+                .admission_available_bytes = 1ull << 30};
+            input.first_layer = input.last_layer = 0;
+            input.max_seq_len = input.activation_seq_len = 16;
+            input.kv_precision = "fp16";
+            input.prefix_cache = config.prefix_cache;
+            input.mtp_terminal_logits_layout = config.mtpTerminalLogitsLayout();
+            auto memory = std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(
+                    MemoryPlanner::plan(profile, {input}).physicalPlan()), 0);
+            auto graph = std::make_shared<Qwen35Graph>(config, nullptr);
+            auto owner = DeviceGraphOrchestrator::createForTest({
+                .model_ctx = MockModelContext::createMinimal(), .graph_builder = graph,
+                .physical_memory_authority = memory});
+            ASSERT_TRUE(owner->initializeInferenceStateFromArena(1, 16, device));
+            const std::vector<float> shard(expected.begin() + rank * shard_columns,
+                expected.begin() + (rank + 1) * shard_columns);
+            size_t surface_index = 0;
+            for (const auto surface : {ForwardLogitsStorageSurface::CanonicalFull,
+                                      ForwardLogitsStorageSurface::CanonicalLocal,
+                                      ForwardLogitsStorageSurface::AllPositionFull,
+                                      ForwardLogitsStorageSurface::AllPositionLocal})
+            {
+                SCOPED_TRACE(static_cast<int>(surface));
+                const std::vector<int32_t> prompt{1, 2, 3, 4 + static_cast<int32_t>(surface_index)};
+                const auto admission = owner->lookupPrefix(prompt);
+                ASSERT_TRUE(admission.supported) << admission.bypass_reason;
+                const bool local = surface == ForwardLogitsStorageSurface::CanonicalLocal ||
+                    surface == ForwardLogitsStorageSurface::AllPositionLocal;
+                ASSERT_TRUE(DeviceGraphOrchestratorLiveStateTestAccess::publishTerminalRow(
+                    *owner, local ? shard : expected, surface));
+                ASSERT_TRUE(owner->harvestPrefix(admission, prompt, 4));
+                const auto hit = owner->lookupPrefix(prompt);
+                ASSERT_EQ(hit.cached_tokens, 4);
+                ASSERT_FALSE(hit.blocks.empty());
+                const auto &terminal = hit.blocks.back();
+                ASSERT_TRUE(terminal.has_terminal_logits);
+                ASSERT_EQ(terminal.layout.terminal_logits_bytes, shard_columns * sizeof(float));
+                // Harvest publishes an asynchronous archive. Raw host inspection
+                // is a diagnostic consumer and must join that archive's event.
+                ASSERT_TRUE(terminal.waitForPayloadOnHost());
+                const auto *archived = static_cast<const float *>(terminal.terminal_logits);
+                ASSERT_NE(archived, nullptr);
+                EXPECT_EQ(std::vector<float>(archived, archived + shard_columns), shard);
+                auto &assembled_row = assembled[surface_index++];
+                assembled_row.insert(assembled_row.end(), archived, archived + shard_columns);
+
+                // Diagnostic evidence must name the same interval as the copy.
+                const PrefixProbeCapturePolicy probe{.hash_terminal_state = true,
+                    .capture_terminal_logits_values = true};
+                EXPECT_EQ(owner->prefixStateProbe(probe).terminal_logits_values, shard);
+                ASSERT_TRUE(owner->restorePrefixTerminalState(hit));
+                EXPECT_EQ(owner->prefixStateProbe(probe).terminal_logits_values, shard);
+            }
+        }
+        for (const auto &row : assembled) EXPECT_EQ(row, expected);
+    }
+    };
+    if (device.is_cpu()) prove();
+    else
+    {
+        ASSERT_NE(device.is_cuda() ? getCUDABackend() : getROCmBackend(), nullptr);
+        GPUDeviceContextPool::instance().getContext(device).submitAndWait(prove);
+    }
+}
 
 /**
  * @brief Prefix preparation follows the stage's state, not whole-model geometry.
@@ -136,6 +282,9 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     const auto lookup = runner.lookupPrefix({});
                     ASSERT_TRUE(lookup.supported) << lookup.bypass_reason;
                     EXPECT_TRUE(lookup.cache_enabled);
+                    EXPECT_EQ(lookup.checkpoint_policy, stage == 1
+                        ? PrefixCheckpointPolicy::TerminalOnly
+                        : PrefixCheckpointPolicy::ReusableBoundary);
                     EXPECT_EQ(lookup.requires_terminal_hidden, stage == 2 && execution_enabled);
                     EXPECT_EQ(lookup.requires_terminal_logits, stage == 2);
                     EXPECT_EQ(runner.inferenceState().mtp_kv_caches.size(), stage == 2 ? 1u : 0u);
@@ -173,15 +322,34 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     auto long_prompt = short_prompt;
                     long_prompt.insert(long_prompt.end(), {10, 11, 12, 13});
                     const auto first_admission = runner.lookupPrefix(short_prompt);
+                    // A chat turn replaces the final template tokens. Archive
+                    // the earlier state while live, before the terminal one
+                    // can overwrite recurrence. No synthetic rewind is used.
+                    const auto frontier = first_admission.reusablePrefillCheckpoint(9, 0);
+                    ASSERT_EQ(frontier, 8);
+                    const std::vector<int32_t> reusable_prompt(
+                        short_prompt.begin(), short_prompt.begin() + *frontier);
+                    seed(0.125F);
+                    ASSERT_FALSE(HasFatalFailure());
+                    ASSERT_TRUE(runner.harvestPrefix(first_admission, reusable_prompt, *frontier));
                     seed(0.25F);
                     ASSERT_FALSE(HasFatalFailure());
                     ASSERT_TRUE(runner.harvestPrefix(first_admission, short_prompt, 9));
                     const auto short_hit = runner.lookupPrefix(short_prompt);
                     ASSERT_EQ(short_hit.cached_tokens, 9);
-                    ASSERT_EQ(short_hit.blocks.size(), 1u)
+                    ASSERT_EQ(short_hit.blocks.size(), 2u)
                         << "Recurrent-only participants must not allocate empty ancestor blocks";
                     EXPECT_EQ(short_hit.blocks.back().layout.faKVBytes(), 0u);
                     EXPECT_EQ(short_hit.blocks.back().key.block_index, 2);
+
+                    auto changed_tail = short_prompt;
+                    changed_tail.back() = 30;
+                    changed_tail.push_back(31);
+                    const auto changed_hit = runner.lookupPrefix(changed_tail);
+                    ASSERT_EQ(changed_hit.cached_tokens, 8);
+                    ASSERT_EQ(changed_hit.blocks.size(), 1u);
+                    ASSERT_TRUE(runner.populatePrefix(changed_hit));
+                    expect_state(0.125F);
 
                     const auto second_admission = runner.lookupPrefix(long_prompt);
                     ASSERT_EQ(second_admission.cached_tokens, 9);
@@ -190,7 +358,7 @@ TEST_P(PipelinePrefixState, PrefixPreparationMatchesStageOwnership)
                     ASSERT_TRUE(runner.harvestPrefix(second_admission, long_prompt, 13));
                     const auto long_hit = runner.lookupPrefix(long_prompt);
                     ASSERT_EQ(long_hit.cached_tokens, 13);
-                    ASSERT_EQ(long_hit.blocks.size(), 2u);
+                    ASSERT_EQ(long_hit.blocks.size(), 3u);
                     const auto clamped = long_hit.clampedTo(9);
                     ASSERT_EQ(clamped.cached_tokens, 9);
                     runner.resetInferenceState(InferenceStateResetRequest::requestBoundary("prefix-stage-proof"));

@@ -53,6 +53,7 @@ jobs:
     concurrency:
       group: llaminar-develop-image-gate
       cancel-in-progress: false
+      queue: max
     steps:
       - uses: docker/login-action@v4
         with:
@@ -125,6 +126,7 @@ jobs:
     concurrency:
       group: llaminar-develop-image-gate
       cancel-in-progress: false
+      queue: max
     steps:
       - uses: docker/login-action@v4
         with:

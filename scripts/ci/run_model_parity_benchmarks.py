@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark canonical E2E candidates on an image or local Release diagnostic.
 
-The typed E2E argument vector owns model execution policy. This runner owns
-only a versioned workload, timing validation and the high-water comparison.
+The canonical matrix exports a separate production-default benchmark policy
+for each E2E candidate. HTTP stress arguments never enter timing. This runner
+owns only a versioned workload, timing validation and the high-water comparison.
 It never commits results, lowers a baseline, or mints a production certificate;
 the full pipeline owns those operations after all correctness gates pass.
 Full same-image E2E evidence is required unless --diagnostic explicitly selects
@@ -58,13 +59,32 @@ def validate_workload(workload: dict) -> str:
     return workload["prompt_unit"] * workload["prompt_repetitions"]
 
 
-def benchmark_arguments(record: dict, model: str, output: str, workload: dict) -> list[str]:
-    """Use the server's exported policy verbatim; add only benchmark workload."""
-    prompt = validate_workload(workload)
+def benchmark_profile(record: dict) -> dict:
+    """Require producer-owned production defaults; never salvage stale HTTP argv.
+
+    The matrix owns model/topology and selected execution modes. Missing or
+    malformed metadata means discovery must be rebuilt, not that the consumer
+    may reconstruct policy by stripping a growing blacklist of stress flags.
+    """
     if not record.get("e2e"):
         raise ValueError("only E2E-tagged cells may be benchmarked")
-    return ["benchmark", *record["e2e"]["server_args"], "-m", model,
-            "--context-length", str(record["e2e"]["context_length"]),
+    profile = record.get("benchmark")
+    if (not isinstance(profile, dict) or type(profile.get("schema")) is not int
+            or profile["schema"] != 1 or profile.get("policy") != "production_defaults"
+            or type(profile.get("context_length")) is not int or profile["context_length"] <= 0
+            or profile["context_length"] != record["e2e"]["context_length"]
+            or not isinstance(profile.get("args"), list) or not profile["args"]
+            or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in profile["args"])):
+        raise ValueError("invalid or missing production-default benchmark policy; rebuild/export canonical metadata")
+    return profile
+
+
+def benchmark_arguments(record: dict, model: str, output: str, workload: dict) -> list[str]:
+    """Use the exported benchmark intent verbatim; add only the fixed workload."""
+    prompt = validate_workload(workload)
+    profile = benchmark_profile(record)
+    return ["benchmark", *profile["args"], "-m", model,
+            "--context-length", str(profile["context_length"]),
             "--prompt", prompt, "-n", str(workload["decode_tokens"]),
             "--seed", str(workload["seed"]), "--temperature", str(workload["temperature"]),
             "--top-k", str(workload["top_k"]), "--top-p", str(workload["top_p"]),
@@ -178,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     if not cells:
         raise ValueError("no eligible benchmark cells selected")
     for row in cells:
+        benchmark_profile(row["configuration"])
         print(f"[production-benchmark] selected {row['case']}", flush=True)
     if args.list:
         return 0
@@ -188,12 +209,20 @@ def main(argv: list[str] | None = None) -> int:
         binary = args.diagnostic_binary.resolve(strict=True)
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError("diagnostic binary must be an executable file")
+        # Diagnostic/certifying is report provenance, not an instruction set.
+        # Reuse HTTP's Release/ISA authority so native runs compare against the
+        # matching image baseline instead of silently creating a new ISA key.
+        cpu_isa = e2e.release_binary_cpu_isa(binary)
         runtime = {"id": f"local-release:{binary}",
-                   "labels": {"org.llaminar.cpu_isa": "local-diagnostic"}}
+                   "labels": {"org.llaminar.cpu_isa": cpu_isa.value}}
     else:
         binary = None
         runtime = image_identity(args.image)
-        if runtime["labels"].get("org.opencontainers.image.revision") != args.source_revision:
+        # Explicit diagnostics may compare an older immutable implementation
+        # under the current workload policy. Keep both revisions in evidence;
+        # this never satisfies same-source/same-image certification admission.
+        if (not args.diagnostic and
+                runtime["labels"].get("org.opencontainers.image.revision") != args.source_revision):
             raise ValueError("benchmark image has the wrong source revision")
     e2e_digest = None
     if args.e2e_report is not None:
@@ -205,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     hardware = hardware_identity()
     baseline = json.loads(args.baseline.read_text())
     report = {"schema": 1, "image": runtime["id"], "source_revision": args.source_revision,
+              "runtime_source_revision": runtime["labels"].get("org.opencontainers.image.revision"),
               "manifest_digest": digest(manifest), "hardware": hardware,
               "diagnostic": args.diagnostic, "e2e_report_digest": e2e_digest,
               "workload": workload, "complete": False, "passed": False, "cells": []}

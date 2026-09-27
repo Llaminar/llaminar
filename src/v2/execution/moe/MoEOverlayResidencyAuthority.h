@@ -35,6 +35,10 @@
 namespace llaminar2
 {
     class MoEOverlayEconomyCalibrationLayerCatalog;
+    namespace test
+    {
+        struct MoEOverlayResidencyAuthorityConcurrencyPeer;
+    }
 
     /** @brief Thermal direction of one complete expert residency move. */
     enum class MoEOverlayTierMigrationDirection
@@ -1375,6 +1379,9 @@ namespace llaminar2
         bool hasActiveBackgroundWave() const noexcept;
 
     private:
+        /** Device-free regression access for holding a real proposal lock. */
+        friend struct test::MoEOverlayResidencyAuthorityConcurrencyPeer;
+
         /** Sole typed owner of the shared runtime-histogram drain lane. */
         enum class HistogramDrainState : std::uint8_t
         {

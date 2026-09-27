@@ -1327,7 +1327,7 @@ namespace
         {
             if (shared)
             {
-                return moe->prepareSharedExpertPrefillGroup(rows);
+                return moe->prepareSharedExpertPrefillGroup(llaminar2::DeviceRowRange::fullyActive(rows));
             }
             return moe->prepareExpertGroupsAsync(
                 route_indices_tensor.get(), route_weights_tensor.get(),

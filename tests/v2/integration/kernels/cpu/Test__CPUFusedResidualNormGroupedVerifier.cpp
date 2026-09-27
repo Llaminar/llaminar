@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <omp.h>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,17 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Restore the caller's OpenMP worker budget even after a failed assertion. */
+    struct ScopedNormWorkers
+    {
+        int previous = omp_get_max_threads();
+        /** @brief Select a positive diagnostic worker count for independent rows. */
+        explicit ScopedNormWorkers(int workers) { omp_set_num_threads(workers); }
+        /** @brief Restore the incoming invocation budget. */
+        ~ScopedNormWorkers() { omp_set_num_threads(previous); }
+    };
+
+    constexpr std::array<int, 2> kNormWidths = {128, 4096};
     /** @brief Enable perfstats for the test lifetime and restore the caller. */
     class ScopedPerfStats
     {
@@ -205,10 +218,11 @@ namespace
     void runNativeFormat(
         IDeviceContext *context,
         const char *format_label,
-        const char *implementation)
+        const char *implementation,
+        std::span<const int> runtime_rows = test::kGroupedVerifierRuntimeRows,
+        std::span<const int> column_counts = kNormWidths)
     {
-        constexpr std::array<int, 2> column_counts = {128, 4096};
-        constexpr int max_rows = test::kGroupedVerifierRuntimeRows.back();
+        const int max_rows = *std::max_element(runtime_rows.begin(), runtime_rows.end());
         constexpr const char *counter_name =
             "cpu_fused_residual_rmsnorm_grouped_verifier_rows_calls";
 
@@ -222,7 +236,7 @@ namespace
                 0xF0020000u ^ static_cast<uint32_t>(cols));
             const auto gamma_values = makeGamma(static_cast<size_t>(cols));
 
-            for (int verifier_rows : test::kGroupedVerifierRuntimeRows)
+            for (int verifier_rows : runtime_rows)
             {
                 SCOPED_TRACE(
                     std::string("CPU format=") + format_label +
@@ -318,6 +332,12 @@ namespace
                 EXPECT_EQ(
                     tag(record, "invocation_policy"),
                     "single_grouped_stage_call");
+                if constexpr (Precision == ActivationPrecision::FP32)
+                {
+                    if (verifier_rows == 512 && cols == 2048 && omp_get_max_threads() > 1)
+                        EXPECT_EQ(PerfStatsCollector::snapshot({
+                            "kernel.cpu_fused_residual_rmsnorm_parallel_rows"}).size(), 1u);
+                }
             }
         }
     }
@@ -336,4 +356,25 @@ TEST(Test__CPUFusedResidualNormGroupedVerifier,
         context.get(), "BF16", "typed_residual_then_rmsnorm");
     runNativeFormat<ActivationPrecision::FP16>(
         context.get(), "FP16", "typed_residual_then_rmsnorm");
+}
+
+/** @test Prefill-sized independent rows retain serial output bytes on both CPU builds. */
+TEST(Test__CPUFusedResidualNormGroupedVerifier,
+     PrefillAllNativeFormatsMatchSerialRows)
+{
+    ScopedPerfStats perfstats;
+    auto context = IDeviceContext::create(DeviceId::cpu());
+    ASSERT_NE(context, nullptr);
+    constexpr std::array<int, 3> rows = {32, 127, 512};
+    constexpr std::array<int, 2> widths = {65, 2048};
+    for (int workers : {1, 3})
+    {
+        ScopedNormWorkers team(workers);
+        runNativeFormat<ActivationPrecision::FP32>(
+            context.get(), "FP32", "fused_cache_resident_rows", rows, widths);
+        runNativeFormat<ActivationPrecision::BF16>(
+            context.get(), "BF16", "typed_residual_then_rmsnorm", rows, widths);
+        runNativeFormat<ActivationPrecision::FP16>(
+            context.get(), "FP16", "typed_residual_then_rmsnorm", rows, widths);
+    }
 }

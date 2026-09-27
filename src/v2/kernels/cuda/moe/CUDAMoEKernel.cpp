@@ -1621,7 +1621,7 @@ extern "C"
         int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
-        int seq_len,
+        llaminar2::DeviceRowRange rows,
         int device_idx,
         void *stream);
 
@@ -8519,8 +8519,9 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
+    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
     {
+        const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
         void *stream = requireStream("CUDAMoEKernel::prepareSharedExpertPrefillGroup");
@@ -8534,7 +8535,7 @@ namespace llaminar2
                 d_group_original_expert_ids_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
-                seq_len,
+                rows,
                 device_ordinal_,
                 stream))
         {

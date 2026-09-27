@@ -26,6 +26,7 @@ from model_parity_inventory import InventoryScope, discover as discover_inventor
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
 from tool_calling_checks import validate_evidence as validate_tool_calling_evidence
+from gpu_driver_diagnostics import validate_evidence as validate_driver_diagnostics
 from server_execution_contract import automatic_selection_policy, validate_automatic_selection
 
 
@@ -125,7 +126,8 @@ def validate_long_context_evidence(directory: Path, profile: dict) -> None:
 
 
 def validate_http_cell_evidence(directory: Path, profile: dict) -> None:
-    """Revalidate the full needle, tool and automatic-placement proof after shell success."""
+    """Require driver health and the full HTTP proof, not shell exit status alone."""
+    validate_driver_diagnostics(directory)
     validate_long_context_evidence(directory, profile)
     validate_tool_calling_evidence(json.loads((directory / "tool_calling_results.json").read_text()))
     selection = json.loads((directory / "automatic_selection_results.json").read_text())

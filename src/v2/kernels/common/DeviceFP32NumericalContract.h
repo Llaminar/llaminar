@@ -59,9 +59,12 @@ namespace llaminar2::device_fp32_contract
     /**
      * @brief Preserve one explicitly rounded binary32 intermediate.
      *
-     * The empty VGPR dependency is a compiler boundary only; it emits no
-     * memory traffic or synchronization. CUDA intrinsics already retain this
-     * boundary, so CUDA returns the word directly.
+     * The empty GPU/CPU register dependency is a compiler boundary only; it
+     * emits no memory traffic or synchronization. CUDA intrinsics already
+     * retain this boundary, so CUDA returns the word directly. On x86 SSE,
+     * scalar arithmetic has already rounded to binary32 in its XMM register;
+     * making the value an opaque register output prevents the next operation
+     * from contracting it without forcing every Newton step through memory.
      *
      * @param value Result of one explicit binary32 arithmetic operation.
      * @return The identical binary32 word with its dependency edge retained.
@@ -70,11 +73,14 @@ namespace llaminar2::device_fp32_contract
     {
 #if defined(__HIP_DEVICE_COMPILE__)
         asm volatile("" : "+v"(value));
+#elif !defined(__CUDA_ARCH__) && defined(__SSE2__) && \
+    (defined(__GNUC__) || defined(__clang__))
+        asm volatile("" : "+x"(value));
 #elif !defined(__CUDA_ARCH__)
         /*
-         * A volatile binary32 store/load is the portable host equivalent of
-         * the device dependency barrier. It prevents contraction or
-         * reassociation across a contract edge without changing the value.
+         * Hosts without the x86 register constraint still require an explicit
+         * binary32 storage boundary (in particular, extended x87 arithmetic).
+         * This is the same arithmetic contract, not a different approximation.
          */
         volatile float rounded = value;
         return rounded;

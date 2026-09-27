@@ -18,6 +18,9 @@
 #include <cmath>
 #include <numeric>
 #include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <limits>
 
 #include "utils/Sampler.h"
 #include "kernels/common/SamplingMath.h"
@@ -510,6 +513,65 @@ namespace
             }
         }
         EXPECT_EQ(actual_ids.size(), expected_active);
+    }
+
+    /** @test Every CPU selector preserves the former strict-greater greedy scan. */
+    TEST_F(SamplerTest, CPUGreedySelectorRetainsFirstWinnerAndEverySIMDTail)
+    {
+        using Selector = decltype(&cpu_sampling::select_topk);
+        for (int width : {1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33,
+                          63, 64, 65, 124160, 248320})
+        {
+            for (int pattern = 0; pattern != 7; ++pattern)
+            {
+                SCOPED_TRACE(::testing::Message() << "width=" << width
+                                                << " pattern=" << pattern);
+                // An offset base and odd row lengths exercise unaligned loads
+                // and scalar tails, with sentinels outside the published row.
+                std::vector<float> storage(static_cast<size_t>(width) + 2, 1e30f);
+                float *row = storage.data() + 1;
+                for (int i = 0; i < width; ++i)
+                    row[i] = pattern == 0 ? float(i) : -float(i + 1);
+                if (pattern == 1)
+                    row[width - 1] = row[0];
+                if (pattern == 2)
+                {
+                    std::fill_n(row, width, 0.0f);
+                    row[0] = -0.0f;
+                }
+                if (pattern == 3)
+                    std::fill_n(row, width, -std::numeric_limits<float>::infinity());
+                if (pattern == 4)
+                    row[0] = std::numeric_limits<float>::quiet_NaN();
+                if (pattern == 5)
+                    row[width / 2] = std::numeric_limits<float>::quiet_NaN();
+                if (pattern == 6)
+                    row[width - 1] = std::numeric_limits<float>::infinity();
+
+                int expected_id = 0;
+                float expected_value = row[0];
+                for (int i = 1; i < width; ++i)
+                    if (row[i] > expected_value)
+                    {
+                        expected_id = i;
+                        expected_value = row[i];
+                    }
+                for (Selector selector : {&cpu_sampling::select_topk_scalar,
+                                          &cpu_sampling::select_topk_avx2,
+                                          &cpu_sampling::select_topk_avx512,
+                                          &cpu_sampling::select_topk})
+                {
+                    float actual_value = 0;
+                    int actual_id = -1;
+                    ASSERT_EQ(selector(row, width, 1, &actual_value, &actual_id), 1);
+                    EXPECT_EQ(actual_id, expected_id);
+                    EXPECT_EQ(std::bit_cast<uint32_t>(actual_value),
+                              std::bit_cast<uint32_t>(expected_value));
+                }
+                EXPECT_EQ(storage.front(), 1e30f);
+                EXPECT_EQ(storage.back(), 1e30f);
+            }
+        }
     }
 
     TEST_F(SamplerTest, CPUSelectTopKVariantsMatchScalar)

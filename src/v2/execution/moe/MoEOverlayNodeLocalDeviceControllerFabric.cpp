@@ -425,6 +425,8 @@ namespace llaminar2
     bool MoEOverlayDeviceControllerParticipantBinding::valid() const noexcept
     {
         return device.is_gpu() && participant_id >= 0 && group_id >= 0 &&
+               capture_metadata.topology_fingerprint != 0u &&
+               capture_metadata.group_collected_state_words != 0u &&
                mapped_base_device && mapped_bytes != 0u && layout &&
                participants && groups && controller &&
                inference_epoch_record && command &&
@@ -448,7 +450,9 @@ namespace llaminar2
             throw std::logic_error(
                 "device controller participant cannot export an incomplete GPU binding");
         }
-        const auto &metadata = participants[participant_id];
+        // A registered GPU alias need not be CPU-addressable. All scalar
+        // arguments come from the frozen host layout, never from an alias
+        // dereference or a copy of mutable device controller state.
         return {
             .mapped_base = mapped_base_device,
             .mapped_bytes = mapped_bytes,
@@ -472,10 +476,10 @@ namespace llaminar2
             .local_participant_record = local_participant_record,
             .group_collected_state = group_collected_state,
             .participant_collected_state = participant_collected_state,
-            .topology_fingerprint = layout->topology_fingerprint,
+            .topology_fingerprint = capture_metadata.topology_fingerprint,
             .participant_id = static_cast<std::uint32_t>(participant_id),
             .group_id = static_cast<std::uint32_t>(group_id),
-            .role_flags = metadata.flags,
+            .role_flags = capture_metadata.role_flags,
         };
     }
 
@@ -1783,6 +1787,12 @@ namespace llaminar2
             .device = participant.device,
             .participant_id = participant_id,
             .group_id = topology_group->group_id,
+            .capture_metadata = {
+                .topology_fingerprint = layout_.header.topology_fingerprint,
+                .group_collected_state_words = group.collected_state_words,
+                .role_flags = participantFlags(
+                    *config_.topology, participant_id, *topology_group),
+            },
             .authority_leader =
                 participant_id == config_.topology->leader_participant_id,
             .group_root =

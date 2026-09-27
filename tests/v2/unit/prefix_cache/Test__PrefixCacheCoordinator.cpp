@@ -147,6 +147,23 @@ TEST(Test__PrefixCacheCoordinator, ClampsToMinimumMatchedTokensAndBlocks)
     EXPECT_NE(result.clamp_reason.find("common prefix"), std::string::npos);
 }
 
+/** @brief Cold hybrid policy must survive rank-local aggregation before MPI lookup. */
+TEST(Test__PrefixCacheCoordinator, ReusableCheckpointIsSharedAcrossMixedColdParticipants)
+{
+    auto attention = participant(0, 0, false, false);
+    auto recurrent = participant(1, 0, false, false);
+    recurrent.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+    const auto coordinated = makePrefixLookupResult(
+        coordinatePrefixLookups({attention, recurrent}), 64);
+    EXPECT_EQ(coordinated.cached_tokens, 0);
+    EXPECT_EQ(coordinated.checkpoint_policy, PrefixCheckpointPolicy::ReusableBoundary);
+    const auto nested = makePrefixLookupResult(coordinatePrefixLookups({
+        makePrefixParticipantLookup(0, DeviceId::cpu(), coordinated)}), 64);
+    EXPECT_EQ(nested.reusablePrefillCheckpoint(365, 0), 320);
+    EXPECT_EQ(makePrefixLookupResult(coordinatePrefixLookups({attention}), 64).checkpoint_policy,
+        PrefixCheckpointPolicy::TerminalOnly);
+}
+
 TEST(Test__PrefixCacheCoordinator, TerminalStateRequiresEveryParticipant)
 {
     auto result = coordinatePrefixLookups({

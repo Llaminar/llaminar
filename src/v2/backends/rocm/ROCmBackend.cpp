@@ -16,6 +16,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
+#include "../../memory/HostRegistrationPageBoundary.h"
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
@@ -549,6 +550,9 @@ namespace llaminar2
                      << device_id << " ptr=" << ptr << " bytes=" << bytes);
             return false;
         }
+        // Fence shared huge-PMD edges before HIP owns the pages. Otherwise a
+        // neighbouring heap trim can evict all queues for this live process.
+        HostRegistrationPageBoundary::prepare(ptr, bytes);
         hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
         if (err != hipSuccess)
         {
@@ -619,6 +623,9 @@ namespace llaminar2
                                    (scope == MappedHostRegistrationScope::BackendPortable
                                         ? hipHostRegisterPortable
                                         : 0u);
+        // External shared channels need the same edge ownership as tensor
+        // uploads; portable registration must not retain a neighbour's PMD.
+        HostRegistrationPageBoundary::prepare(ptr, bytes);
         const hipError_t error = hipHostRegister(ptr, bytes, flags);
         if (error != hipSuccess)
         {

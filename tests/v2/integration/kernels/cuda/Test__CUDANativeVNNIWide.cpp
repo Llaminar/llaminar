@@ -15,6 +15,7 @@
 #include "backends/cuda/CUDAGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "kernels/cuda/gemm/CUDAGroupedVerifierLaunch.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <array>
@@ -31,6 +32,9 @@ extern "C"
     bool cudaNativeVNNIInitIQGridTables_tuned();
     void cudaNativeVNNIGemvSweep_setConfig(int, int, int, int, int, int, int, int);
     void cudaNativeVNNIGemvSweep_clearConfig();
+    void cudaNativeVNNIGemvSweep_setGroupedRows(int);
+    void cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(int);
+    int cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config();
     bool cudaNativeVNNIGemvTuned_fp32(
         const int8_t *, const uint8_t *, const uint16_t *, const uint16_t *,
         const uint32_t *, float *, const float *, int, int, float, float,
@@ -106,16 +110,29 @@ class RecordingPolicy final
 {
 public:
     /** @brief Select a physical WIDE tile or the exact one-partition KPAR oracle. */
-    RecordingPolicy(Family family, int tile, int columns_per_thread)
+    RecordingPolicy(Family family, int tile, int columns_per_thread,
+                    int grouped_rows = 0, int partitions = 1)
+        : previous_verifier_(cudaNativeVNNIGemvTuned_getDecodeEquivalentM1Config())
     {
         cudaNativeVNNIGemvSweep_setConfig(
             static_cast<int>(family), tile, columns_per_thread,
-            1, 1, 1, 1, family == Family::SinglePartition ? 1 : 0);
+            1, 1, partitions, partitions, family == Family::SinglePartition ? 1 : 0);
+        if (grouped_rows)
+        {
+            cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(1);
+            cudaNativeVNNIGemvSweep_setGroupedRows(grouped_rows);
+        }
     }
     /** @brief Restore ordinary production dispatch even when recording throws. */
-    ~RecordingPolicy() { cudaNativeVNNIGemvSweep_clearConfig(); }
+    ~RecordingPolicy()
+    {
+        cudaNativeVNNIGemvSweep_clearConfig();
+        cudaNativeVNNIGemvTuned_setDecodeEquivalentM1Config(previous_verifier_);
+    }
     RecordingPolicy(const RecordingPolicy &) = delete;
     RecordingPolicy &operator=(const RecordingPolicy &) = delete;
+private:
+    int previous_verifier_;
 };
 
 /** @brief Stable signed, nonzero fixture values without model loading. */
@@ -136,15 +153,19 @@ uint32_t mixed(uint32_t value)
  * @param cpt Consecutive output columns assigned to each thread.
  * @param n Logical output width straddling a physical tile boundary.
  * @param k Input width including single-block and odd-block-count witnesses.
+ * @param m Logical rows; one selects the original WIDE proof, larger values the grouped proof.
+ * @param grouped_rows Exact grouped row tile, including register-bounded grid-Z slices.
+ * @param partitions Exact serial/grouped K partition count for ordered reduction.
  */
-void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k)
+void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k,
+                int m = 1, int grouped_rows = 0, int partitions = 1)
 {
     const size_t blocks = static_cast<size_t>(n) * (k / 32);
     std::vector<uint8_t> payload(blocks * payload_bytes);
     std::vector<uint16_t> scales(blocks), secondary(blocks);
     std::vector<uint32_t> minima(blocks);
-    std::vector<int8_t> activations(k);
-    std::vector<float> activation_scales(k / 32);
+    std::vector<int8_t> activations(m * k);
+    std::vector<float> activation_scales(m * (k / 32));
     for (size_t i = 0; i < payload.size(); ++i)
         payload[i] = static_cast<uint8_t>(mixed(i + 203));
     for (size_t i = 0; i < blocks; ++i)
@@ -153,57 +174,69 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
         secondary[i] = static_cast<uint16_t>(0x1000U + (mixed(i + 77) & 0x1fffU));
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
     }
-    for (int i = 0; i < k; ++i)
+    for (int i = 0; i < m * k; ++i)
         activations[i] = static_cast<int>(mixed(i + 389) % 255) - 127;
-    for (int i = 0; i < k / 32; ++i)
+    for (int i = 0; i < m * (k / 32); ++i)
         activation_scales[i] = static_cast<float>(1 + mixed(i + 7) % 31) / 256;
 
     Storage<uint8_t> p(payload.size());
     Storage<uint16_t> s(blocks), secondary_s(blocks);
     Storage<uint32_t> em(blocks);
-    Storage<int8_t> a(k);
-    Storage<float> sa(k / 32), partials(n), oracle(n + 8), output(n + 8);
+    Storage<int8_t> a(m * k);
+    const int elements = m * n;
+    Storage<float> sa(m * (k / 32)), partials(elements * partitions), oracle(elements + 8), output(elements + 8);
     Execution execution;
     const auto stream = execution.stream;
     p.upload(payload, stream); s.upload(scales, stream);
     secondary_s.upload(secondary, stream); em.upload(minima, stream);
     a.upload(activations, stream); sa.upload(activation_scales, stream);
-    cudaGemvContext_bindWorkspace(execution.context.get(), partials.data, n * sizeof(float));
+    cudaGemvContext_bindWorkspace(execution.context.get(), partials.data, elements * partitions * sizeof(float));
     checked(cudaStreamSynchronize(stream));
 
     for (int path = 0; path < 2; ++path)
     {
         auto &graph = execution.graphs[path];
         graph = std::make_unique<llaminar2::CUDAGraphCapture>(stream, 0);
-        RecordingPolicy policy(path == 0 ? Family::SinglePartition : Family::Wide,
-                               path == 0 ? 64 : tile, path == 0 ? 1 : cpt);
+        RecordingPolicy policy(path == 0 || m > 1 ? Family::SinglePartition : Family::Wide,
+                               path == 0 ? 64 : tile, path == 0 ? 1 : cpt,
+                               path == 1 ? grouped_rows : 0, partitions);
         llaminar2::ScopedBackendGraphCapture recording(*graph, "native WIDE tail proof");
         ASSERT_TRUE(recording.begin());
         float *destination = path == 0 ? oracle.data : output.data;
         // This poison is part of the replay, not just setup: stale outputs
         // cannot masquerade as complete publication on a later launch.
-        checked(cudaMemsetAsync(destination, 0x5a, (n + 8) * sizeof(float), stream));
-        ASSERT_TRUE(cudaNativeVNNIGemvTuned_fp32(
-            a.data, p.data, s.data, secondary_s.data, em.data, destination,
-            sa.data, n, k, 1.0f, 0.0f, nullptr, nullptr,
-            static_cast<uint8_t>(codebook), 0, stream,
-            execution.context.get(), nullptr));
+        checked(cudaMemsetAsync(destination, 0x5a, (elements + 8) * sizeof(float), stream));
+        if (path == 1 && m > 1)
+        {
+            ASSERT_TRUE(cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+                a.data, p.data, s.data, secondary_s.data, em.data, destination,
+                sa.data, m, n, k, 1.0f, 0.0f, nullptr, nullptr,
+                static_cast<uint8_t>(codebook), static_cast<uint8_t>(codebook), 0, stream,
+                execution.context.get(), nullptr));
+        }
+        else
+            for (int row = 0; row < m; ++row)
+                ASSERT_TRUE(cudaNativeVNNIGemvTuned_fp32(
+                    a.data + row * k, p.data, s.data, secondary_s.data, em.data, destination + row * n,
+                    sa.data + row * (k / 32), n, k, 1.0f, 0.0f, nullptr, nullptr,
+                    static_cast<uint8_t>(codebook), 0, stream,
+                    execution.context.get(), nullptr));
         recording.finish();
         ASSERT_TRUE(graph->instantiate());
     }
-    std::vector<float> expected(n + 8), actual(n + 8);
+    std::vector<float> expected(elements + 8), actual(elements + 8);
     for (int replay = 0; replay < 20; ++replay)
     {
         ASSERT_TRUE(execution.graphs[0]->launch());
         ASSERT_TRUE(execution.graphs[1]->launch());
-        checked(cudaMemcpyAsync(expected.data(), oracle.data, (n + 8) * sizeof(float),
+        checked(cudaMemcpyAsync(expected.data(), oracle.data, (elements + 8) * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream));
-        checked(cudaMemcpyAsync(actual.data(), output.data, (n + 8) * sizeof(float),
+        checked(cudaMemcpyAsync(actual.data(), output.data, (elements + 8) * sizeof(float),
                                 cudaMemcpyDeviceToHost, stream));
         checked(cudaStreamSynchronize(stream));
-        ASSERT_EQ(std::memcmp(expected.data(), actual.data(), n * sizeof(float)), 0)
+        ASSERT_EQ(std::memcmp(expected.data(), actual.data(), elements * sizeof(float)), 0)
             << "replay=" << replay;
-        for (int i = n; i < n + 8; ++i)
+        for (int i = elements; i < elements + 8; ++i)
         {
             ASSERT_EQ(std::bit_cast<uint32_t>(actual[i]), 0x5a5a5a5aU);
             ASSERT_EQ(std::bit_cast<uint32_t>(expected[i]), 0x5a5a5a5aU);
@@ -211,6 +244,39 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
     }
 }
 } // namespace
+
+/** @brief Prove register-bounded row ownership and K partitions on every codebook. */
+TEST(CUDANativeVNNIWide, CapturedGroupedRegisterBoundsMatchSerialAllFormats)
+{
+    int count = 0;
+    checked(cudaGetDeviceCount(&count));
+    ASSERT_GT(count, 0);
+    checked(cudaSetDevice(0));
+    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned());
+    std::map<int, int> formats;
+    for (const auto &source : llaminar2::native_vnni_formats::kAllSourceFormats)
+    {
+        const auto &format = *source.metadata;
+        formats.emplace(llaminar2::canonicalDeviceVnniCodebookId(format.codebook_id),
+                        format.payload_bytes);
+        const auto promoted = llaminar2::migrationStableDeviceVnniFormat(format);
+        formats.emplace(promoted.codebook_id, promoted.payload_bytes_per_block);
+    }
+    for (const auto &[codebook, payload_bytes] : formats)
+        for (const auto &[tile, cpt] : std::array{
+                 std::pair{32, 1}, std::pair{256, 4}, std::pair{512, 4}})
+            for (int rows : {2, 4, 8, 16, 32, 64})
+                for (int m : {rows, rows + 1, 65})
+                    for (int partitions : {1, 3})
+                    {
+                        SCOPED_TRACE(::testing::Message() << "codebook=" << codebook
+                            << " tile=" << tile << " cpt=" << cpt << " rows=" << rows
+                            << " M=" << m << " K partitions=" << partitions);
+                        verifyWide(codebook, payload_bytes, tile, cpt, tile + 1, 160,
+                                   m, rows, partitions);
+                        if (::testing::Test::HasFatalFailure()) return;
+                    }
+}
 
 /** @brief Sweep every physical codebook and every compiled WIDE output geometry. */
 TEST(CUDANativeVNNIWide, CapturedAllCodebooksAndTileTailsMatchSinglePartition)

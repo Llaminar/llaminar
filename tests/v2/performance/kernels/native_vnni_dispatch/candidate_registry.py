@@ -710,6 +710,26 @@ def cpu_native_vnni_prefill_registry() -> CandidateRegistry:
                 f"nbc{n_block_chunks}-full-k-v1"
             ),
         ))
+    for n_block_chunks in (1, 2, 4, 8):
+        entries.append(_candidate(
+            **common,
+            candidate_id=(
+                "cpu.nvnni.prefill.four_row_grid."
+                f"nbc{n_block_chunks}.full_k"
+            ),
+            aliases=(),
+            family="cpu_native_vnni_four_row_grid",
+            config={
+                "route": "four_row_grid",
+                "n_block_chunks": n_block_chunks,
+                "row_tile": 4,
+                "runtime_isa": "AVX512",
+                "minimum_m": 3,
+                "k_tile_policy": "full_k",
+            },
+            arithmetic="independent ordered serial-M1 K accumulation per row-v1",
+            schedule=f"cpu-native-vnni-four-row-grid-nbc{n_block_chunks}-full-k-v1",
+        ))
     for policy, family, row_tile in (
         ("Pairwise", "cpu_native_vnni_kpart_pairwise", 2),
         ("WideRows", "cpu_native_vnni_kpart_wide_rows", 4),

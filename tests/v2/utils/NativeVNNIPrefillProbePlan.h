@@ -20,6 +20,7 @@
 
 #include <stdexcept>
 #include <string_view>
+#include "kernels/cpu/gemm/CPUNativeVNNIPrefillSchedule.h"
 
 namespace llaminar2::test::trainer
 {
@@ -46,6 +47,7 @@ namespace llaminar2::test::trainer
      * @param M Number of grouped input rows. Ordinary prefill requires M >= 2.
      * @param N Number of output columns.
      * @param threads Number of threads visible to the production launcher.
+     * @param encoding Actual prepared encoding; required for Auto row reuse.
      * @return Registry ID of the physical route production will execute.
      *
      * @throws std::invalid_argument when the supplied geometry is not an
@@ -63,7 +65,9 @@ namespace llaminar2::test::trainer
         bool effective_runtime_is_avx512,
         int M,
         int N,
-        int threads)
+        int threads,
+        cpu::native_vnni::CPUNativeVNNIEncoding encoding =
+            cpu::native_vnni::CPUNativeVNNIEncoding::ExpandedInt8)
     {
         if (M < 2 || N <= 0 || threads <= 0)
         {
@@ -83,17 +87,44 @@ namespace llaminar2::test::trainer
                        : kCPUPrefillKPartPairwiseCandidate;
         }
 
+        // Keep unsupported ISA/M candidates in the complete research matrix.
+        // Reuse an independently measured pairwise probe, but its different
+        // observed identity prevents timing or promoting the four-row label.
+        // This is diagnostic evidence reuse, never production dispatch.
+        if (!effective_runtime_is_avx512 || M < 3)
+        {
+            if (requested_candidate_id == "cpu.nvnni.prefill.four_row_grid.nbc1.full_k")
+                return "cpu.nvnni.prefill.two_row_pair_grid.nbc1.full_k";
+            if (requested_candidate_id == "cpu.nvnni.prefill.four_row_grid.nbc2.full_k")
+                return "cpu.nvnni.prefill.two_row_pair_grid.nbc2.full_k";
+            if (requested_candidate_id == "cpu.nvnni.prefill.four_row_grid.nbc4.full_k")
+                return "cpu.nvnni.prefill.two_row_pair_grid.nbc4.full_k";
+            if (requested_candidate_id == "cpu.nvnni.prefill.four_row_grid.nbc8.full_k")
+                return "cpu.nvnni.prefill.two_row_pair_grid.nbc8.full_k";
+        }
         if (!candidate_uses_kpart)
             return requested_candidate_id;
 
-        // A K-part request on a serial-full-K shape carries an Auto schedule
-        // and nbc=1 into the production launcher. Auto selects the row/chunk
-        // grid when there are too few N chunks for the thread team, or when a
-        // sub-64 output stride makes the two-row microkernel inapplicable.
-        const int n_chunks = (N + 63) / 64;
-        const int row_chunk_task_limit = threads / 4;
-        return N < 64 || n_chunks <= row_chunk_task_limit
-                   ? kCPUPrefillRowChunkCandidate
-                   : kCPUPrefillTwoRowNbc1Candidate;
+        // A K-part request on a serial-full-K shape carries Auto and nbc=1.
+        // Reuse the production policy; a second heuristic here previously
+        // disagreed with the real grid once wave balancing was introduced.
+        using namespace cpu::native_vnni;
+        switch (resolvePrefillSchedule(PrefillSchedulePolicy::Auto,
+            {M, N, N, 1, threads, encoding,
+             effective_runtime_is_avx512 ? PrefillRowKernelSet::WideRows
+                                        : PrefillRowKernelSet::Pairwise}))
+        {
+        case PrefillSchedulePolicy::RowChunkGrid:
+            return kCPUPrefillRowChunkCandidate;
+        case PrefillSchedulePolicy::TwoRowNMajor:
+            return kCPUPrefillTwoRowNbc1Candidate;
+        case PrefillSchedulePolicy::TwoRowPairGrid:
+            return "cpu.nvnni.prefill.two_row_pair_grid.nbc1.full_k";
+        case PrefillSchedulePolicy::FourRowGrid:
+            return "cpu.nvnni.prefill.four_row_grid.nbc1.full_k";
+        case PrefillSchedulePolicy::Auto:
+            throw std::logic_error("Prefill policy failed to resolve Auto");
+        }
+        throw std::logic_error("Unknown resolved CPU prefill schedule");
     }
 } // namespace llaminar2::test::trainer

@@ -1,11 +1,17 @@
 /**
  * @file MoESparseDispatchStage.cpp
  * @brief Implementation of graph-native sparse MoE dispatch payload stage.
+ *
+ * Host descriptors are consumed in canonical token-major order. Metadata is
+ * validated and compacted before independent hidden-row copies; publication
+ * occurs only after those copies join, using the graph's fixed workspace.
  */
 
 #include "MoESparseDispatchStage.h"
 
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEOverlayHostDispatchRows.h"
+#include "../../../execution/moe/MoEOverlayHostRowWork.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -480,13 +486,12 @@ namespace llaminar2
                     entry_targets_this_participant));
             size_t entry_cursor = 0;
             size_t compact_row = 0;
-            for (const int token_row : tier->token_rows)
-            {
+            const MoEOverlayHostDispatchRows ordered_rows(*tier, logical_seq_len);
+            ordered_rows.forEachRow([&](int token_row, auto row_entries) {
                 const size_t row_entry_begin = entry_cursor;
-                for (const auto &entry : tier->entries)
+                for (const auto &entry : row_entries)
                 {
-                    if (entry.token_row != token_row ||
-                        !entry_targets_this_participant(entry))
+                    if (!entry_targets_this_participant(entry))
                         continue;
                     const std::int32_t local_route =
                         static_cast<std::int32_t>(entry_cursor -
@@ -502,19 +507,23 @@ namespace llaminar2
                     ++entry_cursor;
                 }
                 if (entry_cursor == row_entry_begin)
-                    continue;
+                    return true;
 
                 outbound.row_ids_host[compact_row] = token_row;
-                std::memcpy(
-                    outbound.hidden_rows_fp32 +
-                        compact_row * static_cast<size_t>(params_.d_model),
-                    hidden + static_cast<size_t>(token_row) *
-                                 static_cast<size_t>(params_.d_model),
-                    static_cast<size_t>(params_.d_model) * sizeof(float));
                 outbound.entry_offsets_host[compact_row] =
                     static_cast<int32_t>(row_entry_begin);
                 ++compact_row;
-            }
+                return true;
+            });
+            // The compact row map is immutable before workers copy payloads.
+            // Counts become visible only after the workshare's implicit join.
+            forEachMoEOverlayHostRow(compact_row,
+                static_cast<size_t>(params_.d_model) * sizeof(float), [&](size_t row) {
+                std::memcpy(
+                    outbound.hidden_rows_fp32 + row * static_cast<size_t>(params_.d_model),
+                    hidden + static_cast<size_t>(outbound.row_ids_host[row]) * params_.d_model,
+                    static_cast<size_t>(params_.d_model) * sizeof(float));
+            });
             outbound.live_row_count = compact_row;
             outbound.live_entry_count = entry_cursor;
             if (entry_cursor != expected_entry_count)

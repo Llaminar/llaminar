@@ -144,7 +144,9 @@ existing_owned_mount() {
 }
 
 share_runner_access() {
-    [[ -n "${shared_uid}" ]] || return
+    # Local callers do not request ARC ACLs. This is a successful no-op: bare
+    # `return` would preserve the false test status and abort setup under -e.
+    [[ -n "${shared_uid}" ]] || return 0
     # ARC's non-root runner receives read/traverse ACLs on the same mounted
     # pages. This deliberately does not make that runner the persistent-cache
     # lifecycle owner: staging toggles directory modes and therefore must stay

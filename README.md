@@ -220,9 +220,16 @@ You can add these options to the command when you need them:
 | Connect from another machine | Change to `--host 0.0.0.0` and use the server's IP address |
 
 MTP lets the model propose and verify several output tokens at a time. Dynamic
-depth adapts how many it proposes. Prefix caching, which reuses work from
+depth adapts how many it proposes. It works with both ordinary temperature-based
+chat sampling and greedy requests; you do not need an extra verification flag.
+Prefix caching, which reuses work from
 previous prompts, is enabled by default. If you expose the server to other
 machines, use a trusted network or an authenticated proxy.
+
+Head placement is automatic too: CPU tensor-parallel execution splits the
+vocabulary projection across participants; CUDA and ROCm keep a mirrored head.
+For experiments, `--mtp-terminal-head-policy vocabulary-sharded` or
+`--mtp-terminal-head-policy mirrored-full-vocabulary` overrides that choice.
 
 Wait for the server to become ready, then use another terminal:
 
@@ -970,6 +977,8 @@ creating the plan if you intend to benchmark it.
 
 The examples use `--temperature 0 --seed 42` for greedy sampling. Avoid adding
 `--deterministic` just for a benchmark: it also changes kernel selection.
+For sampled generation, set `--temperature`, `--top-k`, and `--top-p` explicitly;
+the same sampling settings apply with MTP on or off.
 Leave profiling and debug options off while measuring throughput.
 
 For comparisons with other engines, the JSON field
@@ -999,7 +1008,7 @@ results. Each configuration's AVX512 result sets the scale for its pair of bars.
 
 ![Published-image prefill and decode benchmarks](benchmarks/production/published/benchmarks.svg)
 
-Tested image source: [`6f823000cd06`](https://github.com/Llaminar/llaminar/commit/6f823000cd0654cf70b1187cae2128aff551ce95). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
+Tested image source: [`ff61316f3184`](https://github.com/Llaminar/llaminar/commit/ff61316f3184a2846201445833c6fd4687d4142e). Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.
 [Exact configurations, image digests and samples](benchmarks/production/published/results.json). This is E2E/benchmark evidence, not full production-image certification.
 
 <!-- published-benchmarks:end -->

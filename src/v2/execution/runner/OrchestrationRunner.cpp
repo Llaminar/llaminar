@@ -44,6 +44,7 @@
 #include "../mtp/MTPStateTransaction.h"
 #include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPDeviceGenerationPolicy.h"
+#include "../mtp/MTPRequestSamplingPolicy.h"
 #include "../mtp/MTPRejectionSampler.h"
 #include "../mtp/MTPSpecDecodeMetadata.h"
 #include "../mtp/MTPSpecDecodeTransaction.h"
@@ -639,16 +640,12 @@ namespace llaminar2
             if (!model_ctx)
                 return MTPDepthPolicyModelClass::Any;
 
-            std::string architecture = model_ctx->architecture();
-            std::transform(
-                architecture.begin(),
-                architecture.end(),
-                architecture.begin(),
-                [](unsigned char c)
-                { return static_cast<char>(std::tolower(c)); });
+            const auto &architecture = model_ctx->architecture();
             if (architecture.empty())
                 return MTPDepthPolicyModelClass::Any;
-            if (architecture.find("moe") != std::string::npos)
+            constexpr std::string_view marker = "moe";
+            if (std::search(architecture.begin(), architecture.end(), marker.begin(), marker.end(),
+                    [](unsigned char left, char right) { return std::tolower(left) == right; }) != architecture.end())
                 return MTPDepthPolicyModelClass::MoE;
             return MTPDepthPolicyModelClass::Dense;
         }
@@ -4381,12 +4378,15 @@ namespace llaminar2
                 }
 
                 int suffix_start = matched_tokens;
-                int suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
                 bool terminal_state_restored = false;
 
-                if (suffix_len > 0)
+                // Both an imported checkpoint and a newly archived frontier
+                // are live prefix state. Advance each interval once, through
+                // the same native prefill or one-row decode transaction.
+                const auto forward_prefix_interval = [&](int end) -> bool
                 {
-                    if (matched_tokens > 0 && suffix_len == 1)
+                    const int suffix_len = end - suffix_start;
+                    if (suffix_start > 0 && suffix_len == 1)
                     {
                         /*
                          * A one-row suffix after a restored prefix is a serial
@@ -4414,7 +4414,7 @@ namespace llaminar2
                                 ? runner_->forwardRestoredPrefixMTPDecodeBridge(
                                       {.token_id = suffix_token,
                                        .restored_prefix_tokens =
-                                           matched_tokens})
+                                           suffix_start})
                                 : runner_->forward(
                                       &suffix_token,
                                       /*seq_len=*/1);
@@ -4450,6 +4450,30 @@ namespace llaminar2
                     {
                         return false;
                     }
+                    suffix_start = end;
+                    return true;
+                };
+
+                if (const auto checkpoint = coordinated_hit.reusablePrefillCheckpoint(
+                        static_cast<int>(prompt_tokens.size()), matched_tokens,
+                        stable_prefix_prefill_segment_tokens))
+                {
+                    if (!forward_prefix_interval(*checkpoint))
+                        return false;
+                    // Harvest authenticates exactly the tokens already run,
+                    // never the still-unexecuted chat-template tail. Saving
+                    // here is essential: recurrent state cannot be rewound
+                    // from the final prompt checkpoint on the next request.
+                    const std::vector<int32_t> checkpoint_tokens(
+                        prompt_tokens.begin(), prompt_tokens.begin() + *checkpoint);
+                    if (!runner_->harvestPrefix(local_hit, checkpoint_tokens, *checkpoint))
+                        return setError("Prefix cache reusable-boundary harvest failed");
+                }
+
+                if (suffix_start < static_cast<int>(prompt_tokens.size()))
+                {
+                    if (!forward_prefix_interval(static_cast<int>(prompt_tokens.size())))
+                        return false;
                     prefill_logits_ready_ = true;
                 }
                 else if ((!common_hit.requires_terminal_logits ||
@@ -7129,6 +7153,12 @@ namespace llaminar2
         if (!mtp.enabled || !runner_)
             return {};
 
+        if (!active_sampling_params_.is_greedy() &&
+            mtp.verify_mode == MTPVerifyMode::Greedy)
+        {
+            return "MTP greedy verification requires greedy sampling; use --mtp-verify-mode speculative-sampling for non-greedy requests";
+        }
+
         const int effective_max_draft_tokens = effectiveMTPMaxDraftDepth(mtp);
         if (effective_max_draft_tokens < 1)
         {
@@ -7171,11 +7201,6 @@ namespace llaminar2
         if (!runner_)
         {
             return "runner unavailable";
-        }
-        if (!active_sampling_params_.is_greedy() &&
-            mtp.verify_mode != MTPVerifyMode::SpeculativeSampling)
-        {
-            return "sampling is not greedy";
         }
         const std::string runner_reason = runner_->mtpDecodeUnsupportedReason();
         if (!runner_reason.empty())
@@ -7231,18 +7256,6 @@ namespace llaminar2
             if (!mtp_depth_controller_)
             {
                 MTPDepthPolicyConfig depth_policy = resolveMTPDepthPolicyConfig(mtp);
-                const DeviceId primary_device = runner_->primaryDeviceId();
-                if (primary_device.is_cuda())
-                    depth_policy.backend = MTPDepthPolicyBackend::CUDA;
-                else if (primary_device.is_rocm())
-                    depth_policy.backend = MTPDepthPolicyBackend::ROCm;
-                else if (primary_device.is_cpu())
-                    depth_policy.backend = MTPDepthPolicyBackend::CPU;
-                else
-                    depth_policy.backend = MTPDepthPolicyBackend::Any;
-                depth_policy.model_class =
-                    inferMTPDepthPolicyModelClass(model_ctx_);
-
                 mtp_depth_controller_ =
                     std::make_unique<MTPDepthController>(
                         depth_policy,
@@ -16642,10 +16655,23 @@ namespace llaminar2
     MTPRuntimeConfig OrchestrationRunner::activeMTPRequestConfig() const
     {
         const MTPRuntimeConfig &retained = retainedMTPConfig();
-        return composeMTPRequestConfig(
+        auto active = resolveMTPSamplingRequestConfig(
             retained,
             mtp_request_policy_.value_or(
-                makeMTPRequestPolicy(retained)));
+                makeMTPRequestPolicy(retained)),
+            active_sampling_params_);
+        // Both host and device-controller admission consume this same context.
+        // Previously only the host controller received backend/model identity,
+        // leaving the GPU ABI on a different, untrained initial-depth policy.
+        if (runner_)
+        {
+            const auto device = runner_->primaryDeviceId();
+            active.depth_policy.backend = device.is_cuda() ? MTPDepthPolicyBackend::CUDA
+                : device.is_rocm() ? MTPDepthPolicyBackend::ROCm
+                : device.is_cpu() ? MTPDepthPolicyBackend::CPU : MTPDepthPolicyBackend::Any;
+            active.depth_policy.model_class = inferMTPDepthPolicyModelClass(model_ctx_);
+        }
+        return active;
     }
 
     bool OrchestrationRunner::mtpRequestPolicyTransitionIsIdle() const noexcept
@@ -24887,6 +24913,11 @@ namespace llaminar2
                 params_buf, 6, mpi_coordinated_root_rank_);
         }
 
+        // Depth observations belong to one sampling law. A long-lived service
+        // may alternate stochastic and argmax requests over the same retained
+        // graph family; the new specialization must not reuse the old controller.
+        if (active_sampling_params_.is_greedy() != params.is_greedy())
+            mtp_depth_controller_.reset();
         active_sampling_params_ = params;
         ordinary_generation_seeds_.reset();
         // Reset token history and deterministic RNG for a new conversation/request.

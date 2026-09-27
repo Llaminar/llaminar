@@ -1977,8 +1977,10 @@ namespace
                  reference_output,
                  candidate_output})
         {
-            if (!tensor->ensureOnDevice(device, stream))
-                throw std::runtime_error("failed to publish CUDA sweep tensor");
+            // Admission must join each upload's exact producer event before
+            // recording. Residency alone is not a capture-ready input contract.
+            TransferEngine::prepareDeviceInput(tensor.get(), device, stream);
+            TransferEngine::requireDeviceInput(tensor.get(), device, stream);
         }
 
         const auto prepare_groups = [&]()
@@ -2471,7 +2473,7 @@ namespace
         {
             if (shared)
             {
-                return moe->prepareSharedExpertPrefillGroup(rows);
+                return moe->prepareSharedExpertPrefillGroup(llaminar2::DeviceRowRange::fullyActive(rows));
             }
             return moe->prepareExpertGroupsAsync(
                 route_indices_tensor.get(), route_weights_tensor.get(),
@@ -3182,6 +3184,52 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
     }
     EXPECT_GT(executed_cells, 0)
         << "CUDA production filters selected no GGUF-derived cells";
+#endif
+}
+
+/**
+ * @brief Guard paired gate/up register-lifetime changes across every format.
+ *
+ * A small model-free expert bank exercises full and partial sixteen-row tiles
+ * through captured production dispatch. Each compiled column width must retain
+ * the complete serial-row output bytes. This is a functional certificate with
+ * no throughput requirement; timing tournaments remain outside preflight.
+ */
+TEST(Perf__MoEVerifierPrefill, CUDA_PairedGateUpRegisterLifetimeAllFormats)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    ASSERT_TRUE(hasCudaDevice());
+    ScopedEnvOverride rowwise_iterations(
+        "LLAMINAR_MOE_VERIFIER_PREFILL_ROWWISE_ITERS", "1");
+    ScopedEnvOverride perfstats("LLAMINAR_PERF_STATS_JSON", "1");
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        const llaminar2::test::native_vnni_dispatch::MoERoutedPrefillCase fixture{
+            .hidden_size = 512,
+            .routed_expert_width = 256,
+            .expert_count = 5,
+            .experts_per_token = 2,
+            .routed = {.gate = format.label, .up = format.label,
+                       .down = format.label},
+        };
+        for (const int columns : {32, 64, 128})
+        {
+            SCOPED_TRACE(::testing::Message()
+                         << format.label << "/columns=" << columns);
+            const CudaMoEProductionCandidate candidate{
+                .gateup_columns = columns,
+                .down_columns = 32,
+                .schedule = llaminar2::cuda::moe::
+                    GroupedImmaGateUpSchedule::PairedProjections,
+            };
+            proveCudaProductionCandidateInvariance(
+                fixture, 39, 0,
+                llaminar2::test::native_vnni_dispatch::MoERoutingProfile::PowerLaw,
+                candidate);
+        }
+    }
 #endif
 }
 

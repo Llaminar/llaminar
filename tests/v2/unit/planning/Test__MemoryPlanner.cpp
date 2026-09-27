@@ -20,7 +20,9 @@
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
+#include "../../utils/QuantizedVerifierFormats.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "backends/DeviceId.h"
 
@@ -2705,6 +2707,126 @@ TEST(Test__MemoryPlanner, RoutedExpertConcurrentWorkspaceOwnersAreAdditive)
     participant.concurrent_workspace_owners = 0u;
     EXPECT_THROW((void)MemoryPlanner::plan(profile, {participant}),
                  std::invalid_argument);
+}
+
+/**
+ * @test CPU continuations admit the exact local sparse stage, not token-only scratch.
+ *
+ * A continuation still executes a compact expert packet: each token can route
+ * to every top-k expert. Compare the physical BOM with the production stage's
+ * metadata-only declaration, without allocating weights or multi-GiB scratch.
+ * Explicit serial capacities are already flattened across requests; TP changes
+ * expert ownership, never the shape of one whole expert's projection.
+ */
+TEST(Test__MemoryPlanner, CPUOverlayContinuationAdmitsCompactProjectionWorkspaceAllFormats)
+{
+    std::vector<std::pair<std::string, TensorType>> formats{
+        {"F32", TensorType::FP32}, {"F16", TensorType::FP16}, {"BF16", TensorType::BF16}};
+    for (const auto &format : test::quantizedVerifierFormats())
+        formats.emplace_back(format.label, format.tensor_type);
+
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 1;
+    profile.d_model = 2048;
+    profile.d_ff = profile.expert_feed_forward_length = 512;
+    profile.expert_count = 8;
+    profile.expert_used_count = 8;
+    profile.n_heads = 16;
+    profile.n_kv_heads = 8;
+    profile.head_dim = 128;
+    profile.vocab_size = 1024;
+    profile.max_seq_len = 8192;
+
+    for (const int batch : {1, 2})
+    for (const int declared_rows : {0, 31, 512, 2048, 4096})
+    for (int shards = 1; shards <= 8; ++shards)
+    {
+        auto cfg = overlayDeviceConfig(DeviceId::cpu());
+        cfg.device_total_bytes = cfg.device_free_bytes = 256ULL * 1024 * 1024 * 1024;
+        cfg.device_compute_units = 28;
+        cfg.batch_size = batch;
+        cfg.max_seq_len = 8192;
+        cfg.activation_seq_len = 2048;
+        cfg.first_layer = cfg.last_layer = 0;
+        cfg.total_shards = shards;
+        cfg.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(8, {1});
+        cfg.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+        cfg.serial_routed_expert_participant_count = 1;
+        cfg.serial_routed_expert_compact_rows = declared_rows;
+        const int token_rows = declared_rows > 0 ? declared_rows : batch * cfg.activation_seq_len;
+
+        // Remove only the expert matrices to isolate their named workspace
+        // contribution from the independent attention family in the same BOM.
+        profile.tensors.clear();
+        const auto base = MemoryPlanner::plan(profile, {cfg}).devices.front().workspace_bytes();
+        for (const auto &[name, type] : formats)
+        {
+            SCOPED_TRACE(name + " batch=" + std::to_string(batch) +
+                " declared_rows=" + std::to_string(declared_rows) + " tp=" + std::to_string(shards));
+            profile.tensors = {
+                {.name = "blk.0.ffn_gate_exps.weight", .quant_type = name,
+                 .elements = 8u * 512 * 2048, .K = 2048, .layer_index = 0},
+                {.name = "blk.0.ffn_up_exps.weight", .quant_type = name,
+                 .elements = 8u * 512 * 2048, .K = 2048, .layer_index = 0},
+                {.name = "blk.0.ffn_down_exps.weight", .quant_type = name,
+                 .elements = 8u * 2048 * 512, .K = 512, .layer_index = 0}};
+            MoELocalExpertStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.num_experts = profile.expert_count;
+            params.top_k = profile.expert_used_count;
+            params.d_model = profile.d_model;
+            params.expert_intermediate = profile.expert_feed_forward_length;
+            params.cpu_workspace_source = MoELocalExpertStage::CPUExpertWorkspaceSource{
+                .gate = type, .up = type, .down = type,
+                .workers = cfg.device_compute_units, .execution = cfg.cpu_execution};
+            const MoELocalExpertStage stage(std::move(params));
+            const auto required = stage.getWorkspaceRequirements(token_rows, 0, 0).total_bytes_with_alignment();
+            const auto plan = MemoryPlanner::plan(profile, {cfg});
+            EXPECT_EQ(plan.devices.front().workspace_bytes(), base + required);
+            const auto *bom = plan.physicalPlan().find({-1, DeviceId::cpu()});
+            ASSERT_NE(bom, nullptr);
+            EXPECT_EQ(bom->bytes(PhysicalMemoryOwner::ExecutionWorkspace), base + required);
+
+            // A follower consumes the same packet without the continuation's
+            // attention scratch. In particular, batch=2 must not double an
+            // explicitly flattened serial token capacity for a second time.
+            auto follower = cfg;
+            follower.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+            follower.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(8, {1});
+            EXPECT_EQ(MemoryPlanner::plan(profile, {follower}).devices.front().workspace_bytes(), required);
+        }
+    }
+    auto invalid = overlayDeviceConfig(DeviceId::cpu());
+    invalid.first_layer = invalid.last_layer = 0;
+    invalid.weight_residency = DeviceWeightResidency::continuationWithSelectedRoutedExperts(8, {1});
+    invalid.serial_routed_expert_compact_rows = -1;
+    EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::invalid_argument);
+    invalid.serial_routed_expert_compact_rows = std::numeric_limits<int>::max();
+    EXPECT_THROW(MemoryPlanner::plan(profile, {invalid}), std::runtime_error);
+}
+
+/** @test Explicit compact capacity is already batched on every backend. */
+TEST(Test__MemoryPlanner, OverlayCompactWorkspaceCapacityIsFlattenedOnEveryBackend)
+{
+    const auto profile = createMoEOverlayProfile();
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto cfg = overlayDeviceConfig(device);
+        cfg.execution_role = DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        cfg.weight_residency = DeviceWeightResidency::selectedRoutedExpertsOnly(8, {2, 2});
+        cfg.routed_expert_compact_buffer_lifetime = RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+        cfg.serial_routed_expert_participant_count = 1;
+        cfg.serial_routed_expert_compact_rows = 31;
+        const auto one = MemoryPlanner::plan(profile, {cfg}).devices.front().workspace_bytes();
+        ASSERT_GT(one, 0u);
+        for (int batch : {2, 3, 8})
+        {
+            cfg.batch_size = batch;
+            EXPECT_EQ(MemoryPlanner::plan(profile, {cfg}).devices.front().workspace_bytes(), one);
+        }
+    }
 }
 
 TEST(Test__MemoryPlanner, OverlayContinuationReservesItsOwnCompactRouteBuffers)

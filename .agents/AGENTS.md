@@ -301,6 +301,39 @@ ownership.
 
 ## Build
 
+Optimized `Release` and `Integration` builds reject memory spills in all
+project-owned CUDA/HIP kernels, including generated specializations and test
+targets. `cmake/GpuSpillGuard.cmake` owns this policy: CUDA uses fatal ptxas
+spill warnings; HIP audits final per-architecture code-object spill counts and
+LLVM's final per-function stack-slot classifications after compilation or a ccache hit.
+Proven ROCm scalar-to-vector register-lane moves are reported, not rejected.
+Incomplete allocation evidence fails closed. Do not disable the guard or add kernel
+allowlists to make a build pass. Fix register pressure while retaining numeric
+correctness and measured performance. Intentional private storage and diagnostic
+call frames are distinct from register spills; Debug is not a performance gate.
+Integration retains symbols but disables HIP's debug-unwind-only register saves,
+which otherwise introduce scratch traffic absent from optimized Release code.
+Full intrusive device call-frame unwinding remains available in Debug.
+The model-free `GPUSpillCompilation` build dependencies prove spilling kernels
+and device helpers fail, while register-only moves and deliberate-local-memory
+kernels pass with the actual compilers. Preflight verifies the complete
+source/compiler/architecture-bound proof, including every rebuild outcome.
+Missing or stale evidence fails; installed test runners never need to carry a
+compiler SDK or silently skip compilation-policy coverage.
+
+Spill results are architecture-specific. Before publishing GPU kernel or
+compiler-resource changes, compile the complete architecture set declared by
+the canonical image build, not only the locally installed GPU's target. Record
+the target set with the validation evidence. Passing native-device runtime
+tests does not prove register allocation on the other shipped targets.
+
+ROCm test/tuning builds also require the lightweight `rocprofiler-sdk-roctx`
+annotation package. `scripts/docker/install-rocm-test-deps.sh` installs that
+closure from the configured ROCm repository in both the compiler builder and
+the installed test runner. A full development SDK already provides it. CMake
+requires the package's imported target; do not hard-code an unchecked library
+filename or add the profiler toolchain to the production serving image.
+
 Use an out-of-tree Ninja build and unrestricted build parallelism. The
 container image and workspace environment pin the same Ninja release. Resolve
 that active executable once when configuring, record it in
@@ -331,6 +364,19 @@ package and run this installer before ROCm gates. Do not disable packet capture
 or serialize independent graph builders to hide an unfixed system HIP runtime.
 `V2_Integration_HIPConcurrentGraphIdentity` is the focused preflight proof that
 every operation survives concurrent construction and replay.
+
+`ROCmRuntimeStartup` also prepares the process-wide explicit host-memory ABI
+before HIP/HSA initialization: native driver-backed host allocations and pinned
+buffer-object registration (`HSA_USERPTR_FOR_PAGED_MEM=0`, `HSA_USE_SVM=0`).
+Callers do not set these as tuning flags or substitute HMM-managed host ranges
+for TransferEngine ownership. Conflicting or late setup fails ROCm admission;
+CPU-only startup must not initialize a GPU to prepare this policy.
+ROCm registration also isolates its first/last base pages from neighbouring
+huge-page reclaim through `HostRegistrationPageBoundary`. Do not replace this
+storage-boundary contract with a global THP setting or a driver-warning
+allowlist; interior huge pages remain eligible and TransferEngine retains
+registration ownership. Its geometry and captured-replay regressions belong
+to `ProductionTestPreflight`.
 
 Full-backend binaries also run on CPU-only cluster members. Keep CUDA Driver
 API binding in `CUDADriverApi`, prepared before CUDA graph recording; do not
@@ -634,6 +680,12 @@ requests fail as unimplemented. KV precision, allreduce wire precision and exper
 weight formats are separate settings. Leave their defaults intact for the
 initial auto baseline. Prefix caching is enabled by default; MTP is independently
 enabled with `--mtp`, and `--mtp-depth-policy dynamic` selects adaptive depth.
+MTP verification defaults to `speculative-sampling`, which also specializes
+greedy requests without changing their depth economics. Non-greedy requests
+must not silently disable MTP. Explicit `--mtp-verify-mode greedy` is a
+greedy-request-only restriction; incompatible sampling fails with a diagnostic.
+Request admission derives execution policy from the actual sampler while
+retaining the startup graph envelope and authored verification capability.
 
 MTP hardware defaults are selected once by `ExecutionPlanBuilder` from the
 complete continuation domain and canonical device inventory. Their numeric
@@ -642,6 +694,13 @@ explicit request intent through CLI/YAML and MPI; never infer an override by
 comparing its value with an old default. Other expert tiers cannot select the
 continuation policy. Request admission resolves the profile into the existing
 device-controller ABI without changing MTP enablement, mode, or graph capacity.
+
+`--mtp-terminal-head-policy auto` is the public default: CPU continuation
+domains use vocabulary-sharded heads, while CUDA/ROCm retain mirrored full
+heads. Expert-only tiers do not change that choice. Explicit
+`vocabulary-sharded` or `mirrored-full-vocabulary` overrides are preserved.
+The rank compiler seals the policy before memory admission; graph construction,
+saved plans, and physical-weight accounting consume that same resolved value.
 
 ## Benchmarking
 
@@ -727,7 +786,13 @@ commit or publish implicitly. See `docs/production-ci.md`. Do not
 add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
 
-The enabled `develop` GitHub workflow is deliberately smaller: it invokes
+Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml`: build
+one AVX512 full-backend image pair and run only complete Unit and
+`ProductionTestPreflight` inside its test-runner image. This is the pre-commit
+test scope, not model or image certification. It reuses the existing image
+driver without publication; no AVX2, models, E2E or benchmarks run on this PR.
+
+The enabled `develop` push workflow is deliberately smaller than certification: it invokes
 `scripts/ci/run_develop_image_gate.py` to build AVX512 and AVX2 full-backend
 images, run only the complete Unit and `ProductionTestPreflight` gates inside
 each builder, and publish the two tested `develop` runtime tags. It does not

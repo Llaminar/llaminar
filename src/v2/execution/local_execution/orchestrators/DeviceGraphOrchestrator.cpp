@@ -70,6 +70,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/common/SamplingMath.h"
+#include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
 #include "../../../models/qwen35moe/Qwen35MoEGraph.h"
 #include "../../compute_stages/stages/RoPEStage.h"
 #include "../../moe/MoERebalanceController.h"
@@ -3157,6 +3158,23 @@ namespace llaminar2
                     {"row", std::to_string(row)}});
         }
 
+        /**
+         * @brief Select the first maximal token from the producer's exact row.
+         *
+         * GPU tensors retain their stream-ordered backend reduction. CPU rows
+         * use the shared ISA-dispatched selector; the optional margin observer
+         * alone needs a second-best logit. Neither path changes row ownership
+         * or coordinates participants: the caller owns that explicit edge.
+         * @param tensor Published logits tensor, not an unpopulated sibling.
+         * @param row Logical row inside the published tensor.
+         * @param token_offset Global vocabulary origin of this participant.
+         * @param argmax_partial_vals Prepared GPU reduction-value scratch.
+         * @param argmax_partial_idxs Prepared GPU reduction-index scratch.
+         * @param argmax_partial_capacity Capacity of both GPU scratch banks.
+         * @param stream Exact GPU producer/consumer stream; unused for CPU.
+         * @param source Diagnostic name of the publication surface.
+         * @return Candidate with global token ID, or an invalid candidate.
+         */
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
             TensorBase *tensor,
             int row,
@@ -3280,6 +3298,24 @@ namespace llaminar2
                 return candidate;
 
             const float *row_data = data + row_offset;
+            if (!greedyMarginStatsEnabled())
+            {
+                // The selector visits lanes in vocabulary order and only
+                // replaces a winner on strict greater-than. SIMD therefore
+                // preserves first-token ties (including signed zero) without
+                // computing unused runner-up diagnostics on every MTP row.
+                if (cpu_sampling::select_topk(
+                        row_data, static_cast<int>(cols), 1,
+                        &max_val, &max_idx) != 1)
+                    return candidate;
+                candidate.value = max_val;
+                candidate.token = token_offset + max_idx;
+                candidate.valid = 1;
+                return candidate;
+            }
+
+            // Keep the explicitly requested margin observation's original
+            // second-best/NaN semantics; it does not label clean timing runs.
             max_idx = 0;
             max_val = row_data[0];
             float second_val = -std::numeric_limits<float>::infinity();
@@ -29924,16 +29960,55 @@ namespace llaminar2
         return publication.tensor;
     }
 
-    TensorBase *DeviceGraphOrchestrator::currentPrefixArchiveLogits() const noexcept
+    std::optional<DeviceGraphOrchestrator::PrefixArchiveLogitsView>
+    DeviceGraphOrchestrator::currentPrefixArchiveLogits() const
     {
         const auto &publication = current_main_logits_publication_;
         if (!publication.valid || !publication.tensor ||
             publication.session_epoch != session_epoch_ ||
-            !publication.descriptor.supportsScalarMainConsumer())
+            !publication.descriptor.supportsScalarMainConsumer() ||
+            prefix_layout_.terminal_logits_bytes == 0)
         {
-            return nullptr;
+            return std::nullopt;
         }
-        return publication.tensor;
+        if (!graph_builder_ || publication.tensor->native_type() != TensorType::FP32 ||
+            prefix_layout_.terminal_logits_bytes % sizeof(float) != 0)
+            throw std::logic_error("Prefix terminal logits require an owned FP32 vocabulary row");
+
+        const auto &config = graph_builder_->config();
+        const int local_start = localLogitsVocabOffset();
+        if (config.vocab_size <= 0 || local_start < 0)
+            throw std::logic_error("Prefix terminal logits have invalid vocabulary ownership");
+        const size_t full_columns = static_cast<size_t>(config.vocab_size);
+        const size_t archive_columns = prefix_layout_.terminal_logits_bytes / sizeof(float);
+        const PrefixLogitsVocabularyRange full{0, full_columns};
+        const PrefixLogitsVocabularyRange local{static_cast<size_t>(local_start),
+            config.vocab_local > 0 ? static_cast<size_t>(config.vocab_local) : 0};
+        const PrefixLogitsVocabularyRange archive = archive_columns == full_columns ? full : local;
+        if (archive_columns != archive.token_count)
+            throw std::logic_error("Prefix terminal-logit layout disagrees with its vocabulary shard");
+
+        PrefixLogitsVocabularyRange source = full;
+        switch (publication.descriptor.storage_surface)
+        {
+        case ForwardLogitsStorageSurface::CanonicalFull:
+        case ForwardLogitsStorageSurface::AllPositionFull:
+            break;
+        case ForwardLogitsStorageSurface::CanonicalLocal:
+        case ForwardLogitsStorageSurface::AllPositionLocal:
+            source = local;
+            break;
+        default:
+            throw std::logic_error("Prefix terminal logits have no owned publication surface");
+        }
+        // The immutable archive width, not the current decode/prefill phase,
+        // selects its vocabulary interval. The published surface selects the
+        // physical source. A gathered CPU row therefore starts at this rank's
+        // vocab offset; a local CPU/GPU row starts at byte zero.
+        const size_t full_row_bytes = fp32LogitsRowBytes(state_.logits.get());
+        (void)PrefixTerminalLogitsSlice::resolve(full, archive, full_row_bytes);
+        return PrefixArchiveLogitsView{publication.tensor,
+            PrefixTerminalLogitsSlice::resolve(source, archive, fp32LogitsRowBytes(publication.tensor))};
     }
 
     TensorBase *DeviceGraphOrchestrator::resolveDeviceLogitsTensor(
@@ -44241,7 +44316,8 @@ namespace llaminar2
                     size_t *reported_bytes,
                     uint64_t *reported_hash,
                     std::vector<float> *reported_fp32_values,
-                    const char *name)
+                    const char *name,
+                    size_t source_byte_offset = 0)
             {
                 if (!tensor || bytes == 0)
                     return;
@@ -44250,7 +44326,8 @@ namespace llaminar2
                 if (state_.device_id.is_gpu())
                 {
                     IBackend *backend = getBackendFor(state_.device_id);
-                    const void *source = tensor->gpu_data_ptr();
+                    const auto *base = static_cast<const uint8_t *>(tensor->gpu_data_ptr());
+                    const void *source = base ? base + source_byte_offset : nullptr;
                     if (!backend || !probe_stream || !source ||
                         !backend->deviceToHostFast(
                             payload.data(),
@@ -44267,7 +44344,8 @@ namespace llaminar2
                 }
                 else
                 {
-                    const void *source = tensor->raw_data();
+                    const auto *base = static_cast<const uint8_t *>(tensor->raw_data());
+                    const void *source = base ? base + source_byte_offset : nullptr;
                     if (!source)
                     {
                         throw std::runtime_error(
@@ -44321,21 +44399,20 @@ namespace llaminar2
              * row zero of the preplanned all-position surface; the dormant
              * canonical LOGITS allocation still contains the prompt row.
              */
-            const TensorBase *terminal_logits =
-                currentPrefixArchiveLogits();
-            if (terminal_logits &&
-                prefix_layout_.terminal_logits_bytes > 0)
+            const auto terminal_logits = currentPrefixArchiveLogits();
+            if (terminal_logits)
             {
                 hash_terminal_tensor(
-                    terminal_logits,
-                    prefix_layout_.terminal_logits_bytes,
+                    terminal_logits->tensor,
+                    terminal_logits->slice.byteCount(),
                     &snapshot.terminal_logits_hash_available,
                     &snapshot.terminal_logits_bytes,
                     &snapshot.terminal_logits_hash,
                     capture_policy.capture_terminal_logits_values
                         ? &snapshot.terminal_logits_values
                         : nullptr,
-                    "logits row");
+                    "logits row",
+                    terminal_logits->slice.byteOffset());
             }
 
             /*
@@ -46515,6 +46592,9 @@ namespace llaminar2
         result.supported = true;
         result.block_size = prefix_layout_.block_size;
         result.fingerprint_key = prefix_identity_.key;
+        result.checkpoint_policy = prefix_layout_.includes_hybrid_state
+            ? PrefixCheckpointPolicy::ReusableBoundary
+            : PrefixCheckpointPolicy::TerminalOnly;
         result.placement_epochs = PrefixPlacementEpochSpan::at(
             prefix_identity_.placement_epoch);
         result.requires_terminal_logits = prefix_layout_.includes_terminal_logits;
@@ -48258,9 +48338,9 @@ namespace llaminar2
                 }
             }
 
-            TensorBase *terminal_logits_tensor = currentPrefixArchiveLogits();
+            const auto terminal_logits = currentPrefixArchiveLogits();
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
-                !terminal_logits_tensor)
+                !terminal_logits)
             {
                 LOG_ERROR(
                     "[DeviceGraphOrchestrator] Prefix harvest has no current "
@@ -48268,21 +48348,23 @@ namespace llaminar2
                 ok = false;
             }
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
-                terminal_logits_tensor && handle.terminal_logits)
+                terminal_logits && handle.terminal_logits)
             {
-                if (fp32LogitsRowBytes(terminal_logits_tensor) < prefix_layout_.terminal_logits_bytes)
-                {
-                    ok = false;
-                }
+                // Slice the actual producer, not a dormant local allocation.
+                // This is the same checked interval used by prefix diagnostics.
+                TensorBase *terminal_logits_tensor = terminal_logits->tensor;
+                const size_t logits_offset = terminal_logits->slice.byteOffset();
+                const size_t logits_bytes = terminal_logits->slice.byteCount();
                 if (state_.device_id.is_gpu())
                 {
-                    const void *logits_device =
-                        terminal_logits_tensor->gpu_data_ptr();
+                    const auto *logits_base = static_cast<const uint8_t *>(
+                        terminal_logits_tensor->gpu_data_ptr());
+                    const void *logits_device = logits_base ? logits_base + logits_offset : nullptr;
                     if (!logits_device ||
                         !prefix_backend->deviceToHostOnStream(
                             handle.terminal_logits,
                             logits_device,
-                            prefix_layout_.terminal_logits_bytes,
+                            logits_bytes,
                             state_.device_id.gpu_ordinal(),
                             stream) ||
                         (device_hot_handle.valid() &&
@@ -48290,7 +48372,7 @@ namespace llaminar2
                           !prefix_backend->deviceCopyAsync(
                               device_hot_handle.deviceTerminalLogitsData(),
                               logits_device,
-                              prefix_layout_.terminal_logits_bytes,
+                              logits_bytes,
                               state_.device_id.gpu_ordinal(),
                               stream))))
                     {
@@ -48303,14 +48385,15 @@ namespace llaminar2
                 }
                 else
                 {
-                    const float *logits =
-                        ok ? terminal_logits_tensor->fp32_data() : nullptr;
+                    const auto *logits_base = static_cast<const uint8_t *>(
+                        terminal_logits_tensor->raw_data());
+                    const void *logits = logits_base ? logits_base + logits_offset : nullptr;
                     if (ok && logits)
                     {
                         std::memcpy(
                             handle.terminal_logits,
                             logits,
-                            prefix_layout_.terminal_logits_bytes);
+                            logits_bytes);
                         handle.has_terminal_logits = true;
                     }
                     else if (ok)
@@ -50850,26 +50933,16 @@ namespace llaminar2
 
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()
     {
-        TensorBase *main_logits =
-            state_.device_id.is_gpu()
-                ? requireCurrentMainLogits(
-                      DeviceLogitsSource::Main,
-                      "sampleGreedyOnDevice")
-                : (activeMainLogitsAreColumnParallel()
-                       ? state_.logits_local.get()
-                       : state_.logits.get());
-        if (!main_logits)
-            return -1;
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main, "sampleGreedyOnDevice");
 
-        // LmHeadStage always writes the last-token logits to row 0 for both
-        // prefill and decode.  In GlobalTP/NodeTP, the terminal restore path
-        // repopulates logits_local, so greedy sampling must use the shard-local
-        // tensor and coordinate the winning candidate across ranks.
+        // The producer, not the allocated weight/shard geometry, owns the row.
+        // CPU GlobalTP forward and prefix restore publish a gathered full row;
+        // a local projection may publish a shard. Using the dormant local
+        // allocation would add a collective that followers never enter.
         const bool column_parallel =
-            state_.device_id.is_gpu()
-                ? current_main_logits_publication_.descriptor
-                      .isColumnParallelStorage()
-                : activeMainLogitsAreColumnParallel();
+            current_main_logits_publication_.descriptor
+                .isColumnParallelStorage();
         if (column_parallel)
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
@@ -51033,28 +51106,20 @@ namespace llaminar2
         const SamplingParams &params) const
     {
         /*
-         * Greedy sampling on a vocab-sharded GlobalTP LM head allgathers the
-         * local winning candidate from every MPI rank.  Worker ranks must enter
-         * that same sampling method or rank 0 blocks in candidate coordination.
-         * CPU GlobalTP already materializes gathered logits through the graph
-         * allgather stage, so rank 0 can sample the authoritative row without a
-         * second sampling-time collective.  Keeping CPU out of this hook also
-         * prevents divergent root/worker fallback paths when a worker has only
-         * a local logits shard.
-         * Penalty and non-greedy column-parallel sampling currently can fall
-         * back to root-local host logic, so advertising participation there
-         * would create the exact command-stream deadlock this hook is meant to
-         * avoid.
+         * This is the same published-layout decision as the greedy consumer,
+         * not a CPU/GPU capability guess. A full row needs no candidate gather;
+         * a distributed shard requires every peer, including when each peer
+         * applies its own portion of the root's penalty map first. CPU
+         * stochastic sampling uses the already-gathered host distribution and
+         * does not enter this greedy candidate protocol.
          */
-        if (!state_.device_id.is_gpu())
+        if (!params.is_greedy())
         {
             return false;
         }
-        if (!params.is_greedy() || params.has_penalties())
-        {
-            return false;
-        }
-        if (!activeMainLogitsAreColumnParallel())
+        (void)requireCurrentMainLogits(
+            DeviceLogitsSource::Main, "requiresMPICoordinatedDecodeSampling");
+        if (!current_main_logits_publication_.descriptor.isColumnParallelStorage())
         {
             return false;
         }
@@ -53320,7 +53385,9 @@ namespace llaminar2
                  {"pending_window_tokens",
                   std::to_string(depth_window_attempted_tokens)},
                  {"evaluated_windows",
-                  std::to_string(depth_evaluated_windows)}});
+                  std::to_string(depth_evaluated_windows)},
+                 {"learned_matched_windows", std::to_string(
+                      control[kDeviceGenerationControlLearnedDepthMatchedWindows])}});
             parsed.requests.push_back(std::move(request_result));
         }
 
@@ -55032,13 +55099,17 @@ namespace llaminar2
     }
 
     /**
-     * @brief Apply sparse penalties to the current main logits on the logits stream.
+     * @brief Apply sparse penalties to the exact published main-logits row.
+     * @param penalties Global token IDs and additive logit penalties.
+     * @param vocab_size Complete model vocabulary size.
+     * @return True when every relevant penalty has been applied.
+     * @throws std::logic_error if there is no current main-logits publication.
      *
      * GPU graph replay can leave logits pending on a capture stream. Penalty
      * application is an in-place mutation of those logits, so it is also a
-     * logits producer. Keep the same stream in pending_main_decode_logits_stream_
-     * for the next sampler/distribution consumer; otherwise a penalty kernel on
-     * one stream can race a top-k kernel on another stream.
+     * logits producer. Republish its exact stream through the typed handoff for
+     * the next sampler. CPU execution has no pending device edge, but must
+     * select the same published tensor and global-token offset as the sampler.
      */
     bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                                          int vocab_size)
@@ -55046,21 +55117,16 @@ namespace llaminar2
         if (penalties.empty())
             return true; // Nothing to apply, success
 
+        TensorBase *main_logits = requireCurrentMainLogits(
+            DeviceLogitsSource::Main, "applyPenaltiesOnDevice");
+        const bool column_parallel =
+            current_main_logits_publication_.descriptor.isColumnParallelStorage();
         if (!state_.device_id.is_gpu())
         {
-            TensorBase *tensor = nullptr;
-            int token_offset = 0;
-            if (activeMainLogitsAreColumnParallel())
-            {
-                tensor = state_.logits_local.get();
-                token_offset = vocabOffsetForTPConfig(graph_builder_->config());
-            }
-            else
-            {
-                tensor = state_.logits.get();
-            }
+            const int token_offset = column_parallel
+                ? vocabOffsetForTPConfig(graph_builder_->config()) : 0;
             return applyPenaltiesToTensorRowOnHost(
-                tensor,
+                main_logits,
                 penalties,
                 vocab_size,
                 0,
@@ -55074,12 +55140,6 @@ namespace llaminar2
         if (!stream)
             return false;
 
-        TensorBase *main_logits = requireCurrentMainLogits(
-            DeviceLogitsSource::Main,
-            "applyPenaltiesOnDevice");
-        const bool column_parallel =
-            current_main_logits_publication_.descriptor
-                .isColumnParallelStorage();
         bool ok = false;
         if (column_parallel)
         {

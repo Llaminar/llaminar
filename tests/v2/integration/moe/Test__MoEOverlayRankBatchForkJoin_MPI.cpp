@@ -2,10 +2,11 @@
  * @file Test__MoEOverlayRankBatchForkJoin_MPI.cpp
  * @brief Real-MPI witness that independent sparse peers start before return waits.
  *
- * Two followers exchange a test-only receipt after receiving their dispatches
- * and before either returns. A serialized root deadlocks at the first return;
- * the production graph fork/join submits both peers and preserves exact ordered
- * output consumption. No model, GPU, sleep, or wall-time performance gate is used.
+ * Two followers exchange a test-only receipt after receiving their dispatches,
+ * then wait for a receipt from the root's local expert compute before returning.
+ * A serialized root deadlocks at the first return; the production graph fork/join
+ * submits both peers and completes local work before waiting, while preserving
+ * exact ordered output consumption. No model, GPU, sleep, or performance gate.
  */
 #include "execution/moe/MoEOverlayRankBatchGraphSchedule.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
@@ -50,8 +51,8 @@ namespace llaminar2::test
         };
     }
 
-    /** @test All peers receive before any return, including send-slot reuse and MTP keys. */
-    TEST(Test__MoEOverlayRankBatchForkJoin_MPI, AllPeersReceiveBeforeAnyReturn)
+    /** @test Remote dispatch and local compute precede all waits, including slot reuse/MTP. */
+    TEST(Test__MoEOverlayRankBatchForkJoin_MPI, AllPeersAndLocalWorkStartBeforeAnyReturn)
     {
         int rank = -1;
         int world_size = 0;
@@ -114,10 +115,26 @@ namespace llaminar2::test
                     graph.addNode(nodes.back().returned, std::move(receive), DeviceId::cpu());
                     graph.addDependency(nodes.back().returned, nodes.back().dispatch);
                 }
-                wireMoEOverlayRankBatchForkJoin(graph, nodes);
+                auto local_dispatch = std::make_unique<testing::MockComputeStage>(ComputeStageType::MOE_SPARSE_DISPATCH);
+                auto local_compute = std::make_unique<testing::MockComputeStage>(ComputeStageType::MOE_LOCAL_EXPERT);
+                local_compute->setOnExecute([&](IDeviceContext *) {
+                    // Each remote return depends on this local-compute receipt.
+                    // Reintroducing return-before-local-work creates a real MPI
+                    // deadlock, not a throughput/noisy-clock assertion.
+                    for (int peer = 1; peer <= 2; ++peer)
+                        ASSERT_EQ(MPI_Send(&round, 1, MPI_INT, peer, 19008, MPI_COMM_WORLD), MPI_SUCCESS);
+                });
+                auto local_return = std::make_unique<testing::MockComputeStage>(ComputeStageType::MOE_SPARSE_RETURN_REDUCE);
+                local_return->setOnExecute([&](IDeviceContext *) { consumed.push_back(0); });
+                graph.addNode("local_dispatch", std::move(local_dispatch), DeviceId::cpu());
+                graph.addNode("local_compute", std::move(local_compute), DeviceId::cpu());
+                graph.addNode("local_return", std::move(local_return), DeviceId::cpu());
+                const std::array<MoEOverlayLocalExpertGraphLane, 1> local{{
+                    {"local_dispatch", "local_compute", "local_return"}}};
+                wireMoEOverlayRankBatchForkJoin(graph, nodes, local);
                 for (auto *stage : graph.getExecutionStages())
                     ASSERT_TRUE(stage->execute(nullptr)); // Test stage bodies invoke the real transport.
-                EXPECT_EQ(consumed, (std::vector<int>{1, 2}));
+                EXPECT_EQ(consumed, (std::vector<int>{1, 2, 0}));
             }
             else
             {
@@ -131,6 +148,9 @@ namespace llaminar2::test
                 int observed = -1;
                 ASSERT_EQ(MPI_Sendrecv(&round, 1, MPI_INT, 3 - rank, 19007,
                     &observed, 1, MPI_INT, 3 - rank, 19007, MPI_COMM_WORLD, MPI_STATUS_IGNORE), MPI_SUCCESS);
+                ASSERT_EQ(observed, round);
+                ASSERT_EQ(MPI_Recv(&observed, 1, MPI_INT, 0, 19008,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE), MPI_SUCCESS);
                 ASSERT_EQ(observed, round);
                 lane.returned.source_participant = rank;
                 lane.returned.target_participant = 0;

@@ -107,9 +107,9 @@ namespace llaminar2
              * dense policy.  Resolve every concurrently retained auxiliary
              * weight view from that same typed policy and the request's MTP
              * policy before PhysicalMemoryAuthority publishes its immutable
-             * admission.  In particular, the default mirrored terminal head
-             * remains live for the serial decode oracle even when this request
-             * has MTP execution disabled.
+             * admission. A resolved mirrored terminal head remains live for the
+             * serial decode oracle even when this request disables MTP; CPU's
+             * resolved vocabulary-sharded policy does not retain that mirror.
              */
             cfg.additional_weight_sets =
                 resolveAdditionalPersistentWeightSets(

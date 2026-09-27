@@ -13,6 +13,7 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <bit>
 #include <cstring>
 #include <immintrin.h>
@@ -20,10 +21,18 @@
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIFP16.h"
+#include "CPUNativeVNNIActivationSums.h"
 #include "VNNIEmulation.h"
 
 namespace llaminar2::cpu::native_vnni::multi_scale
 {
+    /** @brief Arithmetic ownership of a complete column tile's K traversal. */
+    enum class Reduction
+    {
+        Contiguous,        ///< One accumulator visits the requested K interval.
+        OrderedPartitions, ///< Positive-zero partials folded in ascending order.
+    };
+
     /** @return Whether an immutable signed grid fits the AVX2 sign/maddubs domain. */
     template <size_t N> constexpr bool gridFitsSignedDot(const uint64_t (&table)[N])
     {
@@ -79,6 +88,31 @@ namespace llaminar2::cpu::native_vnni::multi_scale
             return std::bit_cast<I>(_mm256_i32gather_epi32(
                 reinterpret_cast<const int *>(table), std::bit_cast<__m256i>(index * 2 + half), 4));
         }
+        /** @return One selected metadata byte repeated within each column's word. */
+        template <int Byte> static I repeatByte(I metadata)
+        {
+            const __m256i indices = _mm256_setr_epi32(
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c,
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c);
+            return std::bit_cast<I>(_mm256_shuffle_epi8(
+                _mm256_srli_epi32(std::bit_cast<__m256i>(metadata), Byte * 8), indices));
+        }
+        /** @return Signed grid bytes selected by one half of the replicated sign byte. */
+        template <int Half> static I signGrid(I values, I signs)
+        {
+            const auto bits = _mm256_set1_epi32(0x08040201 << (Half * 4));
+            const auto positive = _mm256_cmpeq_epi8(
+                _mm256_and_si256(std::bit_cast<__m256i>(signs), bits), _mm256_setzero_si256());
+            const auto negative = _mm256_xor_si256(positive, _mm256_set1_epi8(-1));
+            return std::bit_cast<I>(_mm256_sub_epi8(
+                _mm256_xor_si256(std::bit_cast<__m256i>(values), negative), negative));
+        }
+        /** @brief Load both four-byte halves with the AVX2 gather geometry. */
+        static void gridPair(const uint64_t *table, I index, I &low, I &high)
+        {
+            low = grid(table, index, 0);
+            high = grid(table, index, 1);
+        }
         /** @return Eight exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
         {
@@ -111,11 +145,57 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         {
             return std::bit_cast<I>(_mm512_sub_epi8(std::bit_cast<__m512i>(a), std::bit_cast<__m512i>(b)));
         }
-        /** @return Selected four-byte halves of immutable eight-byte grid entries. */
-        static I grid(const uint64_t *table, I index, int half)
+        /** @return One metadata byte per column, replicated for its four dot bytes. */
+        template <int Byte> static I repeatByte(I metadata)
         {
-            return std::bit_cast<I>(_mm512_i32gather_epi32(
-                std::bit_cast<__m512i>(index * 2 + half), table, 4));
+            const __m512i indices = _mm512_setr_epi32(
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c,
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c,
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c,
+                0x00000000, 0x04040404, 0x08080808, 0x0c0c0c0c);
+            return std::bit_cast<I>(_mm512_shuffle_epi8(
+                _mm512_srli_epi32(std::bit_cast<__m512i>(metadata), Byte * 8), indices));
+        }
+        /**
+         * @return Grid bytes negated exactly where their packed sign bit is set.
+         *
+         * Byte tests directly produce the AVX-512 predicate. This replaces
+         * multiplication-based bit spreading and its long shift/add chain.
+         * These codebook grids exclude -128, so negation preserves every byte.
+         */
+        template <int Half> static I signGrid(I values, I signs)
+        {
+            const auto bits = _mm512_set1_epi32(0x08040201 << (Half * 4));
+            const auto negative = _mm512_test_epi8_mask(std::bit_cast<__m512i>(signs), bits);
+            return std::bit_cast<I>(_mm512_mask_sub_epi8(
+                std::bit_cast<__m512i>(values), negative,
+                _mm512_setzero_si512(), std::bit_cast<__m512i>(values)));
+        }
+        /**
+         * @brief Fetch each complete eight-byte grid entry once for sixteen columns.
+         * @param table Immutable codebook's eight-byte entries.
+         * @param index One entry index per output column.
+         * @param low Receives values K0..3 for every column.
+         * @param high Receives values K4..7 for every column.
+         *
+         * Two eight-lane QWORD gathers replace two sixteen-lane DWORD gathers.
+         * This halves the number of indexed loads, while the permutations only
+         * rearrange integer bytes. No decoded-weight cache or wider prepared
+         * representation is created.
+         */
+        static void gridPair(const uint64_t *table, I index, I &low, I &high)
+        {
+            const __m512i indices = std::bit_cast<__m512i>(index);
+            const __m512i first = _mm512_i32gather_epi64(
+                _mm512_castsi512_si256(indices), table, 8);
+            const __m512i second = _mm512_i32gather_epi64(
+                _mm512_extracti64x4_epi64(indices, 1), table, 8);
+            const __m512i even = _mm512_setr_epi32(
+                0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+            const __m512i odd = _mm512_setr_epi32(
+                1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+            low = std::bit_cast<I>(_mm512_permutex2var_epi32(first, even, second));
+            high = std::bit_cast<I>(_mm512_permutex2var_epi32(first, odd, second));
         }
         /** @return Sixteen exact FP16-to-FP32 conversions. */
         static F half(const uint16_t *source)
@@ -192,8 +272,8 @@ namespace llaminar2::cpu::native_vnni::multi_scale
     }
 
     /**
-     * @brief Decode one four-K group for a SIMD vector of output columns.
-     * @tparam Codebook Source execution format (9, 10, 13, 14 or 17).
+     * @brief Decode one linear two/three-bit four-K group for SIMD columns.
+     * @tparam Codebook Q3_K (9) or Q2_K (10) execution format.
      * @tparam Group Four-value group in [0,7].
      * @tparam Lanes Eight AVX2 or sixteen AVX-512 columns.
      * @param unit Native CPU unit's first payload byte.
@@ -201,50 +281,22 @@ namespace llaminar2::cpu::native_vnni::multi_scale
      * @return Signed native grids on AVX2; unsigned-biased grids for AVX-512 VNNI.
      */
     template <int Codebook, int Group, int Lanes>
-    inline typename SIMD<Lanes>::I decode(const uint8_t *unit, int column)
+    inline typename SIMD<Lanes>::I decodeLinear(const uint8_t *unit, int column)
     {
+        static_assert(Codebook == 9 || Codebook == 10);
         using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         const auto word = [&](int index) { return load<I>(unit + index * 256 + column * 4); };
-        if constexpr (Codebook == 9 || Codebook == 10)
+        I values = (word(Group / 4) >> ((Group % 4) * 2)) & 0x03030303;
+        if constexpr (Codebook == 9)
         {
-            I values = (word(Group / 4) >> ((Group % 4) * 2)) & 0x03030303;
-            if constexpr (Codebook == 9)
-            {
-                // Four high bits become bit two of four separate byte lanes.
-                const I high = (word(2) >> (Group * 4)) & 15;
-                values |= ((high * 0x02040810) & 0x10101010) >> 2;
-                if constexpr (Lanes == 8)
-                    values = Ops::subtractBytes(values, I{} + 0x04040404);
-            }
-            return values;
-        }
-        else
-        {
-            constexpr int grid_group = Group / 2;
-            I index = (word(0) >> (grid_group * 8)) & 255;
-            I values;
-            if constexpr (Codebook == 17)
-            {
-                index |= ((word(1) >> ((grid_group / 2) * 8 + (grid_group % 2) * 4)) & 7) << 8;
-                values = Ops::grid(iq1s_grid, index, Group % 2);
-            }
-            else
-            {
-                constexpr int bits = Codebook == 13 ? 2 : 1;
-                index |= ((word(1) >> (grid_group * bits)) & ((1 << bits) - 1)) << 8;
-                values = Ops::grid(Codebook == 13 ? iq2s_grid : iq2xs_grid, index, Group % 2);
-                constexpr int sign_byte = 5 + grid_group;
-                const I signs = (word(sign_byte / 4) >> ((sign_byte % 4) * 8 + (Group % 2) * 4)) & 15;
-                const I spread = ((signs * 0x02040810) & 0x10101010) >> 4;
-                const I mask = Ops::subtractBytes(I{}, spread);
-                values = Ops::subtractBytes(values ^ mask, mask);
-            }
+            // Four high bits become bit two of four separate byte lanes.
+            const I high = (word(2) >> (Group * 4)) & 15;
+            values |= ((high * 0x02040810) & 0x10101010) >> 2;
             if constexpr (Lanes == 8)
-                return values;
-            // Native AVX-512 VNNI takes unsigned weights without a sign shuffle.
-            return values ^ static_cast<int>(0x80808080u);
+                values = Ops::subtractBytes(values, I{} + 0x04040404);
         }
+        return values;
     }
 
     /**
@@ -266,20 +318,69 @@ namespace llaminar2::cpu::native_vnni::multi_scale
     {
         using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
-        const auto group = [&]<int G>() {
-            const I weights = decode<Codebook, G, Lanes>(unit, column);
+        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        {
+            const auto quarter = [&]<int Q>() {
+                const auto word = [&](int offset) {
+                    return load<I>(unit + offset * 256 + column * 4);
+                };
+                I index = (word(0) >> (Q * 8)) & 255;
+                if constexpr (Codebook == 17)
+                    index |= ((word(1) >> ((Q / 2) * 8 + (Q % 2) * 4)) & 7) << 8;
+                else
+                {
+                    constexpr int bits = Codebook == 13 ? 2 : 1;
+                    index |= ((word(1) >> (Q * bits)) & ((1 << bits) - 1)) << 8;
+                }
+                const uint64_t *table = Codebook == 17 ? iq1s_grid
+                    : Codebook == 13 ? iq2s_grid : iq2xs_grid;
+                I low, high;
+                Ops::gridPair(table, index, low, high);
+                I signs{};
+                if constexpr (Codebook != 17)
+                {
+                    constexpr int sign_byte = 5 + Q;
+                    signs = Ops::template repeatByte<sign_byte % 4>(word(sign_byte / 4));
+                }
+                const auto consume = [&]<int H>(I weights) {
+                    if constexpr (Codebook != 17)
+                        weights = Ops::template signGrid<H>(weights, signs);
+                    if constexpr (Lanes == 16)
+                        weights ^= static_cast<int>(0x80808080u);
 #pragma GCC unroll 4
-            for (size_t row = 0; row < Rows; ++row)
-            {
-                int word = 0;
-                std::memcpy(&word, activation[row][kb].qs + G * 4, 4);
-                dots[row] = Ops::dot(dots[row], weights, I{} + word);
-            }
-        };
-        group.template operator()<Half * 4>();
-        group.template operator()<Half * 4 + 1>();
-        group.template operator()<Half * 4 + 2>();
-        group.template operator()<Half * 4 + 3>();
+                    for (size_t row = 0; row < Rows; ++row)
+                    {
+                        int activation_word = 0;
+                        std::memcpy(&activation_word,
+                            activation[row][kb].qs + Q * 8 + H * 4, 4);
+                        dots[row] = Ops::dot(dots[row], weights, I{} + activation_word);
+                    }
+                };
+                // Consume one signed half at a time. Both ISA implementations
+                // share the decoded index; AVX-512 also halves indexed loads.
+                consume.template operator()<0>(low);
+                consume.template operator()<1>(high);
+            };
+            quarter.template operator()<Half * 2>();
+            quarter.template operator()<Half * 2 + 1>();
+        }
+        else
+        {
+            const auto group = [&]<int G>() {
+                const I weights = decodeLinear<Codebook, G, Lanes>(unit, column);
+#pragma GCC unroll 4
+                for (size_t row = 0; row < Rows; ++row)
+                {
+                    int word = 0;
+                    std::memcpy(&word, activation[row][kb].qs + G * 4, 4);
+                    dots[row] = Ops::dot(dots[row], weights, I{} + word);
+                }
+            };
+            group.template operator()<Half * 4>();
+            group.template operator()<Half * 4 + 1>();
+            group.template operator()<Half * 4 + 2>();
+            group.template operator()<Half * 4 + 3>();
+        }
     }
 
     /**
@@ -287,6 +388,7 @@ namespace llaminar2::cpu::native_vnni::multi_scale
      * @tparam Codebook Native source execution codebook.
      * @tparam Lanes Physical SIMD column width.
      * @tparam Rows Independent rows sharing each payload decode.
+     * @tparam Tree Contiguous dot or the admitted ordered expert partition tree.
      * @param packed Prepared immutable native matrix.
      * @param activation Persistent Q8_1 rows.
      * @param output Padded output rows for this 64-column chunk.
@@ -294,13 +396,15 @@ namespace llaminar2::cpu::native_vnni::multi_scale
      * @param begin First logical K block.
      * @param end One-past-last logical K block.
      * @param accumulate Whether the output owns a preceding K partition.
+     * @param partitions Exact number of ordered partitions; unused for Contiguous.
+     * @param blocks_per_partition Exact K-block span; unused for Contiguous.
      */
-    template <int Codebook, int Lanes, size_t Rows>
-    LLAMINAR_MULTISCALE_EXACT
-    inline void rows(const CPUNativeVNNIPackedWeights &packed,
-                     const std::array<const Q8_1Block *, Rows> &activation,
-                     const std::array<float *, Rows> &output,
-                     int chunk, int begin, int end, bool accumulate)
+    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous>
+    LLAMINAR_MULTISCALE_EXACT inline void rows(const CPUNativeVNNIPackedWeights &packed,
+                                               const std::array<const Q8_1Block *, Rows> &activation,
+                                               const std::array<float *, Rows> &output, int chunk, int begin,
+                                               int end, bool accumulate, int partitions = 1,
+                                               int blocks_per_partition = 0)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -313,66 +417,104 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         constexpr int center = Lanes == 8 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
         for (int column = 0; column < 64; column += Lanes)
         {
-            F acc[Rows];
-#pragma GCC unroll 4
-            for (size_t row = 0; row < Rows; ++row)
-                acc[row] = accumulate ? load<F>(output[row] + column) : F{};
-            for (int kb = begin; kb < end; ++kb)
+            F reduced[Rows]{};
+            const int partition_count = Tree == Reduction::OrderedPartitions ? partitions : 1;
+            for (int partition = 0; partition < partition_count; ++partition)
             {
-                const uint8_t *const unit = packed.interleavedBase() +
-                    (static_cast<size_t>(chunk) * packed.blocks_per_row + kb) * packed.interleaved_block_stride;
-                I low[Rows]{}, high[Rows]{};
-                dotHalf<Codebook, 0, Lanes>(unit, column, activation, kb, low);
-                dotHalf<Codebook, 1, Lanes>(unit, column, activation, kb, high);
-                const F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
-                const F scale1 = Ops::half(packed.chunkMins(chunk, kb) + column);
-                // Rows is at most four. Expanding this tiny loop keeps every
-                // accumulator/dot in a distinct register: a runtime-indexed
-                // array otherwise spills the entire tile on every K block.
+                F acc[Rows];
 #pragma GCC unroll 4
                 for (size_t row = 0; row < Rows; ++row)
                 {
-                    const auto &a = activation[row][kb];
-                    int sums[4]{};
-                    for (int group = 0; group < 4; ++group)
-                        for (int k = 0; k < 8; ++k)
-                            sums[group] += a.qs[group * 8 + k];
-                    const int sum0 = sums[0] + sums[1];
-                    const int sum1 = sums[2] + sums[3];
-                    const F dot0 = __builtin_convertvector(low[row] - center * sum0, F);
-                    const F dot1 = __builtin_convertvector(high[row] - center * sum1, F);
-                    const F activation_scale = F{} + nativeVNNIFP16ScaleToFP32(a.d);
-                    const F term0 = scale0 * dot0;
-                    const F term1 = scale1 * dot1;
-                    F contribution = activation_scale * (term0 + term1);
-                    if constexpr (Codebook == 10)
+                    if constexpr (Tree == Reduction::Contiguous)
+                        acc[row] = accumulate ? load<F>(output[row] + column) : F{};
+                    else
+                        acc[row] = F{};
+                }
+                const int first =
+                    Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
+                const int last =
+                    Tree == Reduction::OrderedPartitions ? std::min(first + blocks_per_partition, end) : end;
+                for (int kb = first; kb < last; ++kb)
+                {
+                    const uint8_t *const unit =
+                        packed.interleavedBase() + (static_cast<size_t>(chunk) * packed.blocks_per_row + kb) *
+                                                       packed.interleaved_block_stride;
+                    I low[Rows]{}, high[Rows]{};
+                    dotHalf<Codebook, 0, Lanes>(unit, column, activation, kb, low);
+                    dotHalf<Codebook, 1, Lanes>(unit, column, activation, kb, high);
+                    const F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
+                    const F scale1 = Ops::half(packed.chunkMins(chunk, kb) + column);
+                    // Rows is at most four. Expanding this tiny loop keeps every
+                    // accumulator/dot in a distinct register: a runtime-indexed
+                    // array otherwise spills the entire tile on every K block.
+#pragma GCC unroll 4
+                    for (size_t row = 0; row < Rows; ++row)
                     {
-                        // Minima retain their original half bits and the GPU
-                        // rounds this correction independently of the dot term.
-                        const I bits = load<I>(packed.chunkEffectiveMins(chunk, kb) + column);
-                        const F correction0 = Ops::halfWords(bits) * static_cast<float>(sum0);
-                        const F correction1 = Ops::halfWords(bits >> 16) * static_cast<float>(sum1);
-                        contribution += activation_scale * (correction0 + correction1);
+                        const auto &a = activation[row][kb];
+                        // IQ1's signed quarter corrections need all four sums.
+                        // Other formats need only one half: the quantizer already
+                        // publishes the exact whole-block sum in Q8_1Block. Avoid
+                        // expanding/reducing the same 32 bytes for every column.
+                        std::array<int, 4> sums{};
+                        int sum0 = 0, sum1 = 0;
+                        if constexpr (Codebook == 17)
+                        {
+                            sums = activationQuarterSums(a.qs);
+                            sum0 = sums[0] + sums[1];
+                            sum1 = sums[2] + sums[3];
+                        }
+                        else if constexpr (center != 0 || Codebook == 10)
+                        {
+                            sum0 = activationHalfSum(a.qs);
+                            sum1 = static_cast<int>(a.sum_qs) - sum0;
+                        }
+                        const F dot0 = __builtin_convertvector(low[row] - center * sum0, F);
+                        const F dot1 = __builtin_convertvector(high[row] - center * sum1, F);
+                        const F activation_scale = F{} + nativeVNNIFP16ScaleToFP32(a.d);
+                        const F term0 = scale0 * dot0;
+                        const F term1 = scale1 * dot1;
+                        F contribution = activation_scale * (term0 + term1);
+                        if constexpr (Codebook == 10)
+                        {
+                            // Minima retain their original half bits and the GPU
+                            // rounds this correction independently of the dot term.
+                            const I bits = load<I>(packed.chunkEffectiveMins(chunk, kb) + column);
+                            const F correction0 = Ops::halfWords(bits) * static_cast<float>(sum0);
+                            const F correction1 = Ops::halfWords(bits >> 16) * static_cast<float>(sum1);
+                            contribution += activation_scale * (correction0 + correction1);
+                        }
+                        if constexpr (Codebook == 17)
+                        {
+                            const I signs = load<I>(unit + 256 + column * 4);
+                            const auto delta = [&](int bit, int sum) {
+                                // Materialize the sign on the FP32 delta itself so
+                                // zero sums preserve exactly the GPU's signed zero.
+                                const I delta_bits = (I{} + 0x3e000000) ^ (((signs >> bit) & 1) << 31);
+                                return std::bit_cast<F>(delta_bits) * static_cast<float>(sum);
+                            };
+                            const F correction0 = (delta(3, sums[0]) + delta(7, sums[1])) * scale0;
+                            const F correction1 = (delta(11, sums[2]) + delta(15, sums[3])) * scale1;
+                            contribution += activation_scale * (correction0 + correction1);
+                        }
+                        acc[row] += contribution;
                     }
-                    if constexpr (Codebook == 17)
-                    {
-                        const I signs = load<I>(unit + 256 + column * 4);
-                        const auto delta = [&](int bit, int sum) {
-                            // Materialize the sign on the FP32 delta itself so
-                            // zero sums preserve exactly the GPU's signed zero.
-                            const I delta_bits = (I{} + 0x3e000000) ^ (((signs >> bit) & 1) << 31);
-                            return std::bit_cast<F>(delta_bits) * static_cast<float>(sum);
-                        };
-                        const F correction0 = (delta(3, sums[0]) + delta(7, sums[1])) * scale0;
-                        const F correction1 = (delta(11, sums[2]) + delta(15, sums[3])) * scale1;
-                        contribution += activation_scale * (correction0 + correction1);
-                    }
-                    acc[row] += contribution;
+                }
+#pragma GCC unroll 4
+                for (size_t row = 0; row < Rows; ++row)
+                {
+                    // The first partial is copied, not added to an extra zero.
+                    // Later partials retain the exact device tree's left fold.
+                    // Keeping this inside the column loop removes repeated
+                    // dispatch/setup and temporary 64-column partial planes.
+                    if constexpr (Tree == Reduction::OrderedPartitions)
+                        reduced[row] = partition == 0 ? acc[row] : reduced[row] + acc[row];
+                    else
+                        reduced[row] = acc[row];
                 }
             }
 #pragma GCC unroll 4
             for (size_t row = 0; row < Rows; ++row)
-                std::memcpy(output[row] + column, &acc[row], sizeof(F));
+                std::memcpy(output[row] + column, &reduced[row], sizeof(F));
         }
     }
 
@@ -389,8 +531,8 @@ namespace llaminar2::cpu::native_vnni::multi_scale
     template <int Lanes, size_t Rows>
     inline void dispatch(const CPUNativeVNNIPackedWeights &packed,
                          const std::array<const Q8_1Block *, Rows> &activation,
-                         const std::array<float *, Rows> &output,
-                         int chunk, int begin, int end, bool accumulate)
+                         const std::array<float *, Rows> &output, int chunk, int begin, int end,
+                         bool accumulate)
     {
         if (!packed.usesCompactMultiScale())
             throw std::invalid_argument("Compact multi-scale kernel requires its native encoding");
@@ -403,6 +545,48 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         LLAMINAR_MULTISCALE_CASE(14);
         LLAMINAR_MULTISCALE_CASE(17);
 #undef LLAMINAR_MULTISCALE_CASE
+        }
+        throw std::invalid_argument("Unsupported native multi-scale codebook");
+    }
+
+    /**
+     * @brief Execute the admitted ordered expert tree in one compact-format call.
+     * @param packed Immutable compact multi-scale weights.
+     * @param activation One persistent Q8_1 activation row per tile row.
+     * @param output Sixty-four writable FP32 columns per tile row.
+     * @param chunk Output column chunk.
+     * @param blocks Complete logical K extent in 32-value blocks.
+     * @param partitions Exact arithmetic partition count from the shared contract.
+     * @param blocks_per_partition Consecutive K blocks per partial.
+     * @throws std::invalid_argument For inconsistent encoding or partition geometry.
+     *
+     * This changes physical traversal only. Each partial starts at positive
+     * zero, visits the same K interval and is folded at the same rounding point
+     * as the independent producer/reducer path. No quantized bytes, dispatch
+     * choice, output precision, or scratch capacity are changed.
+     */
+    template <int Lanes, size_t Rows>
+    inline void dispatchOrdered(const CPUNativeVNNIPackedWeights &packed,
+                                const std::array<const Q8_1Block *, Rows> &activation,
+                                const std::array<float *, Rows> &output,
+                                int chunk, int blocks, int partitions,
+                                int blocks_per_partition)
+    {
+        if (!packed.usesCompactMultiScale() || blocks <= 0 ||
+            blocks != packed.blocks_per_row || partitions <= 0 ||
+            blocks_per_partition <= 0 ||
+            static_cast<int64_t>(partitions) * blocks_per_partition < blocks ||
+            static_cast<int64_t>(partitions) * blocks_per_partition > INT32_MAX)
+            throw std::invalid_argument("Compact ordered dot requires its exact admitted K tree");
+        switch (packed.codebook_id)
+        {
+#define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition)
+        LLAMINAR_MULTISCALE_ORDERED_CASE(9);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(10);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(13);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(14);
+        LLAMINAR_MULTISCALE_ORDERED_CASE(17);
+#undef LLAMINAR_MULTISCALE_ORDERED_CASE
         }
         throw std::invalid_argument("Unsupported native multi-scale codebook");
     }

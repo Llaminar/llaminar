@@ -329,13 +329,21 @@ namespace llaminar2::cuda::prefill
         // IQ1_M needs per-block delta sign bytes from payload (qh0, qh1)
         [[maybe_unused]] __shared__ uint16_t smem_iq1m_qh[STAGES_][IS_IQ1_M ? 2 * BN : 1];
 
+        // Cache the exact correction granularity each format needs per BK64
+        // row: two full-block sums for asymmetric formats, four half-block
+        // sums for dual-scale minima, or eight subgroup sums for IQ1_M.
+        // Even 32 signed INT8 values fit INT16 exactly; storage does not change
+        // quantization. Volatile consumption keeps metadata at its use site
+        // instead of hoisting a wide tile's corrections into live registers.
+        constexpr bool NEEDS_SUMS = IS_ASYMMETRIC || IS_DUAL_SCALE_ASYM || IS_IQ1_M;
+        constexpr int CORRECTION_GROUPS = IS_ASYMMETRIC ? 2 : (IS_IQ1_M ? 8 : 4);
+        constexpr int GROUPS_PER_HALF = CORRECTION_GROUPS / 2;
+        __shared__ volatile int16_t smem_corrections[STAGES_][NEEDS_SUMS ? BM * CORRECTION_GROUPS : 1];
+
         float acc[WM][WN][4];
         float serial_acc[WM][WN][4];
-
-        // The launcher resolves the immutable span from the canonical serial
-        // schedule before capture. Keeping it in the parameter bank avoids
-        // both device integer division and an extra long-lived computed
-        // register. Only the moving boundary needs a thread-local register.
+        // One cursor replaces a per-block integer remainder in the hot loop.
+        // Scoped correction lifetimes leave room for it on every codebook.
         int next_serial_partition_end = serial_partitions.blocks_per_partition;
 
         /**
@@ -354,33 +362,11 @@ namespace llaminar2::cuda::prefill
             if (!serial_m1_uses_ordered_reducer)
                 return;
 
-            bool partition_complete;
-            if constexpr (IS_IQ1_M)
-            {
-                // Four subgroup corrections make IQ1_M register-constrained.
-                // A live cursor spills its two-CTA tile; reducing occupancy to
-                // avoid that spill costs more than the boundary division. Keep
-                // the same stateless boundary test for this format, including
-                // its original register allocation and concurrent CTA budget.
-                const int blocks_per_partition =
-                    (num_q40_blocks + serial_partitions.count - 1) /
-                    serial_partitions.count;
-                partition_complete = completed_block == num_q40_blocks ||
-                    (completed_block % blocks_per_partition) == 0;
-            }
-            else
-            {
-                partition_complete = completed_block == num_q40_blocks ||
-                    completed_block == next_serial_partition_end;
-            }
+            const bool partition_complete = completed_block == num_q40_blocks ||
+                completed_block == next_serial_partition_end;
             if (!partition_complete)
                 return;
-
-            // A short final partition still commits at num_q40_blocks. Empty
-            // trailing partitions require no work here, just as in the
-            // previous ascending serial fold; no arithmetic is reassociated.
-            if constexpr (!IS_IQ1_M)
-                next_serial_partition_end += serial_partitions.blocks_per_partition;
+            next_serial_partition_end += serial_partitions.blocks_per_partition;
 
 #pragma unroll
             for (int i = 0; i < WM; ++i)
@@ -419,6 +405,25 @@ namespace llaminar2::cuda::prefill
                                       ? static_cast<const void *>(&A[static_cast<size_t>(grow) * K + kt * BK64 + col])
                                       : static_cast<const void *>(A);
                 cp_async_cg_16_zfill_128(dst, src, valid ? 16 : 0);
+                if constexpr (NEEDS_SUMS && !IS_ASYMMETRIC)
+                {
+                    // The source read is independent of the pending A copy.
+                    // The existing operand publication barrier joins both
+                    // producers, including explicit zeros for padded owners.
+                    const int4 words = valid ? *static_cast<const int4 *>(src)
+                                             : make_int4(0, 0, 0, 0);
+                    const int low = __dp4a(0x01010101, words.y,
+                                         __dp4a(0x01010101, words.x, 0));
+                    const int high = __dp4a(0x01010101, words.w,
+                                          __dp4a(0x01010101, words.z, 0));
+                    if constexpr (IS_IQ1_M)
+                    {
+                        smem_corrections[stage][row * 8 + col / 8] = low;
+                        smem_corrections[stage][row * 8 + col / 8 + 1] = high;
+                    }
+                    else
+                        smem_corrections[stage][row * 4 + col / 16] = low + high;
+                }
             }
         };
 
@@ -881,6 +886,27 @@ namespace llaminar2::cuda::prefill
                 const int kb = kb0 + half;
                 const int grow = block_m + row;
                 const bool valid = grow < M && kb < num_q40_blocks;
+                if constexpr (IS_ASYMMETRIC)
+                {
+                    // Reuse the quantizer's block-major sum when supplied.
+                    // Otherwise this scale owner computes it once from the
+                    // identical bytes, not once per output-column warp.
+                    int sum = 0;
+                    if (valid)
+                    {
+                        if (sums_A)
+                            sum = sums_A[static_cast<size_t>(kb) * M + grow];
+                        else
+                        {
+                            const int32_t *words = reinterpret_cast<const int32_t *>(
+                                A + static_cast<size_t>(grow) * K + kb * 32);
+#pragma unroll
+                            for (int word = 0; word < 8; ++word)
+                                sum = __dp4a(0x01010101, words[word], sum);
+                        }
+                    }
+                    smem_corrections[stage][idx] = sum;
+                }
                 if constexpr (ASYNC_RAW_MODE == 3)
                 {
                     // The four-byte copy remains aligned even for odd K-block
@@ -900,314 +926,16 @@ namespace llaminar2::cuda::prefill
             }
         };
 
-        const bool is_interior_tile =
-            (block_m + BM <= M) && (block_n + BN <= N);
-
-        auto compute_k_tile_interior = [&](int stage, int kt) __attribute__((always_inline))
-        {
-            const int kb0 = kt * 2;
-#pragma unroll
-            for (int half = 0; half < 2; ++half)
-            {
-                const int kb = kb0 + half;
-                if (kb >= num_q40_blocks)
-                    break; // K-tail: second q-block doesn't exist
-                if constexpr (CANONICAL_KPART)
-                {
-                    if (kb < canonical_block_begin ||
-                        kb >= canonical_block_end)
-                    {
-                        continue;
-                    }
-                }
-                const int k_offset = half * 32;
-                const int scale_slot = half;
-
-                // Pre-load ALL A scales for this half from smem
-                float sa_pre[WM][2];
-#pragma unroll
-                for (int wi = 0; wi < WM; ++wi)
-                {
-                    const int local_row0 = wr * WARP_M + wi * 16 + gid;
-                    sa_pre[wi][0] = smem_sa[stage][local_row0 * 2 + half];
-                    sa_pre[wi][1] = smem_sa[stage][(local_row0 + 8) * 2 + half];
-                }
-
-                /*
-                 * Preserve the exact FP16 metadata bits until the shared
-                 * decode-equivalent contribution helper consumes them. Earlier
-                 * versions expanded these values and then re-expressed every
-                 * format's FP32 formula locally, allowing the tensor-core path
-                 * to acquire a different contraction tree from serial DP4A.
-                 */
-                uint16_t scale_bits_pre[WN][2];
-                [[maybe_unused]] uint16_t secondary_bits_pre[WN][2];
-                [[maybe_unused]] uint32_t emin_bits_pre[WN][2];
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    const int b_col_base = wc * WARP_N + wj * 8;
-                    scale_bits_pre[wj][0] =
-                        smem_scales_B[stage][metadata_index(b_col_base + frag_col(lane_id, 0), scale_slot)];
-                    scale_bits_pre[wj][1] =
-                        smem_scales_B[stage][metadata_index(b_col_base + frag_col(lane_id, 1), scale_slot)];
-                    if constexpr (NEEDS_MINS)
-                    {
-                        secondary_bits_pre[wj][0] =
-                            smem_mins_B[stage][metadata_index(b_col_base + frag_col(lane_id, 0), scale_slot)];
-                        secondary_bits_pre[wj][1] =
-                            smem_mins_B[stage][metadata_index(b_col_base + frag_col(lane_id, 1), scale_slot)];
-                    }
-                    if constexpr (IS_DUAL_SCALE_ASYM)
-                    {
-                        emin_bits_pre[wj][0] =
-                            smem_emins_B[stage][metadata_index(b_col_base + frag_col(lane_id, 0), scale_slot)];
-                        emin_bits_pre[wj][1] =
-                            smem_emins_B[stage][metadata_index(b_col_base + frag_col(lane_id, 1), scale_slot)];
-                    }
-                }
-
-                // ── Pre-load ALL A fragments for this half ────────────
-                // Decouples A ldmatrix from MMA, enabling the restructured
-                // wj→wi loop that loads each B fragment ONCE instead of WM times.
-                uint32_t A_frag_all[WM][4];
-                [[maybe_unused]] int sum_A_row0_all[WM], sum_A_row1_all[WM];
-                [[maybe_unused]] int sum_A_lo_row0_all[WM], sum_A_lo_row1_all[WM];
-                [[maybe_unused]] int sum_A_hi_row0_all[WM], sum_A_hi_row1_all[WM];
-                [[maybe_unused]] int sg0_r0_all[WM], sg1_r0_all[WM], sg2_r0_all[WM], sg3_r0_all[WM];
-                [[maybe_unused]] int sg0_r1_all[WM], sg1_r1_all[WM], sg2_r1_all[WM], sg3_r1_all[WM];
-
-#pragma unroll
-                for (int wi = 0; wi < WM; ++wi)
-                {
-                    const int a_row_base = wr * WARP_M + wi * 16;
-                    load_ldmatrix_a_m16n8k32(
-                        A_frag_all[wi],
-                        reinterpret_cast<const int *>(&smem_A[stage][a_row_base * SMEM_STRIDE_64 + k_offset]),
-                        SMEM_STRIDE_64 / 4, lane_id);
-
-                    if constexpr (IS_ASYMMETRIC)
-                    {
-                        const int grow0 = block_m + a_row_base + gid;
-                        const int grow1 = grow0 + 8;
-                        if (sums_A)
-                        {
-                            // Both quantizers publish block-major sums using
-                            // this captured M, not the request's active-row
-                            // count. Adjacent MMA rows therefore share sectors.
-                            sum_A_row0_all[wi] =
-                                sums_A[static_cast<size_t>(kb) * M + grow0];
-                            sum_A_row1_all[wi] =
-                                sums_A[static_cast<size_t>(kb) * M + grow1];
-                        }
-                        else
-                        {
-                            const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                            const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                            int32_t s0 = 0, s1 = 0;
-#pragma unroll
-                            for (int w = 0; w < 8; ++w)
-                            {
-                                s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
-                                s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
-                            }
-                            sum_A_row0_all[wi] = s0;
-                            sum_A_row1_all[wi] = s1;
-                        }
-                    }
-
-                    if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                    {
-                        const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                        const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                        int32_t slo0 = 0, slo1 = 0, shi0 = 0, shi1 = 0;
-#pragma unroll
-                        for (int w = 0; w < 4; ++w)
-                        {
-                            slo0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], slo0);
-                            slo1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], slo1);
-                        }
-#pragma unroll
-                        for (int w = 4; w < 8; ++w)
-                        {
-                            shi0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], shi0);
-                            shi1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], shi1);
-                        }
-                        sum_A_lo_row0_all[wi] = slo0;
-                        sum_A_lo_row1_all[wi] = slo1;
-                        sum_A_hi_row0_all[wi] = shi0;
-                        sum_A_hi_row1_all[wi] = shi1;
-                    }
-
-                    if constexpr (IS_IQ1_M)
-                    {
-                        const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                        const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                        sg0_r0_all[wi] = sg1_r0_all[wi] = sg2_r0_all[wi] = sg3_r0_all[wi] = 0;
-                        sg0_r1_all[wi] = sg1_r1_all[wi] = sg2_r1_all[wi] = sg3_r1_all[wi] = 0;
-                        for (int w = 0; w < 2; ++w)
-                        {
-                            sg0_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg0_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                        }
-                        for (int w = 2; w < 4; ++w)
-                        {
-                            sg1_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg1_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                        }
-                        for (int w = 4; w < 6; ++w)
-                        {
-                            sg2_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg2_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                        }
-                        for (int w = 6; w < 8; ++w)
-                        {
-                            sg3_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg3_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
-                        }
-                    }
-                }
-
-                // ── Compute: wj (outer) → wi (inner) ─────────────────
-                // B fragment loaded ONCE per wj, reused across all WM rows.
-                // Halves B ldmatrix loads vs the original wi→wj order.
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    uint32_t B_frag[2];
-                    load_ldmatrix_b_m16n8k32(
-                        B_frag,
-                        reinterpret_cast<const int *>(&smem_B[stage][(wc * WARP_N + wj * 8) * SMEM_STRIDE_64 + k_offset]),
-                        SMEM_STRIDE_64 / 4, lane_id);
-
-#pragma unroll
-                    for (int wi = 0; wi < WM; ++wi)
-                    {
-                        const float sa0 = sa_pre[wi][0];
-                        const float sa1 = sa_pre[wi][1];
-
-                        int32_t dot_lo[4] = {0, 0, 0, 0};
-                        int32_t dot_hi[4] = {0, 0, 0, 0};
-                        if constexpr (IS_DUAL_SCALE)
-                        {
-                            const uint32_t B_lo[2] = {B_frag[0], 0u};
-                            const uint32_t B_hi[2] = {0u, B_frag[1]};
-                            mma_m16n8k32_s8(
-                                dot_lo,
-                                A_frag_all[wi],
-                                B_lo);
-                            mma_m16n8k32_s8(
-                                dot_hi,
-                                A_frag_all[wi],
-                                B_hi);
-                        }
-                        else
-                        {
-                            mma_m16n8k32_s8(
-                                dot_lo,
-                                A_frag_all[wi],
-                                B_frag);
-                        }
-
-                        const int b_col_base =
-                            wc * WARP_N + wj * 8;
-                        const uint16_t qh_c0 = IS_IQ1_M
-                            ? smem_iq1m_qh[stage][
-                                  2 * (b_col_base +
-                                       frag_col(lane_id, 0)) +
-                                  scale_slot]
-                            : uint16_t{0};
-                        const uint16_t qh_c1 = IS_IQ1_M
-                            ? smem_iq1m_qh[stage][
-                                  2 * (b_col_base +
-                                       frag_col(lane_id, 1)) +
-                                  scale_slot]
-                            : uint16_t{0};
-
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                        {
-                            const int column = e & 1;
-                            const bool first_row = e < 2;
-                            const float activation_scale =
-                                first_row ? sa0 : sa1;
-                            const int activation_sum =
-                                IS_ASYMMETRIC
-                                    ? (first_row
-                                           ? sum_A_row0_all[wi]
-                                           : sum_A_row1_all[wi])
-                                    : 0;
-                            const int activation_sum_lo =
-                                (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                                    ? (first_row
-                                           ? sum_A_lo_row0_all[wi]
-                                           : sum_A_lo_row1_all[wi])
-                                    : 0;
-                            const int activation_sum_hi =
-                                (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                                    ? (first_row
-                                           ? sum_A_hi_row0_all[wi]
-                                           : sum_A_hi_row1_all[wi])
-                                    : 0;
-                            const uint32_t emin_bits =
-                                IS_DUAL_SCALE_ASYM
-                                    ? emin_bits_pre[wj][column]
-                                    : uint32_t{0};
-                            const uint16_t secondary_bits =
-                                NEEDS_MINS
-                                    ? secondary_bits_pre[wj][column]
-                                    : uint16_t{0};
-                            const uint16_t iq1m_qh =
-                                column ? qh_c1 : qh_c0;
-                            const int subgroup_sum0 = IS_IQ1_M
-                                ? (first_row
-                                       ? sg0_r0_all[wi]
-                                       : sg0_r1_all[wi])
-                                : 0;
-                            const int subgroup_sum1 = IS_IQ1_M
-                                ? (first_row
-                                       ? sg1_r0_all[wi]
-                                       : sg1_r1_all[wi])
-                                : 0;
-                            const int subgroup_sum2 = IS_IQ1_M
-                                ? (first_row
-                                       ? sg2_r0_all[wi]
-                                       : sg2_r1_all[wi])
-                                : 0;
-                            const int subgroup_sum3 = IS_IQ1_M
-                                ? (first_row
-                                       ? sg3_r0_all[wi]
-                                       : sg3_r1_all[wi])
-                                : 0;
-                            const float contribution =
-                                llaminar2::cuda_native_vnni::
-                                    native_vnni_block_contribution_from_reduced_terms_rn<
-                                        CODEBOOK_ID>(
-                                        dot_lo[e],
-                                        dot_hi[e],
-                                        activation_scale,
-                                        scale_bits_pre[wj][column],
-                                        secondary_bits,
-                                        emin_bits,
-                                        activation_sum,
-                                        activation_sum_lo,
-                                        activation_sum_hi,
-                                        iq1m_qh,
-                                        subgroup_sum0,
-                                        subgroup_sum1,
-                                        subgroup_sum2,
-                                        subgroup_sum3);
-                            acc[wi][wj][e] = __fadd_rn(
-                                acc[wi][wj][e],
-                                contribution);
-                        }
-                    }
-                }
-                commit_serial_m1_partition(kb + 1);
-            }
-        };
-
-        auto compute_k_tile_border = [&](int stage, int kt) __attribute__((always_inline))
+        /**
+         * @brief Consume one zero-padded operand slot for every output tile.
+         *
+         * Copy/decode owners already initialize out-of-range rows, columns and
+         * metadata. Interior and border tiles share one MMA walk; only final
+         * output publication needs bounds checks. One live A fragment and its
+         * reused corrections bound register pressure without changing the
+         * ascending block/partition arithmetic or creating global scratch.
+         */
+        auto compute_k_tile = [&](int stage, int kt) __attribute__((always_inline))
         {
             const int kb0 = kt * 2;
 #pragma unroll
@@ -1237,118 +965,20 @@ namespace llaminar2::cuda::prefill
                         reinterpret_cast<const int *>(&smem_A[stage][a_row_base * SMEM_STRIDE_64 + k_offset]),
                         SMEM_STRIDE_64 / 4, lane_id);
 
-                    const int grow0 = block_m + a_row_base + gid;
-                    const int grow1 = grow0 + 8;
                     const int local_row0 = a_row_base + gid;
-                    const float sa0 = (grow0 < M) ? smem_sa[stage][local_row0 * 2 + half] : 0.0f;
-                    const float sa1 = (grow1 < M) ? smem_sa[stage][(local_row0 + 8) * 2 + half] : 0.0f;
+                    const float sa0 = smem_sa[stage][local_row0 * 2 + half];
+                    const float sa1 = smem_sa[stage][(local_row0 + 8) * 2 + half];
 
-                    // sum_A for asymmetric correction (border variant with bounds check)
-                    [[maybe_unused]] int sum_A_row0 = 0, sum_A_row1 = 0;
-                    if constexpr (IS_ASYMMETRIC)
+                    // Share each row's correction across every output column
+                    // assigned to this warp, but retain only this A fragment.
+                    int subgroup_r0[4] = {}, subgroup_r1[4] = {};
+                    if constexpr (NEEDS_SUMS && !IS_ASYMMETRIC)
                     {
-                        if (sums_A)
-                        {
-                            if (grow0 < M)
-                                sum_A_row0 =
-                                    sums_A[static_cast<size_t>(kb) * M + grow0];
-                            if (grow1 < M)
-                                sum_A_row1 =
-                                    sums_A[static_cast<size_t>(kb) * M + grow1];
-                        }
-                        else if (grow0 < M)
-                        {
-                            const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                            int32_t s0 = 0;
 #pragma unroll
-                            for (int w = 0; w < 8; ++w)
-                                s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
-                            sum_A_row0 = s0;
-                            if (grow1 < M)
-                            {
-                                const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                                int32_t s1 = 0;
-#pragma unroll
-                                for (int w = 0; w < 8; ++w)
-                                    s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
-                                sum_A_row1 = s1;
-                            }
-                        }
-                        else if (grow1 < M)
+                        for (int group = 0; group < GROUPS_PER_HALF; ++group)
                         {
-                            const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                            int32_t s1 = 0;
-#pragma unroll
-                            for (int w = 0; w < 8; ++w)
-                                s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
-                            sum_A_row1 = s1;
-                        }
-                    }
-
-                    // Split sums for dual_scale_asym (Q2_K) and IQ1_M
-                    [[maybe_unused]] int sum_A_lo_row0 = 0, sum_A_lo_row1 = 0;
-                    [[maybe_unused]] int sum_A_hi_row0 = 0, sum_A_hi_row1 = 0;
-                    if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                    {
-                        if (grow0 < M)
-                        {
-                            const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                            int32_t slo = 0, shi = 0;
-                            for (int w = 0; w < 4; ++w)
-                                slo = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], slo);
-                            for (int w = 4; w < 8; ++w)
-                                shi = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], shi);
-                            sum_A_lo_row0 = slo;
-                            sum_A_hi_row0 = shi;
-                        }
-                        if (grow1 < M)
-                        {
-                            const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                            int32_t slo = 0, shi = 0;
-                            for (int w = 0; w < 4; ++w)
-                                slo = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], slo);
-                            for (int w = 4; w < 8; ++w)
-                                shi = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], shi);
-                            sum_A_lo_row1 = slo;
-                            sum_A_hi_row1 = shi;
-                        }
-                    }
-
-                    [[maybe_unused]] int subgroup_r0[4] = {0, 0, 0, 0};
-                    [[maybe_unused]] int subgroup_r1[4] = {0, 0, 0, 0};
-                    if constexpr (IS_IQ1_M)
-                    {
-                        if (grow0 < M)
-                        {
-                            const int32_t *row0_words =
-                                reinterpret_cast<const int32_t *>(
-                                    &smem_A[stage][
-                                        (a_row_base + gid) *
-                                            SMEM_STRIDE_64 +
-                                        k_offset]);
-#pragma unroll
-                            for (int word = 0; word < 8; ++word)
-                            {
-                                subgroup_r0[word / 2] +=
-                                    llaminar2::cuda_native_vnni::
-                                        sum_packed_i8(row0_words[word]);
-                            }
-                        }
-                        if (grow1 < M)
-                        {
-                            const int32_t *row1_words =
-                                reinterpret_cast<const int32_t *>(
-                                    &smem_A[stage][
-                                        (a_row_base + gid + 8) *
-                                            SMEM_STRIDE_64 +
-                                        k_offset]);
-#pragma unroll
-                            for (int word = 0; word < 8; ++word)
-                            {
-                                subgroup_r1[word / 2] +=
-                                    llaminar2::cuda_native_vnni::
-                                        sum_packed_i8(row1_words[word]);
-                            }
+                            subgroup_r0[group] = smem_corrections[stage][local_row0 * CORRECTION_GROUPS + half * GROUPS_PER_HALF + group];
+                            subgroup_r1[group] = smem_corrections[stage][(local_row0 + 8) * CORRECTION_GROUPS + half * GROUPS_PER_HALF + group];
                         }
                     }
 
@@ -1358,34 +988,28 @@ namespace llaminar2::cuda::prefill
                         const int b_col_base = wc * WARP_N + wj * 8;
                         const int lc0 = b_col_base + frag_col(lane_id, 0);
                         const int lc1 = b_col_base + frag_col(lane_id, 1);
-                        const bool column0_valid = block_n + lc0 < N;
-                        const bool column1_valid = block_n + lc1 < N;
                         const uint16_t scale_bits[2] = {
-                            column0_valid
-                                ? smem_scales_B[stage][metadata_index(lc0, scale_slot)]
-                                : uint16_t{0},
-                            column1_valid
-                                ? smem_scales_B[stage][metadata_index(lc1, scale_slot)]
-                                : uint16_t{0}};
+                            smem_scales_B[stage][metadata_index(lc0, scale_slot)],
+                            smem_scales_B[stage][metadata_index(lc1, scale_slot)]};
                         const uint16_t secondary_bits[2] = {
-                            NEEDS_MINS && column0_valid
+                            NEEDS_MINS
                                 ? smem_mins_B[stage][metadata_index(lc0, scale_slot)]
                                 : uint16_t{0},
-                            NEEDS_MINS && column1_valid
+                            NEEDS_MINS
                                 ? smem_mins_B[stage][metadata_index(lc1, scale_slot)]
                                 : uint16_t{0}};
                         const uint32_t emin_bits[2] = {
-                            IS_DUAL_SCALE_ASYM && column0_valid
+                            IS_DUAL_SCALE_ASYM
                                 ? smem_emins_B[stage][metadata_index(lc0, scale_slot)]
                                 : uint32_t{0},
-                            IS_DUAL_SCALE_ASYM && column1_valid
+                            IS_DUAL_SCALE_ASYM
                                 ? smem_emins_B[stage][metadata_index(lc1, scale_slot)]
                                 : uint32_t{0}};
                         const uint16_t iq1m_qh[2] = {
-                            IS_IQ1_M && column0_valid
+                            IS_IQ1_M
                                 ? smem_iq1m_qh[stage][metadata_index(lc0, scale_slot)]
                                 : uint16_t{0},
-                            IS_IQ1_M && column1_valid
+                            IS_IQ1_M
                                 ? smem_iq1m_qh[stage][metadata_index(lc1, scale_slot)]
                                 : uint16_t{0}};
 
@@ -1410,47 +1034,47 @@ namespace llaminar2::cuda::prefill
                         }
 
 #pragma unroll
-                        for (int e = 0; e < 4; ++e)
+                        for (int row_component = 0; row_component < 2; ++row_component)
                         {
-                            const int column = e & 1;
-                            const bool first_row = e < 2;
-                            const float activation_scale =
-                                first_row ? sa0 : sa1;
-                            const int *subgroup_sums =
-                                first_row ? subgroup_r0 : subgroup_r1;
-                            const float contribution =
-                                llaminar2::cuda_native_vnni::
-                                    native_vnni_block_contribution_from_reduced_terms_rn<
-                                        CODEBOOK_ID>(
-                                        dot_lo[e],
-                                        dot_hi[e],
-                                        activation_scale,
-                                        scale_bits[column],
-                                        secondary_bits[column],
-                                        emin_bits[column],
-                                        IS_ASYMMETRIC
-                                            ? (first_row
-                                                   ? sum_A_row0
-                                                   : sum_A_row1)
-                                            : 0,
-                                        (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                                            ? (first_row
-                                                   ? sum_A_lo_row0
-                                                   : sum_A_lo_row1)
-                                            : 0,
-                                        (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
-                                            ? (first_row
-                                                   ? sum_A_hi_row0
-                                                   : sum_A_hi_row1)
-                                            : 0,
-                                        iq1m_qh[column],
-                                        IS_IQ1_M ? subgroup_sums[0] : 0,
-                                        IS_IQ1_M ? subgroup_sums[1] : 0,
-                                        IS_IQ1_M ? subgroup_sums[2] : 0,
-                                        IS_IQ1_M ? subgroup_sums[3] : 0);
-                            acc[wi][wj][e] = __fadd_rn(
-                                acc[wi][wj][e],
-                                contribution);
+                            // Two adjacent output columns share one correction
+                            // load, and its register dies before the next row.
+                            const bool first_row = row_component == 0;
+                            const int activation_sum = IS_ASYMMETRIC
+                                ? smem_corrections[stage][(local_row0 + row_component * 8) * 2 + half]
+                                : 0;
+#pragma unroll
+                            for (int column = 0; column < 2; ++column)
+                            {
+                                const int e = row_component * 2 + column;
+                                const float activation_scale =
+                                    first_row ? sa0 : sa1;
+                                const int *subgroup_sums = first_row ? subgroup_r0 : subgroup_r1;
+                                const float contribution =
+                                    llaminar2::cuda_native_vnni::
+                                        native_vnni_block_contribution_from_reduced_terms_rn<
+                                            CODEBOOK_ID>(
+                                            dot_lo[e],
+                                            dot_hi[e],
+                                            activation_scale,
+                                            scale_bits[column],
+                                            secondary_bits[column],
+                                            emin_bits[column],
+                                            activation_sum,
+                                            (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                                ? (IS_IQ1_M ? subgroup_sums[0] + subgroup_sums[1] : subgroup_sums[0])
+                                                : 0,
+                                            (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
+                                                ? (IS_IQ1_M ? subgroup_sums[2] + subgroup_sums[3] : subgroup_sums[1])
+                                                : 0,
+                                            iq1m_qh[column],
+                                            IS_IQ1_M ? subgroup_sums[0] : 0,
+                                            IS_IQ1_M ? subgroup_sums[1] : 0,
+                                            IS_IQ1_M ? subgroup_sums[2] : 0,
+                                            IS_IQ1_M ? subgroup_sums[3] : 0);
+                                acc[wi][wj][e] = __fadd_rn(
+                                    acc[wi][wj][e],
+                                    contribution);
+                            }
                         }
                     }
                 }
@@ -1490,10 +1114,7 @@ namespace llaminar2::cuda::prefill
                         cp_async_wait<0>();
                         __syncthreads();
 
-                        if (is_interior_tile)
-                            compute_k_tile_interior(0, kt);
-                        else
-                            compute_k_tile_border(0, kt);
+                        compute_k_tile(0, kt);
 
                         if (ki + 1 < num_k_iters)
                             __syncthreads();
@@ -1530,10 +1151,7 @@ namespace llaminar2::cuda::prefill
                             if constexpr (ASYNC_RAW_MODE != 3)
                                 load_scales_A(stage ^ 1, kt + 1);
                         }
-                        if (is_interior_tile)
-                            compute_k_tile_interior(stage, kt);
-                        else
-                            compute_k_tile_border(stage, kt);
+                        compute_k_tile(stage, kt);
                         if (ki + 1 < num_k_iters)
                         {
                             cp_async_wait<0>();
@@ -1567,10 +1185,7 @@ namespace llaminar2::cuda::prefill
                             load_scales_A(stage ^ 1, kt + 1);
                         }
 
-                        if (is_interior_tile)
-                            compute_k_tile_interior(stage, kt);
-                        else
-                            compute_k_tile_border(stage, kt);
+                        compute_k_tile(stage, kt);
 
                         if (ki + 1 < num_k_iters)
                         {

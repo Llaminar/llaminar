@@ -50,13 +50,33 @@ namespace llaminar2
      *
      * The opaque lifetime keeps both the POSIX mapping and every CUDA/HIP host
      * registration alive. Callers receive no host pointer and cannot use this
-     * binding to create a host policy shadow.
+     * binding to create a host policy shadow. Pointer members are GPU aliases,
+     * not CPU addresses, even when a driver happens to give them equal values.
+     * Host-side launch construction uses only the immutable setup metadata.
      */
     struct MoEOverlayDeviceControllerParticipantBinding
     {
+        /**
+         * @brief Model-frozen launch scalars authored by the fabric layout.
+         *
+         * These are setup geometry, not a mirror of device-owned execution
+         * state. Keeping them separate avoids reading a GPU alias while the
+         * host constructs capture arguments or estimates stage traffic.
+         */
+        struct CaptureMetadata
+        {
+            std::uint64_t topology_fingerprint = 0u;
+            std::uint64_t group_collected_state_words = 0u;
+            std::uint32_t role_flags = 0u;
+
+            /** @return Whether all immutable capture scalars agree. */
+            bool operator==(const CaptureMetadata &) const = default;
+        };
+
         DeviceId device = DeviceId::invalid();
         int participant_id = -1;
         int group_id = -1;
+        CaptureMetadata capture_metadata;
         bool authority_leader = false;
         bool group_root = false;
         /** True only for members of the symmetric continuation epoch barrier. */

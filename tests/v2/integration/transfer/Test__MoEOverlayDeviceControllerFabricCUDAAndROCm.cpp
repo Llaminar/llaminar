@@ -15,6 +15,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/compute_stages/stages/MoEOverlayDeviceControllerStage.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
@@ -1813,6 +1814,7 @@ namespace llaminar2::test
             if (error)
                 error->clear();
             if (!cuda || !rocm || !evidence || participant_bindings.empty() ||
+                transport_bindings.empty() ||
                 fixtures.size() != participant_bindings.size())
             {
                 if (error)
@@ -1869,6 +1871,8 @@ namespace llaminar2::test
             struct Endpoint
             {
                 MoEOverlayDeviceControllerParticipantBinding binding;
+                /** Host transport alias, never a GPU capture address. */
+                const MoEOverlayDeviceControllerParticipantRecord *host_lifecycle = nullptr;
                 MoEOverlayDeviceRuntimePublicationFixture *fixture = nullptr;
                 IBackend *backend = nullptr;
                 std::unique_ptr<IMoEKernel> kernel;
@@ -1896,9 +1900,28 @@ namespace llaminar2::test
                         *error = "runtime apply participant binding is incomplete";
                     return false;
                 }
+                const MoEOverlayDeviceControllerParticipantRecord *host_lifecycle = nullptr;
+                for (const auto &transport : transport_bindings)
+                {
+                    if (transport.group_id != binding.group_id) continue;
+                    for (std::uint32_t member = 0u;
+                         member < transport.participant_record_count; ++member)
+                    {
+                        const auto *record = &transport.participant_records[member];
+                        if (record->participant_id ==
+                            static_cast<std::uint32_t>(binding.participant_id))
+                            host_lifecycle = record;
+                    }
+                }
+                if (!host_lifecycle)
+                {
+                    if (error) *error = "runtime apply has no exact host lifecycle alias";
+                    return false;
+                }
                 const auto &runtime = fixture->runtimeBinding();
                 endpoints.push_back({
                     .binding = binding,
+                    .host_lifecycle = host_lifecycle,
                     .fixture = fixture,
                     .backend = backend,
                     .kernel = KernelFactory::createMoEKernel(binding.device),
@@ -2699,8 +2722,7 @@ namespace llaminar2::test
                     for (auto &endpoint : endpoints)
                     {
                         DeviceMoEOverlayEpochControl control{};
-                        const auto *record =
-                            endpoint.binding.local_participant_record;
+                        const auto *record = endpoint.host_lifecycle;
                         // The readiness kernel also runs on inference streams.
                         // Its probe must leave maintenance-entry evidence intact
                         // so a stalled publication can be diagnosed reliably.
@@ -2791,9 +2813,7 @@ namespace llaminar2::test
                             endpoints.end(),
                             [initial_epoch](const Endpoint &endpoint)
                             {
-                                return endpoint.binding
-                                           .local_participant_record
-                                           ->retirement_ready_epoch ==
+                                return endpoint.host_lifecycle->retirement_ready_epoch ==
                                     initial_epoch;
                             });
                     submitted = submitted && all_readers_ready;
@@ -2856,9 +2876,7 @@ namespace llaminar2::test
                             endpoints.end(),
                             [initial_epoch](const Endpoint &endpoint)
                             {
-                                return endpoint.binding
-                                           .local_participant_record
-                                           ->retired_epoch == initial_epoch;
+                                return endpoint.host_lifecycle->retired_epoch == initial_epoch;
                             });
                     submitted = submitted && all_retired;
                 }
@@ -2883,10 +2901,9 @@ namespace llaminar2::test
                             endpoints.end(),
                             [initial_epoch](const Endpoint &endpoint)
                             {
-                                return endpoint.binding
-                                           .local_participant_record
-                                           ->retirement_ready_epoch ==
-                                    initial_epoch;
+                                return std::atomic_ref<const std::uint64_t>(
+                                           endpoint.host_lifecycle->retirement_ready_epoch)
+                                           .load(std::memory_order_acquire) == initial_epoch;
                             });
                         if (topology_ready)
                             break;
@@ -3303,8 +3320,10 @@ namespace llaminar2::test
                     leader->stream);
             }
             evidence->economy_last_moved.resize(
-                static_cast<std::size_t>(leader->binding.layout->num_layers) *
-                leader->binding.layout->num_experts);
+                // Geometry is read through the explicit host transport view,
+                // never through the leader's GPU-only capture aliases.
+                static_cast<std::size_t>(transport_bindings.front().layout->num_layers) *
+                transport_bindings.front().layout->num_experts);
             if (copied)
             {
                 copied = leader->backend->deviceToHost(
@@ -3857,6 +3876,59 @@ namespace llaminar2::test
         EXPECT_FALSE(inbox.finishWave(protocol, command, &error));
         EXPECT_FALSE(inbox.stage(batch, prepared, &error))
             << "A retired transaction cannot be staged again";
+    }
+
+    /**
+     * @test Setup metadata and graph identity work with every registered alias.
+     *
+     * Explicit HIP registration may return GPU VAs that the CPU cannot read.
+     * Validate all six participants, including stage traffic estimation, before
+     * the remaining tests execute real captured controller transactions.
+     */
+    TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,
+         CaptureMetadataUsesFrozenLayoutForEveryParticipant)
+    {
+        auto *const cuda = getCUDABackend();
+        auto *const rocm = getROCmBackend();
+        if (!cuda || !rocm || cuda->deviceCount() < 2 || rocm->deviceCount() < 4)
+            GTEST_SKIP() << "Requires two CUDA and four ROCm devices";
+        const auto resolved = topology();
+        const auto input = adversarialPolicyInput();
+        auto fabrics = makeControllerFabricPair(resolved, input);
+        for (const auto &participant : resolved->participants)
+        {
+            SCOPED_TRACE(participant.participant_id);
+            auto &fabric = participant.device.is_cuda()
+                ? *fabrics.cuda_rank : *fabrics.rocm_rank;
+            const auto binding = fabric.participantBinding(participant.participant_id);
+            const auto captured = binding.deviceBinding();
+            EXPECT_EQ(captured.topology_fingerprint, resolved->topology_fingerprint);
+            EXPECT_EQ(captured.layout, binding.layout);
+            const auto words = fabric.layout().groups.at(binding.group_id).collected_state_words;
+            EXPECT_EQ(binding.capture_metadata.group_collected_state_words, words);
+            MoEOverlayDeviceControllerStage::Params params{
+                .device_id = binding.device,
+                .binding = binding,
+                .action = binding.group_root
+                    ? MoEOverlayDeviceControllerAction::PublishGroupSnapshot
+                    : MoEOverlayDeviceControllerAction::AwaitTransactionComplete,
+            };
+            MoEOverlayDeviceControllerStage stage(params);
+            EXPECT_EQ(stage.estimatedMemoryBytes(),
+                sizeof(MoEOverlayDeviceControllerSharedHeader) +
+                sizeof(MoEOverlayDeviceControllerCommandHeader) +
+                sizeof(MoEOverlayDeviceControllerGroupRecord) +
+                (binding.group_root ? words * sizeof(std::uint64_t) : 0u));
+            EXPECT_TRUE(stage.hasSameCaptureIdentity(params));
+            ++params.binding.capture_metadata.topology_fingerprint;
+            EXPECT_FALSE(stage.hasSameCaptureIdentity(params));
+            params.binding = binding;
+            ++params.binding.capture_metadata.group_collected_state_words;
+            EXPECT_FALSE(stage.hasSameCaptureIdentity(params));
+            params.binding = binding;
+            params.binding.capture_metadata.role_flags ^= 1u;
+            EXPECT_FALSE(stage.hasSameCaptureIdentity(params));
+        }
     }
 
     TEST(Test__MoEOverlayDeviceControllerFabricCUDAAndROCm,

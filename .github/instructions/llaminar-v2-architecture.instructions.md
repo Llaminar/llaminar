@@ -140,6 +140,25 @@ per-replay resolution. CUDA still uses its native graph queries, stream memory
 operations and context checks. Driver-free startup and native binding belong
 to the canonical model-free integration preflight.
 
+`ROCmRuntimeStartup` owns the immutable native host-memory ABI before HSA is
+opened. `hipHostMalloc` uses driver-backed GTT pages; caller-owned registrations
+use explicit pinned buffer objects, not demand-paged HMM/SVM ranges. The two
+vendor inputs (`HSA_USERPTR_FOR_PAGED_MEM=0` and `HSA_USE_SVM=0`) are installed
+together or rejected before ROCm admission. TransferEngine retains the exact
+registration owner and completion-event lifetime. This changes neither device
+residency nor captured DMA: there is no extra staging copy, polling loop, or
+implicit migration. Preparing the policy does not enumerate or initialize GPUs
+in a CPU-only process. The startup-policy and all-device registration/replay
+regressions belong to ProductionTestPreflight.
+
+Before either ordinary or mapped ROCm registration,
+`HostRegistrationPageBoundary` isolates only its edge base pages with
+`MADV_NOHUGEPAGE`. Reclaiming an unregistered neighbour must not split a shared
+huge PMD and evict live KFD queues. The immutable geometry is VMA policy, not a
+memory ledger: it neither allocates nor discards bytes, preserves interior
+huge-page eligibility, and stays in place until storage reuse/unmap. Do not
+rejoin an edge on unregister while an adjacent registration may still be live.
+
 Each real `MPIContext` publishes that observation once for its exact communicator.
 Startup, runner admission and topology share the immutable publication; topology
 does not own a refresh API. Failed discovery and failed topology construction
@@ -1244,6 +1263,14 @@ harvest, promotion/demotion, and device rehydration are explicit lifecycle
 operations. Cache fingerprints include model/graph policy needed to reject an
 incompatible state image.
 
+Terminal-logit archival binds the latest ordered producer to the archive's
+logical vocabulary interval through `PrefixTerminalLogitsSlice`. A gathered
+full row and a local shard are different physical surfaces for the same token
+interval. Copies and diagnostic hashes consume the same checked slice; restore
+retains the existing participant-local publication and required TP collective.
+Incompatible persisted arithmetic/layout contracts are rejected through the
+canonical fingerprint version, without deleting prior archive files.
+
 Prefix payload ownership follows the participant's actual cache role. A
 pipeline follower archives its main-model state, not the tail's shifted MTP
 cache. `PrefixPayloadLayout` distinguishes attention-block chains from complete
@@ -1269,6 +1296,16 @@ objects and device events. `MTPDepthController` selects a permitted draft depth;
 `MTPVerifierForwardExecutor` and the runner interfaces coordinate verifier
 forwards. Production grouped verification must preserve serial-row byte
 equivalence while publishing accepted state without row replay.
+
+Terminal-head authoring defaults to `auto`. `ExecutionPlanBuilder` seals it
+before admission: CPU continuation domains use vocabulary shards; accelerator
+continuation domains retain full-vocabulary mirrors. Expert-only tiers do not
+participate in that decision, and pipelines use the final domain. Explicit
+policies survive unchanged. `ResolvedRankOrchestration` publishes the same
+concrete policy to the saved configuration and rank runtime, so graph layout,
+costing and `PhysicalMemoryAuthority` weight-set inputs cannot select separate
+defaults. Lower-level graph and weight-accounting consumers reject unresolved
+automatic intent.
 
 Stochastic admission distinguishes full-model collective peers from expert-only
 transaction followers through `MTPRankParticipation`. An installed overlay

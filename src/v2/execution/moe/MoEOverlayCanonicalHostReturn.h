@@ -13,6 +13,7 @@
 
 #include "CanonicalMoERouteRecord.h"
 #include "MoEOverlaySparseCollective.h"
+#include "MoEOverlayHostRowWork.h"
 
 #include <algorithm>
 #include <span>
@@ -62,14 +63,14 @@ namespace llaminar2
 
         // Validate the complete append before exposing a new count. The graph
         // dependency on the final reducer is the publication edge on CPU.
-        for (size_t row = 0; row < rows.live_row_count; ++row)
-        {
+        forEachMoEOverlayHostRow(rows.live_row_count,
+            static_cast<size_t>(rows.d_model) * sizeof(float), [&](size_t row) {
             float *destination = record::record(bank.data(), first + row, rows.d_model);
             std::copy_n(rows.output_rows_fp32 + row * static_cast<size_t>(rows.d_model),
                         rows.d_model, destination);
             record::writeFlatRouteSlot(destination, rows.d_model,
                                       static_cast<size_t>(rows.row_ids_host[row]));
-        }
+        });
         return record::writeRecordCount(bank.data(), bank.size(), first + rows.live_row_count);
     }
 } // namespace llaminar2

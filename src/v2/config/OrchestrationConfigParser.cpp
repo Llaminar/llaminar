@@ -706,7 +706,7 @@ namespace llaminar2
                 {
                     throw std::invalid_argument(
                         "Invalid mtp terminal_head_policy: '" + value +
-                        "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                        "' (valid: auto, vocabulary-sharded, mirrored-full-vocabulary)");
                 }
                 config.mtp.terminal_head_policy = *parsed;
             }
@@ -2686,7 +2686,7 @@ namespace llaminar2
             .long_name = "--mtp-verify-mode",
             .category = "MTP",
             .value_label = "<mode>",
-            .description = "MTP verification mode: greedy, speculative-sampling",
+            .description = "MTP verification mode: speculative-sampling (default; includes greedy requests), greedy (greedy requests only)",
             .valid_values = {"greedy", "speculative-sampling"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
@@ -2705,8 +2705,8 @@ namespace llaminar2
             .long_name = "--mtp-terminal-head-policy",
             .category = "MTP",
             .value_label = "<policy>",
-            .description = "MTP final norm/LM-head placement: vocabulary-sharded or mirrored-full-vocabulary",
-            .valid_values = {"vocabulary-sharded", "mirrored-full-vocabulary"},
+            .description = "MTP final norm/LM-head placement: auto (CPU vocabulary-sharded, GPU mirrored), vocabulary-sharded, or mirrored-full-vocabulary",
+            .valid_values = {"auto", "vocabulary-sharded", "mirrored-full-vocabulary"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2715,7 +2715,7 @@ namespace llaminar2
                     {
                         throw std::invalid_argument(
                             "Invalid value for --mtp-terminal-head-policy: '" + v +
-                            "' (valid: vocabulary-sharded, mirrored-full-vocabulary)");
+                            "' (valid: auto, vocabulary-sharded, mirrored-full-vocabulary)");
                     }
                     c.mtp.terminal_head_policy = *parsed;
                 }),

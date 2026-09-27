@@ -1,3 +1,12 @@
+/**
+ * @file MTPDepthController.h
+ * @brief Host-owned adaptive depth observations and explicit admission policy.
+ *
+ * Request admission selects a measured startup independently of the learned
+ * acceptance-window transitions. The controller owns only CPU request state;
+ * GPU admission seals the same policy into the device-owned generation ABI.
+ * Neither startup selection nor adaptation changes the retained graph capacity.
+ */
 #pragma once
 
 #include "../config/RuntimeConfig.h"
@@ -35,6 +44,7 @@ namespace llaminar2
         Hold,
     };
 
+    /** @return Stable diagnostic spelling of a depth decision reason. */
     const char *toString(MTPDepthDecisionReason reason);
 
     /**
@@ -119,27 +129,56 @@ namespace llaminar2
     class MTPDepthController
     {
     public:
+        /** @brief Construct portable bookkeeping for subsequent configuration. */
         MTPDepthController() = default;
+        /**
+         * @brief Validate and admit one request's depth policy.
+         * @param config Authored bounds, immutable domain identity and hysteresis.
+         * @param configured_draft_tokens Positive fixed depth, not an adaptive ceiling.
+         * @param verify_mode Active request sampling specialization.
+         * @throws std::invalid_argument If bounds or policy thresholds are invalid.
+         */
         MTPDepthController(
             MTPDepthPolicyConfig config,
             int configured_draft_tokens,
             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy);
 
+        /**
+         * @brief Replace policy and reset all observations for a new request.
+         * @param config Authored bounds, domain identity and hysteresis.
+         * @param configured_draft_tokens Positive fixed-mode draft count.
+         * @param verify_mode Active request sampling specialization.
+         * @throws std::invalid_argument If the requested policy is inconsistent.
+         */
         void configure(
             MTPDepthPolicyConfig config,
             int configured_draft_tokens,
             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy);
+        /** @brief Restore the admitted startup depth without changing capacity. */
         void reset();
 
+        /** @return Current live draft depth, including an explicitly enabled zero. */
         int currentDepth() const { return current_depth_; }
+        /** @return Next depth, including a scheduled probe out of explicit bypass. */
         int requestedDepthForStep() const;
+        /** @return Admitted lower bound. */
         int minDepth() const { return config_.min_depth; }
+        /** @return Admitted upper bound, independent of measured startup. */
         int maxDepth() const { return config_.max_depth; }
+        /** @return Fixed, observing, or adaptive execution intent. */
         MTPDepthPolicyMode mode() const { return config_.mode; }
+        /** @return Request-owned aggregate observation and transition counts. */
         const MTPDepthControllerStats &stats() const { return stats_; }
+        /** @return Last evaluated or deferred transition, for diagnostics. */
         const MTPDepthDecision &lastDecision() const { return last_decision_; }
 
+        /**
+         * @brief Observe one completed verifier transaction and evaluate if due.
+         * @param observation Actual execution depth and accepted prefix, not capacity.
+         * @return Decision after applying policy, hysteresis and explicit bounds.
+         */
         MTPDepthDecision recordStep(const MTPDepthObservation &observation);
+        /** @return Transition after a step in an explicitly admitted depth-zero mode. */
         MTPDepthDecision recordBypassStep();
 
     private:
@@ -167,8 +206,11 @@ namespace llaminar2
          */
         int nextUnrejectedDepthAbove(int depth) const;
 
+        /** @return Learned or portable recommendation for the accumulated window. */
         MTPDepthDecision evaluateWindow() const;
+        /** @return Whether sufficient unbiased observations permit evaluation. */
         bool windowReady() const;
+        /** @return Whether an explicitly admitted depth-zero lane may probe again. */
         bool depthZeroProbeReady() const;
 
         MTPDepthPolicyConfig config_;
@@ -181,8 +223,8 @@ namespace llaminar2
          * @brief Consecutive non-catastrophic bad windows at the learned best
          * fixed-depth lane.
          *
-         * Benchmark-trained hold rows can identify a depth that wins over a
-         * whole request even though individual 16-step windows are noisy.  One
+         * The benchmark-trained startup identifies a depth that wins across
+         * requests even though individual 16-step windows are noisy. One
          * bad window gets grace; a second consecutive bad window is treated as
          * request-local evidence that this prompt differs from the trained
          * fixed-depth lane.

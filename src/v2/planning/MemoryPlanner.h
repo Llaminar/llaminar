@@ -73,6 +73,7 @@ enum class AdditionalPersistentWeightSet
  *        when MTP execution is disabled; a replicated predictor is retained
  *        whenever the graph-capacity envelope exists.
  * @return Complete, duplicate-free list of additional physical weight sets.
+ * @throws std::logic_error if topology has not resolved the terminal-head policy.
  */
 [[nodiscard]] inline std::vector<AdditionalPersistentWeightSet>
 resolveAdditionalPersistentWeightSets(
@@ -80,14 +81,14 @@ resolveAdditionalPersistentWeightSets(
     int tensor_parallel_degree,
     const MTPRuntimeConfig &mtp)
 {
+    const bool mirrored_mtp_head =
+        mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
     if (tensor_parallel_degree <= 1)
         return {};
     if (denseParallelPolicyReplicatesDecode(policy))
         return {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
 
     std::vector<AdditionalPersistentWeightSet> sets;
-    const bool mirrored_mtp_head =
-        mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
     if (denseParallelPolicyMirrorsDecodeEmbedding(policy))
     {
         sets.push_back(

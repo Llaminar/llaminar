@@ -980,7 +980,8 @@ namespace llaminar2::moe_activation_packet_device
      * original router order. Chunk carries make the same algorithm total for
      * graph buckets larger than one block without atomics or reordered output.
      */
-    static __global__ void packDispatchMetadataKernel(
+    // Both backend bridges launch this exact scan width, not 1024 work items.
+    static __global__ __launch_bounds__(kDispatchMetadataBlockThreads) void packDispatchMetadataKernel(
         MoEOverlayActivationDispatchPackLaunch launch)
     {
         __shared__ DispatchMetadataScanValue
@@ -1454,7 +1455,7 @@ namespace llaminar2::moe_activation_packet_device
      * the exact same endpoint transition only after every checker arrives at
      * the final barrier.
      */
-    static __global__ void validateDispatchKernel(
+    static __global__ __launch_bounds__(256) void validateDispatchKernel(
         MoEOverlayActivationDispatchConsumeLaunch launch)
     {
         if (blockIdx.x != 0u)
@@ -2921,7 +2922,9 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /** @brief Launch-compatible wrapper for one direct-mapped dispatch lane. */
-    static __global__ void packSingleRowDispatchKernel(
+    // CUDA and HIP launch 512 threads for mapped single-row payloads. Keeping
+    // this bound explicit prevents an unnecessarily restricted register budget.
+    static __global__ __launch_bounds__(512) void packSingleRowDispatchKernel(
         MoEOverlayActivationSingleRowDispatchPackLaunch launch)
     {
         if (blockIdx.x == 0u)
@@ -2936,7 +2939,7 @@ namespace llaminar2::moe_activation_packet_device
      * removes serial launch and mapped-store latency without changing any lane's
      * packet bytes or timeline protocol.
      */
-    static __global__ void packSingleRowDispatchBatchKernel(
+    static __global__ __launch_bounds__(512) void packSingleRowDispatchBatchKernel(
         MoEOverlayActivationSingleRowDispatchBatchLaunch launch)
     {
         const std::uint32_t lane = blockIdx.x;
@@ -2953,7 +2956,7 @@ namespace llaminar2::moe_activation_packet_device
      * Thus downstream expert compute observes the same tensors as the ordinary
      * validator/materializer pair, with two graph nodes removed.
      */
-    static __global__ void consumeSingleRowDispatchKernel(
+    static __global__ __launch_bounds__(512) void consumeSingleRowDispatchKernel(
         MoEOverlayActivationSingleRowDispatchConsumeLaunch launch)
     {
         auto &packet = launch.packet;

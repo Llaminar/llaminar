@@ -633,8 +633,36 @@ __device__ __forceinline__ void decode_block(
 // in safe/boundary/final loops.
 // ============================================================================
 
+/**
+ * @brief Commit one quantization block with bounded integer-dot lifetimes.
+ * @tparam N_TILE Workgroup output-column extent.
+ * @tparam BPT Number of quantization blocks in each shared-memory slot.
+ * @tparam M_TILE Workgroup output-row extent.
+ * @tparam FMT Physical codebook and its exact scale/correction arithmetic.
+ * @tparam UNROLL_G Dot-group unrolling policy for simple symmetric formats.
+ * @tparam BLOCK_SIZE_ Workgroup thread count.
+ * @tparam M_PER_THREAD_ Output rows owned by each lane.
+ * @tparam MINIMUM_WAVES Kernel launch bound constraining the register budget.
+ * @param bp Quantization-block index within the current shared-memory slot.
+ * @param a_buf Packed activation operands, indexed by K group then row.
+ * @param b_buf Decoded weight operands, indexed by K group then column.
+ * @param s_buf First FP16 weight scale for each block/column.
+ * @param aux_buf Second scale or asymmetric correction for each block/column.
+ * @param iq1_m_qh_buf IQ1_M delta-sign bits; unused for other codebooks.
+ * @param emin_lo_buf Lower-half asymmetric correction coefficients.
+ * @param emin_hi_buf Upper-half asymmetric correction coefficients.
+ * @param sum_a_buf Cooperatively computed half-block activation sums.
+ * @param acc Current serial-K-partition FP32 output accumulators.
+ * @param m_base First row owned by this lane within the shared slot.
+ * @param t_n Lane's output-column group.
+ * @param sa_blk Exact per-row activation scale for this quantization block.
+ *
+ * Independent columns may be committed earlier to release integer registers;
+ * the order of contributions to any one output must never change. This keeps
+ * ordinary tiles' operand reuse and narrows only register-constrained tiles.
+ */
 template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int UNROLL_G = 4,
-          int BLOCK_SIZE_ = 256, int M_PER_THREAD_ = 4>
+          int BLOCK_SIZE_ = 256, int M_PER_THREAD_ = 4, int MINIMUM_WAVES = 2>
 __device__ __forceinline__ void accumulate_block_gemm(
     int bp,
     const int32_t* __restrict__ a_buf,
@@ -656,235 +684,115 @@ __device__ __forceinline__ void accumulate_block_gemm(
     constexpr int THREADS_N = BLOCK_SIZE_ / THREADS_M;
     constexpr int N_PER_THREAD = N_TILE / THREADS_N;
 
-    if constexpr (Traits::is_dual_scale_asym)
+    if constexpr (Traits::is_dual_scale_asym || Traits::is_dual_scale)
     {
-        // Pattern DA: dual-scale + asymmetric (Q2_K only)
-        //
-        // Keep both exact INT32 half-dots live until the serial-order base
-        // update, then commit the two precomputed half-sums as one correction.
-        // Applying each half immediately changes the expression tree when the
-        // kernel tile changes.
-        int32_t low_dot[M_PER_THREAD][N_PER_THREAD];
-        int32_t high_dot[M_PER_THREAD][N_PER_THREAD];
+        // Preserve the full MxN operand reuse wherever it fits. Only a tight
+        // three-wave budget or a wide correction-bearing tile needs to retire
+        // columns earlier. This is independent-output scheduling: every dot4
+        // and FP32 commit retains the exact serial-M1 arithmetic tree.
+        constexpr bool bounded_columns =
+            (MINIMUM_WAVES >= 3 && N_PER_THREAD >= 2) ||
+            (MINIMUM_WAVES >= 2 && N_PER_THREAD >= 4 &&
+             (Traits::is_dual_scale_asym || FMT == NVNNI_GEMM_IQ1_M));
+        constexpr int columns = bounded_columns ? 1 : N_PER_THREAD;
         #pragma unroll
-        for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+        for (int column_base = 0; column_base < N_PER_THREAD; column_base += columns)
+        {
+            int32_t low_dot[M_PER_THREAD][columns] = {};
+            int32_t high_dot[M_PER_THREAD][columns] = {};
+            #pragma clang loop unroll_count(2)
+            for (int g = 0; g < 4; ++g)
             {
-                low_dot[mm][nn] = 0;
-                high_dot[mm][nn] = 0;
+                const int kk = bp * 8 + g;
+                int32_t a_reg[M_PER_THREAD];
+                int32_t b_reg[columns];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
+                #pragma unroll
+                for (int nn = 0; nn < columns; ++nn)
+                    b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + column_base + nn];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < columns; ++nn)
+                        low_dot[mm][nn] = __builtin_amdgcn_sdot4(
+                            a_reg[mm], b_reg[nn], low_dot[mm][nn], false);
+            }
+            #pragma clang loop unroll_count(2)
+            for (int g = 4; g < 8; ++g)
+            {
+                const int kk = bp * 8 + g;
+                int32_t a_reg[M_PER_THREAD];
+                int32_t b_reg[columns];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
+                #pragma unroll
+                for (int nn = 0; nn < columns; ++nn)
+                    b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + column_base + nn];
+                #pragma unroll
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                    #pragma unroll
+                    for (int nn = 0; nn < columns; ++nn)
+                        high_dot[mm][nn] = __builtin_amdgcn_sdot4(
+                            a_reg[mm], b_reg[nn], high_dot[mm][nn], false);
             }
 
-        #pragma clang loop unroll_count(2)
-        for (int g = 0; g < 4; ++g)
-        {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
             #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    low_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], low_dot[mm][nn], false);
-        }
-
-        #pragma clang loop unroll_count(2)
-        for (int g = 4; g < 8; ++g)
-        {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    high_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], high_dot[mm][nn], false);
-        }
-
-        int32_t low_sum[M_PER_THREAD];
-        int32_t high_sum[M_PER_THREAD];
-        #pragma unroll
-        for (int mm = 0; mm < M_PER_THREAD; ++mm)
-        {
-            low_sum[mm] =
-                sum_a_buf[(bp * 2) * M_TILE + m_base + mm];
-            high_sum[mm] =
-                sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
-        }
-
-        #pragma unroll
-        for (int nn = 0; nn < N_PER_THREAD; ++nn)
-        {
-            const int sn = bp * N_TILE + t_n * N_PER_THREAD + nn;
-            const float scale_lo = __half2float(
-                *reinterpret_cast<const __half*>(&s_buf[sn]));
-            const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&aux_buf[sn]));
-            const float emin_lo  = __half2float(*reinterpret_cast<const __half*>(&emin_lo_buf[sn]));
-            const float emin_hi  = __half2float(*reinterpret_cast<const __half*>(&emin_hi_buf[sn]));
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+            for (int nn = 0; nn < columns; ++nn)
             {
-                acc[mm][nn] =
-                    rocm_native_vnni_commit_corrected_dual_scale_block(
-                        acc[mm][nn],
-                        low_dot[mm][nn],
-                        high_dot[mm][nn],
-                        scale_lo,
-                        scale_hi,
-                        low_sum[mm],
-                        high_sum[mm],
-                        emin_lo,
-                        emin_hi,
-                        sa_blk[mm]);
-            }
-        }
-    }
-    else if constexpr (Traits::is_dual_scale)
-    {
-        // Pattern D: dual-scale symmetric (Q6_K, Q3_K, IQ2_S, IQ2_XS)
-        //
-        // The exact serial M=1 contract first creates one INT32 sum for each
-        // 16-element half-block and only then applies both weight scales and
-        // the activation scale.  Retain both half-sums until the shared commit
-        // helper is called.  Scaling each dot4 independently is algebraically
-        // valid but changes FP32 parenthesization as M crosses tile boundaries.
-        int32_t low_dot[M_PER_THREAD][N_PER_THREAD];
-        int32_t high_dot[M_PER_THREAD][N_PER_THREAD];
-
-        #pragma unroll
-        for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-            {
-                low_dot[mm][nn] = 0;
-                high_dot[mm][nn] = 0;
-            }
-
-        #pragma clang loop unroll_count(2)
-        for (int g = 0; g < 4; ++g)
-        {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                const int column = column_base + nn;
+                const int sn = bp * N_TILE + t_n * N_PER_THREAD + column;
+                const float scale_lo = __half2float(
+                    *reinterpret_cast<const __half*>(&s_buf[sn]));
+                const float scale_hi = __half2float(
+                    *reinterpret_cast<const __half*>(&aux_buf[sn]));
                 #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    low_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], low_dot[mm][nn], false);
-        }
-
-        #pragma clang loop unroll_count(2)
-        for (int g = 4; g < 8; ++g)
-        {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    high_dot[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], high_dot[mm][nn], false);
-        }
-
-        int32_t iq1_m_group_sum[M_PER_THREAD][4];
-        if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-        {
-            constexpr int32_t ones = 0x01010101;
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            {
-                #pragma unroll
-                for (int group = 0; group < 4; ++group)
+                for (int mm = 0; mm < M_PER_THREAD; ++mm)
                 {
-                    const int kg0 = bp * 8 + group * 2;
-                    const int kg1 = kg0 + 1;
-                    iq1_m_group_sum[mm][group] = __builtin_amdgcn_sdot4(
-                        a_buf[kg1 * M_TILE + m_base + mm],
-                        ones,
-                        __builtin_amdgcn_sdot4(
-                            a_buf[kg0 * M_TILE + m_base + mm],
-                            ones,
-                            0,
-                            false),
-                        false);
-                }
-            }
-        }
-
-        #pragma unroll
-        for (int nn = 0; nn < N_PER_THREAD; ++nn)
-        {
-            const int sn = bp * N_TILE + t_n * N_PER_THREAD + nn;
-            const float scale_lo = __half2float(
-                *reinterpret_cast<const __half*>(&s_buf[sn]));
-            const float scale_hi = __half2float(
-                *reinterpret_cast<const __half*>(&aux_buf[sn]));
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            {
-                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                {
-                    constexpr float delta = 0.125f;
-                    const uint16_t qh =
-                        iq1_m_qh_buf[
-                            bp * N_TILE +
-                            t_n * N_PER_THREAD +
-                            nn];
-                    const uint8_t qh0 = static_cast<uint8_t>(qh);
-                    const uint8_t qh1 = static_cast<uint8_t>(qh >> 8);
-                    acc[mm][nn] = rocm_native_vnni_commit_iq1_m_block(
-                        acc[mm][nn],
-                        low_dot[mm][nn],
-                        high_dot[mm][nn],
-                        iq1_m_group_sum[mm][0],
-                        iq1_m_group_sum[mm][1],
-                        iq1_m_group_sum[mm][2],
-                        iq1_m_group_sum[mm][3],
-                        (qh0 & 0x08) ? -delta : delta,
-                        (qh0 & 0x80) ? -delta : delta,
-                        (qh1 & 0x08) ? -delta : delta,
-                        (qh1 & 0x80) ? -delta : delta,
-                        scale_lo,
-                        scale_hi,
-                        sa_blk[mm]);
-                }
-                else
-                {
-                    acc[mm][nn] = rocm_native_vnni_commit_dual_scale_block(
-                        acc[mm][nn],
-                        low_dot[mm][nn],
-                        high_dot[mm][nn],
-                        scale_lo,
-                        scale_hi,
-                        sa_blk[mm]);
+                    if constexpr (Traits::is_dual_scale_asym)
+                    {
+                        const int32_t low_sum = sum_a_buf[(bp * 2) * M_TILE + m_base + mm];
+                        const int32_t high_sum = sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
+                        const float emin_lo = __half2float(
+                            *reinterpret_cast<const __half*>(&emin_lo_buf[sn]));
+                        const float emin_hi = __half2float(
+                            *reinterpret_cast<const __half*>(&emin_hi_buf[sn]));
+                        acc[mm][column] = rocm_native_vnni_commit_corrected_dual_scale_block(
+                            acc[mm][column], low_dot[mm][nn], high_dot[mm][nn],
+                            scale_lo, scale_hi, low_sum, high_sum,
+                            emin_lo, emin_hi, sa_blk[mm]);
+                    }
+                    else if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    {
+                        constexpr int32_t ones = 0x01010101;
+                        constexpr float delta = 0.125f;
+                        int32_t sums[4];
+                        #pragma unroll
+                        for (int group = 0; group < 4; ++group)
+                        {
+                            const int kg0 = bp * 8 + group * 2;
+                            sums[group] = __builtin_amdgcn_sdot4(
+                                a_buf[(kg0 + 1) * M_TILE + m_base + mm], ones,
+                                __builtin_amdgcn_sdot4(
+                                    a_buf[kg0 * M_TILE + m_base + mm], ones, 0, false),
+                                false);
+                        }
+                        const uint16_t qh = iq1_m_qh_buf[sn];
+                        acc[mm][column] = rocm_native_vnni_commit_iq1_m_block(
+                            acc[mm][column], low_dot[mm][nn], high_dot[mm][nn],
+                            sums[0], sums[1], sums[2], sums[3],
+                            (qh & 0x0008) ? -delta : delta,
+                            (qh & 0x0080) ? -delta : delta,
+                            (qh & 0x0800) ? -delta : delta,
+                            (qh & 0x8000) ? -delta : delta,
+                            scale_lo, scale_hi, sa_blk[mm]);
+                    }
+                    else
+                        acc[mm][column] = rocm_native_vnni_commit_dual_scale_block(
+                            acc[mm][column], low_dot[mm][nn], high_dot[mm][nn],
+                            scale_lo, scale_hi, sa_blk[mm]);
                 }
             }
         }
@@ -1265,7 +1173,6 @@ void native_vnni_gemm_kernel(
     uint32_t b_payload_dw[PD];  // variable-size payload dwords
     uint16_t b_scale_staging;   // 1 FP16 scale
     uint16_t b_aux_staging;     // 1 FP16 aux scale/min (for needs_aux_compute)
-    uint16_t b_iq1_m_qh_staging; // IQ1_M high-index and delta-sign bytes
     uint16_t b_emin_lo_staging; // embedded min lo (for dual_scale_asym)
     uint16_t b_emin_hi_staging; // embedded min hi (for dual_scale_asym)
 
@@ -1310,7 +1217,6 @@ void native_vnni_gemm_kernel(
         for (int d = 0; d < PD; ++d) b_payload_dw[d] = 0;
         b_scale_staging = 0;
         if constexpr (Traits::needs_aux_compute) b_aux_staging = 0;
-        if constexpr (FMT == NVNNI_GEMM_IQ1_M) b_iq1_m_qh_staging = 0;
         if constexpr (Traits::is_dual_scale_asym) { b_emin_lo_staging = 0; b_emin_hi_staging = 0; }
         if (threadIdx.x < B_LOAD_THREADS)
         {
@@ -1320,9 +1226,6 @@ void native_vnni_gemm_kernel(
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
                 b_scale_staging = d_block_scales[linear];
-                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                    b_iq1_m_qh_staging =
-                        static_cast<uint16_t>(b_payload_dw[1]);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -1376,8 +1279,10 @@ void native_vnni_gemm_kernel(
         if constexpr (Traits::needs_aux_compute)
             aux_lds[0][b_load_block * N_TILE + b_load_n] = b_aux_staging;
         if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+            // The payload remains live until decode; derive its sign bits
+            // here instead of retaining a duplicate register across compute.
             iq1_m_qh_lds[0][b_load_block * N_TILE + b_load_n] =
-                b_iq1_m_qh_staging;
+                static_cast<uint16_t>(b_payload_dw[1]);
         if constexpr (Traits::is_dual_scale_asym) {
             emin_lo_lds[0][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
             emin_hi_lds[0][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
@@ -1424,9 +1329,6 @@ void native_vnni_gemm_kernel(
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
             b_scale_staging = d_block_scales[linear];
-            if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                b_iq1_m_qh_staging =
-                    static_cast<uint16_t>(b_payload_dw[1]);
             if constexpr (Traits::needs_aux_compute)
                 b_aux_staging = d_block_mins[linear];
             if constexpr (Traits::is_dual_scale_asym) {
@@ -1437,6 +1339,59 @@ void native_vnni_gemm_kernel(
                 } else {
                     b_emin_lo_staging = 0;
                     b_emin_hi_staging = 0;
+                }
+            }
+        }
+
+        // The previous iteration's final CTA edge released both shared
+        // slots. IQ1_M's four correction sums need the register budget that
+        // next-tile operands otherwise retain across compute: publish those
+        // operands directly into the independent next slot first. One final
+        // CTA edge both joins publication and retires current-slot readers.
+        // Other formats retain their measured register-prefetch overlap.
+        if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+        {
+            #pragma unroll
+            for (int p = 0; p < A_NUM_PASSES; ++p)
+            {
+                const int mi = a_mi[p];
+                if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+                a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+                a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+                a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+                a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+                if constexpr (Traits::needs_cooperative_sum_a) {
+                    const int bhi = a_kg / 4;
+                    int32_t sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+                }
+            }
+
+            if (threadIdx.x < B_LOAD_THREADS)
+            {
+                int32_t packed_groups[8];
+                decode_block<FMT>(b_payload_dw, packed_groups);
+
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+
+                scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
+                if constexpr (Traits::needs_aux_compute)
+                    aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
+                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
+                        static_cast<uint16_t>(b_payload_dw[1]);
+                if constexpr (Traits::is_dual_scale_asym) {
+                    emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
+                    emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
                 }
             }
         }
@@ -1461,7 +1416,8 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G,
+                                  BLOCK_SIZE, M_PER_THREAD, MIN_BLOCKS>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 iq1_m_qh_lds[cur_buf],
@@ -1483,51 +1439,54 @@ void native_vnni_gemm_kernel(
             }
         }
 
-        // --- 3. Barrier: all reads from cur_buf done ---
-        __syncthreads();
-
-        // --- 4. Decode + write staging → next buffer ---
-        #pragma unroll
-        for (int p = 0; p < A_NUM_PASSES; ++p)
+        if constexpr (FMT != NVNNI_GEMM_IQ1_M)
         {
-            const int mi = a_mi[p];
-            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
-            a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
-            a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
-            a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
-            a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
-            if constexpr (Traits::needs_cooperative_sum_a) {
-                const int bhi = a_kg / 4;
-                int32_t sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
-                sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
-            }
-        }
-
-        if (threadIdx.x < B_LOAD_THREADS)
-        {
-            int32_t packed_groups[8];
-            decode_block<FMT>(b_payload_dw, packed_groups);
-
+            __syncthreads(); // Retire current readers before staged publication.
+            // Keep this schedule local: a reference-capturing publication
+            // closure extends address lifetimes in other codebooks. IQ1_M
+            // alone needs the early-publication path above.
             #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+            for (int p = 0; p < A_NUM_PASSES; ++p)
+            {
+                const int mi = a_mi[p];
+                if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+                a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+                a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+                a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+                a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+                if constexpr (Traits::needs_cooperative_sum_a) {
+                    const int bhi = a_kg / 4;
+                    int32_t sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+                }
+            }
 
-            scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
-            if constexpr (Traits::needs_aux_compute)
-                aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
-            if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
-                    b_iq1_m_qh_staging;
-            if constexpr (Traits::is_dual_scale_asym) {
-                emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
-                emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
+            if (threadIdx.x < B_LOAD_THREADS)
+            {
+                int32_t packed_groups[8];
+                decode_block<FMT>(b_payload_dw, packed_groups);
+
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+
+                scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
+                if constexpr (Traits::needs_aux_compute)
+                    aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
+                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
+                        static_cast<uint16_t>(b_payload_dw[1]);
+                if constexpr (Traits::is_dual_scale_asym) {
+                    emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
+                    emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
+                }
             }
         }
 
@@ -1579,7 +1538,6 @@ void native_vnni_gemm_kernel(
         for (int d = 0; d < PD; ++d) b_payload_dw[d] = 0;
         b_scale_staging = 0;
         if constexpr (Traits::needs_aux_compute) b_aux_staging = 0;
-        if constexpr (FMT == NVNNI_GEMM_IQ1_M) b_iq1_m_qh_staging = 0;
         if constexpr (Traits::is_dual_scale_asym) { b_emin_lo_staging = 0; b_emin_hi_staging = 0; }
         if (threadIdx.x < B_LOAD_THREADS)
         {
@@ -1589,9 +1547,6 @@ void native_vnni_gemm_kernel(
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
                 b_scale_staging = d_block_scales[linear];
-                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                    b_iq1_m_qh_staging =
-                        static_cast<uint16_t>(b_payload_dw[1]);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -1603,6 +1558,59 @@ void native_vnni_gemm_kernel(
                         b_emin_lo_staging = 0;
                         b_emin_hi_staging = 0;
                     }
+                }
+            }
+        }
+
+        // The previous iteration's final CTA edge released both shared
+        // slots. IQ1_M's four correction sums need the register budget that
+        // next-tile operands otherwise retain across compute: publish those
+        // operands directly into the independent next slot first. One final
+        // CTA edge both joins publication and retires current-slot readers.
+        // Other formats retain their measured register-prefetch overlap.
+        if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+        {
+            #pragma unroll
+            for (int p = 0; p < A_NUM_PASSES; ++p)
+            {
+                const int mi = a_mi[p];
+                if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+                a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+                a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+                a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+                a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+                if constexpr (Traits::needs_cooperative_sum_a) {
+                    const int bhi = a_kg / 4;
+                    int32_t sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+                }
+            }
+
+            if (threadIdx.x < B_LOAD_THREADS)
+            {
+                int32_t packed_groups[8];
+                decode_block<FMT>(b_payload_dw, packed_groups);
+
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+
+                scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
+                if constexpr (Traits::needs_aux_compute)
+                    aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
+                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
+                        static_cast<uint16_t>(b_payload_dw[1]);
+                if constexpr (Traits::is_dual_scale_asym) {
+                    emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
+                    emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
                 }
             }
         }
@@ -1627,7 +1635,8 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G,
+                                  BLOCK_SIZE, M_PER_THREAD, MIN_BLOCKS>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 iq1_m_qh_lds[cur_buf],
@@ -1649,51 +1658,54 @@ void native_vnni_gemm_kernel(
             }
         }
 
-        // --- 3. Barrier: all reads from cur_buf done ---
-        __syncthreads();
-
-        // --- 4. Decode + write staging → next buffer ---
-        #pragma unroll
-        for (int p = 0; p < A_NUM_PASSES; ++p)
+        if constexpr (FMT != NVNNI_GEMM_IQ1_M)
         {
-            const int mi = a_mi[p];
-            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
-            a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
-            a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
-            a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
-            a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
-            if constexpr (Traits::needs_cooperative_sum_a) {
-                const int bhi = a_kg / 4;
-                int32_t sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
-                sa = __builtin_amdgcn_sdot4(
-                    static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
-                sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
-            }
-        }
-
-        if (threadIdx.x < B_LOAD_THREADS)
-        {
-            int32_t packed_groups[8];
-            decode_block<FMT>(b_payload_dw, packed_groups);
-
+            __syncthreads(); // Retire current readers before staged publication.
+            // Keep this schedule local: a reference-capturing publication
+            // closure extends address lifetimes in other codebooks. IQ1_M
+            // alone needs the early-publication path above.
             #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+            for (int p = 0; p < A_NUM_PASSES; ++p)
+            {
+                const int mi = a_mi[p];
+                if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+                a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+                a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+                a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+                a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+                if constexpr (Traits::needs_cooperative_sum_a) {
+                    const int bhi = a_kg / 4;
+                    int32_t sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                    sa = __builtin_amdgcn_sdot4(
+                        static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                    sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+                }
+            }
 
-            scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
-            if constexpr (Traits::needs_aux_compute)
-                aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
-            if constexpr (FMT == NVNNI_GEMM_IQ1_M)
-                iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
-                    b_iq1_m_qh_staging;
-            if constexpr (Traits::is_dual_scale_asym) {
-                emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
-                emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
+            if (threadIdx.x < B_LOAD_THREADS)
+            {
+                int32_t packed_groups[8];
+                decode_block<FMT>(b_payload_dw, packed_groups);
+
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    b_lds[nxt_buf][(b_load_block * 8 + g) * N_TILE + b_load_n] = packed_groups[g];
+
+                scale_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_scale_staging;
+                if constexpr (Traits::needs_aux_compute)
+                    aux_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_aux_staging;
+                if constexpr (FMT == NVNNI_GEMM_IQ1_M)
+                    iq1_m_qh_lds[nxt_buf][b_load_block * N_TILE + b_load_n] =
+                        static_cast<uint16_t>(b_payload_dw[1]);
+                if constexpr (Traits::is_dual_scale_asym) {
+                    emin_lo_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_lo_staging;
+                    emin_hi_lds[nxt_buf][b_load_block * N_TILE + b_load_n] = b_emin_hi_staging;
+                }
             }
         }
 
@@ -1726,7 +1738,8 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G,
+                                  BLOCK_SIZE, M_PER_THREAD, MIN_BLOCKS>(
                 bp, a_lds[last_buf], b_lds[last_buf],
                 scale_lds[last_buf], aux_lds[last_buf],
                 iq1_m_qh_lds[last_buf],
@@ -1866,10 +1879,10 @@ void native_vnni_gemm_kernel(
 // free, and no correction sum is redundantly recomputed per N column.
 //
 // Thread geometry (M_TILE=16):
-//   THREADS_M = 1 (each thread owns all M_TILE M-rows)
-//   THREADS_N = 256 (each thread owns 1 N-column)
-//   N_PER_WG = 256
-//   Zero B decode redundancy (each B block decoded exactly once)
+//   Each of 256 lanes owns all sixteen rows for one output column.
+//   A decoded B block is reused across those rows without a K-loop barrier.
+//   Both row tiles retain the measured three-wave register budget; scalar
+//   register-lane moves are legal, while actual memory spills fail the build.
 //
 // B data redundancy (across m-tiles): absorbed by L2 cache (4MB).
 // A data broadcast: 256 threads read same address → L0/L1 cache broadcast.
@@ -2594,33 +2607,42 @@ static bool launch_native_vnni_gemm(
             NT, MT, MB, 4, /*full_tiles=*/false, function);
     };
 
-    // 3-wave variant: MIN_BLOCKS=3 tells compiler to target ≤84 VGPRs
+    // Small-grid occupancy policy. IQ1_M's four correction sums cannot fit
+    // the 84-VGPR three-wave ceiling: request two resident waves explicitly
+    // instead of asking the compiler to manufacture occupancy with scratch.
     auto launch3 = [&](auto n_tile_tag, auto m_tile_tag) -> bool
     {
         constexpr int NT = decltype(n_tile_tag)::value;
         constexpr int MT = decltype(m_tile_tag)::value;
+        constexpr int kMinimumWaves = FMT == NVNNI_GEMM_IQ1_M ? 2 : 3;
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
         const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-            native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>));
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves>));
 
         clear_launch_error();
-        native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
+        native_vnni_gemm_kernel<NT, BPT, MT, FMT, kMinimumWaves>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise,
                 serial_m1_kblocks);
 
         return complete_launch(
-            "three_wave", NT, MT, 3, 4, /*full_tiles=*/false, function);
+            "small_grid", NT, MT, kMinimumWaves, 4,
+            /*full_tiles=*/false, function);
     };
 
-    // Streaming LM_Head variant: zero barriers, zero LDS, 3-wave occupancy
+    // Streaming LM_Head variant: synchronization-free K loop and three-wave
+    // register budget. Correction formats use setup-only LDS.
     // (Pattern A uses small LDS for sum_a precompute → 4-wave achievable)
     auto launch_streaming = [&](auto m_tile_tag) -> bool
     {
         constexpr int MT = decltype(m_tile_tag)::value;
-        constexpr int N_PER_WG = 256;  // each thread handles 1 N-column
+        constexpr int N_PER_WG = 256;  // one complete row tile per output-column lane
+        // HIP's second launch bound is waves per SIMD, not CTAs per CU.
+        // Preserve the measured three-wave schedule for reachable streaming
+        // formats; register-bank moves do not justify reducing occupancy.
+        constexpr int kMinimumWaves = 3;
         dim3 grid((N + N_PER_WG - 1) / N_PER_WG, (M + MT - 1) / MT, 1);
         dim3 block(256, 1, 1);
 
@@ -2635,10 +2657,10 @@ static bool launch_native_vnni_gemm(
                 : 0;
         const size_t shared_bytes = sum_a_bytes;
         const void* function = reinterpret_cast<const void*>(HIP_KERNEL_NAME(
-            streaming_lm_head_kernel<MT, FMT>));
+            streaming_lm_head_kernel<MT, FMT, kMinimumWaves>));
 
         clear_launch_error();
-        streaming_lm_head_kernel<MT, FMT>
+        streaming_lm_head_kernel<MT, FMT, kMinimumWaves>
             <<<grid, block, shared_bytes, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, d_scales_A_blockwise, M, N, K,
@@ -2648,7 +2670,7 @@ static bool launch_native_vnni_gemm(
             "streaming_lm_head",
             N_PER_WG,
             MT,
-            3,
+            kMinimumWaves,
             0,
             /*full_tiles=*/false,
             function);
@@ -2765,9 +2787,16 @@ static bool launch_native_vnni_gemm(
             if (m_tile_cfg == 32)
                 return dispatch_min_blocks(
                     nt, std::integral_constant<int, 32>{}, full);
-            if (n_tile == 64 && m_tile_cfg == 64 && !full_tiles)
-                return dispatch_min_blocks(
-                    nt, std::integral_constant<int, 64>{}, full);
+            // N128/M64 is not a supported launch geometry. A runtime test of
+            // n_tile still instantiated that dead specialization, including
+            // its overflowing register tile. Make the template inventory match
+            // the admitted runtime shapes instead of compiling unreachable code.
+            if constexpr (decltype(nt)::value == 64 && !decltype(full)::value)
+            {
+                if (m_tile_cfg == 64 && !full_tiles)
+                    return dispatch_min_blocks(
+                        nt, std::integral_constant<int, 64>{}, full);
+            }
             return false;
         };
 
@@ -2921,6 +2950,12 @@ static bool launch_native_vnni_gemm(
         // Default: N128/MT32/MB1/UG2
         return launch_mb1_ug2(N128_{}, M32_{});
     }
+    else
+    {
+    // These families are disjoint at compile time. A return above does not
+    // prevent HIP from emitting kernels mentioned in later source, so retain
+    // only dispatches that a format can actually reach. In particular, simple
+    // symmetric weights never use the spilling legacy M16 streaming body.
 
     // Dispatch tags for (N_TILE, M_TILE) combinations
     using N64  = std::integral_constant<int, 64>;
@@ -3126,6 +3161,7 @@ static bool launch_native_vnni_gemm(
             default:  return launch(N64{}, M64{});
         }
     }
+    } // non-simple-symmetric dispatch families
 }
 
 

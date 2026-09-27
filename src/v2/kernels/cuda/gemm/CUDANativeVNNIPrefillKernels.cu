@@ -1381,47 +1381,39 @@ namespace
         int serial_m1_k_partitions = 1,
         int serial_m1_uses_ordered_reducer = 0)
     {
-        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
-        const dim3 block(WM * WN * 32);
+        // Resource admission also owns template emission. A runtime rejection
+        // alone still emits unreachable spilling kernels into the fat binary.
+        constexpr auto tile = static_cast<TileId>(densePrefillTileId<BM, BN, WM, WN>());
+        if constexpr (densePrefillTileIsResourceEligible<CODEBOOK_ID>(
+                          tile, /*canonical_kpart=*/false, Staging))
+        {
+          const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, 1);
+          const dim3 block(WM * WN * 32);
 
-        // Clear any stale CUDA error from prior operations (e.g. CUTLASS reference path)
-        (void)cudaGetLastError();
+          // Clear any stale CUDA error from prior operations (e.g. CUTLASS
+          // reference path)
+          (void)cudaGetLastError();
 
-        constexpr int block_size = WM * WN * 32;
-        constexpr int min_blocks = densePrefillMinBlocksHint<
-            CODEBOOK_ID, BM, BN, WM, WN, /*CanonicalKpart=*/false>();
-        nativeVnniTC_BK64<
-            CODEBOOK_ID,
-            BM,
-            BN,
-            WM,
-            WN,
-            /*STAGES_=*/2,
-            /*CANONICAL_KPART=*/false,
-            block_size,
-            min_blocks,
-            Staging><<<grid, block, 0, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            d_C_fp32,
-            d_scales_A_block,
-            d_sums_A_block,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            K,
-            alpha,
-            beta,
-            CanonicalM1PartitionGeometry{
-                .count = serial_m1_k_partitions,
-                .blocks_per_partition = (K / 32 + serial_m1_k_partitions - 1) /
-                    serial_m1_k_partitions},
-            serial_m1_uses_ordered_reducer);
-        return cudaGetLastError() == cudaSuccess;
+          constexpr int block_size = WM * WN * 32;
+          constexpr int min_blocks =
+              densePrefillMinBlocksHint<CODEBOOK_ID, BM, BN, WM, WN,
+                                        /*CanonicalKpart=*/false>();
+          nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN,
+                            /*STAGES_=*/2,
+                            /*CANONICAL_KPART=*/false, block_size, min_blocks,
+                            Staging><<<grid, block, 0, cuda_stream>>>(
+              d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,
+              d_scales_A_block, d_sums_A_block, d_C_existing, d_bias, M, N, K,
+              alpha, beta,
+              CanonicalM1PartitionGeometry{
+                  .count = serial_m1_k_partitions,
+                  .blocks_per_partition =
+                      (K / 32 + serial_m1_k_partitions - 1) /
+                      serial_m1_k_partitions},
+              serial_m1_uses_ordered_reducer);
+          return cudaGetLastError() == cudaSuccess;
+        }
+        return false;
     }
 
     /**
@@ -1457,74 +1449,55 @@ namespace
         CUDAPrefillContext_ *prefill_ctx,
         int serial_m1_k_partitions)
     {
-        if (!prefill_ctx || serial_m1_k_partitions <= 1)
+        constexpr auto tile = static_cast<TileId>(densePrefillTileId<BM, BN, WM, WN>());
+        if constexpr (densePrefillTileIsResourceEligible<CODEBOOK_ID>(
+                          tile, /*canonical_kpart=*/true, Staging))
+        {
+          if (!prefill_ctx || serial_m1_k_partitions <= 1)
             return false;
 
-        const size_t partials_bytes =
-            static_cast<size_t>(serial_m1_k_partitions) * M * N *
-            sizeof(float);
-        float *partials = getCanonicalKpartPartials(
-            prefill_ctx, partials_bytes, cuda_stream);
-        if (!partials)
+          const size_t partials_bytes =
+              static_cast<size_t>(serial_m1_k_partitions) * M * N *
+              sizeof(float);
+          float *partials = getCanonicalKpartPartials(
+              prefill_ctx, partials_bytes, cuda_stream);
+          if (!partials)
             return false;
 
-        const dim3 grid(
-            (M + BM - 1) / BM,
-            (N + BN - 1) / BN,
-            serial_m1_k_partitions);
-        const dim3 block(WM * WN * 32);
+          const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN,
+                          serial_m1_k_partitions);
+          const dim3 block(WM * WN * 32);
 
-        (void)cudaGetLastError();
-        constexpr int block_size = WM * WN * 32;
-        constexpr int min_blocks = densePrefillMinBlocksHint<
-            CODEBOOK_ID, BM, BN, WM, WN, /*CanonicalKpart=*/true>();
-        nativeVnniTC_BK64<
-            CODEBOOK_ID,
-            BM,
-            BN,
-            WM,
-            WN,
-            /*STAGES_=*/2,
-            /*CANONICAL_KPART=*/true,
-            block_size,
-            min_blocks,
-            Staging><<<grid, block, 0, cuda_stream>>>(
-            d_A_int8,
-            d_payload,
-            d_scales,
-            d_mins,
-            d_emins,
-            partials,
-            d_scales_A_block,
-            d_sums_A_block,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            K,
-            alpha,
-            beta,
-            CanonicalM1PartitionGeometry{
-                .count = serial_m1_k_partitions,
-                .blocks_per_partition = (K / 32 + serial_m1_k_partitions - 1) /
-                    serial_m1_k_partitions},
-            /*serial_m1_uses_ordered_reducer=*/1);
-        if (cudaGetLastError() != cudaSuccess)
+          (void)cudaGetLastError();
+          constexpr int block_size = WM * WN * 32;
+          constexpr int min_blocks =
+              densePrefillMinBlocksHint<CODEBOOK_ID, BM, BN, WM, WN,
+                                        /*CanonicalKpart=*/true>();
+          nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN,
+                            /*STAGES_=*/2,
+                            /*CANONICAL_KPART=*/true, block_size, min_blocks,
+                            Staging><<<grid, block, 0, cuda_stream>>>(
+              d_A_int8, d_payload, d_scales, d_mins, d_emins, partials,
+              d_scales_A_block, d_sums_A_block, d_C_existing, d_bias, M, N, K,
+              alpha, beta,
+              CanonicalM1PartitionGeometry{
+                  .count = serial_m1_k_partitions,
+                  .blocks_per_partition =
+                      (K / 32 + serial_m1_k_partitions - 1) /
+                      serial_m1_k_partitions},
+              /*serial_m1_uses_ordered_reducer=*/1);
+          if (cudaGetLastError() != cudaSuccess)
             return false;
 
-        const int total = M * N;
-        constexpr int threads = 256;
-        const int blocks = (total + threads - 1) / threads;
-        canonical_kpart_reduce<<<blocks, threads, 0, cuda_stream>>>(
-            partials,
-            d_C_fp32,
-            d_C_existing,
-            d_bias,
-            M,
-            N,
-            serial_m1_k_partitions,
-            beta);
-        return cudaGetLastError() == cudaSuccess;
+          const int total = M * N;
+          constexpr int threads = 256;
+          const int blocks = (total + threads - 1) / threads;
+          canonical_kpart_reduce<<<blocks, threads, 0, cuda_stream>>>(
+              partials, d_C_fp32, d_C_existing, d_bias, M, N,
+              serial_m1_k_partitions, beta);
+          return cudaGetLastError() == cudaSuccess;
+        }
+        return false;
     }
 
     /** Return the exact dynamic shared-memory footprint of one BK256 CTA. */
@@ -1689,73 +1662,63 @@ namespace
     /** Query one BK64 primary and its optional ordered-reducer kernel. */
     template <uint8_t CB, int BM, int BN, int WM, int WN,
               PrefillStagingSchedule Staging>
-    bool queryDensePrefillBK64Resources(
-        bool canonical_kpart,
-        DensePrefillKernelResources &primary,
-        DensePrefillKernelResources &auxiliary)
-    {
-        constexpr int threads = WM * WN * 32;
-        bool primary_ok = false;
-        if (canonical_kpart)
-        {
-            constexpr int min_blocks = densePrefillMinBlocksHint<
-                CB, BM, BN, WM, WN, /*CanonicalKpart=*/true>();
-            primary_ok = queryDensePrefillKernelResources(
-                nativeVnniTC_BK64<
-                    CB,
-                    BM,
-                    BN,
-                    WM,
-                    WN,
-                    /*STAGES_=*/2,
-                    /*CANONICAL_KPART=*/true,
-                    threads,
-                    min_blocks,
-                    Staging>,
-                threads,
-                0,
-                primary);
-            if (!primary_ok)
-                return false;
-            return queryDensePrefillKernelResources(
-                canonical_kpart_reduce,
-                /*threads_per_block=*/256,
-                0,
-                auxiliary);
+    bool
+    queryDensePrefillBK64Resources(bool canonical_kpart,
+                                   DensePrefillKernelResources &primary,
+                                   DensePrefillKernelResources &auxiliary) {
+      constexpr int threads = WM * WN * 32;
+      bool primary_ok = false;
+      if (canonical_kpart) {
+        constexpr auto tile =
+            static_cast<TileId>(densePrefillTileId<BM, BN, WM, WN>());
+        if constexpr (densePrefillTileIsResourceEligible<CB>(
+                          tile, /*canonical_kpart=*/true, Staging)) {
+          constexpr int min_blocks =
+              densePrefillMinBlocksHint<CB, BM, BN, WM, WN,
+                                        /*CanonicalKpart=*/true>();
+          primary_ok = queryDensePrefillKernelResources(
+              nativeVnniTC_BK64<CB, BM, BN, WM, WN,
+                                /*STAGES_=*/2,
+                                /*CANONICAL_KPART=*/true, threads, min_blocks,
+                                Staging>,
+              threads, 0, primary);
+          if (!primary_ok)
+            return false;
+          return queryDensePrefillKernelResources(canonical_kpart_reduce,
+                                                  /*threads_per_block=*/256, 0,
+                                                  auxiliary);
         }
+        return false;
+      }
 
-        constexpr int min_blocks = densePrefillMinBlocksHint<
-            CB, BM, BN, WM, WN, /*CanonicalKpart=*/false>();
+      constexpr auto tile =
+          static_cast<TileId>(densePrefillTileId<BM, BN, WM, WN>());
+      if constexpr (densePrefillTileIsResourceEligible<CB>(
+                        tile, /*canonical_kpart=*/false, Staging)) {
+        constexpr int min_blocks =
+            densePrefillMinBlocksHint<CB, BM, BN, WM, WN,
+                                      /*CanonicalKpart=*/false>();
         primary_ok = queryDensePrefillKernelResources(
-            nativeVnniTC_BK64<
-                CB,
-                BM,
-                BN,
-                WM,
-                WN,
-                /*STAGES_=*/2,
-                /*CANONICAL_KPART=*/false,
-                threads,
-                min_blocks,
-                Staging>,
-            threads,
-            0,
-            primary);
+            nativeVnniTC_BK64<CB, BM, BN, WM, WN,
+                              /*STAGES_=*/2,
+                              /*CANONICAL_KPART=*/false, threads, min_blocks,
+                              Staging>,
+            threads, 0, primary);
         auxiliary = {};
         return primary_ok;
+      }
+      return false;
     }
 
     /** Query one registered, forceable BK64 output geometry. */
     template <uint8_t CB>
-    bool queryDensePrefillTileResources(
-        int tile_id,
-        bool canonical_kpart,
-        PrefillStagingSchedule staging,
-        DensePrefillKernelResources &primary,
-        DensePrefillKernelResources &auxiliary)
-    {
-#define QUERY_DENSE_PREFILL_TILE(ID, BM, BN, WM, WN)                         \
-    case ID:                                                                 \
+    bool
+    queryDensePrefillTileResources(int tile_id, bool canonical_kpart,
+                                   PrefillStagingSchedule staging,
+                                   DensePrefillKernelResources &primary,
+                                   DensePrefillKernelResources &auxiliary) {
+#define QUERY_DENSE_PREFILL_TILE(ID, BM, BN, WM, WN)                       \
+      case ID:                                                                 \
         return visitDensePrefillStaging<CB, BN, WM * WN * 32>(             \
             staging, [&]<PrefillStagingSchedule Staging>() {               \
                 return queryDensePrefillBK64Resources<                     \

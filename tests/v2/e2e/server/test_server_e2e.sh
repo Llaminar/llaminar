@@ -32,6 +32,9 @@
 #   9. Optionally runs objective long-context checks for 4B+ models
 #  10. Measures process RSS / GPU memory and scans the server log for WARN/ERROR
 #  11. Kills server, moves to next backend
+#  12. Fails on new AMDGPU/NVIDIA kernel warnings across startup through teardown.
+#      The harness host must expose dmesg (CAP_SYSLOG or noninteractive sudo).
+#      Lost/unreadable kernel history is a failed observation, not an opt-out.
 #
 # Usage:
 #   ./test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
@@ -3325,6 +3328,18 @@ PY
     pass "[${tag}] Prefix-cache rebalance clear probe: repeated HTTP prefix-cache requests survived rebalance cleanup"
 }
 
+# Close the kernel diagnostic interval only after server retirement. This is
+# shared by full HTTP and token-generation workloads, and by early startup
+# failures, so successful response checks cannot conceal a driver warning.
+finish_driver_diagnostics() {
+    local tag="$1" state="$2" report="$3"
+    if python3 "$SCRIPT_DIR/gpu_driver_diagnostics.py" finish --state "$state" --report "$report"; then
+        pass "[${tag}] GPU driver diagnostics: no new AMDGPU/NVIDIA warnings"
+    else
+        fail "[${tag}] GPU driver diagnostics failed (see ${report})"
+    fi
+}
+
 # ─── Test Runner Function ─────────────────────────────────────────────────────
 # Runs the full test suite against a single model+backend combination.
 # Arguments: $1=model_path $2=backend $3=port $4=model_label $5=max_tokens
@@ -3367,7 +3382,6 @@ run_backend_tests() {
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
     perf_path="${log_path%.log}.perfstats.json"
-    gpu_before_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] PerfStats artifact: ${perf_path}"
     fi
@@ -3375,6 +3389,17 @@ run_backend_tests() {
         fail "[${tag}] Server port ${port} is already in use; pass --port with a free base port or stop the existing server"
         return
     fi
+
+    # Read the serving host's shared kernel before even the telemetry probe.
+    # Kernel boot/cursor continuity, not wall time or grep of historical dmesg,
+    # authenticates this cell. This is mandatory, including auto/CPU discovery.
+    local driver_state="${log_path%.log}.driver-checkpoint.json"
+    local driver_report="${log_path%.log}.driver-diagnostics.json"
+    if ! python3 "$SCRIPT_DIR/gpu_driver_diagnostics.py" begin --state "$driver_state"; then
+        fail "[${tag}] Cannot establish GPU driver diagnostic boundary; server not started"
+        return
+    fi
+    gpu_before_mb=$(get_gpu_memory_mb_for_backend "$backend" "$extra_flags")
 
     local context_args=()
     if [ "$long_context_run" = "true" ]; then
@@ -3501,6 +3526,7 @@ run_backend_tests() {
     server_handle="$STARTED_SERVER_HANDLE"
     if [ -z "$server_handle" ]; then
         fail "[${tag}] Server failed to start: no process handle was created"
+        finish_driver_diagnostics "$tag" "$driver_state" "$driver_report"
         return
     fi
 
@@ -3516,6 +3542,7 @@ run_backend_tests() {
         echo "    ────────────────────────────────────────────────────────────"
         scan_server_log "$tag" "$log_path"
         cleanup_server "$server_handle"
+        finish_driver_diagnostics "$tag" "$driver_state" "$driver_report"
         return
     fi
     pass "[${tag}] Server started"
@@ -3674,6 +3701,7 @@ print(d.get('error', {}).get('type', ''))
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
     shutdown_and_validate "$tag" "$server_handle" "$port" "$gpu_before_mb" "$backend" "$extra_flags"
+    finish_driver_diagnostics "$tag" "$driver_state" "$driver_report"
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
     # Scan AFTER shutdown so we catch errors during teardown too.
     # This covers exit code 1 from mpirun — if the child actually crashed

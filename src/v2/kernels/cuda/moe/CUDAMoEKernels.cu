@@ -16,6 +16,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
@@ -15402,6 +15403,12 @@ namespace
         }
     }
 
+    /**
+     * @brief Publish shared-expert grouping for only the controller's live rows.
+     *
+     * Initialize inactive inverse/descriptor entries on every replay so a
+     * retained wider graph cannot compute stale rows after depth demotion.
+     */
     __global__ void prepare_shared_expert_group_kernel(
         int *__restrict__ expert_offsets,
         int *__restrict__ expert_counts,
@@ -15410,21 +15417,22 @@ namespace
         int *__restrict__ original_expert_ids,
         float *__restrict__ grouped_weights,
         int *__restrict__ active_expert_ids,
-        int seq_len)
+        llaminar2::DeviceRowRange rows)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int active_rows = rows.activeRows();
         if (idx == 0)
         {
             expert_offsets[0] = 0;
-            expert_counts[0] = seq_len;
-            active_expert_ids[0] = 0;
+            expert_counts[0] = active_rows;
+            active_expert_ids[0] = active_rows > 0 ? 0 : -1;
         }
-        if (idx < seq_len)
+        if (idx < rows.physicalRows())
         {
             grouped_token_indices[idx] = idx;
-            original_to_grouped[idx] = idx;
-            original_expert_ids[idx] = 0;
-            grouped_weights[idx] = 1.0f;
+            original_to_grouped[idx] = idx < active_rows ? idx : -1;
+            original_expert_ids[idx] = idx < active_rows ? 0 : -1;
+            grouped_weights[idx] = idx < active_rows ? 1.0f : 0.0f;
         }
     }
 
@@ -22479,14 +22487,19 @@ extern "C"
         int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
-        int seq_len,
+        llaminar2::DeviceRowRange rows,
         int device_idx,
         void *stream)
     {
+        const int seq_len = rows.physicalRows();
+        if (!stream || !expert_offsets || !expert_counts ||
+            !grouped_token_indices || !original_to_grouped ||
+            !original_expert_ids || !grouped_weights || !active_expert_ids)
+            return false;
         cudaSetDevice(device_idx);
         prepare_shared_expert_group_kernel<<<blocksFor(seq_len), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             expert_offsets, expert_counts, grouped_token_indices, original_to_grouped,
-            original_expert_ids, grouped_weights, active_expert_ids, seq_len);
+            original_expert_ids, grouped_weights, active_expert_ids, rows);
         return finishLaunch("cudaMoE_prepare_shared_expert_group");
     }
 

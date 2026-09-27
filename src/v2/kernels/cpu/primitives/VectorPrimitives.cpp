@@ -3,7 +3,9 @@
  * @brief ISA-dispatched vector primitives: dot, axpy, scale
  *
  * Each operation has scalar / AVX2 / AVX-512 variants selected at runtime
- * via ISA_DISPATCH_* macros from CPUFeatures.h.
+ * via ISA_DISPATCH_* macros from CPUFeatures.h. Grouped dot products share
+ * weight loads but retain the serial operation's independent arithmetic
+ * chains and final reduction, so routing cannot change with batch size.
  */
 
 #include "VectorPrimitives.h"
@@ -95,6 +97,119 @@ namespace llaminar2::primitives
     float vec_dot(const float *a, const float *b, int n)
     {
         return ISA_DISPATCH_RETVAL(vec_dot, a, b, n);
+    }
+
+    /** @brief Scalar four-row implementation with unchanged serial arithmetic. */
+    static void vec_dot_four_rows_scalar(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        for (int row = 0; row < 4; ++row)
+            output[row * output_stride] =
+                vec_dot_scalar(weights, rows + row * row_stride, n);
+    }
+
+#if defined(__AVX2__)
+    /** @brief Fold the two eight-lane chains exactly as serial AVX2 vec_dot. */
+    static inline float fold_dot_avx2(__m256 low, __m256 high)
+    {
+        const __m256 sum = _mm256_add_ps(low, high);
+        __m128 folded = _mm_add_ps(
+            _mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+        folded = _mm_add_ps(folded, _mm_movehdup_ps(folded));
+        return _mm_cvtss_f32(
+            _mm_add_ss(folded, _mm_movehl_ps(folded, folded)));
+    }
+
+    /**
+     * @brief Reuse each AVX2 weight load across four serial-equivalent rows.
+     * Eight independent chains hide FMA dependency latency while fitting the
+     * sixteen-register ISA. Do not reassociate either chain or its final fold.
+     */
+    static void vec_dot_four_rows_avx2(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        __m256 a0 = _mm256_setzero_ps(), b0 = _mm256_setzero_ps();
+        __m256 a1 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), b2 = _mm256_setzero_ps();
+        __m256 a3 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
+        const float *r1 = rows + row_stride;
+        const float *r2 = r1 + row_stride;
+        const float *r3 = r2 + row_stride;
+        int i = 0;
+        for (; i < (n & ~15); i += 16)
+        {
+            const __m256 w0 = _mm256_loadu_ps(weights + i);
+            const __m256 w1 = _mm256_loadu_ps(weights + i + 8);
+            a0 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(rows + i), a0);
+            b0 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(rows + i + 8), b0);
+            a1 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(r1 + i), a1);
+            b1 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(r1 + i + 8), b1);
+            a2 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(r2 + i), a2);
+            b2 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(r2 + i + 8), b2);
+            a3 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(r3 + i), a3);
+            b3 = _mm256_fmadd_ps(w1, _mm256_loadu_ps(r3 + i + 8), b3);
+        }
+        float values[4] = {fold_dot_avx2(a0, b0), fold_dot_avx2(a1, b1),
+                           fold_dot_avx2(a2, b2), fold_dot_avx2(a3, b3)};
+        // Keep the scalar tail after the same final SIMD fold as M=1.
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int tail = i; tail < n; ++tail)
+                values[row] += weights[tail] * rows[row * row_stride + tail];
+            output[row * output_stride] = values[row];
+        }
+    }
+#endif
+
+#if defined(__AVX512F__)
+    /** @brief AVX512 four-row dot with the serial two-chain reduction tree. */
+    static void vec_dot_four_rows_avx512(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        __m512 a0 = _mm512_setzero_ps(), b0 = _mm512_setzero_ps();
+        __m512 a1 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps();
+        __m512 a2 = _mm512_setzero_ps(), b2 = _mm512_setzero_ps();
+        __m512 a3 = _mm512_setzero_ps(), b3 = _mm512_setzero_ps();
+        const float *r1 = rows + row_stride;
+        const float *r2 = r1 + row_stride;
+        const float *r3 = r2 + row_stride;
+        int i = 0;
+        for (; i < (n & ~31); i += 32)
+        {
+            const __m512 w0 = _mm512_loadu_ps(weights + i);
+            const __m512 w1 = _mm512_loadu_ps(weights + i + 16);
+            a0 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(rows + i), a0);
+            b0 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(rows + i + 16), b0);
+            a1 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(r1 + i), a1);
+            b1 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(r1 + i + 16), b1);
+            a2 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(r2 + i), a2);
+            b2 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(r2 + i + 16), b2);
+            a3 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(r3 + i), a3);
+            b3 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(r3 + i + 16), b3);
+        }
+        float values[4] = {
+            _mm512_reduce_add_ps(_mm512_add_ps(a0, b0)),
+            _mm512_reduce_add_ps(_mm512_add_ps(a1, b1)),
+            _mm512_reduce_add_ps(_mm512_add_ps(a2, b2)),
+            _mm512_reduce_add_ps(_mm512_add_ps(a3, b3))};
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int tail = i; tail < n; ++tail)
+                values[row] += weights[tail] * rows[row * row_stride + tail];
+            output[row * output_stride] = values[row];
+        }
+    }
+#endif
+
+    void vec_dot_four_rows(
+        const float *weights, const float *rows, int n,
+        std::size_t row_stride, float *output, std::size_t output_stride)
+    {
+        ISA_DISPATCH_VOID(vec_dot_four_rows, weights, rows, n,
+                          row_stride, output, output_stride);
     }
 
     // ========================================================================

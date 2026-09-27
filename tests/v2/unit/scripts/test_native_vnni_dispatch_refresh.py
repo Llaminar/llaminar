@@ -3911,7 +3911,18 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("selectCPUNativeVNNIPrefillGeneratedPolicy", source)
         self.assertNotIn("selectPrefillPolicy(", source)
         self.assertNotIn("No certified CPU NativeVNNI prefill policy", source)
-        self.assertIn("switch (schedule_override)", source)
+        # The total heuristic is a typed, device-free resolver now. Its C++
+        # unit gate proves geometry/worker totality and override semantics;
+        # this architecture check only guards the generated-policy boundary.
+        schedule_source = (source_path.parent / "CPUNativeVNNIPrefillSchedule.h").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(
+            "resolvePrefillSchedule(" in source,
+            "ordinary CPU prefill must use its shared typed schedule resolver",
+        )
+        self.assertNotIn("PolicyGenerated.inc", schedule_source)
+        self.assertNotIn("selectCPUNativeVNNIPrefillGeneratedPolicy", schedule_source)
         self.assertIn(
             "nativeVNNIUsesKPartitions(serial_cfg.k_tiles)",
             source,

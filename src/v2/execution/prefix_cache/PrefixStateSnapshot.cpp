@@ -1,6 +1,14 @@
+/**
+ * @file PrefixStateSnapshot.cpp
+ * @brief Pure decisions for immutable prefix archives and live checkpoint boundaries.
+ *
+ * Payload handles carry the state they can actually restore. Neither clamping
+ * nor checkpoint planning may infer recurrent state from a later token cursor.
+ */
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
 
 #include <algorithm>
+#include <numeric>
 
 namespace llaminar2
 {
@@ -79,6 +87,31 @@ namespace llaminar2
                    : PrefixTerminalHarvestDisposition::ArchiveLiveState;
     }
 
+    std::optional<int> PrefixLookupResult::reusablePrefillCheckpoint(
+        int prompt_token_count,
+        int restored_tokens,
+        int stable_segment_tokens) const
+    {
+        if (!supported || !cache_enabled ||
+            checkpoint_policy != PrefixCheckpointPolicy::ReusableBoundary ||
+            block_size <= 0 || prompt_token_count <= 0)
+        {
+            return std::nullopt;
+        }
+
+        // Use a wide product: relatively prime cache/routing windows can have
+        // an LCM larger than the prompt or even a signed token-count integer.
+        int64_t alignment = block_size;
+        if (stable_segment_tokens > 0)
+            alignment = alignment / std::gcd(block_size, stable_segment_tokens) *
+                        stable_segment_tokens;
+        const int boundary = static_cast<int>(
+            ((prompt_token_count - 1) / alignment) * alignment);
+        return boundary > std::max(0, restored_tokens)
+                   ? std::optional<int>{boundary}
+                   : std::nullopt;
+    }
+
     PrefixLookupResult PrefixLookupResult::clampedTo(int token_count) const
     {
         PrefixLookupResult result = *this;
@@ -124,10 +157,16 @@ namespace llaminar2
                                              result.blocks.back().key.token_count;
         }
 
-        if (!result.blocks.empty() && result.cached_tokens == cached_tokens)
+        if (!result.blocks.empty())
         {
-            result.has_terminal_hidden = has_terminal_hidden;
-            result.has_terminal_logits = has_terminal_logits;
+            // A pre-tail checkpoint may become terminal after coordination
+            // with a shorter participant hit. Its own payload, not the later
+            // prompt's terminal flags, authenticates the hidden/logit rows.
+            const auto &terminal = result.blocks.back();
+            result.has_terminal_hidden = result.cached_tokens == cached_tokens
+                ? has_terminal_hidden : terminal.has_terminal_hidden;
+            result.has_terminal_logits = result.cached_tokens == cached_tokens
+                ? has_terminal_logits : terminal.has_terminal_logits;
         }
 
         return result;

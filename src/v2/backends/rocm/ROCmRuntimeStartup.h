@@ -1,12 +1,21 @@
 /**
  * @file ROCmRuntimeStartup.h
- * @brief One process-wide contract for native ROCm pinned-host backing.
+ * @brief One process-wide contract for explicit ROCm host-memory ownership.
  *
  * ROCr's default USERPTR implementation of hipHostMalloc asks Linux to fault
  * huge pages while pinning them. Under fragmented model-sized allocations this
  * can spend minutes in direct compaction. Llaminar requires KFD/GTT-owned host
  * backing while retaining HIP's allocation, coherence and release contracts.
- * This is a driver-initialization policy, not an inference transport selector.
+ * Registered caller-owned pages must likewise use explicit KFD buffer-object
+ * pin/unpin ownership, not HMM/SVM range registration. The latter repeatedly
+ * remaps per-page DMA addresses across GPUs and can overflow Vega's ATS
+ * interrupt ring with Intel IOMMU invalidations. Its range lifetime also ends
+ * at virtual-memory invalidation, not necessarily hipHostUnregister().
+ *
+ * Llaminar owns residency and event ordering through TransferEngine; it does
+ * not use demand-paged managed memory. These two vendor startup settings select
+ * that explicit allocation/registration ABI without adding copies, changing
+ * graph execution, or disabling asynchronous transfers.
  */
 #pragma once
 
@@ -19,29 +28,40 @@ namespace llaminar2
     enum class ROCmRuntimeState { Uninitialized, Initialized };
 
     /** @brief Total startup decision, including failures that cannot be repaired late. */
-    enum class ROCmHostBackingAction
+    enum class ROCmHostMemoryAction
     {
-        InstallDriverBacking,
-        DriverBackingConfigured,
+        InstallExplicitOwnership,
+        ExplicitOwnershipConfigured,
         RejectUserPointerBacking,
+        RejectSvmRegistration,
         RejectLatePreparation,
     };
 
     /**
-     * @brief Select the only supported native pinned-host backing policy.
-     * @param requested Exact upstream HSA variable, absent when not specified.
+     * @brief Select the complete native pinned-host allocation/registration ABI.
+     * @param userptr Exact HSA_USERPTR_FOR_PAGED_MEM value, or unspecified.
+     * @param svm Exact HSA_USE_SVM value, or unspecified.
      * @param runtime HSA lifecycle before preparing Llaminar's backend.
-     * @return Explicit action; no initialized runtime is silently reconfigured.
+     * @return One total action; reject conflicts before modifying either value.
+     *
+     * An initialized runtime is acceptable only when both settings were already
+     * explicit. Installing the missing half after ROCr snapshots its environment
+     * would publish a policy that the live driver did not actually adopt.
      */
-    [[nodiscard]] inline ROCmHostBackingAction selectROCmHostBackingAction(
-        std::optional<std::string_view> requested, ROCmRuntimeState runtime)
+    [[nodiscard]] inline ROCmHostMemoryAction selectROCmHostMemoryAction(
+        std::optional<std::string_view> userptr,
+        std::optional<std::string_view> svm,
+        ROCmRuntimeState runtime)
     {
-        if (requested.has_value())
-            return *requested == "0" ? ROCmHostBackingAction::DriverBackingConfigured
-                                      : ROCmHostBackingAction::RejectUserPointerBacking;
+        if (userptr && *userptr != "0")
+            return ROCmHostMemoryAction::RejectUserPointerBacking;
+        if (svm && *svm != "0")
+            return ROCmHostMemoryAction::RejectSvmRegistration;
+        if (userptr && svm)
+            return ROCmHostMemoryAction::ExplicitOwnershipConfigured;
         return runtime == ROCmRuntimeState::Uninitialized
-            ? ROCmHostBackingAction::InstallDriverBacking
-            : ROCmHostBackingAction::RejectLatePreparation;
+            ? ROCmHostMemoryAction::InstallExplicitOwnership
+            : ROCmHostMemoryAction::RejectLatePreparation;
     }
 
     /**

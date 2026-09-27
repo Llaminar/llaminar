@@ -26,6 +26,7 @@
 #include "../execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
+#include "common/DeviceRowRange.h"
 
 #include <cstdint>
 #include <memory>
@@ -3095,11 +3096,17 @@ namespace llaminar2
          * Shared experts are always active for every token and have an implicit
          * route weight of 1. GPU implementations can populate the same grouping
          * scratch used by executeGroupedPrefillPipeline() without materializing
-         * synthetic routing tensors. The default returns false.
+         * synthetic routing tensors. Captured capacity and live rows are
+         * distinct: padded rows must publish an invalid route and zero weight,
+         * so no shared-expert projection processes them. The device count is
+         * borrowed from the same controller as the surrounding verifier.
+         *
+         * @param rows Physical capacity with fixed or device-owned live rows.
+         * @return Whether the native backend published the group on its exact stream.
          */
-        virtual bool prepareSharedExpertPrefillGroup(int seq_len)
+        virtual bool prepareSharedExpertPrefillGroup(DeviceRowRange rows)
         {
-            (void)seq_len;
+            (void)rows;
             return false;
         }
 

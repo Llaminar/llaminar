@@ -1409,6 +1409,7 @@ namespace
         bool pair_grid_execution_found = false;
         int pair_grid_execution_n_block_chunks = 0;
         int pair_grid_parallel_tasks = 0;
+        int pair_grid_row_tile = 0;
         uint64_t pair_grid_execution_count = 0;
         int threads = 0;
         uint64_t count = 0;
@@ -1428,6 +1429,9 @@ namespace
                 return "cpu.nvnni.prefill.two_row_pair_grid.nbc" +
                        std::to_string(n_block_chunks) + ".full_k";
             }
+            if (route == "four_row_grid")
+                return "cpu.nvnni.prefill.four_row_grid.nbc" +
+                       std::to_string(n_block_chunks) + ".full_k";
             if (route == "decode_equivalent_kpart_rows")
             {
                 return effective_policy == "WideRows"
@@ -1517,6 +1521,7 @@ namespace
                 std::stoi(tag("n_block_chunks"));
             result.pair_grid_parallel_tasks =
                 std::stoi(tag("parallel_tasks"));
+            result.pair_grid_row_tile = std::stoi(tag("row_tile"));
             result.pair_grid_execution_count += record.count;
         }
         return result;
@@ -7295,6 +7300,15 @@ namespace
                 .schedule = PrefillSchedulePolicy::TwoRowPairGrid,
             });
         }
+        // Four physical rows reuse the same decoded weights. This is an
+        // AVX-512 schedule, not an alias for two pairwise launches on AVX2.
+        for (int n_block_chunks : {1, 2, 4, 8})
+            candidates.push_back({
+                .id = "cpu.nvnni.prefill.four_row_grid.nbc" +
+                      std::to_string(n_block_chunks) + ".full_k",
+                .n_block_chunks = n_block_chunks,
+                .schedule = PrefillSchedulePolicy::FourRowGrid,
+            });
         candidates.push_back({
             .id = "cpu.nvnni.prefill.decode_equivalent_kpart.pairwise",
             .n_block_chunks = 1,
@@ -7461,6 +7475,12 @@ namespace
                 };
                 const auto launch_candidate = [&](const Candidate &candidate)
                 {
+                    // Unsupported research candidates retain the actual paired
+                    // route as evidence, never timing under a four-row label.
+                    // The production FourRowGrid entry still rejects AVX2/M2.
+                    const bool unsupported_wide =
+                        candidate.schedule == PrefillSchedulePolicy::FourRowGrid &&
+                        (effective_runtime_isa != "AVX512" || M < 3);
                     gemm_native_vnni_preq(
                         packed,
                         quantized_rows.data(),
@@ -7469,7 +7489,8 @@ namespace
                         N,
                         isa_path,
                         candidate.verifier_policy,
-                        candidate.schedule);
+                        unsupported_wide ? PrefillSchedulePolicy::TwoRowPairGrid
+                                         : candidate.schedule);
                 };
                 const auto run_candidate = [&](const Candidate &candidate)
                 {
@@ -7495,7 +7516,10 @@ namespace
                 {
                     const bool pair_grid =
                         candidate.schedule ==
-                            PrefillSchedulePolicy::TwoRowPairGrid;
+                            PrefillSchedulePolicy::TwoRowPairGrid ||
+                        candidate.schedule == PrefillSchedulePolicy::FourRowGrid;
+                    const int row_tile = candidate.schedule ==
+                        PrefillSchedulePolicy::FourRowGrid ? 4 : 2;
                     return route.found && route.count > 0 &&
                            route.build_isa == build_isa &&
                            route.isa == effective_runtime_isa &&
@@ -7508,11 +7532,12 @@ namespace
                                       route.k_tile_blocks == k_blocks) &&
                            (!pair_grid ||
                                 (route.pair_grid_execution_found &&
+                                 route.pair_grid_row_tile == row_tile &&
                                  route.pair_grid_execution_count == route.count &&
                                  route.pair_grid_execution_n_block_chunks ==
                                      candidate.n_block_chunks &&
                                  route.pair_grid_parallel_tasks ==
-                                     ((M + 1) / 2) *
+                                     ((M + row_tile - 1) / row_tile) *
                                          ((n_chunks +
                                            candidate.n_block_chunks - 1) /
                                           candidate.n_block_chunks))) &&
@@ -7553,6 +7578,9 @@ namespace
                             if (!batch_request)
                                 continue;
                         }
+                        ASSERT_FALSE(candidate.schedule == PrefillSchedulePolicy::FourRowGrid &&
+                            (effective_runtime_isa != "AVX512" || M < 3))
+                            << "Cannot profile a four-row schedule on an unsupported ISA/M";
                         const std::string &exact_request_id = batch_request
                             ? batch_request->request_id
                             : profiler_request_id;
@@ -7694,7 +7722,8 @@ namespace
                                 effective_runtime_isa == "AVX512",
                                 M,
                                 N,
-                                omp_get_max_threads()));
+                                omp_get_max_threads(),
+                                packed.encoding));
                     const auto cached_probe =
                         physical_route_probes.find(expected_physical_id);
                     if (cached_probe != physical_route_probes.end())

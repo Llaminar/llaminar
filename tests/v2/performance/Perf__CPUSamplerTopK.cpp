@@ -1,10 +1,20 @@
+/**
+ * @file Perf__CPUSamplerTopK.cpp
+ * @brief Isolated CPU sampling economy with output-authenticated comparisons.
+ *
+ * Timing remains outside production preflight. Greedy compares the old
+ * runner-up scan with the existing ISA selector, while stochastic compares
+ * complete top-k distributions. Neither experiment changes runtime policy.
+ */
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <utility>
@@ -187,6 +197,66 @@ namespace
                   << (old_ms / std::max(new_ms, 1e-9)) << "\n";
     }
 } // namespace
+
+/** @test Quantify removal of the unconditional CPU greedy runner-up scan. */
+TEST(Perf__CPUSamplerTopK, GreedyVocabularyScan)
+{
+    std::cout << "vocab,repeat,scalar_margin_us,isa_greedy_us\n";
+    for (size_t width : {size_t{32768}, size_t{124160}, size_t{248320}})
+    {
+        const auto row = make_logits(width);
+        const auto serial = [&]() {
+            int winner = 0;
+            float best = row[0];
+            float second = -std::numeric_limits<float>::infinity();
+            for (size_t i = 1; i < width; ++i)
+                if (row[i] > best)
+                {
+                    second = best;
+                    best = row[i];
+                    winner = static_cast<int>(i);
+                }
+                else if (row[i] > second)
+                    second = row[i];
+            return std::array<float, 3>{float(winner), best, second};
+        };
+        const auto selected = [&]() {
+            int winner = -1;
+            float best = 0;
+            cpu_sampling::select_topk(row.data(), static_cast<int>(width), 1,
+                                     &best, &winner);
+            return std::array<float, 3>{float(winner), best, 0.0f};
+        };
+        const auto reference = serial();
+        const auto result = selected();
+        ASSERT_EQ(reference[0], result[0]);
+        ASSERT_EQ(reference[1], result[1]);
+        const auto scalar_run = [&]() -> double {
+            const auto value = serial();
+            return value[0] + value[1] + value[2];
+        };
+        const auto isa_run = [&]() -> double {
+            const auto value = selected();
+            return value[0] + value[1];
+        };
+        for (int repeat = 0; repeat < 7; ++repeat)
+        {
+            double scalar_ms, isa_ms;
+            if (repeat % 2 == 0)
+            {
+                scalar_ms = time_ms(scalar_run, 10, 250);
+                isa_ms = time_ms(isa_run, 10, 250);
+            }
+            else
+            {
+                isa_ms = time_ms(isa_run, 10, 250);
+                scalar_ms = time_ms(scalar_run, 10, 250);
+            }
+            std::cout << width << ',' << repeat << ',' << scalar_ms * 1000
+                      << ',' << isa_ms * 1000 << '\n';
+        }
+    }
+}
 
 TEST(Perf__CPUSamplerTopK, QwenStyleTopKDistributionBeforeAfter)
 {

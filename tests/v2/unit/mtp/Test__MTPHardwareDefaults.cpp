@@ -11,9 +11,11 @@
 #include <gtest/gtest.h>
 
 #include "config/OrchestrationConfigParser.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/mtp/MTPDeviceGenerationPolicy.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "planning/MemoryPlanner.h"
 
 #include <limits>
 
@@ -100,6 +102,7 @@ TEST(MTPHardwareDefaults, SingleAndHomogeneousLocalTPUseMeasuredCardProfile)
             const auto result = plans(config, inventory({devices}));
             ASSERT_EQ(result.size(), 1u);
             const auto &mtp = result.front().runtime.mtp;
+            EXPECT_EQ(mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
             EXPECT_EQ(mtp.depth_defaults_profile, type == DeviceType::CUDA
                 ? MTPDepthDefaultsProfile::CUDARTX3090 : MTPDepthDefaultsProfile::ROCmMI50);
             EXPECT_DOUBLE_EQ(resolveMTPZeroAcceptDemotionRate(mtp), type == DeviceType::CUDA ? 0.30 : 0.45);
@@ -164,8 +167,12 @@ TEST(MTPHardwareDefaults, ContinuationProfileDoesNotIncludeOtherExpertTiers)
         const auto result = plans(config, inventory({{}, {card(other, 0), card(type, 0), card(type, 1)}}));
         ASSERT_EQ(result.size(), 2u);
         for (const auto &plan : result)
+        {
             EXPECT_EQ(plan.runtime.mtp.depth_defaults_profile, type == DeviceType::CUDA
                 ? MTPDepthDefaultsProfile::CUDARTX3090 : MTPDepthDefaultsProfile::ROCmMI50);
+            EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary)
+                << "An expert-only CPU tier cannot change GPU continuation defaults";
+        }
     }
 }
 
@@ -213,6 +220,130 @@ TEST(MTPHardwareDefaults, RankLocalExplicitOwnerSelectsThatRanksCard)
     unknown.name = "AMD Instinct MI100";
     for (const auto &plan : plans(config, inventory({{unknown}, {card(DeviceType::ROCm, 0)}})))
         EXPECT_EQ(plan.runtime.mtp.depth_defaults_profile, MTPDepthDefaultsProfile::ROCmMI50);
+}
+
+/** @test CPU terminal shards follow complete membership, not MTP enablement or scope. */
+TEST(MTPHardwareDefaults, CPUHeadDefaultsAndExplicitOverridesFollowTerminalOwnership)
+{
+    for (const int count : {1, 2, 3, 4, 8})
+        for (const bool remote : {false, true})
+            for (const bool enabled : {false, true})
+                for (const auto requested : {MTPTerminalHeadPolicy::Automatic,
+                         MTPTerminalHeadPolicy::VocabularySharded,
+                         MTPTerminalHeadPolicy::MirroredFullVocabulary})
+                {
+                    SCOPED_TRACE(::testing::Message() << "count=" << count << " remote=" << remote
+                        << " enabled=" << enabled << " policy=" << mtpTerminalHeadPolicyToString(requested));
+                    auto cluster = inventory(std::vector<std::vector<DeviceInfo>>(count));
+                    std::vector<GlobalDeviceAddress> devices;
+                    std::vector<int> owners;
+                    for (int rank = 0; rank < count; ++rank)
+                    {
+                        auto &observed = cluster.ranks[rank];
+                        if (remote)
+                        {
+                            observed.hostname = "host-" + std::to_string(rank);
+                            observed.node_id = rank;
+                            observed.local_rank = 0;
+                        }
+                        devices.push_back(GlobalDeviceAddress::cpu(rank, observed.hostname));
+                        owners.push_back(rank);
+                    }
+                    cluster.buildNodeAggregations();
+                    OrchestrationConfig config;
+                    config.mtp.enabled = enabled;
+                    config.mtp.terminal_head_policy = requested;
+                    config.domain_definitions = {domain("continuation", devices, owners)};
+                    config.domain_definitions.front().scope = remote ? TPScope::GLOBAL : TPScope::NODE_LOCAL;
+                    const auto result = plans(config, cluster);
+                    ASSERT_EQ(result.size(), static_cast<size_t>(count));
+                    const auto expected = requested == MTPTerminalHeadPolicy::Automatic
+                        ? MTPTerminalHeadPolicy::VocabularySharded : requested;
+                    for (const auto &plan : result)
+                    {
+                        EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, expected);
+                        const auto sets = resolveAdditionalPersistentWeightSets(
+                            DenseParallelPolicy::TensorParallel, count, plan.runtime.mtp);
+                        EXPECT_EQ(std::count(sets.begin(), sets.end(), AdditionalPersistentWeightSet::MirroredMTPTerminalHead),
+                            count > 1 && expected == MTPTerminalHeadPolicy::MirroredFullVocabulary ? 1 : 0);
+                        EXPECT_EQ(resolveMTPTerminalLogitsLayout(count > 1, expected),
+                            count > 1 && expected == MTPTerminalHeadPolicy::VocabularySharded
+                                ? MTPTerminalLogitsLayout::VocabularyShardPerParticipant
+                                : MTPTerminalLogitsLayout::FullVocabularyPerParticipant);
+                    }
+                    EXPECT_EQ(config.mtp.terminal_head_policy, requested);
+                }
+}
+
+/** @test Single CPU, GPU defaults, and explicit GPU sharding share the same compiler. */
+TEST(MTPHardwareDefaults, TerminalHeadExplicitOverridesSurviveSimplePlans)
+{
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto requested : {MTPTerminalHeadPolicy::Automatic,
+                 MTPTerminalHeadPolicy::VocabularySharded, MTPTerminalHeadPolicy::MirroredFullVocabulary})
+        {
+            OrchestrationConfig config;
+            config.device_for_this_rank = backend == DeviceType::CPU
+                ? GlobalDeviceAddress::cpu(0, "node") : address(backend, 0);
+            config.mtp.terminal_head_policy = requested;
+            const auto cluster = inventory({backend == DeviceType::CPU
+                ? std::vector<DeviceInfo>{} : std::vector<DeviceInfo>{card(backend, 0)}});
+            const auto expected = requested == MTPTerminalHeadPolicy::Automatic
+                ? (backend == DeviceType::CPU ? MTPTerminalHeadPolicy::VocabularySharded
+                                              : MTPTerminalHeadPolicy::MirroredFullVocabulary)
+                : requested;
+            EXPECT_EQ(plans(config, cluster).front().runtime.mtp.terminal_head_policy, expected);
+        }
+}
+
+/** @test A pipeline uses its terminal domain, independent of its first stage's backend. */
+TEST(MTPHardwareDefaults, TerminalHeadPipelineDefaultsUseTheFinalDomain)
+{
+    for (const auto gpu : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const bool cpu_last : {false, true})
+        {
+            OrchestrationConfig config;
+            config.domain_definitions = {
+                domain("cpu", {GlobalDeviceAddress::cpu(0, "node")}, {0}),
+                domain("gpu", {address(gpu, 0)}, {1}),
+            };
+            config.pp_stage_definitions = {
+                {.stage_id = 0, .domain_name = cpu_last ? "gpu" : "cpu", .first_layer = 0, .last_layer = 15},
+                {.stage_id = 1, .domain_name = cpu_last ? "cpu" : "gpu", .first_layer = 16, .last_layer = 31},
+            };
+            for (const auto &plan : plans(config, inventory({{}, {card(gpu, 0)}})))
+                EXPECT_EQ(plan.runtime.mtp.terminal_head_policy, cpu_last
+                    ? MTPTerminalHeadPolicy::VocabularySharded : MTPTerminalHeadPolicy::MirroredFullVocabulary);
+        }
+}
+
+/** @test CLI/YAML and saved plans preserve automatic versus explicit head intent. */
+TEST(MTPHardwareDefaults, TerminalHeadPolicyRoundTripsWithoutErasingExplicitIntent)
+{
+    OrchestrationConfigParser parser;
+    for (const auto policy : {MTPTerminalHeadPolicy::Automatic,
+             MTPTerminalHeadPolicy::VocabularySharded, MTPTerminalHeadPolicy::MirroredFullVocabulary})
+    {
+        const char *spelling = mtpTerminalHeadPolicyToString(policy);
+        const char *argv[] = {"llaminar2", "--mtp-terminal-head-policy", spelling};
+        const auto config = parser.parseArgs(3, const_cast<char **>(argv));
+        EXPECT_EQ(config.mtp.terminal_head_policy, policy);
+        EXPECT_EQ(parser.parseYamlString(std::string("mtp:\n  terminal_head_policy: ") + spelling + "\n")
+                      .mtp.terminal_head_policy, policy);
+        EXPECT_EQ(deserializeOrchestrationConfig(serializeOrchestrationConfig(config))
+                      .mtp.terminal_head_policy, policy);
+    }
+}
+
+/** @test Uncompiled intent cannot silently choose graph layout or memory charges. */
+TEST(MTPHardwareDefaults, TerminalHeadConsumersRejectUnresolvedAutomaticIntent)
+{
+    const auto pending = OrchestrationConfig{}.mtp;
+    EXPECT_EQ(pending.terminal_head_policy, MTPTerminalHeadPolicy::Automatic);
+    EXPECT_THROW(mtpTerminalHeadIsMirrored(pending.terminal_head_policy), std::logic_error);
+    for (const bool sharded : {false, true})
+        EXPECT_THROW(resolveMTPTerminalLogitsLayout(sharded, pending.terminal_head_policy), std::logic_error);
+    EXPECT_THROW(resolveAdditionalPersistentWeightSets(DenseParallelPolicy::TensorParallel, 2, pending), std::logic_error);
 }
 
 TEST(MTPHardwareDefaults, RequestsRetainTopologyWhileExplicitThresholdsTakePrecedence)

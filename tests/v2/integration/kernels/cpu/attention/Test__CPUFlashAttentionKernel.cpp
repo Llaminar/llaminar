@@ -1,10 +1,16 @@
 /**
  * @file Test__CPUFlashAttentionKernel.cpp
  * @brief Integration tests for CPUFlashAttentionKernelT mixed-precision tensor path
+ *
+ * Every independently filtered cell registers its actual NUMA participant
+ * before workspace allocation. Attention, grouped verification and wrapped
+ * native KV storage then exercise the production allocator and kernel without
+ * depending on another test having initialized a process-wide CPU backend.
  */
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cpu/attention/CPUFlashAttentionLaunchPolicy.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
@@ -26,8 +32,31 @@
 #include <vector>
 
 #include <omp.h>
+#include <numa.h>
+#include <sched.h>
 
 using namespace llaminar2;
+
+/** @brief Own explicit CPU-participant setup for every standalone test cell. */
+class Test__CPUFlashAttentionKernel : public ::testing::Test
+{
+protected:
+    /**
+     * @brief Register the physical NUMA endpoint before admitting workspace.
+     *
+     * CTest may launch only a grouped/wrapped-cache cell in a fresh process.
+     * Backend lookup must not invent an aggregate owner or rely on test order;
+     * the fixture declares the endpoint selected by the launcher's affinity.
+     */
+    void SetUp() override
+    {
+        const int cpu = sched_getcpu();
+        ASSERT_GE(cpu, 0);
+        const int node = numa_node_of_cpu(cpu);
+        ASSERT_GE(node, 0);
+        initCPUBackend(node);
+    }
+};
 
 namespace
 {
@@ -1040,7 +1069,7 @@ namespace
     }
 }
 
-TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Prefill_FP32Q_Q81KV_MatchesReference)
+TEST_F(Test__CPUFlashAttentionKernel, ComputeTensor_Prefill_FP32Q_Q81KV_MatchesReference)
 {
     constexpr int batch_size = 1;
     constexpr int seq_len = 8;
@@ -1106,7 +1135,7 @@ TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Prefill_FP32Q_Q81KV_MatchesRef
     EXPECT_LE(max_diff, 1e-3f);
 }
 
-TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Decode_FP32Q_Q81KV_MatchesReference)
+TEST_F(Test__CPUFlashAttentionKernel, ComputeTensor_Decode_FP32Q_Q81KV_MatchesReference)
 {
     constexpr int batch_size = 1;
     constexpr int seq_len = 1;
@@ -1174,7 +1203,7 @@ TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Decode_FP32Q_Q81KV_MatchesRefe
     EXPECT_LE(max_diff, 1e-3f);
 }
 
-TEST(Test__CPUFlashAttentionKernel,
+TEST_F(Test__CPUFlashAttentionKernel,
      PhysicalModesAndGroupedVerifierAreByteExactForEveryNonQ16NativeKVFormat)
 {
     ScopedOpenMPThreadCount thread_count(/*threads=*/8);
@@ -1604,7 +1633,7 @@ TEST(Test__CPUFlashAttentionKernel,
     }
 }
 
-TEST(Test__CPUFlashAttentionKernel,
+TEST_F(Test__CPUFlashAttentionKernel,
      WrappedNativeKVRingMatchesCompactForEveryNonQ16FormatAndM)
 {
     ScopedOpenMPThreadCount thread_count(/*threads=*/8);
@@ -1882,7 +1911,7 @@ TEST(Test__CPUFlashAttentionKernel,
     }
 }
 
-TEST(Test__CPUFlashAttentionKernel,
+TEST_F(Test__CPUFlashAttentionKernel,
      NativeRequestBatchWithUnequalWrappedHistoriesIsByteExactForEveryNonQ16Format)
 {
     ScopedOpenMPThreadCount thread_count(/*threads=*/8);
