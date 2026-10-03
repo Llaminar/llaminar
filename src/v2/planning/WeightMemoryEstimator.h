@@ -10,6 +10,7 @@
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@ namespace llaminar2
 {
 
     struct ModelMemoryProfile;
+    class MoEExpertProjectionOwnership;
 
     /**
      * @brief Global weight uses retained beside a participant's layer interval.
@@ -47,6 +49,9 @@ namespace llaminar2
      * a precise routed-expert subset (an auxiliary participant).  Encoding that
      * distinction here keeps memory admission aligned with the immutable
      * expert owner map instead of applying an after-the-fact byte discount.
+     * An explicit projection contract further resolves those owner counts into
+     * movable gate/up residents and fixed down-output shards. It does not alter
+     * owner counts or establish a second live placement map.
      */
     class DeviceWeightResidency
     {
@@ -82,6 +87,22 @@ namespace llaminar2
             int model_expert_count,
             std::vector<int> selected_by_layer);
 
+        /**
+         * @brief Bind the same immutable projection contract used by weight preparation.
+         * @param ownership Exact source/domain geometry, not a byte discount.
+         * @return A selected-residency value whose counts name gate/up owners.
+         * @throws std::invalid_argument for full-model or mismatched expert inventory.
+         *
+         * This describes BOM inputs only; it neither grants capacity nor enables
+         * a serving mode. Fixed down slices remain resident even at zero owners.
+         */
+        [[nodiscard]] DeviceWeightResidency withProjectionOwnership(
+            const MoEExpertProjectionOwnership &ownership) const;
+
+        /** @return Explicit projection geometry, or null for ordinary whole experts. */
+        [[nodiscard]] const MoEExpertProjectionOwnership *projectionOwnership() const noexcept
+        { return projection_ownership_.get(); }
+
         /** @return Residency kind. */
         [[nodiscard]] Kind kind() const noexcept { return kind_; }
         /** @return Whether non-routed dense/shared/global weights are resident. */
@@ -91,7 +112,10 @@ namespace llaminar2
         /** @return Model-wide routed expert count used as the slice denominator. */
         [[nodiscard]] int modelExpertCount() const noexcept { return model_expert_count_; }
         /**
-         * @brief Return the selected routed-expert count for one model layer.
+         * @brief Return the selected owner count for one model layer.
+         *
+         * With projection ownership attached, this counts gate/up owners, not
+         * fixed down slices. Per-projection sizing must use WeightShardGeometry.
          * @throws std::out_of_range when the owner map omits the layer.
          */
         [[nodiscard]] int selectedRoutedExpertsForLayer(int layer) const;
@@ -108,6 +132,7 @@ namespace llaminar2
         Kind kind_ = Kind::FullModel;
         int model_expert_count_ = 0;
         std::vector<int> selected_by_layer_;
+        std::shared_ptr<const MoEExpertProjectionOwnership> projection_ownership_;
     };
 
     /** @brief Immutable-at-publication byte totals, never a live allocation ledger. */

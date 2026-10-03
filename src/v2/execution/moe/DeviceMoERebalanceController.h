@@ -1473,15 +1473,17 @@ namespace llaminar2
                static_cast<uint64_t>(expert);
     }
 
+    /** @return Whether a logical expert publishes its complete movable payload. */
     inline bool deviceMoEDescriptorReady(const DeviceMoEExpertDescriptor &desc) noexcept
     {
         return desc.logical_expert_id >= 0 &&
-               desc.weightsReady();
+               desc.movableWeightsReady();
     }
 
+    /** @return Whether unoccupied arrival storage has the declared projection family. */
     inline bool deviceMoETransferDescriptorReady(const DeviceMoEExpertDescriptor &desc) noexcept
     {
-        return desc.weightsReady();
+        return desc.movableWeightsReady();
     }
 
     inline bool deviceMoENativeVnniFormatForCodebook(
@@ -1748,12 +1750,15 @@ namespace llaminar2
 
     inline bool deviceMoEDirectoryCopyReady(const DeviceMoEExpertDirectoryEntry &entry) noexcept
     {
+        if (!deviceMoEProjectionPayloadValid(entry.descriptor))
+            return false;
         if (deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return deviceMoEFloatingExpertCopyReady(entry.descriptor);
         return entry.descriptor.weight_format == DeviceMoEWeightFormat::NativeVNNI &&
                deviceMoEMatrixCopyReady(entry.descriptor.gate, entry) &&
                deviceMoEMatrixCopyReady(entry.descriptor.up, entry) &&
-               deviceMoEMatrixCopyReady(entry.descriptor.down, entry);
+               (entry.descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
+                deviceMoEMatrixCopyReady(entry.descriptor.down, entry));
     }
 
     inline bool deviceMoEDirectoryEntryReady(
@@ -1808,6 +1813,10 @@ namespace llaminar2
         const DeviceMoEExpertDirectoryEntry &src,
         const DeviceMoEExpertDirectoryEntry &dst) noexcept
     {
+        if (src.descriptor.projection_set != dst.descriptor.projection_set ||
+            !deviceMoEProjectionPayloadValid(src.descriptor) ||
+            !deviceMoEProjectionPayloadValid(dst.descriptor))
+            return false;
         if (deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
         if (src.descriptor.weight_format != DeviceMoEWeightFormat::NativeVNNI)
@@ -1818,9 +1827,10 @@ namespace llaminar2
                deviceMoEMatrixFitsTransferCapacity(
                    src.descriptor.up,
                    dst.descriptor.up) &&
-               deviceMoEMatrixFitsTransferCapacity(
+               (src.descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
+                deviceMoEMatrixFitsTransferCapacity(
                    src.descriptor.down,
-                   dst.descriptor.down);
+                   dst.descriptor.down));
     }
 
     /**
@@ -1841,9 +1851,10 @@ namespace llaminar2
         deviceMoERetargetTransferMatrixFormat(
             dst.descriptor.up,
             src.descriptor.up);
-        deviceMoERetargetTransferMatrixFormat(
-            dst.descriptor.down,
-            src.descriptor.down);
+        if (src.descriptor.projection_set == DeviceMoEProjectionSet::CompleteExpert)
+            deviceMoERetargetTransferMatrixFormat(
+                dst.descriptor.down,
+                src.descriptor.down);
     }
 
     inline int32_t deviceMoEFirstResidentParticipant(

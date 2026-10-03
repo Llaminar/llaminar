@@ -11,7 +11,9 @@ Every branch runs exactly the same two suites, in order:
 2. The full `^ProductionTestPreflight$` CTest label.
 
 The hook configures `build_v2_integration` with CUDA/ROCm enabled and the active
-Ninja executable pinned in `CMAKE_MAKE_PROGRAM`. It builds only `v2_unit_gate`
+Ninja executable pinned in `CMAKE_MAKE_PROGRAM`. It explicitly regenerates
+`compile_commands.json` for the SDK and compiler-flag audits, including after a
+toolchain change resets cached settings. It builds only `v2_unit_gate`
 and `v2_production_test_preflight_gate`, whose dependencies derive from the
 canonical CMake test registrations. Script-only tests need no executable build;
 shared fixtures are built once. Build and test parallelism is unrestricted,
@@ -65,4 +67,6 @@ git commit --no-verify -m 'WIP: checkpoint'
 
 Hook command selection and failure propagation are covered by
 `V2_Unit_PreCommitHook`, using command recorders without running real builds,
-models, accelerators, or modifying Git registration.
+models, accelerators, or modifying Git registration. Compiler-metadata
+regeneration is also registered in `ProductionTestPreflight` as
+`V2_Integration_PreCommitCompilerMetadata`.

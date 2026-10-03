@@ -86,10 +86,12 @@ namespace llaminar2::test
          * @param expert_type Native FFN/expert format; extents use the production directory ABI.
          * @param expert_width Expert intermediate dimension; unequal N/K exposes axis errors.
          * @param gdn_projection Optional alpha/beta source format for canonical runtime-promotion tests.
+         * @param attention_heads Integral Q-head count; source KV and norm tensors
+         *        use its actual head width, allowing valid high-degree GQA tests.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
-            std::optional<GGUFTensorType> gdn_projection = std::nullopt)
+            std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8)
         {
             if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
@@ -98,7 +100,7 @@ namespace llaminar2::test
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
             path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -130,8 +132,11 @@ namespace llaminar2::test
         }
         /** @brief Publish the directory followed by sparse, unread payload extents. */
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
-            std::optional<GGUFTensorType> gdn_projection)
+            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads)
         {
+            if (attention_heads < 2 || 256 % attention_heads != 0)
+                throw std::invalid_argument("Planning fixture needs integral attention heads and two KV heads");
+            const uint64_t head_columns = 256 / attention_heads;
             const std::string arch = moe ? "qwen35moe" : "qwen35";
             const int layers = mtp ? 3 : 2;
             std::vector<Tensor> tensors{
@@ -143,11 +148,11 @@ namespace llaminar2::test
                 for (const auto name : {"attn_norm.weight", "post_attention_norm.weight"})
                     tensors.push_back({prefix + name, {256}});
                 for (const auto name : {"attn_q_norm.weight", "attn_k_norm.weight"})
-                    tensors.push_back({prefix + name, {32}});
+                    tensors.push_back({prefix + name, {head_columns}});
                 for (const auto name : {"attn_q.weight", "attn_output.weight"})
                     tensors.push_back({prefix + name, {256, 256}});
                 for (const auto name : {"attn_k.weight", "attn_v.weight"})
-                    tensors.push_back({prefix + name, {256, 64}});
+                    tensors.push_back({prefix + name, {256, 2 * head_columns}});
                 if (gdn_projection)
                     for (const auto name : {"ssm_alpha.weight", "ssm_beta.weight"})
                         tensors.push_back({prefix + name, {256, 256}, *gdn_projection});
@@ -177,7 +182,7 @@ namespace llaminar2::test
             const std::vector<std::pair<std::string, uint32_t>> metadata{
                 {arch + ".block_count", static_cast<uint32_t>(layers)},
                 {arch + ".embedding_length", 256}, {arch + ".feed_forward_length", 512},
-                {arch + ".attention.head_count", 8}, {arch + ".attention.head_count_kv", 2},
+                {arch + ".attention.head_count", attention_heads}, {arch + ".attention.head_count_kv", 2},
                 {arch + ".context_length", 1024}, {"tokenizer.ggml.token_count", 320},
                 {arch + ".expert_count", moe ? 8u : 0u},
                 {arch + ".expert_used_count", moe ? 2u : 0u},

@@ -767,7 +767,7 @@ class PreflightExecutionLane(str, Enum):
 
     CUDA and ROCm single-rank work may overlap only after each CTest launcher
     is constrained to a disjoint physical CPU package. Every host-only,
-    multi-rank, or mixed-vendor test remains exclusive. This keeps the
+    multi-rank, mixed-vendor, or full-device-inventory test remains exclusive. This keeps the
     acceleration policy explicit instead of treating CTest's historic global
     lock as an implicit execution protocol.
     """
@@ -829,12 +829,19 @@ def _preflight_execution_lane(
 ) -> tuple[int | None, PreflightExecutionLane]:
     """Derive safe lane ownership from explicit CTest capabilities and MPI width.
 
-    A backend label is an ownership claim, not an advisory category. Reject a
+    A backend label is an ownership claim, not an advisory category, unless
+    ``FullDeviceInventory`` explicitly declares broader startup ownership.
+    Inventory discovery can materialize both vendors even when the selected
+    measurement kernel uses only one. Reject a
     contradictory explicit resource lock instead of allowing a test to appear
     CUDA-only while it can concurrently touch ROCm (or the converse). The
     historical ``Integration_Serial`` lock is intentionally ignored here: it
     is replaced by this whole-plan ordering, not treated as a device resource.
     """
+
+    ranks = _preflight_mpi_ranks(name, command)
+    if "FullDeviceInventory" in labels:
+        return ranks, PreflightExecutionLane.EXCLUSIVE
 
     cuda = "CUDA" in labels
     rocm = "ROCm" in labels
@@ -848,7 +855,6 @@ def _preflight_execution_lane(
     if not cuda and not rocm and (has_cuda_lock or has_rocm_lock):
         raise RuntimeError(f"host preflight test claims an accelerator resource lock: {name}")
 
-    ranks = _preflight_mpi_ranks(name, command)
     if cuda and rocm:
         return ranks, PreflightExecutionLane.EXCLUSIVE
     if cuda and ranks == 1:

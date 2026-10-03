@@ -79,6 +79,90 @@ TEST(PhysicalMemoryAuthority, CoalescesCpuAndGpuOwnersExactlyOnce)
     EXPECT_TRUE(plan.fits());
 }
 
+/** @test A claimed lazy pool still protects every unmaterialized backing byte. */
+TEST(PhysicalMemoryAuthority, RuntimeContextAdmissionProtectsUnmaterializedPools)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        PhysicalMemoryPlanBuilder builder;
+        const auto observed = resource(0, device, 1000u, 800u);
+        builder.add(observed, PhysicalMemoryOwner::ExecutionWorkspace, 100u)
+            .add(observed, PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+        PhysicalMemoryAuthority memory(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+        auto payload = memory.claimNewAllocation(device, PhysicalMemoryOwner::ExecutionWorkspace, 100u);
+        auto graphs = memory.reserveNewAllocations(device, PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+        const auto fresh = resource(0, device, 1000u, 700u);
+        EXPECT_THROW(memory.claimMeasuredRuntimeContextStorage(fresh, 601u), PhysicalMemoryCapacityExhausted);
+        auto context = memory.claimMeasuredRuntimeContextStorage(fresh, 600u);
+        EXPECT_EQ(context.owner(), PhysicalMemoryOwner::NativeExecutionContext);
+        EXPECT_EQ(context.bytes(), 600u);
+        EXPECT_EQ(memory.plannedBytes(device, PhysicalMemoryOwner::NativeGraphExecutable), 100u);
+        EXPECT_EQ(graphs.materializedBytes(), 0u);
+        EXPECT_EQ(memory.claimedBytes(device, PhysicalMemoryOwner::NativeExecutionContext,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u)
+            << "Context lifetime must not become a graph-family allocation";
+    }
+}
+
+/** @test Pending demand uses materialized pool children, not the whole reservation. */
+TEST(PhysicalMemoryAuthority, RuntimeContextAdmissionCountsOnlyUnmaterializedChildren)
+{
+    const auto gpu = DeviceId::cuda(0);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, gpu, 1000u, 800u), PhysicalMemoryOwner::ExecutionWorkspace, 120u)
+        .add(resource(0, gpu, 1000u, 800u), PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+    PhysicalMemoryAuthority memory(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    auto direct = memory.claimNewAllocation(gpu, PhysicalMemoryOwner::ExecutionWorkspace, 20u);
+    auto workspace = memory.reserveNewAllocations(gpu, PhysicalMemoryOwner::ExecutionWorkspace, 100u);
+    auto child = workspace.claimAllocation(40u);
+    auto graphs = memory.reserveNewAllocations(gpu, PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+    EXPECT_THROW(memory.claimMeasuredRuntimeContextStorage(resource(0, gpu, 1000u, 740u), 581u),
+        PhysicalMemoryCapacityExhausted);
+    auto context = memory.claimMeasuredRuntimeContextStorage(resource(0, gpu, 1000u, 740u), 580u);
+    EXPECT_EQ(context.bytes(), 580u);
+}
+
+/** @test Native-context residency outlives the setup plan without preserving its obsolete graph owner. */
+TEST(PhysicalMemoryAuthority, RuntimeContextLeaseSurvivesSourceAuthority)
+{
+    PhysicalMemoryAllocationLease context;
+    std::weak_ptr<PhysicalMemoryAuthority> setup_lifetime;
+    {
+        PhysicalMemoryPlanBuilder builder;
+        const auto gpu = DeviceId::cuda(0);
+        builder.add(resource(0, gpu, 1000u, 800u), PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+        auto setup = std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+        setup_lifetime = setup;
+        context = setup->claimMeasuredRuntimeContextStorage(resource(0, gpu, 1000u, 800u), 48u);
+    }
+    EXPECT_TRUE(setup_lifetime.expired());
+    EXPECT_TRUE(context.valid());
+    EXPECT_EQ(context.bytes(), 48u);
+    EXPECT_EQ(context.owner(), PhysicalMemoryOwner::NativeExecutionContext);
+    context = {};
+    EXPECT_FALSE(context.valid());
+}
+
+/** @test Actual allocator identity and a positive observed footprint are mandatory. */
+TEST(PhysicalMemoryAuthority, RuntimeContextAdmissionRejectsResourceSubstitution)
+{
+    const auto gpu = DeviceId::cuda(0);
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0, gpu, 1000u, 800u), PhysicalMemoryOwner::NativeGraphExecutable, 100u);
+    PhysicalMemoryAuthority memory(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    for (const auto invalid : {resource(1, gpu, 1000u, 800u),
+            resource(0, gpu, 999u, 800u),
+            resource(0, DeviceId::cpu(), 1000u, 800u)})
+        EXPECT_THROW(memory.claimMeasuredRuntimeContextStorage(invalid, 48u), std::invalid_argument);
+    EXPECT_THROW(memory.claimMeasuredRuntimeContextStorage(
+        resource(0, DeviceId::cuda(1), 1000u, 800u), 48u), std::out_of_range);
+    EXPECT_THROW(memory.claimMeasuredRuntimeContextStorage(resource(0, gpu, 1000u, 800u), 0u), std::invalid_argument);
+}
+
 TEST(PhysicalMemoryAuthority, ExclusiveSetupPlansShareOwnerMaximaAndKeepConcurrentCharges)
 {
     const auto cpu = resource(0, DeviceId::cpu(), 4000, 4000);

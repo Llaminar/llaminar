@@ -85,8 +85,10 @@ namespace llaminar2
     class CapturedTransferBinding final
     {
     public:
-        /** @return Immutable message geometry embedded in the recorded operation. */
+        /** @return Exact fixed extent or counted maximum embedded in the recorded operation. */
         [[nodiscard]] CapturedTransferMessage message() const noexcept { return native_.message; }
+        /** @return Capture-frozen extent authority; never reads the live device count. */
+        [[nodiscard]] CapturedTransferExtentSource extentSource() const noexcept { return native_.extent_source; }
         /** @return Physical device which must execute this endpoint. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
         /** @return Producer or consumer, without consulting mutable GPU state. */
@@ -103,5 +105,8 @@ namespace llaminar2
         DeviceId device_ = DeviceId::invalid();
         void *device_bytes_ = nullptr; ///< Immutable physical subregion start.
         size_t offset_ = 0; ///< Revalidated against the retained physical owner.
+        std::variant<std::monostate, std::shared_ptr<DeviceTransferBuffer>,
+            std::shared_ptr<const WorkspaceBufferLease>> extent_storage_; ///< Exact count input/output owner.
+        size_t extent_offset_ = 0; ///< Aligned uint64 within that retained device region.
     };
 }

@@ -269,7 +269,8 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op,
             const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-            const std::vector<void *> &streams) override;
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {}) override;
         bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
 
         bool collectiveSidebandsMultiOnStreams(
@@ -298,6 +299,18 @@ namespace llaminar2
             int device_idx,
             void *stream) override;
         bool supportsReduceSingleDeviceOnStream() const override;
+
+        /** @copydoc ICollectiveBackend::nativeRowsOnStream */
+        bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            unsigned long long *payload_bytes = nullptr) override;
+
+        /** @copydoc ICollectiveBackend::reduceScatterSingleDeviceOnStream */
+        bool reduceScatterSingleDeviceOnStream(
+            const void *send_buf, void *recv_buf, size_t receive_count,
+            CollectiveDataType dtype, int device_idx, void *stream) override;
 
         bool allgatherSingleDeviceOnStream(
             const void *send_buf,

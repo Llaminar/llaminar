@@ -16,6 +16,7 @@
 #include "planning/CapturedGraphMemoryEstimator.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "planning/PlanningGPUExpertMeasurement.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../utils/CPUExecutionTestGeometry.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -496,6 +497,72 @@ namespace llaminar2
                 type == TensorType::FP32 ? TensorType::FP16 : TensorType::FP32);
             EXPECT_THROW(Directory::profileForLayerWeightManifest(model_manifest), std::invalid_argument);
         }
+    }
+
+    /**
+     * @brief Unsupported mixed triplets name the exact layer and checkpoint tensors.
+     *
+     * Sweep every quantized codebook against every floating precision in every
+     * projection position. This is an admission diagnostic, not permission to
+     * reinterpret raw bytes or convert a checkpoint. Homogeneous floating
+     * layers beside quantized layers remain valid.
+     */
+    TEST(MoEOverlayCapacityResolver, MixedProjectionAdmissionNamesExactSourceTensors)
+    {
+        using Directory = DeviceMoETransferSlotDirectory;
+        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        {
+            for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+            {
+                for (std::size_t role = 0; role < 3; ++role)
+                {
+                    SCOPED_TRACE(::testing::Message() << source.quant_type
+                        << " floating_type=" << static_cast<int>(type) << " role=" << role);
+                    auto model_manifest = manifest(3, *source.metadata);
+                    model_manifest[1].projections[role].format = ExpertWeightFormat::floating(type);
+                    try
+                    {
+                        (void)Directory::profileForLayerWeightManifest(model_manifest);
+                        FAIL() << "Mixed movable projections were admitted";
+                    }
+                    catch (const std::invalid_argument &error)
+                    {
+                        const std::string message = error.what();
+                        EXPECT_NE(message.find("layer 1"), std::string::npos);
+                        for (const auto *projection_name : {"gate", "up", "down"})
+                            EXPECT_NE(message.find("blk.1.ffn_" + std::string(projection_name) +
+                                                   "_exps.weight="), std::string::npos);
+                        EXPECT_NE(message.find("NativeVNNI/" + std::string(source.quant_type)),
+                                  std::string::npos);
+                        const std::string precision = type == TensorType::FP16 ? "FP16" :
+                            type == TensorType::BF16 ? "BF16" : "FP32";
+                        EXPECT_NE(message.find("floating/" + precision), std::string::npos);
+                        EXPECT_NE(message.find("not implemented"), std::string::npos);
+                        EXPECT_NE(message.find("No weights were converted"), std::string::npos);
+                    }
+
+                    // A quantized/floating transition BETWEEN layers is not
+                    // the unsupported within-payload mixture reported here.
+                    for (auto &projection : model_manifest[1].projections)
+                        projection.format = ExpertWeightFormat::floating(type);
+                    EXPECT_NO_THROW((void)Directory::profileForLayerWeightManifest(model_manifest));
+                }
+            }
+        }
+
+        // Matching byte width is insufficient: BF16 and FP16 are different
+        // arithmetic formats even though both occupy two bytes per element.
+        for (const auto first : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+            for (const auto second : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+            {
+                if (first == second) continue;
+                auto mixed_precision = manifest(1, native_vnni_formats::Q8_0);
+                for (auto &projection : mixed_precision.front().projections)
+                    projection.format = ExpertWeightFormat::floating(first);
+                mixed_precision.front().projections[2].format = ExpertWeightFormat::floating(second);
+                EXPECT_THROW((void)Directory::profileForLayerWeightManifest(mixed_precision),
+                             std::invalid_argument);
+            }
     }
 
     TEST(MoEOverlayCapacityResolver, EveryCataloguedCodebookHasExactCpuAndGpuFootprint)
@@ -3328,6 +3395,63 @@ namespace llaminar2
         EXPECT_THROW(
             (void)MoEOverlayCapacityResolver::resolve(input),
             std::invalid_argument);
+    }
+
+    /** @brief Cost sampling must use live expert arithmetic admission before payload I/O. */
+    TEST(MoEOverlayCapacityResolver, GPUExpertMixedProjectionAdmissionNamesExactSourceTensors)
+    {
+        const PlanningExpertSampleRequest request{
+            {"blk.34.ffn_gate_exps.weight", PlanningExpertMatrix{0}},
+            {"blk.34.ffn_up_exps.weight", PlanningExpertMatrix{0}},
+            {"blk.34.ffn_down_exps.weight", PlanningExpertMatrix{0}}};
+        PlanningExpertSampleDescription description{
+            .matrices = {{{512, 2048, 0}, {512, 2048, 0}, {2048, 512, 0}}},
+            .formats = {"Q8_0", "Q8_0", "Q8_0"}, .layer = 34,
+            .source_bytes = 0, .largest_source_bytes = 0};
+        for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        {
+            description.formats = {std::string(source.quant_type), "Q8_0", "Q4_K"};
+            EXPECT_NO_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description));
+            for (const auto floating : {"F16", "BF16", "F32"})
+                for (std::size_t position = 0; position < 3; ++position)
+                {
+                    description.formats = {std::string(source.quant_type), std::string(source.quant_type),
+                        std::string(source.quant_type)};
+                    description.formats[position] = floating;
+                    try
+                    {
+                        PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description);
+                        FAIL() << "Mixed GPU expert sample accepted: " << source.quant_type << '/' << floating;
+                    }
+                    catch (const std::invalid_argument &error)
+                    {
+                        const std::string message = error.what();
+                        EXPECT_NE(message.find("layer 34"), std::string::npos);
+                        for (const auto *projection : request.projections())
+                            EXPECT_NE(message.find(projection->tensor_name), std::string::npos);
+                        EXPECT_NE(message.find(std::string(source.quant_type)), std::string::npos);
+                        EXPECT_NE(message.find("not implemented"), std::string::npos);
+                        EXPECT_NE(message.find("No weights were converted"), std::string::npos);
+                    }
+                }
+        }
+        for (const auto format : {"F16", "BF16", "F32"})
+        {
+            description.formats = {format, format, format};
+            EXPECT_NO_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description));
+            for (const auto other : {"F16", "BF16", "F32"})
+                if (std::string_view(format) != other)
+                {
+                    description.formats = {format, format, other};
+                    EXPECT_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description),
+                        std::invalid_argument);
+                }
+        }
+        description.formats = {"Q8_0", "Q8_0", "uncatalogued"};
+        EXPECT_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description), std::invalid_argument);
+        description.formats = {"Q8_0", "Q8_0", "Q8_0"};
+        description.matrices[0].n = static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1;
+        EXPECT_THROW(PlanningGPUExpertMeasurement::validateSourceArithmetic(request, description), std::invalid_argument);
     }
 
     TEST(MoEOverlayCapacityResolver, MalformedTopologyAndOverflowAreRejected)

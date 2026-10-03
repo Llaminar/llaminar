@@ -6,6 +6,8 @@
  * cross-backend 256-lane arithmetic contract. Their grouped pipeline stores
  * SwiGLU once per intermediate and reuses existing arena scratch for the down
  * projection. Launch wrappers are C ABI functions consumed by CUDAMoEKernel.
+ * Quantized gate/up borrows original token rows through the grouping map; it
+ * never expands identical hidden activations into one copy per expert route.
  */
 
 #include <cuda_runtime.h>
@@ -16,8 +18,16 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
+#include "kernels/common/DeviceOrderedRouteFold.h"
+#include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/MoERouterOwnedRows.h"
+#include "kernels/common/MoERouterRowPacketDevice.inl"
+#include "kernels/common/MoEGroupedSourceRows.h"
+#include "kernels/common/DeviceIntegerBlockScan.h"
+#include "kernels/common/MoEGroupingInitialization.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
@@ -26,6 +36,7 @@
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
+#include "execution/moe/MoEGroupedPlanDemand.h"
 #include "execution/moe/DeviceMoERebalancePublication.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/DeviceMoERebalanceMovementJournal.h"
@@ -256,11 +267,16 @@ namespace
         uint32_t flags;
         llaminar2::DeviceMoEWeightFormat weight_format;
         llaminar2::DeviceMoEWeightFormat floating_allocation_format;
+        llaminar2::DeviceMoEProjectionSet projection_set;
     };
 
     static_assert(
         sizeof(DeviceMoEExpertDescriptorView) == 240,
         "CUDA expert descriptor view must match the shared runtime ABI");
+
+    static_assert(offsetof(DeviceMoEExpertDescriptorView, weight_format) == 232);
+    static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_allocation_format) == 234);
+    static_assert(offsetof(DeviceMoEExpertDescriptorView, projection_set) == 236);
 
     struct DeviceMoEPlacementBankView
     {
@@ -7276,6 +7292,9 @@ namespace
     __device__ __forceinline__ bool rebalance_expert_desc_ready(
         const DeviceMoEExpertDescriptorView &desc)
     {
+        // Complete-FFN consumers retain their original, stronger contract.
+        if (desc.projection_set != llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+            return false;
         const bool native_ready =
             desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
             rebalance_matrix_desc_ready(desc.gate) &&
@@ -7293,13 +7312,16 @@ namespace
     __device__ __forceinline__ bool rebalance_transfer_desc_ready(
         const DeviceMoEExpertDescriptorView &desc)
     {
+        if (!llaminar2::deviceMoEProjectionPayloadValid(desc))
+            return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
                    llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
                rebalance_matrix_desc_ready(desc.gate) &&
                rebalance_matrix_desc_ready(desc.up) &&
-               rebalance_matrix_desc_ready(desc.down);
+               (desc.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
+                rebalance_matrix_desc_ready(desc.down));
     }
 
     __device__ __forceinline__ bool rebalance_format_for_codebook(
@@ -7487,12 +7509,15 @@ namespace
     __device__ __forceinline__ bool rebalance_directory_copy_ready(
         const DeviceMoEExpertDirectoryEntryView &entry)
     {
+        if (!llaminar2::deviceMoEProjectionPayloadValid(entry.descriptor))
+            return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(entry.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(entry.descriptor);
         return entry.descriptor.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
                rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
                rebalance_matrix_copy_ready(entry.descriptor.up, entry) &&
-               rebalance_matrix_copy_ready(entry.descriptor.down, entry);
+               (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
+                rebalance_matrix_copy_ready(entry.descriptor.down, entry));
     }
 
     __device__ __forceinline__ bool rebalance_source_entry_ready(
@@ -7511,7 +7536,8 @@ namespace
                entry.slot_index != kDeviceMoEInvalidSlot &&
                entry.descriptor.local_slot >= 0 &&
                (entry.flags & required) == required &&
-               rebalance_expert_desc_ready(entry.descriptor) &&
+               entry.descriptor.logical_expert_id >= 0 &&
+               rebalance_transfer_desc_ready(entry.descriptor) &&
                rebalance_directory_copy_ready(entry);
     }
 
@@ -7575,6 +7601,10 @@ namespace
         const DeviceMoEExpertDirectoryEntryView &src,
         const DeviceMoEExpertDirectoryEntryView &dst)
     {
+        if (src.descriptor.projection_set != dst.descriptor.projection_set ||
+            !llaminar2::deviceMoEProjectionPayloadValid(src.descriptor) ||
+            !llaminar2::deviceMoEProjectionPayloadValid(dst.descriptor))
+            return false;
         if (llaminar2::deviceMoEWeightFormatIsFloating(src.descriptor.weight_format))
             return llaminar2::deviceMoEFloatingExpertFitsTransferCapacity(src.descriptor, dst.descriptor);
         if (src.descriptor.weight_format != llaminar2::DeviceMoEWeightFormat::NativeVNNI)
@@ -7585,9 +7615,10 @@ namespace
                rebalance_matrix_fits_transfer_capacity(
                    src.descriptor.up,
                    dst.descriptor.up) &&
-               rebalance_matrix_fits_transfer_capacity(
+               (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::GateUp ||
+                rebalance_matrix_fits_transfer_capacity(
                    src.descriptor.down,
-                   dst.descriptor.down);
+                   dst.descriptor.down));
     }
 
     __device__ __forceinline__ void rebalance_retarget_transfer_directory(
@@ -7605,9 +7636,10 @@ namespace
         rebalance_retarget_transfer_matrix(
             dst.descriptor.up,
             src.descriptor.up);
-        rebalance_retarget_transfer_matrix(
-            dst.descriptor.down,
-            src.descriptor.down);
+        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+            rebalance_retarget_transfer_matrix(
+                dst.descriptor.down,
+                src.descriptor.down);
     }
 
     __device__ __forceinline__ DeviceMoEExpertDirectoryEntryView make_rebalance_source_entry(
@@ -7653,7 +7685,8 @@ namespace
         if (desc.local_slot >= 0)
             entry.slot_index = static_cast<uint32_t>(desc.local_slot);
 
-        if (local_resident && local_slot_resident && rebalance_expert_desc_ready(desc))
+        if (local_resident && local_slot_resident && desc.logical_expert_id >= 0 &&
+            rebalance_transfer_desc_ready(desc))
         {
             entry.descriptor = desc;
             if (rebalance_directory_copy_ready(entry))
@@ -10343,7 +10376,8 @@ namespace
         }
         return rebalance_projection_payload_bytes(entry.descriptor.gate, entry) +
                rebalance_projection_payload_bytes(entry.descriptor.up, entry) +
-               rebalance_projection_payload_bytes(entry.descriptor.down, entry);
+               (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert
+                    ? rebalance_projection_payload_bytes(entry.descriptor.down, entry) : 0ULL);
     }
 
     __device__ unsigned long long rebalance_pack_projection_to_payload(
@@ -10440,7 +10474,8 @@ namespace
         }
         offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload + offset);
         offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload + offset);
-        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload + offset);
+        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+            offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload + offset);
         return offset;
     }
 
@@ -10467,7 +10502,8 @@ namespace
         }
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.gate, dst);
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.up, dst);
-        offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.down, dst);
+        if (dst.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+            offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.down, dst);
         return offset;
     }
 
@@ -13158,12 +13194,20 @@ namespace
         }
     }
 
+    template<bool Partitioned = false>
     __global__ void route_logits_bf16_kernel(
         const float *__restrict__ hidden,
         const __nv_bfloat16 *__restrict__ gate_weights,
         float *__restrict__ logits,
-        int seq_len, int d_model, int num_experts)
+        int seq_len, int d_model, int num_experts,
+        const int *live_rows = nullptr, llaminar2::DeviceRowPartition partition = {})
     {
+        if constexpr (Partitioned)
+        {
+            const auto rows = partition.resolve(seq_len, live_rows);
+            hidden += static_cast<size_t>(rows.first) * d_model;
+            seq_len = rows.count;
+        }
         const int expert = blockIdx.x;
         const int token = blockIdx.y;
         if (expert >= num_experts || token >= seq_len)
@@ -13375,13 +13419,23 @@ namespace
     // Tile geometry: BM=64 tokens × BN=64 experts per block, BK=16 along d_model.
     // Block = 16×16 = 256 threads, each thread computes a TM×TN = 4×4 output micro-tile.
     // Decode (seq_len == 1) still uses the warp-reduction kernel above for SM coverage.
-    template <int BM, int BN, int BK, int TM, int TN>
+    template <int BM, int BN, int BK, int TM, int TN, bool Partitioned = false>
     __global__ void route_logits_tiled_kernel(
         const float *__restrict__ hidden,       // A: [seq_len, d_model] row-major
         const float *__restrict__ gate_weights, // B: [num_experts, d_model] row-major
         float *__restrict__ logits,             // C: [seq_len, num_experts] row-major
-        int seq_len, int d_model, int num_experts)
+        int seq_len, int d_model, int num_experts,
+        const int *live_rows = nullptr, llaminar2::DeviceRowPartition partition = {})
     {
+        if constexpr (Partitioned)
+        {
+            // Retain the exact increasing-K FMA sequence. Only complete input
+            // rows change owner; no expert/K partials enter a new reduction.
+            const auto rows = partition.resolve(seq_len, live_rows);
+            hidden += static_cast<size_t>(rows.first) * d_model;
+            seq_len = rows.count;
+            if (static_cast<int>(blockIdx.y) * BM >= seq_len) return;
+        }
         // Shared tiles, stored K-major so the compute loop reads a full column of
         // BM (resp. BN) values contiguously for each k step.
         __shared__ float As[BK * BM]; // As[k * BM + m] = hidden[blockM + m, kk + k]
@@ -13603,7 +13657,7 @@ namespace
      * candidate may be promoted only after the harness proves full-output byte
      * equality with the installed production geometry.
      */
-    template <int BM, int BN, int BK, int TM, int TN>
+    template <int BM, int BN, int BK, int TM, int TN, bool Partitioned = false>
     bool launch_route_logits_tiled_geometry(
         const float *hidden,
         const float *gate_weights,
@@ -13612,25 +13666,103 @@ namespace
         int d_model,
         int num_experts,
         cudaStream_t stream,
-        const char *launch_name)
+        const char *launch_name,
+        const int *live_rows = nullptr, llaminar2::DeviceRowPartition partition = {})
     {
         static_assert(BM > 0 && BN > 0 && BK > 0 && TM > 0 && TN > 0);
         static_assert(BM % TM == 0 && BN % TN == 0);
         constexpr int kThreads = (BM / TM) * (BN / TN);
         static_assert(kThreads == 256);
 
+        const int grid_rows = Partitioned ? partition.capacityFor(seq_len) : seq_len;
         const dim3 grid(
             static_cast<unsigned int>((num_experts + BN - 1) / BN),
-            static_cast<unsigned int>((seq_len + BM - 1) / BM));
-        route_logits_tiled_kernel<BM, BN, BK, TM, TN>
+            static_cast<unsigned int>((grid_rows + BM - 1) / BM));
+        route_logits_tiled_kernel<BM, BN, BK, TM, TN, Partitioned>
             <<<grid, kThreads, 0, stream>>>(
                 hidden,
                 gate_weights,
                 logits,
                 seq_len,
                 d_model,
-                num_experts);
+                num_experts, live_rows, partition);
         return finishLaunch(launch_name);
+    }
+
+    /**
+     * @brief Shared geometry lowering for replicated and row-owned router work.
+     * @tparam Partitioned Compile away ownership resolution in the established path.
+     *
+     * Geometry selection remains CUDAMoERouterPrefillPolicy's authority. This
+     * switch only lowers that enum into the identical physical kernel family.
+     */
+    template<bool Partitioned = false>
+    bool dispatch_route_logits_geometry(const float *hidden, const float *gate_weights,
+        float *logits, int seq_len, int d_model, int num_experts, cudaStream_t stream,
+        llaminar2::CUDAMoERouterPrefillGeometry geometry,
+        const int *live_rows = nullptr, llaminar2::DeviceRowPartition partition = {})
+    {
+        using Geometry = llaminar2::CUDAMoERouterPrefillGeometry;
+        switch (geometry)
+        {
+        case Geometry::Tile64x64:
+            return launch_route_logits_tiled_geometry<64, 64, 16, 4, 4, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile64x64", live_rows, partition);
+        case Geometry::Tile64x32:
+            return launch_route_logits_tiled_geometry<64, 32, 16, 4, 2, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile64x32", live_rows, partition);
+        case Geometry::Tile32x64:
+            return launch_route_logits_tiled_geometry<32, 64, 16, 2, 4, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile32x64", live_rows, partition);
+        case Geometry::Tile32x32:
+            return launch_route_logits_tiled_geometry<32, 32, 32, 2, 2, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile32x32", live_rows, partition);
+        case Geometry::Tile32x32K16:
+            return launch_route_logits_tiled_geometry<32, 32, 16, 2, 2, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile32x32K16", live_rows, partition);
+        case Geometry::Tile32x24:
+            return launch_route_logits_tiled_geometry<32, 24, 16, 1, 3, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile32x24", live_rows, partition);
+        case Geometry::Tile24x32:
+            return launch_route_logits_tiled_geometry<24, 32, 16, 3, 1, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile24x32", live_rows, partition);
+        case Geometry::Tile64x16:
+            return launch_route_logits_tiled_geometry<64, 16, 16, 4, 1, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile64x16", live_rows, partition);
+        case Geometry::Tile32x16:
+            return launch_route_logits_tiled_geometry<32, 16, 16, 2, 1, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile32x16", live_rows, partition);
+        case Geometry::Tile16x64:
+            return launch_route_logits_tiled_geometry<16, 64, 16, 1, 4, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile16x64", live_rows, partition);
+        case Geometry::Tile16x32:
+            return launch_route_logits_tiled_geometry<16, 32, 16, 1, 2, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile16x32", live_rows, partition);
+        case Geometry::Tile16x16:
+            return launch_route_logits_tiled_geometry<16, 16, 16, 1, 1, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile16x16", live_rows, partition);
+        case Geometry::Tile8x64:
+            return launch_route_logits_tiled_geometry<8, 64, 16, 1, 2, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile8x64", live_rows, partition);
+        case Geometry::Tile8x32:
+            return launch_route_logits_tiled_geometry<8, 32, 16, 1, 1, Partitioned>(
+                hidden, gate_weights, logits, seq_len, d_model, num_experts,
+                stream, "cudaMoE_route_logits_Tile8x32", live_rows, partition);
+        }
+        return false;
     }
 
     /** Compiler-owned resource facts for one router geometry. */
@@ -13793,6 +13925,14 @@ namespace
         __syncthreads();
     }
 
+    /**
+     * @brief Publish top-k routes only for the current device-owned live prefix.
+     *
+     * Captured verifier graphs retain physical rows even for an empty replay.
+     * Inactive rows clear both public outputs and the optional deferred ledger;
+     * they must never invent a live first row from a zero logical count.
+     */
+    template<bool Partitioned = false>
     __global__ void softmax_topk_kernel(
         float *__restrict__ logits,
         float *__restrict__ expert_indices,
@@ -13800,8 +13940,21 @@ namespace
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
         const int *__restrict__ effective_seq_len_ptr,
-        DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger)
+        DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger,
+        llaminar2::DeviceRowPartition partition = {},
+        llaminar2::MoERouterSelectedRoute *selected_packet = nullptr,
+        std::uint64_t *selected_bytes = nullptr)
     {
+        if constexpr (Partitioned)
+        {
+            seq_len = partition.resolve(seq_len, effective_seq_len_ptr).count;
+            effective_seq_len_ptr = nullptr;
+            // The producer publishes even an empty message. This write is
+            // ordered before the separate collective by the graph edge; it is
+            // not a readiness flag polled while other top-k CTAs are running.
+            if (blockIdx.x == 0 && threadIdx.x == 0)
+                *selected_bytes = std::uint64_t(seq_len) * top_k * sizeof(*selected_packet);
+        }
         const int token = blockIdx.x;
         if (token >= seq_len)
             return;
@@ -13831,7 +13984,9 @@ namespace
         if (effective_seq_len_ptr)
         {
             const int raw_effective = *effective_seq_len_ptr;
-            effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+            // Zero is an ordinary empty retained replay, not a minimum batch
+            // of one. This also protects every gate format using this kernel.
+            effective_seq_len = raw_effective < 0 ? 0 : (raw_effective > seq_len ? seq_len : raw_effective);
         }
         if (token >= effective_seq_len)
         {
@@ -13939,11 +14094,17 @@ namespace
             for (int k = 0; k < top_k; ++k)
             {
                 const size_t out = static_cast<size_t>(token) * top_k + k;
-                expert_indices[out] = static_cast<float>(selected[k]);
-                expert_weights[out] =
+                const float probability =
                     normalize_weights && selected_sum > 0.0f
                         ? selected_weights[k] / selected_sum
                         : selected_weights[k];
+                if constexpr (Partitioned)
+                    selected_packet[out] = {static_cast<float>(selected[k]), probability};
+                else
+                {
+                    expert_indices[out] = static_cast<float>(selected[k]);
+                    expert_weights[out] = probability;
+                }
                 if (deferred_selected_route_ledger)
                 {
                     /*
@@ -14636,6 +14797,14 @@ namespace
         }
     }
 
+    /**
+     * @brief Gate a full row or its disjoint output-column slice with the identical full-width dot.
+     * @tparam ColumnSlice False preserves the established full-row generated kernel.
+     *
+     * Input stride and sigmoid reduction always use the full model width. Only
+     * output addressing narrows; inactive rows overwrite both outputs with zero.
+     */
+    template<bool ColumnSlice = false>
     __global__ void shared_expert_gate_add_kernel(
         const float *__restrict__ input,
         const float *__restrict__ gate_inp,
@@ -14643,24 +14812,26 @@ namespace
         const float *__restrict__ routed_residual,
         float *__restrict__ combined_output,
         int seq_len, int d_model,
-        const int *__restrict__ device_effective_seq_len = nullptr)
+        const int *__restrict__ device_effective_seq_len = nullptr,
+        int output_columns = 0)
     {
         const int token = blockIdx.x;
         if (token >= seq_len)
             return;
 
         __shared__ float partial[kThreads];
-        const size_t row_offset = static_cast<size_t>(token) * d_model;
+        const int columns = ColumnSlice ? output_columns : d_model;
+        const size_t row_offset = static_cast<size_t>(token) * columns;
         const int effective_seq_len = clamp_effective_seq_len(seq_len, device_effective_seq_len);
         if (token >= effective_seq_len)
         {
-            if ((d_model & 3) == 0)
+            if ((columns & 3) == 0)
             {
                 float4 *shared4 =
                     reinterpret_cast<float4 *>(shared_output + row_offset);
                 float4 *out4 =
                     reinterpret_cast<float4 *>(combined_output + row_offset);
-                const int n4 = d_model >> 2;
+                const int n4 = columns >> 2;
                 for (int i = threadIdx.x; i < n4; i += blockDim.x)
                 {
                     shared4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -14669,7 +14840,7 @@ namespace
             }
             else
             {
-                for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+                for (int i = threadIdx.x; i < columns; i += blockDim.x)
                 {
                     shared_output[row_offset + i] = 0.0f;
                     combined_output[row_offset + i] = 0.0f;
@@ -14677,7 +14848,7 @@ namespace
             }
             return;
         }
-        const float *x = input + row_offset;
+        const float *x = input + static_cast<size_t>(token) * d_model;
 
         float dot = 0.0f;
         if ((d_model & 3) == 0)
@@ -14709,9 +14880,9 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        if ((d_model & 3) == 0)
+        if ((columns & 3) == 0)
         {
-            const int n4 = d_model >> 2;
+            const int n4 = columns >> 2;
             float4 *shared4 =
                 reinterpret_cast<float4 *>(shared_output + row_offset);
             const float4 *residual4 =
@@ -14723,24 +14894,35 @@ namespace
             {
                 const float4 s = shared4[i];
                 const float4 r = residual4[i];
-                const float4 gated = make_float4(
-                    gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+                const float4 gated = ColumnSlice ? make_float4(
+                    llaminar2::device_fp32_contract::multiply(gate, s.x),
+                    llaminar2::device_fp32_contract::multiply(gate, s.y),
+                    llaminar2::device_fp32_contract::multiply(gate, s.z),
+                    llaminar2::device_fp32_contract::multiply(gate, s.w))
+                    : make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
                 shared4[i] = gated;
-                out4[i] = make_float4(
-                    r.x + gated.x,
-                    r.y + gated.y,
-                    r.z + gated.z,
-                    r.w + gated.w);
+                // Column completion replaces a standalone shared gate followed
+                // by ResidualAdd. Preserve that intervening FP32 rounding;
+                // an FMA here would change the prefill arithmetic contract.
+                if constexpr (ColumnSlice)
+                    out4[i] = make_float4(__fadd_rn(r.x, gated.x), __fadd_rn(r.y, gated.y),
+                        __fadd_rn(r.z, gated.z), __fadd_rn(r.w, gated.w));
+                else
+                    out4[i] = make_float4(r.x + gated.x, r.y + gated.y, r.z + gated.z, r.w + gated.w);
             }
         }
         else
         {
-            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            for (int i = threadIdx.x; i < columns; i += blockDim.x)
             {
-                const float gated = gate * shared_output[row_offset + i];
+                const float gated = ColumnSlice
+                    ? llaminar2::device_fp32_contract::multiply(gate, shared_output[row_offset + i])
+                    : gate * shared_output[row_offset + i];
                 shared_output[row_offset + i] = gated;
-                combined_output[row_offset + i] =
-                    routed_residual[row_offset + i] + gated;
+                if constexpr (ColumnSlice)
+                    combined_output[row_offset + i] = __fadd_rn(routed_residual[row_offset + i], gated);
+                else
+                    combined_output[row_offset + i] = routed_residual[row_offset + i] + gated;
             }
         }
     }
@@ -14792,6 +14974,15 @@ namespace
             output[tail_idx] += weight * input[tail_idx];
     }
 
+    /**
+     * @brief Initialize grouping arrays in one coalesced, barrier-free launch.
+     * @param binding Exact borrowed workspace arrays and independent extents.
+     */
+    __global__ void initialize_grouping_kernel(llaminar2::MoEGroupingInitialization binding)
+    {
+        binding.resetIndex(blockIdx.x * blockDim.x + threadIdx.x);
+    }
+
     __global__ void count_per_expert_kernel(
         const int *__restrict__ routing_indices,
         int *__restrict__ expert_counts,
@@ -14805,34 +14996,17 @@ namespace
             atomicAdd(expert_counts + expert, 1);
     }
 
+    /**
+     * @brief Publish exact expert offsets with a cooperative integer scan.
+     * @param expert_counts Immutable per-expert route counts.
+     * @param expert_offsets Output offsets in ascending expert order.
+     * @param num_experts Admitted expert count, including partial block tails.
+     */
     __global__ void exclusive_scan_kernel(const int *__restrict__ expert_counts, int *__restrict__ expert_offsets, int num_experts)
     {
-        // The prefix sum is inherently serial, but the original implementation ran it
-        // on thread 0 reading/writing global memory — num_experts (256) dependent
-        // global loads at ~400-cycle latency dominated the ~9µs runtime. Stage the
-        // counts into shared memory with a coalesced strided load, run the serial scan
-        // in smem (~20-cycle latency), then write the offsets back coalesced. Arithmetic
-        // order is identical to the original, so results are bit-exact.
-        __shared__ int s_counts[kMaxExperts];
-
-        for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
-            s_counts[i] = expert_counts[i];
-        __syncthreads();
-
-        if (threadIdx.x == 0)
-        {
-            int running = 0;
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                const int c = s_counts[expert];
-                s_counts[expert] = running; // in-place exclusive prefix
-                running += c;
-            }
-        }
-        __syncthreads();
-
-        for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
-            expert_offsets[i] = s_counts[i];
+        __shared__ llaminar2::device_integer_scan::Scratch<kThreads> scan;
+        llaminar2::device_integer_scan::arrayExclusive(
+            expert_counts, expert_offsets, num_experts, scan);
     }
 
     __global__ void scatter_tokens_kernel(
@@ -14993,6 +15167,8 @@ namespace
      * @param gate_descs Compact gate descriptor table to publish.
      * @param up_descs Compact up descriptor table to publish.
      * @param down_descs Compact down descriptor table to publish.
+     * @param expected_format Storage format shared by the layer's projections.
+     * @param expected_projections Exact movable payload required by this plan.
      * @return True when the expert is locally resident and compute-ready.
      */
     __device__ __forceinline__ bool publish_runtime_expert_descriptors_lane(
@@ -15003,21 +15179,17 @@ namespace
         DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
-        llaminar2::DeviceMoEWeightFormat expected_format)
+        llaminar2::DeviceMoEWeightFormat expected_format,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         if (expert >= num_experts)
             return false;
 
         const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        // Gate/up-only banks have no movable down descriptor. The immutable
+        // column bank owns down; absence alone never selects split execution.
         const bool descriptor_ready =
-            expected_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI
-                ? rebalance_matrix_desc_ready(desc.gate) &&
-                      rebalance_matrix_desc_ready(desc.up) &&
-                      rebalance_matrix_desc_ready(desc.down)
-                : llaminar2::deviceMoEWeightFormatIsFloating(expected_format) &&
-                      desc.floating_gate.valid() &&
-                      desc.floating_up.valid() &&
-                      desc.floating_down.valid();
+            llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
         const bool local_ready =
             bank.local_compute_mask[expert] != 0u &&
             (bank.resident_participant_mask[expert] & local_bit) != 0u &&
@@ -15080,6 +15252,7 @@ namespace
         int *__restrict__ active_expert_ids,
         int max_active_experts,
         llaminar2::DeviceMoEWeightFormat expected_format,
+        llaminar2::DeviceMoEProjectionSet expected_projections,
         RuntimePrefillPlanPublicationScratch &scratch)
     {
         const bool publish_active_experts = active_expert_ids != nullptr;
@@ -15087,6 +15260,7 @@ namespace
         if (!runtime || !gate_descs || !up_descs || !down_descs ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             execution_bank > 1u ||
+            !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
             (expected_format !=
                  llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
              !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
@@ -15163,7 +15337,8 @@ namespace
             gate_descs,
             up_descs,
             down_descs,
-            expected_format);
+            expected_format,
+            expected_projections);
 
         // Descriptor-only decode publication is complete at this point. This
         // branch is uniform and cannot strand a lane at a collective barrier.
@@ -15484,7 +15659,8 @@ namespace
     __device__ __forceinline__ bool prefill_static_local_runtime_ready(
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
         int expert_id,
-        int num_experts)
+        int num_experts,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime ||
@@ -15504,7 +15680,7 @@ namespace
         return bank.local_compute_mask[expert_id] != 0u &&
                (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
                desc.local_slot >= 0 &&
-               rebalance_expert_desc_ready(desc);
+               llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
     }
 
     /**
@@ -15676,14 +15852,19 @@ namespace
         int num_experts,
         int top_k,
         int filter_to_local_runtime_experts,
-        int retain_routes_for_deferred_commit,
+        int grouped_demand,
         DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
         int *__restrict__ active_expert_ids,
         int max_active_experts,
-        llaminar2::DeviceMoEWeightFormat expected_format)
+        llaminar2::DeviceMoEWeightFormat expected_format,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
+        // Complete-plan demand is distinct from route retention. Decode,
+        // static and sidecar grouping must not count ordinary prefill.
+        const int retain_routes_for_deferred_commit =
+            grouped_demand == static_cast<int>(llaminar2::MoEGroupedPlanDemand::DeferredAcceptedRows);
         __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
         __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
         __shared__ float shared_route_weights[kDeviceMoERuntimeSmallGroupMaxSlots];
@@ -15701,6 +15882,7 @@ namespace
             top_k <= 0 || top_k > kMaxTopK ||
             (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
             execution_bank > 1u ||
+            !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
             runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
             !runtime->route_expert_ids || !runtime->route_weights ||
             !runtime->route_participant_ids || !runtime->expert_counts ||
@@ -15819,7 +16001,8 @@ namespace
                             !prefill_static_local_runtime_ready(
                                 runtime,
                                 expert_id,
-                                num_experts))
+                                num_experts,
+                                expected_projections))
                         {
                             route_weight = 0.0f;
                         }
@@ -15873,7 +16056,7 @@ namespace
          */
         if constexpr (PublishCompletePlan)
         {
-            if (retain_routes_for_deferred_commit == 0 &&
+            if (grouped_demand == static_cast<int>(llaminar2::MoEGroupedPlanDemand::OrdinaryPrefill) &&
                 tid < current_slots &&
                 runtime_histogram_admits_rows(*runtime))
             {
@@ -15947,7 +16130,8 @@ namespace
                         gate_descs,
                         up_descs,
                         down_descs,
-                        expected_format);
+                        expected_format,
+                        expected_projections);
                 }
                 if (is_active)
                 {
@@ -16109,7 +16293,8 @@ namespace
         int max_slots,
         int num_experts,
         int filter_to_local_runtime_experts,
-        int retain_routes_for_deferred_commit)
+        int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         const int slot = blockIdx.x * blockDim.x + threadIdx.x;
         if (!runtime || slot >= max_slots)
@@ -16148,7 +16333,8 @@ namespace
                 !prefill_static_local_runtime_ready(
                     runtime,
                     expert_id,
-                    num_experts))
+                    num_experts,
+                    expected_projections))
             {
                 weight = 0.0f;
             }
@@ -16318,6 +16504,12 @@ namespace
      * scan and have no floating-point ordering concern. Keeping publication
      * and consumption in one block makes the offset dependency explicit and
      * removes one graph node from every MoE layer.
+     * @param runtime Authoritative device route/count buffers, already published.
+     * @param original_to_grouped Required inverse map indexed by original route slot.
+     * @param current_slots Slots visible in this grouping transaction.
+     * @param max_slots Admitted capacity; padded outputs are owned by prior clear.
+     * @param num_experts Number of independent expert blocks.
+     * @param top_k Router fanout retained by the common launch ABI.
      */
     __global__ void prefill_group_scan_scatter_deterministic_runtime_kernel(
         DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -16339,25 +16531,16 @@ namespace
         if (runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
             return;
 
-        __shared__ int local_offsets[kThreads];
-        __shared__ int running_count;
-        __shared__ int expert_offset;
-        __shared__ int expert_end;
-        __shared__ int participant_id;
-
-        if (threadIdx.x == 0)
+        __shared__ llaminar2::device_integer_scan::Scratch<kThreads> scan;
+        int preceding_count = 0;
+        for (int preceding_expert = static_cast<int>(threadIdx.x);
+             preceding_expert < expert; preceding_expert += kThreads)
+            preceding_count += runtime->expert_counts[preceding_expert];
+        const int prefix = llaminar2::device_integer_scan::exclusive(preceding_count, scan).total;
+        const int count = runtime->expert_counts[expert];
+        if (prefix < 0 || count < 0 || prefix + count > max_slots)
         {
-            running_count = 0;
-            int prefix = 0;
-#pragma unroll 1
-            for (int preceding_expert = 0;
-                 preceding_expert < expert;
-                 ++preceding_expert)
-            {
-                prefix += runtime->expert_counts[preceding_expert];
-            }
-            const int count = runtime->expert_counts[expert];
-            if (prefix < 0 || count < 0 || prefix + count > max_slots)
+            if (threadIdx.x == 0)
             {
                 printf("runtime_group_scan_scatter_invalid_range "
                        "participant=%u expert=%d prefix=%d count=%d max_slots=%d\n",
@@ -16368,16 +16551,22 @@ namespace
                        max_slots);
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                     "runtime grouped route prefix exceeds the published capacity");
-                return;
             }
-            runtime->expert_offsets[expert] = prefix;
-            expert_offset = prefix;
-            expert_end = prefix + count;
-            participant_id = static_cast<int>(runtime->participant_id);
+            return;
         }
-        __syncthreads();
+        if (threadIdx.x == 0)
+            runtime->expert_offsets[expert] = prefix;
+        // Empty experts still publish their prefix, but do not rescan every
+        // route. This return is block-uniform after the cooperative prefix.
+        if (count == 0)
+            return;
+        const int expert_end = prefix + count;
+        const int participant_id = static_cast<int>(runtime->participant_id);
+        int running_count = 0;
 
-        for (int chunk_start = 0; chunk_start < max_slots; chunk_start += blockDim.x)
+        // Slots beyond current_slots cannot be retained. The preceding clear
+        // owns padded outputs; grouping need not read that unused capacity.
+        for (int chunk_start = 0; chunk_start < current_slots; chunk_start += kThreads)
         {
             const int slot = chunk_start + threadIdx.x;
             const int keep =
@@ -16385,25 +16574,11 @@ namespace
                 runtime->route_expert_ids[slot] == expert &&
                 runtime->route_participant_ids[slot] == participant_id;
 
-            local_offsets[threadIdx.x] = keep;
-            __syncthreads();
-
-            if (threadIdx.x == 0)
-            {
-                int chunk_running = running_count;
-                for (int lane = 0; lane < blockDim.x; ++lane)
-                {
-                    const int count = local_offsets[lane];
-                    local_offsets[lane] = chunk_running;
-                    chunk_running += count;
-                }
-                running_count = chunk_running;
-            }
-            __syncthreads();
+            const auto local = llaminar2::device_integer_scan::exclusive(keep, scan);
 
             if (keep)
             {
-                const int dest = expert_offset + local_offsets[threadIdx.x];
+                const int dest = prefix + running_count + local.exclusive;
                 if (dest < expert_end)
                 {
                     runtime->grouped_token_ids[dest] = slot;
@@ -16411,7 +16586,9 @@ namespace
                     original_to_grouped[slot] = dest;
                 }
             }
-            __syncthreads();
+            // Every lane carries the same chunk total. Prefixes keep the exact
+            // ascending route order without a lane-zero flag scan.
+            running_count += local.total;
         }
     }
 
@@ -17338,7 +17515,8 @@ namespace
         int max_active_experts,
         int current_slots,
         int publish_prefill_histogram,
-        llaminar2::DeviceMoEWeightFormat expected_format)
+        llaminar2::DeviceMoEWeightFormat expected_format,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         __shared__ RuntimePrefillPlanPublicationScratch scratch;
         publish_runtime_prefill_plan_block(
@@ -17350,6 +17528,7 @@ namespace
             active_expert_ids,
             max_active_experts,
             expected_format,
+            expected_projections,
             scratch);
 
         /*
@@ -17873,30 +18052,29 @@ namespace
         }
     }
 
-    // Gather + blockwise-int8 quantize for the prefill expert pipeline.
-    //
-    // Each 32-lane warp owns exactly one 32-element quant block: it loads the block,
-    // computes the absmax via warp shuffle, derives the per-block scale, and writes the
-    // quantized int8 + scale. The original launch used block=32 (a single warp), which
-    // caps occupancy at one warp per block (profiled ~21% occupancy). Packing
-    // kWarpsPerQuantBlock warps into each CUDA block lets the scheduler run many warps
-    // per SM with the same per-warp work, lifting occupancy ~8× with no extra arithmetic.
+    // Independent warps preserve the canonical 32-value quantization tree.
     static constexpr int kWarpsPerQuantBlock = 8; // 8 warps = 256-thread block
-    __global__ void grouped_prefill_gather_quantize_blockwise_kernel(
+    /**
+     * @brief Quantize each original hidden row once when the router has not.
+     * @param hidden Original FP32 token rows, without expert-route duplication.
+     * @param A_int8 Existing arena storage for canonical original Q8 rows.
+     * @param scales_A_blockwise Existing arena FP32 scales, one per 32 values.
+     * @param source_rows Physical token-row count in this captured invocation.
+     * @param K Hidden width, a positive multiple of the 32-value contract.
+     *
+     * The paired gate/up kernels resolve grouped routes into these rows. A live
+     * router publication skips this producer entirely, with its exact stream
+     * edge already owned by the enclosing graph.
+     */
+    __global__ void moe_prefill_hidden_quantize_rows_kernel(
         const float *__restrict__ hidden,
-        const int8_t *__restrict__ prequantized_hidden,
-        const float *__restrict__ prequantized_hidden_scales,
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
-        const int *__restrict__ grouped_token_indices,
-        int total_slots,
-        int max_tokens,
-        int top_k,
-        int grouped_indices_are_route_slots,
+        int source_rows,
         int K)
     {
         const int slot = logical_row_from_grid_yz();
-        if (slot >= total_slots)
+        if (slot >= source_rows)
             return;
 
         // Map this thread to (warp, lane); each warp handles a distinct 32-col block.
@@ -17908,29 +18086,7 @@ namespace
         if (block_idx >= blocks_per_row || col >= K)
             return;
 
-        const int source_index = grouped_token_indices[slot];
-        const int source_token =
-            grouped_indices_are_route_slots ? (source_index / top_k) : source_index;
-        if (source_token < 0 || source_token >= max_tokens)
-        {
-            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
-                "grouped prefill gather references an invalid source token");
-            return;
-        }
-        if (prequantized_hidden && prequantized_hidden_scales)
-        {
-            A_int8[static_cast<size_t>(slot) * K + col] =
-                prequantized_hidden[static_cast<size_t>(source_token) * K + col];
-            if (lane == 0)
-            {
-                scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] =
-                    prequantized_hidden_scales[
-                        static_cast<size_t>(source_token) * blocks_per_row + block_idx];
-            }
-            return;
-        }
-
-        const float value = hidden[static_cast<size_t>(source_token) * K + col];
+        const float value = hidden[static_cast<size_t>(slot) * K + col];
 
         // Warp-local absmax reduction (each warp owns its own 32-element block).
         float abs_value = fabsf(value);
@@ -18120,6 +18276,7 @@ namespace
     __global__ void grouped_native_vnni_gate_up_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
@@ -18178,6 +18335,14 @@ namespace
         __shared__ __align__(16) int32_t s_a[kTileM * 8];
         __shared__ float s_scale[kTileM];
 
+        // Resolve each lane's source once, not once per K block. The activation
+        // and scale staging roles differ, but both borrow the same token row.
+        static_assert(kTileM * 8 <= kTileN);
+        const int a_source = threadIdx.x < tokens_in_group * 8
+            ? source_rows.sourceRow(first_slot + (threadIdx.x >> 3)) : 0;
+        const int scale_source = threadIdx.x < tokens_in_group
+            ? source_rows.sourceRow(first_slot + threadIdx.x) : 0;
+
         float gate_acc[kTileM] = {};
         float up_acc[kTileM] = {};
 
@@ -18210,16 +18375,13 @@ namespace
             const int a_count = tokens_in_group * 8;
             for (int idx = threadIdx.x; idx < a_count; idx += kTileN)
             {
-                const int m = idx >> 3;
                 const int g = idx & 7;
-                const int slot = first_slot + m;
                 s_a[idx] = reinterpret_cast<const int32_t *>(
-                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+                    A_int8 + static_cast<size_t>(a_source) * K + block_idx * 32)[g];
             }
             for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
             {
-                const int slot = first_slot + m;
-                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(scale_source) * blocks_per_row + block_idx];
             }
             __syncthreads();
 
@@ -18268,6 +18430,7 @@ namespace
     __global__ void grouped_native_vnni_gate_up_swiglu_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
@@ -18317,6 +18480,12 @@ namespace
         __shared__ __align__(16) int32_t s_a[kTileM * 8];
         __shared__ float s_scale[kTileM];
 
+        static_assert(kTileM * 8 <= kTileN);
+        const int a_source = threadIdx.x < tokens_in_group * 8
+            ? source_rows.sourceRow(first_slot + (threadIdx.x >> 3)) : 0;
+        const int scale_source = threadIdx.x < tokens_in_group
+            ? source_rows.sourceRow(first_slot + threadIdx.x) : 0;
+
         float gate_acc[kTileM] = {};
         float up_acc[kTileM] = {};
 
@@ -18343,16 +18512,13 @@ namespace
             const int a_count = tokens_in_group * 8;
             for (int idx = threadIdx.x; idx < a_count; idx += kTileN)
             {
-                const int m = idx >> 3;
                 const int g = idx & 7;
-                const int slot = first_slot + m;
                 s_a[idx] = reinterpret_cast<const int32_t *>(
-                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+                    A_int8 + static_cast<size_t>(a_source) * K + block_idx * 32)[g];
             }
             for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
             {
-                const int slot = first_slot + m;
-                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(scale_source) * blocks_per_row + block_idx];
             }
             __syncthreads();
 
@@ -19091,7 +19257,8 @@ namespace
      * and projects each original top-k route independently. This kernel keeps
      * both properties: one launch covers a fixed tile of original verifier
      * routes, while `original_to_grouped` redirects each route to the grouped
-     * activation row prepared by the planner.
+     * slot and its checked source-row view resolves the original token. Hidden
+     * rows remain unique; only the output is stored in grouped-slot order.
      *
      * Scratch is indexed by the tile-local route number rather than the global
      * grouped slot. Consequently, a graph can certify arbitrary runtime M by
@@ -19102,6 +19269,7 @@ namespace
     __global__ void grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ original_to_grouped,
@@ -19153,9 +19321,10 @@ namespace
             return;
         }
 
-        const int8_t *slot_A = A_int8 + static_cast<size_t>(grouped_slot) * K;
+        const int source_row = source_rows.sourceRow(grouped_slot);
+        const int8_t *slot_A = A_int8 + static_cast<size_t>(source_row) * K;
         const float *slot_scales =
-            scales_A_blockwise + static_cast<size_t>(grouped_slot) * blocks_per_row;
+            scales_A_blockwise + static_cast<size_t>(source_row) * blocks_per_row;
         float gate_partial = 0.0f;
         float up_partial = 0.0f;
         native_vnni_dot_desc_pair_range<CodebookId>(
@@ -19616,7 +19785,12 @@ namespace
         }
     }
 
-    /** @brief Canonically sum allreduced route slots in original router order. */
+    /**
+     * @brief Fold canonical routes with overlapping loads and serial arithmetic.
+     *
+     * A bounded register window exposes independent memory requests. It does
+     * not change the router-order addition tree or add persistent GPU storage.
+     */
     __global__ void reduce_canonical_route_contributions_kernel(
         const float *__restrict__ route_contributions,
         float *__restrict__ output,
@@ -19630,17 +19804,9 @@ namespace
         if (token >= seq_len || n >= d_model)
             return;
 
-        float sum = 0.0f;
-#pragma unroll 1
-        for (int route = 0; route < top_k; ++route)
-        {
-            const size_t index =
-                (static_cast<size_t>(token) * static_cast<size_t>(top_k) +
-                 static_cast<size_t>(route)) *
-                    static_cast<size_t>(d_model) +
-                static_cast<size_t>(n);
-            sum = moe_accumulate_rn(sum, route_contributions[index]);
-        }
+        const size_t first = static_cast<size_t>(token) * top_k * d_model + n;
+        const float sum = llaminar2::device_ordered_route_fold::sum(
+            route_contributions + first, static_cast<size_t>(d_model), top_k);
         output[
             static_cast<size_t>(token) * static_cast<size_t>(d_model) +
             static_cast<size_t>(n)] = sum;
@@ -20613,7 +20779,7 @@ extern "C"
      * - 0: codebook-specialized ordered gate/up split-K producer;
      * - 1: codebook-specialized non-collective direct down producer;
      * - 2: codebook-specialized canonical-route down split-K producer;
-     * - 3: common hidden gather and blockwise quantizer;
+     * - 3: original-token hidden-row blockwise quantizer;
      * - 4: common gate/up split-K reduction and SwiGLU quantizer;
      * - 5: common canonical-route down split-K reduction.
      *
@@ -20652,7 +20818,7 @@ extern "C"
         case 3:
             queried = block_threads == kWarpsPerQuantBlock * 32 &&
                       query_grouped_prefill_kernel_resources(
-                          grouped_prefill_gather_quantize_blockwise_kernel,
+                          moe_prefill_hidden_quantize_rows_kernel,
                           block_threads,
                           &resources);
             break;
@@ -20943,68 +21109,8 @@ extern "C"
         if (cudaSetDevice(device_idx) != cudaSuccess)
             return false;
 
-        const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        using Geometry = llaminar2::CUDAMoERouterPrefillGeometry;
-        switch (geometry)
-        {
-        case Geometry::Tile64x64:
-            return launch_route_logits_tiled_geometry<64, 64, 16, 4, 4>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_64x64");
-        case Geometry::Tile64x32:
-            return launch_route_logits_tiled_geometry<64, 32, 16, 4, 2>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_64x32");
-        case Geometry::Tile32x64:
-            return launch_route_logits_tiled_geometry<32, 64, 16, 2, 4>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_32x64");
-        case Geometry::Tile32x32:
-            return launch_route_logits_tiled_geometry<32, 32, 32, 2, 2>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_32x32");
-        case Geometry::Tile32x32K16:
-            return launch_route_logits_tiled_geometry<32, 32, 16, 2, 2>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_32x32_k16");
-        case Geometry::Tile32x24:
-            return launch_route_logits_tiled_geometry<32, 24, 16, 1, 3>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_32x24");
-        case Geometry::Tile24x32:
-            return launch_route_logits_tiled_geometry<24, 32, 16, 3, 1>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_24x32");
-        case Geometry::Tile64x16:
-            return launch_route_logits_tiled_geometry<64, 16, 16, 4, 1>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_64x16");
-        case Geometry::Tile32x16:
-            return launch_route_logits_tiled_geometry<32, 16, 16, 2, 1>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_32x16");
-        case Geometry::Tile16x64:
-            return launch_route_logits_tiled_geometry<16, 64, 16, 1, 4>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_16x64");
-        case Geometry::Tile16x32:
-            return launch_route_logits_tiled_geometry<16, 32, 16, 1, 2>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_16x32");
-        case Geometry::Tile16x16:
-            return launch_route_logits_tiled_geometry<16, 16, 16, 1, 1>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_16x16");
-        case Geometry::Tile8x64:
-            return launch_route_logits_tiled_geometry<8, 64, 16, 1, 2>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_8x64");
-        case Geometry::Tile8x32:
-            return launch_route_logits_tiled_geometry<8, 32, 16, 1, 1>(
-                hidden, gate_weights, logits, seq_len, d_model, num_experts,
-                cuda_stream, "cudaMoE_route_logits_tiled_8x32");
-        }
-        return false;
+        return dispatch_route_logits_geometry(hidden, gate_weights, logits,
+            seq_len, d_model, num_experts, static_cast<cudaStream_t>(stream), geometry);
     }
 
     bool cudaMoE_route_logits_query_geometry_resources(
@@ -22293,7 +22399,7 @@ extern "C"
         int seq_len, int d_model, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        shared_expert_gate_add_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        shared_expert_gate_add_kernel<false><<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gate_inp, shared_output, routed_residual, combined_output, seq_len, d_model);
         return finishLaunch("cudaMoE_shared_expert_gate_add");
     }
@@ -22309,10 +22415,27 @@ extern "C"
             seq_len <= 0 || d_model <= 0 || !stream)
             return false;
         cudaSetDevice(device_idx);
-        shared_expert_gate_add_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        shared_expert_gate_add_kernel<false><<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             input, gate_inp, shared_output, routed_residual, combined_output,
             seq_len, d_model, device_effective_seq_len);
         return finishLaunch("cudaMoE_shared_expert_gate_add_effective_seq_len");
+    }
+
+    /** @brief Gate and combine owned columns, retaining the original full-row dot and padded-row mask. */
+    bool cudaMoE_shared_expert_column_gate_add(
+        const float *input, const float *gate_inp, float *shared_output,
+        const float *routed_columns, float *combined_columns,
+        int rows, int model_columns, int local_columns, const int *active_rows,
+        int ordinal, void *stream)
+    {
+        if (!input || !gate_inp || !shared_output || !routed_columns || !combined_columns ||
+            rows <= 0 || local_columns <= 0 || local_columns > model_columns || !stream)
+            return false;
+        if (cudaSetDevice(ordinal) != cudaSuccess || cudaGetLastError() != cudaSuccess) return false;
+        shared_expert_gate_add_kernel<true><<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            input, gate_inp, shared_output, routed_columns, combined_columns,
+            rows, model_columns, active_rows, local_columns);
+        return finishLaunch("cudaMoE_shared_expert_column_gate_add");
     }
 
     bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)
@@ -22329,6 +22452,17 @@ extern "C"
         cudaSetDevice(device_idx);
         weighted_add_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(output, input, weight, count);
         return finishLaunch("cudaMoE_weighted_add");
+    }
+
+    /** @brief Validate and launch the shared grouping-reset contract; see its public declaration. */
+    bool cudaMoE_initialize_grouping(
+        llaminar2::MoEGroupingInitialization binding, int device_ordinal, void *stream)
+    {
+        if (!binding.valid() || !stream || cudaSetDevice(device_ordinal) != cudaSuccess)
+            return false;
+        const int blocks = 1 + (binding.workItems() - 1) / kThreads;
+        initialize_grouping_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(binding);
+        return finishLaunch("cudaMoE_initialize_grouping");
     }
 
     bool cudaMoE_count_per_expert(const int *routing_indices, int *expert_counts, int total_slots,
@@ -22483,9 +22617,10 @@ extern "C"
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
         int device_idx,
-        void *stream)
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
-        if (!runtime || !routing_indices || !routing_weights ||
+        if (!runtime || !llaminar2::deviceMoEProjectionSetValid(expected_projections) || !routing_indices || !routing_weights ||
             !original_to_grouped || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -22517,7 +22652,8 @@ extern "C"
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
-                llaminar2::DeviceMoEWeightFormat::NativeVNNI);
+                llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+                expected_projections);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_small_runtime", cuda_stream);
         }
@@ -22532,7 +22668,8 @@ extern "C"
             runtime_view, routing_indices, routing_weights,
             current_slots, max_slots, num_experts,
             filter_to_local_runtime_experts,
-            retain_routes_for_deferred_commit);
+            retain_routes_for_deferred_commit,
+            expected_projections);
         if (!finishGroupedPrefillLaunch("cudaMoE_prefill_group_cast_count_runtime", cuda_stream))
             return false;
 
@@ -22569,12 +22706,17 @@ extern "C"
         int top_k,
         int max_active_experts,
         int filter_to_local_runtime_experts,
-        int retain_routes_for_deferred_commit,
+        int grouped_demand,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream)
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
-        if (!runtime || !routing_indices || !routing_weights ||
+        const auto demand = static_cast<llaminar2::MoEGroupedPlanDemand>(grouped_demand);
+        if (!llaminar2::validMoEGroupedPlanDemand(demand)) return false;
+        const int retain_routes_for_deferred_commit =
+            demand == llaminar2::MoEGroupedPlanDemand::DeferredAcceptedRows;
+        if (!runtime || !llaminar2::deviceMoEProjectionSetValid(expected_projections) || !routing_indices || !routing_weights ||
             !original_to_grouped || !gate_descs || !up_descs || !down_descs ||
             !active_expert_ids || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
@@ -22605,13 +22747,14 @@ extern "C"
                 num_experts,
                 top_k,
                 filter_to_local_runtime_experts,
-                retain_routes_for_deferred_commit,
+                grouped_demand,
                 gate_descs,
                 up_descs,
                 down_descs,
                 active_expert_ids,
                 max_active_experts,
-                expected_format);
+                expected_format,
+                expected_projections);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_and_plan_small_runtime", cuda_stream);
         }
@@ -22628,7 +22771,8 @@ extern "C"
                 filter_to_local_runtime_experts,
                 retain_routes_for_deferred_commit,
                 device_idx,
-                stream))
+                stream,
+                expected_projections))
         {
             return false;
         }
@@ -22643,8 +22787,9 @@ extern "C"
             active_expert_ids,
             max_active_experts,
             current_slots,
-            retain_routes_for_deferred_commit == 0 ? 1 : 0,
-            expected_format);
+            demand == llaminar2::MoEGroupedPlanDemand::OrdinaryPrefill ? 1 : 0,
+            expected_format,
+            expected_projections);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_group_and_plan_scalable_runtime", cuda_stream);
     }
@@ -22691,7 +22836,8 @@ extern "C"
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
                 /*max_active_experts=*/0,
-                llaminar2::DeviceMoEWeightFormat::NativeVNNI);
+                llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+                llaminar2::DeviceMoEProjectionSet::CompleteExpert);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
         }
@@ -22738,12 +22884,17 @@ extern "C"
         int num_experts,
         int top_k,
         int max_active_experts,
-        int retain_routes_for_deferred_commit,
+        int grouped_demand,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream)
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections)
     {
-        if (!runtime || !original_to_grouped ||
+        const auto demand = static_cast<llaminar2::MoEGroupedPlanDemand>(grouped_demand);
+        if (!llaminar2::validMoEGroupedPlanDemand(demand)) return false;
+        const int retain_routes_for_deferred_commit =
+            demand == llaminar2::MoEGroupedPlanDemand::DeferredAcceptedRows;
+        if (!runtime || !llaminar2::deviceMoEProjectionSetValid(expected_projections) || !original_to_grouped ||
             !gate_descs || !up_descs || !down_descs ||
             !active_expert_ids || !stream ||
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
@@ -22774,13 +22925,14 @@ extern "C"
                 num_experts,
                 top_k,
                 /*filter_to_local_runtime_experts=*/0,
-                retain_routes_for_deferred_commit,
+                grouped_demand,
                 gate_descs,
                 up_descs,
                 down_descs,
                 active_expert_ids,
                 max_active_experts,
-                expected_format);
+                expected_format,
+                expected_projections);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_and_plan_small_runtime", cuda_stream);
         }
@@ -22809,8 +22961,9 @@ extern "C"
             active_expert_ids,
             max_active_experts,
             current_slots,
-            retain_routes_for_deferred_commit == 0 ? 1 : 0,
-            expected_format);
+            demand == llaminar2::MoEGroupedPlanDemand::OrdinaryPrefill ? 1 : 0,
+            expected_format,
+            expected_projections);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_regroup_and_plan_scalable_runtime", cuda_stream);
     }
@@ -23071,7 +23224,8 @@ extern "C"
             /*max_active_experts=*/0,
             /*current_slots=*/0,
             /*publish_prefill_histogram=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI);
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_descriptor_tables",
             static_cast<cudaStream_t>(stream));
@@ -23112,7 +23266,8 @@ extern "C"
             max_active_experts,
             /*current_slots=*/0,
             /*publish_prefill_histogram=*/0,
-            llaminar2::DeviceMoEWeightFormat::NativeVNNI);
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_plan",
             static_cast<cudaStream_t>(stream));
@@ -23336,11 +23491,12 @@ extern "C"
     }
 
     /**
-     * @brief Launch fixed-tree gate/up/SwiGLU then down on the exact stream.
+     * @brief Launch the declared fixed-tree floating phase on the exact stream.
      * @param d_grouped_swiglu Existing exclusive arena FP32 intermediate.
+     * @param execution Complete transaction, gate/up producer, or full-K down-column consumer.
      *
-     * Fusion retains two captured nodes and serial decode's arithmetic without
-     * changing any weight format, activation precision or allocation requirement.
+     * Complete execution retains two captured nodes. A split phase borrows the
+     * same storage and serial arithmetic; it adds no conversion or allocation.
      */
     bool cudaMoE_grouped_floating_prefill_pipeline(
         const float *d_hidden,
@@ -23361,14 +23517,16 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream)
+        void *stream,
+        const llaminar2::MoEPrefillProjectionExecution &execution)
     {
-        if (!d_hidden || !d_gate_descs || !d_up_descs || !d_down_descs ||
+        if ((execution.executesGateUp() && (!d_hidden || !d_gate_descs || !d_up_descs)) ||
+            (execution.executesDown() && (!d_down_descs || !d_grouped_weights ||
+                (!d_output && !d_canonical_routes))) ||
             !d_original_to_grouped ||
             (!d_original_expert_ids && num_experts != 1) ||
-            !d_grouped_weights || !d_grouped_swiglu ||
-            (!d_output && !d_canonical_routes) || seq_len <= 0 ||
-            total_slots != seq_len * top_k || top_k <= 0 || d_model <= 0 ||
+            !d_grouped_swiglu || seq_len <= 0 || execution.modelColumns() != d_model ||
+            total_slots != static_cast<std::int64_t>(seq_len) * top_k || top_k <= 0 || d_model <= 0 ||
             intermediate <= 0 || num_experts <= 0 ||
             !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
         {
@@ -23377,31 +23535,38 @@ extern "C"
         if (cudaSetDevice(device_idx) != cudaSuccess)
             return false;
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        grouped_floating_gate_up_swiglu_prefill_kernel<<<
-            make_row_major_grid(
-                static_cast<unsigned int>((intermediate + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
-                    llaminar2::device_moe_floating_warp::columns_per_block), total_slots),
-            kThreads,
-            0,
-            cuda_stream>>>(
-                d_hidden,
-                d_gate_descs,
-                d_up_descs,
-                d_original_to_grouped,
-                d_original_expert_ids,
-                d_grouped_swiglu,
-                total_slots,
-                top_k,
-                intermediate,
-                d_model,
-                num_experts,
-                format);
-        if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
-            return false;
+        // Only independent output columns are partitioned; K's fixed tree is unchanged.
+        if (execution.executesGateUp())
+        {
+            grouped_floating_gate_up_swiglu_prefill_kernel<<<
+                make_row_major_grid(
+                    static_cast<unsigned int>((intermediate + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
+                        llaminar2::device_moe_floating_warp::columns_per_block), total_slots),
+                kThreads,
+                0,
+                cuda_stream>>>(
+                    d_hidden,
+                    d_gate_descs,
+                    d_up_descs,
+                    d_original_to_grouped,
+                    d_original_expert_ids,
+                    d_grouped_swiglu,
+                    total_slots,
+                    top_k,
+                    intermediate,
+                    d_model,
+                    num_experts,
+                    format);
+            if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
+                return false;
+        }
+        if (!execution.executesDown())
+            return true;
+        const int down_columns = execution.columnCount();
         const int publication_rows = d_canonical_routes ? total_slots : seq_len;
         grouped_floating_down_prefill_kernel<<<
             make_row_major_grid(
-                static_cast<unsigned int>((d_model + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
+                static_cast<unsigned int>((down_columns + llaminar2::device_moe_floating_warp::columns_per_block - 1) /
                     llaminar2::device_moe_floating_warp::columns_per_block), publication_rows),
             kThreads,
             0,
@@ -23416,7 +23581,7 @@ extern "C"
                 seq_len,
                 total_slots,
                 top_k,
-                d_model,
+                down_columns,
                 intermediate,
                 num_experts,
                 format);
@@ -23883,6 +24048,7 @@ extern "C"
      * @param imma_gateup_schedule Projection-to-warp ownership in gate/up.
      * @param device_idx CUDA ordinal that owns every supplied pointer.
      * @param stream Exact non-null producer stream embedded by graph capture.
+     * @param execution Phase and full-source/local-column arithmetic identity.
      * @return true after all launches have been enqueued without launch errors.
      */
     bool cudaMoE_grouped_prefill_pipeline(
@@ -23936,22 +24102,32 @@ extern "C"
         llaminar2::cuda::moe::GroupedImmaGateUpSchedule
             imma_gateup_schedule,
         int device_idx,
-        void *stream)
+        void *stream,
+        const llaminar2::MoEPrefillProjectionExecution &execution)
     {
-        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
-            !d_group_counts || !d_group_offsets || !d_group_token_indices || !d_group_weights ||
-            !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
-            !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out ||
-            (!d_output && !d_canonical_route_contributions) ||
+        const bool executes_gateup = execution.executesGateUp();
+        const bool executes_down = execution.executesDown();
+        const int down_columns = execution.columnCount();
+        if (!d_group_counts || !d_group_offsets ||
+            !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales ||
+            (executes_gateup && (!d_hidden || !d_gate_desc_table || !d_up_desc_table ||
+                !d_group_token_indices || !d_scratch_A_int8 || !d_scratch_scales ||
+                !d_scratch_gate || !d_scratch_up)) ||
+            (executes_down && (!d_down_desc_table || !d_group_weights || !d_scratch_down_out ||
+                (!d_output && !d_canonical_route_contributions))) ||
+            execution.modelColumns() != d_model ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
             max_tokens_per_expert <= 0 || total_slots <= 0 || !stream ||
-            top_k <= 0 || top_k > kMaxTopK ||
+            top_k <= 0 || top_k > kMaxTopK || (total_slots % top_k) != 0 ||
             active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
             return false;
         }
+        if ((d_prequantized_hidden == nullptr) != (d_prequantized_hidden_scales == nullptr) ||
+            (grouped_indices_are_route_slots != 0 && grouped_indices_are_route_slots != 1))
+            return false;
         using GroupedProjectionEngine =
             llaminar2::CUDAMoEBatchInvariantPolicy::GroupedProjectionEngine;
         const bool use_grouped_imma =
@@ -24002,12 +24178,12 @@ extern "C"
             d_original_expert_ids &&
             (!canonical_publication || d_down_partials) &&
             valid_down_k_partitions;
-        if (gateup_kpart_requested &&
+        if (executes_gateup && gateup_kpart_requested &&
             (!use_gateup_kpart || !valid_gateup_ordered_tile_n))
             return false;
         if (down_k_partitions > 0 && !valid_down_k_partitions)
             return false;
-        if (down_kpart_requested && !use_ordered_down_kpart)
+        if (executes_down && down_kpart_requested && !use_ordered_down_kpart)
             return false;
         if ((use_gateup_kpart || use_ordered_down_kpart) && splitk_tile_rows <= 0)
             return false;
@@ -24040,262 +24216,283 @@ extern "C"
         if (!use_active_expert_grid)
             return true;
 
+        if (executes_gateup)
         {
-            // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
-            // block so each block covers kWarpsPerQuantBlock*32 columns. grid.x rounds up.
-            const int blocks_per_row = d_model / 32;
-            const dim3 grid = make_row_major_grid(
-                static_cast<unsigned int>(
-                    (blocks_per_row + kWarpsPerQuantBlock - 1) /
-                    kWarpsPerQuantBlock),
-                total_slots);
-            dim3 block(kWarpsPerQuantBlock * 32);
-            grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-                d_hidden, d_prequantized_hidden, d_prequantized_hidden_scales,
-                d_scratch_A_int8, d_scratch_scales,
-                d_group_token_indices, total_slots, seq_len, top_k,
-                grouped_indices_are_route_slots, d_model);
-            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_prefill_gather_quantize", cuda_stream))
-                return false;
-        }
-
-        if (use_grouped_imma)
-        {
-            if (!cudaMoEGroupedImma_buildDirectory(
-                    d_group_counts,
-                    d_group_work_directory,
-                    num_experts,
-                    total_slots,
-                    group_work_directory_entries,
-                    device_idx,
-                    stream))
+            const auto source_rows = grouped_indices_are_route_slots
+                ? llaminar2::MoEGroupedSourceRows::routeIndices(d_group_token_indices, seq_len, top_k)
+                : llaminar2::MoEGroupedSourceRows::tokenIndices(d_group_token_indices, seq_len);
+            const auto *gateup_input = d_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8;
+            const auto *gateup_scales = d_prequantized_hidden_scales ? d_prequantized_hidden_scales : d_scratch_scales;
+            // The router publication is already ordered before this stage. If
+            // absent, the same canonical producer writes one row per token.
+            // Neither case creates a top-k-expanded activation representation.
+            if (!d_prequantized_hidden)
             {
-                return false;
+                // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
+                // block so each block covers kWarpsPerQuantBlock*32 columns. grid.x rounds up.
+                const int blocks_per_row = d_model / 32;
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(
+                        (blocks_per_row + kWarpsPerQuantBlock - 1) /
+                        kWarpsPerQuantBlock),
+                    seq_len);
+                dim3 block(kWarpsPerQuantBlock * 32);
+                moe_prefill_hidden_quantize_rows_kernel<<<grid, block, 0, cuda_stream>>>(
+                    d_hidden, d_scratch_A_int8, d_scratch_scales, seq_len, d_model);
+                if (!finishGroupedPrefillLaunch("cudaMoE_prefill_hidden_quantize_rows", cuda_stream))
+                    return false;
             }
 
-            const auto *gate_descriptors = reinterpret_cast<
-                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
-                    d_gate_desc_table);
-            const auto *up_descriptors = reinterpret_cast<
-                const llaminar2::DeviceNativeVNNIMatrixDesc *>(
-                    d_up_desc_table);
-            if (!cudaMoEGroupedImma_projectGateUpSwiGlu(
-                    d_scratch_A_int8,
-                    d_scratch_scales,
-                    gate_descriptors,
-                    up_descriptors,
-                    d_group_counts,
-                    d_group_offsets,
-                    d_group_work_directory,
-                    d_scratch_swiglu_int8,
-                    d_scratch_swiglu_scales,
-                    group_work_directory_entries,
-                    num_experts,
-                    total_slots,
-                    intermediate,
-                    d_model,
-                    gateup_codebook_mask,
-                    llaminar2::CUDAMoEBatchInvariantPolicy::
-                        gate_up_k_partitions,
-                    imma_gateup_columns,
-                    imma_gateup_schedule,
-                    device_idx,
-                    stream))
+            if (use_grouped_imma)
             {
-                return false;
-            }
-        }
-        else if (use_gateup_kpart)
-        {
-            const int kTileN = gateup_ordered_tile_n;
-            constexpr int kReduceTileN = 32;
-            dim3 block(kTileN);
-            dim3 reduce_block(kReduceTileN);
+                if (!cudaMoEGroupedImma_buildDirectory(
+                        d_group_counts,
+                        d_group_work_directory,
+                        num_experts,
+                        total_slots,
+                        group_work_directory_entries,
+                        device_idx,
+                        stream))
+                {
+                    return false;
+                }
 
-            for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
+                const auto *gate_descriptors = reinterpret_cast<
+                    const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                        d_gate_desc_table);
+                const auto *up_descriptors = reinterpret_cast<
+                    const llaminar2::DeviceNativeVNNIMatrixDesc *>(
+                        d_up_desc_table);
+                if (!cudaMoEGroupedImma_projectGateUpSwiGlu(
+                        gateup_input,
+                        gateup_scales,
+                        source_rows,
+                        gate_descriptors,
+                        up_descriptors,
+                        d_group_counts,
+                        d_group_offsets,
+                        d_group_work_directory,
+                        d_scratch_swiglu_int8,
+                        d_scratch_swiglu_scales,
+                        group_work_directory_entries,
+                        num_experts,
+                        total_slots,
+                        intermediate,
+                        d_model,
+                        gateup_codebook_mask,
+                        llaminar2::CUDAMoEBatchInvariantPolicy::
+                            gate_up_k_partitions,
+                        imma_gateup_columns,
+                        imma_gateup_schedule,
+                        device_idx,
+                        stream))
+                {
+                    return false;
+                }
+            }
+            else if (use_gateup_kpart)
             {
-                const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
-                const int original_slot_base = token_base * top_k;
-                const int tile_route_slots = tile_rows * top_k;
-                dim3 scatter_grid(
+                const int kTileN = gateup_ordered_tile_n;
+                constexpr int kReduceTileN = 32;
+                dim3 block(kTileN);
+                dim3 reduce_block(kReduceTileN);
+
+                for (int token_base = 0; token_base < seq_len; token_base += splitk_tile_rows)
+                {
+                    const int tile_rows = std::min(splitk_tile_rows, seq_len - token_base);
+                    const int original_slot_base = token_base * top_k;
+                    const int tile_route_slots = tile_rows * top_k;
+                    dim3 scatter_grid(
+                        (intermediate + kTileN - 1) / kTileN,
+                        tile_route_slots,
+                        gateup_k_partitions);
+
+    #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB)                                                   \
+        grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
+            <<<scatter_grid, block, 0, cuda_stream>>>(                                                 \
+                gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
+                d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,          \
+                original_slot_base, tile_route_slots, intermediate, d_model, num_experts,              \
+                gateup_k_partitions)
+
+                    bool launched_gateup = false;
+    #define LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(CB)                                        \
+        do {                                                                                           \
+            if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                       \
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB);                                               \
+                if (!finishGroupedPrefillLaunch(                                                       \
+                        "cudaMoE_grouped_gate_up_ordered_kpart_prefill", cuda_stream))                \
+                    return false;                                                                      \
+                launched_gateup = true;                                                                \
+            }                                                                                          \
+        } while (0)
+
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(8);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(9);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(10);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(11);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(12);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(13);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(14);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(15);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(16);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(
+                        llaminar2::kNativeVnniExpandedInt8MinCodebook);
+                    if (!launched_gateup)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[cudaMoE_grouped_prefill_pipeline] unsupported ordered kpart gate/up codebook_id=%u mask=0x%x\n",
+                            static_cast<unsigned>(gateup_codebook_id),
+                            static_cast<unsigned>(gateup_codebook_mask));
+                        return false;
+                    }
+
+                    dim3 reduce_grid(
+                        (intermediate + kReduceTileN - 1) / kReduceTileN,
+                        tile_route_slots);
+                    grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
+                        reduce_grid, reduce_block, 0, cuda_stream>>>(
+                        d_gate_partials, d_up_partials, d_original_to_grouped,
+                        d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                        original_slot_base, tile_route_slots, intermediate,
+                        gateup_k_partitions);
+                    if (!finishGroupedPrefillLaunch(
+                            "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
+                            cuda_stream))
+                    {
+                        return false;
+                    }
+
+    #undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT
+    #undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART
+                }
+            }
+            else
+            {
+                const int requestedTileM =
+                    llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
+                const int kTileM =
+                    select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
+                constexpr int kTileN = 128;
+                const bool fuse_swiglu =
+                    llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
+                dim3 grid(
                     (intermediate + kTileN - 1) / kTileN,
-                    tile_route_slots,
-                    gateup_k_partitions);
+                    (max_tokens_per_expert + kTileM - 1) / kTileM,
+                    expert_grid);
+                dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB)                                                   \
-    grouped_native_vnni_gate_up_ordered_kpart_scatter_kernel<CB>                                  \
-        <<<scatter_grid, block, 0, cuda_stream>>>(                                                 \
-            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
-            d_original_to_grouped, d_original_expert_ids, d_gate_partials, d_up_partials,          \
-            original_slot_base, tile_route_slots, intermediate, d_model, num_experts,              \
-            gateup_k_partitions)
+    #define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                  \
+        grouped_native_vnni_gate_up_prefill_kernel<CB, TM, kTileN>                                    \
+            <<<grid, block, 0, cuda_stream>>>(                                                         \
+                gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
+                d_scratch_gate, d_scratch_up, intermediate, d_model)
+    #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                           \
+        grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, kTileN>                             \
+            <<<grid, block, 0, cuda_stream>>>(                                                         \
+                gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
+                d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model)
+    #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                         \
+        do {                                                                                          \
+            if (fuse_swiglu) {                                                                        \
+                if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);               \
+                else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                \
+                else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                \
+                else                   LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                \
+            } else {                                                                                  \
+                if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                      \
+                else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                       \
+                else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                       \
+                else                   LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                       \
+            }                                                                                         \
+        } while (0)
 
                 bool launched_gateup = false;
-#define LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(CB)                                        \
-    do {                                                                                           \
-        if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                       \
-            LAUNCH_GROUPED_GATEUP_ORDERED_KPART(CB);                                               \
-            if (!finishGroupedPrefillLaunch(                                                       \
-                    "cudaMoE_grouped_gate_up_ordered_kpart_prefill", cuda_stream))                \
-                return false;                                                                      \
-            launched_gateup = true;                                                                \
-        }                                                                                          \
-    } while (0)
+    #define LAUNCH_GROUPED_GATEUP_IF_PRESENT(CB)                                                      \
+        do {                                                                                          \
+            if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                      \
+                LAUNCH_GROUPED_GATEUP_PREFILL(CB);                                                    \
+                if (!finishGroupedPrefillLaunch("cudaMoE_grouped_gate_up_prefill", cuda_stream))     \
+                    return false;                                                                     \
+                launched_gateup = true;                                                               \
+            }                                                                                         \
+        } while (0)
 
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(8);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(9);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(10);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(11);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(12);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(13);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(14);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(15);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(16);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
-                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(4);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(5);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(6);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(7);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(8);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(9);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(10);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(11);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(12);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(13);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(14);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(15);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(16);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(
                     llaminar2::kNativeVnniExpandedInt8MinCodebook);
                 if (!launched_gateup)
                 {
                     std::fprintf(
                         stderr,
-                        "[cudaMoE_grouped_prefill_pipeline] unsupported ordered kpart gate/up codebook_id=%u mask=0x%x\n",
+                        "[cudaMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%u mask=0x%x\n",
                         static_cast<unsigned>(gateup_codebook_id),
                         static_cast<unsigned>(gateup_codebook_mask));
                     return false;
                 }
 
-                dim3 reduce_grid(
-                    (intermediate + kReduceTileN - 1) / kReduceTileN,
-                    tile_route_slots);
-                grouped_native_vnni_gate_up_ordered_kpart_reduce_swiglu_kernel<<<
-                    reduce_grid, reduce_block, 0, cuda_stream>>>(
-                    d_gate_partials, d_up_partials, d_original_to_grouped,
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                    original_slot_base, tile_route_slots, intermediate,
-                    gateup_k_partitions);
-                if (!finishGroupedPrefillLaunch(
-                        "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
-                        cuda_stream))
-                {
-                    return false;
-                }
-
-#undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT
-#undef LAUNCH_GROUPED_GATEUP_ORDERED_KPART
+    #undef LAUNCH_GROUPED_GATEUP_IF_PRESENT
+    #undef LAUNCH_GROUPED_GATEUP_PREFILL
+    #undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
+    #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
             }
-        }
-        else
-        {
-            const int requestedTileM =
-                llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int kTileM =
-                select_grouped_prefill_tile_m(requestedTileM, max_tokens_per_expert);
-            constexpr int kTileN = 128;
-            const bool fuse_swiglu =
-                llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
-            dim3 grid(
-                (intermediate + kTileN - 1) / kTileN,
-                (max_tokens_per_expert + kTileM - 1) / kTileM,
-                expert_grid);
-            dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                  \
-    grouped_native_vnni_gate_up_prefill_kernel<CB, TM, kTileN>                                    \
-        <<<grid, block, 0, cuda_stream>>>(                                                         \
-            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
-            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
-            d_scratch_gate, d_scratch_up, intermediate, d_model)
-#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                           \
-    grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, kTileN>                             \
-        <<<grid, block, 0, cuda_stream>>>(                                                         \
-            d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,               \
-            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
-            d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model)
-#define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                         \
-    do {                                                                                          \
-        if (fuse_swiglu) {                                                                        \
-            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);               \
-            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                \
-            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                \
-            else                   LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                \
-        } else {                                                                                  \
-            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                      \
-            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                       \
-            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                       \
-            else                   LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                       \
-        }                                                                                         \
-    } while (0)
-
-            bool launched_gateup = false;
-#define LAUNCH_GROUPED_GATEUP_IF_PRESENT(CB)                                                      \
-    do {                                                                                          \
-        if (gateup_codebook_mask & (uint32_t{1} << (CB))) {                                      \
-            LAUNCH_GROUPED_GATEUP_PREFILL(CB);                                                    \
-            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_gate_up_prefill", cuda_stream))     \
-                return false;                                                                     \
-            launched_gateup = true;                                                               \
-        }                                                                                         \
-    } while (0)
-
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(4);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(5);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(6);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(7);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(8);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(9);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(10);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(11);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(12);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(13);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(14);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(15);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(16);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
-            LAUNCH_GROUPED_GATEUP_IF_PRESENT(
-                llaminar2::kNativeVnniExpandedInt8MinCodebook);
-            if (!launched_gateup)
+            // Separate SwiGLU + blockwise-quant pass. Both grouped-IMMA and the
+            // direct fused gate/up kernel publish d_scratch_swiglu_int8/scales in
+            // their epilogues, so only the unfused ordered-DP4A geometry enters
+            // this launch.
+            if (!use_grouped_imma &&
+                !use_gateup_kpart &&
+                !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
             {
-                std::fprintf(
-                    stderr,
-                    "[cudaMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%u mask=0x%x\n",
-                    static_cast<unsigned>(gateup_codebook_id),
-                    static_cast<unsigned>(gateup_codebook_mask));
-                return false;
+                const dim3 grid = make_row_major_grid(
+                    static_cast<unsigned int>(intermediate / 32),
+                    total_slots);
+                dim3 block(32);
+                grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+                    d_scratch_gate, d_scratch_up,
+                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                    total_slots, intermediate);
+                if (!finishGroupedPrefillLaunch("cudaMoE_grouped_swiglu_quantize_prefill", cuda_stream))
+                    return false;
             }
-
-#undef LAUNCH_GROUPED_GATEUP_IF_PRESENT
-#undef LAUNCH_GROUPED_GATEUP_PREFILL
-#undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
-#undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
         }
+        if (!executes_down)
+            return true;
 
-        // Separate SwiGLU + blockwise-quant pass. Both grouped-IMMA and the
-        // direct fused gate/up kernel publish d_scratch_swiglu_int8/scales in
-        // their epilogues, so only the unfused ordered-DP4A geometry enters
-        // this launch.
-        if (!use_grouped_imma &&
-            !use_gateup_kpart &&
-            !llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
-        {
-            const dim3 grid = make_row_major_grid(
-                static_cast<unsigned int>(intermediate / 32),
-                total_slots);
-            dim3 block(32);
-            grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-                d_scratch_gate, d_scratch_up,
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                total_slots, intermediate);
-            if (!finishGroupedPrefillLaunch("cudaMoE_grouped_swiglu_quantize_prefill", cuda_stream))
-                return false;
-        }
+        // A separately recorded down phase owns its complete consumer grouping,
+        // which may differ from the owner-only gate/up grouping before exchange.
+        // Rebuild only that phase's directory; no host observes live route counts.
+        if (use_grouped_imma && !executes_gateup &&
+            !cudaMoEGroupedImma_buildDirectory(
+                d_group_counts, d_group_work_directory, num_experts,
+                total_slots, group_work_directory_entries, device_idx, stream))
+            return false;
 
         if (use_grouped_imma)
         {
@@ -24314,7 +24511,7 @@ extern "C"
                     group_work_directory_entries,
                     num_experts,
                     total_slots,
-                    d_model,
+                    down_columns,
                     intermediate,
                     down_codebook_mask,
                     llaminar2::CUDAMoEBatchInvariantPolicy::
@@ -24333,7 +24530,7 @@ extern "C"
             constexpr int kReduceTileN = 64;
             const int kDirectWarpsPerBlock =
                 llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k);
-            const int N = d_model;
+            const int N = down_columns;
             const int K = intermediate;
             dim3 scatter_block(kScatterTileN);
             dim3 reduce_block(kReduceTileN);
@@ -24461,7 +24658,7 @@ extern "C"
             const bool tiny_active_verifier =
                 active_expert_slots > 0 && max_tokens_per_expert <= 4;
             const int kTileN = tiny_active_verifier ? 64 : 128;
-            dim3 grid((d_model + kTileN - 1) / kTileN,
+            dim3 grid((down_columns + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
                       expert_grid);
             dim3 block(kTileN);
@@ -24473,12 +24670,12 @@ extern "C"
             grouped_native_vnni_down_prefill_kernel<CB, TM, 64><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_down_out, d_model, intermediate);                                         \
+                d_scratch_down_out, down_columns, intermediate);                                         \
         else                                                                                         \
             grouped_native_vnni_down_prefill_kernel<CB, TM, 128><<<cb_grid, block, 0, cuda_stream>>>( \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                  \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,          \
-                d_scratch_down_out, d_model, intermediate);                                         \
+                d_scratch_down_out, down_columns, intermediate);                                         \
     } while (0)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
@@ -24539,7 +24736,7 @@ extern "C"
             {
                 const dim3 grid = make_row_major_grid(
                     static_cast<unsigned int>(
-                        (d_model + kTileN - 1) / kTileN),
+                        (down_columns + kTileN - 1) / kTileN),
                     total_slots);
                 grouped_prefill_scatter_contributions_canonical_kernel<<<
                     grid,
@@ -24550,13 +24747,13 @@ extern "C"
                     d_scratch_down_out,
                     d_original_to_grouped,
                     total_slots,
-                    d_model);
+                    down_columns);
             }
             else
             {
                 const dim3 grid = make_row_major_grid(
                     static_cast<unsigned int>(
-                        (d_model + kTileN - 1) / kTileN),
+                        (down_columns + kTileN - 1) / kTileN),
                     seq_len);
                 grouped_prefill_scatter_contributions_ordered_kernel<<<
                     grid,
@@ -24568,7 +24765,7 @@ extern "C"
                     d_original_to_grouped,
                     seq_len,
                     top_k,
-                    d_model);
+                    down_columns);
             }
             if (!finishGroupedPrefillLaunch(
                     "cudaMoE_grouped_imma_scatter_prefill",
@@ -24585,24 +24782,24 @@ extern "C"
             {
                 const dim3 grid = make_row_major_grid(
                     static_cast<unsigned int>(
-                        (d_model + kTileN - 1) / kTileN),
+                        (down_columns + kTileN - 1) / kTileN),
                     seq_len);
                 grouped_prefill_scatter_weighted_ordered_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_output, d_scratch_down_out,
                     d_original_to_grouped, d_group_weights,
-                    seq_len, top_k, d_model);
+                    seq_len, top_k, down_columns);
             }
             else
             {
                 const dim3 grid = make_row_major_grid(
                     static_cast<unsigned int>(
-                        (d_model + kTileN - 1) / kTileN),
+                        (down_columns + kTileN - 1) / kTileN),
                     total_slots);
                 grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_output, d_scratch_down_out,
                     d_group_token_indices, d_group_weights,
                     total_slots, seq_len, top_k,
-                    grouped_indices_are_route_slots, d_model);
+                    grouped_indices_are_route_slots, down_columns);
             }
             if (!finishGroupedPrefillLaunch("cudaMoE_grouped_scatter_prefill", cuda_stream))
                 return false;
@@ -24728,5 +24925,55 @@ extern "C"
             participant_count,
             d_effective_seq_len);
         return finishLaunch("cudaMoE_finalize_canonical_publication");
+    }
+}
+
+namespace llaminar2::cuda
+{
+    /** @brief Reuse canonical prefill arithmetic; distribute rows, never K reductions. */
+    bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream)
+    {
+        if (!stream || !launch.valid() || launch.experts > kMaxExperts ||
+            launch.top_k > kMaxTopK ||
+            (launch.format != MoERouterPreparedFormat::FP32 &&
+             launch.format != MoERouterPreparedFormat::BF16))
+            return false;
+        const int rows = launch.partition.capacityFor(launch.capacity);
+        const auto native_stream = static_cast<cudaStream_t>(stream);
+        if (rows > 0 && launch.format == MoERouterPreparedFormat::FP32)
+        {
+            // Keep the established prefill family even when an owner currently
+            // has one row. Scalar decode is a different numerical contract.
+            if (!dispatch_route_logits_geometry<true>(launch.hidden,
+                    static_cast<const float *>(launch.gate), launch.logits,
+                    launch.capacity, launch.width, launch.experts, native_stream,
+                    selectCUDAMoERouterPrefillGeometry(
+                        launch.capacity, launch.width, launch.experts),
+                    launch.live_rows, launch.partition))
+                return false;
+        }
+        else if (rows > 0)
+        {
+            route_logits_bf16_kernel<true><<<dim3(launch.experts, rows), kThreads, 0, native_stream>>>(
+                launch.hidden, static_cast<const __nv_bfloat16 *>(launch.gate), launch.logits,
+                launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
+            if (!finishLaunch("cudaMoE_owned_bf16_logits")) return false;
+        }
+        softmax_topk_kernel<true><<<std::max(1, rows), kThreads, 0, native_stream>>>(
+            launch.logits, nullptr, nullptr, launch.capacity, launch.experts,
+            launch.top_k, launch.normalize, launch.live_rows, nullptr, launch.partition,
+            launch.selected, launch.selected_bytes);
+        return finishLaunch("cudaMoE_owned_topk");
+    }
+
+    bool publishRouterOwnedRows(const MoERouterRowPublication &publication, void *stream)
+    {
+        if (!stream || !publication.valid()) return false;
+        const auto slots = std::max(std::size_t(publication.layout.capacity) * publication.layout.top_k,
+            std::size_t(publication.layout.partition.participants()));
+        if ((slots + 127) / 128 > std::size_t(INT_MAX)) return false;
+        publish_router_owned_rows_kernel<<<unsigned((slots + 127) / 128), 128, 0,
+            static_cast<cudaStream_t>(stream)>>>(publication, publication.layout.packetBytes());
+        return finishLaunch("cudaMoE_publish_owned_rows");
     }
 }

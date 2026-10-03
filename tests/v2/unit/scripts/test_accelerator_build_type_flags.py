@@ -7,9 +7,10 @@ flags silently compiles device kernels with the accelerator compiler's
 unoptimized defaults. Accelerator translation units are also expensive enough
 that continuously evicting or bypassing ccache makes ordinary iteration
 needlessly slow. CUDA and HIP must also share the project's modern device
-dialect instead of relying on compiler defaults. This test checks all three
-declarative contracts and, when supplied, the generated compile database used
-by the current test binary.
+dialect instead of relying on compiler defaults. A relocated HIP compiler must
+also bind headers and device bitcode to the selected SDK, never silently search
+the old system installation. Check declarations and the actual generated
+commands; the SDK-only preflight does not need a compiler in the serving image.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-root", type=pathlib.Path, required=True)
     parser.add_argument("--compile-commands", type=pathlib.Path)
     parser.add_argument("--build-dir", type=pathlib.Path)
+    parser.add_argument("--check", choices=("all", "rocm-sdk"), default="all")
     return parser.parse_args()
 
 
@@ -228,10 +230,56 @@ def verify_generated_launcher(build_dir: pathlib.Path) -> None:
             )
 
 
+def verify_hip_sdk_command_binding(entries: list[dict[str, object]], sdk_root: str) -> None:
+    """Reject every HIP command that inherits or overrides a different SDK.
+
+    HIP-compiled .cpp files matter too. Compare the effective driver options,
+    not source include lists that CMake may suppress as supposedly implicit.
+    No directory, SDK tool or accelerator is accessed by this metadata proof.
+    """
+    count = 0
+    for entry in entries:
+        tokens = shlex.split(command_text(entry))
+        is_hip = str(entry.get("file", "")).endswith(".hip") or any(
+            tokens[index:index + 2] == ["-x", "hip"]
+            for index in range(len(tokens) - 1)
+        )
+        if not is_hip:
+            continue
+        count += 1
+        for option in ("--hip-path", "--rocm-path"):
+            roots = [token.split("=", 1)[1] for token in tokens
+                     if token.startswith(option + "=")]
+            if not roots or any(root != sdk_root for root in roots):
+                raise AssertionError(
+                    f"HIP command requires {option}={sdk_root}, got {roots}: {entry.get('file')}"
+                )
+    if not count:
+        raise AssertionError("ROCm SDK binding proof has no HIP compile commands")
+
+
+def verify_generated_sdk_binding(build_dir: pathlib.Path) -> None:
+    """Bind this tree's actual HIP commands to its one configured SDK root."""
+    cache = (build_dir / "CMakeCache.txt").read_text(encoding="utf-8")
+    if re.search(r"^HAVE_ROCM:BOOL=ON$", cache, flags=re.MULTILINE) is None:
+        return
+    root = re.search(r"^ROCM_PATH:[^=]+=(.+)$", cache, flags=re.MULTILINE)
+    if root is None:
+        raise AssertionError("Enabled ROCm build has no canonical ROCM_PATH")
+    entries = json.loads((build_dir / "compile_commands.json").read_text(encoding="utf-8"))
+    verify_hip_sdk_command_binding(entries, root.group(1))
+
+
 def main() -> int:
     """Run the source contract and optional generated-command regression."""
 
     args = parse_args()
+    if args.check == "rocm-sdk":
+        if args.build_dir is None:
+            raise AssertionError("ROCm SDK preflight requires the certified build metadata")
+        verify_generated_sdk_binding(args.build_dir)
+        print("ROCm compiler SDK binding: PASS")
+        return 0
     verify_declarations(args.repo_root / "src" / "v2" / "CMakeLists.txt")
     verify_ccache_declarations(args.repo_root)
     if args.compile_commands is not None:
@@ -242,6 +290,7 @@ def main() -> int:
         verify_generated_commands(args.compile_commands)
     if args.build_dir is not None:
         verify_generated_launcher(args.build_dir)
+        verify_generated_sdk_binding(args.build_dir)
     print("accelerator custom-build flags: PASS")
     return 0
 

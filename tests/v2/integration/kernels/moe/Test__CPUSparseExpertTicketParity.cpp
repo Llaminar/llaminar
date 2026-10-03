@@ -189,7 +189,7 @@ void runSparseExpertTicketParity(DeviceId device)
                 .num_layers = 1, .num_experts = experts});
         MoEOverlayParticipantResidencyBank initial{.epoch = 1, .participant_id = 1,
             .device = DeviceId::cpu(), .layers = {{std::vector<bool>(experts, false),
-                std::vector<MoEOverlayPreparedExpertTriplet>(experts)}}};
+                std::vector<MoEOverlayPreparedExpertPayload>(experts)}}};
         auto ready = residency->prepareReadyBank(std::move(initial));
         ASSERT_TRUE(ready.has_value());
         ASSERT_EQ(residency->installReadyBank(std::move(*ready)),

@@ -4405,6 +4405,38 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
     runSparseCanonicalRouteExchange(DeviceId::cuda(0), DeviceId::rocm(0));
 }
 
+/**
+ * @brief Preserve full-prefill route bytes through independently captured endpoints.
+ *
+ * Adjacent bucket/tail geometries exercise uneven rows, empty peer payloads,
+ * changed ownership, and cancellation-sensitive canonical route order.
+ * Each retained graph is reused for twenty device-owned publication epochs.
+ */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDASparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two CUDA devices";
+    for (const auto rows : {63u, 64u, 65u, 512u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::cuda(0), DeviceId::cuda(1), rows, 2049u, 20u, true, 17u);
+}
+
+/** @brief Symmetric retained-HIP proof of full-prefill publication and reuse. */
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmSparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs)
+{
+    auto *const backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    if (backend->deviceCount() < 2)
+        GTEST_SKIP() << "Requires two ROCm devices";
+    for (const auto rows : {63u, 64u, 65u, 512u})
+        runSparseCanonicalRouteExchange(
+            DeviceId::rocm(0), DeviceId::rocm(1), rows, 2049u, 20u, true, 17u);
+}
+
 TEST(Test__MappedActivationPacketCUDAAndROCm,
      DenseContinuationPublicationAcrossTwoCUDADevicesIsExactAndAsync)
 {

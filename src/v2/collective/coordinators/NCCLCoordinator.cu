@@ -10,12 +10,16 @@
  * - Proper ncclGroupStart/End semantics for multi-GPU collectives
  * - Thread-safe work queue for operation submission
  *
- * All NCCL operations are serialized on the coordinator thread to ensure
- * proper threading semantics - NCCL requires that all operations on a
- * communicator happen from the same thread.
+ * Setup and grouped host transactions use the coordinator worker. Captured
+ * participant-local operations enqueue directly on their caller's explicit
+ * stream; each participant retains a consistent communicator operation order.
+ * No coordinator queue, default stream or host wait is inserted into those
+ * captured operations, including output-partitioned sum/reduce-scatter.
  */
 
 #include "NCCLCoordinator.h"
+#include "../NativeReduceScatterContract.h"
+#include "../NativeCollectiveRowsContract.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 
@@ -1043,7 +1047,8 @@ namespace llaminar2
         CollectiveDataType dtype,
         CollectiveOp op,
         const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-        const std::vector<void *> &streams)
+        const std::vector<void *> &streams,
+        const std::vector<NativeCollectiveRows> &live_rows)
     {
 #ifdef HAVE_NCCL
         if (!initialized_.load())
@@ -1053,7 +1058,8 @@ namespace llaminar2
         }
 
         if (buffers.size() != static_cast<size_t>(num_devices_) ||
-            streams.size() != static_cast<size_t>(num_devices_))
+            streams.size() != static_cast<size_t>(num_devices_) ||
+            (!live_rows.empty() && live_rows.size() != static_cast<size_t>(num_devices_)))
         {
             last_error_ = "Buffer/stream count does not match device count";
             return false;
@@ -1061,6 +1067,19 @@ namespace llaminar2
 
         for (int i = 0; i < num_devices_; ++i)
         {
+            // Validate the complete bundle before opening a native group. Each
+            // GPU owns a distinct count pointer, never a host-read row value.
+            if (!live_rows.empty() &&
+                (live_rows[i].bankElements() != count ||
+                 live_rows[i].elementsPerRow() != live_rows.front().elementsPerRow() ||
+                 (live_rows[i].rows().countOwner() != nullptr) !=
+                     (live_rows.front().rows().countOwner() != nullptr) ||
+                 !nativeCollectiveRowsValid(NativeRowCollective::AllReduce,
+                     buffers[i], buffers[i], live_rows[i], dtype, op, num_devices_, i, streams[i])))
+            {
+                last_error_ = "Grouped allreduce live-row binding mismatch at participant " + std::to_string(i);
+                return false;
+            }
             if (!buffers[i])
             {
                 last_error_ = "Null anchor allreduce buffer for device " + std::to_string(i);
@@ -1142,10 +1161,13 @@ namespace llaminar2
 
             nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
             cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
-            r = nccl::ncclAllReduce(
-                buffers[i], buffers[i], count,
-                toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
-                comm, stream);
+            r = live_rows.empty()
+                ? nccl::ncclAllReduce(buffers[i], buffers[i], count,
+                    toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)), comm, stream)
+                : nccl::nativeRows(NativeRowCollective::AllReduce,
+                    buffers[i], buffers[i], live_rows[i],
+                    toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
+                    nullptr, comm, stream);
             if (r != nccl::ncclSuccess)
             {
                 last_error_ = std::string("ncclAllReduce(grouped bundle anchor) failed for device ") +
@@ -1585,6 +1607,108 @@ namespace llaminar2
         (void)op;
         (void)device_idx;
         (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::nativeRowsOnStream(
+        NativeRowCollective operation, const void *send, void *receive,
+        const NativeCollectiveRows &rows, CollectiveDataType dtype,
+        CollectiveOp reduction, int participant, void *stream, unsigned long long *payload_bytes)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !nativeCollectiveRowsValid(operation, send, receive, rows,
+                dtype, reduction, num_devices_, participant, stream))
+        {
+            last_error_ = "NCCL live-row collective has invalid native row/buffer/stream geometry";
+            return false;
+        }
+        // Another operation may change this host thread's current GPU between
+        // graph recordings. Select the actual owner; never cache that assumption.
+        const auto selected = cudaSetDevice(device_ordinals_[participant]);
+        if (selected != cudaSuccess)
+        {
+            last_error_ = std::string("NCCL live-row device selection failed: ") + cudaGetErrorString(selected);
+            return false;
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            last_error_ = std::string("NCCL live-row producer failed: ") + cudaGetErrorString(producer_error);
+            return false;
+        }
+        const auto native_op = operation == NativeRowCollective::AllGather ? nccl::ncclSum :
+            toNcclRedOpInt(toOpInt(reduction));
+        const auto result = nccl::nativeRows(operation, send, receive, rows,
+            toNcclDataTypeInt(toDataTypeInt(dtype)), native_op, payload_bytes,
+            static_cast<nccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("NCCL live-row enqueue failed: ") + nccl::ncclGetErrorString(result);
+            return false;
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            last_error_ = std::string("NCCL live-row runtime enqueue failed: ") + cudaGetErrorString(enqueue_error);
+            return false;
+        }
+        return true;
+#else
+        (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+        (void)reduction; (void)participant; (void)stream; (void)payload_bytes;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::reduceScatterSingleDeviceOnStream(
+        const void *send_buf, void *recv_buf, size_t receive_count,
+        CollectiveDataType dtype, int device_idx, void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !nativeReduceScatterBuffersValid(
+                send_buf, recv_buf, receive_count, dtype, num_devices_, device_idx, stream))
+        {
+            last_error_ = "NCCL reduce-scatter has an invalid communicator, stream or disjoint buffer geometry";
+            return false;
+        }
+        // Never cache an assumed current device here: another operation on
+        // this host thread may have selected a different participant since the
+        // last capture. Replay has no host-side device-selection work.
+        const auto selected = cudaSetDevice(device_ordinals_[device_idx]);
+        if (selected != cudaSuccess)
+        {
+            last_error_ = std::string("cudaSetDevice before reduce-scatter failed: ") + cudaGetErrorString(selected);
+            return false;
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            last_error_ = std::string("NCCL reduce-scatter producer launch failed: ") + cudaGetErrorString(producer_error);
+            return false;
+        }
+        const auto result = nccl::ncclReduceScatter(send_buf, recv_buf, receive_count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)), nccl::ncclSum,
+            static_cast<nccl::ncclComm_t>(comms_[device_idx]), static_cast<cudaStream_t>(stream));
+        if (result != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("NCCL native reduce-scatter failed: ") + nccl::ncclGetErrorString(result);
+            return false;
+        }
+        // Attribute sticky enqueue failures here, not to the next model kernel.
+        // Later asynchronous execution errors remain owned by graph completion.
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            last_error_ = std::string("NCCL reduce-scatter runtime enqueue failed: ") + cudaGetErrorString(enqueue_error);
+            return false;
+        }
+        return true;
+#else
+        (void)send_buf; (void)recv_buf; (void)receive_count;
+        (void)dtype; (void)device_idx; (void)stream;
         last_error_ = "NCCL not available";
         return false;
 #endif

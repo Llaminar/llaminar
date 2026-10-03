@@ -4,6 +4,10 @@
  *
  * **Purpose**: Public interface for CUDA backend. Implementation lives in .cu file
  * to avoid exposing cuda_runtime.h to other compilation units.
+ * Exact native-context storage is prepared through a reversible cold footprint
+ * probe and admitted by PhysicalMemoryAuthority. Its leases have primary-context
+ * lifetime, separately from model allocations and graph executables; only a
+ * successful exclusive native reset publishes their retirement.
  *
  * @author David Sanftenberg
  */
@@ -12,11 +16,13 @@
 
 #include "../IBackend.h"
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
 
     /**
      * @class CUDABackend
@@ -88,6 +94,25 @@ namespace llaminar2
         std::string deviceName(int device_id) const override;
         size_t deviceMemoryTotal(int device_id) const override;
         size_t deviceMemoryFree(int device_id) const override;
+
+        /**
+         * @brief Admit and prepare exact driver-private stack storage outside capture.
+         * @param required_local_bytes Maximum actual captured-kernel local requirement.
+         * @param device_id Exact CUDA context owner.
+         * @param stream Exact non-capturing graph stream.
+         * @param memory Source family authority whose outstanding demand is protected.
+         *
+         * A reversible cold footprint probe supplies the physical byte count.
+         * Its PMA lease survives graph destruction and retires only after the
+         * matching native context is reset. No inferred driver allocation
+         * granule, guessed safety margin, or graph allowance is used.
+         */
+        void prepareNativeExecutionContextStorage(std::size_t required_local_bytes,
+            int device_id, void *stream,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+
+        /** @return Exact sum of context-lifetime PMA leases; diagnostic setup use only. */
+        [[nodiscard]] std::size_t nativeExecutionContextStorageBytes(int device_id) const;
         [[nodiscard]] DeviceAllocationAccounting
         deviceAllocationAccounting(int device_id) const override;
 
@@ -909,9 +934,9 @@ namespace llaminar2
         bool prepareMappedHostCopyKernels(int device_id) override;
         /** @copydoc IBackend::prepareCapturedTransferChannelKernels */
         bool prepareCapturedTransferChannelKernels(int device_id, int timeout_ms, std::uint64_t *timeout_ticks) override;
-        /** @copydoc IBackend::enqueueCapturedTransferChannelBoundary */
-        bool enqueueCapturedTransferChannelBoundary(const CapturedTransferChannelDeviceBinding &binding,
-            CapturedTransferBoundaryOperation operation, int device_id, void *stream) override;
+        /** @copydoc IBackend::enqueueCapturedTransferChannel */
+        bool enqueueCapturedTransferChannel(const CapturedTransferChannelDeviceBinding &binding,
+            void *destination, const void *source, int device_id, void *stream) override;
 
         /** @copydoc IBackend::enqueueBackgroundMappedCopyOnStream */
         bool enqueueBackgroundMappedCopyOnStream(

@@ -29,7 +29,6 @@ namespace llaminar2
 {
     class TransferEngine;
     struct CapturedTransferChannelDeviceBinding;
-    enum class CapturedTransferBoundaryOperation : std::uint32_t;
     struct MappedTransferProgressClaim;
     struct MappedTransferProgressCommand;
     struct MappedTransferProgressCompletion;
@@ -2597,7 +2596,9 @@ namespace llaminar2
          * @param verifier_input_tokens_device Materialized `[first, drafts...]` row.
          * @param stop_tokens_device Fixed-width, `-1`-padded stop-token row.
          * @param generation_control_device Resident transaction budget/control row.
-         * @param sampled_target_tokens_device Persistent sampled-row destination.
+         * @param sampled_target_tokens_device Persistent row_count + 1 sampled
+         *        slots. Inactive logical rows inside that physical extent are
+         *        cleared; memory beyond the declared extent is never touched.
          * @param out_tokens_device Compact committed-token destination.
          * @param out_meta_device Compact speculative metadata destination.
          * @param first_transaction_diagnostic_device Optional backend-neutral
@@ -4109,7 +4110,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Prepare the two retained-channel boundary kernels before capture.
+         * @brief Prepare every complete retained-channel lowering before capture.
          * @param device_id Exact local GPU ordinal.
          * @param timeout_ms Positive bounded peer-wait policy from TransferEngine.
          * @param timeout_ticks Receives the immutable device-clock timeout bound.
@@ -4124,21 +4125,26 @@ namespace llaminar2
         }
 
         /**
-         * @brief Lower one TransferEngine-owned acquire/publication node on an exact stream.
-         * @param binding Validated mapped aliases, private cursor and exact message.
-         * @param operation Typed boundary; byte copying is the intervening parallel node.
-         * @param device_id Exact local GPU interpreting every pointer.
-         * @param stream Non-null stream supplied by the transfer authority.
-         * @return Whether the native kernel submission succeeded.
-         * This backend bridge never allocates, waits on the host or mutates a
-         * host shadow. Asynchronous semantic failures trap and surface through
-         * the ordinary fatal backend event/query path.
+         * @brief Lower one complete TransferEngine-owned acquire/copy/publication operation.
+         * @param binding Validated aliases, private cursor and immutable extent authority.
+         * @param destination Exact retained destination alias, sized for the captured maximum.
+         * @param source Exact retained source alias with the same bounded capacity.
+         * @param device_id GPU owning the cursor and interpreting both aliases.
+         * @param stream Exact non-null stream supplied by TransferEngine.
+         * @return Whether the complete native operation was submitted successfully.
+         *
+         * TransferEngine owns this infrastructure boundary. Backend lowering may
+         * fuse protocol phases but may not omit them or retry a different path.
+         * All launch geometry is capture-stable; only the acquired extent controls accesses.
+         * Zero bytes perform no payload access, not a host-side skipped message.
+         * No allocation, host wait or host shadow is permitted. Asynchronous
+         * semantic failures trap and surface through normal fatal event queries.
          */
-        virtual bool enqueueCapturedTransferChannelBoundary(
+        virtual bool enqueueCapturedTransferChannel(
             const CapturedTransferChannelDeviceBinding &binding,
-            CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+            void *destination, const void *source, int device_id, void *stream)
         {
-            (void)binding; (void)operation; (void)device_id; (void)stream;
+            (void)binding; (void)destination; (void)source; (void)device_id; (void)stream;
             return false;
         }
 

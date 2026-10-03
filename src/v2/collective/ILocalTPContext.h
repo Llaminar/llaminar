@@ -35,6 +35,8 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class PhysicalMemoryAuthority;
+    class AcquiredDeviceTransferInput;
+    class DeviceCountedAllGather;
 
     /**
      * @brief Operation semantics for compact LocalTP control sidebands.
@@ -249,6 +251,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Sum rank-major partials directly into each native participant's slice.
+         *
+         * Every participant contributes degree()*receive_count elements and
+         * receives only its communicator-indexed receive_count-element block.
+         * This is the native NCCL/RCCL reduce-scatter, never allreduce plus a
+         * local copy. Callers own disjoint, persistent device storage and order
+         * its producer and consumers on the exact supplied stream.
+         *
+         * @param rank_major_send Full rank-major contribution on this device.
+         * @param local_receive Disjoint output for this participant's reduced slice.
+         * @param receive_count Elements received by each participant, not total input.
+         * @param dtype Exact native arithmetic/transport type; no implicit conversion.
+         * @param device_index Communicator participant, independent of physical ordinal.
+         * @param producer_stream Non-null stream owning both input and output ordering.
+         * @param stage_name Stable graph identity for failure attribution and telemetry.
+         * @return Whether native enqueue succeeded; unsupported contexts fail closed.
+         */
+        virtual bool reduceScatterRawOnStream(
+            const void *rank_major_send, void *local_receive, size_t receive_count,
+            CollectiveDataType dtype, int device_index, void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)rank_major_send; (void)local_receive; (void)receive_count;
+            (void)dtype; (void)device_index; (void)producer_stream; (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Record a native equal-prefix collective on its producer stream.
+         * @copydetails ICollectiveBackend::nativeRowsOnStream
+         * @param stage_name Stable graph identity used for failure attribution.
+         *
+         * This operation is rank-local and owns no host rendezvous or count
+         * readback. The caller retains buffers/counts through graph retirement.
+         */
+        virtual bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            const std::string &stage_name, unsigned long long *payload_bytes = nullptr)
+        {
+            (void)operation; (void)send; (void)receive; (void)rows; (void)dtype;
+            (void)reduction; (void)participant; (void)stream; (void)stage_name; (void)payload_bytes;
+            return false;
+        }
+
+        /**
          * @brief Reduce raw device buffers to one LocalTP root on an explicit stream.
          *
          * This primitive is intended for graph-visible activation protocols
@@ -428,6 +477,10 @@ namespace llaminar2
          * NCCL/RCCL domains. The allreduce and sidebands are lowered together,
          * allowing the backend to enqueue them inside the same group region
          * instead of issuing separate rebalance-specific collectives.
+         * @param live_rows Optional device-owned anchor prefix. Empty sidebands
+         * still use the ordinary precision/publication path with this extent;
+         * the host never reads the row count. The count operand is the retained
+         * bank stride, and must equal live_rows->bankElements().
          */
         virtual bool allreduceWithSidebandsOnStream(
             TensorBase *tensor,
@@ -436,7 +489,8 @@ namespace llaminar2
             void *producer_stream,
             const std::string &precision,
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
-            int device_index)
+            int device_index,
+            const NativeCollectiveRows *live_rows = nullptr)
         {
             (void)tensor;
             (void)stage_name;
@@ -444,9 +498,42 @@ namespace llaminar2
             (void)precision;
             (void)sidebands;
             (void)device_index;
+            (void)live_rows;
             if (!producer_stream)
                 throw std::invalid_argument("ILocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
             return false;
+        }
+
+        /**
+         * @brief Enqueue a native sum on an authenticated auxiliary-stream fork.
+         *
+         * This uses the ordinary allreduce's precision and reserved workspace,
+         * but does not publish the tensor. A paired graph join must acquire the
+         * completion event before publishing on its canonical graph stream.
+         * Unlike raw-stream calls, the input token proves the producer frontier
+         * and fixes both storage ownership and the exact consumer stream.
+         * Sidebands and heterogeneous host completion are not this operation.
+         *
+         * @param input TransferEngine acquisition of this participant's tensor.
+         * @param stage_name Stable identity, identical across participants.
+         * @param count Exact element count, positive and within the tensor.
+         * @param precision Existing graph-resolved transport precision.
+         * @param live_rows Optional immutable device-owned live prefix; count is its bank stride.
+         * @return True only after native enqueue; no host completion is implied.
+         * @throws std::logic_error When this context does not implement the contract.
+         */
+        virtual bool allreduceAcquiredInput(
+            const AcquiredDeviceTransferInput &input,
+            const std::string &stage_name, size_t count,
+            const std::string &precision,
+            const NativeCollectiveRows *live_rows = nullptr)
+        {
+            (void)input;
+            (void)stage_name;
+            (void)count;
+            (void)precision;
+            (void)live_rows;
+            throw std::logic_error("LocalTP context has no acquired-input native allreduce implementation");
         }
 
         /**
@@ -767,6 +854,14 @@ namespace llaminar2
             size_t backend_payload_capacity_bytes,
             size_t fp16_scratch_elements,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) = 0;
+
+        /** @brief Install an admitted counted fabric once, before any graph construction.
+         * @param fabric Exact ordered rank-local membership, retained through graph retirement.
+         * @throws std::logic_error When the context cannot own this transport. */
+        virtual void installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather>)
+        { throw std::logic_error("This LocalTP context cannot own a counted allgather"); }
+        /** @return Frozen optional counted transport, not a capability probe or live state. */
+        [[nodiscard]] virtual std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const { return {}; }
     };
 
     /**

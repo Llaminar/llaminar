@@ -11,6 +11,9 @@
  * - Parallel forward pass execution across devices via TPWorkerPool (TP) / std::async (PP)
  * - AllGather for combining partial logits from column-parallel LM head
  * - Unified snapshot/profiling API across all device runners
+ * Diagnostic assembly obeys each immutable producer publication, including
+ * complete values and explicit output-column partitions, instead of assuming
+ * that a semantic checkpoint always retains its schema's historical layout.
  */
 
 #include "RankOrchestrator.h"
@@ -35,6 +38,10 @@
 #include "../../../kernels/common/SamplingMath.h"
 #include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
 #include "../../../collective/ILocalTPContext.h"
+#include "../../../collective/DeviceCountedAllGather.h"
+#include "../../moe/MoEProjectionArenaGeometry.h"
+#include "../../../planning/ActivationBufferSizing.h"
+#include "../../../planning/ModelMemoryProfile.h"
 #include "../../../collective/ILocalPPContext.h"
 #include "../../../config/TensorParallelConfig.h"
 #include "../../../interfaces/IModelContext.h"
@@ -1667,6 +1674,42 @@ namespace llaminar2
                 throw std::runtime_error(
                     "RankOrchestrator: failed to reserve complete LocalTP "
                     "collective resources");
+            }
+            if (config_.moe_routed_expert_plan)
+            {
+                const auto &plan = *config_.moe_routed_expert_plan;
+                const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
+                    [&](const auto &candidate) { return candidate.name == plan.continuation_domain; });
+                if (domain != plan.domains.end() &&
+                    domain->routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+                {
+                    std::vector<DeviceId> members;
+                    for (const auto &address : devices) members.push_back(address.toLocalDeviceId());
+                    const auto coverage = DeviceManager::instance().peerAccessCoverage(members);
+                    if (!coverage) throw std::runtime_error("Projection transport has no canonical P2P observation");
+                    if (*coverage == PeerAccessCoverage::None)
+                    {
+                        const auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_);
+                        if (!model || !memory_authority)
+                            throw std::logic_error("Projection transport has no admitted model/physical authority");
+                        const auto arena = MoEProjectionArenaGeometry::resolve(
+                            ModelMemoryProfile::fromGGUF(model->concreteLoader().getModel()), members.size());
+                        const int rows = std::max(config_.resident_graph_rows > 0
+                            ? std::min(static_cast<int>(config_.max_seq_len), config_.resident_graph_rows)
+                            : resolveActivationBufferSeqLen(config_.max_seq_len, members.front()),
+                            retainsMTPGraphCapacity(config_.mtp) ? resolveMTPRetainedTargetQueryRows(config_.mtp) : 1);
+                        std::vector<void *> streams(members.size());
+                        for (std::size_t i = 0; i < members.size(); ++i)
+                        {
+                            auto &worker = GPUDeviceContextPool::instance().getContext(members[i]);
+                            worker.submitAndWait([&] { streams[i] = worker.getOrCreateAuxiliaryStream("projection_exchange_setup"); });
+                        }
+                        tp_ctx_->installDeviceCountedAllGather(DeviceCountedAllGather::create(
+                            *memory_authority, DeviceId::cpu(), members, streams, *coverage, arena.packetCapacityBytes(rows)));
+                        LOG_INFO("RankOrchestrator: installed device-counted projection exchange: participants="
+                            << members.size() << " max_packet_bytes=" << arena.packetCapacityBytes(rows));
+                    }
+                }
             }
         }
 
@@ -17032,6 +17075,32 @@ namespace llaminar2
         return aggregate;
     }
 
+    bool RankOrchestrator::preparePrefixHarvest(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule)
+    {
+        if (!admission.supported || !admission.cache_enabled)
+            return false;
+        const auto prepare = [&](const auto &runners, const auto &hits)
+        {
+            size_t index = 0u;
+            for (const auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+                if (index >= hits.size() ||
+                    !runner->preparePrefixHarvest(hits[index++], tokens, schedule))
+                    return false;
+            }
+            return index == hits.size();
+        };
+        // Geometry/metadata only: start every participant writer before model
+        // execution. Preserve distinct child fingerprints and payload owners.
+        return prepare(device_runners_, last_device_prefix_hits_) &&
+               prepare(pp_stage_runners_, last_pp_prefix_hits_);
+    }
+
     bool RankOrchestrator::populatePrefix(const PrefixLookupResult &hit, int seq_idx)
     {
         const int common_tokens = std::max(0, hit.cached_tokens);
@@ -18457,6 +18526,36 @@ namespace llaminar2
         }
         if (has_complete_publication)
             result.mode = SnapshotShardingMode::REPLICATED;
+        else if (std::any_of(publications.begin(), publications.end(), [](const auto &snap) {
+                     return snap && snap.publication == SnapshotPublication::RowPartition; }))
+        {
+            for (const auto &snap : publications)
+            {
+                if (!snap || snap.publication != SnapshotPublication::RowPartition)
+                    throw std::runtime_error("Snapshot '" + key + "' has missing or mixed explicit row partitions");
+            }
+            // This is host diagnostic assembly, not an inference collective.
+            // Each row is copied once. Adding zero-filled unowned rows would
+            // needlessly change signed-zero/NaN bits and hide missing owners.
+            result.mode = SnapshotShardingMode::TOKEN_ROW_PARTITION;
+        }
+        else if (std::any_of(publications.begin(), publications.end(),
+                     [](const SnapshotInfo &snap) {
+                         return snap && snap.publication == SnapshotPublication::ColumnPartition;
+                     }))
+        {
+            // A column producer owns a contiguous slice in participant order.
+            // Dropping a missing participant would silently shrink/reindex the
+            // tensor; mixing schema partial sums with columns would corrupt it.
+            // Complete finalizers above retain their existing supersession rule.
+            if (!std::all_of(publications.begin(), publications.end(),
+                    [](const SnapshotInfo &snap) {
+                        return snap && snap.publication == SnapshotPublication::ColumnPartition;
+                    }))
+                throw std::runtime_error("Snapshot '" + key +
+                    "' has missing or mixed explicit output-column partitions");
+            result.mode = SnapshotShardingMode::COLUMN_PARALLEL;
+        }
 
         // Special case: GATHERED stages (e.g., LM_HEAD) with combined logits already gathered
         if (result.mode == SnapshotShardingMode::GATHERED &&
@@ -18537,6 +18636,7 @@ namespace llaminar2
             dev_data.device_id = GlobalDeviceId::gpu(0, static_cast<int>(i), dev_type);
             dev_data.device_index = static_cast<int>(i);
             dev_data.data.assign(snap.data, snap.data + snap.size);
+            dev_data.row_ownership = snap.row_ownership;
 
             // Use shape metadata from the stage's getDumpInfo() output.
             // This is model-agnostic: stages report their own dimensions

@@ -47,6 +47,25 @@ broken, or uneconomical implementation.
    entrypoints, generic suites, CLI names, capability checks, and dead code when
    the replacement is installed. Do not preserve a second path "just in case."
 
+### Communication Volume
+
+**Communicate only the necessary live data.** In every multi-rank or
+multi-device path, collectives (`allgather`, `allreduce`, `alltoall`, broadcast,
+reduce-scatter, etc.) and point-to-point transfers must communicate only the
+data each actual consumer needs, plus required protocol metadata. Allocation
+capacity is never the communication extent. Sending unused capacity, inactive
+rows, unowned expert slots, or oversized zero-padded buffers for implementation
+convenience is **forbidden** on every backend and transport, within or across
+hosts. Legitimate zero-valued tensor elements are data; padding is not.
+
+Graph capture is not an exception: retain admitted worst-case storage where
+necessary, but use capture-safe live counts and compact payloads with explicit
+ownership. Do not introduce host count readbacks, blocking synchronization, or
+recapture to satisfy this rule. Empty participants exchange only the metadata
+required for safe progress. Tests must prove actual communication extents for
+partial buckets, empty participants, skewed ownership, and large-to-small
+replays; correct output alone does not prove economical communication.
+
 ### GPU Execution and Memory
 
 8. **GPU inference is device-resident end to end.** After request admission,
@@ -327,9 +346,15 @@ the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
 
-ROCm test/tuning builds also require the lightweight `rocprofiler-sdk-roctx`
-annotation package. `scripts/docker/install-rocm-test-deps.sh` installs that
-closure from the configured ROCm repository in both the compiler builder and
+ROCm user-space package/source pins and the stable SDK alias belong only to
+`scripts/docker/rocm-release.env`. Development and release images use the shared
+`scripts/docker/install-rocm.sh` installer; local builds must select that same
+SDK rather than mixing distribution libraries with a different compiler.
+The host kernel driver is separate and must not be changed by these installers.
+
+ROCm test/tuning builds also require the lightweight profiler-base annotation
+closure. `scripts/docker/install-rocm-test-deps.sh` installs its pinned package
+from the configured signed ROCm repository in both the compiler builder and
 the installed test runner. A full development SDK already provides it. CMake
 requires the package's imported target; do not hard-code an unchecked library
 filename or add the profiler toolchain to the production serving image.
@@ -343,6 +368,18 @@ can make every object appear dirty. If an existing tree names another
 executable, reconfigure it once with the active devcontainer path before
 building.
 
+For ROCm qualification, `ROCM_PATH` owns the header and device-bitcode roots as
+well as dependency discovery. Every HIP compile/link command binds `--hip-path`
+and `--rocm-path` to that same SDK; relocated compiler discovery alone can still
+inherit old `/opt/rocm` headers. `V2_Integration_ROCmSDKCompilerBinding` applies
+the source-independent validator to the build's complete compile database and
+belongs to `ProductionTestPreflight`; its negative controls remain device-free.
+Optional component headers use `cmake/ROCmSDKHeaders.cmake` and that same SDK
+authority. Do not borrow cached CK or other component headers from `/opt/rocm`
+or system include directories when a selected SDK does not provide them.
+`V2_Integration_ROCmSDKHeaderDiscovery` proves conflicting SDKs and warmed
+build-tree discovery and belongs to `ProductionTestPreflight`.
+
 CUDA builds use the canonical capture-reentry NCCL dependency installed by
 `scripts/docker/install-nccl.sh` in both development and release images.
 Outside those images, run `sudo bash scripts/docker/install-nccl.sh` before
@@ -355,15 +392,93 @@ RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
 second runtime search. Select the compatible library explicitly when configuring
 a local build. Container builders and Release images install the same source-
 built RCCL at the same stable path; moving a checkout must not change the DSO.
+Its project-patched source/ABI pin is separate from the SDK release pin; compile
+it against the selected SDK and prove its native capture/storage contracts.
+
+For gfx906, `scripts/docker/install-rocblas-gfx906.sh` compiles matching rocBLAS
+and Tensile sources, including the full floating-format kernel inventory.
+The host DSO, device code objects and dispatch metadata form one authenticated
+runtime closure. Both CPU ISA images copy that closure from the builder; never
+graft another release's kernel pack into a newer DSO or ship only the host
+library. `V2_Integration_ROCmBLASKernelPackaging` belongs to preflight, alongside
+the functional floating-format BLAS/expert tests.
+
+RCCL bootstrap proves host/process identity before selecting transport storage.
+Same-process SHM connections use native mapped pinned backing; cross-process
+connections retain real IPC, never an exported raw process pointer. The required
+passive storage ABI observes endpoint mappings, not unique physical bytes, and
+must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage`
+proves captured replay and both endpoint retirement orders; dependency admission
+and source-bound packaging regressions also belong to `ProductionTestPreflight`.
 
 ROCm graph execution also requires the canonical HIP runtime built by
 `scripts/docker/install-hip-graph-runtime.sh`. Development and release builders
-install its race-free graph-identity repair; Release images copy that exact DSO
-from the builder. Outside those images, install the matching `rocm-llvm-dev`
-package and run this installer before ROCm gates. Do not disable packet capture
+install the remaining source-bound native graph repairs; Release images copy
+that exact DSO from the builder. Outside those images, install the matching SDK
+compiler/development closure through the shared installer and build the same
+HIP artifact before ROCm gates. Do not disable packet capture
 or serialize independent graph builders to hide an unfixed system HIP runtime.
+The HIP installation receipt authenticates the public SONAME and link-time
+aliases as well as the versioned artifact. The package-stamped filename must
+also identify that same repaired DSO; leaving a stock candidate beside it lets
+`ldconfig` silently restore unpatched code. A receipt for a file callers do not
+load is not qualification evidence.
 `V2_Integration_HIPConcurrentGraphIdentity` is the focused preflight proof that
 every operation survives concurrent construction and replay.
+`V2_Integration_HIPGraphQueuePlacement` additionally proves that independent
+branches retain distinct available hardware queues when launch streams change
+and other stream owners have uneven reference counts. Logical stream counts
+alone do not prove concurrent scheduling. The canonical repair keeps the
+existing hardware queue limit; do not raise that limit to hide queue aliasing.
+`V2_Integration_HIPGraphBatchPublication` proves every retained kernel dispatch
+survives long native packet batches, repeated queue wrap and ordered launch-stream
+changes. The canonical runtime copies every AQL body with an invalid header
+before release-publishing valid headers; an interior packet is never considered
+published merely because the batch's first header is still invalid. Batch
+admission preserves the single-packet writer's vacant-slot boundary for the
+entire reserved extent; reserved slots are not already published work. Do not
+disable packet capture, shrink batching or add inference synchronization to
+substitute for this publication contract. Every runtime repair participates in
+the installer's authenticated reuse receipt and ships with both CPU ISA images.
+`V2_Integration_HIPGraphLaunchOrdering` proves that every independent native
+graph root consumes its launch stream's incoming producer frontier, including
+external event waits and parent-to-child dependencies. Keep the dependency
+fan-out in the native graph authority; do not serialize roots or mirror device
+state on the host to compensate for a missing edge. The same regression checks
+the complete exit frontier of uneven independent roots and retained children.
+Join the actual last submission on each reused FIFO; graph depth or unordered
+container iteration must never substitute for the queue's completion frontier.
+`V2_Integration_HIPEmptySegmentPublication` proves that an empty captured
+segment still publishes a requested native completion signal, including child
+graphs and cross-stream consumers. A reserved signal without a producer is a
+fatal native lifecycle defect, not permission to add a host synchronization.
+`V2_Integration_HIPHostThreadStack` proves retained diagnostic/timeline graphs
+admit a client with large initial ELF TLS. Native pthread stack admission owns
+that layout; never cap worker stacks below valid client TLS or add retries and
+environment overrides to hide a rejected thread. The installer backports the
+upstream stack repair when absent from its pinned release.
+`V2_Integration_HIPSDMAStreamSharing` proves that mapped round trips and captured
+NoCU copies remain byte-exact when independent stream owners outnumber physical
+DMA engines. Engine scarcity requires native queue sharing, never silent copy
+loss, a compute-blit substitute or host serialization. A completion marker is
+not a byte-transfer certificate; verify payloads and exact guarded extents.
+`V2_Integration_HIPSDMAEventPublication_*` additionally proves that ordering
+receipts for independent NoCU copies can complete while a shared compute queue
+is held by an unrelated graph. They retain the exact native SDMA frontier;
+real stream dependencies must never be dropped to obtain progress.
+`IWorkerGPUContext::createEvent` defaults to `GPUEventPurpose::Ordering`, with
+timing disabled, consistently with `IBackend`. Actual profiling callers must
+explicitly request `GPUEventPurpose::Timing`. A timestamp barrier is not an
+ordinary transfer receipt. CUDA and ROCm native event-purpose tests and the
+device-free policy/timeline regressions belong to `ProductionTestPreflight`.
+`V2_Integration_HIPGraphWaitConcurrency` proves finite-work graph cost heuristics
+never collapse a waiter ahead of its independent producer, in flat and child
+graphs and both timeline widths. Validate progress eligibility before applying
+an economy heuristic. Keep the native optimization for ordinary finite work;
+do not set global scheduling overrides or add synchronization to hide a deadlock.
+When rolling the SDK forward, audit which repairs are already upstream and
+retain only the remaining authenticated patches. Every listed regression must
+still pass against the actual upgraded runtime, not just its source packaging.
 
 `ROCmRuntimeStartup` also prepares the process-wide explicit host-memory ABI
 before HIP/HSA initialization: native driver-backed host allocations and pinned
@@ -634,6 +749,19 @@ Domain fields `routed_prefill_assignment` / `routed_decode_assignment` select
 rows are decode work, not ordinary prefill. There is no `llep` value for
 `--moe-residency-maintenance`. See `RoutedExpertPolicy.h` and domain validation
 for supported combinations rather than treating these policies as synonyms.
+
+Projection ownership is a separate, explicit physical mode. For a native
+homogeneous multi-GPU domain, `routed_compute=gate-up-owned-down-columns`
+keeps movable gate/up pairs with their expert owner and fixes disjoint full-K
+down-output columns on every participant. Both exchanges are graph-visible:
+proven no-P2P domains use device-counted TransferEngine channels for compact
+intermediates; enabled native P2P and completed-column publication retain
+NCCL/RCCL. Channels belong to the admitted domain and are reused across
+sequential layers and graph families, never allocated per layer. `apportioned` remains the
+whole-expert default and A/B control; never reinterpret it or automatically
+substitute the projection mode. CPU, cross-tier and cross-rank projection
+execution are not admitted by this implementation. Compare the same model,
+topology, precision, MTP, movement and request policy before claiming a benefit.
 
 ### Cluster launch and shared runtime policy
 

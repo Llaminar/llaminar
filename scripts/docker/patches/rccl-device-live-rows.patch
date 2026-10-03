@@ -1,0 +1,1083 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e75f52b..117ab9a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -454,6 +454,7 @@ set(SRC_FILES
+   src/symmetric.cc
+   src/transport.cc
+   src/device/all_gather.h
++  src/device/llaminar_device_payload.h
+   src/device/all_reduce.h
+   src/device/alltoall_pivot.h
+   src/device/broadcast.h
+@@ -511,6 +512,7 @@ set(SRC_FILES
+ # src/include/cudawrap.h
+   src/include/debug.h
+   src/include/device.h
++  src/include/llaminar_device_extent.h
+   src/include/enqueue.h
+   src/include/gdrwrap.h
+   src/include/git_version.h
+diff --git a/src/collectives.cc b/src/collectives.cc
+index e07a6ee..0aca1e8 100644
+--- a/src/collectives.cc
++++ b/src/collectives.cc
+@@ -15,6 +15,101 @@
+ 
+ using namespace rccl;
+ 
++/**
++ * @brief Captured native byte allgather with a device-owned live row prefix.
++ * @param sendbuff Contiguous participant-local capacity bank.
++ * @param recvbuff Participant-major output with the unchanged capacity stride.
++ * @param liveRows Device INT32 authority; producer completion precedes stream.
++ * @param capacityRows Immutable capture capacity, never a claimed live count.
++ * @param rowBytes Positive exact bytes per logical row.
++ * @param outgoingPayloadBytes Optional device counter of primitive payload bytes.
++ * @param comm Existing node-local native communicator, not another transport.
++ * @param stream Exact non-default producer/collective stream.
++ * @return Native enqueue result, or invalid arguments for an incomplete binding.
++ *
++ * Native setup retains its normal transport, channels, algorithm and protocol;
++ * unsupported selected algorithms fail explicitly during enqueue planning.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclAllGatherDeviceRows(const void* sendbuff, void* recvbuff,
++    const int32_t* liveRows, size_t capacityRows, size_t rowBytes,
++    unsigned long long* outgoingPayloadBytes, ncclComm_t comm, cudaStream_t stream) {
++  if (!sendbuff || !recvbuff || !liveRows || !stream || !comm ||
++      !capacityRows || capacityRows > INT32_MAX || !rowBytes ||
++      rowBytes > UINT32_MAX || rowBytes > SIZE_MAX / capacityRows) return ncclInvalidArgument;
++  int ranks;
++  NCCLCHECK(ncclCommCount(comm, &ranks));
++  if (ranks < 2 || comm->nNodes != 1) return ncclInvalidUsage;
++  ncclInfo info = {ncclFuncAllGather, "AllGatherDeviceRows", sendbuff,
++    recvbuff, capacityRows * rowBytes, ncclInt8, ncclSum, 0, comm, stream,
++    ALLGATHER_CHUNKSTEPS, comm->rcclUseOneSlice ? ALLGATHER_SLICESTEPS_SINGLE_NODE : ALLGATHER_SLICESTEPS, nullptr};
++  info.llaminarRows = {liveRows, {uint32_t(rowBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
++  return ncclEnqueueCheck(&info);
++}
++
++/**
++ * @brief Enqueue a capacity-stable row-counted native reduction.
++ * @param func AllReduce or ReduceScatter; the latter has rank-major input banks.
++ * @param sendbuff Input allocation, including immutable captured bank strides.
++ * @param recvbuff Output allocation; its inactive tail must remain untouched.
++ * @param liveRows Ordered producer-owned INT32 row authority on this device.
++ * @param capacityRows Positive admitted number of rows in each bank.
++ * @param elementsPerRow Exact logical elements, independent of allocation slack.
++ * @param datatype Native wire scalar type, not the model weight format.
++ * @param op Native reduction operator; its arithmetic order is unchanged.
++ * @param outgoingPayloadBytes Optional passive counter of real primitive sends.
++ * @param comm Existing native node-local communicator.
++ * @param stream Exact non-default native collective stream.
++ * @return Enqueue result, with unsupported selected algorithms rejected.
++ */
++static ncclResult_t llaminarEnqueueReduction(ncclFunc_t func,
++    const void* sendbuff, void* recvbuff, const int32_t* liveRows,
++    size_t capacityRows, size_t elementsPerRow, ncclDataType_t datatype,
++    ncclRedOp_t op, unsigned long long* outgoingPayloadBytes,
++    ncclComm_t comm, cudaStream_t stream) {
++  if (!sendbuff || !recvbuff || !liveRows || !stream || !comm ||
++      !capacityRows || capacityRows > INT32_MAX || !elementsPerRow)
++    return ncclInvalidArgument;
++  // Match the engine's supported wire scalars without conflating them with the
++  // independent quantized weight codebook. Native operator checks still apply.
++  if (datatype != ncclInt8 && datatype != ncclInt32 && datatype != ncclFloat16 &&
++      datatype != ncclBfloat16 && datatype != ncclFloat32) return ncclInvalidArgument;
++  const size_t typeBytes = ncclTypeSize(datatype);
++  if (elementsPerRow > UINT32_MAX / typeBytes ||
++      capacityRows > SIZE_MAX / (elementsPerRow * typeBytes)) return ncclInvalidArgument;
++  int ranks;
++  NCCLCHECK(ncclCommCount(comm, &ranks));
++  if (ranks < 2 || comm->nNodes != 1) return ncclInvalidUsage;
++  const bool scatter = func == ncclFuncReduceScatter;
++  ncclInfo info = {func, scatter ? "ReduceScatterDeviceRows" : "AllReduceDeviceRows",
++    sendbuff, recvbuff, capacityRows * elementsPerRow, datatype, op, 0, comm, stream,
++    scatter ? REDUCESCATTER_CHUNKSTEPS : ALLREDUCE_CHUNKSTEPS,
++    scatter ? (comm->rcclUseOneSlice ? REDUCESCATTER_SLICESTEPS_SINGLE_NODE : REDUCESCATTER_SLICESTEPS) :
++      (comm->rcclUseOneSlice ? ALLREDUCE_SLICESTEPS_SINGLE_NODE : ALLREDUCE_SLICESTEPS), nullptr};
++  info.llaminarRows = {liveRows, {uint32_t(elementsPerRow * typeBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
++  return ncclEnqueueCheck(&info);
++}
++
++/** @brief Captured allreduce over the device-owned useful prefix; see the common enqueue contract. */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclAllReduceDeviceRows(const void* sendbuff, void* recvbuff,
++    const int32_t* liveRows, size_t capacityRows, size_t elementsPerRow,
++    ncclDataType_t datatype, ncclRedOp_t op, unsigned long long* outgoingPayloadBytes,
++    ncclComm_t comm, cudaStream_t stream) {
++  return llaminarEnqueueReduction(ncclFuncAllReduce, sendbuff, recvbuff, liveRows,
++      capacityRows, elementsPerRow, datatype, op, outgoingPayloadBytes, comm, stream);
++}
++
++/** @brief Captured reduce-scatter with unchanged input bank strides; see the common enqueue contract. */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclReduceScatterDeviceRows(const void* sendbuff, void* recvbuff,
++    const int32_t* liveRows, size_t capacityRows, size_t elementsPerRow,
++    ncclDataType_t datatype, ncclRedOp_t op, unsigned long long* outgoingPayloadBytes,
++    ncclComm_t comm, cudaStream_t stream) {
++  return llaminarEnqueueReduction(ncclFuncReduceScatter, sendbuff, recvbuff, liveRows,
++      capacityRows, elementsPerRow, datatype, op, outgoingPayloadBytes, comm, stream);
++}
++
+ const char* ncclFuncToString(ncclFunc_t fn) {
+   switch (fn) {
+   case ncclFuncAllGather: return "AllGather";
+diff --git a/src/device/all_gather.h b/src/device/all_gather.h
+index 2dc1f04..47ea3cc 100644
+--- a/src/device/all_gather.h
++++ b/src/device/all_gather.h
+@@ -5,17 +5,37 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file all_gather.h
++ * @brief Native gather with device-owned useful extents and fixed progress.
++ *
++ * The ring retains its captured bank strides and acknowledgement schedule.
++ * Only the payload count handed to each native primitive is narrowed; empty
++ * slices still participate in progress and never touch inactive output bytes.
++ */
++
+ #include "device.h"
+ #include "collectives.h"
+ #include "primitives.h"
++#include "llaminar_device_payload.h"
+ 
+ namespace {
+-  template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
+-#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx942__) && !defined(__gfx950__)
+-  __device__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#else
+-  __device__ __attribute__((noinline)) void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#endif
++  /**
++   * @brief Execute the captured ring with useful prefixes in fixed-size banks.
++   * @tparam T Native copy scalar.
++   * @tparam RedOp Existing native copy/reduction functor.
++   * @tparam Proto Native protocol and slice geometry.
++   * @tparam isNetOffload Native network-offload specialization, not a new mode.
++   * @param tid Thread index within this collective block.
++   * @param nthreads Number of participating threads.
++   * @param work Shared descriptor; its metadata remains stable through the call.
++   * @note The uniform entry inlines its body to avoid the native device-call
++   * save/restore ABI. Resource evidence must cover the complete linked entry.
++   */
++  template<typename T, typename RedOp, typename Proto,
++      int USE_ACC, int COLL_UNROLL, int Pipeline, bool isNetOffload,
++      ncclLlaminarPayloadMode PayloadMode>
++  __device__ __forceinline__ void runRingPayload(int tid, int nthreads, struct ncclDevWorkColl* work) {
+ #if defined(ENABLE_NPKIT)
+     const int bid = ncclShmem.channelId - work->channelLo;
+     int npKitCtxIdx = bid; // unused variable - compiler warning
+@@ -25,6 +45,9 @@ namespace {
+     const int nranks = ncclShmem.comm.nRanks;
+     ssize_t count, partOffset, partCount, chunkCount;
+     ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count, &partOffset, &partCount, &chunkCount);
++    // Keep count/partCount/chunkCount unchanged: host proxy progress and every
++    // peer retain the exact captured schedule and participant-major stride.
++    // Only the payload passed to each already-required native step is clipped.
+     ssize_t offset;
+     ssize_t dataOffset;
+     int nelem;
+@@ -81,6 +104,8 @@ namespace {
+         /////////////// begin AllGather steps ///////////////
+         nelem = min(chunkCount, partCount - elemOffset);
+         dataOffset = partOffset + elemOffset;
++        // Observe exactly the shortened argument used by every ring send.
++        nelem = ncclLlaminarPayload<T, PayloadMode>(work, tid, dataOffset, nelem, nranks - 1);
+ 
+         // step 0: push data to next GPU
+         rankDest = ringRanks[0];
+@@ -173,6 +198,22 @@ namespace {
+     if (isNetOffload) barrier_sync(14, nThreads);
+ #endif
+   }
++
++  /**
++   * @brief Use one native primitive loop for full and prefix-clipped work.
++   * @param tid Thread within the participating block.
++   * @param nthreads Threads admitted by the existing native collective.
++   * @param work Published immutable shared descriptor.
++   *
++   * Ordinary work publishes an unbounded byte end, so the same minimum leaves
++   * its original payload unchanged. Keeping one body bounds instruction size
++   * and register lifetimes in the sealed direct entry without changing native
++   * transport, storage, peer order or acknowledgement scheduling.
++   */
++  template<typename T, typename RedOp, typename Proto, bool isNetOffload = false>
++  __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
++    runRingPayload<T, RedOp, Proto, USE_ACC, COLL_UNROLL, Pipeline, isNetOffload, ncclLlaminarPayloadMode::LivePrefix>(tid, nthreads, work);
++  }
+ }
+ 
+ #if defined(__gfx942__) || defined(__gfx950__) // Use a single slice per simple primitive for a single node on some GFX9 devices.
+@@ -671,4 +712,4 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NCCL_P
+       return;
+     }
+   }
+-};
+\ No newline at end of file
++};
+diff --git a/src/device/all_reduce.h b/src/device/all_reduce.h
+index 45b06be..aef0427 100644
+--- a/src/device/all_reduce.h
++++ b/src/device/all_reduce.h
+@@ -5,21 +5,37 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/** @file all_reduce.h
++ * @brief Native reductions with capacity-stable, device-counted useful payload.
++ * Ring/tree ordering and all acknowledgement steps remain native; clipping is
++ * immediately adjacent to each primitive and never changes reduction order.
++ */
+ #include "device.h"
+ #include "collectives.h"
+ #include "primitives.h"
++#include "llaminar_device_payload.h"
+ 
+ #if defined(ENABLE_NPKIT)
+ #include "npkit/npkit.h"
+ #endif
+ 
+ namespace {
++  /**
++   * @brief Keep ring primitive state and its live bound in one compiler scope.
++   * @tparam T Native reduction scalar.
++   * @tparam RedOp Native arithmetic operation with unchanged rank order.
++   * @tparam Proto Native transport protocol and slice geometry.
++   * @tparam RCCLMetadata Existing native metadata flags.
++   * @param tid Thread index within the collective participant block.
++   * @param nthreads Number of participating threads.
++   * @param work Immutable-for-this-operation shared native descriptor.
++   *
++   * This isolated resource experiment removes an out-of-line helper boundary;
++   * linked frame evidence and replay proofs, not the annotation alone, decide
++   * whether it is suitable for production. Protocol progress is unchanged.
++   */
+   template<typename T, typename RedOp, typename Proto, int RCCLMetadata>
+-#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx942__) && !defined(__gfx950__)
+-  __device__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#else
+-  __device__ __attribute__((noinline)) void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#endif
++  __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+     ncclRing *ring = &ncclShmem.channel.ring;
+     int ringIx = ring->index;
+     const int nranks = ncclShmem.comm.nRanks;
+@@ -94,6 +110,7 @@ namespace {
+       }
+ #endif
+ 
++      nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+       prims.directSend(offset, offset, nelem);
+ 
+ #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_REDUCE_RING_SEND_EXIT)
+@@ -118,6 +135,7 @@ namespace {
+         chunkOffset = chunk * chunkCount;
+         offset = gridOffset + elemOffset + chunkOffset;
+         nelem = (int)min(chunkCount, remCount - chunkOffset);
++        nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+         prims.directRecvReduceDirectSend(offset, offset, nelem);
+       }
+ 
+@@ -143,6 +161,7 @@ namespace {
+       }
+ #endif
+ 
++      nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+       prims.directRecvReduceCopyDirectSend(offset, offset, nelem, /*postOp=*/true);
+ 
+ #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_REDUCE_RING_DIRECT_RECV_REDUCE_COPY_SEND_EXIT)
+@@ -166,6 +185,7 @@ namespace {
+         chunkOffset = chunk * chunkCount;
+         offset = gridOffset + elemOffset + chunkOffset;
+         nelem = (int)min(chunkCount, remCount - chunkOffset);
++        nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+         prims.directRecvCopyDirectSend(offset, offset, nelem);
+       }
+ 
+@@ -190,6 +210,7 @@ namespace {
+       offset = gridOffset + elemOffset + chunkOffset;
+       nelem = (int)min(chunkCount, remCount - chunkOffset);
+ 
++      nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 0);
+       prims.directRecv(offset, nelem);
+ 
+ #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_ALL_REDUCE_RING_DIRECT_RECV_EXIT)
+@@ -210,12 +231,17 @@ namespace {
+ 
+   }
+ 
++  /**
++   * @brief Run the native tree's upward/downward phases without a helper call.
++   * @tparam T Native reduction scalar.
++   * @tparam RedOp Native arithmetic operation.
++   * @tparam Proto Existing native protocol and slice geometry.
++   * @param tid Thread index within the collective participant block.
++   * @param nthreads Number of participating threads.
++   * @param work Shared descriptor retaining captured strides and live bindings.
++   */
+   template<typename T, typename RedOp, typename Proto>
+-#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx942__) && !defined(__gfx950__)
+-  __device__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#else
+-  __device__ __attribute__((noinline)) void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#endif
++  __device__ __forceinline__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
+ #if defined(ENABLE_NPKIT)
+     const int bid = ncclShmem.channelId - work->channelLo;
+     int npKitCtxIdx = bid; // unused variable - compiler warning
+@@ -273,6 +299,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 0);
+           prims.directRecvReduceCopy(offset, offset, nelem, /*postOp=*/true);
+         }
+       }
+@@ -280,6 +307,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+           prims.directSend(offset, offset, nelem);
+         }
+       }
+@@ -287,6 +315,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+           prims.directRecvReduceDirectSend(offset, offset, nelem);
+         }
+       }
+@@ -322,6 +351,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, ncclLlaminarTreeFan(tree->down));
+           prims.directSendFromOutput(offset, nelem);
+         }
+       }
+@@ -329,6 +359,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 0);
+           prims.directRecv(offset, nelem);
+         }
+       }
+@@ -336,6 +367,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, ncclLlaminarTreeFan(tree->down));
+           prims.directRecvCopyDirectSend(offset, offset, nelem);
+         }
+       }
+@@ -358,12 +390,17 @@ namespace {
+ 
+   }
+ 
++  /**
++   * @brief Preserve split-tree progress while exposing lifetimes to the caller.
++   * @tparam T Native reduction scalar.
++   * @tparam RedOp Native arithmetic operation.
++   * @tparam Proto Existing native protocol and slice geometry.
++   * @param tid Thread index before the native tree's worker-group split.
++   * @param nthreads Total participating threads before that split.
++   * @param work Shared descriptor; each primitive clips its own bank-relative span.
++   */
+   template<typename T, typename RedOp, typename Proto>
+-#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx942__) && !defined(__gfx950__)
+-  __device__ void runTreeSplit(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#else
+-  __device__ __attribute__((noinline)) void runTreeSplit(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#endif
++  __device__ __forceinline__ void runTreeSplit(int tid, int nthreads, struct ncclDevWorkColl* work) {
+ #if defined(ENABLE_NPKIT)
+     const int bid = ncclShmem.channelId - work->channelLo; // unused variable - compiler warning
+ #endif
+@@ -440,6 +477,7 @@ namespace {
+       for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+         offset = gridOffset + elemOffset;
+         nelem = min(chunkCount, channelCount - elemOffset);
++        nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, ncclLlaminarTreeFan(tree->down));
+         prims.directRecvReduceCopyDirectSend(offset, offset, nelem, /*doPost=*/true);
+       }
+ 
+@@ -484,6 +522,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+           prims.directSend(offset, offset, nelem);
+         }
+       }
+@@ -491,6 +530,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid, offset, nelem, 1);
+           prims.directRecvReduceDirectSend(offset, offset, nelem);
+         }
+       }
+@@ -530,6 +570,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid-nthreadsSplit, offset, nelem, 0);
+           prims.directRecv(offset, nelem);
+         }
+       }
+@@ -537,6 +578,7 @@ namespace {
+         for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+           offset = gridOffset + elemOffset;
+           nelem = min(chunkCount, channelCount - elemOffset);
++          nelem = ncclLlaminarPayload<T>(work, tid-nthreadsSplit, offset, nelem, ncclLlaminarTreeFan(tree->down));
+           prims.directRecvCopyDirectSend(offset, offset, nelem);
+         }
+       }
+diff --git a/src/device/common.h b/src/device/common.h
+index ada2eba..5cc5508 100644
+--- a/src/device/common.h
++++ b/src/device/common.h
+@@ -5,11 +5,21 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file common.h
++ * @brief Native work loading and typed homogeneous/mixed batch execution.
++ *
++ * A homogeneous entry is admitted only after the host planner checks every
++ * channel batch. Its device identity check fails closed before running a
++ * mismatched body, so the compiler need not retain an indirect-call ABI on the
++ * common single-function path. Work publication and progress remain native.
++ */
+ #ifndef NCCL_DEVICE_COMMON_H_
+ #define NCCL_DEVICE_COMMON_H_
+ 
+ #include "collectives.h"
+ #include "device.h"
++#include "llaminar_device_payload.h"
+ #include "op128.h"
+ #include "reduce_kernel.h"
+ #include "device_table.h"
+@@ -362,10 +372,31 @@ __device__ __forceinline__ void loadWorkBatchToShmem(
+       if (ncclShmem.args.workStorageType == ncclDevWorkStorageTypeArgs) {
+         char* src = (char*)args + (batch.offsetBase + srcWork*workSize + packInWork*16);
+         tmp = *(ulong2*)src; // becomes ld.param.v2.u64
++        // This lane owns the pointer word; resolve it before shared publication.
++        // Keep parameter/global loads separate: taking a generic parameter
++        // address would force the complete 4-KiB argument bank onto the stack.
++        static_assert(offsetof(ncclDevWorkColl, llaminarRows) % 16 == 8,
++            "The row pointer must occupy the second word of its native pack");
++        if (batch.workType != ncclDevWorkTypeP2p &&
++            packInWork == offsetof(ncclDevWorkColl, llaminarRows) / 16)
++          tmp.y = tmp.y ? ncclLlaminarResolveRowWord(tmp.y, *(uint64_t*)(src + 16)) : ~uint64_t(0);
+       }
+       if (ncclShmem.args.workStorageType != ncclDevWorkStorageTypeArgs) {
+         char* src = (char*)ncclShmem.args.workBuf + ((batch.offsetBase + srcWork*workSize + packInWork*16) & ncclShmem.args.workMask);
+         tmp = *(ulong2*)src; // becomes ld.v2.u64
++        // This lane owns the pointer word; resolve it before shared publication.
++        // Keep parameter/global loads separate: taking a generic parameter
++        // address would force the complete 4-KiB argument bank onto the stack.
++        static_assert(offsetof(ncclDevWorkColl, llaminarRows) % 16 == 8,
++            "The row pointer must occupy the second word of its native pack");
++        if (batch.workType != ncclDevWorkTypeP2p &&
++            packInWork == offsetof(ncclDevWorkColl, llaminarRows) / 16)
++          // The adjacent geometry word may wrap independently in the native
++          // FIFO. Apply the work mask to its own offset, not to the pack alone.
++          tmp.y = tmp.y ? ncclLlaminarResolveRowWord(tmp.y,
++              *(uint64_t*)((char*)ncclShmem.args.workBuf +
++                  ncclLlaminarAdjacentWorkWord(batch.offsetBase + srcWork*workSize + packInWork*16,
++                      ncclShmem.args.workMask))) : ~uint64_t(0);
+       }
+       char* dst = ncclShmem.workStorage;
+       dst += (workCursor + dstWork)*workSize + packInWork*16;
+@@ -482,7 +513,17 @@ __device__ __forceinline__ void profiler(int action) {
+   }
+ }
+ 
+-template<int SpecializedFnId, typename SpecializedRunWorkBatch, bool COLLTRACE, int COLL_UNROLL>
++/** @brief Whether the sealed plan admits one function or native mixed work. */
++enum class ncclKernelBatchPolicy { MixedFunctions, UniformFunction };
++
++/**
++ * @brief Execute native batches with an optional sealed function identity.
++ * @param args Immutable native launch arguments, retained for graph replay.
++ * @tparam BatchPolicy Uniform plans reject foreign functions; mixed plans keep
++ * the native function table for genuinely heterogeneous grouped work.
++ */
++template<int SpecializedFnId, typename SpecializedRunWorkBatch, bool COLLTRACE, int COLL_UNROLL,
++         ncclKernelBatchPolicy BatchPolicy = ncclKernelBatchPolicy::MixedFunctions>
+ __device__ __forceinline__ void ncclKernelMain(struct ncclDevKernelArgs const* args) {
+   const int tid = threadIdx.x;
+   int tn = blockDim.x;
+@@ -598,7 +639,13 @@ __device__ __forceinline__ void ncclKernelMain(struct ncclDevKernelArgs const* a
+   while (ncclShmem.aborted == 0) {
+     if (tid == 0) __insert_timestamp(__LINE__);
+     profiler(START);
+-    if (0 <= SpecializedFnId && ncclShmem.funcId == (unsigned)SpecializedFnId) {
++    if constexpr (BatchPolicy == ncclKernelBatchPolicy::UniformFunction) {
++      static_assert(SpecializedFnId >= 0, "A uniform plan needs a concrete function");
++      // This is an admission invariant, not a request to dispatch another
++      // function on device. The other branch is absent from this entry's ISA.
++      if (ncclShmem.funcId != (unsigned)SpecializedFnId) __builtin_trap();
++      SpecializedRunWorkBatch().run();
++    } else if (0 <= SpecializedFnId && ncclShmem.funcId == (unsigned)SpecializedFnId) {
+       SpecializedRunWorkBatch().run();
+     } else {
+ #ifdef USE_INDIRECT_FUNCTION_CALL
+diff --git a/src/device/generate.py b/src/device/generate.py
+index ef2ecf9..d319445 100755
+--- a/src/device/generate.py
++++ b/src/device/generate.py
+@@ -1,4 +1,9 @@
+ #!/usr/bin/env python3
++"""Generate native function identities and matching sealed uniform entries.
++
++Uniform entry IDs are derived from each unroll-specific device table. They are
++never handwritten offsets into a build-dependent collective inventory.
++"""
+ import os
+ import sys
+ import subprocess
+@@ -363,6 +368,23 @@ primary_funcs = sorted(
+ primary_to_index = {fn: i for i, fn in enumerate(primary_funcs)}
+ primary_to_index = {fn: primary_to_index.get(Fn(*fn), -1) for fn in func_rows}
+ 
++# Seal existing node-local ring/tree collective functions, retaining each exact
++# scalar, arithmetic and pipeline identity. Architecture-gated variants need
++# their own admission metadata before they may receive an unconditional entry.
++# A gather remains the library's byte-copy primary, independent of caller dtype.
++uniform_funcs = [fn for fn in primary_funcs
++                 if fn.coll in ("AllGather", "AllReduce", "ReduceScatter")
++                 and fn.algo in ("RING", "TREE")
++                 and fn.proto in ("SIMPLE", "LL") and get_arch_guard(fn) is None]
++uniform_func_ids = {fn: [other for other in primary_funcs
++                        if other.unroll == fn.unroll].index(fn)
++                    for fn in uniform_funcs}
++
++
++def uniform_symbol(fn, trace):
++  """Keep normal and tracing launch identities distinct in the host inventory."""
++  return paste("_", "ncclDevKernel_Uniform", *fn, "Trace" if trace else "Plain")
++
+ ################################################################################
+ 
+ # Generate <gensrc>/device_table.h
+@@ -452,6 +474,20 @@ with open(os.path.join(gensrc, "host_table.cpp"), "w") as f:
+   out = f.write
+   out('#include "device.h"\n')
+   out("\n")
++
++  for fn in uniform_funcs:
++    for trace in range(is_colltrace + 1):
++      out("__global__ void %s(ncclDevKernelArgs4K);\n" % uniform_symbol(fn, trace))
++  out("const ncclUniformKernelEntry ncclUniformKernelList[] = {\n")
++  for fn in uniform_funcs:
++    for trace in range(is_colltrace + 1):
++      out("  {%d, %d, %s, (void*)%s},\n" % (
++          uniform_func_ids[fn], all_unrolls.index(fn.unroll),
++          "true" if trace else "false", uniform_symbol(fn, trace)))
++  # A sentinel also gives a valid C++ array when no listed function is compiled.
++  out("  {-1, -1, false, nullptr}\n};\n")
++  out("const int ncclUniformKernelCount = sizeof(ncclUniformKernelList) / "
++      "sizeof(ncclUniformKernelList[0]) - 1;\n\n")
+   out("// The key for the ncclDevFuncNameToId map is a 64-bit unsigned integer.\n")
+   out("// Each field (coll, algo, proto, redop, ty, acc, pipeline) is packed into 4 bits,\n")
+   out("// This allows up to 16 unique values per field. The layout is:\n")
+@@ -580,6 +616,19 @@ for name in name_to_funcs.keys():
+       if guard: 
+         out("#endif\n")
+ 
++      if fn in uniform_func_ids:
++        for trace in range(is_colltrace + 1):
++          out("\n/** @brief Sealed native collective plan; foreign functions trap. */\n")
++          out("__launch_bounds__(NCCL_MAX_NTHREADS, 1) __global__ void %s("
++              "ncclDevKernelArgs4K NCCL_GRID_CONSTANT const args4K) {\n" % uniform_symbol(fn, trace))
++          out("  using Work = RunWorkBatch<ncclFunc%s, %s, %s<%s>, NCCL_ALGO_%s, "
++              "NCCL_PROTO_%s, %s, %s, %s>;\n" % (
++                  fn.coll, ty_to_cxx[fn.ty], redop_to_cxx[fn.redop], ty_to_cxx[fn.ty],
++                  fn.algo, fn.proto, fn.acc, fn.unroll, fn.pipeline))
++          out("  ncclKernelMain<%d, Work, %s, %s, "
++              "ncclKernelBatchPolicy::UniformFunction>(&args4K.args);\n}\n" % (
++                  uniform_func_ids[fn], "true" if trace else "false", fn.unroll))
++
+ # Generate each <gensrc>/<msccl_impl>.cpp
+ if is_msccl_kernels:
+   for redop in all_redops:
+diff --git a/src/device/reduce_scatter.h b/src/device/reduce_scatter.h
+index e5c6896..4459cc6 100644
+--- a/src/device/reduce_scatter.h
++++ b/src/device/reduce_scatter.h
+@@ -5,17 +5,28 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/** @file reduce_scatter.h
++ * @brief Native reduction of live prefixes in stable participant-major banks.
++ * Padding is never useful payload; empty slices retain native progress.
++ */
+ #include "device.h"
+ #include "collectives.h"
+ #include "primitives.h"
++#include "llaminar_device_payload.h"
+ 
+ namespace {
++  /**
++   * @brief Reduce useful prefixes while retaining the native ring's bank strides.
++   * @tparam T Native reduction scalar.
++   * @tparam RedOp Native arithmetic operation with unchanged rank order.
++   * @tparam Proto Native transport protocol and slice geometry.
++   * @param tid Thread index within this collective block.
++   * @param nthreads Number of participating threads.
++   * @param work Shared descriptor; no caller may change its bindings mid-operation.
++   * @note Inlining exposes lifetimes to the typed dispatch; resource validation is separate.
++   */
+   template<typename T, typename RedOp, typename Proto>
+-#if defined(USE_INDIRECT_FUNCTION_CALL) && !defined(__gfx942__) && !defined(__gfx950__)
+-  __device__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#else
+-  __device__ __attribute__((noinline)) void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-#endif
++  __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
+     ncclRing *ring = &ncclShmem.channel.ring;
+     int const *ringRanks = ring->userRanks;
+     const int nranks = ncclShmem.comm.nRanks;
+@@ -69,6 +80,9 @@ namespace {
+       nelem = min(chunkCount, channelCount - elemOffset);
+ 
+       dataOffset = gridOffset + elemOffset;
++      // All ring sends use this same clipped bank-relative span. Rank strides,
++      // outer loops and acknowledgements remain capacity-derived.
++      nelem = ncclLlaminarPayload<T>(work, tid, dataOffset, nelem, nranks-1);
+       /////////////// begin ReduceScatter steps ///////////////
+       // step 0: push data to next GPU
+ #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_REDUCE_SCATTER_RING_SEND_ENTRY)
+@@ -601,4 +615,4 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_COLLNET_DIRECT, NC
+       return;
+     }
+   }
+-};
+\ No newline at end of file
++};
+diff --git a/src/enqueue.cc b/src/enqueue.cc
+index 7ff7a1a..7adf690 100644
+--- a/src/enqueue.cc
++++ b/src/enqueue.cc
+@@ -6,6 +6,15 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file enqueue.cc
++ * @brief Seal native collective plans, including uniform-function admission.
++ *
++ * Plan specialization inspects the complete serialized batch inventory. It
++ * cannot infer eligibility from the first task, change the collective protocol
++ * or ignore another channel's later work. Kernel attributes are initialized
++ * for the same generated inventory that admission selects.
++ */
+ #include "enqueue.h"
+ #include "argcheck.h"
+ #include "coll_net.h"
+@@ -85,7 +94,8 @@ NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
+ 
+ // Returns maximum kernel stack size of all CUDA kernels
+ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
+-  constexpr int KernelCount = sizeof(ncclKerns)/sizeof(ncclKerns[0]);
++  constexpr int GenericKernelCount = sizeof(ncclKerns)/sizeof(ncclKerns[0]);
++  const int KernelCount = GenericKernelCount + ncclUniformKernelCount;
+   ncclResult_t result = ncclSuccess;
+ 
+   if (maxStackSize) *maxStackSize = 0;
+@@ -101,10 +111,12 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
+   for (int sym=0; sym <= 1; sym++) {
+     int kcount = sym==0 ? KernelCount : ncclSymKernelCount;
+     for (int k=0; k < kcount; k++) {
+-      void* fn = sym==0 ? ncclKerns[k].kernelFn : ncclSymKernelList[k];
++      void* fn = sym==0 ? (k < GenericKernelCount ? ncclKerns[k].kernelFn
++          : ncclUniformKernelList[k-GenericKernelCount].kernelFn) : ncclSymKernelList[k];
+ #else
+   for (int k = 0; k < KernelCount; k++) {
+-    void* fn = ncclKerns[k].kernelFn;
++    void* fn = k < GenericKernelCount ? ncclKerns[k].kernelFn
++        : ncclUniformKernelList[k-GenericKernelCount].kernelFn;
+ #endif
+       cudaFuncAttributes attr = {0};
+       if (fn == nullptr) continue;
+@@ -237,6 +249,32 @@ static void addWorkBatchToPlan(
+   }
+ }
+ 
++/**
++ * @brief Select a direct entry only for an entirely uniform serialized plan.
++ * @param comm Native communicator owning the unroll/tracing policies.
++ * @param batches Complete channel-interleaved sealed batch array.
++ * @param count Number of valid batch descriptors in that array.
++ * @return Matching typed entry, or null for a native mixed/unlisted plan.
++ */
++static void* uniformKernelForPlan(struct ncclComm* comm,
++    struct ncclDevWorkBatch const* batches, int count) {
++  if (count == 0) return nullptr;
++  for (int b = 1; b < count; ++b) {
++    if (batches[b].funcId != batches[0].funcId) return nullptr;
++  }
++  bool trace = false;
++#ifdef ENABLE_COLLTRACE
++  trace = comm->collTraceEnabled;
++#endif
++  for (int k = 0; k < ncclUniformKernelCount; ++k) {
++    auto const& entry = ncclUniformKernelList[k];
++    if (entry.funcId == batches[0].funcId && entry.unrollIndex == comm->unroll &&
++        entry.collTrace == trace) return entry.kernelFn;
++  }
++  return nullptr;
++}
++
++/** @brief Freeze native storage, launch identity and proxy progress together. */
+ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+   ncclKernelPlanner::WipPlan::Channel* wipChannels = comm->planner.wipPlan.channels;
+   size_t workBytes = plan->workBytes;
+@@ -291,6 +329,13 @@ static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+     }
+   }
+ 
++  // The complete batch array, not the first task or channel, owns eligibility.
++  // Mixed groups retain native generic dispatch; no payload or schedule changes.
++  if (void* uniform = uniformKernelForPlan(comm, batchZero, batchIx)) {
++    plan->kernelFn = uniform;
++    plan->kernelSpecialized = true;
++  }
++
+   // Merge-sort per-channel proxy-op lists by opCount when merging them into plan->proxyOpQueue
+   // Phase 1: scan first op of each channel, store opCount in headIds[c].
+   uint64_t headIds[MAXCHANNELS];
+@@ -378,6 +423,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
+     devWork.sendbuff = (void*)task->sendbuff;
+     devWork.recvbuff = (void*)task->recvbuff;
+     devWork.acc = (void*)task->acc;
++    devWork.llaminarRows = task->llaminarRows;
+     devWork.sendbuffOffset = task->sendbuffOffset;
+     devWork.recvbuffOffset = task->recvbuffOffset;
+     devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
+@@ -538,6 +584,17 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
+       do {
+         struct ncclTaskColl* next = aggBeg->next;
+         aggBeg->algorithm = agg.algorithm;
++        // The prototype implements the native ring's fixed progress schedule.
++        // Reject a different selected algorithm; never silently change transport
++        // or claim that an unmodified algorithm consumes this device binding.
++        if (aggBeg->llaminarRows.rows &&
++            !((aggBeg->func == ncclFuncAllGather || aggBeg->func == ncclFuncReduceScatter) ?
++                agg.algorithm == NCCL_ALGO_RING :
++                (aggBeg->func == ncclFuncAllReduce &&
++                 (agg.algorithm == NCCL_ALGO_RING || agg.algorithm == NCCL_ALGO_TREE)))) {
++          WARN("Device-row prototype requires native RING gather/scatter or RING/TREE allreduce");
++          return ncclInvalidUsage;
++        }
+         aggBeg->protocol = agg.protocol;
+         aggBeg->acc = agg.acc;
+         aggBeg->pipeline = agg.pipeline;
+@@ -2714,6 +2771,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
+       t->sendbuff = info->sendbuff;
+       t->recvbuff = info->recvbuff;
+       t->count = info->count;
++      t->llaminarRows = info->llaminarRows;
+       t->root = info->root;
+       t->datatype = info->datatype;
+       size_t elementSize = ncclTypeSize(t->datatype);
+diff --git a/src/include/comm.h b/src/include/comm.h
+index 55fd630..e3d7066 100644
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -198,6 +198,7 @@ struct ncclTaskColl {
+   void* recvbuff;
+   void const* acc;
+   size_t count;
++  ncclLlaminarDeviceRows llaminarRows;
+   int root;
+   ncclDataType_t datatype;
+   ncclRedOp_t opHost;
+diff --git a/src/include/device.h b/src/include/device.h
+index 0cf7569..8375925 100644
+--- a/src/include/device.h
++++ b/src/include/device.h
+@@ -6,6 +6,14 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file device.h
++ * @brief Native host/device work ABI, including borrowed live-extent metadata.
++ *
++ * Batching and costing must derive their geometry from the same concrete work
++ * descriptor. Its live-row binding affects payload only, never the captured
++ * storage stride, protocol progress schedule, or native transport selection.
++ */
+ #ifndef NCCL_DEVICE_H_
+ #define NCCL_DEVICE_H_
+ 
+@@ -351,6 +359,8 @@ inline __device__ int ncclP2pChannelToPart(int nP2pChannels, int base, int chann
+   }
+ }
+ 
++#include "llaminar_device_extent.h"
++
+ struct alignas(16) ncclDevWorkColl {
+   // Running on channels [channelLo..channelHi], hi is inclusive.
+   //   nChannels == (channelHi - channelLo) + 1
+@@ -382,6 +392,12 @@ struct alignas(16) ncclDevWorkColl {
+   };
+   uint64_t redOpArg;
+   uint64_t opCount;
++  // Host enqueue constructs the producer member. Native work loading alone
++  // activates the resolved member, then publishes it to all primitive threads.
++  union {
++    ncclLlaminarDeviceRows llaminarRows;
++    ncclLlaminarResolvedRows llaminarResolvedRows;
++  };
+ };
+ 
+ 
+@@ -438,8 +454,14 @@ constexpr size_t ncclDevWorkSize(enum ncclDevWorkType type) {
+         type == ncclDevWorkTypeColl ? sizeof(ncclDevWorkColl) : sizeof(ncclDevWorkCollReg);
+ }
+ 
+-#define NCCL_MAX_DEV_WORK_BATCH_BYTES 128
++// This RCCL configuration admits one ordinary collective descriptor per
++// batch. Derive the byte budget from that descriptor, including explicit live
++// extent metadata. A stale byte literal can make the cost model divide by a
++// zero work count even though the device's retained work storage is sufficient.
++#define NCCL_MAX_DEV_WORK_BATCH_BYTES sizeof(ncclDevWorkColl)
+ #define NCCL_MAX_DEV_WORK_BATCH_COLLS (NCCL_MAX_DEV_WORK_BATCH_BYTES/sizeof(ncclDevWorkColl))
++static_assert(NCCL_MAX_DEV_WORK_BATCH_COLLS == 1,
++    "RCCL native batching must retain its one-collective work contract");
+ #define NCCL_MAX_DEV_WORK_P2P_PER_BATCH 2
+ #define NCCL_MAX_DEV_WORK_P2P_ELEMENTS 2
+ struct alignas(16) ncclDevWorkBatch {
+@@ -725,6 +747,16 @@ extern int const ncclDevFuncRowToId[];
+ extern void* const ncclDevKernelForFunc[/*funcIndex*/];
+ extern bool const ncclDevKernelForFuncIsSpecialized[/*funcIndex*/];
+ 
++/** @brief Generated entry for a sealed, single-function native work plan. */
++struct ncclUniformKernelEntry {
++  int funcId;
++  int unrollIndex;
++  bool collTrace;
++  void* kernelFn;
++};
++extern int const ncclUniformKernelCount;
++extern ncclUniformKernelEntry const ncclUniformKernelList[];
++
+ // Launch a one-rank reduction on stream.
+ ncclResult_t ncclLaunchOneRank(void* dst, void const* src, size_t nElts, struct ncclDevRedOpFull redOp, ncclDataType_t type, cudaStream_t stream);
+ 
+diff --git a/src/include/info.h b/src/include/info.h
+index 415a4f6..cad5898 100644
+--- a/src/include/info.h
++++ b/src/include/info.h
+@@ -12,6 +12,7 @@
+ #include "collectives.h"
+ #include "core.h"
+ #include "utils.h"
++#include "llaminar_device_extent.h"
+ 
+ // Used to pass NCCL call information between functions
+ struct ncclInfo {
+@@ -30,6 +31,7 @@ struct ncclInfo {
+   int chunkSteps;
+   int sliceSteps;
+   const void* acc;
++  ncclLlaminarDeviceRows llaminarRows{};
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/src/device/llaminar_device_payload.h b/src/device/llaminar_device_payload.h
+new file mode 100644
+index 0000000..3166890
+--- /dev/null
++++ b/src/device/llaminar_device_payload.h
+@@ -0,0 +1,108 @@
++/**
++ * @file llaminar_device_payload.h
++ * @brief Device-only live-payload clipping without changing native progress.
++ *
++ * The native algorithm owns capacity partitioning, peer ordering, chunk strides
++ * and acknowledgement counts. These helpers only narrow the elements handed
++ * to an already-required primitive. Empty chunks still execute that primitive.
++ */
++#ifndef LLAMINAR_NATIVE_DEVICE_PAYLOAD_H_
++#define LLAMINAR_NATIVE_DEVICE_PAYLOAD_H_
++
++/** @brief Work-uniform payload policy, selected before entering native loops. */
++enum class ncclLlaminarPayloadMode { Capacity, LivePrefix };
++
++/**
++ * @brief Select an unclipped specialization only when every byte is live.
++ * @param work Resolved shared work, already published by the native barrier.
++ * @return Capacity for ordinary or full unobserved work; LivePrefix otherwise.
++ *
++ * An observer deliberately retains the counted path, including for full work.
++ * The decision is uniform across the primitive group and immutable throughout
++ * the work item. It does not change acknowledgement counts or buffer strides.
++ */
++__device__ __forceinline__ ncclLlaminarPayloadMode ncclLlaminarSelectPayloadMode(
++    const ncclDevWorkColl* work) {
++  const volatile ncclLlaminarResolvedRows& extent = work->llaminarResolvedRows;
++  if (extent.liveBytes == ~size_t(0)) return ncclLlaminarPayloadMode::Capacity;
++  if (!extent.outgoingPayloadBytes && extent.liveBytes ==
++      size_t(extent.geometry.bytesPerRow) * extent.geometry.capacityRows)
++    return ncclLlaminarPayloadMode::Capacity;
++  return ncclLlaminarPayloadMode::LivePrefix;
++}
++
++/**
++ * @brief Resolve the captured pointer word before its shared work-pack store.
++ * @param pointerWord Borrowed device pointer, or zero for ordinary native work.
++ * @param geometryWord The adjacent admitted row-width/capacity pair.
++ * @return Validated useful byte end, or an unbounded end for ordinary work.
++ *
++ * The native loader's pack owner alone performs this transition. The existing
++ * work-publication barrier exposes resolved metadata to all primitive threads;
++ * no additional barrier, work bank, graph node or dispatch helper is needed.
++ * Host admission validates element divisibility and bounded row geometry.
++ */
++__device__ __forceinline__ uint64_t ncclLlaminarResolveRowWord(
++    uint64_t pointerWord, uint64_t geometryWord) {
++  if (!pointerWord) return ~uint64_t(0);
++  const int32_t rows = *reinterpret_cast<const int32_t*>(pointerWord);
++  const uint32_t bytesPerRow = uint32_t(geometryWord);
++  const uint32_t capacityRows = uint32_t(geometryWord >> 32);
++  if (rows < 0 || !bytesPerRow || !capacityRows ||
++      uint32_t(rows) > capacityRows) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  // Widen before multiplication. Empty and ordinary work remain distinct.
++  return uint64_t(uint32_t(rows)) * bytesPerRow;
++}
++
++/**
++ * @brief Return the exact primitive count and optionally observe its sends.
++ * @param work Prepared shared descriptor; its observer never drives progress.
++ * @param tid Thread within the native primitive group, not necessarily the CTA.
++ * @param offset Element offset within that bank, not the allocation base.
++ * @param elements Original native chunk count, which may be nonpositive.
++ * @param sends Number of actual outgoing peers for this primitive invocation.
++ * @return Count passed unchanged to the following native primitive.
++ *
++ * Callers must retain the original loop/step schedule. Receipts accumulate the
++ * same count the primitive consumes, not an independently predicted byte count.
++ */
++template<typename T,
++    ncclLlaminarPayloadMode Mode = ncclLlaminarPayloadMode::LivePrefix,
++    typename Offset>
++__device__ __forceinline__ int ncclLlaminarPayload(
++    const ncclDevWorkColl* work, int tid, Offset offset,
++    int elements, int sends) {
++  // Compile this entire helper out of the full-span specialization. Keeping
++  // the choice outside the native loop avoids per-chunk metadata reloads and
++  // prevents live-prefix state extending register lifetimes in the copy loop.
++  if constexpr (Mode == ncclLlaminarPayloadMode::Capacity) return elements;
++  // Reload immutable shared metadata at the use site. Volatile prevents the
++  // compiler retaining an extra 64-bit end across a large native primitive.
++  const volatile ncclLlaminarResolvedRows& extent = work->llaminarResolvedRows;
++  const size_t endBytes = extent.liveBytes;
++  if (endBytes == ~size_t(0)) return elements;
++  const size_t end = endBytes / sizeof(T);
++  const size_t begin = size_t(offset);
++  const int count = elements <= 0 || begin >= end ? 0 :
++      int(min(size_t(elements), end - begin));
++  if (tid == 0 && sends != 0 && extent.outgoingPayloadBytes)
++    atomicAdd(extent.outgoingPayloadBytes,
++        static_cast<unsigned long long>(count) * sizeof(T) * sends);
++  return count;
++}
++
++/** @brief Count real child links; unused tree entries are protocol metadata. */
++template<int N>
++__device__ __forceinline__ int ncclLlaminarTreeFan(const int (&children)[N]) {
++  int count = 0;
++  #pragma unroll
++  for (int i = 0; i < N; ++i) count += children[i] != -1;
++  return count;
++}
++#endif
+diff --git a/src/include/llaminar_device_extent.h b/src/include/llaminar_device_extent.h
+new file mode 100644
+index 0000000..cfa026f
+--- /dev/null
++++ b/src/include/llaminar_device_extent.h
+@@ -0,0 +1,59 @@
++/**
++ * @file llaminar_device_extent.h
++ * @brief Prototype device-owned row extent for a retained native collective.
++ *
++ * Storage stride and protocol scheduling remain capture-time constants. Only
++ * useful payload is shortened, by the producer's immutable-for-this-operation
++ * device scalar. Empty slices still execute native protocol progress. The
++ * optional counter is passive test evidence, never an execution authority.
++ */
++#ifndef LLAMINAR_NCCL_DEVICE_EXTENT_H_
++#define LLAMINAR_NCCL_DEVICE_EXTENT_H_
++#include <stddef.h>
++#include <stdint.h>
++
++/**
++ * @brief Locate the adjacent native work pack without losing FIFO wrap.
++ * @param packOffset Original virtual byte offset, before applying a work mask.
++ * @param mask Native work-storage mask; all bits set denotes linear storage.
++ * @return Physical byte offset of the next pack's first word.
++ *
++ * Pointer arithmetic after masking can escape the ring. Mask each addressed
++ * word independently. This pure offset contract is also tested without a GPU.
++ */
++#if defined(__CUDACC__) || defined(__HIPCC__)
++__host__ __device__
++#endif
++constexpr uint32_t ncclLlaminarAdjacentWorkWord(uint32_t packOffset, uint32_t mask) {
++  return (packOffset + 16u) & mask;
++}
++
++/** @brief Host-admitted row geometry, independent of the native scalar type. */
++struct ncclLlaminarRowGeometry {
++  uint32_t bytesPerRow;
++  uint32_t capacityRows;
++};
++
++/** @brief Borrowed device bindings; their owner outlives every captured replay. */
++struct ncclLlaminarDeviceRows {
++  const int32_t* rows;
++  ncclLlaminarRowGeometry geometry;
++  unsigned long long* outgoingPayloadBytes;
++};
++
++/**
++ * @brief Validated execution-local extent published in native shared storage.
++ *
++ * The producer binding is resolved once per work item, before any primitive.
++ * Ordinary native work has an unbounded byte end; a valid empty operation has end
++ * zero. These are distinct even when both carry no observer. The layout matches
++ * the captured binding so resolution adds neither persistent nor shared bytes.
++ */
++struct ncclLlaminarResolvedRows {
++  size_t liveBytes;
++  ncclLlaminarRowGeometry geometry;
++  unsigned long long* outgoingPayloadBytes;
++};
++static_assert(sizeof(ncclLlaminarResolvedRows) == sizeof(ncclLlaminarDeviceRows),
++    "Resolving a row binding must not enlarge the native work ABI");
++#endif

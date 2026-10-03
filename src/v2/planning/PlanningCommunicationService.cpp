@@ -24,7 +24,7 @@ namespace llaminar2
     namespace
     {
         using Json = nlohmann::json;
-        constexpr auto kSchema = "llaminar.planning-communication.v3";
+        constexpr auto kSchema = "llaminar.planning-communication.v4";
 
         /** @brief Reject incomplete evidence before it can influence selection. */
         void require(bool condition, const char *detail)
@@ -121,7 +121,7 @@ namespace llaminar2
 
     PlanningCommunicationSamplePlan PlanningCommunicationSamplePlan::resolve(const ClusterInventory &inventory,
         const AutomaticOrchestrationRequest &request, int width, int rows,
-        std::span<const PlanningAllreducePrecision> precisions)
+        std::span<const PlanningAllreducePrecision> precisions, RoutedExpertComputePolicy routed_compute_policy)
     {
         require(width > 0 && rows > 0 && size_t(width) <= size_t(INT_MAX) / sizeof(float) / size_t(rows),
             "activation payload must be positive and MPI-representable");
@@ -130,10 +130,22 @@ namespace llaminar2
             require((precision == PlanningAllreducePrecision::FP32 || precision == PlanningAllreducePrecision::FP16) &&
                 unique.insert(precision).second, "duplicate or unsupported native precision");
         require(!unique.empty(), "missing native precision policy");
+        switch (routed_compute_policy)
+        {
+        case RoutedExpertComputePolicy::Unspecified:
+        case RoutedExpertComputePolicy::Replicated:
+        case RoutedExpertComputePolicy::Apportioned:
+        case RoutedExpertComputePolicy::TensorSharded:
+        case RoutedExpertComputePolicy::GateUpOwnedDownColumns:
+            break;
+        default:
+            throw std::invalid_argument("Planning communication: unknown routed compute policy");
+        }
         // Reuse the canonical alias/physical membership checks without fresh
         // discovery. A CPU staging process is not itself an eligible endpoint.
         (void)PlanningKernelServiceCatalog::observers(inventory, request);
         PlanningCommunicationSamplePlan result;
+        result.routed_compute_policy_ = routed_compute_policy;
         for (const auto &rank : inventory.ranks) result.rank_nodes_.push_back(rank.node_id);
         if (!request.allows(OrchestrationStrategy::TensorParallel) &&
             !request.allows(OrchestrationStrategy::PipelineParallel) &&
@@ -208,11 +220,18 @@ namespace llaminar2
                     result.mpi_.push_back({from, to, payload, 1});
                     result.mpi_.push_back({from, to, 1, payload});
                 }
-        // Native homogeneous TP does not use host-GPU activation staging. PP
-        // and overlay searches do. Preserve every observing rank's host scope:
+        // A strategy name is not its physical communication contract: the
+        // homogeneous gate/up-owner mode is enumerated as TP, but its counted
+        // intermediate fabric needs mapped pages when direct P2P is absent.
+        // Keep a bounded per-GPU basis for the candidate subsets, rather than
+        // changing the inference transport or probing each candidate. PP and
+        // heterogeneous overlay searches also need host staging. Preserve
+        // every observing rank's host scope:
         // the same GPU with pages first-touched on another socket is not the
         // same link sample, even when both ranks see identical GPU ordinals.
-        if (request.allows(OrchestrationStrategy::PipelineParallel) || request.allows(OrchestrationStrategy::ExpertOverlay))
+        if (request.allows(OrchestrationStrategy::PipelineParallel) || request.allows(OrchestrationStrategy::ExpertOverlay) ||
+            (request.allows(OrchestrationStrategy::TensorParallel) &&
+                routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns))
             for (const auto &rank : inventory.ranks)
             {
                 std::vector<DeviceId> devices;
@@ -235,7 +254,8 @@ namespace llaminar2
     std::vector<uint8_t> PlanningCommunicationSamplePlan::serialize() const
     {
         Json wire{{"schema", kSchema}, {"rank_nodes", rank_nodes_}, {"native", Json::array()},
-            {"mpi", Json::array()}, {"host_device", Json::array()}};
+            {"mpi", Json::array()}, {"host_device", Json::array()},
+            {"routed_compute_policy", int(routed_compute_policy_)}};
         for (const auto &sample : native_)
             wire["native"].push_back({{"rank", sample.discovery_rank}, {"node", sample.physical_node},
                 {"uuids", sample.uuids}, {"request", identity(sample.request)}});
@@ -355,7 +375,8 @@ namespace llaminar2
 
     std::optional<PlanningCommunicationService> PlanningCommunicationService::collect(const std::shared_ptr<IMPIContext> &mpi,
         const ClusterInventory &inventory, const AutomaticOrchestrationRequest &request,
-        int width, int rows, std::span<const PlanningAllreducePrecision> precisions)
+        int width, int rows, std::span<const PlanningAllreducePrecision> precisions,
+        RoutedExpertComputePolicy routed_compute_policy)
     {
         std::optional<PlanningCommunicationSamplePlan> plan;
         std::shared_ptr<PhysicalMemoryAuthority> memory;
@@ -363,12 +384,14 @@ namespace llaminar2
         int node_slot = 0, rounds = 1;
         exchangePlanningSamples(mpi, [&](int count) {
             require(count == inventory.world_size, "discovery communicator size mismatch");
-            const auto agreed = PlanningCommunicationSamplePlan::resolve(inventory, request, width, rows, precisions).serialize();
+            const auto agreed = PlanningCommunicationSamplePlan::resolve(inventory, request, width, rows, precisions,
+                routed_compute_policy).serialize();
             return std::vector<std::vector<uint8_t>>(count, agreed);
         }, [&](auto envelope) {
             require(!mpi || (mpi->clusterInventory() && mpi->clusterInventory().get() == &inventory),
                 "collection must use context-owned inventory");
-            plan = PlanningCommunicationSamplePlan::resolve(inventory, request, width, rows, precisions);
+            plan = PlanningCommunicationSamplePlan::resolve(inventory, request, width, rows, precisions,
+                routed_compute_policy);
             require(plan->serialize() == std::vector<uint8_t>(envelope.begin(), envelope.end()), "sample basis disagrees across ranks");
             memory = admit(inventory, rank, *plan);
             std::map<int, int> slots;

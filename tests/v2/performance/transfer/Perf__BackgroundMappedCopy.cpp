@@ -382,8 +382,8 @@ namespace
             expected[i] = static_cast<unsigned char>((i * 43u + (i >> 3u)) & 255u);
 
         context.submitAndWait([&] {
-            void *start = context.createEvent();
-            void *end = context.createEvent();
+            void *start = context.createEvent(GPUEventPurpose::Timing);
+            void *end = context.createEvent(GPUEventPurpose::Timing);
             if (!start || !end) throw std::runtime_error("copy benchmark event setup failed");
             for (const std::size_t bytes : {std::size_t{4096}, std::size_t{196608}, capacity - 13u, capacity})
             for (const auto path : {CopySample::DMA, CopySample::BackgroundProgress,
@@ -481,8 +481,8 @@ namespace
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&] {
             void *stream = context.getOrCreateAuxiliaryStream("canonical_ticket_economy");
-            void *start = context.createEvent();
-            void *end = context.createEvent();
+            void *start = context.createEvent(GPUEventPurpose::Timing);
+            void *end = context.createEvent(GPUEventPurpose::Timing);
             ASSERT_NE(stream, nullptr);
             ASSERT_NE(start, nullptr);
             ASSERT_NE(end, nullptr);
@@ -607,8 +607,8 @@ namespace
             TransferEngine engine;
             const std::array devices{device};
             void *stream = context.getOrCreateAuxiliaryStream("return_packet_economy");
-            void *start = context.createEvent();
-            void *end = context.createEvent();
+            void *start = context.createEvent(GPUEventPurpose::Timing);
+            void *end = context.createEvent(GPUEventPurpose::Timing);
             ASSERT_NE(stream, nullptr);
             ASSERT_NE(start, nullptr);
             ASSERT_NE(end, nullptr);
@@ -752,8 +752,8 @@ namespace
             TransferEngine engine;
             const std::array devices{device};
             void *stream = context.getOrCreateAuxiliaryStream("dispatch_packet_economy");
-            void *start = context.createEvent();
-            void *end = context.createEvent();
+            void *start = context.createEvent(GPUEventPurpose::Timing);
+            void *end = context.createEvent(GPUEventPurpose::Timing);
             ASSERT_NE(stream, nullptr);
             ASSERT_NE(start, nullptr);
             ASSERT_NE(end, nullptr);
@@ -917,8 +917,8 @@ namespace
             TransferEngine engine;
             const std::array devices{device};
             void *stream = context.getOrCreateAuxiliaryStream("return_batch_economy");
-            void *start = context.createEvent();
-            void *end = context.createEvent();
+            void *start = context.createEvent(GPUEventPurpose::Timing);
+            void *end = context.createEvent(GPUEventPurpose::Timing);
             ASSERT_NE(stream, nullptr);
             ASSERT_NE(start, nullptr);
             ASSERT_NE(end, nullptr);

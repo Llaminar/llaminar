@@ -549,6 +549,47 @@ namespace
 
 TEST(PlanningKernelServiceCatalogMPI, CPU_StreamingCollection) { proveStreamingCollection(DeviceType::CPU); }
 TEST(PlanningKernelServiceCatalogMPI, CPU_CommunicationService) { proveCommunicationService(DeviceType::CPU); }
+
+/**
+ * @test Authenticate projection policy even when it changes no CPU-only sample geometry.
+ *
+ * A GPU TP request can require counted mapped-host publication only for the
+ * projection-owned policy. Participants must agree on that policy before any
+ * measurement starts, rather than accidentally agreeing because their current
+ * inventory produces the same empty GPU sample lists. The matched collection
+ * afterward proves rejection leaves the MPI transaction usable.
+ */
+TEST(PlanningKernelServiceCatalogMPI, CPU_ProjectionPolicyDisagreementIsCollective)
+{
+    const auto mpi = MPIContextFactory::global();
+    const auto inventory = mpi->clusterInventory();
+    ASSERT_GE(mpi->world_size(), 2);
+    const AutomaticOrchestrationRequest request({
+        .only_backends = std::vector{DeviceType::CPU},
+        .only_strategies = std::vector{OrchestrationStrategy::TensorParallel}});
+    const std::array precisions{PlanningAllreducePrecision::FP32};
+    const auto policy = mpi->rank() == 1
+        ? RoutedExpertComputePolicy::GateUpOwnedDownColumns
+        : RoutedExpertComputePolicy::Apportioned;
+    const auto expected = PlanningCommunicationSamplePlan::resolve(
+        *inventory, request, 257, 31, precisions,
+        RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    ASSERT_TRUE(expected.native().empty());
+    ASSERT_TRUE(expected.hostDevice().empty());
+    EXPECT_THROW(PlanningCommunicationService::collect(
+        mpi, *inventory, request, 257, 31, precisions, policy), std::runtime_error);
+
+    const auto service = PlanningCommunicationService::collect(
+        mpi, *inventory, request, 257, 31, precisions,
+        RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    ASSERT_EQ(service.has_value(), mpi->is_root());
+    if (service)
+    {
+        EXPECT_TRUE(service->native().empty());
+        EXPECT_TRUE(service->hostDevice().empty());
+        EXPECT_EQ(service->mpi().size(), expected.mpi().size());
+    }
+}
 #ifdef HAVE_CUDA
 TEST(PlanningKernelServiceCatalogMPI, CUDA_CommunicationService)
 {

@@ -224,6 +224,47 @@ TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority
     }
 }
 
+/**
+ * @brief Auto preserves the requested routed arithmetic/ownership mode through apply.
+ *
+ * The planner remains free to select sparse endpoint ordinals and dense work
+ * policy. Neither normalization, serialization nor compilation may silently
+ * turn projection ownership or replication into whole-expert apportionment.
+ */
+TEST(AutomaticOrchestrationCandidates, LocalMoETPPreservesRoutedComputeConstraint)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto policy : {RoutedExpertComputePolicy::Apportioned,
+                                  RoutedExpertComputePolicy::Replicated,
+                                  RoutedExpertComputePolicy::GateUpOwnedDownColumns})
+        {
+            SCOPED_TRACE(::testing::Message() << deviceTypeToString(backend)
+                << " policy=" << routedExpertComputePolicyToString(policy));
+            auto inventory = hosts(1);
+            cards(inventory, 0, backend, 2);
+            auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+            config.routed_expert_compute_policy = policy;
+            const auto proposals = candidates(config, inventory, true);
+            ASSERT_EQ(proposals.size(), 2u);
+            for (const auto &proposal : proposals)
+            {
+                compile(proposal, true);
+                const auto applied = deserializeOrchestrationConfig(
+                    serializeOrchestrationConfig(proposal.config));
+                ExecutionPlanBuilder builder;
+                const auto resolved = ResolvedRankOrchestration::resolve(
+                    applied, model(true), proposal.membership.inventory(), builder, 0);
+                ASSERT_TRUE(resolved.config().moe_routed_expert_plan);
+                const auto &plan = *resolved.config().moe_routed_expert_plan;
+                ASSERT_EQ(plan.domains.size(), 1u);
+                EXPECT_EQ(plan.domains.front().routed_compute_policy, policy);
+                for (const auto &domain : plan.dense_domains)
+                    EXPECT_EQ(domain.routed_compute_policy, policy);
+                EXPECT_EQ(config.routed_expert_compute_policy, policy);
+            }
+        }
+}
+
 TEST(AutomaticOrchestrationCandidates,
      MultiTierLocalGpuContinuationOffersBothAdmittedDensePolicies)
 {

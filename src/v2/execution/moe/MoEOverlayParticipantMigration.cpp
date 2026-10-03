@@ -26,17 +26,17 @@ namespace llaminar2
     {
         /** @brief Select the shared-pointer field named by one wire projection. */
         std::shared_ptr<ITensorGemm> &projectionField(
-            MoEOverlayPreparedExpertTriplet &triplet,
+            std::array<std::shared_ptr<ITensorGemm>, 3> &engines,
             ExpertTierWeightProjection projection)
         {
             switch (projection)
             {
             case ExpertTierWeightProjection::Gate:
-                return triplet.gate;
+                return engines[0];
             case ExpertTierWeightProjection::Up:
-                return triplet.up;
+                return engines[1];
             case ExpertTierWeightProjection::Down:
-                return triplet.down;
+                return engines[2];
             }
             throw std::invalid_argument(
                 "ExpertOverlay arrival references an unknown projection role");
@@ -298,21 +298,21 @@ namespace llaminar2
                                 "ExpertOverlay local destination has no prepared arrival authority");
                         }
 
-                        MoEOverlayPreparedExpertTriplet triplet;
+                        MoEOverlayPreparedExpertPayload payload;
                         std::string arrival_error;
-                        if (!arrivals_[index]->completeTriplet(
-                                triplet, &arrival_error))
+                        if (!arrivals_[index]->completePayload(
+                                payload, &arrival_error))
                         {
                             throw std::runtime_error(
                                 arrival_error.empty()
-                                    ? "ExpertOverlay destination triplet is incomplete after transfer readiness"
+                                    ? "ExpertOverlay destination payload is incomplete after transfer readiness"
                                     : arrival_error);
                         }
                         local_candidate
                             ->bank.layers[static_cast<std::size_t>(
                                 migration.layer_idx)]
                             .setResidentExpert(
-                                migration.expert_id, std::move(triplet));
+                                migration.expert_id, std::move(payload));
                     }
 
                     /*
@@ -731,6 +731,13 @@ namespace llaminar2
         }
     } // namespace
 
+    MoEOverlayPreparedExpertArrival::MoEOverlayPreparedExpertArrival(DeviceMoEProjectionSet projections)
+        : projections_(projections)
+    {
+        if (projections != DeviceMoEProjectionSet::CompleteExpert && projections != DeviceMoEProjectionSet::GateUp)
+            throw std::invalid_argument("ExpertOverlay arrival requires a known projection family");
+    }
+
     bool MoEOverlayPreparedExpertArrival::publish(
         ExpertTierWeightProjection projection,
         std::shared_ptr<ITensorGemm> engine,
@@ -738,10 +745,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
-        if (!engine)
+        if (!engine || (projections_ == DeviceMoEProjectionSet::GateUp &&
+                        projection == ExpertTierWeightProjection::Down))
         {
             if (error)
-                *error = "ExpertOverlay cannot publish a null prepared projection";
+                *error = "ExpertOverlay cannot publish an absent or non-movable projection";
             return false;
         }
 
@@ -754,7 +762,7 @@ namespace llaminar2
         }
         try
         {
-            auto &field = projectionField(triplet_, projection);
+            auto &field = projectionField(engines_, projection);
             if (field && field.get() != engine.get())
             {
                 if (error)
@@ -783,8 +791,8 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEOverlayPreparedExpertArrival::completeTriplet(
-        MoEOverlayPreparedExpertTriplet &triplet,
+    bool MoEOverlayPreparedExpertArrival::completePayload(
+        MoEOverlayPreparedExpertPayload &payload,
         std::string *error) const
     {
         if (error)
@@ -794,17 +802,20 @@ namespace llaminar2
         {
             if (error)
                 *error = failure_;
-            triplet = {};
+            payload = {};
             return false;
         }
-        if (!triplet_.complete())
+        if (!engines_[0] || !engines_[1] ||
+            (projections_ == DeviceMoEProjectionSet::CompleteExpert && !engines_[2]))
         {
             if (error)
-                *error = "ExpertOverlay destination does not have a complete gate/up/down triplet";
-            triplet = {};
+                *error = projections_ == DeviceMoEProjectionSet::CompleteExpert
+                    ? "ExpertOverlay destination does not have its complete gate/up/down payload"
+                    : "ExpertOverlay destination does not have its complete gate/up payload";
+            payload = {};
             return false;
         }
-        triplet = triplet_;
+        payload = MoEOverlayPreparedExpertPayload::fromProjections(projections_, engines_);
         return true;
     }
 

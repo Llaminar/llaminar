@@ -12,6 +12,9 @@
  * prefill additionally retains each live bucket under an explicit context and
  * joins sequence-shaped values back into one full-prompt checkpoint only after
  * all chunks have published their diagnostic copies.
+ * Projection-distributed experts publish per-route output-column shards at
+ * the down producer and complete folded rows at the assembly producer; their
+ * typed publication contracts prevent the ordinary expert-sum interpretation.
  *
  * Extracted from DeviceGraphOrchestrator.h (Phase 2 of DGO refactor).
  */
@@ -201,9 +204,13 @@ namespace llaminar2
          * overlay-return ordered reducer or the mapped-sparse local reducer.
          * A single-participant continuation publishes the identical views at
          * its final mapped return join, after grouped planning has finalized
-         * the invocation-local domain assignment ledger. All three nodes are
-         * observations of the same runtime-table authority: their root-only
-         * `output` is the complete routed value in original route order.
+         * the invocation-local domain assignment ledger. Projection-distributed
+         * execution publishes the same evidence after assembling full rows on
+         * every participant. Its down producer publishes column-sharded route
+         * addends separately, before folding and scratch reuse. These nodes
+         * observe the same runtime authority;
+         * the projection output additionally declares complete-value semantics
+         * so TP diagnostic aggregation does not sum its identical replicas.
          */
         std::string pinnedRouteEvidencePrefix(
             const std::string &stage_name)
@@ -219,6 +226,12 @@ namespace llaminar2
                 marker = stage_name.find(kMappedSparseLocalTPReduce);
             if (marker == std::string::npos)
                 marker = stage_name.find(kMappedReturn);
+            if (marker == std::string::npos && stage_name.ends_with("_projection_assemble"))
+                marker = stage_name.size() - std::string_view("_projection_assemble").size();
+            if (marker == std::string::npos && stage_name.ends_with("_projection_import_down"))
+                marker = stage_name.size() - std::string_view("_projection_import_down").size();
+            if (marker == std::string::npos && stage_name.ends_with("_projection_shared_columns"))
+                marker = stage_name.size() - std::string_view("_projection_shared_columns").size();
             return marker == std::string::npos
                        ? std::string{}
                        : stage_name.substr(0, marker);
@@ -238,6 +251,12 @@ namespace llaminar2
         {
             if (output_name == "output")
                 return prefix + "_MOE_EXPERT_OUTPUT";
+            if (output_name == "routed_output")
+                return prefix + "_MOE_EXPERT_OUTPUT";
+            if (output_name == "shared_output")
+                return prefix + "_MOE_SHARED_GATE_OUTPUT";
+            if (output_name == "combined_output")
+                return prefix + "_MOE_COMBINED_OUTPUT";
             if (output_name == "canonical_route_contributions")
                 return prefix + "_MOE_ROUTE_CONTRIBUTIONS";
             if (output_name == "domain_route_participant_ids")
@@ -677,7 +696,18 @@ namespace llaminar2
                 const std::string key =
                     pinnedRouteEvidenceKey(prefix, output_name);
                 if (!key.empty() && output.data)
-                    storeOutput(key, output);
+                {
+                    if ((output_name == "output" || output_name == "combined_output") && name.ends_with("_projection_assemble"))
+                        storeOutput(key, output, SnapshotPublication::CompleteValue);
+                    else if (name.ends_with("_projection_shared_columns") &&
+                             (output_name == "routed_output" || output_name == "shared_output"))
+                        storeOutput(key, output, SnapshotPublication::ColumnPartition);
+                    else if (output_name == "canonical_route_contributions" &&
+                             name.ends_with("_projection_import_down"))
+                        storeOutput(key, output, SnapshotPublication::ColumnPartition);
+                    else
+                        storeOutput(key, output);
+                }
             }
             return;
         }
@@ -1008,6 +1038,7 @@ namespace llaminar2
 
             size_t total_rows = 0;
             std::vector<float> joined;
+            SnapshotOwnedRows joined_ownership;
             for (size_t chunk_index = 0;
                  chunk_index < chunks.size();
                  ++chunk_index)
@@ -1057,6 +1088,12 @@ namespace llaminar2
                                    ")";
                     return result;
                 }
+                if (piece.publication == SnapshotPublication::RowPartition)
+                {
+                    validateSnapshotOwnedRows(piece.row_ownership, live_rows);
+                    for (const auto &range : piece.row_ownership.intervals)
+                        joined_ownership.intervals.push_back({total_rows + range.begin, range.count});
+                }
                 total_rows += live_rows;
 
                 if (live_rows >
@@ -1092,7 +1129,8 @@ namespace llaminar2
                 std::move(joined),
                 total_rows,
                 first.cols,
-                first.publication);
+                first.publication,
+                std::move(joined_ownership));
             ++result.aggregated_sequence_keys;
         }
 
@@ -1520,6 +1558,8 @@ namespace llaminar2
                 pinnedRouteEvidencePrefix(stage_name);
             !prefix.empty())
         {
+            if (stage_name.ends_with("_projection_import_down"))
+                return {prefix + "_MOE_ROUTE_CONTRIBUTIONS"};
             std::vector<std::string> keys{
                 prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
                 prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS",
@@ -1686,7 +1726,8 @@ namespace llaminar2
         std::vector<float> data,
         size_t rows,
         size_t cols,
-        SnapshotPublication publication)
+        SnapshotPublication publication,
+        SnapshotOwnedRows row_ownership)
     {
         snapshots_[key] = std::make_shared<const StoredSnapshot>(
             StoredSnapshot{
@@ -1694,6 +1735,7 @@ namespace llaminar2
                 .rows = rows,
                 .cols = cols,
                 .publication = publication,
+                .row_ownership = std::move(row_ownership),
             });
     }
 
@@ -1704,9 +1746,20 @@ namespace llaminar2
     {
         if (!out.data)
             return;
+        if (std::holds_alternative<SnapshotCompactRows>(out.row_layout))
+            throw std::logic_error("Compact snapshot rows must be observed before publication");
         auto data = extractFp32FromOutput(out);
         if (!data.empty())
-            storeSnapshot(key, std::move(data), out.rows, out.cols, publication);
+        {
+            if (const auto *owned = std::get_if<SnapshotOwnedRows>(&out.row_layout))
+            {
+                if (publication != SnapshotPublication::SchemaPartition)
+                    throw std::logic_error("Conflicting explicit snapshot publication policies");
+                validateSnapshotOwnedRows(*owned, out.rows);
+                storeSnapshot(key, std::move(data), out.rows, out.cols, SnapshotPublication::RowPartition, *owned);
+            }
+            else storeSnapshot(key, std::move(data), out.rows, out.cols, publication);
+        }
     }
 
 } // namespace llaminar2

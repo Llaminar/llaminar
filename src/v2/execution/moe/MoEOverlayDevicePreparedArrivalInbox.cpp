@@ -52,20 +52,16 @@ namespace llaminar2
          * keeping the descriptor ineligible for local compute before RCU apply.
          */
         bool exportArrival(
-            const MoEOverlayPreparedExpertTriplet &triplet,
+            const MoEOverlayPreparedExpertPayload &payload,
             int expert,
             DeviceMoEExpertDescriptor *output) noexcept
         {
-            if (!output || expert < 0 || !triplet.complete())
+            if (!output || expert < 0 || !payload.ready())
             {
                 return false;
             }
             DeviceMoEExpertDescriptor descriptor{};
-            if (!exportDeviceMoEExpertWeightDescriptors(
-                    triplet.gate.get(),
-                    triplet.up.get(),
-                    triplet.down.get(),
-                    descriptor))
+            if (!exportDeviceMoEPreparedPayload(payload, descriptor))
             {
                 return false;
             }
@@ -226,11 +222,11 @@ namespace llaminar2
                     error,
                     "device prepared-arrival inbox lost a local destination lifetime");
             }
-            MoEOverlayPreparedExpertTriplet triplet;
+            MoEOverlayPreparedExpertPayload payload;
             std::string arrival_error;
-            if (!arrival->completeTriplet(triplet, &arrival_error) ||
+            if (!arrival->completePayload(payload, &arrival_error) ||
                 !exportArrival(
-                    triplet,
+                    payload,
                     migration.expert_id,
                     prepared_arrivals_staging_ + ordinal))
             {

@@ -65,6 +65,31 @@ TEST(OrchestrationPlanConfig, AutomaticFilterOverridesReplaceYamlSetsWithoutWide
     EXPECT_FALSE(request.allows(OrchestrationStrategy::PipelineParallel));
 }
 
+/** @test Projection ownership is explicit, lossless and never the whole-expert default. */
+TEST(OrchestrationPlanConfig, GateUpProjectionOwnershipIsAnExplicitPhysicalMode)
+{
+    EXPECT_EQ(parse({}).routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    const auto request = parse({"--moe-routed-expert-compute", "gate-up-owned-down-columns"});
+    EXPECT_EQ(request.routed_expert_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    const auto restored = deserializeOrchestrationConfig(serializeOrchestrationConfig(request));
+    EXPECT_EQ(restored.routed_expert_compute_policy, request.routed_expert_compute_policy);
+    for (const auto *backend : {"cuda", "rocm"})
+    {
+        const auto config = parse({"--expert-tier", std::string("native=") + backend + ":0," + backend +
+            ":1;priority=0;routed_compute=gate-up-owned-down-columns"});
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        const auto &domain = config.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(domain.routed_compute_policy, request.routed_expert_compute_policy);
+        EXPECT_TRUE(domain.toExecutionDomainDefinition().validate().empty());
+        auto invalid = domain;
+        invalid.scope = ExecutionDomainScope::GLOBAL;
+        EXPECT_FALSE(invalid.toExecutionDomainDefinition().validate().empty());
+        invalid = domain;
+        invalid.participants.front().device_type = DeviceType::CPU;
+        EXPECT_FALSE(invalid.toExecutionDomainDefinition().validate().empty());
+    }
+}
+
 TEST(OrchestrationPlanConfig, CommandPresentationPreservesTheCompleteServingPolicy)
 {
     const std::vector<std::string> policy{

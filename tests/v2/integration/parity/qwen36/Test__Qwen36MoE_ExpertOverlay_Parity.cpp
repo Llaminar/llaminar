@@ -45,17 +45,23 @@ namespace
         {
             const std::array definitions = {
                 qwen36MoECPU2NodeTPParityDefinition(),
-                qwen36MoEParityDefinition(
+                qwen36MoEExpertOverlayCertificationDefinition(
                     qwen36MoECuda2ExpertOverlayTopology(),
-                    "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-                    qwen36MoEExpertOverlayThresholds()),
-                qwen36MoEParityDefinition(
+                    "pytorch_qwen36_moe_singledevice_cuda_snapshots"),
+                qwen36MoEExpertOverlayCertificationDefinition(
                     qwen36MoERocm2ExpertOverlayTopology(),
-                    "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-                    qwen36MoEExpertOverlayThresholds()),
+                    "pytorch_qwen36_moe_singledevice_rocm_snapshots"),
             };
 
             auto all_definitions = withOrnith15CertificationModels(definitions);
+            // A separately selectable physical mode, not a new fixture or a
+            // reduced matrix. Reuse the whole-expert model/reference definition
+            // and expand all placement, movement, MTP and prefix checks.
+            for (std::size_t i = 1; i < definitions.size(); ++i)
+            {
+                all_definitions.push_back(qwen36MoEProjectionParityDefinition(
+                    definitions[i].topology, definitions[i].model.reference_directory));
+            }
             // Keep the observed HTTP wrong-answer case in the same typed
             // expander as every other real-weight diagnostic.  Its standard
             // Static/Ordinal MTP-off cell gives checkpoint CSV evidence for
@@ -64,9 +70,9 @@ namespace
                 ornith15MoEQ4ChatNoThinkingForwardParityDefinition(
                     qwen36MoECuda2ExpertOverlayTopology(),
                     "pytorch_ornith15_q4_chat_nonthinking_cuda2_snapshots"));
-            all_definitions.push_back(ornith15MoEQ8AccuracyParityDefinition(
-                ornith15MoERocm4ExpertOverlayTopology(),
-                "pytorch_ornith15_q8_natural_decode_rocm4_snapshots"));
+            // Tag the reported Q8 deployment itself, not the Q4 fine-tune's
+            // superficially similar overlay or another handwritten HTTP case.
+            all_definitions.push_back(ornith15MoEQ8Rocm4CertificationDefinition());
             std::vector<ModelParityCase> expanded;
             for (const auto &definition : all_definitions)
             {

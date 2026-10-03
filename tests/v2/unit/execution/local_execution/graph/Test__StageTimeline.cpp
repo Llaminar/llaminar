@@ -68,8 +68,11 @@ namespace
         }
         void resetAuxiliaryStreams() override {}
 
-        void *createEvent() override
+        /** @copydoc IWorkerGPUContext::createEvent */
+        void *createEvent(GPUEventPurpose purpose = GPUEventPurpose::Ordering) override
         {
+            (void)gpuEventHasTiming(purpose);
+            event_purposes_.push_back(purpose);
             events_created_++;
             // Return distinct fake pointers by using a counter
             return reinterpret_cast<void *>(static_cast<uintptr_t>(0xEE000000 + events_created_));
@@ -126,6 +129,7 @@ namespace
 
         // --- Test inspection ---
         int events_created_ = 0;
+        std::vector<GPUEventPurpose> event_purposes_;
         int events_recorded_ = 0;
         int events_synchronized_ = 0;
         int synchronize_failures_ = 0;
@@ -240,6 +244,7 @@ TEST_F(Test__StageTimeline, Initialize_CreatesEventPairs)
     EXPECT_TRUE(timeline.isInitialized());
     // 5 stages × 2 events (start + stop) = 10 events
     EXPECT_EQ(gpu_ctx_->events_created_, 10);
+    EXPECT_EQ(gpu_ctx_->event_purposes_, std::vector<GPUEventPurpose>(10, GPUEventPurpose::Timing));
 }
 
 TEST_F(Test__StageTimeline, RecordAndCollect_BasicFlow)
@@ -740,6 +745,10 @@ TEST_F(Test__StageTimeline, EnsureCapacity_GrowDoesNotSetValidFlags)
 
     // Grow to 5 stages
     timeline.ensureCapacity(gpu_ctx_.get(), 5);
+
+    // Growth must preserve timing instrumentation instead of silently using
+    // the ordinary ordering-only default for newly admitted event pairs.
+    EXPECT_EQ(gpu_ctx_->event_purposes_, std::vector<GPUEventPurpose>(10, GPUEventPurpose::Timing));
 
     // New slots should NOT be valid
     gpu_ctx_->events_synchronized_ = 0;

@@ -175,6 +175,33 @@ namespace llaminar2::test::parity
     }
 
     /**
+     * @brief Preserve routed arithmetic intent while leaving device placement to auto.
+     * @param cell Canonical model/topology definition, not a resolved runtime plan.
+     * @return The uniform routed policy, or no routed policy for a dense topology.
+     * @throws std::invalid_argument when one global auto constraint cannot express
+     *         the declared per-domain policies without changing their semantics.
+     *
+     * Device counts alone do not distinguish whole-expert ownership from movable
+     * gate/up ownership. Dropping this value would certify the old implementation
+     * under a new cell name. Heterogeneous per-domain policies need an authored
+     * placement rather than an invented common policy.
+     */
+    inline std::optional<RoutedExpertComputePolicy> modelParityAutomaticRoutedComputePolicy(
+        const ModelParityCase &cell)
+    {
+        if (!cell.topology.isExpertOverlay()) return std::nullopt;
+        const auto &domains = cell.topology.expert_overlay_plan->domains;
+        if (domains.empty()) throw std::invalid_argument("automatic overlay requires routed domains");
+        const auto policy = domains.front().routed_compute_policy;
+        if (policy == RoutedExpertComputePolicy::Unspecified ||
+            std::any_of(domains.begin(), domains.end(), [policy](const auto &domain) {
+                return domain.routed_compute_policy != policy;
+            }))
+            throw std::invalid_argument("automatic cell requires one explicit routed compute policy");
+        return policy;
+    }
+
+    /**
      * @brief Share automatic placement intent between HTTP and benchmarks.
      * @param cell Sole model/topology declaration supplying counts and strategy.
      * @return CLI constraints, without performance or correctness overrides.
@@ -198,6 +225,8 @@ namespace llaminar2::test::parity
         if (cell.expert_overlay)
             args.insert(args.end(), {"--moe-routed-expert-owner-order",
                 cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random"});
+        if (const auto policy = modelParityAutomaticRoutedComputePolicy(cell))
+            args.insert(args.end(), {"--moe-routed-expert-compute", routedExpertComputePolicyToString(*policy)});
         return args;
     }
 
@@ -437,11 +466,13 @@ namespace llaminar2::test::parity
      * @brief Expand remote-host declarations over both mandatory public routes.
      * @param cell Existing selected source; model identity remains in its parent record.
      * @param out Discovery stream, receiving a complete JSON array.
+     * @throws std::invalid_argument if the cell cannot express remote automatic intent.
      *
      * A scenario declares intent, never claims that hardware was provisioned or
      * a plan passed. Rank/host binding, remote expert rows and MPI payloads must
      * be authenticated by the later live E2E phase. Local shared-memory traffic
-     * cannot satisfy its cross-host obligation.
+     * cannot satisfy its cross-host obligation. Topology and planning both use
+     * the sealed host-count authority for complete communicator membership.
      */
     inline void writeModelParityCrossHostE2E(const ModelParityCase &cell, std::ostream &out)
     {
@@ -459,6 +490,9 @@ namespace llaminar2::test::parity
                     auto route_args = args;
                     route_args.insert(route_args.end(), {"--auto-device-counts",
                         backend + "=1,cpu=" + std::to_string(remote.count())});
+                    // Compute cardinality alone does not seal MPI membership:
+                    // the planning contract also needs the continuation rank.
+                    // Derive both records from the same typed host declaration.
                     out << (first ? "" : ",") << "{\"schema\":1,\"id\":"
                         << modelParityJsonString(cell.testName() + "_RemoteCPU" + std::to_string(remote.count()) + "_" + route_name)
                         << ",\"frontend\":" << modelParityJsonString(route_name)
@@ -469,7 +503,8 @@ namespace llaminar2::test::parity
                         << ",\"continuation_priority\":0,\"remote_priority\":1}"
                         << ",\"movement_evidence\":\"required\",\"owner_order\":\"ordinal\""
                         << ",\"planning\":{\"mode\":\"auto\",\"strategy\":\"expert-overlay\",\"device_counts\":{"
-                        << modelParityJsonString(backend) << ":1,\"cpu\":" << remote.count() << "}}"
+                        << modelParityJsonString(backend) << ":1,\"cpu\":" << remote.count()
+                        << "},\"mpi_ranks\":" << remote.executionRanks() << "}"
                         << ",\"server_policy_args\":[";
                     for (std::size_t i = 0; i < route_args.size(); ++i)
                         out << (i ? "," : "") << modelParityJsonString(route_args[i]);
@@ -569,6 +604,8 @@ namespace llaminar2::test::parity
             first = false;
         }
         *out << "}";
+        if (const auto policy = modelParityAutomaticRoutedComputePolicy(cell))
+            *out << ",\"routed_compute\":" << modelParityJsonString(routedExpertComputePolicyToString(*policy));
         if (cell.topology.kind == ModelParityTopologyKind::RankLocalPipelineParallel)
         {
             // This is a shape obligation, not authored placement. Auto retains

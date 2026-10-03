@@ -467,8 +467,14 @@ namespace llaminar2::test
 
         EXPECT_FALSE(table.hasInitialRuntimeState());
         EXPECT_FALSE(table.hasCompleteInitialRuntimeState());
+        for (int layer = 0; layer < kLayers; ++layer)
+            EXPECT_FALSE(table.hasInitialLayerRuntimeState(layer));
+        EXPECT_THROW(table.hasInitialLayerRuntimeState(kLayers), std::out_of_range);
         publish_layer(0);
         publish_layer(1);
+        EXPECT_TRUE(table.hasInitialLayerRuntimeState(0));
+        EXPECT_TRUE(table.hasInitialLayerRuntimeState(1));
+        EXPECT_FALSE(table.hasInitialLayerRuntimeState(2));
         EXPECT_TRUE(table.hasInitialRuntimeState());
         EXPECT_FALSE(table.hasCompleteInitialRuntimeState())
             << "An inactive retained MTP/NextN layer cannot be omitted from "
@@ -476,6 +482,12 @@ namespace llaminar2::test
                "does not execute it";
         publish_layer(2);
         EXPECT_TRUE(table.hasCompleteInitialRuntimeState());
+        table.resetDecodeRuntimeState();
+        for (int layer = 0; layer < kLayers; ++layer)
+            EXPECT_FALSE(table.hasInitialLayerRuntimeState(layer));
+        table.restoreInitialRuntimeState();
+        for (int layer = 0; layer < kLayers; ++layer)
+            EXPECT_TRUE(table.hasInitialLayerRuntimeState(layer));
     }
 
     TEST(Test__MoERuntimeTable,

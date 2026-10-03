@@ -3,7 +3,7 @@
  * @brief Physical allocation lifetimes for device-owned ExpertOverlay epochs.
  *
  * Device-resident policy deliberately has no host owner-map mirror.  The byte
- * transport still needs to retain the prepared engine triplets backing raw GPU
+ * transport still needs to retain the prepared engine payloads backing raw GPU
  * descriptors and to know when a departed slot can be recycled.  This ledger
  * records only those physical facts.  It cannot observe histograms, score a
  * placement, change a movement command, or publish a device runtime bank.
@@ -48,17 +48,17 @@ namespace llaminar2
         MoEOverlayDevicePhysicalSlotKey key;
         std::uint64_t entered_epoch = 0u;
         bool bootstrap_allocation = true;
-        MoEOverlayPreparedExpertTriplet triplet;
+        MoEOverlayPreparedExpertPayload payload;
 
-        /** @return Whether identity, epoch, and all three engines are complete. */
+        /** @return Whether identity, epoch, and the declared payload family are complete. */
         [[nodiscard]] bool valid() const noexcept;
     };
 
-    /** @brief One completed destination triplet awaiting device RCU publication. */
+    /** @brief One completed destination payload awaiting device RCU publication. */
     struct MoEOverlayDeviceStagedPhysicalArrival
     {
         MoEOverlayDevicePhysicalSlotKey key;
-        MoEOverlayPreparedExpertTriplet triplet;
+        MoEOverlayPreparedExpertPayload payload;
 
         /** @return Whether identity and all prepared engines are complete. */
         [[nodiscard]] bool valid() const noexcept;
@@ -70,14 +70,14 @@ namespace llaminar2
         MoEOverlayDevicePhysicalSlotKey key;
         std::uint64_t entered_epoch = 0u;
         bool bootstrap_allocation = false;
-        MoEOverlayPreparedExpertTriplet triplet;
+        MoEOverlayPreparedExpertPayload payload;
     };
 
     /**
      * @brief One immutable entry in a quiescent device-owned physical epoch.
      *
      * Shared prepared-engine ownership makes this snapshot cheap: copying an
-     * entry retains three engine lifetimes but never copies weight bytes.  The
+     * entry retains its declared engine lifetimes but never copies weight bytes. The
      * terminal model-context sealer uses these entries instead of consulting a
      * deliberately stale host participant-bank mirror.
      */
@@ -86,9 +86,9 @@ namespace llaminar2
         MoEOverlayDevicePhysicalSlotKey key;
         std::uint64_t entered_epoch = 0u;
         bool bootstrap_allocation = false;
-        MoEOverlayPreparedExpertTriplet triplet;
+        MoEOverlayPreparedExpertPayload payload;
 
-        /** @return Whether identity, birth epoch, and engine triplet are complete. */
+        /** @return Whether identity, birth epoch, and engine payload are complete. */
         [[nodiscard]] bool valid() const noexcept;
     };
 
@@ -112,7 +112,7 @@ namespace llaminar2
      *
      * Lifecycle is strictly `begin -> stage -> publish -> retire`, or
      * `begin -> abort`. `publish` advances physical epoch identity only after
-     * destination triplets are complete; `retire` releases sources only after
+     * destination payloads are complete; `retire` releases sources only after
      * the device controller's old-reader barrier. Exactly one wave may exist,
      * matching the controller's one-transaction ABI.
      */
@@ -125,6 +125,8 @@ namespace llaminar2
             std::uint64_t initial_epoch = 0u;
             std::vector<int> local_participant_ids;
             std::vector<MoEOverlayDeviceInitialPhysicalSlot> initial_slots;
+            /** Immutable family accepted for sources and every future arrival. */
+            DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
         };
 
         /**
@@ -157,10 +159,10 @@ namespace llaminar2
          * @param batch Exact active batch identity.
          * @param key Source coordinate named by one migration.
          * @param error Optional exact rejection diagnostic.
-         * @return Copy of the shared triplet lifetime, or no value on rejection.
+         * @return Copy of the shared payload lifetime, or no value on rejection.
          */
-        [[nodiscard]] std::optional<MoEOverlayPreparedExpertTriplet>
-        sourceTriplet(
+        [[nodiscard]] std::optional<MoEOverlayPreparedExpertPayload>
+        sourcePayload(
             const MoEOverlayDevicePhysicalMovementBatch &batch,
             const MoEOverlayDevicePhysicalSlotKey &key,
             std::string *error = nullptr) const noexcept;
@@ -168,7 +170,7 @@ namespace llaminar2
         /**
          * @brief Retain every completed local destination before RCU apply.
          * @param batch Exact active batch identity.
-         * @param arrivals Exactly one complete triplet per local destination.
+         * @param arrivals Exactly one complete payload per local destination.
          * @param error Optional exact rejection diagnostic.
          * @return True after the inactive physical inventory is complete.
          */
@@ -221,7 +223,7 @@ namespace llaminar2
          *
          * A snapshot is legal only after the transaction pipeline has drained:
          * the requested epoch must equal the ledger's current epoch and no
-         * begun/staged/published wave may remain. Copying shared triplets does
+         * begun/staged/published wave may remain. Copying shared payloads does
          * not copy, download, synchronize, or repack their weight bytes.
          */
         [[nodiscard]] std::optional<

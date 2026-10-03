@@ -762,7 +762,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     MoEOverlayParticipantResidencyBank bank{
         .epoch = 1, .participant_id = 0, .device = DeviceId::cpu(),
         .layers = {{std::vector<bool>(experts, false),
-                    std::vector<MoEOverlayPreparedExpertTriplet>(experts)}}};
+                    std::vector<MoEOverlayPreparedExpertPayload>(experts)}}};
     for (int expert = 0; expert < experts; ++expert)
         bank.layers[0].setResidentExpert(expert,
             {engines[expert * 3], engines[expert * 3 + 1], engines[expert * 3 + 2]});
@@ -1750,11 +1750,11 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     epoch_one.layers[0].setResidentExpert(
         0,
         {
-            .gate = std::make_shared<FakePreparedGemm>(
+            std::make_shared<FakePreparedGemm>(
                 nativeDesc(0, 0, 32, kDModel)),
-            .up = std::make_shared<FakePreparedGemm>(
+            std::make_shared<FakePreparedGemm>(
                 nativeDesc(0, 1, 32, kDModel)),
-            .down = std::make_shared<FakePreparedGemm>(
+            std::make_shared<FakePreparedGemm>(
                 nativeDesc(0, 2, kDModel, 32)),
         });
     std::string error;

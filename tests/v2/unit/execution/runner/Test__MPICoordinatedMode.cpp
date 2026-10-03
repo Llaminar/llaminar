@@ -2,9 +2,9 @@
  * @file Test__MPICoordinatedMode.cpp
  * @brief Unit tests for MPI coordinated mode in OrchestrationRunner
  *
- * Tests the MPI worker loop protocol where rank 0 broadcasts commands
- * to non-root ranks, enabling them to participate in inference collectives
- * (AllreduceStage) in lockstep.
+ * Tests the MPI worker loop protocol where the resolved command root publishes
+ * metadata to peers. Prompt payloads reach only continuation consumers; expert
+ * followers retain their sparse ticket lifecycle without unused token traffic.
  *
  * Uses a RecordingMPIContext that records all broadcast calls (data + types)
  * so we can verify the protocol without real MPI.
@@ -25,6 +25,7 @@
 
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string_view>
 
 using namespace llaminar2;
@@ -203,6 +204,36 @@ namespace
             return forward_success_;
         }
 
+        /**
+         * @brief Admit positive live prompt extents in the protocol-only witness.
+         * @param seq_len Live prompt token count.
+         * @return Whether this witness can record the scheduled request.
+         */
+        bool supportsPrefillChunkSchedule(int seq_len) const override
+        {
+            return seq_len > 0;
+        }
+
+        /**
+         * @brief Accept the production prefill entrypoint in this protocol witness.
+         * @param tokens Exact unpadded request data to record.
+         * @param seq_len Live prompt count.
+         * @param policy Scheduling policy, irrelevant to the device-free witness.
+         * @param pad_token_id Unused: this witness never adds padded model rows.
+         * @param allow_padded_execution Unused: only live tokens are recorded.
+         * @return The same injected outcome as the ordinary forward witness.
+         */
+        bool forwardPrefillChunkSchedule(
+            const int *tokens, int seq_len,
+            const PrefillChunkSchedulerPolicy &policy, int pad_token_id,
+            bool allow_padded_execution) override
+        {
+            (void)policy;
+            (void)pad_token_id;
+            (void)allow_padded_execution;
+            return forward(tokens, seq_len);
+        }
+
         const float *logits() const override { return logits_.data(); }
         int vocab_size() const override { return VOCAB_SIZE; }
         void clear_cache() override { clear_cache_count_++; }
@@ -325,7 +356,8 @@ namespace
         RunnerBundle createRunner(
             int mpi_rank,
             int mpi_world_size,
-            int retained_mtp_draft_capacity = 0)
+            int retained_mtp_draft_capacity = 0,
+            std::shared_ptr<MoERoutedExpertPlacementPlan> overlay = {})
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get();
@@ -340,6 +372,7 @@ namespace
                 PrefixCacheStorageMode::Disabled;
             config.mtp.graph_capacity_draft_tokens =
                 retained_mtp_draft_capacity;
+            config.moe_routed_expert_plan = std::move(overlay);
 
             auto plan = createPlan(mpi_rank);
             plan.runtime.prefix_cache.enabled = false;
@@ -434,6 +467,104 @@ namespace
         // Verify forward was called with the tokens
         EXPECT_EQ(mock->forwardCallCount(), 1);
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(1, 2, 3));
+    }
+
+    // =========================================================================
+    // Prompt recipients: ordinary consumers versus expert-only followers
+    // =========================================================================
+
+    /** @brief Device-free resolved topology with one continuation and one expert rank. */
+    std::shared_ptr<MoERoutedExpertPlacementPlan> promptRecipientOverlay(int root)
+    {
+        auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
+        overlay->enabled = true;
+        overlay->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay->continuation_domain = overlay->base_model_domain =
+            overlay->shared_expert_domain = "continuation";
+        overlay->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        for (int role = 0; role != 2; ++role)
+        {
+            RoutedExpertDomain domain;
+            domain.name = role == 0 ? "continuation" : "experts";
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            domain.backend = CollectiveBackendType::HOST;
+            domain.owner_rank = role == 0 ? root : 1 - root;
+            domain.participants = {GlobalDeviceAddress::cpu(domain.owner_rank)};
+            overlay->domains.push_back(domain);
+            RoutedExpertTier tier;
+            tier.name = domain.name;
+            tier.domain = domain.name;
+            tier.priority = role;
+            tier.fallback = role == 1;
+            overlay->routed_tiers.push_back(tier);
+        }
+        return overlay;
+    }
+
+    TEST_F(Test__MPICoordinatedMode, ExpertOverlayPrefillPublishesHeaderWithoutUnusedPromptBytes)
+    {
+        for (int root : {0, 1})
+        {
+            auto [runner, mock, mpi] = createRunner(root, 2, 0, promptRecipientOverlay(root));
+            ASSERT_EQ(runner->coordinatedRootRank(), root);
+            runner->setMPICoordinatedMode(true);
+            for (std::size_t count : {8192u, 1u, 65u, 3u})
+            {
+                const std::vector<std::int32_t> prompt(count, 7);
+                mpi->clearRecords();
+                ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+                // The ordinary PREFILL tag and three-word progress header are
+                // retained. The sole consumer owns its tokens already.
+                ASSERT_EQ(mpi->broadcastCount(), 2u);
+                EXPECT_THAT(mpi->broadcasts()[0].int_data, ElementsAre(
+                    static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)));
+                EXPECT_THAT(mpi->broadcasts()[1].int_data,
+                            ElementsAre(static_cast<int32_t>(count), 0, 0));
+                EXPECT_EQ(mpi->broadcasts()[0].root, root);
+                EXPECT_EQ(mpi->broadcasts()[1].root, root);
+                EXPECT_EQ(mock->lastForwardTokens(), prompt);
+            }
+            EXPECT_EQ(mpi->barrierCount(), 0u);
+        }
+    }
+
+    TEST(ContinuationRequestGroup, ExpertFollowersNeverAllocateOrReceivePromptPayloads)
+    {
+        for (int root : {0, 1})
+        {
+            auto mpi = std::make_shared<RecordingMPIContext>(1 - root, 2);
+            ContinuationRequestGroup group(mpi, {root});
+            EXPECT_EQ(group.role(), ContinuationRequestGroup::Role::ExpertOnly);
+            EXPECT_EQ(group.scope(), ContinuationRequestGroup::Scope::ProcessLocalContinuation);
+            for (std::size_t count : {8192u, 1u, 31u})
+            {
+                const auto tokens = group.receivePrompt(count, root);
+                EXPECT_TRUE(tokens.empty());
+                EXPECT_EQ(tokens.capacity(), 0u);
+            }
+            EXPECT_EQ(mpi->broadcastCount(), 0u);
+            EXPECT_EQ(mpi->barrierCount(), 0u);
+            EXPECT_THROW((void)group.coordinationCommunicator(), std::logic_error);
+            EXPECT_THROW(group.publishPrompt(std::vector<int32_t>{1}, root), std::logic_error);
+        }
+    }
+
+    TEST(ContinuationRequestGroup, InvalidMembershipAndPromptAuthorityFailBeforeTransport)
+    {
+        auto mpi = std::make_shared<RecordingMPIContext>(0, 3);
+        for (const auto &members : std::vector<std::vector<int>>{
+                 {}, {-1}, {3}, {0, 0}, {1, 0}, {0, 1, 1}})
+            EXPECT_THROW((void)ContinuationRequestGroup(mpi, members), std::invalid_argument);
+        ContinuationRequestGroup group(mpi, {0});
+        EXPECT_THROW(group.publishPrompt({}, 0), std::invalid_argument);
+        EXPECT_THROW(group.publishPrompt(std::vector<int32_t>{1}, 1), std::invalid_argument);
+        EXPECT_THROW((void)group.receivePrompt(1, 0), std::logic_error);
+        ContinuationRequestGroup excluded(std::make_shared<RecordingMPIContext>(1, 3), {0});
+        EXPECT_THROW((void)excluded.receivePrompt(0, 0), std::invalid_argument);
+        EXPECT_THROW((void)excluded.receivePrompt(
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) + 1u, 0),
+            std::invalid_argument);
+        EXPECT_EQ(mpi->broadcastCount(), 0u);
     }
 
     // =========================================================================

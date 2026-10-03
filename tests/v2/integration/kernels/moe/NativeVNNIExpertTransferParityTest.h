@@ -88,8 +88,10 @@ namespace llaminar2::test
      * @brief Captured compact/collective transfers reuse one slot across all formats.
      * @param device Real CUDA or ROCm device under test.
      * @param stream Exact non-default setup/capture stream.
+     * @param projections Immutable movable family; fixed down storage is excluded for GateUp.
      */
-    void runMixedFormatExpertTransferPublication(DeviceId device, void *stream);
+    void runMixedFormatExpertTransferPublication(DeviceId device, void *stream,
+        DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
 
     namespace native_vnni_transfer_parity_detail
     {
@@ -595,7 +597,7 @@ namespace llaminar2::test
             uint64_t identity);
 
         /**
-         * @brief Demote a GPU-prepared triplet into the real CPU inactive pool.
+         * @brief Demote a GPU-prepared payload into the real CPU inactive pool.
          * @param device Source device whose packed projections are immutable.
          * @param stream Exact source readiness stream.
          * @param format Original source-format identity.
@@ -654,7 +656,7 @@ namespace llaminar2::test
      * @param device CUDA or ROCm endpoint paired with the CPU tier.
      * @param stream Explicit non-default GPU stream.
      * @param formats Source operands; registered gates use the complete default
-     *        inventory. A focused diagnostic can supply actual GGUF triplets.
+     *        inventory. A focused diagnostic can supply actual GGUF payloads.
      * @param input_scale Positive diagnostic amplitude multiplier. Synthetic
      *        format fixtures use one; native weights can probe larger states
      *        without overflowing the synthetic fixtures' oversized scales.
@@ -1767,7 +1769,7 @@ namespace llaminar2::test
      *
          * Three real Q5_K projections are prepared twice: the ordinary compact GPU
      * load path publishes codebook 7, while the CPU-cold promotion path streams
-     * the same mathematical weights into codebook 23. Both descriptor triplets
+     * the same mathematical weights into codebook 23. Both descriptor payloads
      * then execute the production grouped route plan at verifier and long-prefill
      * sizes. Final outputs and canonical route contributions must be byte equal.
      *
@@ -2136,31 +2138,31 @@ namespace llaminar2::test
                 return std::shared_ptr<ITensorGemm>(
                     engine, [](ITensorGemm *) {});
             };
-            MoEOverlayPreparedExpertTriplet compact_triplet{
-                .gate = borrowed(prepared[0].kernel),
-                .up = borrowed(prepared[1].kernel),
-                .down = borrowed(prepared[2].kernel),
+            MoEOverlayPreparedExpertPayload compact_payload{
+                borrowed(prepared[0].kernel),
+                borrowed(prepared[1].kernel),
+                borrowed(prepared[2].kernel),
             };
-            std::vector<MoEOverlayPreparedExpertTriplet> initial_triplets(
+            std::vector<MoEOverlayPreparedExpertPayload> initial_payloads(
                 kNumExperts);
-            initial_triplets[0] = compact_triplet;
+            initial_payloads[0] = compact_payload;
             std::string publication_error;
             ASSERT_TRUE(registry->registerInitialLayer(
                 /*participant_id=*/0,
                 /*layer_idx=*/0,
                 std::vector<bool>{true, false},
-                initial_triplets,
+                initial_payloads,
                 &publication_error))
                 << publication_error;
             ASSERT_TRUE(registry->allInitialBanksReady());
 
             auto promoted_lifetime = std::make_shared<int>(7319);
-            MoEOverlayPreparedExpertTriplet promoted_triplet{
-                .gate = promotedEngine(
+            MoEOverlayPreparedExpertPayload promoted_payload{
+                promotedEngine(
                     device, promoted_gate.descriptor, promoted_lifetime),
-                .up = promotedEngine(
+                promotedEngine(
                     device, promoted_up.descriptor, promoted_lifetime),
-                .down = promotedEngine(
+                promotedEngine(
                     device, promoted_down.descriptor, promoted_lifetime),
             };
             auto endpoint = registry->endpoint(0);
@@ -2168,7 +2170,7 @@ namespace llaminar2::test
             auto candidate_bank = endpoint->cloneCandidate(1u, 2u);
             candidate_bank.layers[0].clearExpert(0);
             candidate_bank.layers[0].setResidentExpert(
-                1, promoted_triplet);
+                1, promoted_payload);
             auto prepared_candidate = endpoint->prepareReadyBank(
                 std::move(candidate_bank), &publication_error);
             ASSERT_TRUE(prepared_candidate.has_value()) << publication_error;

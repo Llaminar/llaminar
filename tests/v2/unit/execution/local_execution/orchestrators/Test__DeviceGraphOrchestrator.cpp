@@ -3219,7 +3219,7 @@ TEST_F(
              "mtp_speculative_state_publication_graph_.invalidate();",
              "mtp_draft_token_publication_graphs_",
              "mtp_verifier_preparation_graphs_",
-             "mtp_stochastic_serial_outcome_graph_.invalidate();",
+             "mtp_stochastic_outcome_graph_.invalidate();",
              "mtp_stochastic_target_distribution_graph_.invalidate();",
              "moe_overlay_epoch_acquire_graph_.invalidate();",
              "moe_overlay_epoch_release_graph_.invalidate();",

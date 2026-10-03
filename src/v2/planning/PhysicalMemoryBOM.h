@@ -58,6 +58,7 @@ namespace llaminar2
         ExpertMigrationStaging,   ///< Background expert transfer/repack lanes.
         ExpertShadowSlots,        ///< Inactive RCU expert-arrival banks.
         RoutedExpertWeights,      ///< Live prepared routed experts.
+        NativeExecutionContext,   ///< Driver-private storage retained until native context retirement.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -107,6 +108,8 @@ namespace llaminar2
             return "expert_shadow_slots";
         case PhysicalMemoryOwner::RoutedExpertWeights:
             return "routed_expert_weights";
+        case PhysicalMemoryOwner::NativeExecutionContext:
+            return "native_execution_context";
         case PhysicalMemoryOwner::Count:
             break;
         }

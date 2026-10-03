@@ -24,6 +24,37 @@ namespace llaminar2
 {
 
     /**
+     * @brief The semantic purpose of a persistent native GPU event.
+     *
+     * Ordering receipts certify a producer frontier without measuring it.
+     * Timing instrumentation explicitly opts into native timestamp work; it
+     * must not be imposed on transfer and graph-lifecycle receipts.
+     */
+    enum class GPUEventPurpose : std::uint8_t
+    {
+        Ordering = 0, ///< Exact producer/consumer completion, without timestamps.
+        Timing, ///< Diagnostic elapsed-time measurement on this device.
+    };
+
+    /**
+     * @brief Validate an event purpose before choosing native creation flags.
+     * @param purpose Typed event semantics requested by the resource owner.
+     * @return Whether the native event must retain timestamp instrumentation.
+     * @throws std::invalid_argument For any value outside the declared policy.
+     */
+    [[nodiscard]] constexpr bool gpuEventHasTiming(GPUEventPurpose purpose)
+    {
+        switch (purpose)
+        {
+        case GPUEventPurpose::Ordering:
+            return false;
+        case GPUEventPurpose::Timing:
+            return true;
+        }
+        throw std::invalid_argument("GPU event creation requires Ordering or Timing purpose");
+    }
+
+    /**
      * @brief Scheduling class for a persistent named auxiliary GPU stream.
      *
      * `LatencyCritical` is reserved for bounded control work that must become
@@ -318,13 +349,19 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Create a new event on this device
+         * @brief Create an event with explicit ordering or timing semantics.
+         * @param purpose Ordering by default; timing callers must opt in.
          * @return Platform-specific event handle (cudaEvent_t or hipEvent_t)
+         * @throws std::invalid_argument If the purpose is not a declared value.
+         * @throws std::runtime_error If native device/event admission fails.
          * @thread_safety Must be called from worker thread (within submitted work)
          *
-         * @note Caller is responsible for destroying the event with destroyEvent()
+         * An ordering event must disable timing, just like IBackend's ordinary
+         * events. In particular a DMA receipt must not acquire timestamp work
+         * on an unrelated shared compute queue. Callers retain ownership and
+         * destroy the event with destroyEvent().
          */
-        virtual void *createEvent() = 0;
+        virtual void *createEvent(GPUEventPurpose purpose = GPUEventPurpose::Ordering) = 0;
 
         /**
          * @brief Destroy a previously created event
@@ -463,7 +500,7 @@ namespace llaminar2
          * @return Elapsed time in milliseconds, or -1.0f on error
          * @thread_safety Must be called from worker thread after both events have completed
          *
-         * @note Both events must have been recorded on the same device.
+         * @note Both events must use GPUEventPurpose::Timing and have been recorded on the same device.
          *       The stop event must have completed (synchronize first).
          */
         virtual float eventElapsedTime(void *start, void *stop) = 0;

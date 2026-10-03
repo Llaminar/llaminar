@@ -9,6 +9,18 @@
 
 ---
 
+## Dense Auto-family evidence correction (September 29)
+
+An all-format ROCm production-shape sweep exposed a validator-only gap: valid
+IQ1_M/IQ1_S streaming Auto launches were rejected because their 256-column,
+8/16-row family is absent from the forced cooperative-tile tournament. The
+validator now admits those complete Auto tuples without widening independent
+axis sets or changing byte/resource/timing gates. Positive and adversarial
+device-free regressions are explicitly registered in ProductionTestPreflight.
+No production dispatch or generated overlay was installed by this correction.
+The measured transaction and remaining economy work are recorded in the
+[two-GPU prefill investigation](../2026-09/2026-09-27-qwen36-rocm2-prefill.md).
+
 ## Additive dense exact refresh (September 8)
 
 The dense CUDA/ROCm generator now accepts an explicitly retained installed
@@ -3227,6 +3239,8 @@ until the one-command path owns a focused regression for each item.
 
 | Defect | Observed failure | Required automatic behavior |
 |---|---|---|
+| ROCm Q8 producer omitted from dense trainer (September 29) | Q8_0 reached a NativeVNNI-only launch observer although production dispatched blockwise INT8; the named forced controls were also inapplicable. | Schema v3 authenticates the actual producer, its own controls and complete static/dynamic resource geometry. Preserve all three Q8 source aliases, full-output captured byte verification and explicit preflight regressions; never substitute weights or ignore missing launch evidence. |
+| Rounded timing ties rejected real native winners (September 29) | Q2_K native timing chose the first exact minimum, while Python chose a lexical winner from rounded display microseconds. | Validate raw event minima with the native candidate inventory's tie order. Regress exact ties and unequal raw values that round identically; reject an incorrectly marked winner. |
 | Nsight SI byte display units interpreted as IEC (September 7) | A fused CTA with 896 bytes of dynamic shared memory appeared as 917.504 bytes after parsing `0.896 Kbyte/block`. | Export explicit base units, interpret retained decimal prefixes correctly, and offline-reparse authenticated complete batch reports before fitting or mixing generations. Preserve physical commands, timing, raw-report digests and stream attribution; publish a distinct collector generation with the original evidence retained. Missing optional spill counters must not be treated as zero. |
 | Repeated immutable-key hashing in fit-result IPC (September 7) | A ten-second, 489-sample profile of the live CUDA fitter attributed 97.34% of active sample weight to generated dataclass hashes while the parent reconstructed worker result sets. | Cache the unchanged structural hash on immutable runtime/domain keys, exclude process-salted caches from pickle, and prove fresh/warmed equality, replacement, cross-hash-seed reconstruction and a focused economy comparison. This does not change candidate costs, timing evidence or policy identity; the already-running fit retains its imported implementation. |
 | Repeated runtime-key serialization in prediction inventories (September 7) | The live surrogate worker reaches `json.dumps` from `_profiler_prediction_point_inventory` while publishing point-aligned prediction caches. Each candidate repeats its geometry's identical runtime mapping and JSON fields. | Reuse canonical runtime/string fragments within each inventory, retain the original length-framed JSON bytes and SHA-256 exactly, and gate every changed runtime discriminator plus escaped/Unicode strings against the independent historical encoder. Measure host-only inventory construction; do not change predictions, evidence or the imported live fitter. |

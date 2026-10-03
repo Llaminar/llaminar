@@ -296,6 +296,11 @@ current inventory; adding a tag must not add a runner-side configuration.
 Qwen3.6 MoE 35B also tags a CPU-only, two-socket NodeTP cell with ordinal
 placement, Dynamic rebalancing, and dynamic-depth MTP. Its single CPU tier
 rebalances expert skew between participants; it has no tier-migration axis.
+Its two-CUDA and two-ROCm overlays each tag both whole-expert ownership and
+the separately selectable `gate-up-owned-down-columns` mode. Those controls
+retain the same model, profile and Dynamic/Ordinal/adaptive policies; the
+canonical benchmark projection compares ownership without another topology
+list or borrowed score from a different fine-tune.
 
 Ornith 1.5 MoE 35B (`Ornith-1.5-35B-Q4_K_M.gguf`) inherits the tagged
 Qwen3.6 MoE topology definitions: single ROCm, two-CUDA NCCL and two-ROCm RCCL
@@ -312,8 +317,12 @@ the exact `Ornith-1.5-35B-Q8_0.gguf` weights on CPU and four-ROCm rank-local
 RCCL ExpertOverlay. `Ornith15AccuracyWorkload.h` owns its untemplated 424-token
 prompt and 89-step incremental-decode horizon. The canonical expander supplies
 six CPU MTP cases and all 24 overlay placement/movement/MTP cases, including
-mandatory prefix restore and the ordinary HF checkpoint CSVs. These cases have
-no HTTP certification tag. Select the affected mathematical cell for token-drift
+mandatory prefix restore and the ordinary HF checkpoint CSVs. CPU remains
+diagnostic-only. The four-ROCm overlay tags its Dynamic/Ordinal/adaptive cell
+for the full HTTP suite and production-default benchmark, using the same
+real Q8 weights rather than the Q4_K_M certificate. This eligibility does not
+change its mathematical prompt, checkpoint horizon or serial controls, and
+does not establish a pass. Select the affected mathematical cell for token-drift
 diagnosis; do not substitute the existing Q4_K_M reference or acquire new golden
 token streams to hide a mismatch.
 
@@ -369,8 +378,12 @@ diagnostic mathematical-cell watchdog or shorten any accuracy check.
 
 For a focused stability proof, add `--repeat 20 --fail-fast` to the selected
 HTTP command and choose a new report path. Every iteration starts and retires
-its own real server and runs the complete checks; only immutable tmpfs model
-staging is shared. The report records iteration numbers, independent artifact
+its own real server and runs the complete checks. Immutable tmpfs model staging
+is shared, and the normal durable prefix archive may also be reused across
+lifetimes; a fresh process alone does not prove a cold prefix admission.
+Use the lifecycle hammer's nonce-qualified prefix-pressure workload when that
+edge needs explicit cold/full/partial restore evidence. The report records
+iteration numbers, independent artifact
 directories, and completed versus required run counts. A failure or missing
 behavioral proof stops the diagnostic cohort without certifying its earlier
 passes. After a runtime fix, begin a new cohort for the affected cells instead

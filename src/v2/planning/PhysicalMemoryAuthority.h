@@ -502,6 +502,17 @@ namespace llaminar2
             PhysicalMemoryAllocatorIdentity identity,
             PhysicalMemoryOwner owner) const;
 
+        /**
+         * @return New bytes still required by this allocator's admitted owners.
+         *
+         * Lazy reservations are commitments, not backing allocations. Their
+         * unmaterialized children remain demand even when the whole owner pool
+         * has already been reserved. The snapshot is taken under one ledger
+         * lock and cannot join inconsistent per-owner queries.
+         */
+        [[nodiscard]] std::size_t unmaterializedNewBytes(
+            PhysicalMemoryAllocatorIdentity identity) const;
+
         /** @return Whether every certified owner byte has a live RAII claim. */
         [[nodiscard]] bool complete() const;
 
@@ -622,6 +633,29 @@ namespace llaminar2
             DeviceId device,
             PhysicalMemoryOwner owner,
             std::size_t bytes);
+
+        /**
+         * @brief Admit an exactly measured, context-lifetime native allocation.
+         * @param observed Fresh same-rank physical capacity after the reversible
+         *        driver-footprint probe has restored its original storage.
+         * @param bytes Exact measured footprint, never a per-thread estimate.
+         * @return Unique lease to retain beside the native context until reset.
+         * @throws PhysicalMemoryCapacityExhausted when the context allocation
+         *         plus every outstanding owner of this plan cannot fit.
+         * @throws std::out_of_range for a GPU absent from this rank's admission.
+         * @throws std::invalid_argument for changed allocator geometry, foreign
+         *         rank, CPU storage, or a zero-byte footprint.
+         *
+         * The native context outlives a sample/model graph family, so it needs
+         * its own immutable certificate and ledger lease. This authority first
+         * protects the source plan's still-unmaterialized demand. It does not
+         * transfer bytes out of graph reservations, enlarge a graph allowance,
+         * or give the caller capacity arithmetic to duplicate. The lease keeps
+         * its certificate alive after the source authority is destroyed.
+         */
+        [[nodiscard]] PhysicalMemoryAllocationLease claimMeasuredRuntimeContextStorage(
+            PhysicalMemoryResource observed,
+            std::size_t bytes) const;
 
         /** @return Currently live bytes for one local owner and claim kind. */
         [[nodiscard]] std::size_t claimedBytes(

@@ -1835,8 +1835,8 @@ namespace llaminar2
         segment_cache.replay_gpu_timing_slots.resize(slot_capacity);
         for (auto &slot : segment_cache.replay_gpu_timing_slots)
         {
-            slot.start_event = gpu_ctx->createEvent();
-            slot.stop_event = gpu_ctx->createEvent();
+            slot.start_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
+            slot.stop_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
             if (!slot.start_event || !slot.stop_event)
             {
                 LOG_ERROR(

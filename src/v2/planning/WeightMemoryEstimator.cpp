@@ -1,6 +1,7 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/WeightShardGeometry.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "kernels/common/EmbedQ8Block.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -267,6 +268,16 @@ namespace llaminar2
         return kind_ != Kind::SelectedRoutedExpertsOnly;
     }
 
+    DeviceWeightResidency DeviceWeightResidency::withProjectionOwnership(
+        const MoEExpertProjectionOwnership &ownership) const
+    {
+        if (!selectsRoutedExperts() || ownership.geometry().experts != model_expert_count_)
+            throw std::invalid_argument("Projection residency requires a matching selected expert inventory");
+        auto result = *this;
+        result.projection_ownership_ = std::make_shared<const MoEExpertProjectionOwnership>(ownership);
+        return result;
+    }
+
     bool DeviceWeightResidency::selectsRoutedExperts() const noexcept
     {
         return kind_ != Kind::FullModel;
@@ -448,15 +459,20 @@ namespace llaminar2
                 }
                 selected_routed_experts =
                     residency.selectedRoutedExpertsForLayer(t.layer_index);
-                if (selected_routed_experts == 0)
+                if (selected_routed_experts == 0 && !residency.projectionOwnership())
                     return;
             }
 
-            const auto geometry = geometry_resolver.resolve(t,
-                routed_expert_tensor && residency.selectsRoutedExperts()
-                    ? std::optional<size_t>(static_cast<size_t>(selected_routed_experts))
-                    : std::nullopt);
+            const auto geometry = routed_expert_tensor && residency.projectionOwnership()
+                ? geometry_resolver.resolve(t, *residency.projectionOwnership(),
+                    static_cast<size_t>(selected_routed_experts))
+                : geometry_resolver.resolve(t,
+                    routed_expert_tensor && residency.selectsRoutedExperts()
+                        ? std::optional<size_t>(static_cast<size_t>(selected_routed_experts))
+                        : std::nullopt);
             const size_t selected_elements = geometry.elements();
+            if (selected_elements == 0)
+                return;
             const size_t native = selectedElementBytes(
                 t.native_bytes, selected_elements, t.elements);
 

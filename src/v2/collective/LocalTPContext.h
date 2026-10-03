@@ -101,9 +101,16 @@ namespace llaminar2
 
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
+        /** @brief Enqueue the canonical sum and publish on its exact producer stream. */
         bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
                                size_t count, void *stream,
                                const std::string &precision = "") override;
+        /** @brief Reuse canonical sum/precision logic, deferring publication to the paired join. */
+        bool allreduceAcquiredInput(
+            const AcquiredDeviceTransferInput &input,
+            const std::string &stage_name, size_t count,
+            const std::string &precision,
+            const NativeCollectiveRows *live_rows = nullptr) override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
         bool allgatherRawOnStream(
@@ -201,7 +208,8 @@ namespace llaminar2
             void *producer_stream,
             const std::string &precision,
             const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
-            int device_index) override;
+            int device_index,
+            const NativeCollectiveRows *live_rows = nullptr) override;
         bool supportsCollectiveSidebandOnStreamGraphCapture() const override;
 
         void setBackendForTesting(
@@ -224,6 +232,17 @@ namespace llaminar2
             const std::vector<const TensorBase *> &shards,
             TensorBase *output) override;
         bool reduceScatter(const TensorBase *input, TensorBase *output_shard) override;
+        /** @copydoc ILocalTPContext::nativeRowsOnStream */
+        bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            const std::string &stage_name, unsigned long long *payload_bytes = nullptr) override;
+        /** @copydoc ILocalTPContext::reduceScatterRawOnStream */
+        bool reduceScatterRawOnStream(
+            const void *rank_major_send, void *local_receive, size_t receive_count,
+            CollectiveDataType dtype, int device_index, void *producer_stream,
+            const std::string &stage_name) override;
         bool broadcast(TensorBase *tensor, int source_device_index = 0) override;
 
         // =====================================================================
@@ -299,6 +318,11 @@ namespace llaminar2
             size_t backend_payload_capacity_bytes,
             size_t fp16_scratch_elements,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority) override;
+
+        /** @brief Freeze one complete no-P2P fabric with exactly this domain's membership. */
+        void installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather> fabric) override;
+        /** @return Setup-frozen shared transport; graph bindings retain its physical owners. */
+        std::shared_ptr<DeviceCountedAllGather> deviceCountedAllGather() const override { return counted_allgather_; }
 
         /**
          * @brief Get all registered tensors for a stage (concrete implementation)
@@ -487,6 +511,8 @@ namespace llaminar2
         std::string grouped_onstream_allreduce_error_;
         std::vector<void *> grouped_onstream_allreduce_buffers_;
         std::vector<void *> grouped_onstream_allreduce_streams_;
+        /// Participant-local immutable prefix bindings for this recording generation; empty means fixed extent.
+        std::vector<NativeCollectiveRows> grouped_onstream_allreduce_rows_;
         std::vector<bool> grouped_onstream_allreduce_seen_;
         bool grouped_onstream_allreduce_graph_capture_active_{false};
         size_t grouped_onstream_allreduce_sideband_count_{0};
@@ -538,6 +564,7 @@ namespace llaminar2
         /// non-explicit-stream collectives can publish completion on the exact
         /// stream that receives the backend's completion wait.
         std::vector<void *> compute_streams_;
+        std::shared_ptr<DeviceCountedAllGather> counted_allgather_; ///< Domain lifetime, never a per-layer channel set.
 
         // =====================================================================
         // BAR-Backed Tensor Registry
@@ -599,6 +626,31 @@ namespace llaminar2
          */
         bool allreduceImpl(TensorBase *tensor);
 
+        /** @brief The caller either owns the exact producer or a paired graph join. */
+        enum class AllreducePublication { ExactProducer, PairedGraphJoin };
+
+        /**
+         * @brief Sole explicit-stream sum implementation with explicit publication ownership.
+         *
+         * Ordinary calls publish their actual final producer; authenticated forks
+         * publish only after their graph join. Both consume identical casts,
+         * native grouping, reserved scratch and per-row precision decisions.
+         * The existing HOST boundary retains its own completed publication.
+         * @param tensor Already-resident participant-local activation storage.
+         * @param stage_name Common collective identity.
+         * @param count Exact elements, or zero for the complete tensor.
+         * @param stream Exact non-null producer or acquired consumer stream.
+         * @param precision Graph-resolved wire precision.
+         * @param publication Whether this operation or its paired join publishes.
+         * @param live_rows Optional exact prefix binding, forwarded through precision conversion and grouping.
+         * @return Whether the complete operation was successfully submitted.
+         */
+        bool enqueueAllreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                                      size_t count, void *stream,
+                                      const std::string &precision,
+                                      AllreducePublication publication,
+                                      const NativeCollectiveRows *live_rows = nullptr);
+
         bool rendezvousOnStreamCollective(int device_index,
                                           TensorBase *tensor,
                                           const std::string &stage_name,
@@ -607,6 +659,23 @@ namespace llaminar2
                                           void *stream,
                                           const std::string &precision);
 
+        /**
+         * @brief Record one participant in the existing allreduce capture generation.
+         * @param buffer Native payload (possibly the reserved FP16 cast bank).
+         * @param effective_count Retained element extent, exact when live_rows is absent.
+         * @param dtype Scalar type on the wire, after transport conversion.
+         * @param device_index Communicator-local participant.
+         * @param stream Exact non-null participant stream.
+         * @param stage_name Common graph-stage identity.
+         * @param precision Agreed transport policy, compared across participants.
+         * @param sidebands Optional exact-size control operations in the same group.
+         * @param live_rows Optional participant-local device prefix, never read on host.
+         * @return Whether this generation's required native submission succeeded.
+         *
+         * Rendezvous occurs only while enqueuing/recording, never on captured
+         * replay. RCCL and sideband anchors retain one grouped submission; CUDA
+         * standalone anchors keep their existing participant-local recording.
+         */
         bool allreduceGroupedOnExplicitStreams(void *buffer,
                                                size_t effective_count,
                                                CollectiveDataType dtype,
@@ -614,7 +683,8 @@ namespace llaminar2
                                                void *stream,
                                                const std::string &stage_name,
                                                const std::string &precision,
-                                               const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr);
+                                               const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr,
+                                               const NativeCollectiveRows *live_rows = nullptr);
 
         /**
          * @brief Enqueue the required per-device asynchronous GPU allreduce.

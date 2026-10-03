@@ -44,6 +44,7 @@
 #include "../../execution/moe/DecodeExpertHistogram.h"
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../../execution/moe/MoEExpertOwnerMap.h"
 #include "../../execution/moe/MoEOverlayParticipantGraphRunner.h"
 #include "../../execution/moe/MoEOverlayParticipantResidency.h"
@@ -2097,7 +2098,7 @@ namespace llaminar2
      * device-specific and cannot materialize each other's experts.
      *
      * Replace every generic parent with the exact expert-axis requirements
-     * declared by the canonical owner map for this graph. This makes source
+     * declared by the canonical preparation requests for this graph. This makes source
      * page faults, packed GEMM registration, and the graph participant mask
      * describe the same ownership without causing one graph to materialize a
      * sibling device's experts.
@@ -2120,6 +2121,9 @@ namespace llaminar2
             graph_config.moe.expert_overlay_execution_plan;
         if (!placement || !placement->usesExpertOverlayAuthority() || !execution)
             return base_plan;
+        const auto &runtime = graph_config.moe.expert_overlay_runtime_plan;
+        if (!runtime)
+            throw std::logic_error("ExpertOverlay source loading requires its frozen runtime plan");
 
         const MoEExpertOwnerMap owner_map =
             MoEExpertOwnerMap::build(*placement);
@@ -2177,26 +2181,19 @@ namespace llaminar2
             return combined;
         }
 
-        std::sort(
-            graph_local.begin(),
-            graph_local.end(),
-            [](const MoEExpertOwnerParticipant *left,
-               const MoEExpertOwnerParticipant *right)
-            { return left->participant_id < right->participant_id; });
-
-        for (const auto *participant : graph_local)
+        if (!graph_local.empty())
         {
-            const WeightPlan participant_plan =
-                buildMoEOverlayParticipantWeightPlan(
-                    model_ctx,
-                    *execution,
-                    owner_map,
-                    *participant);
-            for (const auto &requirement :
-                 participant_plan.requirements())
-            {
+            std::vector<DeviceId> devices;
+            for (const auto *participant : graph_local)
+                devices.push_back(participant->device);
+            std::sort(devices.begin(), devices.end());
+            devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
+            const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, model_ctx.concreteLoader())
+                .filteredForRank(execution->currentRankPlan()).filteredForDevices(devices);
+            const auto sources = preparation.sourceWeightPlan(
+                model_ctx.concreteLoader(), base_plan.strategy().model_id);
+            for (const auto &requirement : sources.requirements())
                 combined.add(requirement);
-            }
         }
 
         LOG_DEBUG(
@@ -2333,7 +2330,8 @@ namespace llaminar2
             return false;
         }
 
-        if (graph_config.moe.routed_compute_policy != RoutedExpertComputePolicy::Apportioned)
+        if (graph_config.moe.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+            graph_config.moe.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)
             return true;
 
         int participants = 1;
@@ -2792,6 +2790,15 @@ namespace llaminar2
 
         if (config.pp_stage_config)
             config.pp_stage_config->requireValidForModel(*model_ctx);
+
+        // Apply mode may bypass automatic discovery. A terminal graph must
+        // authenticate its learned predictor before allocating even main state.
+        if (retainsMTPGraphCapacity(config.mtp) &&
+            (!config.pp_stage_config || config.pp_stage_config->has_lm_head))
+        {
+            (void)requireMTPWeightManifest(model_ctx->concreteLoader(),
+                model_ctx->architecture(), model_ctx->totalBlockCount());
+        }
 
         // Graph is the only execution path (as of January 2025 cleanup)
         std::string architecture = model_ctx->architecture();
@@ -3978,6 +3985,18 @@ namespace llaminar2
         // definition of the model's main-forward layer range.
         if (config.pp_stage_config)
             config.pp_stage_config->requireValidForModel(*model_ctx);
+
+        // Injected participant factories are also production entrypoints. They
+        // cannot synthesize a predictor after admission has priced no sidecar.
+        if (retainsMTPGraphCapacity(config.mtp) &&
+            (!config.pp_stage_config || config.pp_stage_config->has_lm_head))
+        {
+            auto loader = model_ctx->loader();
+            if (!loader)
+                throw std::invalid_argument("Retained MTP capacity requires a model source directory");
+            (void)requireMTPWeightManifest(*loader,
+                model_ctx->architecture(), model_ctx->totalBlockCount());
+        }
 
         // Validate device
         if (!device.is_valid())

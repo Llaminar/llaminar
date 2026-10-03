@@ -8,14 +8,20 @@
  * owner map before it narrows to those local devices; otherwise a rank with
  * one local CPU NodeTP endpoint would incorrectly prepare the other
  * endpoint's experts as well.
+ * The same projection requests compile source loading and prepared engines;
+ * graph runners must not independently apply whole-expert IDs to every role.
  */
 
 #include "MoEExpertOverlayPreparationPlan.h"
 
 #include "MoEExpertOverlayExecutionPlan.h"
 #include "MoEExpertOwnerMap.h"
+#include "loaders/IModelLoader.h"
 
 #include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -167,7 +173,8 @@ namespace llaminar2
             // size to decide whether ownership is apportioned: a distributed
             // NodeTP domain can have one local endpoint and several
             // remote endpoints, all of which still divide the logical experts.
-            if (domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned ||
+            if ((domain.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+                 domain.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
                 domain.participants.size() <= 1 ||
                 owner_map == nullptr)
             {
@@ -382,9 +389,122 @@ namespace llaminar2
         return out.str();
     }
 
+    MoEExpertProjectionOwnership MoEExpertOverlayPreparationPlan::requireProjectionOwnershipForParticipant(
+        const MoEExpertOwnerParticipant &participant, int layer) const
+    {
+        if (layer < 0 || !participant.device.is_gpu() || participant.domain_participant_index < 0)
+            throw std::invalid_argument("Projection layout requires an exact GPU participant/layer");
+        std::optional<MoEExpertProjectionOwnership> ownership;
+        const int rank = participant.world_rank_known ? participant.world_rank : -1;
+        for (const auto &request : requests_)
+        {
+            if (request.layer != layer || request.device != participant.device ||
+                request.domain_name != participant.domain_name ||
+                request.participant_index != participant.domain_participant_index ||
+                request.participant_world_rank != rank)
+                continue;
+            if (!request.projection_ownership ||
+                request.projection_ownership->movableProjections() != DeviceMoEProjectionSet::GateUp ||
+                (ownership && *ownership != *request.projection_ownership))
+                throw std::invalid_argument("Participant preparation does not declare one exact projection layout");
+            ownership = request.projection_ownership;
+        }
+        if (!ownership)
+            throw std::invalid_argument("Projection preparation has no request for the exact participant/layer");
+        return *ownership;
+    }
+
     MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::build(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         size_t routed_expert_bytes_per_expert)
+    {
+        // This overload has no source directory and therefore cannot prove the
+        // fixed down-slice geometry. Never prepare whole tensors for a plan that
+        // explicitly selected the projection-partitioned A/B mode.
+        if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
+            [](const auto &domain) {
+                return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            }))
+            throw std::invalid_argument("Gate/up-owned down-column preparation requires the source-authenticated overload");
+        return compile(runtime_plan, routed_expert_bytes_per_expert, {});
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::build(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        const IModelLoader &loader,
+        size_t routed_expert_bytes_per_expert)
+    {
+        const bool projection_mode = std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
+            [](const auto &domain) {
+                return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            });
+        return projection_mode ? buildProjectionPartitioned(runtime_plan, loader)
+                               : build(runtime_plan, routed_expert_bytes_per_expert);
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::buildProjectionPartitioned(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        const IModelLoader &loader)
+    {
+        const auto &source = runtime_plan.sourcePlan();
+        if (!source.usesExpertOverlayAuthority() || source.routed_tiers.size() != 1 ||
+            source.placements.empty())
+            throw std::invalid_argument("Projection preparation requires one complete routed domain");
+        const auto &domain = runtime_plan.domainForTier(0);
+        if (domain.participants.empty() ||
+            domain.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
+            domain.routed_phase_policy != RoutedExpertPhasePolicy::Uniform)
+            throw std::invalid_argument("Projection preparation requires explicit gate-up-owned-down-columns intent and uniform phases");
+        const auto type = domain.participants.front().address.device_type;
+        for (const auto &participant : domain.participants)
+        {
+            if (!participant.address.isGPU() || participant.address.device_type != type)
+                throw std::invalid_argument("Projection preparation requires a homogeneous GPU domain");
+        }
+        std::map<int, MoEExpertProjectionOwnership::Geometry> geometries;
+        for (const auto &placement : source.placements)
+        {
+            // Sidecar and main layers need not share the same intermediate
+            // width. Authenticate all three source matrices before publishing
+            // any requests, rather than extrapolating one layer's geometry.
+            const auto prefix = "blk." + std::to_string(placement.layer) + ".";
+            const auto source_shape = [&](const char *suffix)
+            {
+                const auto name = prefix + suffix;
+                const auto shape = loader.getTensorShape(name);
+                if (!shape || shape->size() != 3 ||
+                    std::any_of(shape->begin(), shape->end(), [](size_t extent)
+                        { return extent == 0 || extent > static_cast<size_t>(std::numeric_limits<int>::max()); }))
+                    throw std::invalid_argument("Projection preparation requires bounded GGUF [K,N,E] geometry: " + name);
+                return *shape;
+            };
+            const auto gate = source_shape("ffn_gate_exps.weight");
+            const auto up = source_shape("ffn_up_exps.weight");
+            const auto down = source_shape("ffn_down_exps.weight");
+            if (up != gate || down[0] != gate[1] || down[1] != gate[0] || down[2] != gate[2])
+                throw std::invalid_argument("Projection preparation requires compatible gate/up/down geometry: " + prefix);
+            const MoEExpertProjectionOwnership::Geometry geometry{
+                static_cast<int>(gate[2]), static_cast<int>(gate[0]), static_cast<int>(gate[1])};
+            if (placement.routed_expert_tier.size() != static_cast<size_t>(geometry.experts) ||
+                std::any_of(placement.routed_expert_tier.begin(), placement.routed_expert_tier.end(),
+                    [](int tier) { return tier != 0; }))
+                throw std::invalid_argument("Projection preparation must cover the complete expert inventory");
+            for (const auto &participant : domain.participants)
+            {
+                // Global domain coordinates survive rank/device filtering.
+                (void)MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                    geometry, participant.participant_index, static_cast<int>(domain.participants.size()));
+            }
+            if (!geometries.emplace(placement.layer, geometry).second)
+                throw std::invalid_argument("Projection preparation repeats one layer's ownership");
+        }
+        return compile(runtime_plan, 0, geometries);
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::compile(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        size_t routed_expert_bytes_per_expert,
+        const std::map<int, MoEExpertProjectionOwnership::Geometry> &projection_geometries)
     {
         const auto &source = runtime_plan.sourcePlan();
         if (!source.usesExpertOverlayAuthority())
@@ -424,7 +544,8 @@ namespace llaminar2
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
                         [](const auto &domain)
                         {
-                            return domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned &&
+                            return (domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
+                                    domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns) &&
                                    domain.participants.size() > 1;
                         }))
         {
@@ -435,6 +556,8 @@ namespace llaminar2
 
         for (const auto &placement : source.placements)
         {
+            const auto projection_geometry = projection_geometries.empty()
+                ? std::nullopt : std::optional(projection_geometries.at(placement.layer));
             for (size_t expert_index = 0; expert_index < placement.routed_expert_tier.size(); ++expert_index)
             {
                 const int tier_index = placement.routed_expert_tier[expert_index];
@@ -449,43 +572,51 @@ namespace llaminar2
 
                 const auto &tier = source.routed_tiers[static_cast<size_t>(tier_index)];
                 const auto &domain = runtime_plan.domainForTier(static_cast<size_t>(tier_index));
-                for (const auto &participant : preparationParticipantsForExpert(
+                const auto owner_participants = preparationParticipantsForExpert(
                          domain,
                          owner_map ? &*owner_map : nullptr,
                          runtime_plan.currentWorldRank(),
                          placement.layer,
-                         static_cast<int>(expert_index)))
+                         static_cast<int>(expert_index));
+                const auto all_participants = projection_geometry
+                    ? preparationParticipantsFor(domain) : std::vector<PreparationParticipant>{};
+                for (const auto role : kRoles)
                 {
-                    const auto category = routedResidencyCategoryFor(tier, participant.device);
-                    auto &stats = statsFor(
-                        result.diagnostics_,
-                        tier.domain,
-                        participant.device,
-                        participant.participant_index,
-                        participant.world_rank,
-                        participant.world_rank_known,
-                        participant.owner_rank,
-                        category,
-                        source.residency_policy);
-                    const auto expert_key = std::make_tuple(
-                        tier.domain,
-                        participant.device,
-                        participant.participant_index,
-                        participant.world_rank,
-                        category,
-                        placement.layer,
-                        static_cast<int>(expert_index));
-                    if (counted_experts.insert(expert_key).second)
+                    // Only gate/up follows an expert owner under the explicit
+                    // projection contract. All locally addressable participants
+                    // retain their down slice, even when that owner is remote.
+                    const auto &participants = projection_geometry && role == ExpertGemmRegistry::WeightRole::DOWN
+                        ? all_participants : owner_participants;
+                    for (const auto &participant : participants)
                     {
-                        ++stats.assigned_routed_experts;
-                        stats.estimated_routed_bytes += routed_expert_bytes_per_expert;
-                    }
-                    stats.planned_engine_count += 3;
-                    stats.fallback = stats.fallback || tier.fallback;
-                    stats.memory_budget_bytes = std::max(stats.memory_budget_bytes, tier.memory_budget_bytes);
+                        const auto category = routedResidencyCategoryFor(tier, participant.device);
+                        auto &stats = statsFor(
+                            result.diagnostics_,
+                            tier.domain,
+                            participant.device,
+                            participant.participant_index,
+                            participant.world_rank,
+                            participant.world_rank_known,
+                            participant.owner_rank,
+                            category,
+                            source.residency_policy);
+                        const auto expert_key = std::make_tuple(
+                            tier.domain,
+                            participant.device,
+                            participant.participant_index,
+                            participant.world_rank,
+                            category,
+                            placement.layer,
+                            static_cast<int>(expert_index));
+                        if (role == ExpertGemmRegistry::WeightRole::GATE && counted_experts.insert(expert_key).second)
+                        {
+                            ++stats.assigned_routed_experts;
+                            stats.estimated_routed_bytes += routed_expert_bytes_per_expert;
+                        }
+                        ++stats.planned_engine_count;
+                        stats.fallback = stats.fallback || tier.fallback;
+                        stats.memory_budget_bytes = std::max(stats.memory_budget_bytes, tier.memory_budget_bytes);
 
-                    for (const auto role : kRoles)
-                    {
                         MoEExpertOverlayPreparationRequest request;
                         request.layer = placement.layer;
                         request.expert_id = static_cast<int>(expert_index);
@@ -503,6 +634,10 @@ namespace llaminar2
                         request.estimated_routed_bytes = routed_expert_bytes_per_expert;
                         request.memory_budget_bytes = tier.memory_budget_bytes;
                         request.fallback = tier.fallback;
+                        if (projection_geometry)
+                            request.projection_ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                                *projection_geometry, participant.participant_index,
+                                static_cast<int>(domain.participants.size()));
                         result.requests_.push_back(std::move(request));
                     }
                 }
@@ -511,6 +646,95 @@ namespace llaminar2
 
         sortDiagnostics(result.diagnostics_);
         return result;
+    }
+
+    WeightPlan MoEExpertOverlayPreparationPlan::sourceWeightPlan(
+        const IModelLoader &loader, ModelContextId model_id) const
+    {
+        using Role = ExpertGemmRegistry::WeightRole;
+        constexpr std::array<WeightRole, 3> roles{
+            WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown};
+        constexpr std::array<const char *, 3> suffixes{
+            "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
+        // Group by semantic role and exact endpoint, never by the physical
+        // ordinal alone. An ordinal can legitimately recur on another rank.
+        using Key = std::tuple<int, Role, std::string, DeviceId, int, int>;
+        std::map<Key, std::vector<const MoEExpertOverlayPreparationRequest *>> groups;
+        std::set<DeviceId> devices;
+        for (const auto &request : requests_)
+        {
+            groups[{request.layer, request.role, request.domain_name, request.device,
+                request.participant_world_rank_known ? request.participant_world_rank : -1,
+                request.participant_index}].push_back(&request);
+            devices.insert(request.device);
+        }
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::ExpertOverlayRank;
+        strategy.model_id = model_id;
+        strategy.devices.assign(devices.begin(), devices.end());
+        WeightPlan plan(std::move(strategy), PhysicalMemoryOwner::RoutedExpertWeights);
+        for (const auto &[key, requests] : groups)
+        {
+            const auto &first = *requests.front();
+            const auto role_index = static_cast<size_t>(first.role);
+            const auto role = roles.at(role_index);
+            const auto name = "blk." + std::to_string(first.layer) + "." + suffixes.at(role_index);
+            const auto shape = loader.getTensorShape(name);
+            if (!shape || shape->size() != 3 ||
+                std::any_of(shape->begin(), shape->end(), [](size_t extent) { return extent == 0; }))
+                throw std::invalid_argument("Overlay source plan requires a nonempty GGUF [K,N,E] parent: " + name);
+            if (first.projection_ownership)
+            {
+                const auto projection = first.projection_ownership->projection(role);
+                if ((*shape)[0] != static_cast<size_t>(projection.source_columns) ||
+                    (*shape)[1] != static_cast<size_t>(projection.source_rows) ||
+                    (*shape)[2] != static_cast<size_t>(first.projection_ownership->geometry().experts))
+                    throw std::invalid_argument("Overlay source geometry differs from its projection contract: " + name);
+            }
+            std::vector<int> experts;
+            for (const auto *request : requests)
+            {
+                if (request->expert_id < 0 || static_cast<size_t>(request->expert_id) >= (*shape)[2])
+                    throw std::invalid_argument("Overlay source expert lies outside GGUF geometry: " + name);
+                if (request->projection_ownership != first.projection_ownership ||
+                    request->residency_category != first.residency_category)
+                    throw std::logic_error("Overlay source requests disagree on preparation identity: " + name);
+                experts.push_back(request->expert_id);
+            }
+            std::sort(experts.begin(), experts.end());
+            if (std::adjacent_find(experts.begin(), experts.end()) != experts.end())
+                throw std::logic_error("Overlay source plan repeats one expert projection: " + name);
+
+            WeightRequirement requirement;
+            requirement.canonical_name = name;
+            requirement.role = role;
+            requirement.derivation = WeightDerivationKind::ExpertSlice;
+            requirement.layer = first.layer;
+            requirement.target_device = first.device;
+            requirement.lookup_device = DeviceId::cpu();
+            requirement.bypass_tensor_parallel = true;
+            requirement.residency_category = first.residency_category;
+            requirement.overlay_domain = first.domain_name;
+            requirement.overlay_participant_index = first.participant_index;
+            requirement.overlay_participant_world_rank = std::get<4>(key);
+            requirement.host_policy = first.device.is_gpu()
+                ? WeightHostPolicy::RequiredUntilPreparedOrTransferred : WeightHostPolicy::RequiredForCPUExecution;
+            requirement.expected_prepared_kind = PreparedWeightKind::MoeExpertSlab;
+            // These extents describe the bytes the source loader actually
+            // returns, not the smaller prepared down slice on the accelerator.
+            requirement.slice.source_rows = (*shape)[0];
+            requirement.slice.source_cols = (*shape)[1];
+            requirement.slice.row_count = (*shape)[0];
+            requirement.slice.col_count = (*shape)[1];
+            requirement.slice.expert_start = static_cast<size_t>(experts.front());
+            requirement.slice.expert_count = experts.size();
+            requirement.slice.expert_ids = std::move(experts);
+            requirement.slice.inner_is_presliced = true;
+            plan.add(std::move(requirement));
+        }
+        // Empty initial residency is valid. The retained endpoint may receive
+        // an economical move later; it has no source payload to load today.
+        return plan;
     }
 
     bool MoEExpertOverlayPreparationPlan::hasRequestsForDevice(DeviceId device) const
@@ -569,7 +793,7 @@ namespace llaminar2
                 filtered_request.residency_category,
                 filtered_request.layer,
                 filtered_request.expert_id);
-            if (counted_experts.insert(expert_key).second)
+            if (filtered_request.role == ExpertGemmRegistry::WeightRole::GATE && counted_experts.insert(expert_key).second)
             {
                 ++stats.assigned_routed_experts;
                 stats.estimated_routed_bytes += filtered_request.estimated_routed_bytes;
@@ -624,7 +848,7 @@ namespace llaminar2
                 request.residency_category,
                 request.layer,
                 request.expert_id);
-            if (counted_experts.insert(expert_key).second)
+            if (request.role == ExpertGemmRegistry::WeightRole::GATE && counted_experts.insert(expert_key).second)
             {
                 ++stats.assigned_routed_experts;
                 stats.estimated_routed_bytes += request.estimated_routed_bytes;

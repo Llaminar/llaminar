@@ -14,6 +14,7 @@
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/modes/MoEMovementLedgerJson.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/mtp/MTPRequestSamplingPolicy.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockTokenizer.h"
 #include "utils/Logger.h"
@@ -1292,6 +1293,49 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ReplacesInvalidUtf8InGenerated
 // =============================================================================
 // Error handling tests
 // =============================================================================
+
+/** @brief Both public response modes reject unsupported sampling before prefill or SSE. */
+TEST_F(Test__ChatCompletionHandler, UnsupportedMTPSamplingReturns400BeforeInference)
+{
+    EXPECT_CALL(*runner_, setSamplingParams(_))
+        .Times(2).WillRepeatedly(Throw(UnsupportedMTPSamplingRequest{}));
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    EXPECT_CALL(*runner_, decodeStep()).Times(0);
+    EXPECT_CALL(*tokenizer_, encodeChat(_, _, _, _)).Times(0);
+    ChatCompletionResponse error;
+    auto request = ChatCompletionHandler::parseRequest(
+        minimalRequest({{"dry_multiplier", 0.8}, {"temperature", 0.8}}), error);
+    ASSERT_TRUE(request);
+    auto handler = makeHandler();
+    auto response = handler->handleRequest(*request);
+    EXPECT_EQ(response.http_status, 400);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["error"]["type"], "invalid_request_error");
+    EXPECT_EQ(body["error"]["code"], UnsupportedMTPSamplingRequest::code);
+    EXPECT_EQ(body["error"]["param"], "dry_multiplier");
+    request->stream = true;
+    int publications = 0;
+    response = handler->handleStreamingRequest(*request, [&](const std::string &) {
+        ++publications;
+        return true;
+    });
+    EXPECT_EQ(response.http_status, 400);
+    EXPECT_EQ(publications, 0);
+    EXPECT_EQ(json::parse(response.json_body)["error"]["code"], UnsupportedMTPSamplingRequest::code);
+}
+
+/** @brief Typed admission rejection must not disguise a broken graph as a client error. */
+TEST_F(Test__ChatCompletionHandler, SamplingBackendFailureRemains500)
+{
+    EXPECT_CALL(*runner_, setSamplingParams(_))
+        .WillOnce(Throw(std::runtime_error("graph construction failed")));
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    const auto response = makeHandler()->handleRequest(request);
+    EXPECT_EQ(response.http_status, 500);
+    EXPECT_EQ(json::parse(response.json_body)["error"]["type"], "server_error");
+}
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_EncodeEmpty_Returns500)
 {

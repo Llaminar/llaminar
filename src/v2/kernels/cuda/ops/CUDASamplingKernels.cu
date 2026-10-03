@@ -26,6 +26,7 @@
 #include <cstdio>
 #include "../../common/SamplingMath.h"
 #include "../../common/GenerationLogicalState.h"
+#include "../../common/SamplingWideTopKDevice.inl"
 #include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../../execution/moe/DeviceMoERebalanceABI.h"
 
@@ -4160,7 +4161,7 @@ cuda_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
 
     if (active_comparison_rows == 0)
     {
-        if (sample_row < kMaxSampleRows)
+        if (sample_row <= row_count)
             sampled_target_tokens[sample_row] = -1;
         return;
     }
@@ -4201,7 +4202,10 @@ cuda_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
         else
         {
             sampled_rows[sample_row] = -1;
-            sampled_target_tokens[sample_row] = -1;
+            // The warp has sixteen scratch lanes, but the caller owns only
+            // row_count + 1 output slots. Never clear a neighbouring request.
+            if (sample_row <= row_count)
+                sampled_target_tokens[sample_row] = -1;
         }
         if constexpr (RetainFirstTransactionDiagnostic)
         {
@@ -6776,6 +6780,25 @@ extern "C"
 
         cudaSetDevice(device_idx);
         cudaStream_t s = static_cast<cudaStream_t>(stream);
+
+        if (k > TOPK_SMALL_K_CAP)
+        {
+            const auto geometry = llaminar2::sampling_wide::geometry(n, row_count, k, scratch_capacity);
+            if (!geometry || !scratch_values || !scratch_indices)
+                return false;
+            // Wide K reuses the admitted scratch pair. The complete warp
+            // merges bounded shared lists; no K-entry automatic arrays spill.
+            llaminar2::sampling_wide::partials<32>
+                <<<dim3(geometry->partial_blocks, row_count), 32, geometry->shared_bytes, s>>>(
+                    data, n, row_stride, k, geometry->partial_blocks,
+                    scratch_values, scratch_indices, active_rows);
+            if (cudaGetLastError() != cudaSuccess)
+                return false;
+            llaminar2::sampling_wide::distributions<32><<<row_count, 32, 0, s>>>(
+                scratch_values, scratch_indices, geometry->partial_blocks, k,
+                top_p, temperature, out_token_ids, out_stride, out_probs, active_rows);
+            return cudaGetLastError() == cudaSuccess;
+        }
 
         if (k <= TOPK_SMALL_K_CAP && scratch_values && scratch_indices)
         {

@@ -590,6 +590,26 @@ namespace
     // createTestableRankOrchestrator Tests
     // =============================================================================
 
+    /** @brief Apply/injected factories reject missing MTP before device allocation. */
+    TEST(Test__InferenceRunnerFactory_MTPAdmission, PlainModelRejectsBeforeAnyBackendIsTouched)
+    {
+        for (const std::string architecture : {"qwen35", "qwen35moe"})
+        for (const auto device : {DeviceId::cpu(), DeviceId::cuda(71), DeviceId::rocm(93)})
+        for (const bool active : {false, true})
+        {
+            SCOPED_TRACE(::testing::Message() << architecture << " " << device
+                << " active=" << active);
+            auto model = MockModelContextBuilder().setArchitecture(architecture)
+                .setBlockCount(40).build();
+            InferenceRunnerConfig config;
+            config.mtp.enabled = active;
+            config.mtp.graph_capacity_draft_tokens = 15;
+            // Deliberately nonexistent GPU ordinals prove that validation stops
+            // at the source contract, without initializing either accelerator.
+            EXPECT_THROW((void)createTestableInferenceRunner(model, device, config), std::invalid_argument);
+        }
+    }
+
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, TestableWithNullModelCtxReturnsNull)
     {
         std::vector<std::unique_ptr<IInferenceRunner>> runners;

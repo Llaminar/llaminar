@@ -40,7 +40,8 @@ namespace
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     extern "C" bool hipMoE_build_runtime_original_to_grouped(
         const void *runtime,
@@ -81,7 +82,8 @@ namespace
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     extern "C" bool hipMoE_regroup_prefill_routes_runtime_assignments(
         void *runtime,
@@ -108,7 +110,8 @@ namespace
         int retain_routes_for_deferred_commit,
         llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
-        void *stream);
+        void *stream,
+        llaminar2::DeviceMoEProjectionSet expected_projections);
 
     bool hasROCmDevice()
     {
@@ -635,7 +638,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
                    /*filter_to_local_runtime_experts=*/0,
                    /*retain_routes_for_deferred_commit=*/0,
                    /*device_idx=*/0,
-                   harness.stream_) &&
+                   harness.stream_,
+                   llaminar2::DeviceMoEProjectionSet::CompleteExpert) &&
                hipMoE_build_runtime_original_to_grouped(
                    harness.runtime_table_->deviceLayerState(0),
                    baseline_inverse,
@@ -676,7 +680,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
             /*retain_routes_for_deferred_commit=*/0,
             llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
-            harness.stream_);
+            harness.stream_,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
     };
 
     ASSERT_TRUE(launch_baseline());
@@ -889,7 +894,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
             /*retain_routes_for_deferred_commit=*/0,
             llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
-            harness.stream_);
+            harness.stream_,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
     };
 
     ASSERT_TRUE(launch_assigned_baseline());

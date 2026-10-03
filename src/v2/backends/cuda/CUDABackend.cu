@@ -15,10 +15,12 @@
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
+#include "../../planning/PhysicalMemoryAuthority.h"
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
+#include "../../transfer/CapturedTransferKernelPlan.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include "MappedTransferServiceDevice.cuh"
 #include "MappedTransferServiceCUDA.h"
@@ -97,6 +100,76 @@ namespace llaminar2
         }
 
         /**
+         * @return Context-owned leases, not a second physical-byte ledger.
+         *
+         * Storage has process/native-context lifetime. Static destruction must
+         * not release its accounting while the CUDA primary context remains
+         * live. Successful explicit reset is the sole erase boundary; process
+         * exit reclaims both native storage and these process-lifetime objects.
+         * Every access is covered by cudaRuntimeResourceLifecycleMutex().
+         */
+        std::unordered_map<int, std::vector<PhysicalMemoryAllocationLease>> &nativeContextStorageLeases()
+        {
+            static auto *leases = new std::unordered_map<int, std::vector<PhysicalMemoryAllocationLease>>;
+            return *leases;
+        }
+
+        /** @brief Translate a cold native-memory operation failure into a fatal diagnostic. */
+        void requireContextMemoryOperation(cudaError_t error, const char *operation)
+        {
+            if (error != cudaSuccess)
+                throw std::runtime_error(std::string("CUDA execution-context storage: ") + operation +
+                    ": " + cudaGetErrorString(error));
+        }
+
+        /** @brief Restore a probed stack limit unless ownership is explicitly retained. */
+        class CUDAStackFootprintProbe final
+        {
+        public:
+            /** @brief Capture the current context's exact pre-probe limit. */
+            CUDAStackFootprintProbe()
+            {
+                requireContextMemoryOperation(cudaDeviceGetLimit(&original_, cudaLimitStackSize), "read original stack limit");
+            }
+            CUDAStackFootprintProbe(const CUDAStackFootprintProbe &) = delete;
+            CUDAStackFootprintProbe &operator=(const CUDAStackFootprintProbe &) = delete;
+            /** @brief Undo temporary growth even when a query or admission throws. */
+            ~CUDAStackFootprintProbe()
+            {
+                if (state_ == State::Changed && cudaDeviceSetLimit(cudaLimitStackSize, original_) != cudaSuccess)
+                    std::terminate();
+            }
+            /** @return Captured original per-thread stack limit. */
+            std::size_t original() const noexcept { return original_; }
+            /** @brief Grow only outside captured execution; arm rollback before the native call. */
+            void grow(std::size_t requested)
+            {
+                if (state_ != State::Unchanged || requested <= original_)
+                    throw std::logic_error("CUDA stack footprint probe has an invalid growth transition");
+                state_ = State::Changed;
+                requireContextMemoryOperation(cudaDeviceSetLimit(cudaLimitStackSize, requested), "set required stack limit");
+            }
+            /** @brief Return to the original limit before physical admission. */
+            void restore()
+            {
+                if (state_ != State::Changed)
+                    throw std::logic_error("CUDA stack footprint probe has no temporary growth to restore");
+                requireContextMemoryOperation(cudaDeviceSetLimit(cudaLimitStackSize, original_), "restore original stack limit");
+                state_ = State::Restored;
+            }
+            /** @brief Transfer successful growth to the context's retained PMA lease. */
+            void retain() noexcept
+            {
+                if (state_ != State::Changed) std::terminate();
+                state_ = State::Retained;
+            }
+        private:
+            enum class State { Unchanged, Changed, Restored, Retained };
+            std::size_t original_ = 0u;
+            State state_ = State::Unchanged;
+        };
+
+        /**
          * @brief Preserve the caller's exact CUDA device across backend work.
          *
          * Device-memory accounting is a lifecycle operation and may inspect a
@@ -156,6 +229,22 @@ namespace llaminar2
             ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> reference(
                 *value);
             reference.store(published, ::cuda::memory_order_release);
+        }
+
+        /**
+         * @brief Join completed copy blocks through a device-local release sequence.
+         * @param count Private cursor counter, reset before this copy grid starts.
+         * @return Previous number of completed blocks; the last ticket publishes.
+         *
+         * The caller first joins every writer with a CTA barrier. Acquire/release
+         * RMWs carry those writes transitively to the last block, whose existing
+         * system-release publication then makes the whole payload peer-visible.
+         * A relaxed atomic would only count blocks, not acquire their payloads.
+         */
+        __device__ __forceinline__ std::uint32_t capturedTransferJoinBlock(std::uint32_t *count)
+        {
+            ::cuda::atomic_ref<std::uint32_t, ::cuda::thread_scope_device> reference(*count);
+            return reference.fetch_add(1u, ::cuda::memory_order_acq_rel);
         }
 
 #include "../../kernels/common/MappedHostCopyDevice.inl"
@@ -1183,6 +1272,88 @@ namespace llaminar2
         return free_bytes;
     }
 
+    void CUDABackend::prepareNativeExecutionContextStorage(std::size_t required_local_bytes,
+        int device_id, void *stream, const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+        if (!memory || !memory->contains(DeviceId::cuda(device_id)) ||
+            device_id < 0 || device_id >= device_count_ || !stream)
+            throw std::invalid_argument("CUDA execution-context preparation requires its exact admitted device and stream");
+        std::lock_guard lifecycle_lock(cudaRuntimeResourceLifecycleMutex());
+        CUDADeviceSaveRestore current_device;
+        if (!current_device.valid())
+            throw std::runtime_error("CUDA execution-context preparation lost current-device identity");
+        requireContextMemoryOperation(cudaSetDevice(device_id), "select exact device");
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        requireContextMemoryOperation(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &capture_status), "inspect stream capture");
+        if (capture_status != cudaStreamCaptureStatusNone)
+            throw std::logic_error("CUDA context storage must be prepared after sealing capture, never inside recording");
+        CUDAStackFootprintProbe profile;
+        if (required_local_bytes <= profile.original()) return;
+
+        std::size_t before_free = 0u, before_total = 0u;
+        requireContextMemoryOperation(cudaMemGetInfo(&before_free, &before_total), "observe original footprint");
+        profile.grow(required_local_bytes);
+        std::size_t prepared_limit = 0u, prepared_free = 0u, prepared_total = 0u;
+        requireContextMemoryOperation(cudaDeviceGetLimit(&prepared_limit, cudaLimitStackSize), "read driver-aligned limit");
+        requireContextMemoryOperation(cudaMemGetInfo(&prepared_free, &prepared_total), "observe probed footprint");
+        profile.restore();
+        std::size_t restored_limit = 0u, restored_free = 0u, restored_total = 0u;
+        requireContextMemoryOperation(cudaDeviceGetLimit(&restored_limit, cudaLimitStackSize), "verify restored limit");
+        requireContextMemoryOperation(cudaMemGetInfo(&restored_free, &restored_total), "verify restored footprint");
+        if (prepared_limit < required_local_bytes || restored_limit != profile.original() ||
+            before_total != prepared_total || before_total != restored_total ||
+            prepared_free > before_free || restored_free != before_free)
+            throw std::runtime_error("CUDA stack footprint probe failed exact capacity/limit restoration; no graph may be instantiated");
+
+        const auto measured_bytes = before_free - prepared_free;
+        const auto *physical = memory->admission()->plan().find({
+            .world_rank = memory->worldRank(), .device = DeviceId::cuda(device_id)});
+        if (!physical || before_total > physical->resource().total_bytes)
+            throw std::runtime_error("CUDA context footprint exceeds its authenticated physical resource");
+        std::optional<PhysicalMemoryAllocationLease> lease;
+        if (measured_bytes)
+            lease.emplace(memory->claimMeasuredRuntimeContextStorage({
+                .world_rank = memory->worldRank(), .device = DeviceId::cuda(device_id),
+                // CUDA's currently usable total can exclude fixed driver
+                // backing. Preserve the canonical physical-total identity and
+                // use only the actually observed free bytes for admission.
+                .total_bytes = physical->resource().total_bytes,
+                .admission_available_bytes = before_free}, measured_bytes));
+        // Allocate host bookkeeping before changing persistent native storage:
+        // successful growth must not become unowned on a vector allocation failure.
+        auto &retained = nativeContextStorageLeases()[device_id];
+        if (lease) retained.reserve(retained.size() + 1u);
+        CUDAStackFootprintProbe materialization;
+        materialization.grow(prepared_limit);
+        std::size_t actual_limit = 0u, actual_free = 0u, actual_total = 0u;
+        requireContextMemoryOperation(cudaDeviceGetLimit(&actual_limit, cudaLimitStackSize), "verify materialized limit");
+        requireContextMemoryOperation(cudaMemGetInfo(&actual_free, &actual_total), "verify materialized footprint");
+        if (actual_limit != prepared_limit || actual_total != before_total || actual_free != prepared_free)
+            throw std::runtime_error("CUDA context storage did not reproduce its admitted physical footprint");
+        if (lease) retained.push_back(std::move(*lease));
+        materialization.retain();
+        LOG_DEBUG("[CUDABackend] Prepared context-lifetime storage device=CUDA:" << device_id
+                  << " stack_limit=" << actual_limit << " admitted_growth_bytes=" << measured_bytes);
+    }
+
+    std::size_t CUDABackend::nativeExecutionContextStorageBytes(int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            throw std::invalid_argument("Invalid CUDA context-memory observation device");
+        std::lock_guard lifecycle_lock(cudaRuntimeResourceLifecycleMutex());
+        const auto found = nativeContextStorageLeases().find(device_id);
+        std::size_t bytes = 0u;
+        if (found != nativeContextStorageLeases().end())
+            for (const auto &lease : found->second)
+            {
+                if (lease.owner() != PhysicalMemoryOwner::NativeExecutionContext ||
+                    lease.bytes() > std::numeric_limits<std::size_t>::max() - bytes)
+                    throw std::logic_error("CUDA native-context PMA lease identity or extent is invalid");
+                bytes += lease.bytes();
+            }
+        return bytes;
+    }
+
     DeviceAllocationAccounting
     CUDABackend::deviceAllocationAccounting(int device_id) const
     {
@@ -1489,6 +1660,10 @@ namespace llaminar2
             (void)cudaGetLastError();
             return result;
         }
+        // Only successful native reset releases this context's private stack
+        // backing. Graph/payload retirement and failed reset leave its PMA
+        // leases live; no graph owner can manufacture that reclaimed capacity.
+        nativeContextStorageLeases().erase(device_id);
 
         /*
          * Every pointer/event below belonged to the retired primary context.
@@ -5668,7 +5843,10 @@ namespace llaminar2
         *timeout_ticks = 0;
         cudaFuncAttributes attributes{};
         if (cudaFuncGetAttributes(&attributes, capturedTransferAcquireKernel) != cudaSuccess ||
-            cudaFuncGetAttributes(&attributes, capturedTransferPublishKernel) != cudaSuccess)
+            cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<true>) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferCopyPublishKernel<false>) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<true>) != cudaSuccess ||
+            cudaFuncGetAttributes(&attributes, capturedTransferFusedKernel<false>) != cudaSuccess)
             return false;
         // The graph wait uses %globaltimer nanoseconds, not a DVFS-dependent
         // SM cycle count or a queried maximum shader frequency.
@@ -5676,24 +5854,36 @@ namespace llaminar2
         return prepareMappedHostCopyKernels(device_id);
     }
 
-    bool CUDABackend::enqueueCapturedTransferChannelBoundary(
+    bool CUDABackend::enqueueCapturedTransferChannel(
         const CapturedTransferChannelDeviceBinding &binding,
-        CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+        void *destination, const void *source, int device_id, void *stream)
     {
-        const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannelBoundary");
-        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
-        // One warp orders metadata only. Payload throughput belongs to the
-        // existing multi-block copy, not a serial copy inside a wait kernel.
-        switch (operation)
+        const auto native = requireExplicitStream(stream, "CUDABackend::enqueueCapturedTransferChannel");
+        if (!binding.valid() || !destination || !source || device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id)) return false;
+        const bool aligned = reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
+            reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0;
+        // One block is economical for small admitted messages. This selection
+        // never samples the live count or changes when ownership/skew changes.
+        if (capturedTransferKernelPlan(binding.message.bytes) == CapturedTransferKernelPlan::SingleBlock)
         {
-        case CapturedTransferBoundaryOperation::Acquire:
-            capturedTransferAcquireKernel<<<1, 32, 0, native>>>(binding);
-            break;
-        case CapturedTransferBoundaryOperation::Publish:
-            capturedTransferPublishKernel<<<1, 32, 0, native>>>(binding);
-            break;
-        default: return false;
+            if (aligned)
+                capturedTransferFusedKernel<true><<<1, kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
+            else
+                capturedTransferFusedKernel<false><<<1, kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
+            return cudaGetLastError() == cudaSuccess;
         }
+        // Large messages keep the link-saturating grid. Its last completed
+        // block publishes, so neither a third launch nor a grid barrier is needed.
+        capturedTransferAcquireKernel<<<1, 32, 0, native>>>(binding);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        if (aligned)
+            capturedTransferCopyPublishKernel<true><<<mappedHostCopyBlocks(
+                binding.message.bytes / sizeof(uint4) + (binding.message.bytes % sizeof(uint4) != 0)),
+                kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
+        else
+            capturedTransferCopyPublishKernel<false><<<mappedHostCopyBlocks(binding.message.bytes),
+                kMappedHostCopyThreads, 0, native>>>(binding, destination, source);
         return cudaGetLastError() == cudaSuccess;
     }
 

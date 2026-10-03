@@ -2,6 +2,24 @@
 
 ## Objective
 
+2026-09-30 follow-up: six public-auto Release stochastic matrices now pass
+fixed 3/15 and dynamic CUDA/ROCm, including ROCm 262,144 capacity. Single-CUDA
+dynamic max context is a precise physical admission rejection, not a graph
+certificate. The issue #17 950-record cold/exact/changed-prefix sequence passes
+both current fixed-3 servers with authentic hits, but the exact Nail GGUF
+remains untested. Native outcome, wide Top-K, typed sampling admission and
+maximum-context physical state regressions are explicitly in production
+preflight and pass their focused gates. GPU DRY is a precise early rejection,
+not a host or non-MTP substitution. Issue #13 now has shared mandatory learned-
+weight admission before auto evidence, direct BOM or graph allocations; its
+six focused Unit/preflight entries pass. Refresh the complete gate, then drive
+the now-staged exact Nail weights through the reported public requests. Keep
+mixed-projection implementation (#14) and matched dynamic economics (#16)
+separate;
+do not equate these local correctness checks with a new image or 1.6x scaling
+certificate. Current evidence and next proof obligations live in the
+[two-GPU project handoff](../2026-09/2026-09-27-qwen36-rocm2-prefill.md).
+
 2026-09-27 six-GPU 122B follow-up: mapped-packet and floating-expert tuning
 reaches 351.49 tok/s prefill and 42.38 decode under unchanged dynamic MTP
 defaults; the updated 43.80 decode target remains open. An explicit GPU

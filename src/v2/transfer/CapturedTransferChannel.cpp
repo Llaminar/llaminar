@@ -47,6 +47,21 @@ namespace llaminar2
             }
             throw std::invalid_argument("Captured transfer has an invalid endpoint role");
         }
+
+        /** @brief Reject misaligned count storage or aliasing with payload capacity.
+         * @param count Exact device address of a retained uint64 count.
+         * @param payload Exact start of the bound device payload.
+         * @param capacity Capture-frozen maximum payload extent. */
+        void validateExtentAddress(void *count, void *payload, size_t capacity)
+        {
+            const auto address = reinterpret_cast<std::uintptr_t>(count);
+            const auto start = reinterpret_cast<std::uintptr_t>(payload);
+            if (address % alignof(std::uint64_t) != 0)
+                throw std::invalid_argument("Device-counted transfer extent must be uint64 aligned");
+            // Difference comparisons avoid overflowing one-past-end arithmetic.
+            if (address >= start ? address - start < capacity : start - address < sizeof(std::uint64_t))
+                throw std::invalid_argument("Device-counted transfer extent overlaps its payload capacity");
+        }
     }
 
     CapturedTransferChannelMemory CapturedTransferChannel::memoryFor(size_t capacity)
@@ -225,7 +240,94 @@ namespace llaminar2
         return binding;
     }
 
+    CapturedTransferBinding TransferEngine::bindDeviceCountedTransfer(
+        CapturedTransferBinding binding, std::shared_ptr<const WorkspaceBufferLease> storage, size_t offset) const
+    {
+        if (isGraphCaptureActive() || !binding.channel_ || !binding.native_.valid() ||
+            binding.native_.extent_source != CapturedTransferExtentSource::FixedMessage || !storage)
+            throw std::invalid_argument("Device-counted transfer requires setup-time fixed capacity and retained count storage");
+        const auto &endpoint = binding.channel_->endpoints_[endpointIndex(binding.native_.role)];
+        if (storage->device() != binding.device_ || storage->backend() != endpoint.backend ||
+            resolveBackend(binding.device_) != endpoint.backend)
+            throw std::invalid_argument("Device-counted transfer extent belongs to a foreign endpoint/backend");
+        if (!storage->contains(offset, sizeof(std::uint64_t)))
+            throw std::out_of_range("Device-counted transfer extent exceeds its retained workspace");
+        auto *address = storage->data(offset);
+        validateExtentAddress(address, binding.device_bytes_, binding.native_.message.bytes);
+        binding.extent_storage_ = std::move(storage);
+        binding.extent_offset_ = offset;
+        binding.native_.device_extent = static_cast<std::uint64_t *>(address);
+        binding.native_.extent_source = binding.native_.role == CapturedTransferEndpoint::Producer
+            ? CapturedTransferExtentSource::ProducerDevice : CapturedTransferExtentSource::ProducerPublication;
+        return binding;
+    }
+
+    CapturedTransferBinding TransferEngine::bindDeviceCountedTransfer(
+        CapturedTransferBinding binding, std::shared_ptr<DeviceTransferBuffer> storage, size_t offset) const
+    {
+        if (isGraphCaptureActive() || !binding.channel_ || !binding.native_.valid() ||
+            binding.native_.extent_source != CapturedTransferExtentSource::FixedMessage || !storage || !storage->isBound())
+            throw std::invalid_argument("Device-counted transfer requires setup-time fixed capacity and bound count storage");
+        const auto &endpoint = binding.channel_->endpoints_[endpointIndex(binding.native_.role)];
+        if (storage->device_ != binding.device_ || storage->backend_ != endpoint.backend ||
+            resolveBackend(binding.device_) != endpoint.backend)
+            throw std::invalid_argument("Device-counted transfer extent belongs to a foreign endpoint/backend");
+        if (!storage->contains(offset, sizeof(std::uint64_t)))
+            throw std::out_of_range("Device-counted transfer extent exceeds its retained buffer");
+        auto *address = storage->mutableDeviceData(offset);
+        validateExtentAddress(address, binding.device_bytes_, binding.native_.message.bytes);
+        binding.extent_storage_ = std::move(storage);
+        binding.extent_offset_ = offset;
+        binding.native_.device_extent = static_cast<std::uint64_t *>(address);
+        binding.native_.extent_source = binding.native_.role == CapturedTransferEndpoint::Producer
+            ? CapturedTransferExtentSource::ProducerDevice : CapturedTransferExtentSource::ProducerPublication;
+        return binding;
+    }
+
     void TransferEngine::enqueueCapturedTransfer(const CapturedTransferBinding &binding, void *stream) const
+    {
+        enqueueCapturedTransferImpl(binding, stream, nullptr);
+    }
+
+    void TransferEngine::enqueueForkedCapturedExchange(
+        std::span<const CapturedTransferBinding> producers,
+        std::span<const CapturedTransferBinding> consumers,
+        const AcquiredDeviceTransferInput &input, ITensor *output) const
+    {
+        auto *destination = dynamic_cast<TensorBase *>(output);
+        if (!input.valid() || producers.empty() || consumers.empty() || !destination ||
+            destination->transferStorageOwner() != destination || input.sourceOwner() == destination)
+            throw std::invalid_argument("Forked captured exchange requires an acquired input and disjoint canonical output");
+        requireDeviceOutput(destination, input.device(), input.consumerStream());
+        requireDeviceOutput(input.sourceOwner(), input.device(), input.consumerStream());
+        const auto source_address = reinterpret_cast<std::uintptr_t>(input.sourceOwner()->gpu_data_ptr());
+        const auto destination_address = reinterpret_cast<std::uintptr_t>(destination->gpu_data_ptr());
+        if (source_address <= destination_address
+                ? destination_address - source_address < input.sourceOwner()->size_bytes()
+                : source_address - destination_address < destination->size_bytes())
+            throw std::invalid_argument("Forked captured exchange packet banks physically overlap");
+        // Authenticate the complete participant before recording any channel.
+        // A caller cannot use a valid fork to authorize a different tensor,
+        // foreign device, receive-as-send, or unowned workspace publication.
+        const auto validate = [&](const auto &bindings, CapturedTransferEndpoint role, TensorBase *owner) {
+            for (const auto &binding : bindings)
+            {
+                const auto *storage = std::get_if<std::shared_ptr<TensorBase>>(&binding.storage_);
+                if (binding.device_ != input.device() || binding.native_.role != role ||
+                    !storage || storage->get() != owner)
+                    throw std::invalid_argument("Forked captured exchange endpoint disagrees with its acquired arena owners");
+            }
+        };
+        validate(producers, CapturedTransferEndpoint::Producer, input.sourceOwner());
+        validate(consumers, CapturedTransferEndpoint::Consumer, destination);
+        for (const auto &binding : producers)
+            enqueueCapturedTransferImpl(binding, input.consumerStream(), &input);
+        for (const auto &binding : consumers)
+            enqueueCapturedTransferImpl(binding, input.consumerStream(), &input);
+    }
+
+    void TransferEngine::enqueueCapturedTransferImpl(const CapturedTransferBinding &binding,
+        void *stream, const AcquiredDeviceTransferInput *fork) const
     {
         if (!stream || !binding.channel_ || !binding.native_.valid())
             throw std::invalid_argument("Captured transfer submission needs a frozen binding and explicit stream");
@@ -233,6 +335,22 @@ namespace llaminar2
         auto *backend = resolveBackend(binding.device_);
         if (!backend || backend != endpoint.backend)
             throw std::logic_error("Captured transfer backend identity changed after binding");
+        if (binding.native_.extent_source != CapturedTransferExtentSource::FixedMessage)
+        {
+            const bool retained = std::visit([&](const auto &storage) {
+                using Owner = std::decay_t<decltype(storage)>;
+                if constexpr (std::is_same_v<Owner, std::monostate>) return false;
+                else if constexpr (std::is_same_v<Owner, std::shared_ptr<DeviceTransferBuffer>>)
+                    return storage && storage->device_ == binding.device_ && storage->backend_ == backend &&
+                        storage->contains(binding.extent_offset_, sizeof(std::uint64_t)) &&
+                        storage->mutableDeviceData(binding.extent_offset_) == binding.native_.device_extent;
+                else
+                    return storage && storage->device() == binding.device_ && storage->backend() == backend &&
+                        storage->contains(binding.extent_offset_, sizeof(std::uint64_t)) &&
+                        storage->data(binding.extent_offset_) == binding.native_.device_extent;
+            }, binding.extent_storage_);
+            if (!retained) throw std::logic_error("Device-counted transfer lost its retained extent owner");
+        }
         TensorBase *tensor = nullptr;
         if (const auto *storage = std::get_if<std::shared_ptr<DeviceTransferBuffer>>(&binding.storage_))
         {
@@ -255,7 +373,7 @@ namespace llaminar2
             tensor = std::get<std::shared_ptr<TensorBase>>(binding.storage_).get();
             if (!tensor || tensor->transferStorageOwner() != tensor || tensor->resolveBackend(binding.device_) != backend)
                 throw std::logic_error("Captured transfer tensor owner changed");
-            if (binding.native_.role == CapturedTransferEndpoint::Producer)
+            if (binding.native_.role == CapturedTransferEndpoint::Producer && !fork)
                 requireDeviceInput(tensor, binding.device_, stream);
             else
                 requireDeviceOutput(tensor, binding.device_, stream);
@@ -263,18 +381,17 @@ namespace llaminar2
                 static_cast<unsigned char *>(tensor->gpu_data_ptr()) + binding.offset_ != binding.device_bytes_)
                 throw std::logic_error("Captured transfer tensor storage changed after binding");
         }
-        // Setup already certified cursor initialization. The live graph has
-        // exactly acquire/copy/publish; it cannot import an uncaptured event.
-        if (!backend->enqueueCapturedTransferChannelBoundary(binding.native_, CapturedTransferBoundaryOperation::Acquire,
-                binding.device_.ordinal, stream))
-            throw std::runtime_error("Captured transfer acquire submission failed");
+        // Setup certified initialization. Submit one complete typed operation;
+        // the backend may fuse nodes without splitting ownership or making
+        // TransferEngine dictate a needlessly fragmented native graph.
         auto *mapped_bytes = binding.channel_->mapped_->deviceAlias(binding.device_, CapturedTransferChannel::payload_offset);
         const bool outbound = binding.native_.role == CapturedTransferEndpoint::Producer;
-        if (!backend->copyDeviceVisibleRegionByKernelOnStream(outbound ? mapped_bytes : binding.device_bytes_,
-                outbound ? binding.device_bytes_ : mapped_bytes, binding.native_.message.bytes, binding.device_.ordinal, stream) ||
-            !backend->enqueueCapturedTransferChannelBoundary(binding.native_, CapturedTransferBoundaryOperation::Publish,
-                binding.device_.ordinal, stream))
-            throw std::runtime_error("Captured transfer copy/publication submission failed");
-        if (tensor && !outbound) publishDeviceWrite(tensor, binding.device_, stream);
+        void *destination = outbound ? mapped_bytes : binding.device_bytes_;
+        const void *source = outbound ? binding.device_bytes_ : mapped_bytes;
+        if (!backend->enqueueCapturedTransferChannel(binding.native_, destination, source, binding.device_.ordinal, stream))
+            throw std::runtime_error("Captured transfer submission failed");
+        // Forked outputs are not globally ready on this auxiliary stream. The
+        // paired join owns their one publication after its exact event wait.
+        if (tensor && !outbound && !fork) publishDeviceWrite(tensor, binding.device_, stream);
     }
 }

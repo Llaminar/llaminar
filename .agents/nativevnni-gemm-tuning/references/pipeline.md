@@ -66,6 +66,20 @@ The timing sidecar owns raw samples and stationarity. The aggregate owns
 candidate correctness, route identity, and summary timing. Profiler evidence
 owns hardware counters from a separate launch. Digests bind every join.
 
+Auto's observed launch family and the inventory of forceable candidates are
+distinct. ROCm can report its streaming producer even when the tournament
+forces only cooperative tiles. Validate complete family-specific tuples and
+retain the same byte, resource and timing gates. Unknown cross-family tuples
+and a forced candidate reporting another family remain errors. Observation
+admission alone does not prove that an exact-overlay executor can reproduce
+that family; verify that separately before installing a selected policy.
+ROCm dense schema v3 records the producer and dynamic LDS explicitly. Q8 source
+aliases remain independent cells over the blockwise INT8 candidate inventory;
+NativeVNNI-only knobs cannot claim to tune those launches. Resource inspection
+uses the recorded function, block size and dynamic LDS, after clearing stale
+thread-local observations. Native minimum-winner checks consume exact raw
+event samples and inventory-order ties, not rounded aggregate microseconds.
+
 ## Corpus Publication
 
 The turnkey driver computes:

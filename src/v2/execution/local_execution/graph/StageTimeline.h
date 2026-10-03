@@ -109,8 +109,8 @@ namespace llaminar2
 
             for (auto &rec : records_)
             {
-                rec.event_start = gpu_ctx->createEvent();
-                rec.event_stop = gpu_ctx->createEvent();
+                rec.event_start = gpu_ctx->createEvent(GPUEventPurpose::Timing);
+                rec.event_stop = gpu_ctx->createEvent(GPUEventPurpose::Timing);
             }
 
             initialized_ = true;
@@ -129,8 +129,8 @@ namespace llaminar2
 
             for (size_t i = old_size; i < num_stages; ++i)
             {
-                records_[i].event_start = gpu_ctx->createEvent();
-                records_[i].event_stop = gpu_ctx->createEvent();
+                records_[i].event_start = gpu_ctx->createEvent(GPUEventPurpose::Timing);
+                records_[i].event_stop = gpu_ctx->createEvent(GPUEventPurpose::Timing);
             }
 
             gpu_ctx_ = gpu_ctx;

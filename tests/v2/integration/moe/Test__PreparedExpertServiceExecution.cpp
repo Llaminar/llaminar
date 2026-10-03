@@ -134,7 +134,7 @@ namespace llaminar2::test
             /** @brief Bind one complete prepared expert without a live router or histogram. */
             ExpertExecution(DeviceId device, void *stream, int rows,
                             MoEOverlayServicePhaseHint phase,
-                            MoEOverlayPreparedExpertTriplet engines)
+                            MoEOverlayPreparedExpertPayload engines)
                 : device_(device), stream_(stream), rows_(rows),
                   input_({static_cast<size_t>(rows), kWidth}),
                   indices_({static_cast<size_t>(rows), 1}),
@@ -175,9 +175,9 @@ namespace llaminar2::test
                 p.prepared_gate_gemm.assign(kExperts, nullptr);
                 p.prepared_up_gemm.assign(kExperts, nullptr);
                 p.prepared_down_gemm.assign(kExperts, nullptr);
-                p.prepared_gate_gemm[kExpert] = engines_.gate.get();
-                p.prepared_up_gemm[kExpert] = engines_.up.get();
-                p.prepared_down_gemm[kExpert] = engines_.down.get();
+                p.prepared_gate_gemm[kExpert] = engines_.gate().get();
+                p.prepared_up_gemm[kExpert] = engines_.up().get();
+                p.prepared_down_gemm[kExpert] = engines_.down().get();
                 p.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
                 if (device.is_cpu())
                 {
@@ -263,7 +263,7 @@ namespace llaminar2::test
             FP32Tensor input_, indices_, weights_, output_;
             std::unique_ptr<IDeviceContext> context_;
             std::unique_ptr<DeviceWorkspaceManager> workspace_;
-            MoEOverlayPreparedExpertTriplet engines_;
+            MoEOverlayPreparedExpertPayload engines_;
             std::unique_ptr<MoEExpertComputeStage> stage_;
             std::unique_ptr<IGPUGraphCapture> graph_;
         };
@@ -275,7 +275,7 @@ namespace llaminar2::test
          * PMA admits exactly the producer's declared scratch, and must show no
          * live probe payload after completion or a rejected invocation.
          */
-        void proveProductionCPUMeasurement(const MoEOverlayPreparedExpertTriplet &source)
+        void proveProductionCPUMeasurement(const MoEOverlayPreparedExpertPayload &source)
         {
             RoutedExpertDomain domain;
             domain.name = "cpu_service";
@@ -302,9 +302,9 @@ namespace llaminar2::test
                 .num_layers = 1, .num_experts = kExperts, .initial_epoch = 1,
                 .collect_economy_service_measurements = true});
             ASSERT_TRUE(registry.registerInitialLayer(0, 0,
-                std::vector<bool>(kExperts, true), std::vector<MoEOverlayPreparedExpertTriplet>(kExperts, source)));
+                std::vector<bool>(kExperts, true), std::vector<MoEOverlayPreparedExpertPayload>(kExperts, source)));
             MoEOverlayPreparedWeightSource descriptor;
-            ASSERT_TRUE(resolveMoEOverlayPreparedWeightSource(source.gate, DeviceId::cpu(), descriptor));
+            ASSERT_TRUE(resolveMoEOverlayPreparedWeightSource(source.gate(), DeviceId::cpu(), descriptor));
             const MoEOverlayEconomyCalibrationLayerCatalog catalog({{
                 .layer_idx = 0,
                 .projections = {{
@@ -315,7 +315,7 @@ namespace llaminar2::test
             const MoEOverlayCPUServiceMeasurement::Geometry geometry{kWidth, kWidth};
             constexpr int sample_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
             auto invocation = cpuSwiGLUWorkspaceRequirements(sample_rows, kWidth);
-            for (const auto &engine : {source.gate, source.up, source.down})
+            for (const auto &engine : {source.gate(), source.up(), source.down()})
                 if (const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(engine.get()))
                     invocation.merge(consumer->getWorkspaceRequirements(sample_rows, kWidth, kWidth));
             const size_t bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
@@ -386,7 +386,7 @@ namespace llaminar2::test
                     std::array<std::shared_ptr<TensorBase>, 3> weights;
                     for (size_t i = 0; i < weights.size(); ++i) weights[i] = create({kWidth, kWidth}, 71 + i);
                     SCOPED_TRACE(static_cast<int>(weights[0]->native_type()));
-                    MoEOverlayPreparedExpertTriplet source{
+                    MoEOverlayPreparedExpertPayload source{
                         prepare(weights[0], device, serving_stream),
                         prepare(weights[1], device, serving_stream),
                         prepare(weights[2], device, serving_stream)};
@@ -403,10 +403,10 @@ namespace llaminar2::test
                         for (float value : expected) ASSERT_TRUE(std::isfinite(value));
                         if (device.is_cpu()) proveProductionCPUMeasurement(source);
                         {
-                            MoEOverlayPreparedExpertTriplet private_engines{
-                                KernelFactory::createExpertServiceExecutionView(source.gate, device),
-                                KernelFactory::createExpertServiceExecutionView(source.up, device),
-                                KernelFactory::createExpertServiceExecutionView(source.down, device)};
+                            MoEOverlayPreparedExpertPayload private_engines{
+                                KernelFactory::createExpertServiceExecutionView(source.gate(), device),
+                                KernelFactory::createExpertServiceExecutionView(source.up(), device),
+                                KernelFactory::createExpertServiceExecutionView(source.down(), device)};
                             ExpertExecution probe(device, probe_stream, rows, phase, std::move(private_engines));
                             EXPECT_GT(probe.replay(), 0u);
                             const auto observed = probe.output();

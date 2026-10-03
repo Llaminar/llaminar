@@ -76,6 +76,29 @@ class GPUDriverDiagnosticsTests(unittest.TestCase):
         self.assertTrue(driver.driver_diagnostic(record("amdgpu: unexpected status 17", "warn")))
         self.assertTrue(driver.driver_diagnostic(record("NVRM: bad status 17", "crit")))
 
+    def test_nvidia_profiling_assertion_is_not_a_clean_interval(self):
+        """Nsight-associated assertions still fail evidence; no profiler allowlist."""
+        warning = record(
+            "NVRM: nvAssertFailedNoLog: Assertion failed: "
+            "pStaticInfo->pSmIssueThrottleCtrl != NULL @ kernel_graphics.c:3411",
+            "warn", timestamp=20.0)
+        self.assertTrue(driver.driver_diagnostic(warning))
+        before = record("nvidia: normal initialization", timestamp=10.0)
+        observed = driver.new_records(checkpoint(before), snapshot(before, warning))
+        self.assertEqual(observed, (warning,))
+        evidence = clean_evidence()
+        evidence.update(passed=False, new_record_count=1,
+                        records=[asdict(warning)], findings=[asdict(warning)])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for claimed_pass in (False, True):
+                # A stale green summary cannot erase the retained assertion.
+                evidence.update(passed=claimed_pass,
+                                findings=[] if claimed_pass else [asdict(warning)])
+                driver.publish(root / "cell.driver-diagnostics.json", evidence)
+                with self.subTest(claimed_pass=claimed_pass), self.assertRaises(ValueError):
+                    driver.validate_evidence(root)
+
     def test_normal_initialization_and_unrelated_warnings_are_not_gpu_faults(self):
         """Loaded module names alone do not attribute another subsystem's WARN."""
         for message, priority in (

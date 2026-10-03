@@ -83,7 +83,15 @@ public:
     void resetAuxiliaryStreams() override {}
 
     // Event Access - return mock pointers
-    void *createEvent() override { return mock_event_; }
+    /** @copydoc IWorkerGPUContext::createEvent */
+    void *createEvent(GPUEventPurpose purpose = GPUEventPurpose::Ordering) override
+    {
+        (void)gpuEventHasTiming(purpose);
+        last_event_purpose_ = purpose;
+        return mock_event_;
+    }
+    /** @brief Inspect typed event admission without touching a GPU. */
+    GPUEventPurpose lastEventPurpose() const { return last_event_purpose_; }
     void destroyEvent(void * /*event*/) override {}
     void recordEvent(void * /*event*/, void * /*stream*/) override {}
     void waitEvent(void * /*event*/, void * /*stream*/) override {}
@@ -130,10 +138,39 @@ private:
     void *mock_stream_ = reinterpret_cast<void *>(0xDEADBEEF);
     void *mock_auxiliary_stream_ = reinterpret_cast<void *>(0xDEADCAFE);
     void *mock_event_ = reinterpret_cast<void *>(0xCAFEBABE);
+    GPUEventPurpose last_event_purpose_ = GPUEventPurpose::Ordering;
     void *mock_blas_handle_ = reinterpret_cast<void *>(0x12345678);
     void *mock_blas_lt_handle_ = reinterpret_cast<void *>(0x87654321);
     void *mock_comm_ = nullptr;
 };
+
+/** @brief Interface defaults stay ordering-only through virtual dispatch. */
+TEST(Test__WorkerGPUEventPurpose, OrderingIsTheDefaultAndTimingRequiresExplicitAdmission)
+{
+    MockGPUContext context(0);
+    IWorkerGPUContext &worker = context;
+    EXPECT_NE(worker.createEvent(), nullptr);
+    EXPECT_EQ(context.lastEventPurpose(), GPUEventPurpose::Ordering);
+    EXPECT_FALSE(gpuEventHasTiming(context.lastEventPurpose()));
+    EXPECT_NE(worker.createEvent(GPUEventPurpose::Timing), nullptr);
+    EXPECT_EQ(context.lastEventPurpose(), GPUEventPurpose::Timing);
+    EXPECT_TRUE(gpuEventHasTiming(context.lastEventPurpose()));
+    EXPECT_NE(worker.createEvent(), nullptr);
+    EXPECT_EQ(context.lastEventPurpose(), GPUEventPurpose::Ordering);
+}
+
+/** @brief Unknown policy values cannot quietly create a different native event. */
+TEST(Test__WorkerGPUEventPurpose, InvalidPurposesFailBeforeResourceAdmission)
+{
+    MockGPUContext context(0);
+    for (unsigned value = 2; value <= 255; ++value)
+    {
+        const auto purpose = static_cast<GPUEventPurpose>(value);
+        EXPECT_THROW((void)gpuEventHasTiming(purpose), std::invalid_argument);
+        EXPECT_THROW((void)context.createEvent(purpose), std::invalid_argument);
+    }
+    EXPECT_EQ(context.lastEventPurpose(), GPUEventPurpose::Ordering);
+}
 
 TEST(Test__WorkerGPUContextSubmission, NestedSynchronousWorkExecutesInline)
 {

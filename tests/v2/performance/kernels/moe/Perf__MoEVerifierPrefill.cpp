@@ -12,6 +12,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include "../../../mocks/MockComputeStage.h"
+#include "../../../utils/BenchmarkGeometrySelection.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/NativeVNNITrainerEvidence.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -79,12 +80,15 @@ extern "C" bool cudaMoE_grouped_prefill_query_kernel_resources(
  * The harness is deliberately narrower than full-model benchmark mode. It gives
  * us a stable speedometer for kernel and grouping changes before we spend time
  * rerunning the expensive dense/MoE iteration matrix.
+ * CUDA and ROCm share strict geometry admission: a malformed explicit
+ * inventory never substitutes the standard shapes or drops an invalid entry.
  */
 
 namespace
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
     using llaminar2::TransferEngine;
+    using llaminar2::test::benchmarkGeometryIntegers;
 
     struct CloseMetrics
     {
@@ -253,48 +257,6 @@ namespace
                 std::string(name) + " must be a positive finite scalar");
         }
         return parsed;
-    }
-
-    /** Parse a comma-separated positive integer inventory without duplicates. */
-    std::vector<int> envCsvPositiveInts(
-        const char *name,
-        std::initializer_list<int> fallback)
-    {
-        const char *value = std::getenv(name);
-        if (!value || !*value)
-            return std::vector<int>(fallback);
-
-        std::vector<int> result;
-        std::string csv(value);
-        size_t start = 0;
-        while (start <= csv.size())
-        {
-            const size_t comma = csv.find(',', start);
-            const std::string token = csv.substr(
-                start,
-                comma == std::string::npos
-                    ? std::string::npos
-                    : comma - start);
-            char *end = nullptr;
-            const long parsed = std::strtol(token.c_str(), &end, 10);
-            if (token.empty() || end == token.c_str() || *end != '\0' ||
-                parsed <= 0 || parsed > std::numeric_limits<int>::max())
-            {
-                throw std::runtime_error(
-                    std::string(name) + " contains an invalid positive integer");
-            }
-            const int integer = static_cast<int>(parsed);
-            if (std::find(result.begin(), result.end(), integer) != result.end())
-            {
-                throw std::runtime_error(
-                    std::string(name) + " contains a duplicate value");
-            }
-            result.push_back(integer);
-            if (comma == std::string::npos)
-                break;
-            start = comma + 1;
-        }
-        return result;
     }
 
     bool envCsvContainsOrUnset(const char *name, const std::string &candidate)
@@ -3025,7 +2987,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionGGUFMixtureCandidateTrainer)
         "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_MAX_FINALISTS", 8);
     settings.finalist_margin = envPositiveDouble(
         "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_FINALIST_MARGIN", 0.05);
-    const std::vector<int> m_values = envCsvPositiveInts(
+    const std::vector<int> m_values = benchmarkGeometryIntegers(
         "LLAMINAR_CUDA_MOE_PRODUCTION_SWEEP_M",
         {64, 256, 1024, 2048, 4096, 8192, 16384});
     const int maximum_cells = envInt(
@@ -3268,7 +3230,7 @@ TEST(Perf__MoEVerifierPrefill, CUDA_ProductionCandidatesAreSerialRowByteInvarian
         {"IQ3_S", "Q6_K"},
         {"IQ2_S", "IQ3_S"},
     }};
-    const std::vector<int> rows_to_prove = envCsvPositiveInts(
+    const std::vector<int> rows_to_prove = benchmarkGeometryIntegers(
         "LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_M", {64, 1024});
     const int device_ordinal = envInt(
         "LLAMINAR_CUDA_MOE_CANDIDATE_INVARIANCE_DEVICE", 0);

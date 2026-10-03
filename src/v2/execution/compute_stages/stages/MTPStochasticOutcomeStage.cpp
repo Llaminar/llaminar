@@ -1,9 +1,14 @@
 /**
- * @file MTPStochasticSerialOutcomeStage.cpp
- * @brief Implementation of captured serial-equivalent stochastic MTP reduction.
+ * @file MTPStochasticOutcomeStage.cpp
+ * @brief Complete captured stochastic outcomes for both request sampling laws.
+ *
+ * The seeded law keeps the existing fused serial-equivalent kernel. Probability
+ * rejection captures the established verifier, bonus sample and summary on the
+ * same stream, with all draws derived from immutable request entropy and the
+ * device-owned verifier position. Neither law reads back intermediate state.
  */
 
-#include "MTPStochasticSerialOutcomeStage.h"
+#include "MTPStochasticOutcomeStage.h"
 
 #include "../../../backends/IBackend.h"
 #include "../../../kernels/common/SamplingMath.h"
@@ -15,21 +20,21 @@
 
 namespace llaminar2
 {
-    MTPStochasticSerialOutcomeStage::MTPStochasticSerialOutcomeStage(
+    MTPStochasticOutcomeStage::MTPStochasticOutcomeStage(
         Params params)
         : IComputeStage(params.device_id),
           params_(std::move(params))
     {
     }
 
-    bool MTPStochasticSerialOutcomeStage::validate() const
+    bool MTPStochasticOutcomeStage::validate() const
     {
         using namespace sampling_math;
 
         constexpr int kMaxComparisonRows = 15;
         if (!params_.device_id.is_gpu() || !params_.backend)
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] An explicit GPU backend is required");
+            LOG_ERROR("[MTPStochasticOutcomeStage] An explicit GPU backend is required");
             return false;
         }
         if (params_.request_count <= 0 ||
@@ -44,7 +49,7 @@ namespace llaminar2
                 params_.threshold_seeds.end(),
                 [](uint64_t seed) { return seed == 0; }))
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Invalid request, depth, or seed geometry");
+            LOG_ERROR("[MTPStochasticOutcomeStage] Invalid request, depth, or seed geometry");
             return false;
         }
         if (!params_.target_token_ids_device ||
@@ -62,7 +67,7 @@ namespace llaminar2
             !params_.generation_control_device ||
             params_.generation_control_stride <= 0)
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Incomplete resident input binding");
+            LOG_ERROR("[MTPStochasticOutcomeStage] Incomplete resident input binding");
             return false;
         }
         if (!params_.sampled_target_tokens_device ||
@@ -74,7 +79,7 @@ namespace llaminar2
             !params_.output_meta_device ||
             params_.output_meta_stride < kSpeculativeBatchMetaCount)
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Incomplete compact output binding");
+            LOG_ERROR("[MTPStochasticOutcomeStage] Incomplete compact output binding");
             return false;
         }
         if (params_.advance_maintenance_boundary &&
@@ -83,15 +88,31 @@ namespace llaminar2
              !params_.maintenance_due_device ||
              !params_.decode_boundary_advanced_device))
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Maintenance publication is missing controller fields");
+            LOG_ERROR("[MTPStochasticOutcomeStage] Maintenance publication is missing controller fields");
+            return false;
+        }
+        switch (params_.verification)
+        {
+        case Verification::SerialEquivalent:
+            break;
+        case Verification::OneHotProbabilityRejection:
+            if (!params_.accepted_rows_device ||
+                params_.accepted_row_stride < params_.comparison_rows_per_request ||
+                params_.vocabulary_size < params_.top_k)
+            {
+                LOG_ERROR("[MTPStochasticOutcomeStage] Rejection requires resident decisions and full vocabulary geometry");
+                return false;
+            }
+            break;
+        default:
             return false;
         }
         return true;
     }
 
-    bool MTPStochasticSerialOutcomeStage::execute(IDeviceContext *ctx)
+    bool MTPStochasticOutcomeStage::execute(IDeviceContext *ctx)
     {
-        if (!ensureContext(ctx, "MTPStochasticSerialOutcomeStage") ||
+        if (!ensureContext(ctx, "MTPStochasticOutcomeStage") ||
             !validate())
         {
             return false;
@@ -108,7 +129,56 @@ namespace llaminar2
                 static_cast<size_t>(request) *
                 static_cast<size_t>(target_rows_per_request) *
                 static_cast<size_t>(params_.target_distribution_row_stride);
-            if (!params_.backend
+            if (params_.verification == Verification::OneHotProbabilityRejection)
+            {
+                // The materialized verifier row owns both the condition token
+                // and its drafts. Never resurrect a host shadow or a stale
+                // pre-publication sampler slot as the first-token authority.
+                const auto *tokens = params_.verifier_input_tokens_device +
+                    static_cast<size_t>(request) * params_.verifier_input_token_stride;
+                auto *sampled = params_.sampled_target_tokens_device +
+                    static_cast<size_t>(request) * params_.sampled_target_token_stride;
+                auto *accepted = params_.accepted_rows_device +
+                    static_cast<size_t>(request) * params_.accepted_row_stride;
+                const auto *position = params_.threshold_base_positions_device + request;
+                const uint64_t seed = params_.threshold_seeds[static_cast<size_t>(request)];
+                const auto bonus_offset = target_row_offset +
+                    static_cast<size_t>(params_.comparison_rows_per_request) *
+                        params_.target_distribution_row_stride;
+                if (!params_.backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+                        params_.target_token_ids_device + target_row_offset,
+                        params_.target_probs_device + target_row_offset,
+                        nullptr, nullptr, params_.top_k,
+                        params_.target_distribution_row_stride, tokens + 1,
+                        nullptr, nullptr, params_.comparison_rows_per_request,
+                        params_.device_id.gpu_ordinal(), stream, sampled, accepted,
+                        nullptr, nullptr, nullptr, seed, -1,
+                        params_.vocabulary_size, position, params_.threshold_position_offset) ||
+                    !params_.backend->enqueueSampleDistributionF32Device(
+                        params_.target_token_ids_device + bonus_offset,
+                        params_.target_probs_device + bonus_offset, params_.top_k,
+                        0.0f, params_.device_id.gpu_ordinal(), stream,
+                        sampled + params_.comparison_rows_per_request, nullptr,
+                        seed, position,
+                        params_.threshold_position_offset + params_.comparison_rows_per_request) ||
+                    !params_.backend->enqueueSummarizeSpeculativeVerifyBatchDeviceGenerationControls(
+                        sampled, accepted, nullptr, params_.comparison_rows_per_request,
+                        tokens, params_.stop_tokens_device +
+                            static_cast<size_t>(request) * params_.stop_token_stride,
+                        sampled + params_.comparison_rows_per_request, true,
+                        params_.generation_control_device +
+                            static_cast<size_t>(request) * params_.generation_control_stride,
+                        params_.device_id.gpu_ordinal(), stream, params_.output_token_stride,
+                        params_.output_tokens_device +
+                            static_cast<size_t>(request) * params_.output_token_stride,
+                        params_.output_meta_device +
+                            static_cast<size_t>(request) * params_.output_meta_stride))
+                {
+                    LOG_ERROR("[MTPStochasticOutcomeStage] Captured rejection launch failed for request " << request);
+                    return false;
+                }
+            }
+            else if (!params_.backend
                      ->enqueueSampleAndSummarizeSerialEquivalentSpeculativeBatchDeviceGenerationControls(
                          params_.target_token_ids_device + target_row_offset,
                          params_.target_probs_device + target_row_offset,
@@ -143,7 +213,7 @@ namespace llaminar2
                              ? params_.first_transaction_diagnostic_device
                              : nullptr))
             {
-                LOG_ERROR("[MTPStochasticSerialOutcomeStage] Fused request outcome launch failed for request "
+                LOG_ERROR("[MTPStochasticOutcomeStage] Fused request outcome launch failed for request "
                           << request);
                 return false;
             }
@@ -161,13 +231,13 @@ namespace llaminar2
                 params_.device_id.gpu_ordinal(),
                 stream))
         {
-            LOG_ERROR("[MTPStochasticSerialOutcomeStage] Maintenance-boundary advancement failed");
+            LOG_ERROR("[MTPStochasticOutcomeStage] Maintenance-boundary advancement failed");
             return false;
         }
         return true;
     }
 
-    size_t MTPStochasticSerialOutcomeStage::estimatedMemoryBytes() const
+    size_t MTPStochasticOutcomeStage::estimatedMemoryBytes() const
     {
         const size_t target_rows =
             static_cast<size_t>(params_.request_count) *
@@ -179,23 +249,27 @@ namespace llaminar2
                    static_cast<size_t>(params_.output_token_stride +
                                        params_.output_meta_stride) *
                    sizeof(int32_t) +
+               (params_.verification == Verification::OneHotProbabilityRejection
+                    ? target_rows * sizeof(int32_t)
+                    : 0u) +
                (params_.first_transaction_diagnostic_device
                     ? sizeof(
                           sampling_math::MTPFirstTransactionDiagnosticRecord)
                     : 0u);
     }
 
-    bool MTPStochasticSerialOutcomeStage::supportsBackend(
+    bool MTPStochasticOutcomeStage::supportsBackend(
         ComputeBackendType backend) const
     {
         return backend == ComputeBackendType::GPU_CUDA ||
                backend == ComputeBackendType::GPU_ROCM;
     }
 
-    StageDumpInfo MTPStochasticSerialOutcomeStage::buildDumpInfoImpl() const
+    StageDumpInfo MTPStochasticOutcomeStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
         info.addScalarInt("request_count", params_.request_count);
+        info.addScalarInt("verification", static_cast<int>(params_.verification));
         info.addScalarInt(
             "comparison_rows_per_request",
             params_.comparison_rows_per_request);
@@ -212,7 +286,7 @@ namespace llaminar2
         return info;
     }
 
-    StageBufferContract MTPStochasticSerialOutcomeStage::bufferContract() const
+    StageBufferContract MTPStochasticOutcomeStage::bufferContract() const
     {
         StageBufferContract contract;
         contract.addInput(BufferId::STOCHASTIC_TARGET_TOKEN_IDS);
@@ -220,6 +294,8 @@ namespace llaminar2
         contract.addInput(BufferId::MTP_VERIFIER_INPUT_TOKENS);
         contract.addInput(BufferId::MTP_VERIFIER_STOP_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_VERIFY_TOKENS);
+        if (params_.verification == Verification::OneHotProbabilityRejection)
+            contract.addOutput(BufferId::STOCHASTIC_VERIFY_ACCEPTED);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS);
         contract.addOutput(BufferId::STOCHASTIC_BATCH_OUTPUT_META);
         if (params_.first_transaction_diagnostic_device)
@@ -230,11 +306,15 @@ namespace llaminar2
         return contract;
     }
 
-    bool MTPStochasticSerialOutcomeStage::hasSameCaptureIdentity(
+    bool MTPStochasticOutcomeStage::hasSameCaptureIdentity(
         const Params &other) const noexcept
     {
         return params_.device_id == other.device_id &&
                params_.backend == other.backend &&
+               params_.verification == other.verification &&
+               params_.vocabulary_size == other.vocabulary_size &&
+               params_.accepted_rows_device == other.accepted_rows_device &&
+               params_.accepted_row_stride == other.accepted_row_stride &&
                params_.target_token_ids_device ==
                    other.target_token_ids_device &&
                params_.target_probs_device == other.target_probs_device &&

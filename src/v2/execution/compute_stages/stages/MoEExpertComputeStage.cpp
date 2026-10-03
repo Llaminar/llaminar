@@ -7700,6 +7700,14 @@ namespace llaminar2
         const bool retain_routes_for_deferred_commit =
             groupedVerifierHistogramRole() ==
             MoEGroupedVerifierHistogramRole::DeferredAcceptedRows;
+        // Grouped kernels also execute predictor/static work and one-row
+        // decode. Absence of a deferred ledger is not proof of prefill.
+        const auto immediate_demand = seq_len <= 1 ||
+                params_.service_phase == MoEOverlayServicePhaseHint::GroupedVerifier ||
+                groupedVerifierHistogramRole() == MoEGroupedVerifierHistogramRole::StaticNoPublication
+            ? MoEGroupedPlanDemand::None : MoEGroupedPlanDemand::OrdinaryPrefill;
+        const auto grouped_plan_demand = retain_routes_for_deferred_commit
+            ? MoEGroupedPlanDemand::DeferredAcceptedRows : immediate_demand;
         if (retain_routes_for_deferred_commit)
         {
             if (!runtime_grouping || !params_.moe_runtime_table ||
@@ -7809,7 +7817,8 @@ namespace llaminar2
                         grouped_gateup_desc_table_id_,
                         grouped_down_desc_table_id_,
                         filter_runtime_grouping_to_local_experts,
-                        retain_routes_during_initial_grouping);
+                        retain_routes_during_initial_grouping
+                            ? MoEGroupedPlanDemand::DeferredAcceptedRows : immediate_demand);
             }
             if (groups_prepared && fully_replicated_local_rows)
             {
@@ -7945,7 +7954,7 @@ namespace llaminar2
                         top_k,
                         grouped_gateup_desc_table_id_,
                         grouped_down_desc_table_id_,
-                        retain_routes_for_deferred_commit);
+                        grouped_plan_demand);
                 if (groups_prepared &&
                     !trace_runtime_assignment("after_llep_regroup"))
                 {

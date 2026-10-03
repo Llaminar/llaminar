@@ -9,15 +9,19 @@
  * driver remains inside the admitted envelope. No memory query occurs during
  * graph replay or inference. Successful cold setup timings are diagnostics;
  * native failures and invalid accounting remain errors regardless of duration.
+ * The same owner-only completion-edge reduction as CUDA runs before native
+ * compilation; replay never walks or edits the retained dependency graph.
  */
 
 #ifdef HAVE_ROCM
 
 #include "HIPGraphCapture.h"
 #include "../NativeParallelGraphBranch.h"
+#include "../NativeGraphDependencyReduction.h"
 #include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
 #include "../../utils/VramBillOfMaterials.h"
+#include "../../planning/PhysicalMemoryAuthority.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +37,38 @@ namespace llaminar2
 {
     namespace
     {
+        /** @brief HIP's ordinary completion-edge ABI for the shared setup pass. */
+        struct HIPDependencyReductionAPI
+        {
+            using Graph = hipGraph_t;
+            using Node = hipGraphNode_t;
+            /** @brief HIP's edge enumeration API exposes only default edges. */
+            struct EdgeData {};
+            static constexpr auto success = hipSuccess;
+            static constexpr auto nodes = hipGraphGetNodes;
+            static constexpr auto errorString = hipGetErrorString;
+
+            /** @brief Read the current owner graph's complete edge inventory. */
+            static hipError_t edges(Graph graph, Node *from, Node *to,
+                                    EdgeData *, std::size_t *count)
+            {
+                return hipGraphGetEdges(graph, from, to, count);
+            }
+
+            /** @brief Ordinary HIP dependencies publish complete producer work. */
+            static detail::NativeDependencyKind kind(const EdgeData &)
+            {
+                return detail::NativeDependencyKind::FullCompletion;
+            }
+
+            /** @brief Remove exactly the completion edges proved redundant. */
+            static hipError_t remove(Graph graph, const Node *from, const Node *to,
+                                     const EdgeData *, std::size_t count)
+            {
+                return hipGraphRemoveDependencies(graph, from, to, count);
+            }
+        };
+
         /**
          * @brief Result of importing one captured HIP graph into another graph.
          *
@@ -855,6 +891,24 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Compile a sealed HIP graph after eliminating redundant ordering.
+     * @return False on ownership, dependency, accounting or native API failure.
+     *
+     * This setup-only transformation retains every happens-before relation;
+     * no device work or extra synchronization is introduced during inference.
+     */
+    bool HIPGraphCapture::prepareRuntimeContextStorage(
+        const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+        // HIP code-object/queue admission owns scratch before recording. HIP
+        // has no CUDA-style per-thread stack limit grown by graph instantiation.
+        // Preserve the same typed pre-instantiation boundary without pretending
+        // that an unbound or foreign physical allocator has been admitted.
+        return memory && memory->contains(DeviceId::rocm(device_ordinal_)) &&
+            graph_ && !exec_ && activateOwner("prepareRuntimeContextStorage");
+    }
+
     bool HIPGraphCapture::instantiate()
     {
         if (!activateOwner("instantiate"))
@@ -877,6 +931,18 @@ namespace llaminar2
             }
             exec_ = nullptr;
             resident_memory_bytes_ = 0u;
+        }
+
+        try
+        {
+            const auto reduced = detail::reduceNativeGraphDependencies<HIPDependencyReductionAPI>(graph_);
+            LOG_DEBUG("[HIPGraphCapture] Dependency reduction nodes=" << reduced.nodes
+                      << " edges=" << reduced.edges << " removed=" << reduced.removed);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[HIPGraphCapture] Cannot compile native dependency DAG: " << error.what());
+            return false;
         }
 
         std::size_t free_bytes_before = 0u;

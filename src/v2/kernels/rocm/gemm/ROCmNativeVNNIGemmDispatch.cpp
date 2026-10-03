@@ -10,6 +10,7 @@
  */
 
 #include "ROCmNativeVNNIGemmShard.h"
+#include "ROCmVNNIPrefillLaunch.h"
 #include "../../../tensors/NativeVnniFormatInfo.h"
 #include "../../../utils/PerfStatsCollector.h"
 
@@ -17,30 +18,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 
 #include <hip/hip_runtime_api.h>
 
 namespace
 {
-struct ROCmNativeVNNIPrefillLaunchSelection
-{
-    uint8_t codebook_id = 0;
-    int n_tile = 0;
-    int m_tile = 0;
-    int min_blocks = 0;
-    int unroll = 0;
-    bool full_tiles = false;
-    const void *function = nullptr;
-    int block_threads = 0;
-    bool valid = false;
-};
-
 /*
  * Production capture may compile several device graphs concurrently on
  * independent host workers. A thread-local observation avoids a shared lock
  * and guarantees that a trainer reads only the launch it issued itself.
  */
-thread_local ROCmNativeVNNIPrefillLaunchSelection
+thread_local std::optional<llaminar2::rocm::VNNIPrefillLaunch>
     g_last_prefill_launch_selection;
 
 constexpr ROCmNativeVNNIGemmShardFn shardForCodebook(uint8_t codebook_id)
@@ -97,66 +86,31 @@ constexpr std::array<ROCmNativeVNNIGridInitShardFn, 8> kGridInitializers = {
 };
 } // namespace
 
-extern "C" void rocmNativeVNNIPrefill_recordLastLaunchSelection(
-    uint8_t codebook_id,
-    int n_tile,
-    int m_tile,
-    int min_blocks,
-    int unroll,
-    bool full_tiles,
-    const void *function,
-    int block_threads)
+void llaminar2::rocm::publishVNNIPrefillLaunch(
+    const VNNIPrefillLaunch &launch)
 {
-    g_last_prefill_launch_selection = {
-        .codebook_id = codebook_id,
-        .n_tile = n_tile,
-        .m_tile = m_tile,
-        .min_blocks = min_blocks,
-        .unroll = unroll,
-        .full_tiles = full_tiles,
-        .function = function,
-        .block_threads = block_threads,
-        .valid = true,
-    };
+    if (!launch.function || launch.block_threads <= 0 ||
+        launch.n_tile <= 0 || launch.m_tile <= 0 || launch.min_blocks <= 0)
+        throw std::invalid_argument("incomplete ROCm VNNI prefill launch identity");
+    g_last_prefill_launch_selection = launch;
 }
 
-extern "C" bool rocmNativeVNNIPrefill_getLastLaunchSelection(
-    uint8_t *codebook_id,
-    int *n_tile,
-    int *m_tile,
-    int *min_blocks,
-    int *unroll,
-    bool *full_tiles)
+void llaminar2::rocm::clearVNNIPrefillLaunch() noexcept
 {
-    if (!g_last_prefill_launch_selection.valid)
-        return false;
-    if (codebook_id)
-        *codebook_id = g_last_prefill_launch_selection.codebook_id;
-    if (n_tile)
-        *n_tile = g_last_prefill_launch_selection.n_tile;
-    if (m_tile)
-        *m_tile = g_last_prefill_launch_selection.m_tile;
-    if (min_blocks)
-        *min_blocks = g_last_prefill_launch_selection.min_blocks;
-    if (unroll)
-        *unroll = g_last_prefill_launch_selection.unroll;
-    if (full_tiles)
-        *full_tiles = g_last_prefill_launch_selection.full_tiles;
-    return true;
+    g_last_prefill_launch_selection.reset();
 }
 
-extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
-    int *registers_per_thread,
-    size_t *local_memory_bytes_per_thread,
-    size_t *static_shared_memory_bytes,
-    int *max_threads_per_block,
-    int *max_active_blocks_per_sm)
+std::optional<llaminar2::rocm::VNNIPrefillLaunch>
+llaminar2::rocm::lastVNNIPrefillLaunch() noexcept
 {
-    const auto &selection = g_last_prefill_launch_selection;
-    if (!selection.valid || !selection.function || selection.block_threads <= 0 ||
-        !registers_per_thread || !local_memory_bytes_per_thread ||
-        !static_shared_memory_bytes || !max_threads_per_block ||
-        !max_active_blocks_per_sm)
+    return g_last_prefill_launch_selection;
+}
+
+bool llaminar2::rocm::inspectVNNIPrefillLaunch(
+    const VNNIPrefillLaunch &selection, VNNIPrefillLaunchResources &resources)
+{
+    resources = {};
+    if (!selection.function || selection.block_threads <= 0)
     {
         return false;
     }
@@ -170,17 +124,17 @@ extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
             &active_blocks,
             selection.function,
             selection.block_threads,
-            /*dynamicSMemSize=*/0) != hipSuccess ||
+            selection.dynamic_shared_memory_bytes) != hipSuccess ||
         active_blocks <= 0)
     {
         return false;
     }
 
-    *registers_per_thread = attributes.numRegs;
-    *local_memory_bytes_per_thread = attributes.localSizeBytes;
-    *static_shared_memory_bytes = attributes.sharedSizeBytes;
-    *max_threads_per_block = attributes.maxThreadsPerBlock;
-    *max_active_blocks_per_sm = active_blocks;
+    resources.registers_per_thread = attributes.numRegs;
+    resources.local_memory_bytes_per_thread = attributes.localSizeBytes;
+    resources.static_shared_memory_bytes = attributes.sharedSizeBytes;
+    resources.max_threads_per_block = attributes.maxThreadsPerBlock;
+    resources.max_active_blocks_per_sm = active_blocks;
     return attributes.numRegs > 0 &&
            attributes.maxThreadsPerBlock >= selection.block_threads;
 }

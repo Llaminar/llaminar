@@ -1,12 +1,19 @@
 /**
  * @file LocalTPContext.cpp
  * @brief Implementation of LOCAL tensor parallelism context
+ *
+ * The explicit-stream sum implementation owns precision, casts, native grouping
+ * and scratch admission. Ordinary calls publish their actual terminal producer;
+ * authenticated graph forks defer only publication to their paired event join.
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "LocalTPContext.h"
+#include "DeviceCountedAllGather.h"
 #include "AllreducePrecisionPolicy.h"
+#include "NativeReduceScatterContract.h"
+#include "NativeCollectiveRowsContract.h"
 #include "CollectiveTimeoutPolicy.h"
 #include "backends/HostBackend.h"
 #include "../tensors/TensorClasses.h"
@@ -135,6 +142,13 @@ namespace llaminar2
             return 0;
         }
 
+        /**
+         * @brief Record submission geometry without presenting capacity as live traffic.
+         *
+         * Counted rows cannot be measured by host instrumentation: the pointer
+         * is a borrowed device authority. Report capacity separately; focused
+         * device receipts own useful-byte proofs, without affecting execution.
+         */
         void recordLocalTPRuntimeAllreduce(
             const DeviceGroup &device_group,
             CollectiveBackendType backend,
@@ -144,7 +158,8 @@ namespace llaminar2
             size_t elements,
             CollectiveDataType dtype,
             const std::string &path,
-            const std::string &requested_precision)
+            const std::string &requested_precision,
+            const NativeCollectiveRows *live_rows = nullptr)
         {
             if (!PerfStatsCollector::isDomainEnabled(
                     "tp_allreduce_runtime"))
@@ -159,6 +174,7 @@ namespace llaminar2
                 {"dtype", collectiveDataTypeName(dtype)},
                 {"element_bytes", std::to_string(element_bytes)},
                 {"elements", std::to_string(elements)},
+                {"extent", live_rows ? "device_row_prefix" : "fixed_elements"},
                 {"path", path},
                 {"requested_precision", requested_precision.empty() ? "default" : requested_precision},
                 {"homogeneous", device_group.is_homogeneous ? "true" : "false"}};
@@ -172,7 +188,7 @@ namespace llaminar2
                 tags);
             PerfStatsCollector::addCounter(
                 "tp_allreduce_runtime",
-                "bytes",
+                live_rows ? "capacity_bytes" : "bytes",
                 static_cast<double>(elements * element_bytes),
                 {},
                 device.toString(),
@@ -886,6 +902,35 @@ namespace llaminar2
                                            size_t count, void *stream,
                                            const std::string &precision)
     {
+        return enqueueAllreduceOnStream(tensor, stage_name, count, stream, precision,
+                                        AllreducePublication::ExactProducer);
+    }
+
+    bool LocalTPContext::allreduceAcquiredInput(
+        const AcquiredDeviceTransferInput &input,
+        const std::string &stage_name, size_t count,
+        const std::string &precision,
+        const NativeCollectiveRows *live_rows)
+    {
+        if (!input.valid() || !input.sourceOwner() || count == 0 ||
+            count > input.sourceOwner()->numel() || degree() < 2 ||
+            input.sourceOwner()->current_device() != input.device() ||
+            (input.device().is_cuda() ? backend_ != CollectiveBackendType::NCCL
+                                     : backend_ != CollectiveBackendType::RCCL))
+            throw std::invalid_argument("LocalTP acquired allreduce requires an exact native GPU tensor frontier");
+        // Never publish the auxiliary stream into the enclosing graph ledger.
+        // Its visible join owns the event wait and resulting tensor publication.
+        return enqueueAllreduceOnStream(input.sourceOwner(), stage_name, count,
+                                        input.consumerStream(), precision,
+                                        AllreducePublication::PairedGraphJoin, live_rows);
+    }
+
+    bool LocalTPContext::enqueueAllreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                                                  size_t count, void *stream,
+                                                  const std::string &precision,
+                                                  AllreducePublication publication,
+                                                  const NativeCollectiveRows *live_rows)
+    {
         if (!stream)
         {
             throw std::invalid_argument("LocalTPContext::allreduceOnStream requires a non-null GPU stream");
@@ -904,6 +949,15 @@ namespace llaminar2
         }
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
+
+        // Counted rows are a native GPU operand, not a reason to download the
+        // count at a host boundary. Precision casts retain their admitted bank;
+        // only the communication payload follows this device-owned prefix.
+        if (live_rows && (live_rows->bankElements() != effective_count ||
+                          effective_count > tensor->numel() ||
+                          (backend_ != CollectiveBackendType::NCCL &&
+                           backend_ != CollectiveBackendType::RCCL)))
+            throw std::invalid_argument("Live-row allreduce requires matching native GPU row-bank geometry");
 
         // HOST collectives are host-staged by definition, including the
         // deliberately heterogeneous CPU/GPU case. Carry the exact producer
@@ -998,11 +1052,9 @@ namespace llaminar2
         // Capturing independent per-device NCCL/RCCL calls is fragile because a
         // single asymmetric capture/replay decision poisons the communicator.
         const bool use_fp16_allreduce =
-            effective_precision == "fp16" &&
             dtype == CollectiveDataType::FLOAT32 &&
-            batchInvariantAllreduceDecisionElements(
-                effective_count, tensor->cols()) >=
-                debugEnv().allreduce_fp16_min_elements;
+            fp32SumUsesFP16Transport(effective_precision, effective_count,
+                tensor->cols(), debugEnv().allreduce_fp16_min_elements);
 
         if (use_fp16_allreduce)
         {
@@ -1055,7 +1107,7 @@ namespace llaminar2
                                                  device_index,
                                                  stream,
                                                  stage_name,
-                                                 effective_precision)
+                                                 effective_precision, nullptr, live_rows)
                                            : backend_impl_->allreduceSingleDeviceOnStream(
                                                  fp16_buf, effective_count, CollectiveDataType::FLOAT16,
                                                  CollectiveOp::ALLREDUCE_SUM, device_index, stream);
@@ -1108,11 +1160,12 @@ namespace llaminar2
                                     : (grouped_explicit_streams
                                            ? "on_stream_grouped_fp16_scratch"
                                            : "on_stream_fp16_scratch"),
-                                effective_precision);
-                            TransferEngine::publishDeviceWrite(
-                                tensor,
-                                devices_[device_index].toLocalDeviceId(),
-                                stream);
+                                effective_precision, live_rows);
+                            // Cast-back is the final producer even when the
+                            // transport itself used a completed host ticket.
+                            if (publication == AllreducePublication::ExactProducer)
+                                TransferEngine::publishDeviceWrite(
+                                    tensor, devices_[device_index].toLocalDeviceId(), stream);
                             return true;
                         }
                         LOG_ERROR("LocalTPContext: FP16->FP32 cast-back failed for stage="
@@ -1133,7 +1186,7 @@ namespace llaminar2
         {
             const bool success = allreduceGroupedOnExplicitStreams(
                 buffer, effective_count, dtype, device_index, stream,
-                stage_name, effective_precision);
+                stage_name, effective_precision, nullptr, live_rows);
             if (!success)
             {
                 LOG_ERROR("LocalTPContext::allreduceOnStream: grouped explicit-stream allreduce failed"
@@ -1151,22 +1204,15 @@ namespace llaminar2
                 backend_ == CollectiveBackendType::HETEROGENEOUS
                     ? "on_stream_grouped_host_ticket"
                     : "on_stream_grouped",
-                effective_precision);
-            if (backend_ == CollectiveBackendType::HETEROGENEOUS)
+                effective_precision, live_rows);
+            if (publication == AllreducePublication::ExactProducer)
             {
-                // The authenticated ticket already observed every terminal H2D
-                // event. Recording a compute-stream event here would invent a
-                // producer that did not perform the write.
-                TransferEngine::publishCompletedDeviceWrite(
-                    tensor,
-                    devices_[device_index].toLocalDeviceId());
-            }
-            else
-            {
-                TransferEngine::publishDeviceWrite(
-                    tensor,
-                    devices_[device_index].toLocalDeviceId(),
-                    stream);
+                if (backend_ == CollectiveBackendType::HETEROGENEOUS)
+                    TransferEngine::publishCompletedDeviceWrite(
+                        tensor, devices_[device_index].toLocalDeviceId());
+                else
+                    TransferEngine::publishDeviceWrite(
+                        tensor, devices_[device_index].toLocalDeviceId(), stream);
             }
             return true;
         }
@@ -1181,12 +1227,9 @@ namespace llaminar2
                 device_group_, backend_, devices_[device_index].toLocalDeviceId(),
                 stage_name, static_cast<size_t>(degree()), effective_count,
                 dtype, "on_stream_native", effective_precision);
-            // Mark tensor dirty and record completion event on the allreduce stream.
-            // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
-            TransferEngine::publishDeviceWrite(
-                tensor,
-                devices_[device_index].toLocalDeviceId(),
-                stream);
+            if (publication == AllreducePublication::ExactProducer)
+                TransferEngine::publishDeviceWrite(
+                    tensor, devices_[device_index].toLocalDeviceId(), stream);
             return true;
         }
 
@@ -2241,13 +2284,15 @@ namespace llaminar2
         void *producer_stream,
         const std::string &precision,
         const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
-        int device_index)
+        int device_index,
+        const NativeCollectiveRows *live_rows)
     {
         if (!producer_stream)
             throw std::invalid_argument("LocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
 
         if (sidebands.empty())
-            return allreduceOnStream(tensor, stage_name, count, producer_stream, precision);
+            return enqueueAllreduceOnStream(tensor, stage_name, count, producer_stream,
+                precision, AllreducePublication::ExactProducer, live_rows);
 
         if (!tensor)
         {
@@ -2323,6 +2368,9 @@ namespace llaminar2
         }
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
+        if (live_rows && (live_rows->bankElements() != effective_count ||
+                          effective_count > tensor->numel()))
+            throw std::invalid_argument("Live-row sideband anchor requires matching tensor row-bank geometry");
         if (effective_count == 0)
         {
             LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: zero allreduce count"
@@ -2356,11 +2404,9 @@ namespace llaminar2
         const std::string effective_precision =
             precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
         const bool use_fp16_allreduce =
-            effective_precision == "fp16" &&
             dtype == CollectiveDataType::FLOAT32 &&
-            batchInvariantAllreduceDecisionElements(
-                effective_count, tensor->cols()) >=
-                debugEnv().allreduce_fp16_min_elements;
+            fp32SumUsesFP16Transport(effective_precision, effective_count,
+                tensor->cols(), debugEnv().allreduce_fp16_min_elements);
 
         void *collective_buffer = buffer;
         CollectiveDataType collective_dtype = dtype;
@@ -2414,7 +2460,7 @@ namespace llaminar2
             producer_stream,
             stage_name,
             effective_precision,
-            &sidebands);
+            &sidebands, live_rows);
         if (!grouped_ok)
         {
             LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: grouped allreduce sideband bundle failed"
@@ -2462,7 +2508,7 @@ namespace llaminar2
         recordLocalTPRuntimeAllreduce(
             device_group_, backend_, devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
             stage_name, static_cast<size_t>(degree()), effective_count,
-            collective_dtype, "on_stream_grouped_with_sidebands", effective_precision);
+            collective_dtype, "on_stream_grouped_with_sidebands", effective_precision, live_rows);
         recordLocalTPRuntimeGroupedSidebands(
             device_group_, backend_, devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
             stage_name, static_cast<size_t>(degree()), device_index, sidebands);
@@ -3190,6 +3236,90 @@ namespace llaminar2
         return true;
     }
 
+    bool LocalTPContext::nativeRowsOnStream(
+        NativeRowCollective operation, const void *send, void *receive,
+        const NativeCollectiveRows &rows, CollectiveDataType dtype,
+        CollectiveOp reduction, int participant, void *stream,
+        const std::string &stage_name, unsigned long long *payload_bytes)
+    {
+        if (!nativeCollectiveRowsValid(operation, send, receive, rows, dtype, reduction,
+                degree(), participant, stream) || !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP live-row collective rejected its native buffer/stream contract stage=" << stage_name);
+            return false;
+        }
+        if (!backend_impl_->nativeRowsOnStream(operation, send, receive, rows, dtype,
+                reduction, participant, stream, payload_bytes))
+        {
+            LOG_ERROR("LocalTP live-row collective enqueue failed stage=" << stage_name
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        }
+        if (PerfStatsCollector::isDomainEnabled("tp_live_rows_runtime"))
+        {
+            // A captured capacity is never reported as actual communicated
+            // bytes. Passive device receipts prove traffic in focused tests.
+            const char *kind = operation == NativeRowCollective::AllGather ? "allgather" :
+                operation == NativeRowCollective::AllReduce ? "allreduce" : "reduce_scatter";
+            PerfStatsCollector::Tags tags{{"stage", stage_name}, {"operation", kind},
+                {"backend", collectiveBackendTypeToString(backend_)}, {"scope", "rank_local"},
+                {"extent", rows.rows().countOwner() ? "device_prefix" : "fixed_rows"},
+                {"capacity_rows", std::to_string(rows.rows().capacity())},
+                {"elements_per_row", std::to_string(rows.elementsPerRow())},
+                {"dtype", collectiveDataTypeName(dtype)}, {"participant", std::to_string(participant)},
+                {"graph_capture", isGraphCaptureActive() ? "true" : "false"}};
+            PerfStatsCollector::addCounter("tp_live_rows_runtime", "calls", 1.0, {},
+                devices_[static_cast<size_t>(participant)].toLocalDeviceId().toString(), std::move(tags));
+        }
+        return true;
+    }
+
+    bool LocalTPContext::reduceScatterRawOnStream(
+        const void *rank_major_send, void *local_receive, size_t receive_count,
+        CollectiveDataType dtype, int device_index, void *producer_stream,
+        const std::string &stage_name)
+    {
+        if (!nativeReduceScatterBuffersValid(rank_major_send, local_receive,
+                receive_count, dtype, degree(), device_index, producer_stream) ||
+            !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP native reduce-scatter requires a complete, disjoint exact-stream contract"
+                      << " stage=" << stage_name << " participant=" << device_index
+                      << " degree=" << degree());
+            return false;
+        }
+        // The caller's graph stream orders the producer and consumer. Never
+        // replace this with allreduce/copy or the coordinator's private stream.
+        if (!backend_impl_->reduceScatterSingleDeviceOnStream(rank_major_send,
+                local_receive, receive_count, dtype, device_index, producer_stream))
+        {
+            LOG_ERROR("LocalTP native reduce-scatter failed stage=" << stage_name
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        }
+        if (PerfStatsCollector::isDomainEnabled("tp_reduce_scatter_runtime"))
+        {
+            const auto receive_bytes = receive_count * collectiveDataTypeBytes(dtype);
+            PerfStatsCollector::Tags tags{
+                {"stage", stage_name}, {"backend", collectiveBackendTypeToString(backend_)},
+                {"scope", "rank_local"}, {"path", "native_on_stream"},
+                {"degree", std::to_string(degree())}, {"participant", std::to_string(device_index)},
+                {"dtype", collectiveDataTypeName(dtype)},
+                {"send_bytes", std::to_string(receive_bytes * degree())},
+                {"receive_bytes", std::to_string(receive_bytes)},
+                {"graph_capture", isGraphCaptureActive() ? "true" : "false"}};
+            PerfStatsCollector::addCounter("tp_reduce_scatter_runtime", "calls", 1.0, {},
+                devices_[static_cast<size_t>(device_index)].toLocalDeviceId().toString(), std::move(tags));
+        }
+        return true;
+    }
+
     bool LocalTPContext::groupedP2PRawOnStream(
         const std::vector<CollectiveP2POp> &ops,
         int device_index,
@@ -3556,7 +3686,8 @@ namespace llaminar2
                                                            void *stream,
                                                            const std::string &stage_name,
                                                            const std::string &precision,
-                                                           const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands)
+                                                           const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands,
+                                                           const NativeCollectiveRows *live_rows)
     {
         if (degree() <= 1)
             return true;
@@ -3582,6 +3713,14 @@ namespace llaminar2
             return false;
         }
 
+        if (live_rows && (live_rows->bankElements() != effective_count ||
+            !nativeCollectiveRowsValid(NativeRowCollective::AllReduce, buffer, buffer,
+                *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM, degree(), device_index, stream)))
+        {
+            requestAbort();
+            throw std::invalid_argument("Grouped native allreduce has invalid live row geometry");
+        }
+
         std::unique_lock<std::mutex> lock(grouped_onstream_allreduce_mutex_);
         if (abort_requested_.load(std::memory_order_acquire))
             return false;
@@ -3598,6 +3737,7 @@ namespace llaminar2
             grouped_onstream_allreduce_precision_.clear();
             grouped_onstream_allreduce_buffers_.clear();
             grouped_onstream_allreduce_streams_.clear();
+            grouped_onstream_allreduce_rows_.clear();
             grouped_onstream_allreduce_seen_.clear();
             grouped_onstream_allreduce_graph_capture_active_ = false;
             grouped_onstream_allreduce_sideband_count_ = 0;
@@ -3666,6 +3806,8 @@ namespace llaminar2
             grouped_onstream_allreduce_error_.clear();
             grouped_onstream_allreduce_buffers_.assign(static_cast<size_t>(degree()), nullptr);
             grouped_onstream_allreduce_streams_.assign(static_cast<size_t>(degree()), nullptr);
+            if (live_rows)
+                grouped_onstream_allreduce_rows_.assign(static_cast<size_t>(degree()), *live_rows);
             grouped_onstream_allreduce_seen_.assign(static_cast<size_t>(degree()), false);
             grouped_onstream_allreduce_graph_capture_active_ = graph_capture_active;
             grouped_onstream_allreduce_sideband_count_ = sideband_count;
@@ -3677,6 +3819,17 @@ namespace llaminar2
         }
         else
         {
+            const bool expected_live = !grouped_onstream_allreduce_rows_.empty();
+            if (expected_live != (live_rows != nullptr) ||
+                (live_rows &&
+                 (grouped_onstream_allreduce_rows_.front().rows().capacity() != live_rows->rows().capacity() ||
+                  grouped_onstream_allreduce_rows_.front().elementsPerRow() != live_rows->elementsPerRow() ||
+                  (grouped_onstream_allreduce_rows_.front().rows().countOwner() != nullptr) !=
+                      (live_rows->rows().countOwner() != nullptr))))
+            {
+                fail_generation("live row geometry mismatch stage=" + stage_name);
+                return false;
+            }
             if (grouped_onstream_allreduce_stage_ != stage_name)
             {
                 fail_generation("stage mismatch expected=" +
@@ -3748,6 +3901,8 @@ namespace llaminar2
         grouped_onstream_allreduce_seen_[static_cast<size_t>(device_index)] = true;
         grouped_onstream_allreduce_buffers_[static_cast<size_t>(device_index)] = buffer;
         grouped_onstream_allreduce_streams_[static_cast<size_t>(device_index)] = stream;
+        if (live_rows)
+            grouped_onstream_allreduce_rows_[static_cast<size_t>(device_index)] = *live_rows;
         if (sideband_count > 0)
             grouped_onstream_allreduce_sidebands_[static_cast<size_t>(device_index)] = *sidebands;
 
@@ -3835,9 +3990,13 @@ namespace llaminar2
                 bool enqueue_ok = false;
                 if (ready_to_enqueue && backend_impl_)
                 {
-                    enqueue_ok = backend_impl_->allreduceSingleDeviceOnStream(
-                        buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
-                        device_index, stream);
+                    enqueue_ok = live_rows
+                        ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
+                            buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM,
+                            device_index, stream)
+                        : backend_impl_->allreduceSingleDeviceOnStream(
+                            buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
+                            device_index, stream);
                 }
 
                 lock.lock();
@@ -4012,7 +4171,7 @@ namespace llaminar2
                         dtype,
                         CollectiveOp::ALLREDUCE_SUM,
                         backend_sidebands,
-                        grouped_onstream_allreduce_streams_);
+                        grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_);
                 grouped_onstream_allreduce_result_ = enqueue_ok;
                 grouped_onstream_allreduce_ready_ = true;
                 if (!enqueue_ok)
@@ -4052,12 +4211,14 @@ namespace llaminar2
                     return false;
                 }
 
-                const bool enqueue_ok = backend_impl_->allreduceMultiOnStreams(
-                    grouped_onstream_allreduce_buffers_,
-                    effective_count,
-                    dtype,
-                    CollectiveOp::ALLREDUCE_SUM,
-                    grouped_onstream_allreduce_streams_);
+                const bool enqueue_ok = live_rows
+                    ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                        grouped_onstream_allreduce_buffers_, effective_count, dtype,
+                        CollectiveOp::ALLREDUCE_SUM, backend_sidebands,
+                        grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
+                    : backend_impl_->allreduceMultiOnStreams(
+                        grouped_onstream_allreduce_buffers_, effective_count, dtype,
+                        CollectiveOp::ALLREDUCE_SUM, grouped_onstream_allreduce_streams_);
                 grouped_onstream_allreduce_result_ = enqueue_ok;
                 grouped_onstream_allreduce_ready_ = true;
                 if (!enqueue_ok)
@@ -4086,9 +4247,11 @@ namespace llaminar2
             grouped_onstream_allreduce_cv_.notify_all();
             lock.unlock();
 
-            const bool enqueue_ok = backend_impl_->allreduceSingleDeviceOnStream(
-                buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
-                device_index, stream);
+            const bool enqueue_ok = live_rows
+                ? backend_impl_->nativeRowsOnStream(NativeRowCollective::AllReduce,
+                    buffer, buffer, *live_rows, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream)
+                : backend_impl_->allreduceSingleDeviceOnStream(
+                    buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM, device_index, stream);
 
             lock.lock();
             if (!enqueue_ok)
@@ -4153,14 +4316,14 @@ namespace llaminar2
         else
         {
             success =
-                grouped_onstream_allreduce_sideband_count_ > 0
+                grouped_onstream_allreduce_sideband_count_ > 0 || live_rows
                     ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
                           grouped_onstream_allreduce_buffers_,
                           effective_count,
                           dtype,
                           CollectiveOp::ALLREDUCE_SUM,
                           backend_sidebands,
-                          grouped_onstream_allreduce_streams_)
+                          grouped_onstream_allreduce_streams_, grouped_onstream_allreduce_rows_)
                     : backend_impl_->allreduceMultiOnStreams(
                           grouped_onstream_allreduce_buffers_,
                           effective_count,
@@ -5167,6 +5330,16 @@ namespace llaminar2
         }
         return reserveFp16ScratchElements(
             fp16_scratch_elements, memory_authority);
+    }
+
+    void LocalTPContext::installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather> fabric)
+    {
+        if (isGraphCaptureActive() || counted_allgather_ || !fabric || fabric->devices().size() != devices_.size())
+            throw std::logic_error("LocalTP counted fabric requires one complete setup-time installation");
+        for (std::size_t i = 0; i < devices_.size(); ++i)
+            if (fabric->devices()[i] != devices_[i].toLocalDeviceId())
+                throw std::invalid_argument("LocalTP counted fabric membership differs from its communicator");
+        counted_allgather_ = std::move(fabric);
     }
 
     // =========================================================================

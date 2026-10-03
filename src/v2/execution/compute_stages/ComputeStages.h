@@ -66,7 +66,7 @@
 #include "stages/MoEOverlayDeviceControllerStage.h"
 #include "stages/MTPVerifierPreparationStage.h"
 #include "stages/MTPVerifierOutcomeStage.h"
-#include "stages/MTPStochasticSerialOutcomeStage.h"
+#include "stages/MTPStochasticOutcomeStage.h"
 #include "stages/MTPStochasticTargetDistributionStage.h"
 #include "stages/MTPSpeculativeStatePublicationStage.h"
 

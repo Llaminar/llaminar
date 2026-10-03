@@ -1,6 +1,10 @@
 /**
  * @file Test__PrefixStateCacheLRU.cpp
  * @brief Unit regressions for prefix-cache lookup, ownership, and tier LRU.
+ *
+ * Archive pressure must keep payload leases valid without turning a request
+ * thread into a disk writer. A held native archive lock models a slow durable
+ * tier deterministically, instead of depending on an unusually busy SSD.
  */
 
 #include <gtest/gtest.h>
@@ -12,9 +16,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
+#include <mutex>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 using namespace llaminar2;
 
@@ -65,6 +75,162 @@ namespace
             kModelSha256);
     }
 
+    /**
+     * @brief Advance asynchronous pressure at explicit test-only writer joins.
+     *
+     * The already-allocated handle belongs to the fixture, not a production
+     * allocation path. A retry follows one completed durable owner, never an
+     * arbitrary delay or an I/O failure. The resident count bounds transitions.
+     */
+    bool insertAfterArchivePublication(
+        PrefixStateCache &cache,
+        DiskPrefixStorageBackend &disk,
+        const PrefixBlockHandle &handle)
+    {
+        const auto frontiers = cache.size() + 1u;
+        for (size_t frontier = 0; frontier < frontiers; ++frontier)
+        {
+            if (cache.insert(handle))
+                return true;
+            std::string error;
+            if (!disk.waitForPersistence(&error))
+                return false;
+            cache.publishCompletedPersistence();
+        }
+        return cache.insert(handle);
+    }
+
+    /** @brief Join known pending victims before observing a verified promotion. */
+    std::optional<PrefixBlockHandle> findAfterArchivePublication(
+        PrefixStateCache &cache,
+        DiskPrefixStorageBackend &disk,
+        const PrefixCacheKey &key)
+    {
+        const auto frontiers = cache.size() + 1u;
+        for (size_t frontier = 0; frontier < frontiers; ++frontier)
+        {
+            if (auto handle = cache.find(key))
+                return handle;
+            std::string error;
+            if (!disk.waitForPersistence(&error))
+                return std::nullopt;
+            cache.publishCompletedPersistence();
+        }
+        return cache.find(key);
+    }
+
+    /** @brief Own a test-only competing writer's exact native archive lock. */
+    class HeldArchiveLock final
+    {
+    public:
+        /** @brief Acquire a separate file description, like another process. */
+        explicit HeldArchiveLock(const std::filesystem::path &archive)
+            : fd_(::open((archive.string() + ".lock").c_str(),
+                         O_RDWR | O_CLOEXEC))
+        {
+            if (fd_ >= 0 && ::flock(fd_, LOCK_EX) != 0)
+            {
+                ::close(fd_);
+                fd_ = -1;
+            }
+        }
+        /** @brief Release before a failed assertion can strand a worker. */
+        ~HeldArchiveLock() { release(); }
+        HeldArchiveLock(const HeldArchiveLock &) = delete;
+        HeldArchiveLock &operator=(const HeldArchiveLock &) = delete;
+        /** @return Whether the fixture really owns the competing writer lock. */
+        bool valid() const noexcept { return fd_ >= 0; }
+        /** @brief Permit the archive worker to commit after the passive probe. */
+        void release() noexcept
+        {
+            if (fd_ >= 0)
+            {
+                (void)::flock(fd_, LOCK_UN);
+                (void)::close(fd_);
+                fd_ = -1;
+            }
+        }
+    private:
+        int fd_ = -1;
+    };
+
+    /**
+     * @brief Hold one unrelated writer's final source retirement deterministically.
+     *
+     * A fixture-owned vector blocks in its deleter after native writing, but
+     * before its immutable receipt publishes. This proves required admission
+     * waits for its own victims, not global writer idleness. No production hook
+     * or additional cache reservation is involved.
+     */
+    class HeldPayloadRetirement final
+    {
+    public:
+        /** @brief Create the independent test-only retirement frontier. */
+        HeldPayloadRetirement() : state_(std::make_shared<State>()) {}
+        /** @brief Ensure teardown cannot strand the writer in the test gate. */
+        ~HeldPayloadRetirement() { release(); }
+        HeldPayloadRetirement(const HeldPayloadRetirement &) = delete;
+        HeldPayloadRetirement &operator=(const HeldPayloadRetirement &) = delete;
+
+        /** @return An unrelated immutable payload with a held final deleter. */
+        PrefixBlockHandle payload(const PrefixCacheKey &key, size_t bytes)
+        {
+            auto storage = std::shared_ptr<std::vector<uint8_t>>(
+                new std::vector<uint8_t>(bytes, 0x5a),
+                [state = state_](std::vector<uint8_t> *data)
+                {
+                    std::unique_lock lock(state->mutex);
+                    if (state->phase != Phase::Released)
+                    {
+                        state->phase = Phase::Retiring;
+                        state->changed.notify_all();
+                        state->changed.wait(lock, [&] { return state->phase == Phase::Released; });
+                    }
+                    lock.unlock();
+                    delete data;
+                });
+            PrefixBlockHandle handle;
+            handle.key = key;
+            handle.layout = layoutBytes(bytes);
+            handle.total_bytes = bytes;
+            handle.kv_payload = storage->data();
+            handle.kv_storage = std::move(storage);
+            return handle;
+        }
+
+        /** @return Whether the writer reached this exact source-release boundary. */
+        bool observeRetiring()
+        {
+            std::unique_lock lock(state_->mutex);
+            return state_->changed.wait_for(lock, std::chrono::seconds(1), [&]
+            {
+                return state_->phase == Phase::Retiring;
+            });
+        }
+
+        /** @brief Publish the sole fixture-owned retirement permission. */
+        void release() noexcept
+        {
+            {
+                std::lock_guard lock(state_->mutex);
+                state_->phase = Phase::Released;
+            }
+            state_->changed.notify_all();
+        }
+
+    private:
+        /** @brief Source ownership advances monotonically to fixture release. */
+        enum class Phase { Queued, Retiring, Released };
+        /** @brief Shared test gate outlives the final payload-owner callback. */
+        struct State
+        {
+            std::mutex mutex;
+            std::condition_variable changed;
+            Phase phase = Phase::Queued;
+        };
+        std::shared_ptr<State> state_;
+    };
+
     /** @brief Admit one production-style bounded host archive reservation. */
     std::shared_ptr<PhysicalMemoryAuthority> prefixAuthority(
         size_t prefix_bytes)
@@ -84,7 +250,401 @@ namespace
         return std::make_shared<PhysicalMemoryAuthority>(
             std::move(admission), 0);
     }
+
+    /** @brief Observe the real writer frontier without injecting a test hook. */
+    bool observeExecuting(const PrefixArchivePersistenceTicket &ticket)
+    {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(200);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (ticket.phase() == PrefixArchiveMutationPhase::Executing)
+                return true;
+            std::this_thread::yield();
+        }
+        return false;
+    }
 } // namespace
+
+/**
+ * @test Slow durable eviction must not block early inference-side preparation.
+ *
+ * No disk timeout is adjusted: a competing writer is held only until the
+ * bounded observation finishes. Pending physical owners produce typed Busy;
+ * they must not be forgotten, overcommitted, or synchronously persisted. Required
+ * publication has a separate exact-completion contract tested below.
+ */
+TEST(Test__PrefixStateCacheLRU,
+     PendingDiskPersistenceNeverBlocksRequestAdmission)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 1024u);
+        ASSERT_TRUE(disk->ready());
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        auto ram = std::make_shared<RamPrefixStorageBackend>(96u);
+        PrefixStateCache cache(96u, ram, disk);
+        for (int block = 0; block < 3; ++block)
+        {
+            auto handle = ram->allocate(keyFor(block), layoutBytes(32u));
+            ASSERT_TRUE(handle.valid());
+            ASSERT_TRUE(cache.insert(std::move(handle)));
+        }
+        auto admission = std::async(std::launch::async, [&]()
+        {
+            return cache.prepareInsert(keyFor(3), 32u);
+        });
+        const auto state = admission.wait_for(std::chrono::milliseconds(200));
+
+        // Always release before get()/destruction, even for the negative
+        // implementation. This regression fails promptly, never by deadlock.
+        writer_lock.release();
+        const auto preparation = admission.get();
+        EXPECT_EQ(state, std::future_status::ready)
+            << "RAM admission performed foreground archive I/O";
+        EXPECT_EQ(preparation, PrefixRamInsertPreparation::Busy)
+            << "Incomplete disk publication cannot manufacture free RAM";
+        EXPECT_EQ(cache.usedBytes(), 96u);
+        EXPECT_EQ(ram->usedBytes(), 96u);
+        ASSERT_TRUE(disk->waitForPersistence());
+        cache.publishCompletedPersistence();
+        EXPECT_EQ(disk->usedBytes(), 32u)
+            << "One incoming block must not persist the entire RAM capacity";
+        EXPECT_EQ(cache.stats().ram_to_disk_demotions, 1u);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/**
+ * @test Start every necessary victim before inference, without flushing the tier.
+ *
+ * A recurrent checkpoint may be larger than an ordinary KV record. Queuing
+ * only the first victim leaves most of the required work until terminal
+ * harvest; queuing the entire tier needlessly consumes bandwidth. Both are
+ * rejected by this exact two-victim publication witness.
+ */
+TEST(Test__PrefixStateCacheLRU, AsyncPressurePlansAllAndOnlyNecessaryVictims)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 1024u);
+        ASSERT_TRUE(disk->ready());
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        auto ram = std::make_shared<RamPrefixStorageBackend>(96u);
+        PrefixStateCache cache(96u, ram, disk);
+        for (int block = 0; block < 3; ++block)
+        {
+            auto handle = ram->allocate(keyFor(block), layoutBytes(32u));
+            ASSERT_TRUE(handle.valid());
+            ASSERT_TRUE(cache.insert(std::move(handle)));
+        }
+        EXPECT_EQ(cache.prepareCapacity(64u), PrefixRamInsertPreparation::Busy);
+        EXPECT_EQ(cache.usedBytes(), 96u);
+        EXPECT_EQ(ram->usedBytes(), 96u);
+        writer_lock.release();
+        ASSERT_TRUE(disk->waitForPersistence());
+        cache.publishCompletedPersistence();
+        EXPECT_EQ(disk->usedBytes(), 64u);
+        EXPECT_EQ(cache.stats().ram_to_disk_demotions, 2u);
+        EXPECT_EQ(cache.prepareCapacity(64u), PrefixRamInsertPreparation::Prepared)
+            << "One prefill interval must suffice for the complete planned victim set";
+        EXPECT_EQ(cache.usedBytes(), 32u);
+        EXPECT_TRUE(cache.isRamResident(keyFor(2)));
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/**
+ * @test A short producer cannot skip required terminal state under archive pressure.
+ *
+ * Force two necessary victims to remain pending beyond the producer's work.
+ * Required completion must admit the real KV/GDN/MTP image after their receipts,
+ * while a later unrelated write is still held. Global-drain and Busy-to-skip
+ * implementations fail this same bounded interleaving without deadlocking it.
+ */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveRequiredTerminalWaitsOnlyForItsCapacity)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 1024u);
+        auto ram = RamPrefixStorageBackend::create(
+            DeviceId::cpu(), 96u, prefixAuthority(96u));
+        ASSERT_TRUE(disk->ready());
+        ASSERT_NE(ram, nullptr);
+        PrefixStateCache cache(96u, ram, disk);
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        HeldPayloadRetirement unrelated_retirement;
+        for (int block = 0; block < 3; ++block)
+        {
+            auto handle = ram->allocate(keyFor(block), layoutBytes(32u));
+            ASSERT_TRUE(handle.valid());
+            ASSERT_TRUE(cache.insert(std::move(handle)));
+        }
+        EXPECT_EQ(cache.prepareCapacity(64u), PrefixRamInsertPreparation::Busy);
+        EXPECT_EQ(ram->availableAllocationBytes(), 0u)
+            << "Queued writes still own their original physical bytes";
+        const auto unrelated = disk->scheduleWrite(
+            unrelated_retirement.payload(keyFor(99), 32u));
+        auto terminal_layout = layoutBytes(32u);
+        terminal_layout.includes_hybrid_state = true;
+        terminal_layout.hybrid_state_bytes = 16u;
+        terminal_layout.includes_mtp_state = true;
+        terminal_layout.mtp_kv_bytes = 16u;
+        std::promise<void> started;
+        auto started_receipt = started.get_future();
+        auto required = std::async(std::launch::async, [&]()
+        {
+            started.set_value();
+            cache.completeInsertPreparation(keyFor(3), terminal_layout.totalBytes());
+            auto terminal = ram->allocate(keyFor(3), terminal_layout);
+            if (!terminal.valid())
+                throw std::runtime_error("required terminal owner was not admitted");
+            std::fill(terminal.kv_storage->begin(), terminal.kv_storage->end(), 0x11);
+            std::fill(terminal.hybrid_storage->begin(), terminal.hybrid_storage->end(), 0x22);
+            std::fill(terminal.mtp_storage->begin(), terminal.mtp_storage->end(), 0x33);
+            if (!cache.insert(std::move(terminal)))
+                throw std::runtime_error("required terminal publication was lost");
+        });
+        const auto started_state = started_receipt.wait_for(std::chrono::seconds(1));
+        const auto pending_state = required.wait_for(std::chrono::milliseconds(50));
+        writer_lock.release();
+        const bool unrelated_is_retiring = unrelated_retirement.observeRetiring();
+        const auto completed_state = required.wait_for(std::chrono::seconds(1));
+        const bool unrelated_has_published = unrelated.publication() != nullptr;
+        // Release every held native/source edge before get() or a fatal assertion,
+        // including when the negative implementation waited for global idleness.
+        unrelated_retirement.release();
+        EXPECT_EQ(started_state, std::future_status::ready);
+        EXPECT_EQ(pending_state, std::future_status::timeout);
+        EXPECT_TRUE(unrelated_is_retiring);
+        EXPECT_EQ(completed_state, std::future_status::ready)
+            << "Required admission joined unrelated later archive work";
+        EXPECT_FALSE(unrelated_has_published);
+        ASSERT_NO_THROW(required.get());
+        EXPECT_EQ(cache.usedBytes(), 96u);
+        EXPECT_EQ(cache.stats().ram_to_disk_demotions, 2u);
+        EXPECT_EQ(ram->availableAllocationBytes(), 0u);
+        const auto restored = cache.find(keyFor(3));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_TRUE(restored->layout.includes_hybrid_state);
+        EXPECT_TRUE(restored->layout.includes_mtp_state);
+        EXPECT_EQ(*restored->kv_storage, std::vector<uint8_t>(32u, 0x11));
+        EXPECT_EQ(*restored->hybrid_storage, std::vector<uint8_t>(16u, 0x22));
+        EXPECT_EQ(*restored->mtp_storage, std::vector<uint8_t>(16u, 0x33));
+        ASSERT_TRUE(disk->waitForPersistence());
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @test An absent receipt cannot manufacture completion or wait forever. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveEmptyCompletionIsRejected)
+{
+    const PrefixArchivePersistenceTicket absent;
+    EXPECT_THROW((void)absent.waitForPublication(), std::logic_error);
+}
+
+/** @test Required publication rejects untracked owners, never overcommitting RAM. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveRequiredPublicationRejectsUntrackedOwners)
+{
+    auto ram = RamPrefixStorageBackend::create(
+        DeviceId::cpu(), 32u, prefixAuthority(32u));
+    ASSERT_NE(ram, nullptr);
+    PrefixStateCache cache(32u, ram);
+    auto source = ram->allocate(keyFor(0), layoutBytes(32u));
+    ASSERT_TRUE(source.valid());
+    std::fill(source.kv_storage->begin(), source.kv_storage->end(), 0x5a);
+    ASSERT_TRUE(cache.insert(source));
+    ASSERT_TRUE(cache.retain(keyFor(0)));
+    EXPECT_THROW(cache.completeInsertPreparation({}, 32u), std::runtime_error);
+    EXPECT_THROW(cache.completeInsertPreparation(keyFor(1), 33u), std::runtime_error);
+    EXPECT_THROW(cache.completeInsertPreparation(keyFor(0), 32u), std::runtime_error);
+    EXPECT_THROW(cache.completeInsertPreparation(keyFor(1), 32u), std::runtime_error);
+    EXPECT_TRUE(cache.isRamResident(keyFor(0)));
+    EXPECT_EQ(ram->availableAllocationBytes(), 0u);
+    EXPECT_EQ(*source.kv_storage, std::vector<uint8_t>(32u, 0x5a));
+    ASSERT_TRUE(cache.release(keyFor(0)));
+    source = {};
+    EXPECT_NO_THROW(cache.completeInsertPreparation(keyFor(1), 32u));
+    EXPECT_TRUE(ram->allocate(keyFor(1), layoutBytes(32u)).valid());
+}
+
+/**
+ * @test Prepare both real recurrent frontiers and count shared KV keys once.
+ *
+ * The checkpoint's terminal record is also a nonterminal in the final token
+ * chain. Its richer image must stay one publication. This geometry includes
+ * main KV, shifted MTP KV, GDN and the model-owned terminal extension.
+ */
+TEST(Test__PrefixStateCacheLRU, PrefillPublicationPreparesBothRecurrentFrontiers)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 1024u);
+        auto ram = std::make_shared<RamPrefixStorageBackend>(130u);
+        PrefixStateCache cache(130u, ram, disk);
+        for (int block = 100; block < 104; ++block)
+        {
+            auto handle = ram->allocate(keyFor(block), layoutBytes(32u));
+            ASSERT_TRUE(handle.valid());
+            ASSERT_TRUE(cache.insert(std::move(handle)));
+        }
+        PrefixLookupResult admission;
+        admission.supported = admission.cache_enabled = true;
+        admission.fingerprint_key = 0xbeef;
+        admission.block_size = 1;
+        admission.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
+        const std::vector<int32_t> tokens{20, 21, 22};
+        const auto schedule = PrefixHarvestSchedule::forPrefill(admission, 3, 0);
+        ASSERT_EQ(schedule.reusableCheckpoint(), 2);
+        auto layout = layoutBytes(4u);
+        layout.gdn_layers = 1;
+        layout.total_layers = 2;
+        layout.includes_hybrid_state = true;
+        layout.hybrid_state_bytes = 16u;
+        layout.includes_mtp_state = true;
+        layout.mtp_kv_bytes = 2u;
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        EXPECT_EQ(cache.prepareHarvest(admission, tokens, schedule, layout, 8u),
+                  PrefixRamInsertPreparation::Busy);
+        EXPECT_EQ(cache.usedBytes(), 128u);
+        writer_lock.release();
+        ASSERT_TRUE(disk->waitForPersistence());
+        cache.publishCompletedPersistence();
+        EXPECT_EQ(disk->usedBytes(), 64u)
+            << "6-byte ordinary block plus two 30-byte terminals needs exactly two victims";
+        EXPECT_EQ(cache.prepareHarvest(admission, tokens, schedule, layout, 8u),
+                  PrefixRamInsertPreparation::Prepared);
+        EXPECT_EQ(cache.usedBytes(), 64u);
+        EXPECT_EQ(ram->availableAllocationBytes(), 66u);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @test Only publication releases the background writer's original PMA alias. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveWriterRetainsCanonicalPhysicalLease)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 32u);
+        auto ram = RamPrefixStorageBackend::create(
+            DeviceId::cpu(), 32u, prefixAuthority(32u));
+        ASSERT_TRUE(disk->ready());
+        ASSERT_NE(ram, nullptr);
+        auto handle = ram->allocate(keyFor(0), layoutBytes(32u));
+        ASSERT_TRUE(handle.valid());
+        std::fill(handle.kv_storage->begin(), handle.kv_storage->end(), 0x5a);
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        const auto ticket = disk->scheduleWrite(handle);
+        EXPECT_TRUE(observeExecuting(ticket));
+        ASSERT_TRUE(ram->release(handle));
+        handle = {};
+        EXPECT_EQ(ram->usedBytes(), 0u);
+        EXPECT_FALSE(ram->canStore(32u))
+            << "The queued/native writer still owns the canonical physical lease";
+        EXPECT_EQ(ticket.publication(), nullptr);
+        writer_lock.release();
+        ASSERT_TRUE(disk->waitForPersistence());
+        const auto publication = ticket.publication();
+        ASSERT_NE(publication, nullptr);
+        const auto *written = std::get_if<PrefixArchiveWritePublication>(publication.get());
+        ASSERT_NE(written, nullptr);
+        EXPECT_NE(written->executor, std::this_thread::get_id());
+        EXPECT_EQ(written->disk_handle.total_bytes, 32u);
+        EXPECT_TRUE(ram->canStore(32u));
+        PrefixBlockHandle restored;
+        ASSERT_TRUE(disk->readBlock(keyFor(0), layoutBytes(32u), &restored));
+        ASSERT_NE(restored.kv_storage, nullptr);
+        EXPECT_TRUE(std::all_of(restored.kv_storage->begin(), restored.kv_storage->end(),
+                                [](uint8_t byte) { return byte == 0x5a; }));
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @test An ordered tombstone cancels old queued bytes without cancelling their replacement. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveRetirementCannotResurrectQueuedOldPayload)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 256u);
+        auto ram = RamPrefixStorageBackend::create(
+            DeviceId::cpu(), 128u, prefixAuthority(128u));
+        ASSERT_TRUE(disk->ready());
+        ASSERT_NE(ram, nullptr);
+        auto busy = ram->allocate(keyFor(0), layoutBytes(32u));
+        auto old = ram->allocate(keyFor(1), layoutBytes(32u));
+        ASSERT_TRUE(busy.valid());
+        ASSERT_TRUE(old.valid());
+        std::fill(old.kv_storage->begin(), old.kv_storage->end(), 0x11);
+        HeldArchiveLock writer_lock(disk->archivePath());
+        ASSERT_TRUE(writer_lock.valid());
+        const auto busy_ticket = disk->scheduleWrite(busy);
+        EXPECT_TRUE(observeExecuting(busy_ticket));
+        const auto old_ticket = disk->scheduleWrite(old);
+        EXPECT_EQ(old_ticket.phase(), PrefixArchiveMutationPhase::Queued);
+        const auto retirement = disk->scheduleRetirement(old.key);
+        EXPECT_EQ(old_ticket.publication(), nullptr)
+            << "Cancellation cannot publish while the queued source is still retained";
+        ASSERT_TRUE(ram->release(old));
+        old = {};
+        EXPECT_FALSE(ram->canStore(65u))
+            << "The cancelled queue entry still owns its 32-byte PMA lease";
+        auto rich_layout = layoutBytes(32u);
+        rich_layout.includes_mtp_state = true;
+        rich_layout.mtp_kv_bytes = 16u;
+        auto replacement = ram->allocate(keyFor(1), rich_layout);
+        ASSERT_TRUE(replacement.valid());
+        std::fill(replacement.kv_storage->begin(), replacement.kv_storage->end(), 0x22);
+        std::fill(replacement.mtp_storage->begin(), replacement.mtp_storage->end(), 0x33);
+        const auto replacement_ticket = disk->scheduleWrite(replacement);
+        writer_lock.release();
+        const auto cancelled = old_ticket.waitForPublication();
+        ASSERT_NE(cancelled, nullptr);
+        EXPECT_TRUE(std::holds_alternative<PrefixArchiveCancelledPublication>(*cancelled));
+        ASSERT_TRUE(disk->waitForPersistence());
+        ASSERT_NE(retirement.publication(), nullptr);
+        EXPECT_TRUE(std::holds_alternative<PrefixArchiveRetirementPublication>(*retirement.publication()));
+        ASSERT_NE(replacement_ticket.publication(), nullptr);
+        EXPECT_TRUE(std::holds_alternative<PrefixArchiveWritePublication>(*replacement_ticket.publication()));
+        PrefixBlockHandle restored;
+        ASSERT_TRUE(disk->readBlock(keyFor(1), rich_layout, &restored));
+        EXPECT_EQ(*restored.kv_storage, *replacement.kv_storage);
+        EXPECT_EQ(*restored.mtp_storage, *replacement.mtp_storage);
+    }
+    std::filesystem::remove_all(directory);
+}
+
+/** @test A failed background put seals admission and reaches the request as an error. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveFailureIsFatalNotACacheMiss)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 128u);
+        auto ram = std::make_shared<RamPrefixStorageBackend>(32u);
+        ASSERT_TRUE(disk->ready());
+        PrefixStateCache cache(32u, ram, disk);
+        auto handle = ram->allocate(keyFor(0), layoutBytes(32u));
+        ASSERT_TRUE(cache.insert(handle));
+        // Sabotage only this private fixture archive. Opening a directory as
+        // an append target fails deterministically, without permissions noise.
+        const auto backup = directory / "retained-test-archive";
+        std::filesystem::rename(disk->archivePath(), backup);
+        std::filesystem::create_directory(disk->archivePath());
+        EXPECT_EQ(cache.prepareCapacity(32u), PrefixRamInsertPreparation::Busy);
+        EXPECT_THROW(cache.completeInsertPreparation(keyFor(1), 32u), std::runtime_error);
+        std::string error;
+        EXPECT_FALSE(disk->waitForPersistence(&error));
+        EXPECT_FALSE(error.empty());
+        EXPECT_THROW(disk->scheduleWrite(handle), std::runtime_error);
+        EXPECT_EQ(cache.usedBytes(), 32u);
+        EXPECT_EQ(cache.stats().disk_write_failures, 1u);
+    }
+    std::filesystem::remove_all(directory);
+}
 
 /**
  * @test Cache pressure must follow the physical lease, not only LRU keys.
@@ -176,11 +736,14 @@ TEST(Test__PrefixStateCacheLRU,
     ASSERT_TRUE(first.valid());
     ASSERT_TRUE(second.valid());
     ASSERT_TRUE(cache.insert(first));
-    ASSERT_TRUE(cache.insert(second));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, second));
     ASSERT_TRUE(cache.isDiskResident(keyFor(0)));
 
     // Both evicted handles remain owned by the request. Hydration can retire
     // logical keys but must not claim a third physical 32-byte allocation.
+    EXPECT_FALSE(cache.find(keyFor(0)).has_value());
+    ASSERT_TRUE(disk->waitForPersistence());
+    cache.publishCompletedPersistence();
     EXPECT_FALSE(cache.find(keyFor(0)).has_value());
     EXPECT_TRUE(cache.isDiskResident(keyFor(0)));
     first = {};
@@ -189,6 +752,7 @@ TEST(Test__PrefixStateCacheLRU,
     auto hydrated = cache.find(keyFor(0));
     ASSERT_TRUE(hydrated.has_value());
     EXPECT_TRUE(hydrated->valid());
+    ASSERT_TRUE(disk->waitForPersistence());
     std::filesystem::remove_all(directory);
 }
 
@@ -246,7 +810,7 @@ TEST(
     ASSERT_TRUE(old_c.valid());
     ASSERT_TRUE(cache.insert(old_a));
     ASSERT_TRUE(cache.insert(old_b));
-    ASSERT_TRUE(cache.insert(old_c));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, old_c));
     ASSERT_EQ(cache.stats().ram_to_disk_demotions, 1u);
     ASSERT_GT(disk->usedBytes(), 0u);
     const size_t durable_bytes_before_rebase = disk->usedBytes();
@@ -277,6 +841,7 @@ TEST(
     EXPECT_EQ(cache.stats().ram_to_disk_demotions, 1u)
         << "A new-epoch insert must consume recovered RAM rather than spill a stale epoch";
 
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }
 
@@ -403,12 +968,16 @@ TEST(Test__PrefixStateCacheLRU, PreparedReplacementCannotResurrectStaleDiskPaylo
 
     auto pressure = ram->allocate(keyFor(8), layoutBytes(48));
     ASSERT_TRUE(pressure.valid());
-    ASSERT_TRUE(cache.insert(pressure));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, pressure));
     ASSERT_TRUE(cache.isDiskResident(replaced_key));
 
     auto rich_layout = layoutBytes(32);
     rich_layout.includes_mtp_state = true;
     rich_layout.mtp_kv_bytes = 16;
+    ASSERT_EQ(cache.prepareInsert(replaced_key, rich_layout.totalBytes()),
+              PrefixRamInsertPreparation::Busy);
+    ASSERT_TRUE(disk->waitForPersistence());
+    cache.publishCompletedPersistence();
     ASSERT_EQ(cache.prepareInsert(replaced_key, rich_layout.totalBytes()),
               PrefixRamInsertPreparation::Prepared);
     EXPECT_FALSE(cache.contains(replaced_key));
@@ -422,10 +991,10 @@ TEST(Test__PrefixStateCacheLRU, PreparedReplacementCannotResurrectStaleDiskPaylo
 
     auto second_pressure = ram->allocate(keyFor(9), layoutBytes(32));
     ASSERT_TRUE(second_pressure.valid());
-    ASSERT_TRUE(cache.insert(second_pressure));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, second_pressure));
     ASSERT_TRUE(cache.isDiskResident(replaced_key));
 
-    const auto hydrated = cache.find(replaced_key);
+    const auto hydrated = findAfterArchivePublication(cache, *disk, replaced_key);
     ASSERT_TRUE(hydrated.has_value());
     EXPECT_TRUE(hydrated->layout.includes_mtp_state);
     ASSERT_NE(hydrated->kv_storage, nullptr);
@@ -439,6 +1008,7 @@ TEST(Test__PrefixStateCacheLRU, PreparedReplacementCannotResurrectStaleDiskPaylo
         hydrated->mtp_storage->end(),
         [](uint8_t value) { return value == 0x33; }));
 
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }
 
@@ -650,7 +1220,7 @@ TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
 
     ASSERT_TRUE(cache.insert(a));
     ASSERT_TRUE(cache.insert(b));
-    ASSERT_TRUE(cache.insert(c));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, c));
 
     EXPECT_TRUE(cache.contains(a.key))
         << "disk-resident blocks remain addressable after RAM eviction";
@@ -658,7 +1228,7 @@ TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
     EXPECT_EQ(cache.stats().evictions, 1u);
     EXPECT_EQ(cache.stats().disk_bytes, 32u);
 
-    auto hydrated = cache.find(a.key);
+    auto hydrated = findAfterArchivePublication(cache, *disk, a.key);
     ASSERT_TRUE(hydrated.has_value());
     ASSERT_NE(hydrated->kv_storage, nullptr);
     EXPECT_EQ(hydrated->tier, PrefixStorageTier::Ram);
@@ -667,6 +1237,7 @@ TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
     EXPECT_EQ(cache.stats().promotions, 1u);
     EXPECT_GE(cache.stats().disk_bytes, 32u);
 
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }
 
@@ -696,10 +1267,13 @@ TEST(Test__PrefixStateCacheLRU,
     const auto expected_a = *a.kv_storage;
 
     ASSERT_TRUE(cache.insert(a));
-    ASSERT_TRUE(cache.insert(b));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, b));
     ASSERT_TRUE(cache.isDiskResident(a.key));
     ASSERT_TRUE(cache.isRamResident(b.key));
 
+    // Verification retains A's inode before B's asynchronous put evicts A.
+    // The same lookup must complete its required victim and consume that exact
+    // ticket, not return a manufactured miss or allocate full-size staging.
     const auto promoted = cache.find(a.key);
     ASSERT_TRUE(promoted.has_value());
     ASSERT_NE(promoted->kv_storage, nullptr);
@@ -710,7 +1284,42 @@ TEST(Test__PrefixStateCacheLRU,
     EXPECT_TRUE(cache.isDiskResident(b.key));
     EXPECT_EQ(cache.stats().disk_hydrations, 1u);
     EXPECT_EQ(cache.stats().ram_to_disk_demotions, 2u);
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
+}
+
+/** @test A selected disk restore completes its own victim, rather than reporting a miss. */
+TEST(Test__PrefixStateCacheLRU, AsyncArchiveSelectedHydrationCompletesPendingSwap)
+{
+    const auto directory = tempDir();
+    {
+        auto disk = makeDiskBackend(directory, 32u);
+        auto ram = RamPrefixStorageBackend::create(
+            DeviceId::cpu(), 32u, prefixAuthority(32u));
+        ASSERT_TRUE(disk->ready());
+        ASSERT_NE(ram, nullptr);
+        PrefixStateCache cache(32u, ram, disk);
+        auto original = ram->allocate(keyFor(0), layoutBytes(32u));
+        ASSERT_TRUE(original.valid());
+        std::fill(original.kv_storage->begin(), original.kv_storage->end(), 0xa5);
+        ASSERT_TRUE(cache.insert(std::move(original)));
+        ASSERT_NO_THROW(cache.completeInsertPreparation(keyFor(1), 32u));
+        auto victim = ram->allocate(keyFor(1), layoutBytes(32u));
+        ASSERT_TRUE(victim.valid());
+        ASSERT_TRUE(cache.insert(std::move(victim)));
+        ASSERT_TRUE(cache.isDiskResident(keyFor(0)));
+        const auto old_misses = cache.stats().misses;
+        const auto restored = cache.find(keyFor(0));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ(*restored->kv_storage, std::vector<uint8_t>(32u, 0xa5));
+        EXPECT_EQ(cache.stats().misses, old_misses);
+        EXPECT_EQ(cache.usedBytes(), 32u);
+        EXPECT_TRUE(cache.isDiskResident(keyFor(1)));
+        EXPECT_FALSE(cache.isRamResident(keyFor(1)));
+        EXPECT_EQ(ram->availableAllocationBytes(), 0u)
+            << "The verified inode is not a second full-size RAM allocation";
+    }
+    std::filesystem::remove_all(directory);
 }
 
 TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAreExact)
@@ -734,7 +1343,7 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
     ASSERT_TRUE(cache.insert(a));
     ASSERT_TRUE(cache.insert(b));
     ASSERT_TRUE(cache.find(a.key).has_value()); // B is the oldest RAM block.
-    ASSERT_TRUE(cache.insert(c));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, c));
 
     EXPECT_TRUE(cache.isRamResident(a.key));
     EXPECT_FALSE(cache.isRamResident(b.key));
@@ -746,7 +1355,7 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
      * B rises from disk to RAM. Making room demotes A, while B's durable disk
      * copy remains present and receives a persistent LRU touch.
      */
-    ASSERT_TRUE(cache.find(b.key).has_value());
+    ASSERT_TRUE(findAfterArchivePublication(cache, *disk, b.key).has_value());
     EXPECT_FALSE(cache.isRamResident(a.key));
     EXPECT_TRUE(cache.isDiskResident(a.key));
     EXPECT_TRUE(cache.isRamResident(b.key));
@@ -760,7 +1369,7 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
      * arriving C record overwrites B, the oldest bottom-tier record. B remains
      * valid in RAM and can be demoted again on a later pressure cycle.
      */
-    ASSERT_TRUE(cache.find(a.key).has_value());
+    ASSERT_TRUE(findAfterArchivePublication(cache, *disk, a.key).has_value());
     EXPECT_TRUE(cache.isRamResident(a.key));
     EXPECT_TRUE(cache.isDiskResident(a.key));
     EXPECT_TRUE(cache.isRamResident(b.key));
@@ -775,7 +1384,7 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
      * C's second promotion proves the cycle is repeatable. B is demoted back
      * into disk and overwrites now-oldest A; no key is lost from the hierarchy.
      */
-    ASSERT_TRUE(cache.find(c.key).has_value());
+    ASSERT_TRUE(findAfterArchivePublication(cache, *disk, c.key).has_value());
     EXPECT_TRUE(cache.isRamResident(a.key));
     EXPECT_FALSE(cache.isDiskResident(a.key));
     EXPECT_FALSE(cache.isRamResident(b.key));
@@ -787,6 +1396,7 @@ TEST(Test__PrefixStateCacheLRU, RepeatedPromotionDemotionAndBottomTierEvictionAr
     EXPECT_EQ(cache.stats().disk_evictions, 2u);
     EXPECT_EQ(cache.stats().evictions, 4u);
 
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }
 
@@ -804,7 +1414,7 @@ TEST(Test__PrefixStateCacheLRU, ClearReleasesDiskEntries)
     auto c = ram->allocate(keyFor(2), layoutBytes(32));
     ASSERT_TRUE(cache.insert(a));
     ASSERT_TRUE(cache.insert(b));
-    ASSERT_TRUE(cache.insert(c));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, c));
     ASSERT_TRUE(cache.contains(a.key));
     ASSERT_EQ(cache.stats().disk_bytes, 32u);
 
@@ -835,7 +1445,7 @@ TEST(Test__PrefixStateCacheLRU, DiskHydrationFailureRecordsReadFailureAndMiss)
     auto c = ram->allocate(keyFor(2), layoutBytes(32));
     ASSERT_TRUE(cache.insert(a));
     ASSERT_TRUE(cache.insert(b));
-    ASSERT_TRUE(cache.insert(c));
+    ASSERT_TRUE(insertAfterArchivePublication(cache, *disk, c));
 
     const auto archive_bytes = std::filesystem::file_size(disk->archivePath());
     ASSERT_GT(archive_bytes, 17u);
@@ -855,5 +1465,6 @@ TEST(Test__PrefixStateCacheLRU, DiskHydrationFailureRecordsReadFailureAndMiss)
     EXPECT_EQ(cache.stats().misses, 1u);
     EXPECT_FALSE(cache.contains(a.key));
 
+    ASSERT_TRUE(disk->waitForPersistence());
     cleanup();
 }

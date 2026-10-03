@@ -129,7 +129,12 @@ namespace llaminar2
             std::vector<std::vector<uint8_t>> *compacted_outputs)
         {
             if (!logical_rows || !logical_rows->active())
+            {
+                if (snapshot_info && std::any_of(snapshot_info->outputs.begin(), snapshot_info->outputs.end(),
+                    [](const auto &out) { return std::holds_alternative<SnapshotCompactRows>(out.row_layout); }))
+                    throw std::logic_error("Compact row diagnostics require explicit logical request geometry");
                 return true;
+            }
 
             if (!snapshot_info || !compacted_outputs)
             {
@@ -168,6 +173,27 @@ namespace llaminar2
                  ++output_index)
             {
                 auto &output = snapshot_info->outputs[output_index];
+                if (const auto *compact_rows = std::get_if<SnapshotCompactRows>(&output.row_layout))
+                {
+                    if (batch_size != 1 || compact_rows->capacity != static_cast<int>(physical_token_rows) ||
+                        logical_token_rows > std::size_t(std::numeric_limits<int>::max()) ||
+                        !output.data || !output.dtype || std::string_view(output.dtype) != "FP32" ||
+                        output.rows * output.cols * sizeof(float) != output.byte_size)
+                        throw std::logic_error("Compact row snapshot disagrees with its terminal observation geometry");
+                    std::vector<float> projected;
+                    auto owned = projectSnapshotOwnedRows(
+                        {static_cast<const float *>(output.data), output.rows * output.cols},
+                        *compact_rows, static_cast<int>(logical_token_rows), output.cols, projected);
+                    auto &bytes = (*compacted_outputs)[output_index];
+                    bytes.resize(projected.size() * sizeof(float));
+                    std::memcpy(bytes.data(), projected.data(), bytes.size());
+                    output.data = bytes.data();
+                    output.rows = logical_token_rows;
+                    output.byte_size = bytes.size();
+                    output.tensor = nullptr;
+                    output.row_layout = std::move(owned);
+                    continue;
+                }
                 if (output.rows != physical_token_rows)
                     continue;
                 if (!output.data || output.rows == 0 ||

@@ -10,6 +10,8 @@
 
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
+#include "collective/DeviceCountedAllGather.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "execution/prefix_cache/PrefixArchiveIOGeometry.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
@@ -226,6 +228,42 @@ namespace
     }
 
 } // anonymous namespace
+
+/** @test Canonical physical admission charges each compact domain edge once on CPU and GPU. */
+TEST(Test__MemoryPlanner, CountedProjectionTransportHasOneCanonicalPhysicalBOM)
+{
+    auto profile = createMoEOverlayProfile();
+    // TP8 needs eight semantic query heads. Keep the original matrix width by
+    // shrinking each synthetic head, rather than bypassing sharding validation.
+    profile.n_heads = 8;
+    profile.head_dim = 4;
+    constexpr auto staging_owner = PhysicalMemoryOwner::ActivationTransportStaging;
+    for (const auto first : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int degree : {2, 4, 8})
+    for (const auto coverage : {PeerAccessCoverage::None, PeerAccessCoverage::Partial, PeerAccessCoverage::Complete})
+    {
+        std::vector<DevicePlanConfig> configs;
+        for (int participant = 0; participant < degree; ++participant)
+        {
+            auto config = overlayDeviceConfig(first.is_cuda() ? DeviceId::cuda(participant) : DeviceId::rocm(participant));
+            config.shard_index = participant; config.total_shards = degree;
+            config.local_tp_backend = first.is_cuda() ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            config.routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            config.projection_peer_access = coverage;
+            config.associated_host_memory = PhysicalMemoryResource{.world_rank = -1, .device = DeviceId::cpu(),
+                .total_bytes = 1ull << 40, .admission_available_bytes = 1ull << 40};
+            configs.push_back(config);
+        }
+        const auto plan = MemoryPlanner::plan(profile, configs);
+        const auto geometry = DeviceCountedAllGather::memoryFor(degree,
+            MoEProjectionArenaGeometry::resolve(profile, degree).packetCapacityBytes(32));
+        std::size_t host_bytes = 0, device_bytes = 0;
+        for (const auto &row : plan.devices)
+            (row.device().is_cpu() ? host_bytes : device_bytes) += row.bom().bytes(staging_owner);
+        EXPECT_EQ(host_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.host_bytes : 0u);
+        EXPECT_EQ(device_bytes, coverage == PeerAccessCoverage::None ? degree * geometry.device_bytes : 0u);
+    }
+}
 
 /**
  * @brief A weight shard does not imply a rank-local collective allocation.

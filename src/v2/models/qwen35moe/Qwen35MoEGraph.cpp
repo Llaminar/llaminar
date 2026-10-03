@@ -14,6 +14,11 @@
  */
 
 #include "Qwen35MoEGraph.h"
+#include "planning/ModelMemoryProfile.h"
+#include "execution/moe/MoEExpertOverlayPreparationPlan.h"
+#include "execution/moe/MoEProjectionRuntimeBinding.h"
+#include "execution/compute_stages/stages/MoEProjectionPipeline.h"
+#include "execution/compute_stages/stages/MoERoutingPipeline.h"
 #include "loaders/PreparedWeightStore.h"
 #include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "Qwen35MoESchema.h"
@@ -31,6 +36,7 @@
 #include "../../execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "../../execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "../../execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "../../execution/compute_stages/stages/TPLocalReduceOverlap.h"
 #include "../../execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "../../execution/moe/RoutedExpertOwnerAssignment.h"
 #include "../../execution/moe/MoEExpertOwnerMap.h"
@@ -1814,6 +1820,7 @@ namespace llaminar2
 
             const bool expert_id_apportioned =
                 config.moe.routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
+                config.moe.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
                 (config.moe.routed_expert_plan &&
                  (planHasLocalTPApportionedExpertDomain(*config.moe.routed_expert_plan) ||
                   planHasLocalTPPrefillApportionedDecodeReplicatedDomain(
@@ -2424,6 +2431,7 @@ namespace llaminar2
         const GraphConfig &config)
         : Qwen35Graph(std::move(model_ctx), std::move(mpi_ctx), config)
     {
+        bindProjectionArena();
     }
 
     Qwen35MoEGraph::Qwen35MoEGraph(
@@ -2431,6 +2439,33 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx)
         : Qwen35Graph(config, std::move(mpi_ctx))
     {
+        // GraphBuilderRegistry constructs declarations before source injection.
+        // An unbound declaration is legal; resolving/executing it is not.
+    }
+
+    void Qwen35MoEGraph::bindProjectionArena()
+    {
+        if (config_.moe.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) return;
+        if (!model_ctx_ || !config_.tp_ctx || !config_.tp_ctx->isLocal())
+            throw std::invalid_argument("Gate/up-owned MoE requires source metadata and a native local TP domain");
+        projection_arena_ = MoEProjectionArenaGeometry::resolve(
+            ModelMemoryProfile::fromGGUF(model_ctx_->concreteLoader().getModel()), config_.tp_ctx->degree());
+    }
+
+    void Qwen35MoEGraph::setModelContext(std::shared_ptr<IModelContext> model_ctx)
+    {
+        if (projection_arena_ && model_ctx_ != model_ctx)
+            throw std::logic_error("Cannot replace the source identity of a bound projection graph");
+        Qwen35Graph::setModelContext(std::move(model_ctx));
+        bindProjectionArena();
+    }
+
+    const MoEProjectionArenaGeometry *Qwen35MoEGraph::projectionArena() const
+    {
+        if (config_.moe.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) return nullptr;
+        if (!projection_arena_)
+            throw std::logic_error("Projection graph metadata must be bound before schema or execution resolution");
+        return &*projection_arena_;
     }
 
     void Qwen35MoEGraph::resetState(void *execution_stream)
@@ -2722,6 +2757,19 @@ namespace llaminar2
                 layer,
                 selected->participant_id,
                 config_.moe.num_experts);
+            if (projection_arena_)
+            {
+                const auto *fixed = table->fixedDownProjectionBank(layer);
+                if (!fixed) throw std::logic_error("Projection finalization lost its fixed down bank");
+                std::vector<MoEOverlayPreparedExpertPayload> payloads;
+                std::string error;
+                if (!resolveMoEOverlayPreparedExpertPayloads(registry, *selected, layer,
+                        config_.moe.num_experts, expert_mask, payloads, &error, fixed->ownership()))
+                    throw std::runtime_error("Projection finalization: " + error);
+                publishInitialMoEProjectionRuntimeLayer(*table, owner_map, layer, payloads, publication_stream);
+                if (publication_missing) ++finalized_layers;
+                continue;
+            }
             std::vector<ITensorGemm *> gate_gemms;
             std::vector<ITensorGemm *> up_gemms;
             std::vector<ITensorGemm *> down_gemms;
@@ -3069,6 +3117,41 @@ namespace llaminar2
         {
             material.moe.push_back({"expert_overlay.runtime.enabled", "false"});
         }
+    }
+
+    size_t Qwen35MoEGraph::prefixCacheRuntimeStateCapacity() const
+    {
+        size_t table_bytes = 0u;
+        for (const auto &[key, table] : moe_runtime_tables_)
+        {
+            if (!table || table->usesOverlayEpochTicket())
+                continue;
+            const int layers = table->layerCount();
+            const int experts = table->expertCount();
+            if (layers < 0 || experts < 0)
+                throw std::logic_error("invalid MoE prefix serializer geometry");
+            // Match the portable serializer below: length-prefixed table name,
+            // two geometry words, six words per layer, then seven words and
+            // two 64-bit histogram values per expert. Mutable eligibility may
+            // omit a table, but cannot make its serialized geometry larger.
+            constexpr size_t expert_bytes = 7u * sizeof(uint32_t) + 2u * sizeof(uint64_t);
+            constexpr size_t layer_header = 6u * sizeof(uint32_t);
+            constexpr size_t table_header = 3u * sizeof(uint32_t);
+            constexpr size_t archive_header = sizeof(kMoEPrefixRuntimeMagic) + 3u * sizeof(uint32_t);
+            const auto limit = std::numeric_limits<size_t>::max();
+            if (static_cast<size_t>(experts) > (limit - layer_header) / expert_bytes)
+                throw std::overflow_error("MoE prefix expert geometry overflow");
+            const size_t layer_bytes = layer_header + static_cast<size_t>(experts) * expert_bytes;
+            if (key.size() > limit - table_header ||
+                static_cast<size_t>(layers) > (limit - table_header - key.size()) / layer_bytes)
+                throw std::overflow_error("MoE prefix layer geometry overflow");
+            const size_t bytes = table_header + key.size() + static_cast<size_t>(layers) * layer_bytes;
+            if (table_bytes > limit - archive_header || bytes > limit - archive_header - table_bytes)
+                throw std::overflow_error("MoE prefix serializer capacity overflow");
+            table_bytes += bytes;
+        }
+        return table_bytes == 0u ? 0u :
+            sizeof(kMoEPrefixRuntimeMagic) + 3u * sizeof(uint32_t) + table_bytes;
     }
 
     bool Qwen35MoEGraph::capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream)
@@ -4161,6 +4244,29 @@ namespace llaminar2
                 ? verifier_rows
                 : 0;
         table_config.serial_route_scratch_arena = scratch_it->second;
+        if (projection_arena_)
+        {
+            const auto residency = config_.moe.expert_overlay_participant_residency;
+            if (!residency || !residency->projectionPreparation() || !model_ctx_)
+                throw std::logic_error("Projection runtime has no authenticated participant preparation");
+            const auto runtime_plan = runtimePlanForGraph(config_);
+            const auto owners = MoEExpertOwnerMap::build(runtime_plan->sourcePlan());
+            const int id = participantIdForTierDevice(owners, 0, device);
+            const auto *participant = owners.participantForId(id);
+            if (!participant) throw std::logic_error("Projection runtime cannot resolve its graph-local participant");
+            const auto manager = model_ctx_->concreteWeightManager();
+            if (!manager) throw std::logic_error("Projection runtime has no prepared engine registry");
+            table_config.fixed_down_banks.reserve(table_layers);
+            for (int layer = 0; layer < table_layers; ++layer)
+            {
+                // Child graph identities retain the parent's exact immutable
+                // bank; only routing scratch belongs to the child lifecycle.
+                table_config.fixed_down_banks.push_back(overlay_placement_source
+                    ? overlay_placement_source->retainFixedDownProjectionBank(layer)
+                    : MoEOverlayFixedDownProjectionBank::resolve(manager->expertGemmRegistry(), *participant, layer,
+                        residency->projectionPreparation()->requireProjectionOwnershipForParticipant(*participant, layer)));
+            }
+        }
         if (bind_overlay_epoch)
         {
             const auto binding =
@@ -4367,6 +4473,7 @@ namespace llaminar2
     {
         Qwen35MoESchemaFactory factory;
         GraphSchema schema = factory.createSchema();
+        if (const auto *projection = projectionArena()) projection->replaceWholeExpertSchema(schema);
 
         // Populate layer_template_names from config_.layer_types
         if (!config_.layer_types.empty())
@@ -4387,6 +4494,7 @@ namespace llaminar2
 
     GraphResolverConfig Qwen35MoEGraph::getResolverConfig(int seq_len) const
     {
+        const auto *projection = projectionArena();
         // Start with base Qwen35 resolver config (GDN buffers, etc.)
         GraphResolverConfig config = Qwen35Graph::getResolverConfig(seq_len);
 
@@ -4435,6 +4543,7 @@ namespace llaminar2
         config.buffer_name_to_id["moe_shared_expert_output"] = BufferId::MOE_SHARED_EXPERT_OUTPUT;
         config.buffer_name_to_id["moe_gate_scratch"] = BufferId::MOE_GATE_SCRATCH;
         config.buffer_name_to_id["moe_up_scratch"] = BufferId::MOE_UP_SCRATCH;
+        if (projection) projection->bindResolver(config);
 
         LOG_DEBUG("[Qwen35MoEGraph::getResolverConfig] MoE formulas: "
                   << "moe_top_k=" << top_k
@@ -4462,6 +4571,7 @@ namespace llaminar2
         const int32_t *sequence_lengths_device,
         const int32_t *absolute_position_ids_device)
     {
+        (void)projectionArena();
         if (device.is_gpu() && !device_state_publication_stream)
         {
             throw std::invalid_argument(
@@ -5125,7 +5235,7 @@ namespace llaminar2
             local_tp_ctx &&
             local_tp_ctx->degree() > 1;
         const bool runtime_table_eligible =
-            static_full_local_expert_ownership ||
+            projection_arena_.has_value() || static_full_local_expert_ownership ||
             masked_local_tp_overlay_decode_runtime_table ||
             captured_distributed_overlay_runtime_table ||
             full_local_tp_replicated_overlay_decode_runtime_table ||
@@ -5199,6 +5309,13 @@ namespace llaminar2
         auto collectGraphRebalanceTransferProfile =
             [&]() -> DeviceMoETransferSlotDirectory::FormatProfile
         {
+            if (projection_arena_)
+            {
+                if (!model_ctx_) throw std::logic_error("Projection transfer profile has no model metadata");
+                return DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(
+                    buildMoEOverlayLayerWeightManifestFromGGUF(model_ctx_->concreteLoader().getModel(),
+                        bound_runtime_table_layers, config_.moe.num_experts), DeviceMoEProjectionSet::GateUp);
+            }
             /*
              * One transfer directory is shared by the complete device-local MoE
              * domain. Its slots retain arrivals from different layers, so sizing
@@ -6953,9 +7070,10 @@ namespace llaminar2
                 selectMoEGroupedVerifierHistogramRole(
                     forceGpuSmallMMainVerifierPrefill(device) &&
                     use_expert_overlay &&
-                    !masked_local_tp_overlay_decode_runtime_table &&
-                    !captured_distributed_overlay_runtime_table &&
-                    !full_local_tp_replicated_overlay_decode_runtime_table,
+                    (projection_arena_.has_value() ||
+                     (!masked_local_tp_overlay_decode_runtime_table &&
+                      !captured_distributed_overlay_runtime_table &&
+                      !full_local_tp_replicated_overlay_decode_runtime_table)),
                     collect_runtime_histogram);
             route_params.active_row_count_device =
                 device.is_gpu() && batch_size == 1
@@ -7029,10 +7147,13 @@ namespace llaminar2
                 }
             }
 
-            graph.addNode(prefix + "moe_routing",
-                          ComputeStageFactory::createMoERouting(route_params),
-                          device);
-            graph.addDependency(prefix + "moe_routing", prefix + "ffn_norm");
+            MoERoutingDistribution distribution;
+            if (projection_arena_ && ordinary_prefill_graph && batch_size == 1 && local_tp_ctx)
+            {
+                distribution = MoERoutingDistribution::fromDomain(*local_tp_ctx, device, buffers);
+            }
+            appendMoERoutingPipeline(graph, std::move(route_params),
+                prefix + "moe_routing", prefix + "ffn_norm", std::move(distribution));
         }
 
         // =====================================================================
@@ -7112,7 +7233,7 @@ namespace llaminar2
 
         auto needsMoEParticipantAllreduce = [&]() -> bool
         {
-            return config_.tp_ctx && config_.tp_ctx->degree() > 1 &&
+            return !projection_arena_ && config_.tp_ctx && config_.tp_ctx->degree() > 1 &&
                    routed_row_execution_policy ==
                        RoutedExpertRowExecutionPolicy::ParticipantAssigned;
         };
@@ -7578,23 +7699,23 @@ namespace llaminar2
                         layer_idx,
                         local_participant,
                         config_.moe.num_experts);
-                std::vector<MoEOverlayPreparedExpertTriplet>
-                    prepared_triplets;
+                std::vector<MoEOverlayPreparedExpertPayload>
+                    prepared_payloads;
                 std::string residency_error;
-                if (!resolveMoEOverlayPreparedExpertTriplets(
+                if (!resolveMoEOverlayPreparedExpertPayloads(
                         *expert_params.expert_registry,
                         *participant,
                         layer_idx,
                         config_.moe.num_experts,
                         canonical_resident_mask,
-                        prepared_triplets,
+                        prepared_payloads,
                         &residency_error) ||
                     !config_.moe.expert_overlay_participant_residency
                          ->registerInitialLayer(
                              local_participant,
                              layer_idx,
                              canonical_resident_mask,
-                             prepared_triplets,
+                             prepared_payloads,
                              &residency_error))
                 {
                     throw std::runtime_error(
@@ -7626,7 +7747,50 @@ namespace llaminar2
                 phase_split_local_tp_apportioned_gpu_prefill ||
                 local_tp_replicated_fast_candidate;
 
-            if (use_local_tp_routed_fast_path)
+            if (projection_arena_)
+            {
+                // This is a separate physical mode. The reusable lowering
+                // owns its local compute/collective DAG; the model supplies
+                // only frozen weights, the existing runtime and arena IDs.
+                auto *runtime = dynamic_cast<DeviceMoERuntimeTable *>(moe_runtime_table);
+                const auto residency = config_.moe.expert_overlay_participant_residency;
+                if (!runtime || !local_tp_ctx || !residency || !model_ctx_)
+                    throw std::logic_error("Projection graph has incomplete runtime/native-domain ownership");
+                auto fixed = runtime->retainFixedDownProjectionBank(layer_idx);
+                const auto owners = MoEExpertOwnerMap::build(*overlay_plan);
+                const auto *participant = fixed ? owners.participantForId(fixed->participantId()) : nullptr;
+                const auto manager = model_ctx_->concreteWeightManager();
+                if (!participant || !manager)
+                    throw std::logic_error("Projection graph cannot resolve its fixed bank or prepared weights");
+                const auto mask = owners.expertMaskForParticipant(layer_idx, participant->participant_id, config_.moe.num_experts);
+                std::vector<MoEOverlayPreparedExpertPayload> payloads;
+                std::string error;
+                if (!resolveMoEOverlayPreparedExpertPayloads(manager->expertGemmRegistry(), *participant, layer_idx,
+                        config_.moe.num_experts, mask, payloads, &error, fixed->ownership()) ||
+                    !residency->registerInitialLayer(participant->participant_id, layer_idx, mask, payloads, &error))
+                    throw std::runtime_error("Projection graph initial prepared residency: " + error);
+                publishInitialMoEProjectionRuntimeLayer(*runtime, owners, layer_idx, payloads, device_state_publication_stream);
+                MoEProjectionPipelineParams params;
+                params.fixed_down = std::move(fixed);
+                params.initial_gate_up = std::move(payloads);
+                params.kernel_owner = routed_pipeline_kernel_owner;
+                params.runtime = runtime; params.tp = local_tp_ctx;
+                params.counted_exchange = local_tp_ctx->deviceCountedAllGather();
+                params.rows = total_tokens; params.top_k = config_.moe.top_k;
+                params.live_rows = prefillCollectiveRows(device, total_tokens);
+                params.service_phase = routed_service_phase;
+                // The router owns serial-decode demand and the accepted-row
+                // publication boundary. Projection grouping only fills that
+                // same layer ledger after final gate/up ownership is known.
+                params.demand = !collect_runtime_histogram ? MoEGroupedPlanDemand::None
+                    : grouped_main_verifier_layer ? MoEGroupedPlanDemand::DeferredAcceptedRows
+                    : ordinary_prefill_graph ? MoEGroupedPlanDemand::OrdinaryPrefill
+                                             : MoEGroupedPlanDemand::None;
+                params.prefix = prefix + "projection_"; params.router_node = prefix + "moe_routing";
+                params.bindArena(buffers);
+                ffn_terminal = appendMoEProjectionPipeline(graph, std::move(params));
+            }
+            else if (use_local_tp_routed_fast_path)
             {
                 auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
                     MoEExpertOwnerMap::build(*overlay_plan));
@@ -9914,16 +10078,16 @@ namespace llaminar2
                                 "Qwen35 MoE rank-batch follower has no prepared residency endpoint for participant " +
                                 std::to_string(target_participant));
                         }
-                        std::vector<MoEOverlayPreparedExpertTriplet>
-                            prepared_triplets;
+                        std::vector<MoEOverlayPreparedExpertPayload>
+                            prepared_payloads;
                         std::string residency_error;
-                        if (!resolveMoEOverlayPreparedExpertTriplets(
+                        if (!resolveMoEOverlayPreparedExpertPayloads(
                                 *local_params.expert_registry,
                                 *participant,
                                 layer_idx,
                                 config_.moe.num_experts,
                                 local_params.expert_mask,
-                                prepared_triplets,
+                                prepared_payloads,
                                 &residency_error) ||
                             !config_.moe
                                  .expert_overlay_participant_residency
@@ -9931,7 +10095,7 @@ namespace llaminar2
                                      target_participant,
                                      layer_idx,
                                      local_params.expert_mask,
-                                     prepared_triplets,
+                                     prepared_payloads,
                                      &residency_error))
                         {
                             throw std::runtime_error(
@@ -11106,16 +11270,16 @@ namespace llaminar2
                             }
 
                             std::vector<
-                                MoEOverlayPreparedExpertTriplet>
-                                prepared_triplets;
+                                MoEOverlayPreparedExpertPayload>
+                                prepared_payloads;
                             std::string residency_error;
-                            if (!resolveMoEOverlayPreparedExpertTriplets(
+                            if (!resolveMoEOverlayPreparedExpertPayloads(
                                     *local_params.expert_registry,
                                     *participant,
                                     layer_idx,
                                     config_.moe.num_experts,
                                     local_params.expert_mask,
-                                    prepared_triplets,
+                                    prepared_payloads,
                                     &residency_error) ||
                                 !config_.moe
                                      .expert_overlay_participant_residency
@@ -11123,7 +11287,7 @@ namespace llaminar2
                                          target_participant,
                                          layer_idx,
                                          local_params.expert_mask,
-                                         prepared_triplets,
+                                         prepared_payloads,
                                          &residency_error))
                             {
                                 throw std::runtime_error(
@@ -13347,6 +13511,16 @@ namespace llaminar2
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
 
+            if (projection_arena_)
+            {
+                // Gate/up has packed its complete outgoing bytes before this
+                // independent dense branch reuses scratch. Let native transport
+                // run alongside that branch; import/down acquires the join.
+                // No computation, reduction order or collective extent changes.
+                overlapTPLocalAllGather(graph, prefix + "projection_intermediate_allgather",
+                    prefix + "shared_expert_ffn");
+            }
+
             if (canonical_publication_lowering.usesRankBanks())
             {
                 if (!canonical_route_contributions || !buffers.normalized ||
@@ -13522,7 +13696,16 @@ namespace llaminar2
                         rebalance_sidebands,
                         takeCurrentBatchLLEPPayloadSideband());
                 }
+                // Shared partials are independent of routed down in both
+                // prefill and decode. Decode keeps its original full-row sum,
+                // gate and add; an event fork does not alter that arithmetic.
+                // Control sidebands retain their separate ordered transaction.
+                const bool projection_shared_overlap =
+                    projection_arena_ &&
+                    !rooted_overlay_shared_reduction && shared_device == device &&
+                    rebalance_sidebands.empty() && !current_batch_llep_plan_params.has_value();
                 std::unique_ptr<IComputeStage> allreduce_stage;
+                bool installed_reduce_overlap = false;
                 if (rooted_overlay_shared_reduction)
                 {
                     const auto &publication =
@@ -13552,9 +13735,27 @@ namespace llaminar2
                         buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
                     reduce_params.sideband_workspace_bindings =
                         std::move(rebalance_sidebands);
-                    allreduce_stage =
-                        ComputeStageFactory::createTPLocalRootedCollective(
-                            reduce_params);
+                    if (canonical_publication_lowering.usesMappedSparseRoutes() &&
+                        publication.capture_rendezvous ==
+                            DeferredOverlayCombinedPublication::CaptureRendezvous::NativeFullGraph &&
+                        reduce_params.sideband_workspace_bindings.empty())
+                    {
+                        // The shared partial and routed expert rows are independent.
+                        // Keep both event edges in this native executable; ticketed
+                        // overlays and control sidebands retain their explicit order.
+                        addTPLocalReduceOverlap(graph, std::move(reduce_params), {
+                            .producer = prefix + "shared_expert_ffn",
+                            .independent_compute = prefix + "moe_expert_ffn_overlay_fast",
+                        });
+                        graph.addDependency(publication.routed_terminal, ar_name);
+                        installed_reduce_overlap = true;
+                    }
+                    else
+                    {
+                        allreduce_stage =
+                            ComputeStageFactory::createTPLocalRootedCollective(
+                                reduce_params);
+                    }
                 }
                 else
                 {
@@ -13567,11 +13768,36 @@ namespace llaminar2
                         ar_name,
                         buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT),
                         std::move(rebalance_sidebands));
+                    if (projection_shared_overlap && !forwardPhaseAllowsDecodeTopology() &&
+                        layer.shared_expert_gate_inp)
+                    {
+                        const auto *native_sum = dynamic_cast<const TPAllreduceStage *>(allreduce_stage.get());
+                        if (!native_sum)
+                            throw std::logic_error("Projection shared-column publication requires its native sum declaration");
+                        // Declare the final ownership boundary once. The
+                        // reusable builder owns packing, fork/join, gating and
+                        // final gather; this model owns neither event edges nor
+                        // another buffer/precision policy.
+                        ffn_terminal = finalizeMoEProjectionSharedColumns(graph, prefix + "projection_", {
+                            .reduction = native_sum->params(),
+                            .producer = prefix + "shared_expert_ffn",
+                            .gate = layer.shared_expert_gate_inp,
+                            .active_rows = batch_size == 1 ? sequence_lengths_device : nullptr,
+                            .combined_output = {buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)}});
+                        shared_ffn_last = ffn_terminal;
+                        moe_combined_output_ready = true;
+                        allreduce_stage.reset();
+                    }
                 }
-                if (allreduce_stage)
+                if (allreduce_stage || installed_reduce_overlap)
                 {
-                    graph.addNode(ar_name, std::move(allreduce_stage), shared_device);
+                    if (allreduce_stage)
+                        graph.addNode(ar_name, std::move(allreduce_stage), shared_device);
                     graph.addDependency(ar_name, prefix + "shared_expert_ffn");
+                    if (projection_shared_overlap)
+                    {
+                        overlapMoEProjectionSharedAllreduce(graph, prefix + "projection_", ar_name);
+                    }
                     if (rooted_overlay_shared_reduction &&
                         !captured_overlay_routed_unit_terminal.empty())
                     {
@@ -13621,7 +13847,8 @@ namespace llaminar2
                             current_batch_llep_apply_node);
                     }
                     if (!rooted_overlay_shared_reduction &&
-                        routed_overlay_has_distributed_sparse_protocol &&
+                        !projection_shared_overlap &&
+                        (routed_overlay_has_distributed_sparse_protocol || projection_arena_) &&
                         !ffn_terminal.empty())
                     {
                         /*
@@ -13645,7 +13872,7 @@ namespace llaminar2
             }
 
             // Stage 4b: Sigmoid gate on shared expert output
-            if (layer.shared_expert_gate_inp &&
+            if (!moe_combined_output_ready && layer.shared_expert_gate_inp &&
                 !canonical_publication_lowering.usesRankBanks())
             {
                 const bool rooted_overlay_finalize =

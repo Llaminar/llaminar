@@ -297,6 +297,11 @@ namespace llaminar2
          * @return Common locally restorable prefix and typed terminal requirements.
          */
         PrefixLookupResult lookupPrefixAll(const std::vector<int32_t> &tokens);
+        /** @copydoc IInferenceRunner::preparePrefixHarvest */
+        bool preparePrefixHarvestAll(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule);
         /**
          * @brief Restore the coordinated prefix into every local PP stage.
          * @param hit Aggregate result returned by @ref lookupPrefixAll.
@@ -569,6 +574,12 @@ namespace llaminar2
         PrefixLookupResult lookupPrefix(
             const std::vector<int32_t> &tokens) override;
         /** @brief Populate every local stage from its retained lookup handles. */
+        /** @copydoc IInferenceRunner::preparePrefixHarvest */
+        bool preparePrefixHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule) override;
+
         bool populatePrefix(
             const PrefixLookupResult &hit,
             int seq_idx = 0) override;

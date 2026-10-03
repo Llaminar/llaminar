@@ -859,6 +859,15 @@ or `observe` to collect demand information without moving them. The separate
 layout. Extra cached copies of experts are controlled by `--moe-hot-expert-cache`,
 which is off by default.
 
+For explicit A/B experiments on one homogeneous multi-GPU tier, add
+`;routed_compute=gate-up-owned-down-columns` to the tier declaration. This
+keeps gate/up weights movable while splitting each expert's down-output
+columns across the GPUs. It is a separate compute layout, not a movement
+setting. The default `apportioned` layout still owns whole experts. The new
+layout currently requires rank-local GPUs from one backend; it does not yet
+support CPU or cross-tier execution. Measure it on your workload rather than
+assuming a speedup.
+
 For more tuning options, see `serve --help` and the
 [configuration guide](AGENTS.md#run-and-inspect-configuration). To inspect
 your explicit layout before serving, add `--dry-run --explain-placement`.

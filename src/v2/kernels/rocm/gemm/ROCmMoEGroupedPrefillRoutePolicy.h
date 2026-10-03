@@ -205,7 +205,8 @@ namespace llaminar2::rocm
             : key_(key), counts_(counts), offsets_(offsets)
         {
             if (!counts || !offsets ||
-                !selectROCmMoEGroupedPrefillRouteStrategy(key).valid())
+                !selectROCmMoEGroupedPrefillRouteStrategy(key).valid() ||
+                static_cast<std::int64_t>(key.rows) * key.top_k > INT32_MAX)
                 throw std::invalid_argument("MoE route admission requires a complete group publication");
         }
 
@@ -236,17 +237,86 @@ namespace llaminar2::rocm
          */
         [[nodiscard]] bool maySelect(ROCmMoEGroupedPrefillRouteStrategy strategy) const noexcept
         {
-            for (int rows = 1; rows <= key_.rows; ++rows)
+            return maximumSlotsFor(strategy) > 0;
+        }
+
+        /**
+         * @brief Bound a retained family's grid by its reachable compact work.
+         * @param strategy Projection family whose immutable launch is planned.
+         * @return Largest admitted compact prefix, or zero for an absent family.
+         *
+         * The selector, including every exact-key exception, owns this bound.
+         * A sparse family must not launch the full physical matrix merely
+         * because another family can consume that capacity. This examines no
+         * device state; replay still selects the family through allows().
+         */
+        [[nodiscard]] int maximumSlotsFor(
+            ROCmMoEGroupedPrefillRouteStrategy strategy) const noexcept
+        {
+            for (int rows = key_.rows; rows > 0; --rows)
             {
                 auto live = key_;
                 live.rows = rows;
                 if (selectROCmMoEGroupedPrefillRouteStrategy(live).strategy == strategy)
-                    return true;
+                    return rows * key_.top_k;
             }
-            return false;
+            return 0;
         }
 
 #if defined(__HIPCC__)
+        /**
+         * @brief Read the live compact prefix owned by the device group plan.
+         * @return Number of initialized grouped rows on this replay.
+         *
+         * Projections and elementwise consumers borrow the same publication;
+         * captured capacity is never evidence that a scratch row is valid.
+         * A malformed prefix traps before any consumer can access scratch.
+         */
+        [[nodiscard]] __device__ __forceinline__ int activeSlots() const
+        {
+            const int last = key_.expert_count - 1;
+            const int offset = __builtin_amdgcn_readfirstlane(offsets_[last]);
+            const int count = __builtin_amdgcn_readfirstlane(counts_[last]);
+            const auto slots = static_cast<std::int64_t>(offset) + count;
+            if (offset < 0 || count < 0 || slots > INT32_MAX ||
+                slots > static_cast<std::int64_t>(key_.rows) * key_.top_k)
+                __builtin_trap();
+            return static_cast<int>(slots);
+        }
+
+        /**
+         * @brief Resolve a valid compact row to its canonical expert owner.
+         * @param slot Compact row strictly below activeSlots().
+         * @return Expert containing the row, skipping empty expert intervals.
+         *
+         * All lanes in the caller's workgroup resolve the same immutable row.
+         * Binary search reads the existing ordered group plan; no inverse map,
+         * extra allocation, or host mirror is introduced. Invalid publications
+         * trap before a weight descriptor can be dereferenced.
+         */
+        [[nodiscard]] __device__ __forceinline__ int expertForSlot(int slot) const
+        {
+            int first = 0;
+            int end = key_.expert_count;
+            while (first < end)
+            {
+                const int middle = first + (end - first) / 2;
+                const int offset = __builtin_amdgcn_readfirstlane(offsets_[middle]);
+                const int count = __builtin_amdgcn_readfirstlane(counts_[middle]);
+                const auto past = static_cast<std::int64_t>(offset) + count;
+                if (offset < 0 || count < 0 || past > INT32_MAX)
+                    __builtin_trap();
+                if (past <= slot)
+                    first = middle + 1;
+                else
+                    end = middle;
+            }
+            if (slot < 0 || first >= key_.expert_count ||
+                __builtin_amdgcn_readfirstlane(offsets_[first]) > slot)
+                __builtin_trap();
+            return first;
+        }
+
         /**
          * @brief Admit one uniform workgroup before any barrier or weight load.
          * @param strategy This kernel's physical projection/publication family.
@@ -255,13 +325,7 @@ namespace llaminar2::rocm
         [[nodiscard]] __device__ __forceinline__ bool allows(
             ROCmMoEGroupedPrefillRouteStrategy strategy) const
         {
-            const int last = key_.expert_count - 1;
-            const int offset = __builtin_amdgcn_readfirstlane(offsets_[last]);
-            const int count = __builtin_amdgcn_readfirstlane(counts_[last]);
-            if (offset < 0 || count < 0 ||
-                static_cast<std::int64_t>(offset) + count > INT32_MAX)
-                __builtin_trap();
-            const auto selected = strategyForSlots(offset + count);
+            const auto selected = strategyForSlots(activeSlots());
             if (selected == ROCmMoEGroupedPrefillRouteStrategy::Invalid)
                 __builtin_trap();
             return selected == strategy;

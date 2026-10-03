@@ -23,12 +23,15 @@
  * Overlay candidates use the shared BOM adapter inside the common typed rank
  * initialization lifecycle. Capture-policy errors reach consensus before any
  * peer may enter the physical-budget collective.
+ * Prompt tokens and prefix/KV admission share one frozen continuation group;
+ * expert-only followers receive command metadata and sparse tickets, not tokens.
  *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #include "OrchestrationRunner.h"
+#include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "IOrchestrationRunnerFactory.h"
 #include "ModelContextRetirement.h"
@@ -2538,6 +2541,8 @@ namespace llaminar2
         mpi_coordinated_root_rank_ = coordinatedRootRankForRunner(
             config_.moe_routed_expert_plan,
             mpi_ctx_, runner_.get());
+        if (!initializeContinuationRequestGroup())
+            throw std::invalid_argument(lastError());
     }
 
     OrchestrationRunner::~OrchestrationRunner()
@@ -2760,14 +2765,14 @@ namespace llaminar2
                 return false;
             }
 
-            // Step 4c.5: Prefix/KV consensus belongs only to dense
-            // continuation ranks. Freeze that communicator before request
-            // admission so expert-only followers never enter cache collectives.
+            // Step 4c.5: Prompt payloads and prefix/KV consensus have the same
+            // continuation owners. Freeze one group before request admission
+            // so expert-only followers never receive unused token bytes.
             if (!run_phase(
-                    "initializeMoEContinuationPrefixCoordination",
+                    "initializeContinuationRequestGroup",
                     [&]
                     {
-                        return initializeMoEContinuationPrefixCoordination();
+                        return initializeContinuationRequestGroup();
                     }))
             {
                 return false;
@@ -3164,10 +3169,10 @@ namespace llaminar2
                 }))
             return false;
         if (!run_phase(
-                "initializeMoEContinuationPrefixCoordination",
+                "initializeContinuationRequestGroup",
                 [&]
                 {
-                    return initializeMoEContinuationPrefixCoordination();
+                    return initializeContinuationRequestGroup();
                 }))
             return false;
         if (!run_phase(
@@ -3209,9 +3214,7 @@ namespace llaminar2
             moe_expert_overlay_remote_projection_transport_ ||
             moe_expert_overlay_maintenance_service_ ||
             moe_expert_overlay_economy_calibration_ ||
-            continuation_prefix_comm_ != MPI_COMM_NULL ||
-            prefix_coordination_scope_ !=
-                PrefixCoordinationScope::OrchestrationWorld;
+            continuation_request_group_;
         if (!was_initialized && !has_live_resources)
         {
             return;
@@ -3312,7 +3315,7 @@ namespace llaminar2
                     reusable_execution_workspaces_->diagnostic();
             }
         }
-        releaseMoEContinuationPrefixCoordination();
+        continuation_request_group_.reset();
         moe_overlay_rank_batch_transport_registry_.reset();
         moe_overlay_device_controller_graph_service_.reset();
         moe_overlay_device_controller_fabric_.reset();
@@ -3923,7 +3926,7 @@ namespace llaminar2
             0u, std::memory_order_release);
         device_generation_admission_.reset();
         ready_mtp_condition_.reset();
-        ordinary_generation_seeds_.reset();
+        generation_request_seeds_.reset();
         pending_mtp_condition_token_.reset();
         pending_mtp_condition_params_.reset();
         pending_mtp_condition_resident_state_.reset();
@@ -3960,6 +3963,12 @@ namespace llaminar2
          */
         if (mpi_root_command)
         {
+            if (!continuation_request_group_ ||
+                continuation_request_group_->role() !=
+                    ContinuationRequestGroup::Role::TokenConsumer ||
+                prompt_tokens.size() > static_cast<std::size_t>(
+                    std::numeric_limits<std::int32_t>::max()))
+                return setError("PREFILL has no valid continuation recipient group or prompt wire extent");
             broadcastCommand(MPICommand::PREFILL);
             std::array<std::int32_t, 3> command_header{
                 static_cast<std::int32_t>(prompt_tokens.size()),
@@ -3970,10 +3979,10 @@ namespace llaminar2
                 command_header.data(),
                 command_header.size(),
                 mpi_coordinated_root_rank_);
-            // const_cast is safe: the root is the sender, buffer is not modified.
-            mpi_ctx_->broadcast_int32(const_cast<int32_t *>(prompt_tokens.data()),
-                                      prompt_tokens.size(),
-                                      mpi_coordinated_root_rank_);
+            // All peers need the header to enter the command/ticket lifecycle.
+            // Only continuation owners consume tokens; a sole owner sends none.
+            continuation_request_group_->publishPrompt(
+                prompt_tokens, mpi_coordinated_root_rank_);
             prefill_command_failure_abort.markPublished();
         }
         if (retired_prefill_tokens != 0u &&
@@ -4114,7 +4123,9 @@ namespace llaminar2
         {
             try
             {
-                if (!continuation_prefix_participant_)
+                if (continuation_request_group_ &&
+                    continuation_request_group_->role() !=
+                        ContinuationRequestGroup::Role::TokenConsumer)
                 {
                     return setError(
                         "Expert-only rank attempted to enter continuation prefix-cache admission");
@@ -4133,24 +4144,10 @@ namespace llaminar2
                               RequireIdentical);
 
                 PrefixCoordinationResult coordination;
-                MPI_Comm prefix_coordination_comm = MPI_COMM_NULL;
-                switch (prefix_coordination_scope_)
-                {
-                case PrefixCoordinationScope::OrchestrationWorld:
-                    if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-                        prefix_coordination_comm = mpi_ctx_->communicator();
-                    break;
-                case PrefixCoordinationScope::ProcessLocalContinuation:
-                    break;
-                case PrefixCoordinationScope::ContinuationRankGroup:
-                    if (continuation_prefix_comm_ == MPI_COMM_NULL)
-                    {
-                        return setError(
-                            "Continuation rank lost its prefix-cache subgroup communicator");
-                    }
-                    prefix_coordination_comm = continuation_prefix_comm_;
-                    break;
-                }
+                const MPI_Comm prefix_coordination_comm =
+                    continuation_request_group_
+                        ? continuation_request_group_->coordinationCommunicator()
+                        : MPI_COMM_NULL;
                 if (prefix_coordination_comm != MPI_COMM_NULL)
                 {
                     MPIPrefixCollectiveCoordinator domain_coordinator(
@@ -4377,6 +4374,15 @@ namespace llaminar2
                              << summarizePrefixProbeForTrace(probe));
                 }
 
+                const auto harvest_schedule = PrefixHarvestSchedule::forPrefill(
+                    coordinated_hit, static_cast<int>(prompt_tokens.size()),
+                    matched_tokens, stable_prefix_prefill_segment_tokens);
+                if (!runner_->preparePrefixHarvest(
+                        local_hit, prompt_tokens, harvest_schedule))
+                {
+                    return setError("Prefix cache prefill archive preparation failed");
+                }
+
                 int suffix_start = matched_tokens;
                 bool terminal_state_restored = false;
 
@@ -4454,9 +4460,7 @@ namespace llaminar2
                     return true;
                 };
 
-                if (const auto checkpoint = coordinated_hit.reusablePrefillCheckpoint(
-                        static_cast<int>(prompt_tokens.size()), matched_tokens,
-                        stable_prefix_prefill_segment_tokens))
+                if (const auto checkpoint = harvest_schedule.reusableCheckpoint())
                 {
                     if (!forward_prefix_interval(*checkpoint))
                         return false;
@@ -8694,6 +8698,14 @@ namespace llaminar2
         }
 
         const MTPRuntimeConfig mtp = activeMTPRequestConfig();
+        try
+        {
+            requireSupportedMTPSamplingRequest(runner_->primaryDeviceId(), mtp, active_sampling_params_);
+        }
+        catch (const UnsupportedMTPSamplingRequest &error)
+        {
+            return fail_without_checkpoint(error.what());
+        }
         const bool stochastic_verify =
             mtp.verify_mode == MTPVerifyMode::SpeculativeSampling &&
             !active_sampling_params_.is_greedy();
@@ -8701,6 +8713,12 @@ namespace llaminar2
             stochastic_verify &&
             runner_->primaryDeviceId().is_gpu() &&
             runner_->supportsDeviceStochasticMTPVerification();
+        // Unseeded means fresh request entropy, not host-generated draws on
+        // each transaction. Retain that entropy across budget continuations;
+        // captured rejection kernels own every subsequent logical-position draw.
+        if (stochastic_device_verify && !generation_request_seeds_)
+            generation_request_seeds_.emplace(std::vector<uint64_t>{
+                resolveRequestBatchedStochasticSeed(active_sampling_params_, 0)});
         const bool stochastic_host_verify =
             stochastic_verify &&
             !runner_->primaryDeviceId().is_gpu();
@@ -8709,20 +8727,6 @@ namespace llaminar2
             active_sampling_params_.seed != 0;
         const bool use_sampling_penalties =
             active_sampling_params_.has_penalties() && !stochastic_verify;
-        if (stochastic_device_verify &&
-            active_sampling_params_.dry_multiplier != 0.0f &&
-            active_sampling_params_.dry_penalty_last_n != 0)
-        {
-            return fail_without_checkpoint(
-                "GPU stochastic MTP requires a device-owned DRY sequence-history implementation");
-        }
-        if (runner_->primaryDeviceId().is_gpu() && use_sampling_penalties &&
-            active_sampling_params_.dry_multiplier != 0.0f &&
-            active_sampling_params_.dry_penalty_last_n != 0)
-        {
-            return fail_without_checkpoint(
-                "GPU greedy MTP requires a device-owned DRY sequence-history implementation");
-        }
         if (runner_->primaryDeviceId().is_gpu() &&
             !runner_->supportsMTPSidecarLogitsStreamHandoff())
         {
@@ -14047,26 +14051,6 @@ namespace llaminar2
                     }
                 }
 
-                auto inverse_sample_seed_for_thresholds =
-                    [&](const float *thresholds, size_t count) -> uint64_t
-                {
-                    if (active_sampling_params_.seed != 0)
-                    {
-                        return static_cast<uint64_t>(
-                            active_sampling_params_.seed);
-                    }
-
-                    uint64_t seed = 0xD1B54A32D192ED03ull;
-                    for (size_t i = 0; i < count; ++i)
-                    {
-                        uint32_t bits = 0;
-                        std::memcpy(&bits, thresholds + i, sizeof(bits));
-                        seed = sampling_math::splitmix64(
-                            seed ^ static_cast<uint64_t>(bits));
-                    }
-                    return seed;
-                };
-
                 const int bonus_row = compare_rows;
                 const MTPRequestPenaltyPolicy verifier_penalty_policy{
                     .presence_penalty =
@@ -14085,43 +14069,9 @@ namespace llaminar2
                         "Grouped-outcome stochastic MTP captured penalty/distribution transaction failed");
                 }
 
-                std::vector<float> accept_thresholds;
-                std::vector<float> residual_thresholds;
-                accept_thresholds.reserve(static_cast<size_t>(compare_rows));
-                residual_thresholds.reserve(static_cast<size_t>(compare_rows));
-                for (int row = 0; row < compare_rows; ++row)
-                {
-                    const int row_logical_position =
-                        transaction_base_cached_tokens + 1 + row;
-                    if (!use_serial_sample_equivalent_stochastic)
-                    {
-                        accept_thresholds.push_back(
-                            accept_threshold_for_position(
-                                sampler_,
-                                row_logical_position));
-                        residual_thresholds.push_back(
-                            residual_threshold_for_position(
-                                sampler_,
-                                row_logical_position));
-                    }
-                }
-
                 Sampler bonus_sampler = sampler_;
-                const float bonus_threshold =
-                    use_serial_sample_equivalent_stochastic
-                        ? 0.0f
-                        : sample_threshold_for_position(
-                              bonus_sampler,
-                              transaction_base_cached_tokens +
-                                  static_cast<int>(draft_tokens.size()));
                 const uint64_t inverse_sample_seed =
-                    use_serial_sample_equivalent_stochastic
-                        ? static_cast<uint64_t>(active_sampling_params_.seed)
-                        : inverse_sample_seed_for_thresholds(
-                              residual_thresholds.data(),
-                              residual_thresholds.size());
-                const int inverse_sample_first_logical_position =
-                    transaction_base_cached_tokens + 1;
+                    generation_request_seeds_->values().front();
 
                 DeviceSpeculativeOutcomeHandle outcome_handle;
                 bool resident_outcome_ok = false;
@@ -14133,7 +14083,10 @@ namespace llaminar2
                         {},
                         {{"policy_path", "grouped_outcome_device_resident_publication"},
                          {"rows", std::to_string(compare_rows)}});
-                    if (use_serial_sample_equivalent_stochastic)
+                    // Both verification laws construct the same complete
+                    // captured lifecycle. The law is immutable graph identity;
+                    // omitting a public seed must not leave the outcome child
+                    // unbuilt or capture host RNG draws/positions as constants.
                     {
                         DeviceStochasticBatchOutcomeRequest request;
                         request.request_id = 0;
@@ -14158,13 +14111,16 @@ namespace llaminar2
                         request.token_row_stride =
                             verifier_input_plan.total_verifier_input_tokens;
                         request.bonus_target_slot = bonus_row;
-                        request.bonus_threshold = bonus_threshold;
+                        request.bonus_threshold = 0.0f;
                         request.inverse_sample_seed = inverse_sample_seed;
                         request.inverse_sample_first_logical_position = -1;
                         request.derive_thresholds_from_seed = true;
                         request.draw_position_source =
                             DeviceStochasticDrawPositionSource::VerifierBaseSnapshot;
-                        request.serial_sample_equivalent = true;
+                        request.serial_sample_equivalent =
+                            use_serial_sample_equivalent_stochastic;
+                        request.use_vllm_probability_rejection =
+                            !use_serial_sample_equivalent_stochastic;
                         request.use_device_draft_tokens = true;
                         request.stop_token_count =
                             static_cast<int>(stop_tokens_.size());
@@ -14177,43 +14133,6 @@ namespace llaminar2
                                 &request,
                                 /*request_count=*/1,
                                 &outcome_handle);
-                    }
-                    else
-                    {
-                        resident_outcome_ok =
-                            first_token_deferred
-                                ? runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceFirstTokenResident(
-                                      /*first_target_slot=*/0,
-                                      /*first_draft_slot=*/0,
-                                      /*draft_tokens=*/nullptr,
-                                      accept_thresholds.data(),
-                                      residual_thresholds.data(),
-                                      compare_rows,
-                                      /*first_target_sample_slot=*/0,
-                                      stop_tokens_.data(),
-                                      static_cast<int>(stop_tokens_.size()),
-                                      bonus_row,
-                                      bonus_threshold,
-                                      &outcome_handle,
-                                      inverse_sample_seed,
-                                      inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true)
-                                : runner_->verifyStochasticDistributionsBatchOutcomeOnDeviceResident(
-                                      /*first_target_slot=*/0,
-                                      /*first_draft_slot=*/0,
-                                      /*draft_tokens=*/nullptr,
-                                      accept_thresholds.data(),
-                                      residual_thresholds.data(),
-                                      compare_rows,
-                                      first_token,
-                                      stop_tokens_.data(),
-                                      static_cast<int>(stop_tokens_.size()),
-                                      bonus_row,
-                                      bonus_threshold,
-                                      &outcome_handle,
-                                      inverse_sample_seed,
-                                      inverse_sample_first_logical_position,
-                                      /*use_vllm_probability_rejection=*/true);
                     }
                 }
                 std::string verifier_cleanup_error;
@@ -14471,14 +14390,6 @@ namespace llaminar2
                         draft_tokens.begin() + 1,
                         draft_tokens.end(),
                         kDeferredMTPDraftTokenShadow) != draft_tokens.end();
-                if (runner_->primaryDeviceId().is_gpu() &&
-                    active_sampling_params_.dry_multiplier != 0.0f &&
-                    active_sampling_params_.dry_penalty_last_n != 0)
-                {
-                    return fail_after_checkpoint(
-                        "Grouped-outcome GPU greedy MTP requires a "
-                        "device-owned DRY history implementation");
-                }
                 if (!runner_->supportsMTPDeviceDraftTokenInput())
                 {
                     return fail_after_checkpoint(
@@ -14883,15 +14794,15 @@ namespace llaminar2
         if (base < 0 || budget <= 0 || base > capacity || budget > capacity - base)
             return fail("response budget exceeds the admitted context capacity");
 
-        if (!ordinary_generation_seeds_)
-            ordinary_generation_seeds_.emplace(std::vector<uint64_t>{
+        if (!generation_request_seeds_)
+            generation_request_seeds_.emplace(std::vector<uint64_t>{
                 resolveRequestBatchedStochasticSeed(active_sampling_params_, 0)});
         const DeviceGenerationAdmissionRequest admission{
             .request_count = 1,
             .max_new_tokens = budget,
             .depth_policy = sampling_math::DeviceGenerationPolicy::ordinary(),
             .initial_leading_row_disposition = leading,
-            .sampling_seeds = ordinary_generation_seeds_,
+            .sampling_seeds = generation_request_seeds_,
             .ordinary_sampling = active_sampling_params_,
         };
         if (!admission.valid())
@@ -16822,7 +16733,7 @@ namespace llaminar2
         }
         retireMTPRequestContinuationState();
         device_generation_admission_.reset();
-        ordinary_generation_seeds_.reset();
+        generation_request_seeds_.reset();
         device_generation_terminal_ledger_authoritative_ = false;
         device_generation_embedded_moe_maintenance_pending_ack_ = false;
         hosted_device_generation_decode_progress_retired_.store(
@@ -18348,168 +18259,56 @@ namespace llaminar2
         return true;
     }
 
-    bool OrchestrationRunner::initializeMoEContinuationPrefixCoordination()
+    bool OrchestrationRunner::initializeContinuationRequestGroup()
     {
-        if (continuation_prefix_comm_ != MPI_COMM_NULL ||
-            prefix_coordination_scope_ !=
-                PrefixCoordinationScope::OrchestrationWorld)
-        {
-            return setError(
-                "Continuation prefix coordination is setup-only");
-        }
+        if (continuation_request_group_)
+            return setError("Continuation request membership is setup-only");
+        const auto context = moe_expert_overlay_mpi_ctx_
+                                 ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+        if (!context)
+            return true; // A genuinely process-local runner has no MPI payloads.
 
-        continuation_prefix_participant_ = true;
-        const auto overlay_context =
-            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_
-                                        : mpi_ctx_;
-        const auto execution = resolveOverlayExecutionPlanForRunner(
-            config_.moe_routed_expert_plan,
-            overlay_context);
-        if (!execution)
+        try
+        {
+            const auto execution = resolveOverlayExecutionPlanForRunner(
+                config_.moe_routed_expert_plan, context);
+            std::vector<int> consumers;
+            if (execution)
+            {
+                consumers = execution->continuationWorldRanks();
+                if (!std::binary_search(consumers.begin(), consumers.end(),
+                                        execution->continuation_root_rank))
+                    return setError("ExpertOverlay command root is not a continuation owner");
+            }
+            else
+            {
+                // Preserve the existing TP/PP consumer policy. The command root
+                // may be resolved later by the graph's terminal-stage authority.
+                for (int rank = 0; rank < context->world_size(); ++rank)
+                    consumers.push_back(rank);
+            }
+            continuation_request_group_ =
+                std::make_unique<ContinuationRequestGroup>(context, std::move(consumers));
+            PerfStatsCollector::addCounter(
+                "prefix_cache", "coordination_scope_installed", 1.0, "model_setup", {},
+                {{"scope", continuation_request_group_->scopeName()},
+                 {"continuation_ranks",
+                  std::to_string(continuation_request_group_->consumerCount())},
+                 {"participant",
+                  continuation_request_group_->role() ==
+                          ContinuationRequestGroup::Role::TokenConsumer
+                      ? "true" : "false"},
+                 {"expert_only_ranks_excluded",
+                  continuation_request_group_->consumerCount() <
+                          static_cast<std::size_t>(context->world_size())
+                      ? "true" : "false"}});
             return true;
-        if (!overlay_context ||
-            overlay_context->communicator() == MPI_COMM_NULL ||
-            overlay_context->world_size() <= 0)
-        {
-            return setError(
-                "ExpertOverlay continuation prefix coordination has no valid MPI world");
         }
-
-        const std::vector<int> continuation_ranks =
-            execution->continuationWorldRanks();
-        if (continuation_ranks.empty() ||
-            !std::binary_search(
-                continuation_ranks.begin(),
-                continuation_ranks.end(),
-                execution->continuation_root_rank) ||
-            continuation_ranks.front() < 0 ||
-            continuation_ranks.back() >= overlay_context->world_size())
+        catch (const std::exception &error)
         {
-            return setError(
-                "ExpertOverlay execution plan has an invalid continuation prefix authority set");
+            return setError(std::string("Continuation request membership admission failed: ") +
+                            error.what());
         }
-
-        const int local_rank = overlay_context->rank();
-        continuation_prefix_participant_ = std::binary_search(
-            continuation_ranks.begin(),
-            continuation_ranks.end(),
-            local_rank);
-
-        if (continuation_ranks.size() == 1u)
-        {
-            prefix_coordination_scope_ =
-                PrefixCoordinationScope::ProcessLocalContinuation;
-        }
-        else if (continuation_ranks.size() ==
-                 static_cast<std::size_t>(overlay_context->world_size()))
-        {
-            for (int rank = 0; rank < overlay_context->world_size(); ++rank)
-            {
-                if (continuation_ranks[static_cast<std::size_t>(rank)] != rank)
-                {
-                    return setError(
-                        "ExpertOverlay continuation prefix world is not a total rank set");
-                }
-            }
-            prefix_coordination_scope_ =
-                PrefixCoordinationScope::OrchestrationWorld;
-        }
-        else
-        {
-            MPI_Comm continuation_comm = MPI_COMM_NULL;
-            const int color = continuation_prefix_participant_
-                                  ? 1
-                                  : MPI_UNDEFINED;
-            const int split_status = MPI_Comm_split(
-                overlay_context->communicator(),
-                color,
-                local_rank,
-                &continuation_comm);
-            if (split_status != MPI_SUCCESS)
-            {
-                return setError(
-                    "Failed to create the ExpertOverlay continuation prefix communicator");
-            }
-
-            if (continuation_prefix_participant_)
-            {
-                int continuation_size = 0;
-                if (continuation_comm == MPI_COMM_NULL ||
-                    MPI_Comm_size(
-                        continuation_comm,
-                        &continuation_size) != MPI_SUCCESS ||
-                    continuation_size !=
-                        static_cast<int>(continuation_ranks.size()))
-                {
-                    if (continuation_comm != MPI_COMM_NULL)
-                        MPI_Comm_free(&continuation_comm);
-                    return setError(
-                        "ExpertOverlay continuation prefix communicator has the wrong participant count");
-                }
-                continuation_prefix_comm_ = continuation_comm;
-            }
-            else if (continuation_comm != MPI_COMM_NULL)
-            {
-                MPI_Comm_free(&continuation_comm);
-                return setError(
-                    "Expert-only rank unexpectedly joined the continuation prefix communicator");
-            }
-            prefix_coordination_scope_ =
-                PrefixCoordinationScope::ContinuationRankGroup;
-        }
-
-        const char *scope =
-            prefix_coordination_scope_ ==
-                    PrefixCoordinationScope::ProcessLocalContinuation
-                ? "process_local_continuation"
-                : (prefix_coordination_scope_ ==
-                           PrefixCoordinationScope::ContinuationRankGroup
-                       ? "continuation_rank_group"
-                       : "orchestration_world");
-        PerfStatsCollector::addCounter(
-            "prefix_cache",
-            "coordination_scope_installed",
-            1.0,
-            "model_setup",
-            {},
-            {{"scope", scope},
-             {"continuation_ranks",
-              std::to_string(continuation_ranks.size())},
-             {"participant",
-              continuation_prefix_participant_ ? "true" : "false"},
-             {"expert_only_ranks_excluded",
-              continuation_ranks.size() <
-                      static_cast<std::size_t>(
-                          overlay_context->world_size())
-                  ? "true"
-                  : "false"}});
-        return true;
-    }
-
-    void OrchestrationRunner::releaseMoEContinuationPrefixCoordination() noexcept
-    {
-        if (continuation_prefix_comm_ != MPI_COMM_NULL)
-        {
-            int initialized = 0;
-            int finalized = 0;
-            const bool mpi_live =
-                MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
-                MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized;
-            if (!mpi_live)
-            {
-                LOG_ERROR(
-                    "[OrchestrationRunner] Continuation prefix communicator outlived MPI");
-            }
-            else if (MPI_Comm_free(&continuation_prefix_comm_) != MPI_SUCCESS)
-            {
-                LOG_ERROR(
-                    "[OrchestrationRunner] Failed to release continuation prefix communicator");
-            }
-            continuation_prefix_comm_ = MPI_COMM_NULL;
-        }
-        prefix_coordination_scope_ =
-            PrefixCoordinationScope::OrchestrationWorld;
-        continuation_prefix_participant_ = true;
     }
 
     bool OrchestrationRunner::initializeMoEExpertOverlayResidencyAuthority()
@@ -18999,6 +18798,16 @@ namespace llaminar2
                 }
             }
 
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
+            if (std::any_of(plan->domains.begin(), plan->domains.end(), [](const auto &domain) {
+                    return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                }))
+            {
+                const auto runtime = resolveMoEExpertOverlayRuntimePlan(plan,
+                    {.current_world_rank = current_rank, .validate_mvp_root_reachability = false});
+                projection_preparation = std::make_shared<const MoEExpertOverlayPreparationPlan>(
+                    MoEExpertOverlayPreparationPlan::build(*runtime, *model_ctx_->loader()));
+            }
             moe_expert_overlay_participant_residency_ =
                 std::make_shared<
                     MoEOverlayParticipantResidencyRegistry>(
@@ -19012,6 +18821,7 @@ namespace llaminar2
                         .retained_epoch_capacity = 2,
                         .collect_economy_service_measurements =
                             dynamic_residency,
+                        .projection_preparation = std::move(projection_preparation),
                     });
 
             PerfStatsCollector::addCounter(
@@ -20722,9 +20532,9 @@ namespace llaminar2
                         bindings.push_back({
                             .scope = scope,
                             .expert = expert,
-                            .gate = triplet.gate,
-                            .up = triplet.up,
-                            .down = triplet.down,
+                            .gate = triplet.gate(),
+                            .up = triplet.up(),
+                            .down = triplet.down(),
                         });
                     }
                 }
@@ -24896,6 +24706,11 @@ namespace llaminar2
 
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
     {
+        // Reject unsupported laws before an MPI command or any retained request
+        // mutation. A failed admission must leave the previous law intact.
+        if (runner_)
+            requireSupportedMTPSamplingRequest(runner_->primaryDeviceId(), activeMTPRequestConfig(), params);
+
         // Broadcast to worker ranks
         if (mpi_coordinated_mode_ && mpi_ctx_ &&
             mpi_ctx_->rank() == mpi_coordinated_root_rank_ &&
@@ -24919,7 +24734,7 @@ namespace llaminar2
         if (active_sampling_params_.is_greedy() != params.is_greedy())
             mtp_depth_controller_.reset();
         active_sampling_params_ = params;
-        ordinary_generation_seeds_.reset();
+        generation_request_seeds_.reset();
         // Reset token history and deterministic RNG for a new conversation/request.
         sampler_ = Sampler(params.seed);
         if (runner_ &&
@@ -25282,11 +25097,11 @@ namespace llaminar2
                         "received an invalid prompt or retired-progress count");
                 }
 
-                std::vector<int32_t> tokens(n_tokens);
-                mpi_ctx_->broadcast_int32(
-                    tokens.data(),
-                    static_cast<size_t>(n_tokens),
-                    mpi_coordinated_root_rank_);
+                if (!continuation_request_group_)
+                    terminateFailedMPIWorkerCommand(
+                        "PREFILL", "worker has no frozen continuation recipient group");
+                const auto tokens = continuation_request_group_->receivePrompt(
+                    static_cast<std::size_t>(n_tokens), mpi_coordinated_root_rank_);
 
                 /*
                  * This command is the remote half of the same public request
@@ -25335,9 +25150,9 @@ namespace llaminar2
                      * logits, or sampler authority during prefill either. The
                      * root graph publishes one authenticated ticket per
                      * retained prefill segment and then a terminal ticket for
-                     * this outer command. Receiving the prompt above preserves
-                     * the public command wire shape; those token bytes must not
-                     * cause the follower to enter an independent model runner.
+                     * this outer command. The world header admits that lifecycle;
+                     * the continuation group excludes this follower from prompt
+                     * allocation and transport entirely.
                      */
                     const auto follower_result =
                         moe_overlay_inference_transaction_follower_

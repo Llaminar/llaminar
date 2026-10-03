@@ -21,6 +21,7 @@
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../transfer/MappedTransferProgressABI.h"
 #include "../../transfer/CapturedTransferChannelProtocol.h"
+#include "../../transfer/CapturedTransferKernelPlan.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
 #include <hip/hip_runtime.h>
@@ -92,6 +93,20 @@ namespace llaminar2
                 published,
                 __ATOMIC_RELEASE,
                 __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+
+        /**
+         * @brief Join completed copy blocks through an agent-local release sequence.
+         * @param count Private cursor counter, reset before this copy grid starts.
+         * @return Previous number of completed blocks; the last ticket publishes.
+         *
+         * Each caller has acquired its writers through the workgroup barrier.
+         * Acquire/release RMWs carry every prior block's payload to the final
+         * system-release publisher without one system fence per copying lane.
+         */
+        __device__ __forceinline__ std::uint32_t capturedTransferJoinBlock(std::uint32_t *count)
+        {
+            return __hip_atomic_fetch_add(count, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
         }
 
 #include "../../kernels/common/MappedHostCopyDevice.inl"
@@ -5907,7 +5922,10 @@ namespace llaminar2
         hipFuncAttributes attributes{};
         int clock_khz = 0;
         if (hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferAcquireKernel)) != hipSuccess ||
-            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferPublishKernel)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<true>)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferCopyPublishKernel<false>)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<true>)) != hipSuccess ||
+            hipFuncGetAttributes(&attributes, reinterpret_cast<const void *>(capturedTransferFusedKernel<false>)) != hipSuccess ||
             hipDeviceGetAttribute(&clock_khz, hipDeviceAttributeWallClockRate, device_id) != hipSuccess || clock_khz <= 0)
             return false;
         // wall_clock64 uses this fixed-rate clock. Shader clockRate is a
@@ -5916,24 +5934,36 @@ namespace llaminar2
         return prepareMappedHostCopyKernels(device_id);
     }
 
-    bool ROCmBackend::enqueueCapturedTransferChannelBoundary(
+    bool ROCmBackend::enqueueCapturedTransferChannel(
         const CapturedTransferChannelDeviceBinding &binding,
-        CapturedTransferBoundaryOperation operation, int device_id, void *stream)
+        void *destination, const void *source, int device_id, void *stream)
     {
-        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannelBoundary");
-        if (!binding.valid() || device_id < 0 || device_id >= device_count_ || !setDevice(device_id)) return false;
-        // Match CUDA's one-wave metadata ownership. The full payload uses the
-        // same separately tuned parallel copy implementation as other transfers.
-        switch (operation)
+        const auto native = requireExplicitStream(stream, "ROCmBackend::enqueueCapturedTransferChannel");
+        if (!binding.valid() || !destination || !source || device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id)) return false;
+        const bool aligned = reinterpret_cast<std::uintptr_t>(destination) % alignof(uint4) == 0 &&
+            reinterpret_cast<std::uintptr_t>(source) % alignof(uint4) == 0;
+        // The same immutable policy and system-publication proof serve both
+        // vendors. No device count readback or HIP host scheduling ticket is needed.
+        if (capturedTransferKernelPlan(binding.message.bytes) == CapturedTransferKernelPlan::SingleBlock)
         {
-        case CapturedTransferBoundaryOperation::Acquire:
-            hipLaunchKernelGGL(capturedTransferAcquireKernel, dim3(1), dim3(64), 0, native, binding);
-            break;
-        case CapturedTransferBoundaryOperation::Publish:
-            hipLaunchKernelGGL(capturedTransferPublishKernel, dim3(1), dim3(64), 0, native, binding);
-            break;
-        default: return false;
+            if (aligned)
+                hipLaunchKernelGGL(capturedTransferFusedKernel<true>, dim3(1), dim3(kMappedHostCopyThreads),
+                    0, native, binding, destination, source);
+            else
+                hipLaunchKernelGGL(capturedTransferFusedKernel<false>, dim3(1), dim3(kMappedHostCopyThreads),
+                    0, native, binding, destination, source);
+            return hipGetLastError() == hipSuccess;
         }
+        hipLaunchKernelGGL(capturedTransferAcquireKernel, dim3(1), dim3(64), 0, native, binding);
+        if (hipGetLastError() != hipSuccess) return false;
+        if (aligned)
+            hipLaunchKernelGGL(capturedTransferCopyPublishKernel<true>,
+                dim3(mappedHostCopyBlocks(binding.message.bytes / sizeof(uint4) + (binding.message.bytes % sizeof(uint4) != 0))),
+                dim3(kMappedHostCopyThreads), 0, native, binding, destination, source);
+        else
+            hipLaunchKernelGGL(capturedTransferCopyPublishKernel<false>, dim3(mappedHostCopyBlocks(binding.message.bytes)),
+                dim3(kMappedHostCopyThreads), 0, native, binding, destination, source);
         return hipGetLastError() == hipSuccess;
     }
 

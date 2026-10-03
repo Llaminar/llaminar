@@ -1,3 +1,13 @@
+/**
+ * @file ExecutionDomainDefinition.cpp
+ * @brief Parses and validates typed execution-domain topology and compute intent.
+ *
+ * Device addresses describe participants, while scope describes process/host
+ * reachability and routed policies describe weight ownership. Validation keeps
+ * those axes separate: selecting a projection layout cannot silently select a
+ * different topology or fall back to complete-expert execution. Inventory
+ * binding resolves AUTO scope later; explicitly incompatible scopes fail here.
+ */
 #include "config/ExecutionDomainDefinition.h"
 
 #include <algorithm>
@@ -360,6 +370,22 @@ namespace llaminar2
             routed_compute_policy == RoutedExpertComputePolicy::Replicated &&
             routed_phase_policy ==
                 RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+
+        if (routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        {
+            // This physical mode is explicitly native-domain-only. Do not
+            // silently execute whole experts on an unsupported endpoint.
+            const bool homogeneous_gpu = participants.size() >= 2 &&
+                std::all_of(participants.begin(), participants.end(), [&](const auto &participant) {
+                    return participant.isGPU() && participant.device_type == participants.front().device_type;
+                });
+            if (!homogeneous_gpu ||
+                (scope != ExecutionDomainScope::AUTO && scope != ExecutionDomainScope::RANK_LOCAL))
+                errors.push_back("Domain '" + name + "' uses gate-up-owned-down-columns but is not a rank-local homogeneous multi-GPU domain");
+            if (routed_phase_policy != RoutedExpertPhasePolicy::Unspecified &&
+                routed_phase_policy != RoutedExpertPhasePolicy::Uniform)
+                errors.push_back("Domain '" + name + "' requires uniform phases for gate-up-owned-down-columns");
+        }
 
         if (routed_phase_policy ==
                 RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated &&

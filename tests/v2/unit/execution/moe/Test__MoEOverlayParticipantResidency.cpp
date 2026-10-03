@@ -5,6 +5,8 @@
 
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 
 #include "loaders/ExpertGemmRegistry.h"
@@ -63,17 +65,17 @@ namespace
         int identity_ = 0;
     };
 
-    MoEOverlayPreparedExpertTriplet triplet(int base)
+    MoEOverlayPreparedExpertPayload payload(int base)
     {
         return {
-            .gate = std::make_shared<IdentityGemm>(base + 1),
-            .up = std::make_shared<IdentityGemm>(base + 2),
-            .down = std::make_shared<IdentityGemm>(base + 3),
+            std::make_shared<IdentityGemm>(base + 1),
+            std::make_shared<IdentityGemm>(base + 2),
+            std::make_shared<IdentityGemm>(base + 3),
         };
     }
 
     MoEOverlayParticipantResidencyBank initialBank(
-        const MoEOverlayPreparedExpertTriplet &expert_zero)
+        const MoEOverlayPreparedExpertPayload &expert_zero)
     {
         MoEOverlayParticipantResidencyBank bank;
         bank.epoch = 1;
@@ -256,7 +258,7 @@ namespace
 
                 entry.destination_arrival =
                     std::make_shared<MoEOverlayPreparedExpertArrival>();
-                const auto engines = triplet(
+                const auto engines = payload(
                     2000 + migration.destination.owner_participant * 100 +
                     migration.expert_id * 10);
                 entry.projections[0] =
@@ -264,13 +266,13 @@ namespace
                         std::make_unique<ReadyProjectionTransfer>(),
                         entry.destination_arrival,
                         ExpertTierWeightProjection::Gate,
-                        engines.gate);
+                        engines.gate());
                 entry.projections[1] =
                     std::make_unique<MoEOverlayPreparedProjectionOperation>(
                         std::make_unique<ReadyProjectionTransfer>(),
                         entry.destination_arrival,
                         ExpertTierWeightProjection::Up,
-                        engines.up);
+                        engines.up());
                 entry.projections[2] = omit_down_
                                            ? std::unique_ptr<
                                                  IMoEOverlayTierTransferOperation>(
@@ -284,7 +286,7 @@ namespace
                                                          ReadyProjectionTransfer>(),
                                                      entry.destination_arrival,
                                                      ExpertTierWeightProjection::Down,
-                                                     engines.down));
+                                                     engines.down()));
             }
             return prepared;
         }
@@ -629,13 +631,13 @@ namespace
         {
             const auto mask = owner_map.expertMaskForParticipant(
                 0, participant_id, 2);
-            std::vector<MoEOverlayPreparedExpertTriplet> engines(2);
+            std::vector<MoEOverlayPreparedExpertPayload> engines(2);
             for (int expert = 0; expert < 2; ++expert)
             {
                 if (mask[static_cast<std::size_t>(expert)])
                 {
                     engines[static_cast<std::size_t>(expert)] =
-                        triplet(1700 + participant_id * 100 + expert * 10);
+                        payload(1700 + participant_id * 100 + expert * 10);
                 }
             }
             if (!fixture.registry->registerInitialLayer(
@@ -655,6 +657,371 @@ namespace
     }
 } // namespace
 
+/** @brief Payloads cannot represent partial families or leave false-ready moved-from values. */
+TEST(MoEOverlayPreparedPayload, ExactFamiliesAndMoveOwnership)
+{
+    using Payload = MoEOverlayPreparedExpertPayload;
+    auto whole = payload(7000);
+    auto pair = Payload::gateUp(whole.gate(), whole.up());
+    ASSERT_TRUE(pair.readyFor(DeviceMoEProjectionSet::GateUp));
+    EXPECT_FALSE(pair.complete());
+    EXPECT_EQ(pair.down(), nullptr);
+    EXPECT_FALSE(pair.sameIdentity(whole));
+    EXPECT_THROW(Payload(whole.gate(), whole.up(), {}), std::invalid_argument);
+    EXPECT_THROW(Payload::gateUp({}, whole.up()), std::invalid_argument);
+    EXPECT_THROW(Payload::fromProjections(DeviceMoEProjectionSet::GateUp,
+        {whole.gate(), whole.up(), whole.down()}), std::invalid_argument);
+    EXPECT_THROW(Payload::fromProjections(static_cast<DeviceMoEProjectionSet>(99),
+        {whole.gate(), whole.up(), {}}), std::invalid_argument);
+
+    auto retained = pair;
+    auto moved = std::move(pair);
+    EXPECT_TRUE(moved.sameIdentity(retained));
+    EXPECT_TRUE(pair.empty());
+    EXPECT_EQ(pair.gate(), nullptr);
+    EXPECT_THROW((void)pair.projections(), std::logic_error);
+    pair = std::move(moved);
+    EXPECT_TRUE(moved.empty());
+    EXPECT_TRUE(pair.sameIdentity(retained));
+    auto *same = &pair;
+    pair = std::move(*same);
+    EXPECT_TRUE(pair.sameIdentity(retained));
+}
+
+/** @brief A two-projection arrival never waits for or accepts immutable down weights. */
+TEST(MoEOverlayPreparedPayload, GateUpArrivalIsAtomicAndRejectsFixedDown)
+{
+    const auto whole = payload(7100);
+    MoEOverlayPreparedExpertArrival arrival(DeviceMoEProjectionSet::GateUp);
+    std::string error;
+    MoEOverlayPreparedExpertPayload result = whole;
+    EXPECT_FALSE(arrival.completePayload(result, &error));
+    EXPECT_TRUE(result.empty());
+    EXPECT_FALSE(arrival.publish(ExpertTierWeightProjection::Down, whole.down(), &error));
+    ASSERT_TRUE(arrival.publish(ExpertTierWeightProjection::Gate, whole.gate(), &error));
+    EXPECT_FALSE(arrival.completePayload(result, &error));
+    EXPECT_TRUE(result.empty());
+    EXPECT_FALSE(arrival.publish(ExpertTierWeightProjection::Gate, payload(7200).gate(), &error));
+    ASSERT_TRUE(arrival.publish(ExpertTierWeightProjection::Up, whole.up(), &error));
+    ASSERT_TRUE(arrival.completePayload(result, &error)) << error;
+    EXPECT_TRUE(result.readyFor(DeviceMoEProjectionSet::GateUp));
+    EXPECT_FALSE(result.complete());
+    EXPECT_EQ(result.down(), nullptr);
+    EXPECT_TRUE(arrival.fail("late transport failure"));
+    EXPECT_FALSE(arrival.completePayload(result, &error));
+    EXPECT_TRUE(result.empty());
+}
+
+/** @brief Independent transfer completions compose one immutable family under contention. */
+TEST(MoEOverlayPreparedPayload, ConcurrentGateUpArrivalPublication)
+{
+    for (int iteration = 0; iteration < 20; ++iteration)
+    {
+        SCOPED_TRACE(iteration);
+        const auto whole = payload(7300 + iteration * 3);
+        MoEOverlayPreparedExpertArrival arrival(DeviceMoEProjectionSet::GateUp);
+        std::barrier start(3);
+        std::atomic<bool> accepted{true};
+        std::jthread gate([&] {
+            start.arrive_and_wait();
+            if (!arrival.publish(ExpertTierWeightProjection::Gate, whole.gate())) accepted = false;
+        });
+        std::jthread up([&] {
+            start.arrive_and_wait();
+            if (!arrival.publish(ExpertTierWeightProjection::Up, whole.up())) accepted = false;
+        });
+        start.arrive_and_wait();
+        gate.join();
+        up.join();
+        ASSERT_TRUE(accepted);
+        MoEOverlayPreparedExpertPayload result;
+        ASSERT_TRUE(arrival.completePayload(result));
+        EXPECT_EQ(result.gate(), whole.gate());
+        EXPECT_EQ(result.up(), whole.up());
+        EXPECT_EQ(result.down(), nullptr);
+    }
+}
+
+/** @brief The existing RCU mechanism retains and retires pairs without changing their contract. */
+TEST(MoEOverlayPreparedPayload, GateUpEpochsRetainReadersAndRejectContractChanges)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        // Device identifiers are metadata only: no backend is initialized.
+        MoEOverlayParticipantResidency residency({
+            .participant_id = 4, .device = device, .num_layers = 1, .num_experts = 2,
+            .movable_projections = DeviceMoEProjectionSet::GateUp});
+        MoEOverlayParticipantResidencyBank bank;
+        bank.epoch = 1;
+        bank.participant_id = 4;
+        bank.device = device;
+        bank.layers.resize(1);
+        auto &layer = bank.layers[0];
+        layer.resident_mask.assign(2, false);
+        layer.experts.resize(2);
+        layer.movable_projections = DeviceMoEProjectionSet::GateUp;
+        auto whole = payload(7400);
+        std::weak_ptr<ITensorGemm> old_gate = whole.gate();
+        layer.setResidentExpert(0, MoEOverlayPreparedExpertPayload::gateUp(whole.gate(), whole.up()));
+        whole = {};
+        std::string error;
+        ASSERT_EQ(prepareAndInstall(residency, bank, &error), MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        auto reader = residency.acquire(1);
+        ASSERT_TRUE(reader);
+        auto candidate = residency.cloneCandidate(1, 2);
+        candidate.layers[0].clearExpert(0);
+        auto next = payload(7500);
+        EXPECT_THROW(candidate.layers[0].setResidentExpert(1, next), std::invalid_argument);
+        candidate.layers[0].setResidentExpert(1, MoEOverlayPreparedExpertPayload::gateUp(next.gate(), next.up()));
+        ASSERT_EQ(prepareAndInstall(residency, candidate, &error), MoEOverlayParticipantBankInstallStatus::Installed) << error;
+        bank = {};
+        ASSERT_TRUE(residency.retire(1));
+        EXPECT_FALSE(old_gate.expired());
+        reader.reset();
+        EXPECT_FALSE(residency.retire(99)); // Maintenance reclaims the drained old node.
+        EXPECT_TRUE(old_gate.expired());
+
+        auto forged = residency.cloneCandidate(2, 3);
+        forged.layers[0].clearExpert(1);
+        forged.layers[0].movable_projections = DeviceMoEProjectionSet::CompleteExpert;
+        // Even an empty layer cannot change the endpoint's physical contract.
+        EXPECT_FALSE(residency.prepareReadyBank(forged, &error));
+        EXPECT_NE(error.find("incomplete"), std::string::npos);
+        EXPECT_TRUE(residency.acquire(2));
+    }
+    EXPECT_THROW((MoEOverlayParticipantResidency{
+        {.participant_id = 0, .device = DeviceId::cpu(), .num_layers = 1, .num_experts = 2,
+         .movable_projections = DeviceMoEProjectionSet::GateUp}}), std::invalid_argument);
+}
+
+/** @test Fixed down slices outlive registry reset and do not follow movable ownership. */
+TEST(MoEOverlayPreparedPayload, FixedDownLifetimeIsIndependentOfMovableResidency)
+{
+    for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
+    {
+        // Logical slice 1 deliberately differs from the physical device ID.
+        const MoEExpertOwnerParticipant participant{
+            .participant_id = 7, .domain_name = "compute", .domain_participant_index = 1,
+            .device = device, .world_rank = 2, .world_rank_known = true};
+        const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({4, 256, 512}, 1, 2);
+        ExpertGemmRegistry registry;
+        std::vector<std::weak_ptr<ITensorGemm>> down_lifetimes;
+        const auto register_role = [&](int expert, ExpertGemmRegistry::WeightRole role)
+        {
+            auto engine = std::make_shared<IdentityGemm>(100 * expert + static_cast<int>(role));
+            registry.registerEngineForParticipant("compute", device, 2, 1, 0, expert,
+                role, engine.get(), engine, ownership);
+            return std::weak_ptr<ITensorGemm>(engine);
+        };
+        for (int expert = 0; expert < 4; ++expert)
+            down_lifetimes.push_back(register_role(expert, ExpertGemmRegistry::WeightRole::DOWN));
+        auto fixed = MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0, ownership);
+        ASSERT_EQ(fixed->engines().size(), 4u);
+        EXPECT_EQ(fixed->ownership(), ownership);
+        EXPECT_EQ(fixed->participantId(), 7);
+        EXPECT_EQ(fixed->device(), device);
+        EXPECT_TRUE(fixed->sameIdentity(*MoEOverlayFixedDownProjectionBank::resolve(
+            registry, participant, 0, ownership)));
+
+        std::vector<MoEOverlayPreparedExpertPayload> movable;
+        std::string error;
+        // A participant owning no gate/up pairs still needs every fixed down slice.
+        ASSERT_TRUE(resolveMoEOverlayPreparedExpertPayloads(registry, participant, 0, 4,
+            {false, false, false, false}, movable, &error, ownership)) << error;
+        for (const auto &entry : movable) EXPECT_TRUE(entry.empty());
+        const auto gate_lifetime = register_role(2, ExpertGemmRegistry::WeightRole::GATE);
+        register_role(2, ExpertGemmRegistry::WeightRole::UP);
+        ASSERT_TRUE(resolveMoEOverlayPreparedExpertPayloads(registry, participant, 0, 4,
+            {false, false, true, false}, movable, &error, ownership)) << error;
+        EXPECT_TRUE(movable[2].readyFor(DeviceMoEProjectionSet::GateUp));
+        EXPECT_FALSE(movable[2].down());
+        EXPECT_FALSE(movable[2].complete());
+
+        // Registry retirement cannot release weights embedded in a live graph.
+        registry.clear();
+        EXPECT_FALSE(gate_lifetime.expired());
+        movable.clear();
+        EXPECT_TRUE(gate_lifetime.expired());
+        for (const auto &lifetime : down_lifetimes) EXPECT_FALSE(lifetime.expired());
+        fixed.reset();
+        for (const auto &lifetime : down_lifetimes) EXPECT_TRUE(lifetime.expired());
+    }
+}
+
+/** @test An incomplete or differently scoped fixed inventory cannot bind a graph. */
+TEST(MoEOverlayPreparedPayload, FixedDownRequiresCompleteExactIdentity)
+{
+    ExpertGemmRegistry registry;
+    const MoEExpertOwnerParticipant participant{
+        .participant_id = 7, .domain_name = "compute", .domain_participant_index = 1,
+        .device = DeviceId::rocm(3), .world_rank = 2, .world_rank_known = true};
+    const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 256, 512}, 1, 2);
+    auto engine = std::make_shared<IdentityGemm>(5);
+    registry.registerEngineForParticipant("compute", participant.device, 2, 1, 0, 0,
+        ExpertGemmRegistry::WeightRole::DOWN, engine.get(), engine, ownership);
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0, ownership), std::runtime_error);
+    registry.registerEngineForParticipant("compute", participant.device, 2, 1, 0, 1,
+        ExpertGemmRegistry::WeightRole::DOWN, engine.get(), engine, ownership);
+    auto fixed = MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0, ownership);
+    auto other_rank = participant;
+    other_rank.world_rank = 3;
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, other_rank, 0, ownership), std::runtime_error);
+    auto wrong_device = participant;
+    wrong_device.device = DeviceId::cpu();
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, wrong_device, 0, ownership), std::invalid_argument);
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0,
+        MoEExpertProjectionOwnership::completeExperts({2, 256, 512}, 1, 2)), std::invalid_argument);
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0,
+        MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 256, 512}, 0, 2)), std::invalid_argument);
+    EXPECT_THROW(MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0,
+        MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 256, 256}, 1, 2)), std::logic_error);
+
+    // Equal geometry is not equal capture identity after an engine replacement.
+    auto replacement = std::make_shared<IdentityGemm>(6);
+    registry.registerEngineForParticipant("compute", participant.device, 2, 1, 0, 1,
+        ExpertGemmRegistry::WeightRole::DOWN, replacement.get(), replacement, ownership);
+    EXPECT_FALSE(fixed->sameIdentity(*MoEOverlayFixedDownProjectionBank::resolve(
+        registry, participant, 0, ownership)));
+}
+
+/** @test Runtime publication and portable restore preserve the immutable projection contract. */
+TEST(MoEOverlayPreparedPayload, RuntimeResetAndPrefixRestoreRetainFixedDownBindings)
+{
+    for (const auto device : {DeviceId::cuda(3), DeviceId::rocm(3)})
+    for (const auto format : {DeviceMoEWeightFormat::NativeVNNI, DeviceMoEWeightFormat::FP16,
+                             DeviceMoEWeightFormat::BF16, DeviceMoEWeightFormat::FP32})
+    {
+        // These are metadata-only device tables. No GPU driver or engine is invoked.
+        ExpertGemmRegistry registry;
+        const MoEExpertOwnerParticipant participant{
+            .participant_id = 7, .domain_name = "compute", .domain_participant_index = 1,
+            .device = device, .world_rank = 2, .world_rank_known = true};
+        const auto ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns({2, 256, 512}, 1, 2);
+        for (int expert = 0; expert < 2; ++expert)
+        {
+            auto engine = std::make_shared<IdentityGemm>(expert);
+            registry.registerEngineForParticipant("compute", device, 2, 1, 0, expert,
+                ExpertGemmRegistry::WeightRole::DOWN, engine.get(), engine, ownership);
+        }
+        auto fixed = MoEOverlayFixedDownProjectionBank::resolve(registry, participant, 0, ownership);
+        DeviceMoERuntimeTable::Config config{.device_id = device, .num_layers = 1,
+            .num_experts = 2, .top_k = 1, .fixed_down_banks = {fixed}};
+        DeviceMoERuntimeTable table(config);
+        EXPECT_EQ(table.fixedDownProjectionBank(0), fixed.get());
+        EXPECT_EQ(table.movableProjections(), DeviceMoEProjectionSet::GateUp);
+        EXPECT_THROW((void)table.fixedDownProjectionBank(1), std::out_of_range);
+
+        MoEPlacementUpdate update;
+        update.epoch = 1;
+        update.expert_count = 2;
+        update.participant_id = 1;
+        update.participant_count = 2;
+        update.experts.resize(2);
+        update.local_compute_mask = {0, 1};
+        update.replica_role = {static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+                              static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)};
+        update.resident_participant_mask = {1, 2};
+        for (int expert = 0; expert < 2; ++expert)
+        {
+            auto &descriptor = update.experts[expert];
+            descriptor.logical_expert_id = expert;
+            descriptor.owner_participant = expert;
+            descriptor.projection_set = DeviceMoEProjectionSet::GateUp;
+        }
+        auto &local = update.experts[1];
+        local.local_slot = 1;
+        local.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+            DeviceMoEExpertFlags::Resident | DeviceMoEExpertFlags::LocalCompute);
+        local.weight_format = format;
+        if (format == DeviceMoEWeightFormat::NativeVNNI)
+        {
+            local.gate.payload = reinterpret_cast<const uint8_t *>(0x1000u);
+            local.gate.scales = reinterpret_cast<const void *>(0x2000u);
+            local.gate.n = 512;
+            local.gate.k = 256;
+            local.gate.blocks_per_row = 8;
+            local.gate.codebook_id = 7;
+            local.up = local.gate;
+        }
+        else
+        {
+            local.floating_gate = {reinterpret_cast<const void *>(0x1000u), 512, 256};
+            local.floating_up = {reinterpret_cast<const void *>(0x2000u), 512, 256};
+        }
+        ASSERT_TRUE(local.movableWeightsReady());
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        std::vector<DeviceMoEPortableLayerRuntimeState> saved;
+        ASSERT_TRUE(table.capturePortableRuntimeState(saved));
+        table.resetDecodeRuntimeState();
+        EXPECT_EQ(table.fixedDownProjectionBank(0), fixed.get());
+        ASSERT_TRUE(table.restorePortableRuntimeState(saved, nullptr,
+            [&](int layer, int expert, int slot, DeviceMoEExpertDescriptor &descriptor)
+            {
+                EXPECT_EQ(layer, 0);
+                EXPECT_EQ(expert, 1);
+                EXPECT_EQ(slot, 1);
+                descriptor = local;
+                return true;
+            }));
+        const auto &state = table.hostLayerState(0);
+        EXPECT_EQ(state.banks[state.active_bank].experts[1].projection_set, DeviceMoEProjectionSet::GateUp);
+        EXPECT_FALSE(state.banks[state.active_bank].experts[1].weightsReady());
+        EXPECT_EQ(table.fixedDownProjectionBank(0), fixed.get());
+        auto raw_snapshot = std::make_unique<DeviceMoELayerRuntime>(state);
+        const auto accepted_epoch = state.active_epoch;
+        raw_snapshot->banks[raw_snapshot->active_bank].experts[1].projection_set = DeviceMoEProjectionSet::CompleteExpert;
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+        EXPECT_EQ(table.hostLayerState(0).active_epoch, accepted_epoch);
+        *raw_snapshot = state;
+        raw_snapshot->participant_count = 4;
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+        EXPECT_EQ(table.fixedDownProjectionBank(0), fixed.get());
+        *raw_snapshot = state;
+        raw_snapshot->banks[raw_snapshot->active_bank].epoch = 0;
+        EXPECT_THROW(table.restoreRuntimeStateSnapshot(raw_snapshot.get(), 1), std::invalid_argument);
+
+        table.resetDecodeRuntimeState();
+        // A stale full-FFN resolver is not a permissible rehydration of a pair.
+        EXPECT_FALSE(table.restorePortableRuntimeState(saved, nullptr,
+            [&](int, int, int, DeviceMoEExpertDescriptor &descriptor)
+            {
+                descriptor = local;
+                descriptor.projection_set = DeviceMoEProjectionSet::CompleteExpert;
+                return true;
+            }));
+        table.restoreInitialRuntimeState();
+
+        // An epoch may change owners, never the captured arithmetic partition.
+        auto invalid = update;
+        invalid.epoch = table.hostLayerState(0).active_epoch + 1;
+        invalid.experts[1].projection_set = DeviceMoEProjectionSet::CompleteExpert;
+        EXPECT_THROW(table.prepareInactiveBank(0, invalid), std::invalid_argument);
+        invalid = update;
+        invalid.epoch = table.hostLayerState(0).active_epoch + 1;
+        invalid.participant_count = 4;
+        EXPECT_THROW(table.prepareInactiveBank(0, invalid), std::invalid_argument);
+        invalid = update;
+        invalid.epoch = table.hostLayerState(0).active_epoch + 1;
+        // Even an inactive/remote descriptor must never carry fixed down bytes.
+        invalid.experts[0].floating_down = {reinterpret_cast<const void *>(0x3000u), 128, 512};
+        EXPECT_THROW(table.prepareInactiveBank(0, invalid), std::invalid_argument);
+
+        // Conversely, a whole-expert table cannot acquire a partial family.
+        DeviceMoERuntimeTable whole(device, 1, 2, 1, false);
+        EXPECT_THROW(whole.prepareInactiveBank(0, update), std::invalid_argument);
+        auto invalid_config = config;
+        invalid_config.fixed_down_banks = {nullptr};
+        EXPECT_THROW((DeviceMoERuntimeTable{invalid_config}), std::invalid_argument);
+        invalid_config = config;
+        invalid_config.device_id = DeviceId::cpu();
+        EXPECT_THROW((DeviceMoERuntimeTable{invalid_config}), std::invalid_argument);
+        invalid_config = config;
+        invalid_config.num_layers = 2;
+        EXPECT_THROW((DeviceMoERuntimeTable{invalid_config}), std::invalid_argument);
+    }
+}
+
 TEST(Test__MoEOverlayParticipantResidency,
      RetainsOldAndCandidateBanksByExactEpoch)
 {
@@ -666,7 +1033,7 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
 
-    const auto old_expert = triplet(100);
+    const auto old_expert = payload(100);
     auto epoch_one = initialBank(old_expert);
     std::string error;
     EXPECT_EQ(
@@ -676,7 +1043,7 @@ TEST(Test__MoEOverlayParticipantResidency,
 
     auto epoch_two = residency.cloneCandidate(1, 2);
     epoch_two.layers[0].clearExpert(0);
-    const auto new_expert = triplet(200);
+    const auto new_expert = payload(200);
     epoch_two.layers[0].setResidentExpert(1, new_expert);
     EXPECT_EQ(
         prepareAndInstall(residency, epoch_two, &error),
@@ -692,11 +1059,11 @@ TEST(Test__MoEOverlayParticipantResidency,
     EXPECT_FALSE(acquired_two->layers[0].resident_mask[0]);
     EXPECT_TRUE(acquired_two->layers[0].resident_mask[1]);
     EXPECT_EQ(
-        acquired_one->layers[0].experts[0].gate.get(),
-        old_expert.gate.get());
+        acquired_one->layers[0].experts[0].gate().get(),
+        old_expert.gate().get());
     EXPECT_EQ(
-        acquired_two->layers[0].experts[1].gate.get(),
-        new_expert.gate.get());
+        acquired_two->layers[0].experts[1].gate().get(),
+        new_expert.gate().get());
 }
 
 TEST(Test__MoEOverlayParticipantResidency,
@@ -710,7 +1077,7 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    auto epoch_one = initialBank(triplet(300));
+    auto epoch_one = initialBank(payload(300));
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
@@ -748,15 +1115,15 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    auto old_expert = triplet(400);
-    std::weak_ptr<ITensorGemm> old_gate = old_expert.gate;
+    auto old_expert = payload(400);
+    std::weak_ptr<ITensorGemm> old_gate = old_expert.gate();
     auto epoch_one = initialBank(old_expert);
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
     auto epoch_two = residency.cloneCandidate(1, 2);
     epoch_two.layers[0].clearExpert(0);
-    epoch_two.layers[0].setResidentExpert(1, triplet(500));
+    epoch_two.layers[0].setResidentExpert(1, payload(500));
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
@@ -781,8 +1148,8 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    auto old_expert = triplet(550);
-    std::weak_ptr<ITensorGemm> old_gate = old_expert.gate;
+    auto old_expert = payload(550);
+    std::weak_ptr<ITensorGemm> old_gate = old_expert.gate();
     auto epoch_one = initialBank(old_expert);
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
@@ -818,7 +1185,7 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    const auto epoch_one = initialBank(triplet(575));
+    const auto epoch_one = initialBank(payload(575));
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
@@ -910,7 +1277,7 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    const auto epoch_one = initialBank(triplet(600));
+    const auto epoch_one = initialBank(payload(600));
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
@@ -920,7 +1287,7 @@ TEST(Test__MoEOverlayParticipantResidency,
 
     auto conflicting = epoch_one;
     conflicting.layers[0].clearExpert(0);
-    conflicting.layers[0].setResidentExpert(1, triplet(700));
+    conflicting.layers[0].setResidentExpert(1, payload(700));
     EXPECT_EQ(
         prepareAndInstall(residency, conflicting, &error),
         MoEOverlayParticipantBankInstallStatus::EpochConflict);
@@ -937,10 +1304,10 @@ TEST(Test__MoEOverlayParticipantResidency,
         .num_experts = 2,
         .retained_epoch_capacity = 2,
     });
-    auto invalid = initialBank(triplet(800));
+    auto invalid = initialBank(payload(800));
     invalid.layers[0].resident_mask[1] = true;
-    invalid.layers[0].experts[1].gate =
-        std::make_shared<IdentityGemm>(900);
+    // A partial family cannot be constructed. A resident mask over an empty
+    // slot must still be rejected at the bank publication boundary.
 
     std::string error;
     EXPECT_EQ(
@@ -961,7 +1328,7 @@ TEST(Test__MoEOverlayParticipantResidency,
         .retained_epoch_capacity = 2,
     });
     std::string error;
-    const auto epoch_one = initialBank(triplet(1000));
+    const auto epoch_one = initialBank(payload(1000));
     ASSERT_EQ(
         prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
@@ -1002,8 +1369,8 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         EXPECT_EQ(deficits[1].missing_layers, (std::vector<int>{0}));
     }
 
-    std::vector<MoEOverlayPreparedExpertTriplet> first_engines(2);
-    first_engines[0] = triplet(1100);
+    std::vector<MoEOverlayPreparedExpertPayload> first_engines(2);
+    first_engines[0] = payload(1100);
     std::string error;
     EXPECT_TRUE(registry.registerInitialLayer(
         0,
@@ -1020,8 +1387,8 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         EXPECT_EQ(deficits[0].missing_layers, (std::vector<int>{0}));
     }
 
-    std::vector<MoEOverlayPreparedExpertTriplet> second_engines(2);
-    second_engines[1] = triplet(1200);
+    std::vector<MoEOverlayPreparedExpertPayload> second_engines(2);
+    second_engines[1] = payload(1200);
     EXPECT_TRUE(registry.registerInitialLayer(
         1,
         0,
@@ -1071,8 +1438,8 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         .num_experts = 2,
         .initial_epoch = 1,
     });
-    std::vector<MoEOverlayPreparedExpertTriplet> engines(2);
-    engines[0] = triplet(1300);
+    std::vector<MoEOverlayPreparedExpertPayload> engines(2);
+    engines[0] = payload(1300);
     std::string error;
     EXPECT_FALSE(registry.registerInitialLayer(
         0,
@@ -1090,7 +1457,7 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         &error))
         << error;
     auto different = engines;
-    different[0] = triplet(1400);
+    different[0] = payload(1400);
     EXPECT_FALSE(registry.registerInitialLayer(
         0,
         0,
@@ -1111,8 +1478,8 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         .initial_epoch = 1,
         .retained_epoch_capacity = 2,
     });
-    std::vector<MoEOverlayPreparedExpertTriplet> engines(2);
-    engines[0] = triplet(1450);
+    std::vector<MoEOverlayPreparedExpertPayload> engines(2);
+    engines[0] = payload(1450);
     std::string error;
     ASSERT_TRUE(registry.registerInitialLayer(
         0,
@@ -1172,7 +1539,7 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
 }
 
 TEST(Test__MoEOverlayParticipantResidencyRegistry,
-     ResolvesExactOwnedParticipantTripletsAndRejectsPartialRoles)
+     ResolvesExactOwnedParticipantPayloadsAndRejectsPartialRoles)
 {
     const auto owner_map = twoParticipantOwnerMap();
     const auto *participant = owner_map.participantForId(0);
@@ -1203,9 +1570,9 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
     register_role(ExpertGemmRegistry::WeightRole::UP, up);
     register_role(ExpertGemmRegistry::WeightRole::DOWN, down);
 
-    std::vector<MoEOverlayPreparedExpertTriplet> resolved;
+    std::vector<MoEOverlayPreparedExpertPayload> resolved;
     std::string error;
-    ASSERT_TRUE(resolveMoEOverlayPreparedExpertTriplets(
+    ASSERT_TRUE(resolveMoEOverlayPreparedExpertPayloads(
         engines,
         *participant,
         0,
@@ -1215,12 +1582,12 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         &error))
         << error;
     ASSERT_EQ(resolved.size(), 2u);
-    EXPECT_EQ(resolved[0].gate.get(), gate.get());
-    EXPECT_EQ(resolved[0].up.get(), up.get());
-    EXPECT_EQ(resolved[0].down.get(), down.get());
+    EXPECT_EQ(resolved[0].gate().get(), gate.get());
+    EXPECT_EQ(resolved[0].up().get(), up.get());
+    EXPECT_EQ(resolved[0].down().get(), down.get());
     EXPECT_TRUE(resolved[1].empty());
 
-    EXPECT_FALSE(resolveMoEOverlayPreparedExpertTriplets(
+    EXPECT_FALSE(resolveMoEOverlayPreparedExpertPayloads(
         engines,
         *participant,
         0,
@@ -1249,9 +1616,9 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
     const int world_rank = participant->world_rank_known
                                ? participant->world_rank
                                : -1;
-    const auto register_triplet =
+    const auto register_payload =
         [&](int layer_idx,
-            const MoEOverlayPreparedExpertTriplet &engines)
+            const MoEOverlayPreparedExpertPayload &engines)
     {
         const auto register_role =
             [&](ExpertGemmRegistry::WeightRole role,
@@ -1268,14 +1635,14 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
                 engine.get(),
                 engine);
         };
-        register_role(ExpertGemmRegistry::WeightRole::GATE, engines.gate);
-        register_role(ExpertGemmRegistry::WeightRole::UP, engines.up);
-        register_role(ExpertGemmRegistry::WeightRole::DOWN, engines.down);
+        register_role(ExpertGemmRegistry::WeightRole::GATE, engines.gate());
+        register_role(ExpertGemmRegistry::WeightRole::UP, engines.up());
+        register_role(ExpertGemmRegistry::WeightRole::DOWN, engines.down());
     };
 
-    const auto main_layer = triplet(1600);
-    register_triplet(0, main_layer);
-    std::vector<MoEOverlayPreparedExpertTriplet> main_layer_table(2);
+    const auto main_layer = payload(1600);
+    register_payload(0, main_layer);
+    std::vector<MoEOverlayPreparedExpertPayload> main_layer_table(2);
     main_layer_table[0] = main_layer;
     std::string error;
     ASSERT_TRUE(residency.registerInitialLayer(
@@ -1298,8 +1665,8 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         << error;
     EXPECT_FALSE(residency.allInitialBanksReady());
 
-    const auto dormant_sidecar_layer = triplet(1700);
-    register_triplet(1, dormant_sidecar_layer);
+    const auto dormant_sidecar_layer = payload(1700);
+    register_payload(1, dormant_sidecar_layer);
     ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(
         prepared_engines,
         &error))
@@ -1322,35 +1689,35 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
 }
 
 TEST(Test__MoEOverlayPreparedExpertArrival,
-     PublishesOneExactCompleteTripletAndRejectsIdentityDrift)
+     PublishesOneExactCompletePayloadAndRejectsIdentityDrift)
 {
     MoEOverlayPreparedExpertArrival arrival;
-    const auto engines = triplet(3000);
+    const auto engines = payload(3000);
     std::string error;
     EXPECT_TRUE(arrival.publish(
-        ExpertTierWeightProjection::Gate, engines.gate, &error))
+        ExpertTierWeightProjection::Gate, engines.gate(), &error))
         << error;
     EXPECT_TRUE(arrival.publish(
-        ExpertTierWeightProjection::Gate, engines.gate, &error))
+        ExpertTierWeightProjection::Gate, engines.gate(), &error))
         << error;
     EXPECT_FALSE(arrival.publish(
-        ExpertTierWeightProjection::Gate, triplet(3100).gate, &error));
+        ExpertTierWeightProjection::Gate, payload(3100).gate(), &error));
     EXPECT_FALSE(error.empty());
     EXPECT_TRUE(arrival.publish(
-        ExpertTierWeightProjection::Up, engines.up, &error))
+        ExpertTierWeightProjection::Up, engines.up(), &error))
         << error;
 
-    MoEOverlayPreparedExpertTriplet resolved;
-    EXPECT_FALSE(arrival.completeTriplet(resolved, &error));
+    MoEOverlayPreparedExpertPayload resolved;
+    EXPECT_FALSE(arrival.completePayload(resolved, &error));
     EXPECT_TRUE(resolved.empty());
     EXPECT_TRUE(arrival.publish(
-        ExpertTierWeightProjection::Down, engines.down, &error))
+        ExpertTierWeightProjection::Down, engines.down(), &error))
         << error;
-    ASSERT_TRUE(arrival.completeTriplet(resolved, &error)) << error;
+    ASSERT_TRUE(arrival.completePayload(resolved, &error)) << error;
     EXPECT_TRUE(resolved.sameIdentity(engines));
 
     EXPECT_TRUE(arrival.fail("late physical failure"));
-    EXPECT_FALSE(arrival.completeTriplet(resolved, &error));
+    EXPECT_FALSE(arrival.completePayload(resolved, &error));
     EXPECT_EQ(error, "late physical failure");
 }
 
@@ -1717,7 +2084,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     ASSERT_NE(p1, nullptr);
     auto external = p1->cloneCandidate(1, 2);
     external.layers[0].clearExpert(1);
-    external.layers[0].setResidentExpert(0, triplet(4000));
+    external.layers[0].setResidentExpert(0, payload(4000));
     std::string error;
     ASSERT_EQ(
         prepareAndInstall(*p1, external, &error),

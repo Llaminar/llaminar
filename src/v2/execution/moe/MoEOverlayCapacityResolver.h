@@ -22,6 +22,7 @@
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -44,7 +45,32 @@ namespace llaminar2
     {
         Apportioned = 0, ///< One complete copy, balanced across participants.
         Replicated = 1,  ///< One complete copy on every tier participant.
+        /** Movable gate/up owners plus every expert's fixed full-K down slice. */
+        GateUpOwnedDownColumns = 2,
     };
+
+    /**
+     * @brief Resolve the physical payload whose owner cardinality changes.
+     * @param policy Frozen tier copy/layout policy, never inferred from pointers.
+     * @return Projection family for live movable residents and transfer slots.
+     * @throws std::invalid_argument for an unknown policy value.
+     *
+     * Fixed down slices are a separate, unconditional BOM contribution. They
+     * must not enter a per-owner or per-migration charge in the split mode.
+     */
+    [[nodiscard]] inline DeviceMoEProjectionSet moeOverlayMovableProjections(
+        MoEOverlayTierCopyPolicy policy)
+    {
+        switch (policy)
+        {
+        case MoEOverlayTierCopyPolicy::Apportioned:
+        case MoEOverlayTierCopyPolicy::Replicated:
+            return DeviceMoEProjectionSet::CompleteExpert;
+        case MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns:
+            return DeviceMoEProjectionSet::GateUp;
+        }
+        throw std::invalid_argument("Unknown ExpertOverlay capacity copy policy");
+    }
 
     /** @brief Setup-time live-residency invariant applied before priority fill. */
     enum class MoEOverlayInitialResidencyPolicy : std::uint8_t
@@ -198,7 +224,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Exact allocated bytes for one complete gate/up/down expert.
+     * @brief Exact allocated bytes for one declared movable projection family.
      *
      * CPU bytes are the final NativeVNNI interleaved representation. GPU live
      * bytes are the migration-stable separated representation that can remain
@@ -427,12 +453,14 @@ namespace llaminar2
         /**
          * @brief Compute CPU/GPU allocated bytes for every manifest layer.
          * @param manifest Complete authenticated gate/up/down layer contracts.
+         * @param projections Movable family; the source manifest remains complete.
          * @return Layer-ordered exact prepared allocation footprints.
          * @throws std::invalid_argument for an incomplete/non-contiguous layer.
          * @throws std::overflow_error when geometry exceeds addressable bytes.
          */
         [[nodiscard]] static std::vector<MoEOverlayPreparedExpertFootprint>
         preparedFootprints(
-            const std::vector<MoEOverlayLayerWeightManifest> &manifest);
+            const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+            DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
     };
 } // namespace llaminar2

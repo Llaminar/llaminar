@@ -929,6 +929,15 @@ Production keeps overlay lookup enabled. A corpus row in which `AUTO` resolves
 through an installed exact cell is invalid evidence and must fail
 authentication.
 
+Validate Auto's observed physical family separately from the forced-candidate
+inventory: an existing streaming Auto launch need not be a cooperative tile.
+Preserve its complete launch/resource identity; do not widen independent axis
+ranges or assume that an observed family is also forceable by the installer.
+Q8 sources on ROCm use blockwise INT8 producers with their own controls, not
+the low-bit NativeVNNI candidate inventory. Preserve that producer discriminator
+through CSV validation and generated policy. Raw event samples and the native
+candidate order own minimum/tie validation; rounded display values do not.
+
 For a focused dense refresh, retain unrelated installed exact rows with the
 generator's paired `--retain-base-include` and `--retention-receipt` options.
 The base must be an immutable copy of the installed include. The generator

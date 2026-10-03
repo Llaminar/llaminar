@@ -11,8 +11,10 @@
 #pragma once
 #include "planning/WeightShardGeometry.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -62,7 +64,7 @@ namespace llaminar2
     using PlanningOrdinaryWeightWork = std::variant<PlanningProjectionWeight, PlanningRouterWeight,
         PlanningEmbeddingWeight, PlanningNonProjectionWeight, PlanningUnclassifiedWeight>;
 
-    /** @brief How a participant issues complete expert FFNs in this graph phase. */
+    /** @brief How a participant issues owned projections in this graph phase. */
     enum class PlanningExpertExecution
     {
         OwnedExperts, ///< One owner executes each selected expert in its admitted quota.
@@ -120,7 +122,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief One complete expert FFN shape at a routed layer.
+     * @brief Source FFN geometry and projection-specific work at a routed layer.
      *
      * Each operand describes exactly one expert, independent of resident copies.
      * Routing multiplies invocation rows using a separately declared distribution;
@@ -133,9 +135,25 @@ namespace llaminar2
         int routes_per_token;
         std::array<PlanningWeightOperand, 3> gate_up_down;
         std::vector<PlanningExpertExecutionShare> execution_shares; ///< Distinct logical tier bindings on this endpoint.
+        std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< Borrowed-by-value admitted layout; absent for whole FFNs.
 
-        /** @return Sum of this endpoint's disjoint tier populations under uniform routing. */
+        /** @return Sum of owner-local populations; fixed down slices are priced separately. */
         PlanningExpertWorkExpectation uniformExpectation(size_t token_rows) const;
+        /**
+         * @brief Resolve one invoked matrix through the admitted preparation contract.
+         * @param role Gate, up or down; unrelated weight roles are rejected.
+         * @return One local matrix, preserving its complete K and source format.
+         * @throws std::exception for incompatible source/ownership geometry.
+         */
+        WeightShardMatrix projectionMatrix(WeightRole role) const;
+        /**
+         * @brief Price the routing population actually consumed by one projection.
+         * @param role Gate, up or down.
+         * @param token_rows Logical routing rows, including zero.
+         * @return Owner-local expectation for movable projections; all router
+         *         experts for a fixed output slice, even at zero gate/up quota.
+         */
+        PlanningExpertWorkExpectation projectionExpectation(WeightRole role, size_t token_rows) const;
     };
 
     /** @brief Exact rank/device ownership and phase-selected model operands. */

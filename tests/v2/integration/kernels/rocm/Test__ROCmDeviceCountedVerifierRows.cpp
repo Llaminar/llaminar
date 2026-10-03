@@ -54,20 +54,24 @@ enum class VerifierProbePurpose { CorrectnessOnly, CorrectnessAndTiming, Isolate
 /** @brief Learned bias is independent of row admission and must survive replay. */
 enum class VerifierBias { None, PerColumn };
 
-/** @brief Perf-only physical geometry; live counts remain device-owned inputs. */
+/** @brief Optional native-grid proof, independent of correctness and timing. */
+enum class VerifierGridCertificate { NotRequested, BoundedSingleProjection };
+
+/** @brief Captured physical geometry; live counts remain device-owned inputs. */
 struct VerifierCapacityProbe
 {
     int rows;
     int columns;
     int width;
     VerifierProbePurpose purpose = VerifierProbePurpose::CorrectnessAndTiming;
+    VerifierGridCertificate grid_certificate = VerifierGridCertificate::NotRequested;
 };
 
 /**
  * @brief Stress one physical launch family against an independent serial oracle.
  * @param format Source-format creator and arithmetic identity.
  * @param bundle Native launch family, not an alternate execution policy.
- * @param probe Optional captured timing geometry; absent in the functional gate.
+ * @param probe Optional captured geometry and native scheduling certificate.
  * @param bias_policy Include a nonzero learned bias in fused serial/graph proofs.
  *
  * Fused cases use three independent outputs and partial slices. MixedDecoder
@@ -246,6 +250,33 @@ static void proveDeviceCountedRows(
             }
             capture.finish();
             ASSERT_TRUE(launched);
+            if (probe && probe->grid_certificate == VerifierGridCertificate::BoundedSingleProjection)
+            {
+                ASSERT_EQ(bundle, VerifierProjectionBundle::Single);
+                // Byte equivalence alone cannot detect a return to rectangular
+                // capacity scheduling. Inspect the real captured launch, not
+                // a launch-policy mock or a PerfStats-derived authority.
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string inspection_error;
+                ASSERT_TRUE(graph->inspectKernelNodes(nodes, &inspection_error))
+                    << inspection_error;
+                const auto producer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node)
+                {
+                    return node.name.find("gemv_native_vnni_small_m_kernel_t") != std::string::npos;
+                });
+                ASSERT_NE(producer, nodes.end());
+                ASSERT_TRUE(producer->valid());
+                // The producer retains fixed four-row arithmetic tiles. This
+                // wide shape already has ample column/K parallelism; admitted
+                // depth-15 capacity must not schedule every physical row tile.
+                EXPECT_LT(producer->grid_z, static_cast<uint32_t>((M + 3) / 4));
+                for (const auto &node : nodes)
+                    if (node.name.find("gemv_native_vnni_reduce_small_m_kernel_t") != std::string::npos)
+                    {
+                        ASSERT_TRUE(node.valid());
+                        EXPECT_LT(node.grid_y, static_cast<uint32_t>(M));
+                    }
+            }
             ASSERT_TRUE(graph->instantiate());
         }
 
@@ -391,6 +422,22 @@ TEST(ROCmDeviceCountedVerifierRowsEconomy, Qwen38FusedProfile)
 TEST_P(ROCmDeviceCountedVerifierRows, RetainedGraphPreservesPhysicalScratch)
 {
     proveDeviceCountedRows(GetParam(), VerifierProjectionBundle::Single);
+}
+
+/**
+ * @brief Wide single projections must iterate live rows with bounded workers.
+ *
+ * This geometry supplies enough independent columns before the depth-15 row
+ * envelope is considered. Replay sweeps every live width, including zero and
+ * large-to-small transitions, against serial bytes and poisoned inactive rows.
+ * Every source codebook uses the same public production launch. Timing is
+ * deliberately absent from this preflight regression.
+ */
+TEST_P(ROCmDeviceCountedVerifierRows, WideSingleProjectionUsesLiveRowWorkers)
+{
+    proveDeviceCountedRows(GetParam(), VerifierProjectionBundle::Single,
+        VerifierCapacityProbe{16, 16384, 256, VerifierProbePurpose::CorrectnessOnly,
+            VerifierGridCertificate::BoundedSingleProjection});
 }
 
 TEST_P(ROCmDeviceCountedVerifierRows, FusedBundlePreservesIndependentScratch)

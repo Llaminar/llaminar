@@ -34,6 +34,7 @@ namespace llaminar2
         size_t rows = 0;
         size_t cols = 0;
         SnapshotPublication publication = SnapshotPublication::SchemaPartition;
+        SnapshotOwnedRows row_ownership; ///< Meaningful only for RowPartition publications.
     };
 
     /**
@@ -295,13 +296,15 @@ namespace llaminar2
          * @param rows Logical row count reported by the producing stage.
          * @param cols Logical column count reported by the producing stage.
          * @param publication Whether the producer already assembled the value.
+         * @param row_ownership Exact observed intervals for a row-partitioned publication.
          */
         void storeSnapshot(
             const std::string &key,
             std::vector<float> data,
             size_t rows,
             size_t cols,
-            SnapshotPublication publication = SnapshotPublication::SchemaPartition);
+            SnapshotPublication publication = SnapshotPublication::SchemaPartition,
+            SnapshotOwnedRows row_ownership = {});
 
         /**
          * @brief Extract and publish one stage output while the capture lock is held.

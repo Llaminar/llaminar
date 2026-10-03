@@ -294,14 +294,31 @@ endif()
 # ROCm Backend Configuration
 # =============================================================================
 if(HAVE_ROCM)
-    # Set ROCm path (standard install location)
+    # All image roles expose the SDK selected by the shared installer. Honour
+    # an explicit staged SDK for qualification; do not mix its headers/compiler
+    # with libraries discovered independently from the legacy /opt/rocm tree.
     if(NOT DEFINED ROCM_PATH)
-        set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
+        if(DEFINED ENV{ROCM_PATH})
+            set(ROCM_PATH "$ENV{ROCM_PATH}" CACHE PATH "ROCm installation path")
+        else()
+            set(ROCM_PATH "/opt/rocm-sdk" CACHE PATH "ROCm installation path")
+        endif()
     endif()
     
     # Enable HIP language for ROCm compilation
     enable_language(HIP)
-    # ROCm clang 20 supports C++20 throughout host and device compilation.
+    # Compiler relocation discovers device bitcode relative to its executable,
+    # but its implicit HIP header search may still name the legacy /opt/rocm.
+    # CMake can then suppress the selected SDK's include as supposedly implicit.
+    # Bind both compiler roots for every HIP target, including native fixtures,
+    # and its link step. A staged qualification must not be a mixed-SDK build.
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:HIP>:--hip-path=${ROCM_PATH}>"
+        "$<$<COMPILE_LANGUAGE:HIP>:--rocm-path=${ROCM_PATH}>")
+    add_link_options(
+        "$<$<LINK_LANGUAGE:HIP>:--hip-path=${ROCM_PATH}>"
+        "$<$<LINK_LANGUAGE:HIP>:--rocm-path=${ROCM_PATH}>")
+    # The pinned ROCm compiler supports C++20 in host and device compilation.
     # Individual targets may opt into C++23, but no HIP translation unit may
     # inherit the legacy C++17 default.
     set(CMAKE_HIP_STANDARD 20)
@@ -369,6 +386,7 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
         kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.cu   # device-planned byte-exact grouped MoE IMMA prefill
+        kernels/cuda/moe/CUDAMoEGroupedIntermediateExchange.cu # lossless SwiGLU/scales exchange boundary
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
@@ -622,6 +640,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeVNNIGemmShard7.hip
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
+        kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/kvcache/ROCmAttentionKeyQ8Kernels.hip    # Quadratic-companded attention-key cache codec
@@ -809,7 +828,9 @@ if(HAVE_ROCM)
     
     set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
-    set(RCCL_GIT_REF "rocm-7.2.4")  # Match our ROCm version
+    # Our collective source ABI includes live-row and host-storage extensions.
+    # It is pinned independently, but always rebuilt against the active SDK.
+    set(RCCL_GIT_REF "rocm-7.2.4")
     set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
         "C compiler used for the nested RCCL source build")
     set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH
@@ -903,7 +924,9 @@ if(HAVE_ROCM)
             "V2: RCCL capture patch failed: ${RCCL_CAPTURE_PATCH_ERROR}")
     endif()
     file(SHA256 "${RCCL_CAPTURE_PATCH_FILE}" RCCL_CAPTURE_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}")
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-live-rows.patch" RCCL_ROWS_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-native-host-storage.patch" RCCL_HOST_STORAGE_PATCH_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}")
     
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
@@ -914,13 +937,17 @@ if(HAVE_ROCM)
         string(STRIP "${RCCL_BUILD_COMMIT_RAW}" RCCL_BUILD_COMMIT)
     endif()
     
-    if(EXISTS "${RCCL_BUILD_DIR}" AND NOT RCCL_BUILD_COMMIT STREQUAL RCCL_BUILD_ID)
-        message(STATUS "V2: RCCL build cache (${RCCL_BUILD_COMMIT}) is stale vs ${RCCL_BUILD_ID}, rebuilding...")
-        file(REMOVE_RECURSE "${RCCL_BUILD_DIR}")
+    # A receipt mismatch requires a completed native build, not deletion of
+    # every unchanged generated kernel object. Reconfigure the existing Ninja
+    # graph; its source/header/command dependencies are the rebuild authority.
+    set(RCCL_REBUILD_REQUIRED OFF)
+    if(NOT RCCL_BUILD_COMMIT STREQUAL RCCL_BUILD_ID)
+        message(STATUS "V2: RCCL receipt changed; reconfigure and rebuild incrementally")
+        set(RCCL_REBUILD_REQUIRED ON)
     endif()
     
     # Build RCCL if needed
-    if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so")
+    if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so" OR RCCL_REBUILD_REQUIRED)
         message(STATUS "V2: Building RCCL (${RCCL_GIT_URL}@${RCCL_GIT_REF} @ ${RCCL_COMMIT}) from source...")
         message(STATUS "V2: RCCL GPU targets: ${RCCL_GPU_TARGETS}")
         if(RCCL_ONLY_FUNCS)
@@ -931,10 +958,12 @@ if(HAVE_ROCM)
         set(RCCL_CONFIG_ARGS
             -B "${RCCL_BUILD_DIR}"
             -S "${RCCL_EXTERNAL_DIR}"
+            -G Ninja
+            -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_C_COMPILER=${RCCL_C_COMPILER}
             -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
-            -DCMAKE_PREFIX_PATH=/opt/rocm
+            -DCMAKE_PREFIX_PATH=${ROCM_PATH}
             -DROCM_PATH=${ROCM_PATH}
             -DGPU_TARGETS=${RCCL_GPU_TARGETS}
             -DBUILD_TESTS=OFF
@@ -1343,6 +1372,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     backends/HardwareInventory.cpp
     backends/CPUCacheInventory.cpp
     backends/CPUExecutionGeometry.cpp
+    backends/NativeGraphDependencyReduction.cpp
     kernels/cpu/gemm/CPUProjectionWorkspaceContract.cpp
     backends/InventoryPrinter.cpp
     backends/PCIeEnumeration.cpp
@@ -1395,6 +1425,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
     execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
+    execution/compute_stages/stages/NativeAllGatherStage.cpp
+    execution/compute_stages/stages/TPColumnReduceScatterStage.cpp
+    execution/compute_stages/stages/MoEProjectionPipeline.cpp
+    execution/compute_stages/stages/MoERoutingPipeline.cpp
+    kernels/common/ColumnShardAssemblyKernels.cpp
+    kernels/common/SharedExpertColumnGateKernels.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
@@ -1403,7 +1439,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/MTPVerifierPreparationStage.cpp
     execution/compute_stages/stages/PrefillChunkMaterializationStage.cpp
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
-    execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp
+    execution/compute_stages/stages/MTPStochasticOutcomeStage.cpp
     execution/compute_stages/stages/MTPStochasticTargetDistributionStage.cpp
     execution/compute_stages/stages/OrdinaryGenerationSamplingStage.cpp
     execution/compute_stages/stages/DecodePositionSnapshotStage.cpp
@@ -1430,6 +1466,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayMigrationMeasurementLedger.cpp
     execution/moe/MoEOverlayMigrationMeasurementExchange.cpp
     execution/moe/MoEOverlayCapacityResolver.cpp
+    execution/moe/MoEProjectionArenaGeometry.cpp
+    execution/moe/MoEProjectionRuntimeBinding.cpp
     execution/moe/MoEOverlayCapacityAdmission.cpp
     execution/moe/MoEOverlayActivationChannelPlan.cpp
     execution/moe/MoEOverlayLocalCapacityPlanner.cpp
@@ -1503,6 +1541,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/BlockHash.cpp
     execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
     execution/prefix_cache/DiskPrefixStorageBackend.cpp
+    execution/prefix_cache/PrefixArchivePersistence.cpp
     execution/prefix_cache/PrefixCacheCoordinator.cpp
     execution/prefix_cache/PrefixCacheFingerprint.cpp
     execution/prefix_cache/PrefixCacheKey.cpp
@@ -1835,6 +1874,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     memory/CoherenceTracker.cpp
     # LOCAL tensor parallelism (Phase 4: multi-device within single MPI rank)
     collective/LocalTPContext.cpp
+    collective/DeviceCountedAllGather.cpp
     collective/LocalPPContext.cpp
     # GLOBAL tensor parallelism (cross-MPI-rank TP)
     collective/GlobalTPContext.cpp
@@ -1844,6 +1884,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     loaders/LocalTPWeightSharder.cpp
     # TP allreduce stage (Phase 4: supports both LOCAL and GLOBAL TP)
     execution/compute_stages/stages/TPAllreduceStage.cpp
+    execution/compute_stages/stages/TPLocalReduceOverlap.cpp
     execution/compute_stages/stages/LocalPPTransferStage.cpp
     execution/compute_stages/stages/GlobalPPTransferStage.cpp
     # Global Pipeline Parallelism topology and planning
@@ -1865,6 +1906,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/RankInitializationLifecycle.cpp
     execution/runner/ModelContextRetirement.cpp
+    execution/runner/ContinuationRequestGroup.cpp
     execution/runner/OrchestrationRunner.cpp
     execution/runner/MTPStochasticVerificationOwner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp

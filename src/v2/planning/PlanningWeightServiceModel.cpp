@@ -10,6 +10,7 @@
  */
 #include "PlanningWeightServiceModel.h"
 #include "AutomaticPlanningStartup.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -36,6 +37,28 @@ namespace llaminar2
             size_t count = 0;
             const TensorSizeInfo *source = nullptr;
         };
+
+        /**
+         * @brief Traffic in one executed GPU projection, using the loader's plane geometry.
+         *
+         * Alignment gaps and recyclable slot capacity are not reads. Each role
+         * keeps its own source format, including asymmetric minima and effective
+         * minima; down never borrows gate's bytes-per-element or physical K.
+         * This is metadata-only work estimation, not a physical-memory ledger.
+         */
+        double gpuProjectionBytes(const PlanningWeightOperand &operand, WeightShardMatrix matrix)
+        {
+            const auto format = operand.executionFormat();
+            if (const auto *native = native_vnni_formats::forQuantType(format))
+            {
+                if (matrix.columns % 32 != 0)
+                    throw std::invalid_argument("GPU expert work requires complete native execution blocks");
+                return nativeVnniPackedRegionSizes(matrix.rows, matrix.columns, *native).logicalBytes();
+            }
+            if (format != "F32" && format != "F16" && format != "BF16")
+                throw std::invalid_argument("GPU expert work has an unsupported executed projection format");
+            return static_cast<double>(matrix.rows) * matrix.columns * (format == "F32" ? 4 : 2);
+        }
     }
 
     std::vector<PlanningWeightServiceSample> PlanningWeightServiceModel::samples(const PlanningModelMetadata &model)
@@ -270,7 +293,9 @@ namespace llaminar2
         const PlanningRoutedExpertWeightWork &work, size_t token_rows) const
     {
         const auto expectation = work.uniformExpectation(token_rows);
-        if (expectation.routed_rows == 0) return 0;
+        if (token_rows == 0 || (!work.projection_ownership && expectation.routed_rows == 0)) return 0;
+        if (work.projection_ownership && !device.is_gpu())
+            throw std::invalid_argument("Projection-distributed expert service requires its admitted GPU endpoint");
         std::array<std::string, 3> formats;
         double elements = 0;
         for (size_t i = 0; i < formats.size(); ++i)
@@ -297,6 +322,28 @@ namespace llaminar2
                 };
                 const auto &decode = phase(ExpertHistogramSource::DecodeToken);
                 const auto &prefill = phase(ExpertHistogramSource::PrefillChunk);
+                if (work.projection_ownership)
+                {
+                    double arithmetic = 0, traffic = 0;
+                    for (const auto &operand : work.gate_up_down)
+                    {
+                        const auto matrix = work.projectionMatrix(operand.role);
+                        const auto issued = work.projectionExpectation(operand.role, token_rows);
+                        if (issued.routed_rows == 0) continue;
+                        // The bounded witness timed this exact format triplet,
+                        // not three independent projection rates. Attribute its
+                        // effective operation rate to actual local N/K and
+                        // per-role row populations, explicitly as a family
+                        // extrapolation. Never divide complete FFNs by TP width:
+                        // a zero gate/up owner still computes every down route.
+                        const double grouped_rows = std::max(1.0, issued.routed_rows / issued.nonempty_experts);
+                        arithmetic += planningArithmeticSeconds(decode.service, prefill.rows, prefill.service,
+                            grouped_rows, 2.0 * issued.routed_rows * matrix.rows * matrix.columns);
+                        traffic += gpuProjectionBytes(operand, matrix) * issued.nonempty_experts +
+                            sizeof(float) * issued.routed_rows * (matrix.rows + matrix.columns);
+                    }
+                    return positive(std::max(arithmetic, memorySeconds(rank, device, traffic)));
+                }
                 // A nonempty group necessarily contains at least one row.
                 // log1p/expm1 hit probabilities can round a few ULPs above the
                 // one-token expectation; preserve that mathematical boundary.

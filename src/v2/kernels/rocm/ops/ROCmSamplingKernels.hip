@@ -21,6 +21,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../common/SamplingMath.h"
 #include "../../common/GenerationLogicalState.h"
+#include "../../common/SamplingWideTopKDevice.inl"
 
 // Maximum k supported by the kernel (limited by shared memory and registers)
 constexpr int TOPK_MAX_K = 256;
@@ -3900,7 +3901,7 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
 
     if (active_comparison_rows == 0)
     {
-        if (sample_row < kMaxSampleRows)
+        if (sample_row <= row_count)
             sampled_target_tokens[sample_row] = -1;
         return;
     }
@@ -3941,7 +3942,10 @@ rocm_sample_and_summarize_serial_equivalent_speculative_batch_kernel(
         else
         {
             sampled_rows[sample_row] = -1;
-            sampled_target_tokens[sample_row] = -1;
+            // Wavefront scratch capacity is not caller-owned output capacity.
+            // Preserve the next request when this captured depth is below 15.
+            if (sample_row <= row_count)
+                sampled_target_tokens[sample_row] = -1;
         }
         if constexpr (RetainFirstTransactionDiagnostic)
         {
@@ -5404,6 +5408,26 @@ bool rocmOps_topk_topp_distributions_f32(
         k = n;
 
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (k > TOPK_SMALL_K_CAP)
+    {
+        const auto geometry = llaminar2::sampling_wide::geometry(n, row_count, k, scratch_capacity);
+        if (!geometry || !scratch_values || !scratch_indices)
+            return false;
+        // All 64 lanes participate even though sixteen own private LDS lists.
+        // That preserves valid wave shuffles with a bounded 32-KiB list bank.
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(llaminar2::sampling_wide::partials<64>),
+            dim3(geometry->partial_blocks, row_count), dim3(64), geometry->shared_bytes,
+            static_cast<hipStream_t>(stream), data, n, row_stride, k,
+            geometry->partial_blocks, scratch_values, scratch_indices, active_rows);
+        if (hipGetLastError() != hipSuccess)
+            return false;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(llaminar2::sampling_wide::distributions<64>),
+            dim3(row_count), dim3(64), 0, static_cast<hipStream_t>(stream),
+            scratch_values, scratch_indices, geometry->partial_blocks, k,
+            top_p, temperature, out_token_ids, out_stride, out_probs, active_rows);
+        return hipGetLastError() == hipSuccess;
+    }
 
     if (k <= TOPK_SMALL_K_CAP &&
         scratch_values &&

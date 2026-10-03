@@ -1127,11 +1127,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RuntimePrefillDescriptorsUseRetainedGra
 
     const auto cuda_runtime_execution = sliceBetween(
         cuda_source,
-        "bool CUDAMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+        "bool CUDAMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
         "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(");
     const auto rocm_runtime_execution = sliceBetween(
         rocm_source,
-        "bool ROCmMoEKernel::executeGroupedPrefillPipelineFromPublishedRuntimePlan(",
+        "bool ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
         "\n} // namespace llaminar2");
 
     for (const auto &[backend, execution] : {
@@ -2117,8 +2117,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const std::array<std::string, 3> controller_consumers = {
         sliceBetween(
             source,
-            "bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(",
-            "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured("),
+            "bool DeviceGraphOrchestrator::materializeMTPStochasticOutcomeGraph(",
+            "bool DeviceGraphOrchestrator::executeMTPStochasticOutcomeCaptured("),
         sliceBetween(
             source,
             "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
@@ -6490,7 +6490,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ScalarStochasticMTPRemainsDeviceResiden
         removeAsciiWhitespace(stripCommentsAndStringLiterals(body));
 
     const size_t resident_verify = compact.find(
-        "verifyStochasticDistributionsBatchOutcomeOnDeviceResident(");
+        "verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(");
     const size_t direct_publish = compact.find(
         "publishAcceptedMTPSpecStateBatchFromDeviceOutcome(", resident_verify);
     const size_t terminal_generation = compact.find(
@@ -6546,7 +6546,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPStochasticAllPositionPathKeepsCompac
               std::string::npos)
         << "Production stochastic MTP must capture the compact target+bonus "
            "row transaction as one strict device graph.";
-    EXPECT_NE(compact.find("bonus_row,bonus_threshold,"),
+    EXPECT_NE(compact.find("request.bonus_target_slot=bonus_row;"),
               std::string::npos)
         << "The compact bonus slot must remain part of the device verifier request.";
     EXPECT_EQ(compact.find("buildStochasticProcessedLogitRowsOnDevice("),
@@ -11030,8 +11030,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto strict_descriptor = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             runner_source,
-            "if (use_serial_sample_equivalent_stochastic)\n                    {",
-            "else\n                    {")));
+            "// Both verification laws construct the same complete",
+            "std::string verifier_cleanup_error;")));
     EXPECT_NE(strict_descriptor.find(
                   "request.inverse_sample_seed=inverse_sample_seed;"),
               std::string::npos);
@@ -13366,7 +13366,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEExecutionScratchUsesWorkspace)
     const auto async_grouping_scratch = sliceBetween(
         source,
         "bool ROCmMoEKernel::prepareExpertGroupsAsync(",
-        "bool ROCmMoEKernel::executeGroupedPrefillPipeline(");
+        "bool ROCmMoEKernel::executeGroupedPrefillProjection(");
 
     expectNoRawGpuAllocationCalls(route_scratch, "ROCmMoEKernel route scratch");
     expectNoRawGpuAllocationCalls(device_grouping_scratch, "ROCmMoEKernel device grouping scratch");
@@ -15956,7 +15956,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto root = repoRoot();
     const auto stage_source = readFile(
         root /
-        "src/v2/execution/compute_stages/stages/MTPStochasticSerialOutcomeStage.cpp");
+        "src/v2/execution/compute_stages/stages/MTPStochasticOutcomeStage.cpp");
     const auto cuda_source = readFile(
         root / "src/v2/kernels/cuda/ops/CUDASamplingKernels.cu");
     const auto rocm_source = readFile(
@@ -15968,8 +15968,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto stage_execute = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             stage_source,
-            "bool MTPStochasticSerialOutcomeStage::execute(IDeviceContext *ctx)",
-            "size_t MTPStochasticSerialOutcomeStage::estimatedMemoryBytes() const")));
+            "bool MTPStochasticOutcomeStage::execute(IDeviceContext *ctx)",
+            "size_t MTPStochasticOutcomeStage::estimatedMemoryBytes() const")));
     const auto cuda_wrapper = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             cuda_source,
@@ -15983,7 +15983,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto captured_execute = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
-            "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured(",
+            "bool DeviceGraphOrchestrator::executeMTPStochasticOutcomeCaptured(",
             "bool DeviceGraphOrchestrator::sealDeviceSpeculativeOutcomeVerifierGeometry(")));
 
     EXPECT_NE(
@@ -16726,7 +16726,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const size_t target_distribution = composer.find(
         "mtpStochasticTargetDistributionDeviceLoopGraphTemplate(");
     const size_t serial_outcome = composer.find(
-        "mtpStochasticSerialOutcomeDeviceLoopGraphTemplate(");
+        "mtpStochasticOutcomeDeviceLoopGraphTemplate(");
     const size_t state_publication = composer.find(
         "mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(");
     const size_t terminal_hidden = composer.find(
@@ -17076,7 +17076,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,
             "executeMTPStochasticTargetDistributionCaptured(",
-            "bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(")));
+            "bool DeviceGraphOrchestrator::materializeMTPStochasticOutcomeGraph(")));
     const auto public_build = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             orchestrator_source,

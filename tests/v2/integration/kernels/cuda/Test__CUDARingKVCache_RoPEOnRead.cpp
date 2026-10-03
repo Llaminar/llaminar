@@ -202,6 +202,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_RoPEChangesK)
     rope_params.position_start = 0;
     rope_params.n_kv_heads = n_kv_heads;
     rope_params.head_dim = head_dim;
+    rope_params.gpu_stream = append_stream.get();
 
     ITensor *out_k_rope = nullptr;
     ITensor *out_v_rope = nullptr;
@@ -270,6 +271,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_VUnchangedByRoPE)
     rope_params.position_start = 0;
     rope_params.n_kv_heads = n_kv_heads;
     rope_params.head_dim = head_dim;
+    rope_params.gpu_stream = append_stream.get();
 
     ITensor *out_k = nullptr;
     ITensor *out_v = nullptr;
@@ -326,17 +328,14 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, Q8_1_RoPEChangesK)
     }
 
     DeviceId cuda_dev = DeviceId::cuda(0);
-    ASSERT_TRUE(K_tensor->ensureOnDevice(cuda_dev));
-    ASSERT_TRUE(V_tensor->ensureOnDevice(cuda_dev));
-
-    cudaStream_t stream = nullptr;
-    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    ScopedCudaStream append_stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(cuda_dev, append_stream.get()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(cuda_dev, append_stream.get()));
     ASSERT_TRUE(cache->appendWithStream(0, 0,
                                         static_cast<const ITensor *>(K_tensor.get()),
                                         static_cast<const ITensor *>(V_tensor.get()),
-                                        num_tokens, stream));
-    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+                                        num_tokens, append_stream.get()));
+    append_stream.synchronize();
 
     // Get with RoPE
     IKVCache::KVReadParams rope_params;
@@ -344,6 +343,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, Q8_1_RoPEChangesK)
     rope_params.position_start = 0;
     rope_params.n_kv_heads = n_kv_heads;
     rope_params.head_dim = head_dim;
+    rope_params.gpu_stream = append_stream.get();
 
     ITensor *out_k = nullptr;
     ITensor *out_v = nullptr;
@@ -406,6 +406,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP32_RoPEConvertsToFP16)
     rope_params.position_start = 0;
     rope_params.n_kv_heads = n_kv_heads;
     rope_params.head_dim = head_dim;
+    rope_params.gpu_stream = append_stream.get();
 
     ITensor *out_k = nullptr;
     ITensor *out_v = nullptr;

@@ -8,8 +8,12 @@
  *
  * Requirements:
  * - NVIDIA GPUs with CUDA support
- * - NCCL library installed (libnccl-dev)
+ * - Canonical capture-reentry NCCL runtime installed
  * - All participating GPUs must be CUDA devices
+ *
+ * Resource ownership is limited to the declared DeviceGroup. Rank-local
+ * multi-device collectives and copies share NCCLCoordinator's communicator
+ * family; there is no independent all-visible-device copy group.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -85,8 +89,20 @@ namespace llaminar2
         // Lifecycle
         // =====================================================================
 
+        /**
+         * @brief Prepare native resources for exactly the declared membership.
+         * @param group Ordered CUDA participants and this process's local index.
+         * @return Whether native setup succeeded; lastError() describes failure.
+         * @note Rank-local copies reuse the coordinator created for this group.
+         *       Visible devices outside the group are not acquired by setup.
+         */
         bool initialize(const DeviceGroup &group) override;
         bool isInitialized() const override { return initialized_; }
+        /**
+         * @brief Retire this group's coordinator, communicator and owned stream.
+         * @note The caller must retire submitted work and borrowed captures
+         *       first. Repeated shutdown of an uninitialized backend is a no-op.
+         */
         void shutdown() override;
         void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
@@ -261,7 +277,8 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op,
             const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-            const std::vector<void *> &streams) override;
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {}) override;
         bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
 
         bool collectiveSidebandsMultiOnStreams(
@@ -290,6 +307,18 @@ namespace llaminar2
             int device_idx,
             void *stream) override;
         bool supportsReduceSingleDeviceOnStream() const override;
+
+        /** @copydoc ICollectiveBackend::nativeRowsOnStream */
+        bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            unsigned long long *payload_bytes = nullptr) override;
+
+        /** @copydoc ICollectiveBackend::reduceScatterSingleDeviceOnStream */
+        bool reduceScatterSingleDeviceOnStream(
+            const void *send_buf, void *recv_buf, size_t receive_count,
+            CollectiveDataType dtype, int device_idx, void *stream) override;
 
         bool allgatherSingleDeviceOnStream(
             const void *send_buf,
@@ -456,23 +485,6 @@ namespace llaminar2
         void *strided_allgather_temp_buf_ = nullptr;
         size_t strided_allgather_temp_size_ = 0;
 
-        // =====================================================================
-        // All-GPU NCCL communicator for copy() operations
-        // =====================================================================
-        // Initialized once during initialize() to span ALL enumerated CUDA devices.
-        // This allows efficient GPU-to-GPU copy via ncclSend/ncclRecv.
-        // NCCL handles all transport details (P2P, NVLink, PCIe staging) internally.
-
-        int copy_num_gpus_ = 0;               // Number of CUDA GPUs (all enumerated)
-        std::vector<void *> copy_comms_;      // Per-GPU NCCL communicators (size = copy_num_gpus_)
-        std::vector<void *> copy_streams_;    // Per-GPU CUDA streams (size = copy_num_gpus_)
-        bool copy_comms_initialized_ = false; // Flag to track initialization status
-
-        /// Initialize the all-GPU copy communicator (called from initialize())
-        bool initializeCopyComms();
-
-        /// Shutdown the copy communicator (called from shutdown())
-        void shutdownCopyComms();
 #endif
     };
 

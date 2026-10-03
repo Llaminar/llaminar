@@ -1,0 +1,559 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -547,6 +547,7 @@ set(SRC_FILES
+   src/include/roctx.h
+   src/include/recorder.h
+   src/include/shm.h
++  src/include/llaminar_host_transport.h
+   src/include/shmutils.h
+   src/include/signals.h
+   src/include/socket.h
+diff --git a/src/include/shm.h b/src/include/shm.h
+index 223d873..7bbba46 100644
+--- a/src/include/shm.h
++++ b/src/include/shm.h
+@@ -1,14 +1,40 @@
++/**
++ * @file shm.h
++ * @brief Typed native SHM storage and access scope, independent of protocol.
++ *
++ * Same-process descriptors may borrow a reference-counted native pinned owner.
++ * Cross-process descriptors require an actual IPC mapping; raw pointer handles
++ * are rejected before dereference. Descriptor retirement is an explicit state.
++ */
+ #ifndef NCCL_SHM_H_
+ #define NCCL_SHM_H_
+ 
+ #include "comm.h"
+ 
++/** @brief Proven endpoint access scope supplied by peer host/process identity. */
++enum class ncclShmAccessScope : uint8_t { SharedProcesses, SameProcess };
++
++/** @brief Total descriptor lifecycle; allocator failure never selects another kind. */
++enum class ncclShmStorageKind : uint8_t {
++  Vacant, RegisteredFile, SameProcessPinned, CuMem, Retired
++};
++
++struct ncclShmPinnedOwner;
++
++/** @brief One borrowed native allocation reference, valid only in its process. */
++struct shmPinnedIpc {
++  ncclShmPinnedOwner* owner;
++  size_t size;
++};
++
++/** @brief OS-backed cross-process file mapping, never a native owner handle. */
+ struct shmLegacyIpc {
+   char shmSuffix[7];
+   ncclShmHandle_t handle;
+   size_t shmSize;
+ };
+ 
++/** @brief Native cuMem cross-process allocation handle where the SDK supports it. */
+ struct shmCuIpc {
+   union {
+     CUmemFabricHandle handle;
+@@ -18,19 +44,48 @@ struct shmCuIpc {
+   size_t size;
+ };
+ 
++/** @brief One storage-kind-discriminated descriptor reference and retirement state. */
+ struct shmIpcDesc {
+   union
+   {
+     struct shmLegacyIpc shmli;
+     struct shmCuIpc shmci;
++    struct shmPinnedIpc shmpi;
+   };
+-  bool legacy;
++  ncclShmStorageKind kind;
+ };
+ 
+ typedef struct shmIpcDesc ncclShmIpcDesc_t;
+ 
+-ncclResult_t ncclShmAllocateShareableBuffer(size_t size, bool legacy, ncclShmIpcDesc_t *descOut, void **hptr, void **dptr);
++/**
++ * @brief Allocate exactly the storage permitted by authenticated endpoint scope.
++ * @param size Positive native protocol backing extent, not a live payload count.
++ * @param scope Peer-identity proof; SameProcess permits a native pinned owner.
++ * @param descOut Receives the sole creator reference on success.
++ * @param hptr Receives the host address of the allocation.
++ * @param dptr Optional mapped device address on the caller's current device.
++ * @return Native allocation status; failure never substitutes another kind.
++ */
++ncclResult_t ncclShmAllocateShareableBuffer(size_t size, ncclShmAccessScope scope, ncclShmIpcDesc_t *descOut, void **hptr, void **dptr);
++/**
++ * @brief Import a descriptor only into the access scope its creator permits.
++ * @param comm Native peer inventory used to authenticate host/process identity.
++ * @param proxyRank Creator rank in that inventory, checked before use.
++ * @param desc Bootstrap descriptor; native owner addresses are process-local.
++ * @param hptr Receives the imported host mapping.
++ * @param dptr Optional mapped address on the importing device.
++ * @param descOut Receives the importer reference, retired independently later.
++ * @return Native import status; wrong-process owner handles fail before use.
++ */
+ ncclResult_t ncclShmImportShareableBuffer(struct ncclComm *comm, int proxyRank, ncclShmIpcDesc_t *desc, void **hptr, void **dptr, ncclShmIpcDesc_t *descOut);
++/**
++ * @brief Retire one reference; only the final native reference frees backing.
++ * @param desc Owning descriptor, made Retired on successful release.
++ * @return Native release status; null, Vacant and Retired are safe no-ops.
++ *
++ * Creator and importer may retire in either order after their device work is
++ * finished. Repeated close never decrements the allocation owner's count twice.
++ */
+ ncclResult_t ncclShmIpcClose(ncclShmIpcDesc_t *desc);
+ 
+ #endif
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 5904d73..c6bab3c 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -6,6 +6,14 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file net.cc
++ * @brief Native network transport, including process-shared proxy memory banks.
++ *
++ * Network proxy maps distinguish their own process from an importing process.
++ * The cross-process host bank therefore requests an IPC-capable allocation;
++ * a process-local pinned owner is never serialized into that mapping contract.
++ */
+ #include "comm.h"
+ #include "net.h"
+ #include "graph.h"
+@@ -313,8 +321,16 @@ static ncclResult_t netMapShm(struct ncclComm *comm, struct ncclProxyConnector*
+   return ncclSuccess;
+ }
+ 
++/**
++ * @brief Create the host bank used when the network proxy is another process.
++ * @param proxyState Existing native network proxy context.
++ * @param mem Exact bank extent and creator descriptor, populated on success.
++ * @return Native allocation result, without substituting process-local storage.
++ */
+ static ncclResult_t netCreateShm(struct ncclProxyState* proxyState, struct connectMapMem* mem) {
+-  NCCLCHECK(ncclShmAllocateShareableBuffer(mem->size, false, &mem->createDesc, (void**)&mem->cpuPtr, (void**)&mem->gpuPtr));
++  // This helper is called only for !map->sameProcess. The importing process
++  // needs an actual shareable descriptor, not an address in this proxy's heap.
++  NCCLCHECK(ncclShmAllocateShareableBuffer(mem->size, ncclShmAccessScope::SharedProcesses, &mem->createDesc, (void**)&mem->cpuPtr, (void**)&mem->gpuPtr));
+   return ncclSuccess;
+ }
+ 
+diff --git a/src/transport/p2p.cc b/src/transport/p2p.cc
+index a0b00f4..5f57b95 100644
+--- a/src/transport/p2p.cc
++++ b/src/transport/p2p.cc
+@@ -5,6 +5,14 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file p2p.cc
++ * @brief Native GPU peer transport and copy-engine proxy ownership.
++ *
++ * The copy-engine control segment is exported through bootstrap and can be
++ * imported by a peer process. Its shared-memory descriptor must retain real
++ * IPC scope even when the creator's proxy thread happens to be process-local.
++ */
+ #include "comm.h"
+ #include "graph.h"
+ #include "utils.h"
+@@ -656,6 +664,17 @@ ncclResult_t p2pRecvFree(struct ncclConnector* recv) {
+   return ncclSuccess;
+ }
+ 
++/**
++ * @brief Prepare native peer send backing and, when selected, CE control IPC.
++ * @param connection Owns the prepared transport resources until native teardown.
++ * @param proxyState Existing proxy, device and native protocol buffer geometry.
++ * @param reqBuff Bootstrap allocation request for the direct GPU-memory branch.
++ * @param reqSize Exact request ABI size, checked before interpreting the payload.
++ * @param respBuff Receives the native peer allocation or CE bootstrap descriptor.
++ * @param respSize Exact selected response ABI size.
++ * @param done Publishes synchronous proxy setup completion on success.
++ * @return Native setup result; exported CE control remains process-shareable.
++ */
+ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, struct ncclProxyState* proxyState, void* reqBuff, int reqSize, void* respBuff, int respSize, int* done) {
+   if (useMemcpy) {
+     // CE memcpy support
+@@ -674,7 +693,9 @@ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, st
+ 
+     // Create a SHM segment for the peer to attach to
+     shmSize = sizeof(struct ncclSendMem) + sizeof(struct ncclRecvMem);
+-    NCCLCHECK(ncclShmAllocateShareableBuffer(shmSize, false, &proxyInfo->desc, (void**)&proxyInfo->shm, (void**)&proxyInfo->devShm));
++    // Proxy locality does not prove peer locality: bootstrap exports this
++    // descriptor to the receiver, which may live in a distinct MPI process.
++    NCCLCHECK(ncclShmAllocateShareableBuffer(shmSize, ncclShmAccessScope::SharedProcesses, &proxyInfo->desc, (void**)&proxyInfo->shm, (void**)&proxyInfo->devShm));
+ 
+     NCCLCHECK(ncclCudaHostCalloc(&proxyInfo->ceRecvMem, 1));
+     memcpy(respBuff, proxyInfo, sizeof(struct p2pShmProxyInfo));
+@@ -1260,4 +1281,4 @@ static void initCeOperation() {
+     }
+     init = 1;
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/src/transport/shm.cc b/src/transport/shm.cc
+index 513ba68..5c16aa5 100644
+--- a/src/transport/shm.cc
++++ b/src/transport/shm.cc
+@@ -4,10 +4,22 @@
+  * See LICENSE.txt for license information
+  ************************************************************************/
+ 
++/**
++ * @file shm.cc
++ * @brief Native shared-host collective transport with explicit storage evidence.
++ *
++ * GPU protocol, channels, capture and system-scope fences remain RCCL-owned.
++ * The passive diagnostic at the end reads connected endpoint descriptors,
++ * never payloads or a parallel allocation ledger.
++ */
+ #include "comm.h"
+ #include "shmutils.h"
+ #include "shm.h"
+ #include "transport.h"
++#include "llaminar_host_transport.h"
++#include <atomic>
++#include <new>
++#include <unistd.h>
+ 
+ #define SHM_PATH_MAX 128
+ #define SHM_HANDLE_TYPE ncclCuMemHandleType
+@@ -57,9 +69,55 @@ struct shmProxyInfo {
+ 
+ struct shmRequest {
+   size_t size;
+-  bool legacy;
++  ncclShmAccessScope scope;
++};
++
++/**
++ * @brief Sole allocation owner for same-process native SHM transport backing.
++ *
++ * The creator and imported endpoint descriptors each own one reference. The
++ * native allocation is driver-backed under Llaminar's early ROCr ABI, not a
++ * registered migratable POSIX mapping. No payload, protocol or GPU fence changes.
++ */
++struct ncclShmPinnedOwner {
++  std::atomic<unsigned> references{1};
++  void* host = nullptr;
++  size_t size = 0;
++  pid_t process = getpid();
+ };
+ 
++/**
++ * @brief Allocate mapped portable host backing with one explicit native owner.
++ * @param size Exact native protocol storage extent.
++ * @param desc Published descriptor owns the creator reference on success.
++ * @param host Output host mapping; never a file alias.
++ * @param device Optional exact native mapped pointer for this endpoint.
++ * @return Native error; a failed allocation does not select file registration.
++ */
++static ncclResult_t shmAllocatePinned(size_t size, ncclShmIpcDesc_t* desc,
++    void** host, void** device) {
++  auto* owner = new (std::nothrow) ncclShmPinnedOwner;
++  if (!owner) return ncclSystemError;
++  owner->size = size;
++  ncclResult_t result = ncclSuccess;
++  unsigned flags = cudaHostAllocPortable | cudaHostAllocMapped;
++#if defined(HIP_HOST_UNCACHED_MEMORY)
++  flags |= hipHostMallocUncached;
++#endif
++  CUDACHECKGOTO(hipHostMalloc(&owner->host, size, flags), result, fail);
++  if (device) CUDACHECKGOTO(cudaHostGetDevicePointer(device, owner->host, 0), result, fail);
++  memset(owner->host, 0, size);
++  *host = owner->host;
++  desc->shmpi = {owner, size};
++  desc->kind = ncclShmStorageKind::SameProcessPinned;
++  INFO(NCCL_SHM, "NATIVE pinned same-process host buffer size %zu ptr %p", size, *host);
++  return ncclSuccess;
++fail:
++  if (owner->host) (void)cudaFreeHost(owner->host);
++  delete owner;
++  return result;
++}
++
+ #define SHM_SEND_SIDE 1
+ #define SHM_RECV_SIDE 2
+ NCCL_PARAM(ShmDisable, "SHM_DISABLE", 0);
+@@ -114,9 +172,9 @@ static ncclResult_t shmSendSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
+   }
+   req.size = shmSize;
+   if (myInfo->hostHash == peerInfo->hostHash && myInfo->pidHash == peerInfo->pidHash)
+-    req.legacy = true;
++    req.scope = ncclShmAccessScope::SameProcess;
+   else
+-    req.legacy = false;
++    req.scope = ncclShmAccessScope::SharedProcesses;
+ 
+   NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_SHM, 1, myInfo->rank, &send->proxyConn));
+   NCCLCHECK(ncclProxyCallBlocking(comm, &send->proxyConn, ncclProxyMsgSetup, (void*)&req, sizeof(struct shmRequest), (void*)info, sizeof(struct shmConnectInfo)));
+@@ -145,9 +203,9 @@ static ncclResult_t shmRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* gr
+   }
+   req.size = shmSize;
+   if (myInfo->hostHash == peerInfo->hostHash && myInfo->pidHash == peerInfo->pidHash)
+-    req.legacy = true;
++    req.scope = ncclShmAccessScope::SameProcess;
+   else
+-    req.legacy = false;
++    req.scope = ncclShmAccessScope::SharedProcesses;
+ 
+   NCCLCHECK(ncclProxyConnect(comm, TRANSPORT_SHM, 0, myInfo->rank, &recv->proxyConn));
+   NCCLCHECK(ncclProxyCallBlocking(comm, &recv->proxyConn, ncclProxyMsgSetup, (void*)&req, sizeof(struct shmRequest), (void*)info, sizeof(struct shmConnectInfo)));
+@@ -467,7 +525,7 @@ static ncclResult_t shmSendProxySetup(struct ncclProxyConnection* connection, st
+   struct shmProxyInfo* proxyInfo;
+ 
+   NCCLCHECK(ncclCalloc(&proxyInfo, 1));
+-  NCCLCHECKGOTO(ncclShmAllocateShareableBuffer(req->size, req->legacy, &proxyInfo->desc, &info->buf.hptr, &info->buf.dptr), result, fail);
++  NCCLCHECKGOTO(ncclShmAllocateShareableBuffer(req->size, req->scope, &proxyInfo->desc, &info->buf.hptr, &info->buf.dptr), result, fail);
+   memcpy(&info->desc, &proxyInfo->desc, sizeof(ncclShmIpcDesc_t));
+   connection->transportResources = proxyInfo;
+ exit:
+@@ -488,7 +546,7 @@ static ncclResult_t shmRecvProxySetup(struct ncclProxyConnection* connection, st
+   struct shmProxyInfo* proxyInfo;
+ 
+   NCCLCHECK(ncclCalloc(&proxyInfo, 1));
+-  NCCLCHECKGOTO(ncclShmAllocateShareableBuffer(req->size, req->legacy, &proxyInfo->desc, &info->buf.hptr, &info->buf.dptr), result, fail);
++  NCCLCHECKGOTO(ncclShmAllocateShareableBuffer(req->size, req->scope, &proxyInfo->desc, &info->buf.hptr, &info->buf.dptr), result, fail);
+   memcpy(&info->desc, &proxyInfo->desc, sizeof(ncclShmIpcDesc_t));
+   connection->transportResources = proxyInfo;
+ exit:
+@@ -520,13 +578,18 @@ static void initCeOperation() {
+   }
+ }
+ 
+-ncclResult_t ncclShmAllocateShareableBuffer(size_t size, bool legacy, ncclShmIpcDesc_t *desc, void **hptr, void **dptr) {
++/** @copydoc ncclShmAllocateShareableBuffer */
++ncclResult_t ncclShmAllocateShareableBuffer(size_t size, ncclShmAccessScope scope, ncclShmIpcDesc_t *desc, void **hptr, void **dptr) {
+   if (desc == NULL || hptr == NULL) {
+     WARN("Invalid argument desc %p, hptr %p", desc, hptr);
+     return ncclInvalidArgument;
+   }
++  if (!size || (scope != ncclShmAccessScope::SameProcess &&
++      scope != ncclShmAccessScope::SharedProcesses)) return ncclInvalidArgument;
++  if (scope == ncclShmAccessScope::SameProcess)
++    return shmAllocatePinned(size, desc, hptr, dptr);
+ #if CUDART_VERSION >= 12020
+-  if (ncclCuMemEnable() && ncclCuMemHostEnable() && !legacy) {
++  if (ncclCuMemEnable() && ncclCuMemHostEnable()) {
+     // cuMem API support
+     CUmemAllocationHandleType type = SHM_HANDLE_TYPE;
+     CUmemGenericAllocationHandle handle;
+@@ -541,14 +604,14 @@ ncclResult_t ncclShmAllocateShareableBuffer(size_t size, bool legacy, ncclShmIpc
+     desc->shmci.size = size;
+     desc->shmci.ptr = *hptr;
+     if (dptr) *dptr = *hptr;
+-    desc->legacy = false;
++    desc->kind = ncclShmStorageKind::CuMem;
+     INFO(NCCL_SHM, "CUMEM allocated shareable buffer %p size %zi", desc->shmci.ptr, desc->shmci.size);
+   } else {
+     char shmPath[SHM_PATH_MAX] = { '\0' };
+     desc->shmli.shmSize = size;
+     NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), size, hptr, dptr, 1, &desc->shmli.handle));
+     memcpy(desc->shmli.shmSuffix, shmPath + sizeof("/dev/shm/nccl-") - 1, sizeof(desc->shmli.shmSuffix));
+-    desc->legacy = true;
++    desc->kind = ncclShmStorageKind::RegisteredFile;
+     INFO(NCCL_SHM, "MMAP allocated shareable host buffer %s size %zi ptr %p", shmPath, desc->shmli.shmSize, *hptr);
+   }
+ #else /* CUDART_VERSION >= 12020 */
+@@ -556,19 +619,39 @@ ncclResult_t ncclShmAllocateShareableBuffer(size_t size, bool legacy, ncclShmIpc
+   desc->shmli.shmSize = size;
+   NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), size, hptr, dptr, 1, &desc->shmli.handle));
+   memcpy(desc->shmli.shmSuffix, shmPath + sizeof("/dev/shm/nccl-") - 1, sizeof(desc->shmli.shmSuffix));
+-  desc->legacy = true;
++  desc->kind = ncclShmStorageKind::RegisteredFile;
+   INFO(NCCL_SHM, "MMAP allocated shareable host buffer %s size %zi ptr %p", shmPath, size, *hptr);
+ #endif /* CUDART_VERSION >= 12020 */
+   return ncclSuccess;
+ }
+ 
++/** @copydoc ncclShmImportShareableBuffer */
+ ncclResult_t ncclShmImportShareableBuffer(struct ncclComm *comm, int proxyRank, ncclShmIpcDesc_t *desc, void **hptr, void **dptr, ncclShmIpcDesc_t *descOut) {
+   if (comm == NULL || desc == NULL || hptr == NULL || descOut == NULL) {
+     WARN("Invalid argument comm %p, desc %p, hptr %p, descOut %p", comm, desc, hptr, descOut);
+     return ncclInvalidArgument;
+   }
++  if (proxyRank < 0 || proxyRank >= comm->nRanks) return ncclInvalidArgument;
++  if (desc->kind == ncclShmStorageKind::SameProcessPinned) {
++    // Authenticate process scope before interpreting a process-local handle.
++    // Bootstrap keeps the creator alive until every peer has imported it.
++    const auto& local = comm->peerInfo[comm->rank];
++    const auto& peer = comm->peerInfo[proxyRank];
++    if (local.hostHash != peer.hostHash || local.pidHash != peer.pidHash)
++      return ncclInvalidUsage;
++    auto* owner = desc->shmpi.owner;
++    if (!owner || owner->process != getpid() || owner->size != desc->shmpi.size)
++      return ncclInvalidArgument;
++    if (dptr) CUDACHECK(cudaHostGetDevicePointer(dptr, owner->host, 0));
++    owner->references.fetch_add(1, std::memory_order_relaxed);
++    *hptr = owner->host;
++    *descOut = *desc;
++    return ncclSuccess;
++  }
++  if (desc->kind != ncclShmStorageKind::RegisteredFile &&
++      desc->kind != ncclShmStorageKind::CuMem) return ncclInvalidUsage;
+ #if CUDART_VERSION >= 12020
+-  if (ncclCuMemEnable() && ncclCuMemHostEnable() && !desc->legacy) {
++  if (desc->kind == ncclShmStorageKind::CuMem) {
+     // cuMem API support
+     CUdeviceptr hostptr = 0;
+     CUmemAllocationHandleType type = SHM_HANDLE_TYPE;
+@@ -625,37 +708,62 @@ ncclResult_t ncclShmImportShareableBuffer(struct ncclComm *comm, int proxyRank,
+     CUCHECK(cuMemSetAccess(hostptr, size, &accessDesc, 1));
+ 
+     descOut->shmci.ptr = *hptr = (void *)hostptr;
+-    descOut->legacy = false;
++    descOut->shmci.size = desc->shmci.size;
++    descOut->kind = ncclShmStorageKind::CuMem;
+     if (dptr) *dptr = (void *)hostptr;
+     INFO(NCCL_SHM, "CUMEM imported shareable host buffer from proxyRank %d size %zi ptr %p, granularity %ld", proxyRank, desc->shmci.size, descOut->shmci.ptr, granularity);
+   } else {
+     char shmPath[SHM_PATH_MAX];
+     snprintf(shmPath, sizeof(shmPath), "/dev/shm/nccl-%s", desc->shmli.shmSuffix);
+     NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), desc->shmli.shmSize, hptr, dptr, -1, &descOut->shmli.handle));
+-    descOut->legacy = true;
++    descOut->shmli.shmSize = desc->shmli.shmSize;
++    descOut->kind = ncclShmStorageKind::RegisteredFile;
+     INFO(NCCL_SHM, "MMAP imported shareable host buffer %s size %zi ptr %p", shmPath, desc->shmli.shmSize, *hptr);
+   }
+ #else /* CUDART_VERSION >= 12020 */
++  if (desc->kind != ncclShmStorageKind::RegisteredFile) return ncclInvalidUsage;
+   char shmPath[SHM_PATH_MAX];
+   snprintf(shmPath, sizeof(shmPath), "/dev/shm/nccl-%s", desc->shmli.shmSuffix);
+   NCCLCHECK(ncclShmOpen(shmPath, sizeof(shmPath), desc->shmli.shmSize, hptr, dptr, -1, &descOut->shmli.handle));
+-  descOut->legacy = true;
++  descOut->shmli.shmSize = desc->shmli.shmSize;
++  descOut->kind = ncclShmStorageKind::RegisteredFile;
+   INFO(NCCL_SHM, "MMAP imported shareable host buffer %s size %zi ptr %p", shmPath, desc->shmli.shmSize, *hptr);
+ #endif
+   return ncclSuccess;
+ }
+ 
++/** @copydoc ncclShmIpcClose */
+ ncclResult_t ncclShmIpcClose(ncclShmIpcDesc_t *desc) {
+   if (desc) {
++    if (desc->kind == ncclShmStorageKind::Vacant ||
++        desc->kind == ncclShmStorageKind::Retired) return ncclSuccess;
++    if (desc->kind == ncclShmStorageKind::SameProcessPinned) {
++      auto* owner = desc->shmpi.owner;
++      if (!owner || owner->process != getpid()) return ncclInvalidArgument;
++      desc->kind = ncclShmStorageKind::Retired;
++      desc->shmpi.owner = nullptr;
++      // Only the final descriptor reference retires physical backing. Creator
++      // versus importer teardown order does not change the allocation lifetime.
++      if (owner->references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++        auto result = cudaFreeHost(owner->host);
++        delete owner;
++        if (result != cudaSuccess) return ncclUnhandledCudaError;
++      }
++      return ncclSuccess;
++    }
++    if (desc->kind != ncclShmStorageKind::RegisteredFile &&
++        desc->kind != ncclShmStorageKind::CuMem) return ncclInvalidUsage;
+ #if CUDART_VERSION >= 12020
+-    if (ncclCuMemEnable() && ncclCuMemHostEnable() && !desc->legacy) {
++    if (desc->kind == ncclShmStorageKind::CuMem) {
+       NCCLCHECK(ncclCuMemHostFree(desc->shmci.ptr));
+     } else {
+       NCCLCHECK(ncclShmClose(desc->shmli.handle));
+     }
+ #else
++    if (desc->kind != ncclShmStorageKind::RegisteredFile) return ncclInvalidUsage;
+     NCCLCHECK(ncclShmClose(desc->shmli.handle));
+ #endif
++    desc->kind = ncclShmStorageKind::Retired;
+   }
+ 
+   return ncclSuccess;
+@@ -667,3 +775,53 @@ struct ncclTransport shmTransport = {
+   { shmSendSetup, shmSendConnect, shmSendFree, NULL, shmSendProxySetup, NULL, shmSendProxyFree, NULL },
+   { shmRecvSetup, shmRecvConnect, shmRecvFree, NULL, shmRecvProxySetup, NULL, shmRecvProxyFree, NULL }
+ };
++
++/**
++ * @brief Observe actual connected SHM mappings at a quiescent caller boundary.
++ * @param comm Live native communicator; setup/teardown must not run concurrently.
++ * @param output Exact version-one record, checked before any write.
++ * @return Success or an invalid-argument result for an incompatible binding.
++ *
++ * Connections, not unique physical buffers, are counted: peer aliases may
++ * name one backing allocation. These fields are diagnostics, not admission.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarRcclHostTransportStorage(ncclComm_t comm,
++    llaminarRcclHostTransportStorageV1* output) {
++  if (!comm || !output || output->abi_version != 1 ||
++      output->record_bytes != sizeof(*output)) return ncclInvalidArgument;
++  llaminarRcclHostTransportStorageV1 result = {1, sizeof(result), 0, 0, 0, 0, 0, 0};
++  for (int channel = 0; channel < MAXCHANNELS; ++channel) {
++    if (!comm->channels[channel].peers) continue;
++    for (int peer = 0; peer < comm->nRanks; ++peer) {
++      auto* endpoints = comm->channels[channel].peers[peer];
++      if (!endpoints) continue;
++      for (int index = 0; index < NCCL_MAX_CONNS; ++index) {
++        const ncclConnector* send = &endpoints->send[index];
++        const ncclConnector* recv = &endpoints->recv[index];
++        const ncclShmIpcDesc_t* descriptors[2] = {nullptr, nullptr};
++        if (send->connected && send->transportComm == &shmTransport.send)
++          descriptors[0] = &static_cast<shmSendResources*>(send->transportResources)->remDesc;
++        if (recv->connected && recv->transportComm == &shmTransport.recv)
++          descriptors[1] = &static_cast<shmRecvResources*>(recv->transportResources)->remDesc;
++        for (const auto* desc : descriptors) {
++          if (!desc) continue;
++          if (desc->kind == ncclShmStorageKind::SameProcessPinned) {
++            ++result.same_process_pinned_connections;
++            result.same_process_pinned_mapped_bytes += desc->shmpi.size;
++          } else if (desc->kind == ncclShmStorageKind::RegisteredFile) {
++            ++result.shared_process_registered_connections;
++            result.shared_process_registered_mapped_bytes += desc->shmli.shmSize;
++          } else if (desc->kind == ncclShmStorageKind::CuMem) {
++            ++result.cu_mem_connections;
++            result.cu_mem_mapped_bytes += desc->shmci.size;
++          } else {
++            return ncclInvalidUsage;
++          }
++        }
++      }
++    }
++  }
++  *output = result;
++  return ncclSuccess;
++}
+diff --git a/src/include/llaminar_host_transport.h b/src/include/llaminar_host_transport.h
+new file mode 100644
+index 000000000..5d55b4b6e
+--- /dev/null
++++ b/src/include/llaminar_host_transport.h
+@@ -0,0 +1,27 @@
++/**
++ * @file llaminar_host_transport.h
++ * @brief Fixed passive ABI for actual native transport descriptor ownership.
++ *
++ * These endpoint observations are not unique physical-byte accounting and may
++ * not be used for allocation or placement. Call only while setup/teardown is
++ * quiescent. No GPU state is read, no payload is copied and no event is waited.
++ */
++#ifndef LLAMINAR_RCCL_HOST_TRANSPORT_H_
++#define LLAMINAR_RCCL_HOST_TRANSPORT_H_
++
++#include <stdint.h>
++
++/** @brief Version-one C layout, shared with Llaminar's SDK-free loader. */
++struct llaminarRcclHostTransportStorageV1 {
++  uint64_t abi_version;
++  uint64_t record_bytes;
++  uint64_t same_process_pinned_connections;
++  uint64_t shared_process_registered_connections;
++  uint64_t cu_mem_connections;
++  uint64_t same_process_pinned_mapped_bytes;
++  uint64_t shared_process_registered_mapped_bytes;
++  uint64_t cu_mem_mapped_bytes;
++};
++static_assert(sizeof(llaminarRcclHostTransportStorageV1) == 64, "host storage ABI");
++
++#endif

@@ -12,7 +12,8 @@
 
 namespace llaminar2::test
 {
-    void runMixedFormatExpertTransferPublication(DeviceId device, void *stream)
+    void runMixedFormatExpertTransferPublication(DeviceId device, void *stream,
+        DeviceMoEProjectionSet projections)
     {
         using namespace native_vnni_transfer_parity_detail;
         ASSERT_TRUE(device.is_gpu());
@@ -42,9 +43,14 @@ namespace llaminar2::test
                 formats.push_back(std::move(specs));
             }
             formats.push_back(formats.front());
+            // Identical all-format replay inventory for each ownership model.
+            // Pair directories physically omit down storage rather than merely
+            // declining to transmit an allocated whole-expert buffer.
+            if (projections == DeviceMoEProjectionSet::GateUp)
+                for (auto &specs : formats) specs.pop_back();
             auto directory = DeviceMoETransferSlotDirectory::createForTest(
                 backend, device, device.ordinal, 1u, 1u,
-                DeviceMoETransferSlotDirectory::profileForLayerFormats(formats));
+                DeviceMoETransferSlotDirectory::profileForLayerFormats(formats, projections));
             ASSERT_NE(directory, nullptr);
             auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
             ASSERT_NE(kernel, nullptr);
@@ -63,6 +69,7 @@ namespace llaminar2::test
             destination_config.participant_id = 1u;
             const size_t payload_bytes = sizeof(DeviceMoEExpertDirectoryEntry) + directory->wirePayloadBytes();
             DeviceAllocation source_weights(backend, device.ordinal, source_bytes);
+            DeviceAllocation source_runtime(backend, device.ordinal, sizeof(DeviceMoELayerRuntime));
             DeviceAllocation source_directory(backend, device.ordinal, 2u * sizeof(DeviceMoEExpertDirectoryEntry));
             DeviceAllocation plans(backend, device.ordinal, 2u * sizeof(DeviceMoERebalancePlanEntry));
             DeviceAllocation header(backend, device.ordinal, 2u * sizeof(DeviceMoERebalanceCommandBufferHeader));
@@ -90,6 +97,18 @@ namespace llaminar2::test
             ASSERT_NE(graph, nullptr);
             ScopedBackendGraphCapture capture(context, *graph, "all-format expert transfer");
             ASSERT_TRUE(capture.begin());
+            // Read the source from the real graph-facing placement bank. This
+            // proves the GPU descriptor exporter, not just a host-built packet,
+            // understands the movable projection contract.
+            const bool described = packing == Packing::Compact
+                ? kernel->packDeviceRebalanceSourceDescriptors(launch,
+                    source_runtime.as<DeviceMoELayerRuntime>(),
+                    plans.as<DeviceMoERebalancePlanEntry>(),
+                    header.as<DeviceMoERebalanceCommandBufferHeader>(), 1u,
+                    source_directory.as<DeviceMoEExpertDirectoryEntry>(), source_config)
+                : kernel->packDeviceRebalanceDirectory(launch,
+                    source_runtime.as<DeviceMoELayerRuntime>(),
+                    source_directory.as<DeviceMoEExpertDirectoryEntry>(), source_config);
             const bool packed = packing == Packing::Compact ? kernel->packDeviceRebalanceCompactPayloads(
                 launch, plans.as<DeviceMoERebalancePlanEntry>(),
                 header.as<DeviceMoERebalanceCommandBufferHeader>(), 1u,
@@ -106,6 +125,7 @@ namespace llaminar2::test
                 payload.as<uint8_t>(), 2u, payload_bytes, directory->deviceEntries(),
                 1u, destination_config, status.as<DeviceMoERebalanceApplyStatus>(), nullptr, 1u);
             capture.finish();
+            ASSERT_TRUE(described);
             ASSERT_TRUE(packed);
             ASSERT_TRUE(unpacked);
             ASSERT_TRUE(graph->instantiate());
@@ -121,6 +141,7 @@ namespace llaminar2::test
                 source.flags = static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
                                static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident);
                 source.descriptor.logical_expert_id = 0;
+                source.descriptor.projection_set = projections;
                 source.descriptor.owner_participant = 0;
                 source.descriptor.local_slot = 0;
                 source.descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
@@ -130,7 +151,7 @@ namespace llaminar2::test
                 const std::array<DeviceMoEFloatingMatrixDesc *, 3> raw{
                     &source.descriptor.floating_gate, &source.descriptor.floating_up,
                     &source.descriptor.floating_down};
-                for (size_t projection = 0; projection < 3; ++projection)
+                for (size_t projection = 0; projection < specs.size(); ++projection)
                 {
                     const auto &spec = specs[projection];
                     auto *base = source_weights.as<uint8_t>() + projection * 4u * plane_bytes;
@@ -159,7 +180,16 @@ namespace llaminar2::test
                     matrix.allocation_has_emins = spec.has_emins;
                 }
                 ASSERT_TRUE(deviceMoEDirectoryCopyReady(source));
-                std::array<DeviceMoEExpertDirectoryEntry, 2> sources{source, source};
+                auto runtime = std::make_unique<DeviceMoELayerRuntime>();
+                runtime->active_epoch = epoch;
+                runtime->expert_count = runtime->top_k = 1u;
+                runtime->participant_id = 0u;
+                runtime->participant_count = 2u;
+                runtime->banks[0].epoch = epoch;
+                runtime->banks[0].expert_count = 1u;
+                runtime->banks[0].experts[0] = source.descriptor;
+                runtime->banks[0].resident_participant_mask[0] = 1u;
+                runtime->banks[0].local_compute_mask[0] = 1u;
                 DeviceMoERebalancePlanEntry plan;
                 plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
                 plan.source_participant = 0u;
@@ -181,7 +211,7 @@ namespace llaminar2::test
                 destination_command.participant_id = 1u;
                 const std::array plan_records{plan, plan};
                 const std::array command_records{command, destination_command};
-                ASSERT_NO_FATAL_FAILURE(upload(source_directory.get(), sources.data(), sizeof(sources)));
+                ASSERT_NO_FATAL_FAILURE(upload(source_runtime.get(), runtime.get(), sizeof(*runtime)));
                 ASSERT_NO_FATAL_FAILURE(upload(plans.get(), plan_records.data(), sizeof(plan_records)));
                 ASSERT_NO_FATAL_FAILURE(upload(header.get(), command_records.data(), sizeof(command_records)));
                 ASSERT_NO_FATAL_FAILURE(upload(destination_header.get(), &destination_command, sizeof(destination_command)));
@@ -191,10 +221,23 @@ namespace llaminar2::test
                 ASSERT_EQ(result.copied_arrivals, 1u);
                 ASSERT_EQ(result.descriptor_mismatches, 0u);
                 ASSERT_EQ(result.missing_source_descriptors, 0u);
+                const auto exact_wire = DeviceMoETransferSlotDirectory::profileForLayerFormats(
+                    {specs}, projections).max_wire_payload_bytes;
+                EXPECT_EQ(result.copied_payload_bytes, exact_wire)
+                    << "Movement evidence must count only the projections actually transmitted";
                 ASSERT_NO_FATAL_FAILURE(download(&observed, directory->deviceEntries(), sizeof(observed)));
                 EXPECT_TRUE(deviceMoETransferSlotCopyComplete(observed, 1u, 0u, 0u));
                 EXPECT_EQ(observed.generation, plan.destination_generation + 1u);
                 EXPECT_EQ(observed.descriptor.weight_format, source.descriptor.weight_format);
+                EXPECT_EQ(observed.descriptor.projection_set, projections);
+                if (projections == DeviceMoEProjectionSet::GateUp)
+                {
+                    EXPECT_TRUE(observed.descriptor.movableWeightsReady());
+                    EXPECT_FALSE(observed.descriptor.weightsReady());
+                    EXPECT_EQ(observed.descriptor.down.payload, nullptr);
+                    EXPECT_EQ(observed.descriptor.down.scales, nullptr);
+                    EXPECT_EQ(observed.descriptor.floating_down.data, nullptr);
+                }
                 EXPECT_EQ(observed.descriptor.floating_allocation_format, DeviceMoEWeightFormat::FP32);
                 EXPECT_EQ(observed.descriptor.floating_gate.data, immutable_raw_pointer);
                 const std::array<DeviceNativeVNNIMatrixDesc, 3> native_dst{
@@ -202,7 +245,7 @@ namespace llaminar2::test
                 const std::array<DeviceMoEFloatingMatrixDesc, 3> raw_dst{
                     observed.descriptor.floating_gate, observed.descriptor.floating_up,
                     observed.descriptor.floating_down};
-                for (size_t projection = 0; projection < 3; ++projection)
+                for (size_t projection = 0; projection < specs.size(); ++projection)
                 {
                     const auto verify = [&](const void *pointer, size_t count, size_t plane)
                     {

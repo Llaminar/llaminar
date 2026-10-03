@@ -20,6 +20,7 @@
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/modes/MoEMovementLedgerJson.h"
 #include "execution/runner/IOrchestrationRunner.h"
+#include "execution/mtp/MTPRequestSamplingPolicy.h"
 #include "utils/Tokenizer.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
@@ -912,7 +913,21 @@ namespace llaminar2
                   << "presence_penalty=" << effective.presence_penalty << (set_.presence_penalty ? "* " : " ")
                   << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
 
-        runner_.setSamplingParams(effective);
+        try
+        {
+            runner_.setSamplingParams(effective);
+        }
+        catch (const UnsupportedMTPSamplingRequest &error)
+        {
+            // Request admission precedes tokenization, prefill and the first SSE
+            // publication. Catch only this typed limitation, never backend faults.
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", error.what()}, {"type", "invalid_request_error"},
+                {"code", UnsupportedMTPSamplingRequest::code},
+                {"param", UnsupportedMTPSamplingRequest::parameter}}}});
+            return -1;
+        }
         /*
          * Stop policy is part of request admission, just like sampling policy.
          * In particular, a captured MTP verifier must see ChatML terminators on

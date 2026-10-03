@@ -290,7 +290,7 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "Invalid routed-expert compute policy: '" + value +
-                    "' (valid: replicated, apportioned, tensor-sharded)");
+                    "' (valid: replicated, apportioned, tensor-sharded, gate-up-owned-down-columns)");
             }
             return *parsed;
         }
@@ -1823,8 +1823,8 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-compute",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "Routed-expert compute distribution: apportioned (default), replicated, tensor-sharded",
-            .valid_values = {"apportioned", "replicated", "tensor-sharded"},
+            .description = "Routed-expert compute distribution: apportioned (default whole-expert), replicated, tensor-sharded, gate-up-owned-down-columns (explicit native GPU projection ownership)",
+            .valid_values = {"apportioned", "replicated", "tensor-sharded", "gate-up-owned-down-columns"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2401,7 +2401,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=apportioned|replicated|tensor-sharded][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, apportioned experts and static row assignment. Prefer --expert-tier to also declare priority.",
+            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=apportioned|replicated|tensor-sharded|gate-up-owned-down-columns][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, apportioned experts and static row assignment. Prefer --expert-tier to also declare priority.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

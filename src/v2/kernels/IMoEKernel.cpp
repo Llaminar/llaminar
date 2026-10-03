@@ -18,6 +18,17 @@
 
 namespace llaminar2
 {
+    bool IMoEKernel::publishOwnedRouteRows(const MoERouterRowPublication &)
+    {
+        throw std::logic_error("Complete owned-router publication requires a native GPU implementation");
+    }
+
+    bool IMoEKernel::routeOwnedRowsWithTensors(
+        ITensor *, ITensor *, const MoERouterRowPacketLayout &, int, int,
+        bool, ITensor *, std::uint64_t *, const std::int32_t *)
+    {
+        throw std::logic_error("Participant-owned router rows require a native GPU implementation");
+    }
 
     bool IMoEKernel::routeWithTensorsEffectiveSeqLen(
         ITensor *hidden, ITensor *gate_weights,

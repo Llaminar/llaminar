@@ -19,6 +19,7 @@ namespace llaminar2
 {
     struct ModelMemoryProfile;
     struct TensorSizeInfo;
+    class MoEExpertProjectionOwnership;
 
     /** @brief Exact logical matrix shape, before native packing or padding. */
     struct WeightShardMatrix
@@ -81,6 +82,16 @@ namespace llaminar2
          */
         WeightShardGeometry resolve(const TensorSizeInfo &tensor,
             std::optional<size_t> resident_experts = {}) const;
+        /**
+         * @brief Resolve an explicit projection layout without applying TP twice.
+         * @param tensor Complete original routed projection inventory.
+         * @param ownership Immutable source/slice contract used by preparation.
+         * @param owned_experts Exact owner count, not a count of down replicas.
+         * @return Local N/K and the role's independently resolved expert cardinality.
+         * @throws std::invalid_argument when source metadata and the contract disagree.
+         */
+        WeightShardGeometry resolve(const TensorSizeInfo &tensor,
+            const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const;
     private:
         const ModelMemoryProfile &profile_;
         int shard_index_, total_shards_;

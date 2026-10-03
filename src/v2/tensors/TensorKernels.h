@@ -18,6 +18,7 @@
 #include "../kernels/attention/AttentionExecutionPolicy.h"
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "../kernels/common/DeviceRowRange.h"
+#include "../kernels/common/DeviceRequestRowRanges.h"
 #include "NativeVnniFormatInfo.h"
 #include "TensorType.h"
 #include "BlockStructures.h"
@@ -4248,25 +4249,26 @@ namespace llaminar2
          * @param d_q           [out] Device pointer to deinterleaved Q [seq_len, n_v_heads * d_k]
          * @param d_k           [out] Device pointer to deinterleaved K [seq_len, n_v_heads * d_k]
          * @param d_v           [out] Device pointer to deinterleaved V [seq_len, n_v_heads * d_v]
-         * @param seq_len       Sequence length
+         * @param rows          Physical request strides and borrowed live lengths;
+         *                      inactive rows are neither read nor written.
          * @param n_k_heads     Key head count in merged buffer
          * @param n_v_heads     Value head count (output head count)
          * @param d_k           Key/query head dimension
          * @param d_v           Value head dimension
          * @param global_v_head_offset  TP modular repeat offset
-         * @return true after the device transform completes successfully.
+         * @return true after successful enqueue on the exact bound stream.
          */
         virtual bool deinterleave_qkv_device(
             const float *d_merged_qkv,
             float *&d_q, float *&d_k, float *&d_v,
-            int seq_len, int n_k_heads, int n_v_heads,
+            DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
             int head_dim_k, int head_dim_v, int global_v_head_offset)
         {
             (void)d_merged_qkv;
             (void)d_q;
             (void)d_k;
             (void)d_v;
-            (void)seq_len;
+            (void)rows;
             (void)n_k_heads;
             (void)n_v_heads;
             (void)head_dim_k;

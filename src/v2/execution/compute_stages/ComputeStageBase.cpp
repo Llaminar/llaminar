@@ -181,6 +181,14 @@ namespace llaminar2
             return "PIPELINE_ACTIVATION_EXCHANGE";
         case ComputeStageType::ALLGATHER:
             return "ALLGATHER";
+        case ComputeStageType::NATIVE_ALLGATHER:
+            return "NATIVE_ALLGATHER";
+        case ComputeStageType::DEVICE_COUNTED_ALLGATHER:
+            return "DEVICE_COUNTED_ALLGATHER";
+        case ComputeStageType::NATIVE_REDUCE_SCATTER:
+            return "NATIVE_REDUCE_SCATTER";
+        case ComputeStageType::MOE_PROJECTION_PHASE:
+            return "MOE_PROJECTION_PHASE";
         case ComputeStageType::ALLGATHER_V:
             return "ALLGATHER_V";
         case ComputeStageType::SEND_ACTIVATIONS:
@@ -255,8 +263,8 @@ namespace llaminar2
             return "DECODE_POSITION_SNAPSHOT";
         case ComputeStageType::MTP_VERIFIER_OUTCOME:
             return "MTP_VERIFIER_OUTCOME";
-        case ComputeStageType::MTP_STOCHASTIC_SERIAL_OUTCOME:
-            return "MTP_STOCHASTIC_SERIAL_OUTCOME";
+        case ComputeStageType::MTP_STOCHASTIC_OUTCOME:
+            return "MTP_STOCHASTIC_OUTCOME";
         case ComputeStageType::MTP_SPEC_STATE_PUBLICATION:
             return "MTP_SPEC_STATE_PUBLICATION";
         default:

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -110,6 +111,22 @@ namespace llaminar2
         return boundary > std::max(0, restored_tokens)
                    ? std::optional<int>{boundary}
                    : std::nullopt;
+    }
+
+    PrefixHarvestSchedule PrefixHarvestSchedule::forPrefill(
+        const PrefixLookupResult &admission, int prompt_tokens,
+        int restored_tokens, int stable_segment_tokens)
+    {
+        if (!admission.supported || !admission.cache_enabled ||
+            admission.block_size <= 0 || prompt_tokens <= 0 ||
+            restored_tokens < 0 || restored_tokens > prompt_tokens ||
+            stable_segment_tokens < 0)
+        {
+            throw std::invalid_argument("prefix harvest requires a valid coordinated prefill admission");
+        }
+        return PrefixHarvestSchedule(
+            prompt_tokens, admission.reusablePrefillCheckpoint(
+                prompt_tokens, restored_tokens, stable_segment_tokens));
     }
 
     PrefixLookupResult PrefixLookupResult::clampedTo(int token_count) const

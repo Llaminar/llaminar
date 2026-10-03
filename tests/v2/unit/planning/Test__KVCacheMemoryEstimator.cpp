@@ -66,10 +66,10 @@ TEST(Test__KVCacheMemoryEstimator, RecurrentOnlyGPUPricesOnlySequenceFrontiers)
         KVCacheFamily::Hybrid, 0, 1, 32, 1, 64, "fp32", DeviceId::cpu()), 0u);
 }
 
-TEST(Test__KVCacheMemoryEstimator, CUDAFP16IncludesPermanentLinearizationHorizons)
+TEST(Test__KVCacheMemoryEstimator, CUDAFP16UsesWorkspaceScratch)
 {
     const std::size_t expected =
-        kEntries * 4 * kSequence * kHeads * kHeadDim * sizeof(std::uint16_t) +
+        kEntries * 2 * kSequence * kHeads * kHeadDim * sizeof(std::uint16_t) +
         gpuMetadata(2);
     EXPECT_EQ(
         KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
@@ -93,7 +93,7 @@ TEST(Test__KVCacheMemoryEstimator, ROCmFP16UsesWorkspaceScratch)
 TEST(Test__KVCacheMemoryEstimator, LinearFP32ChangesPayloadWithoutDoublingMetadata)
 {
     const std::size_t expected =
-        kEntries * 4 * kSequence * kHeads * kHeadDim * sizeof(float) +
+        kEntries * 2 * kSequence * kHeads * kHeadDim * sizeof(float) +
         gpuMetadata(2);
     EXPECT_EQ(
         KVCacheMemoryEstimator::estimate(KVCacheFamily::AttentionOnly,
@@ -231,7 +231,7 @@ TEST(Test__KVCacheMemoryEstimator, HybridGPUQ8PricesItsConcreteLinearOwner)
         EXPECT_EQ(logical.v_bytes, 64u * row);
         EXPECT_EQ(KVCacheMemoryEstimator::estimate(KVCacheFamily::Hybrid,
             kLayers, kBatch, kSequence, heads, width, "q8_1", device),
-            kEntries * (device.is_cuda() ? 4u : 2u) * kSequence * row + gpuMetadata(2));
+            kEntries * 2u * kSequence * row + gpuMetadata(2));
     }
     // CPU hybrid and ordinary caches already share anchored AQ8 keys. Naming
     // the family must not accidentally change their physical format or price.

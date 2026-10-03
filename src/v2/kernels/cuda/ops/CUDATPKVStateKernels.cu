@@ -1,3 +1,11 @@
+/**
+ * @file CUDATPKVStateKernels.cu
+ * @brief Exact-copy row compaction and column transposition on an explicit CUDA stream.
+ *
+ * These kernels preserve FP32 bit patterns and borrow preallocated disjoint
+ * banks. Swapping the transpose's outer dimensions packs model rows for native
+ * reduce-scatter; one outer element is a valid copy, not a reason to skip it.
+ */
 #include <cuda_runtime.h>
 #include <cstdio>
 
@@ -88,6 +96,7 @@ extern "C" bool cudaTPKV_compact_rows_fp32(
     return true;
 }
 
+/** @brief Enqueue [rank,row,column] to [row,rank,column], including singleton dimensions. */
 extern "C" bool cudaTPKV_deinterleave_rank_major_fp32(
     const float *rank_major,
     float *row_major,
@@ -97,7 +106,7 @@ extern "C" bool cudaTPKV_deinterleave_rank_major_fp32(
     int device_ordinal,
     void *stream)
 {
-    if (!rank_major || !row_major || tokens <= 0 || degree <= 1 || local_dim <= 0 || !stream)
+    if (!rank_major || !row_major || tokens <= 0 || degree < 1 || local_dim <= 0 || !stream)
         return false;
 
     cudaError_t err = cudaSetDevice(device_ordinal);

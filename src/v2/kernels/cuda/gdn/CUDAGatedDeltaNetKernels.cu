@@ -15,12 +15,16 @@
  * - Gate computation: g = A_log * softplus(alpha + dt_bias)
  * - Beta sigmoid: beta_sig = sigmoid(beta_raw)
  *
- * Design: One thread block per head. State matrix S[d_k, d_v] lives in global
- * memory (persistent between decode steps). Shared memory used for Q/K scratch.
+ * Each block owns independent columns of one request/head. Eight lanes retain
+ * fixed key-row partitions in registers and combine them in serial-decode
+ * order. Long prefill double-buffers bounded input tiles in shared memory;
+ * prefetch changes memory scheduling, never the causal recurrence or its
+ * arithmetic. Persistent state is loaded/committed once per captured launch.
  */
 
 #include "../ops/CUDAHelpers.cuh"
 #include "../../../utils/DebugEnv.h"
+#include "kernels/gdn/GDNDeinterleaveRows.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +52,10 @@ namespace
     constexpr int kGdnRecurrentRowSplit = 8;
     constexpr int kGdnRecurrentColumnsPerBlock =
         kGdnRecurrentThreads / kGdnRecurrentRowSplit;
+    constexpr int kGdnPrefillThreads = 128;
+    constexpr int kGdnPrefillColumns =
+        kGdnPrefillThreads / kGdnRecurrentRowSplit;
+    constexpr int kGdnPrefillTileRows = 8;
 
     /**
      * @brief Return the byte-stable query scale shared by every CUDA GDN regime.
@@ -74,37 +82,64 @@ namespace
     }
 
     /**
-     * @brief Start one vectorized Ampere global-to-shared Q/K transfer group.
+     * @brief Start a bounded tile of all next-row recurrence inputs.
      *
-     * Long-prefill recurrence consumes one complete Q row and one complete K
-     * row at every causal step.  Each participating lane moves four adjacent
-     * FP32 values directly into shared memory with `cp.async`, avoiding the
-     * register-staged load/store dependency that otherwise dominates sampled
-     * long-scoreboard stalls.  The caller owns the double-buffer lifetime and
-     * must wait for this group before exposing the destination stage.
+     * Vector copies stage complete Q/K rows; scalar copies stage the block's
+     * value columns and both gates. Scalar copies deliberately require only
+     * float alignment: odd value widths and arbitrary head counts are valid.
+     * Issuing a tile ahead amortizes the asynchronous wait and CTA barrier
+     * across several causal rows without changing their arithmetic order.
      *
      * The CUDA build requires an SM80-or-newer target, so this is the sole
      * production implementation rather than an architecture-dependent eager
      * alternative.
      *
      * @tparam D_K Compile-time Q/K row width, divisible by four floats.
-     * @param q_stage Shared-memory destination for the Q row.
-     * @param k_stage Shared-memory destination for the K row.
-     * @param q_src Global-memory source for the Q row.
-     * @param k_src Global-memory source for the K row.
+     * @param stage Exclusive inactive shared tile: Q, K, V, decay, beta.
+     * @param Q Preprocessed global query rows.
+     * @param K Preprocessed global key rows.
+     * @param V Global value rows.
+     * @param decay Preprocessed decay gates.
+     * @param beta Preprocessed update gates.
+     * @param first_row First global row of this tile, including request offset.
+     * @param live_rows Number of valid rows in this tile, at most TileRows.
+     * @param head Head owned by this CTA.
+     * @param n_heads Number of heads in the participant-local tensors.
+     * @param d_v Value width; need not be a multiple of the CTA's columns.
+     * @param first_column First value column owned by this CTA.
      */
     template <int D_K>
-    __device__ __forceinline__ void cuda_gdn_stage_qk_async(
-        float *q_stage,
-        float *k_stage,
-        const float *q_src,
-        const float *k_src)
+    __device__ __forceinline__ void cuda_gdn_stage_inputs_async(
+        float *stage,
+        const float *Q, const float *K, const float *V,
+        const float *decay, const float *beta,
+        int first_row, int live_rows, int head, int n_heads,
+        int d_v, int first_column)
     {
         static_assert(D_K % 4 == 0);
-        const int vector_index = static_cast<int>(threadIdx.x);
-        if (vector_index < D_K / 4)
+        constexpr int tile_rows = kGdnPrefillTileRows;
+        constexpr int tile_columns = kGdnPrefillColumns;
+        const int tid = static_cast<int>(threadIdx.x);
+        float *q_stage = stage;
+        float *k_stage = q_stage + tile_rows * D_K;
+        float *v_stage = k_stage + tile_rows * D_K;
+        float *decay_stage = v_stage + tile_rows * tile_columns;
+        float *beta_stage = decay_stage + tile_rows;
+
+        // Keep address-generation temporaries bounded. Unrolling these copies
+        // extends their live ranges across register-resident recurrence state
+        // and crosses the register-allocation cliff on Ampere.
+#pragma unroll 1
+        for (int vector_index = tid; vector_index < tile_rows * D_K / 4;
+             vector_index += kGdnPrefillThreads)
         {
+            const int tile_row = vector_index / (D_K / 4);
+            if (tile_row >= live_rows)
+                continue;
             const int element = vector_index * 4;
+            const int column = element % D_K;
+            const int global_element =
+                ((first_row + tile_row) * n_heads + head) * D_K + column;
             const uint32_t q_shared = static_cast<uint32_t>(
                 __cvta_generic_to_shared(q_stage + element));
             const uint32_t k_shared = static_cast<uint32_t>(
@@ -112,25 +147,54 @@ namespace
             asm volatile(
                 "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
                 :
-                : "r"(q_shared), "l"(q_src + element), "r"(16)
+                : "r"(q_shared), "l"(Q + global_element), "r"(16)
                 : "memory");
             asm volatile(
                 "cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
                 :
-                : "r"(k_shared), "l"(k_src + element), "r"(16)
+                : "r"(k_shared), "l"(K + global_element), "r"(16)
                 : "memory");
+        }
+        // Form global pointers only for live rows/columns. No out-of-bounds
+        // address is submitted even for a partial tile or a padded column CTA.
+        for (int value_index = tid; value_index < tile_rows * tile_columns;
+             value_index += kGdnPrefillThreads)
+        {
+            const int tile_row = value_index / tile_columns;
+            const int column = first_column + value_index % tile_columns;
+            if (tile_row < live_rows && column < d_v)
+            {
+                const uint32_t shared = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(v_stage + value_index));
+                const float *source = V +
+                    ((first_row + tile_row) * n_heads + head) * d_v + column;
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             : : "r"(shared), "l"(source) : "memory");
+            }
+        }
+        if (tid < tile_rows && tid < live_rows)
+        {
+            const int gate_index = (first_row + tid) * n_heads + head;
+            const uint32_t decay_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(decay_stage + tid));
+            const uint32_t beta_shared = static_cast<uint32_t>(
+                __cvta_generic_to_shared(beta_stage + tid));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                         : : "r"(decay_shared), "l"(decay + gate_index) : "memory");
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                         : : "r"(beta_shared), "l"(beta + gate_index) : "memory");
         }
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
 
     /**
-     * @brief Wait until every Q/K transfer group issued by this lane is done.
+     * @brief Wait until every input transfer group issued by this lane is done.
      *
      * A following CTA barrier publishes the completed stage to all consumers.
      * Keeping the wait and barrier separate makes the producer/consumer edge
-     * explicit and lets recurrence work overlap the in-flight next-row group.
+     * explicit and lets recurrence work overlap the in-flight next-tile group.
      */
-    __device__ __forceinline__ void cuda_gdn_wait_qk_async()
+    __device__ __forceinline__ void cuda_gdn_wait_inputs_async()
     {
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
@@ -540,8 +604,35 @@ namespace
     //      coverage and no runtime-width indexing can silently truncate state.
     // =========================================================================
 
+    /**
+     * @brief Advance long prefill in exact serial-row order with tiled inputs.
+     *
+     * One CTA owns a request/head column interval. Its two shared tiles alternate
+     * between immutable consumption and asynchronous production; only a tile
+     * boundary waits, and that same barrier protects reuse of the former tile.
+     * Every state update and eight-part reduction retains the decode schedule.
+     * Padded rows publish zero without updating state or touching input memory.
+     *
+     * @tparam D_K Supported key width, 64 or 128.
+     * @param Q Canonically preprocessed query rows.
+     * @param K Canonically preprocessed key rows.
+     * @param V Value rows.
+     * @param decay Canonically preprocessed decay gates.
+     * @param beta Canonically preprocessed update gates.
+     * @param output Per-row value outputs.
+     * @param initial_state Request/head initial states; may alias updated_state.
+     * @param updated_state Terminal state destination.
+     * @param effective_seq_len_ptr Optional device-owned live row counts.
+     * @param state_snapshots Optional post-row state destinations.
+     * @param snapshot_stride_floats Distance between snapshot rows.
+     * @param max_snapshot_rows Snapshot capacity in global rows.
+     * @param request_count Independent requests in this launch.
+     * @param request_seq_len Physical row capacity per request.
+     * @param n_heads Participant-local head count.
+     * @param d_v Value columns per head.
+     */
     template <int D_K>
-    __global__ __launch_bounds__(64, 10) void cuda_gdn_chunk_forward_kernel(
+    __global__ __launch_bounds__(kGdnPrefillThreads, 4) void cuda_gdn_chunk_forward_kernel(
         const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
         const float *__restrict__ K,        // [seq_len, n_heads * d_k]
         const float *__restrict__ V,        // [seq_len, n_heads * d_v]
@@ -569,9 +660,9 @@ namespace
         // Row-split parallelism: eight lanes collaborate on each column and
         // own disjoint contiguous D_K/8 state rows.  Keep all eight lanes in
         // one warp so their partial sums can be exchanged without shared
-        // reduction buffers or CTA-wide barriers.  Four columns fit in each
-        // warp; a 64-thread block owns eight columns and exposes enough
-        // independent CTAs to hide the remaining scalar and value-load latency.
+        // reduction buffers or CTA-wide barriers. Four columns fit in each
+        // warp; four warps own sixteen columns while asynchronous input tiles
+        // hide the next rows' global-memory latency.
         constexpr int ROW_SPLIT = kGdnRecurrentRowSplit;
         constexpr int ROWS_PER_SPLIT = D_K / ROW_SPLIT;
         constexpr int COLUMNS_PER_WARP = 32 / ROW_SPLIT;
@@ -584,7 +675,6 @@ namespace
             warp_id * COLUMNS_PER_WARP + col_in_warp;
         const int vi = blockIdx.y * cols_per_block + col_in_block;
 
-        const int qk_stride = n_heads * D_K;
         const int v_stride = n_heads * d_v;
 
         const int request_row_base = request * request_seq_len;
@@ -598,8 +688,11 @@ namespace
                            static_cast<size_t>(h) * D_K * d_v;
 
         extern __shared__ float smem[];
-        float *q_stages = smem;             // [2][D_K]
-        float *k_stages = smem + 2 * D_K;   // [2][D_K]
+        constexpr int tile_rows = kGdnPrefillTileRows;
+        constexpr int tile_floats =
+            tile_rows * (2 * D_K + kGdnPrefillColumns + 2);
+        static_assert(tile_floats % 4 == 0,
+                      "Both asynchronous Q/K tiles need 16-byte alignment");
 
         int effective_seq_len = request_seq_len;
         if (effective_seq_len_ptr)
@@ -614,7 +707,7 @@ namespace
 
         // Keep this thread's recurrence-state slice resident across the entire
         // prefill. The recurrence is sequential in time, but each (head, column,
-        // row-split) lane owns the same 32 state rows for every token; loading
+        // row-split) lane owns the same D_K/8 state rows for every token; loading
         // them once removes hundreds of global-memory passes at bucket sizes.
         const int j_start = split_id * ROWS_PER_SPLIT;
         float sc[ROWS_PER_SPLIT];
@@ -632,18 +725,16 @@ namespace
                 sc[j] = 0.0f;
         }
 
-        // Seed the first Q/K stage once.  Subsequent rows are loaded into the
-        // opposite stage while the current causal recurrence is executing.
-        int active_qk_stage = 0;
+        // Seed once; the inactive tile is then filled while every causal row
+        // of the current tile consumes only shared inputs and register state.
+        int active_stage = 0;
         if (effective_seq_len > 0)
         {
-            const int first_row = request_row_base;
-            cuda_gdn_stage_qk_async<D_K>(
-                q_stages,
-                k_stages,
-                Q + first_row * qk_stride + h * D_K,
-                K + first_row * qk_stride + h * D_K);
-            cuda_gdn_wait_qk_async();
+            cuda_gdn_stage_inputs_async<D_K>(
+                smem, Q, K, V, decay, beta, request_row_base,
+                min(tile_rows, effective_seq_len), h, n_heads, d_v,
+                blockIdx.y * cols_per_block);
+            cuda_gdn_wait_inputs_async();
             __syncthreads();
         }
 
@@ -651,7 +742,6 @@ namespace
         for (int t = 0; t < request_seq_len; t++)
         {
             const int row = request_row_base + t;
-            const float *v_src = V + row * v_stride + h * d_v;
             float *o_dst = output + row * v_stride + h * d_v;
 
             if (t >= effective_seq_len)
@@ -661,27 +751,29 @@ namespace
                 continue;
             }
 
-            const int next_qk_stage = active_qk_stage ^ 1;
+            const int tile_row = t % tile_rows;
+            const int next_stage = active_stage ^ 1;
             const bool has_next_row = t + 1 < effective_seq_len;
-            if (has_next_row)
+            if (tile_row == 0 && t + tile_rows < effective_seq_len)
             {
-                const int next_row = row + 1;
-                cuda_gdn_stage_qk_async<D_K>(
-                    q_stages + next_qk_stage * D_K,
-                    k_stages + next_qk_stage * D_K,
-                    Q + next_row * qk_stride + h * D_K,
-                    K + next_row * qk_stride + h * D_K);
+                cuda_gdn_stage_inputs_async<D_K>(
+                    smem + next_stage * tile_floats, Q, K, V, decay, beta,
+                    row + tile_rows, min(tile_rows, effective_seq_len - t - tile_rows),
+                    h, n_heads, d_v, blockIdx.y * cols_per_block);
             }
 
-            const float *q_local = q_stages + active_qk_stage * D_K;
-            const float *k_local = k_stages + active_qk_stage * D_K;
+            const float *tile = smem + active_stage * tile_floats;
+            const float *q_local = tile + tile_row * D_K;
+            const float *k_local = tile + tile_rows * D_K + tile_row * D_K;
+            const float *v_local = tile + 2 * tile_rows * D_K;
+            const float *decay_local = v_local + tile_rows * kGdnPrefillColumns;
+            const float *beta_local = decay_local + tile_rows;
 
             // The mandatory captured preprocessor publishes canonical Q/K and
             // gate values before this kernel. Long recurrence has no second
             // preprocessing regime or hidden scalar path.
-            const int gate_idx = row * n_heads + h;
-            const float decay_h = decay[gate_idx];
-            const float beta_h = beta[gate_idx];
+            const float decay_h = decay_local[tile_row];
+            const float beta_h = beta_local[tile_row];
 
             float partial_kv = 0.0f;
             if (vi < d_v)
@@ -715,7 +807,7 @@ namespace
             float delta = 0.0f;
             if (vi < d_v)
             {
-                delta = (v_src[vi] - kv) * beta_h;
+                delta = (v_local[tile_row * kGdnPrefillColumns + col_in_block] - kv) * beta_h;
             }
 
             float partial_out = 0.0f;
@@ -757,14 +849,13 @@ namespace
                 for (int j = 0; j < ROWS_PER_SPLIT; ++j)
                     snapshot[(j_start + j) * d_v + vi] = sc[j];
             }
-            if (has_next_row)
+            if (has_next_row && tile_row == tile_rows - 1)
             {
-                // Every thread finishes consuming the active stage before any
-                // thread may recycle it two iterations later.  The same edge
-                // also publishes the completed asynchronous next-row stage.
-                cuda_gdn_wait_qk_async();
+                // Join the next producer and finish all consumers before the
+                // old tile can be recycled. No per-row global-memory wait.
+                cuda_gdn_wait_inputs_async();
                 __syncthreads();
-                active_qk_stage = next_qk_stage;
+                active_stage = next_stage;
             }
         }
 
@@ -1540,65 +1631,11 @@ namespace
         float *__restrict__ out_q,
         float *__restrict__ out_k,
         float *__restrict__ out_v,
-        int seq_len, int n_k_heads, int n_v_heads,
+        llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
         int d_k, int d_v, int global_v_offset)
     {
-        if (n_k_heads <= 0 || n_v_heads <= 0 || d_k <= 0 || d_v <= 0)
-            return;
-
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-        // Layout sizes
-        int q_src_dim = n_k_heads * d_k;
-        int k_src_dim = n_k_heads * d_k;
-        int v_dim = n_v_heads * d_v;
-        int stride = q_src_dim + k_src_dim + v_dim;
-
-        int q_dst_dim = n_v_heads * d_k;
-        int k_dst_dim = n_v_heads * d_k;
-
-        // Total elements: Q + K + V = seq_len * (q_dst_dim + k_dst_dim + v_dim)
-        int q_total = seq_len * q_dst_dim;
-        int k_total = seq_len * k_dst_dim;
-        int v_total = seq_len * v_dim;
-        int total = q_total + k_total + v_total;
-
-        if (idx >= total)
-            return;
-
-        if (idx < q_total)
-        {
-            // Q region
-            int t = idx / q_dst_dim;
-            int rem = idx % q_dst_dim;
-            int j = rem / d_k; // output head index
-            int d = rem % d_k; // element within head
-            int k_idx = (j + global_v_offset) % n_k_heads;
-            if (k_idx < 0)
-                k_idx += n_k_heads;
-            out_q[idx] = merged[t * stride + k_idx * d_k + d];
-        }
-        else if (idx < q_total + k_total)
-        {
-            // K region
-            int local = idx - q_total;
-            int t = local / k_dst_dim;
-            int rem = local % k_dst_dim;
-            int j = rem / d_k;
-            int d = rem % d_k;
-            int k_idx = (j + global_v_offset) % n_k_heads;
-            if (k_idx < 0)
-                k_idx += n_k_heads;
-            out_k[local] = merged[t * stride + q_src_dim + k_idx * d_k + d];
-        }
-        else
-        {
-            // V region: straight copy (already n_v_heads wide)
-            int local = idx - q_total - k_total;
-            int t = local / v_dim;
-            int d = local % v_dim;
-            out_v[local] = merged[t * stride + q_src_dim + k_src_dim + d];
-        }
+        llaminar2::gdnDeinterleaveLiveRows(merged, out_q, out_k, out_v,
+            rows, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
     }
 
     /**
@@ -2028,9 +2065,10 @@ extern "C"
 extern "C"
 {
 
+    /** @brief Enqueue a checked live-row transform on its exact non-null stream. */
     bool cudaGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
-        int seq_len, int n_k_heads, int n_v_heads,
+        llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
         int d_k, int d_v, int global_v_offset,
         int device_idx, void *stream)
     {
@@ -2045,12 +2083,10 @@ extern "C"
             return false;
         }
 
-        int q_dst_dim = n_v_heads * d_k;
-        int k_dst_dim = n_v_heads * d_k;
-        int v_dim = n_v_heads * d_v;
-        int total = seq_len * (q_dst_dim + k_dst_dim + v_dim);
-        if (seq_len <= 0 || n_k_heads <= 0 || n_v_heads <= 0 ||
-            d_k <= 0 || d_v <= 0 || total <= 0)
+        const int seq_len = rows.physicalRows();
+        const int total = llaminar2::gdnDeinterleaveElementsPerRequest(
+            rows, n_k_heads, n_v_heads, d_k, d_v);
+        if (!stream || !merged || !out_q || !out_k || !out_v || total <= 0)
         {
             fprintf(stderr,
                     "[cudaGDN_deinterleave_qkv] invalid launch geometry: "
@@ -2062,7 +2098,7 @@ extern "C"
         }
 
         int threads = 256;
-        int blocks = (total + threads - 1) / threads;
+        const int blocks = 1 + (total - 1) / threads;
         cudaError_t pre_launch_sticky = cudaPeekAtLastError();
         cudaStreamCaptureStatus pre_capture_status = cudaStreamCaptureStatusNone;
         cudaError_t pre_capture_query =
@@ -2075,9 +2111,9 @@ extern "C"
             pre_stream_query = cudaStreamQuery(static_cast<cudaStream_t>(stream));
         }
 
-        cuda_gdn_deinterleave_qkv_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        cuda_gdn_deinterleave_qkv_kernel<<<dim3(blocks, rows.requests()), threads, 0, (cudaStream_t)stream>>>(
             merged, out_q, out_k, out_v,
-            seq_len, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
+            rows, n_k_heads, n_v_heads, d_k, d_v, global_v_offset);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
@@ -2245,18 +2281,19 @@ extern "C"
         }
 
         // Eight threads retain one deterministic key-row partition per output
-        // column. A 64-thread block owns eight columns, giving the Qwen
-        // D_V=128 geometry 512 independent blocks while retaining exactly the
-        // same within-column arithmetic tree. Profiling selects ten resident
-        // blocks as the best spill-free register/occupancy point on SM86.
-        constexpr int col_threads = 64;
+        // column. Four warps own sixteen columns, giving 256 independent CTAs
+        // for 32 heads of D_V=128. The input copy loop stays rolled so its
+        // address arithmetic does not spill the persistent recurrence state.
+        // The block geometry never changes the within-column reduction order.
+        constexpr int col_threads = kGdnPrefillThreads;
         constexpr int cols_per_block =
             col_threads / kGdnRecurrentRowSplit;
         const int num_col_blocks =
             (d_v + cols_per_block - 1) / cols_per_block;
-        // Q/K use two shared stages so row t+1 transfers overlap row t's exact
-        // recurrence. No reduction workspace or extra graph binding is needed.
-        const int smem_size = 4 * d_k * sizeof(float);
+        // Two bounded input tiles hide global latency without another physical
+        // allocation, graph binding, or change to the arithmetic schedule.
+        const int smem_size = 2 * kGdnPrefillTileRows *
+            (2 * d_k + kGdnPrefillColumns + 2) * sizeof(float);
 
         const int preprocess_blocks = seq_len * n_heads;
         cuda_gdn_prefill_preprocess_kernel<<<preprocess_blocks, 64, 0, (cudaStream_t)stream>>>(

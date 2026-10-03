@@ -14,6 +14,11 @@
  * - IKVCache polymorphism compliance
  * - Evict + append + retrieve sequences
  * - Multi-layer-independent ring wrapping
+ *
+ * Wrapped scalar observations borrow the graph workspace, just like converted
+ * attention views. These fixtures bind that storage before reading and use an
+ * explicit stream; a hidden per-layer contiguous mirror is not part of the
+ * cache's permanent allocation contract.
  */
 
 #include <gtest/gtest.h>
@@ -21,12 +26,14 @@
 #include <vector>
 #include <random>
 #include <cmath>
+#include "../KVCacheTestWorkspace.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "kernels/IKVCache.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
+using llaminar2::test::KVCacheTestWorkspaceBinding;
 
 namespace
 {
@@ -469,6 +476,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiWrap_StressTest)
     const int kv_dim = 2 * 16;
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32, 1, 1, max_seq, 2, 16);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*workspace_consumer, DeviceId::cuda(0));
+    ScopedCudaStream read_stream;
 
     // Wrap around 5 complete times (40 tokens through an 8-slot buffer)
     std::vector<float> last_batch_K;
@@ -492,7 +503,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, MultiWrap_StressTest)
     // Verify the most recent 4 tokens (from last batch) are present
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_TRUE(cache->get_kv_for_attention(
+        0, 0, &d_K_out, &d_V_out, &kv_len, read_stream.stream));
+    read_stream.synchronize();
     EXPECT_EQ(kv_len, max_seq);
 
     std::vector<float> h_K_out(max_seq * kv_dim);
@@ -620,6 +633,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
     const int kv_dim = 2 * 16;
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32, 1, 1, max_seq, 2, 16);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*workspace_consumer, DeviceId::cuda(0));
+    ScopedCudaStream read_stream;
 
     // Fill partially (not wrapped)
     auto h_data = generateRandomFP32((max_seq - 1) * kv_dim);
@@ -630,7 +647,8 @@ TEST(Test__CUDARingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
 
     const void *dk, *dv;
     int len;
-    cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
+    ASSERT_TRUE(cache->get_kv_for_attention(
+        0, 0, &dk, &dv, &len, read_stream.stream));
     int count_after_first = cache->get_linearization_count();
 
     // Add 2 more tokens to force wrap
@@ -640,7 +658,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
         cache, 0, 0, d_extra.ptr, d_extra.ptr, 2));
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
-    cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
+    ASSERT_TRUE(cache->get_kv_for_attention(
+        0, 0, &dk, &dv, &len, read_stream.stream));
+    read_stream.synchronize();
     EXPECT_GT(cache->get_linearization_count(), count_after_first)
         << "Linearization counter should increase after wrapped get_kv";
 
@@ -661,6 +681,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     const int kv_dim = 2 * 16;
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32, 1, 1, max_seq, 2, 16);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*workspace_consumer, DeviceId::cuda(0));
+    ScopedCudaStream read_stream;
 
     auto h_K = generateRandomFP32(max_seq * kv_dim, 42);
     auto h_V = generateRandomFP32(max_seq * kv_dim, 43);
@@ -674,7 +698,9 @@ TEST(Test__CUDARingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     // Retrieve and verify data integrity despite head-pointer wrap
     const void *dk, *dv;
     int len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0));
+    ASSERT_TRUE(cache->get_kv_for_attention(
+        0, 0, &dk, &dv, &len, read_stream.stream));
+    read_stream.synchronize();
     EXPECT_EQ(len, max_seq);
 
     std::vector<float> out(max_seq * kv_dim);
@@ -694,6 +720,10 @@ TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCanonicalRingState)
     const int kv_dim = 2 * 16;
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32, 1, 1, 8, 2, 16);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*workspace_consumer, DeviceId::cuda(0));
+    ScopedCudaStream reset_stream;
 
     auto h_data = generateRandomFP32(10 * kv_dim);
     CudaBuffer d_K(h_data), d_V(h_data);
@@ -704,11 +734,11 @@ TEST(Test__CUDARingKVCache_Comprehensive, Clear_ResetsCanonicalRingState)
 
     const void *dk, *dv;
     int len;
-    cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
-
-    ScopedCudaStream reset_stream;
+    ASSERT_TRUE(cache->get_kv_for_attention(
+        0, 0, &dk, &dv, &len, reset_stream.stream));
     ASSERT_TRUE(cache->resetRequestState(
         IKVCache::StateResetContext::testReinitialization(
             reset_stream.opaque())));
+    reset_stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 }

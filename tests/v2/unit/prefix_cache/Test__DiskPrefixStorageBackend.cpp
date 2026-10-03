@@ -1,3 +1,12 @@
+/**
+ * @file Test__DiskPrefixStorageBackend.cpp
+ * @brief Device-free durability and online prefix-archive lifecycle regressions.
+ *
+ * Exercises the production archive worker, concurrent appends, restart-visible
+ * LRU, checksum rejection and retained-inode hydration. Maintenance must never
+ * require inference to rewrite old payloads or abandon a verified restore.
+ */
+
 #include <gtest/gtest.h>
 
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
@@ -8,8 +17,10 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <string>
+#include <thread>
 
 using namespace llaminar2;
 
@@ -18,6 +29,7 @@ namespace
     constexpr const char *kModelArtifactIdentity =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    /** @brief Small valid attention block, with a terminal payload checksum. */
     PrefixPayloadLayout makeLayout()
     {
         PrefixPayloadLayout layout;
@@ -31,17 +43,20 @@ namespace
         return layout;
     }
 
+    /** @return Stable key independent of hardware, model files or timing. */
     PrefixCacheKey testKey()
     {
         return makePrefixCacheKey(0x12345678, 0, 0, 0, {1, 2});
     }
 
+    /** @return One uniquely owned temporary directory for this test lifetime. */
     std::filesystem::path tempDir()
     {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         return std::filesystem::temp_directory_path() / ("llaminar_prefix_disk_" + std::to_string(stamp));
     }
 
+    /** @return Model-addressed archive within the exact owned temporary root. */
     std::filesystem::path archivePath(const std::filesystem::path &directory)
     {
         return directory /
@@ -115,6 +130,233 @@ TEST(Test__DiskPrefixStorageBackend,
             PhysicalMemoryMaterializationKind::NewAllocation),
         0u);
     cleanup();
+}
+
+/** @test Explicit maintenance executes off the caller and preserves restart LRU. */
+TEST(Test__DiskPrefixStorageBackend, BackgroundCompactionPreservesCommittedLRU)
+{
+    const auto dir = tempDir();
+    auto layout = makeLayout();
+    const auto a = testKey();
+    const auto b = makePrefixCacheKey(a.fingerprint, 0, 1, 2, {3, 4});
+    const auto c = makePrefixCacheKey(a.fingerprint, 0, 2, 4, {5, 6});
+    const size_t budget = 2u * layout.totalBytes();
+    {
+        RamPrefixStorageBackend ram(3u * layout.totalBytes());
+        DiskPrefixStorageBackend disk(archivePath(dir), budget, kModelArtifactIdentity);
+        std::string error;
+        for (const auto &key : {a, b})
+        {
+            auto handle = ram.allocate(key, layout);
+            ASSERT_TRUE(handle.valid());
+            std::fill(handle.kv_storage->begin(), handle.kv_storage->end(),
+                      key == a ? 0x31 : 0x42);
+            ASSERT_TRUE(disk.writeBlock(handle, nullptr, nullptr, &error)) << error;
+        }
+        PrefixBlockHandle hydrated;
+        ASSERT_TRUE(disk.readBlock(a, layout, &hydrated, &error)) << error;
+        ASSERT_TRUE(disk.requestCompaction(&error)) << error;
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        const auto status = disk.compactionStatus();
+        EXPECT_EQ(status.state, DiskPrefixStorageBackend::CompactionState::Idle);
+        EXPECT_EQ(status.publications, 1u);
+        EXPECT_NE(status.last_executor, std::this_thread::get_id())
+            << "Live inference must not execute archive payload maintenance";
+    }
+    {
+        DiskPrefixStorageBackend reopened(archivePath(dir), budget, kModelArtifactIdentity);
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        auto handle = ram.allocate(c, layout);
+        std::vector<PrefixCacheKey> evicted;
+        std::string error;
+        ASSERT_TRUE(reopened.writeBlock(handle, nullptr, &evicted, &error)) << error;
+        ASSERT_EQ(evicted.size(), 1u);
+        EXPECT_EQ(evicted.front(), b) << "Compaction must preserve A's durable touch";
+        PrefixBlockHandle hydrated;
+        ASSERT_TRUE(reopened.readBlock(a, layout, &hydrated, &error)) << error;
+        EXPECT_TRUE(std::all_of(hydrated.kv_storage->begin(), hydrated.kv_storage->end(),
+                               [](uint8_t byte) { return byte == 0x31; }));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/** @test A verified, logically evicted record survives another backend's rename. */
+TEST(Test__DiskPrefixStorageBackend, VerifiedHydrationSurvivesBackgroundInodeReplacement)
+{
+    const auto dir = tempDir();
+    auto layout = makeLayout();
+    const auto key = testKey();
+    {
+        auto reader = std::make_shared<DiskPrefixStorageBackend>(
+            archivePath(dir), layout.totalBytes(), kModelArtifactIdentity);
+        RamPrefixStorageBackend ram(layout.totalBytes());
+        auto original = ram.allocate(key, layout);
+        std::fill(original.kv_storage->begin(), original.kv_storage->end(), 0xab);
+        std::fill(original.terminal_logits_storage->begin(),
+                  original.terminal_logits_storage->end(), 0xcd);
+        std::string error;
+        ASSERT_TRUE(reader->writeBlock(original, nullptr, nullptr, &error)) << error;
+        auto ticket = reader->beginVerifiedHydration(key, layout, &error);
+        ASSERT_TRUE(ticket.has_value()) << error;
+
+        DiskPrefixStorageBackend peer(archivePath(dir), layout.totalBytes(), kModelArtifactIdentity);
+        auto replacement = original;
+        replacement.key = makePrefixCacheKey(key.fingerprint, 0, 1, 2, {9, 10});
+        ASSERT_TRUE(peer.writeBlock(replacement, nullptr, nullptr, &error)) << error;
+        ASSERT_TRUE(peer.requestCompaction(&error)) << error;
+        ASSERT_TRUE(peer.waitForCompaction(&error)) << error;
+        EXPECT_EQ(peer.compactionStatus().publications, 1u);
+
+        // Drop the RAM owner before filling final storage: the old inode, not
+        // a second payload copy, is the ticket's only surviving byte authority.
+        ram.release(original);
+        original = {};
+        replacement = {};
+        PrefixBlockHandle restored;
+        ASSERT_TRUE(reader->hydrateVerified(*ticket, ram, &restored, &error)) << error;
+        EXPECT_EQ(restored.key, key);
+        EXPECT_TRUE(std::all_of(restored.kv_storage->begin(), restored.kv_storage->end(),
+                               [](uint8_t byte) { return byte == 0xab; }));
+        EXPECT_TRUE(std::all_of(restored.terminal_logits_storage->begin(),
+                               restored.terminal_logits_storage->end(),
+                               [](uint8_t byte) { return byte == 0xcd; }));
+        EXPECT_FALSE(reader->hydrateVerified(*ticket, ram, &restored, &error));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/** @test Concurrent writers/touches/deletes survive the worker's exact tail frontier. */
+TEST(Test__DiskPrefixStorageBackend, BackgroundCompactionPreservesConcurrentMutationTail)
+{
+    const auto dir = tempDir();
+    const auto layout = makeLayout();
+    std::vector<PrefixCacheKey> expected;
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 0u, kModelArtifactIdentity);
+        DiskPrefixStorageBackend peer(archivePath(dir), 0u, kModelArtifactIdentity);
+        auto write = [&](DiskPrefixStorageBackend &backend, int begin)
+        {
+            RamPrefixStorageBackend ram(layout.totalBytes());
+            for (int index = begin; index < begin + 40; ++index)
+            {
+                const auto key = makePrefixCacheKey(testKey().fingerprint, 0,
+                    index, 2 * index, {2 * index + 1, 2 * index + 2});
+                auto handle = ram.allocate(key, layout);
+                if (!handle.valid())
+                    return std::string("writer could not allocate its one block");
+                std::fill(handle.kv_storage->begin(), handle.kv_storage->end(),
+                          static_cast<uint8_t>(index));
+                std::string error;
+                if (!backend.writeBlock(handle, nullptr, nullptr, &error))
+                    return error;
+                if (index % 3 == 0 && !backend.release(handle))
+                    return std::string("concurrent delete failed");
+                ram.release(handle);
+                handle = {};
+                if (index % 4 == 0 && !backend.requestCompaction(&error))
+                    return error;
+            }
+            return std::string{};
+        };
+        auto first = std::async(std::launch::async, [&] { return write(disk, 0); });
+        auto second = std::async(std::launch::async, [&] { return write(peer, 40); });
+        EXPECT_EQ(first.get(), "");
+        EXPECT_EQ(second.get(), "");
+        std::string error;
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        ASSERT_TRUE(peer.waitForCompaction(&error)) << error;
+        ASSERT_TRUE(disk.requestCompaction(&error)) << error;
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        EXPECT_GT(disk.compactionStatus().publications, 0u);
+        for (int index = 0; index < 80; ++index)
+            if (index % 3 != 0)
+                expected.push_back(makePrefixCacheKey(testKey().fingerprint, 0,
+                    index, 2 * index, {2 * index + 1, 2 * index + 2}));
+    }
+    {
+        DiskPrefixStorageBackend reopened(archivePath(dir), 0u, kModelArtifactIdentity);
+        std::string error;
+        const auto entries = reopened.compatibleEntries(testKey().fingerprint, layout, &error);
+        ASSERT_EQ(entries.size(), expected.size()) << error;
+        for (const auto &key : expected)
+        {
+            PrefixBlockHandle restored;
+            ASSERT_TRUE(reopened.readBlock(key, layout, &restored, &error)) << error;
+            EXPECT_TRUE(std::all_of(restored.kv_storage->begin(), restored.kv_storage->end(),
+                [&](uint8_t byte) { return byte == static_cast<uint8_t>(key.block_index); }));
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/** @test Real stale payload volume schedules automatic off-request reclamation. */
+TEST(Test__DiskPrefixStorageBackend, BackgroundCompactionReclaimsAutomaticCapacityHistory)
+{
+    const auto dir = tempDir();
+    {
+        auto layout = makeLayout();
+        layout.bytes_per_fa_layer_k = 4u * 1024u * 1024u;
+        layout.bytes_per_fa_layer_v = 4u * 1024u * 1024u;
+        layout.includes_terminal_logits = false;
+        layout.terminal_logits_bytes = 0u;
+        const auto bytes = layout.totalBytes();
+        RamPrefixStorageBackend ram(bytes);
+        auto handle = ram.allocate(testKey(), layout);
+        ASSERT_TRUE(handle.valid());
+        DiskPrefixStorageBackend disk(archivePath(dir), bytes, kModelArtifactIdentity);
+        std::string error;
+        for (uint8_t version = 0; version < 9; ++version)
+        {
+            std::fill(handle.kv_storage->begin(), handle.kv_storage->end(), version);
+            ASSERT_TRUE(disk.writeBlock(handle, nullptr, nullptr, &error)) << error;
+        }
+        ASSERT_TRUE(disk.waitForCompaction(&error)) << error;
+        const auto status = disk.compactionStatus();
+        EXPECT_GT(status.publications, 0u);
+        EXPECT_NE(status.last_executor, std::this_thread::get_id());
+        // Correct restored bytes alone cannot prove economical maintenance.
+        // Check actual descriptor flags as well as completed writes. Successful
+        // range-flush calls can do no work on a container OverlayFS mapping;
+        // the native O_DSYNC contract must be present before any bulk copy.
+        const auto &writeback = status.last_writeback;
+        EXPECT_EQ(writeback.native_open_flags & O_DSYNC, O_DSYNC);
+        EXPECT_GT(writeback.durable_writes, 0u);
+        EXPECT_GE(writeback.durable_bytes, bytes);
+        EXPECT_LE(writeback.largest_write_bytes,
+                  PrefixArchiveIOGeometry::compactionBytes());
+        EXPECT_EQ(disk.usedBytes(), bytes);
+        EXPECT_LT(std::filesystem::file_size(disk.archivePath()), 4u * bytes);
+        PrefixBlockHandle restored;
+        ASSERT_TRUE(disk.readBlock(testKey(), layout, &restored, &error)) << error;
+        EXPECT_TRUE(std::all_of(restored.kv_storage->begin(), restored.kv_storage->end(),
+                               [](uint8_t byte) { return byte == 8u; }));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+/** @test Background failures are retained and reject further archive operations. */
+TEST(Test__DiskPrefixStorageBackend, BackgroundCompactionFailureInvalidatesArchive)
+{
+    const auto dir = tempDir();
+    {
+        DiskPrefixStorageBackend disk(archivePath(dir), 1024u, kModelArtifactIdentity);
+        // A directory at this exact, worker-owned output name deterministically
+        // rejects native open without corrupting the committed source archive.
+        std::filesystem::create_directory(
+            disk.archivePath().string() + ".compact." + std::to_string(::getpid()));
+        std::string error;
+        ASSERT_TRUE(disk.requestCompaction(&error)) << error;
+        EXPECT_FALSE(disk.waitForCompaction(&error));
+        EXPECT_FALSE(disk.ready());
+        EXPECT_EQ(disk.compactionStatus().state,
+                  DiskPrefixStorageBackend::CompactionState::Failed);
+        EXPECT_NE(error.find("failed to create compact prefix archive"), std::string::npos);
+        EXPECT_FALSE(disk.requestCompaction(&error));
+        RamPrefixStorageBackend ram(1024u);
+        auto handle = ram.allocate(testKey(), makeLayout());
+        EXPECT_FALSE(disk.writeBlock(handle, nullptr, nullptr, &error));
+    }
+    std::filesystem::remove_all(dir);
 }
 
 TEST(Test__DiskPrefixStorageBackend, UsesStableModelArtifactIdentityForArchiveNaming)

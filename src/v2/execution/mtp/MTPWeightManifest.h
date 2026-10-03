@@ -30,6 +30,7 @@ namespace llaminar2
         ExpertOverlay,
     };
 
+    /** @brief Authenticated tensor roles for one learned predictor block. */
     struct MTPDepthWeightNames
     {
         int depth_index = 0;
@@ -63,9 +64,11 @@ namespace llaminar2
         std::string shared_expert_down;
         std::string shared_expert_gate_inp;
 
+        /** @return Nonempty mandatory roles, including routed/shared MoE parents. */
         std::vector<std::string> requiredNames() const;
     };
 
+    /** @brief Complete discovery result; unavailable weights never imply a synthetic predictor. */
     struct MTPWeightManifest
     {
         bool available = false;
@@ -75,6 +78,7 @@ namespace llaminar2
         std::vector<std::string> missing_required;
         std::string diagnostic;
 
+        /** @return Sorted, duplicate-free source names for all learned blocks. */
         std::vector<std::string> requiredNames() const;
 
         /**
@@ -93,11 +97,37 @@ namespace llaminar2
             MTPRoutedExpertWeightAuthority routed_authority) const;
     };
 
+    /**
+     * @brief Inspect metadata and the tensor directory without loading payloads.
+     * @param loader Exact model source whose tensor inventory will be materialized.
+     * @param architecture GGUF architecture owning the metadata namespace.
+     * @param base_layer_count Raw block count or known main-layer count.
+     * @param explicit_mtp Select an actionable diagnostic when MTP was requested.
+     * @return Available complete learned weights, or an unavailable diagnostic.
+     */
     MTPWeightManifest discoverMTPWeightManifest(
         const IModelLoader &loader,
         const std::string &architecture,
         int base_layer_count,
         bool explicit_mtp);
+
+    /**
+     * @brief Require real learned MTP weights before admission or graph allocation.
+     * @param loader Exact source directory, not a runtime cache or host mirror.
+     * @param architecture GGUF metadata namespace.
+     * @param base_layer_count Raw block count or known main-layer count.
+     * @return Complete manifest produced by the canonical discovery algorithm.
+     * @throws std::invalid_argument For missing, incomplete or unsupported predictors.
+     *
+     * A rolled predictor still needs learned weights. Increasing the memory BOM
+     * cannot make a plain GGUF support MTP, and startup must not silently disable
+     * an explicitly requested policy. Draft depth is independent of the number
+     * of learned predictor blocks discovered here.
+     */
+    [[nodiscard]] MTPWeightManifest requireMTPWeightManifest(
+        const IModelLoader &loader,
+        const std::string &architecture,
+        int base_layer_count);
 
     /**
      * @brief Return the number of decoder layers that belong to the main graph.
@@ -106,6 +136,10 @@ namespace llaminar2
      * trailing nextn/MTP sidecar block(s). The sidecar weights must remain in
      * the tensor inventory, but orchestration planners and main graph builders
      * should not assign those blocks as ordinary decoder layers.
+     * @param loader Source metadata and tensor directory, without materialization.
+     * @param architecture GGUF metadata namespace.
+     * @param raw_layer_count Unadjusted GGUF block count.
+     * @return Main-forward count, excluding an authenticated trailing NextN block.
      */
     int mainLayerCountExcludingMTP(
         const IModelLoader &loader,

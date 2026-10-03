@@ -137,6 +137,37 @@ namespace llaminar2::test::parity
         }
     }
 
+    TEST(ModelParityCrossHostE2E, ExportedPlanningRetainsTheCompleteTypedRankMembership)
+    {
+        // Discovery consumes this actual C++ wire record. A synthetic Python
+        // fixture alone cannot detect a field dropped by the real exporter.
+        for (const auto address : {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+            for (const int count : {1, 2, 3, 8})
+            {
+                auto definition = remoteSource(address);
+                definition.e2e_certifiable.front().remote_cpu_overlays = {ModelParityRemoteCPUHosts{count}};
+                const auto backend = address.isCUDA() ? "cuda" : "rocm";
+                std::size_t routes = 0;
+                for (const auto &cell : expandModelParityDefinition(definition))
+                {
+                    const auto exported = record(cell);
+                    for (const auto &remote : exported.at("cross_host_e2e"))
+                    {
+                        const nlohmann::json expected{
+                            {"mode", "auto"}, {"strategy", "expert-overlay"},
+                            {"device_counts", {{backend, 1}, {"cpu", count}}},
+                            {"mpi_ranks", remote.at("topology").at("execution_ranks")}};
+                        EXPECT_EQ(remote.at("planning"), expected)
+                            << "Complete planning membership must accompany " << remote.at("id");
+                        ++routes;
+                    }
+                }
+                // Both public routes must carry the same sealed host/rank
+                // contract; no empty export may make the assertion vacuous.
+                EXPECT_EQ(routes, kModelParityCrossHostFrontends.size());
+            }
+    }
+
     TEST(ModelParityCrossHostE2E, EligibilityRejectsDuplicateAndNonGpuSourceTopologies)
     {
         auto definition = remoteSource();

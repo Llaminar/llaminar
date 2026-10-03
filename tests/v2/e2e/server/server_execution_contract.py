@@ -152,6 +152,17 @@ def automatic_selection_policy(profile: Mapping[str, Any]) -> dict:
         raise ValueError("E2E automatic planning requires an exact positive MPI rank count")
     result = {"mode": "auto", "strategy": selection["strategy"],
               "device_counts": dict(counts), "mpi_ranks": ranks}
+    if "routed_compute" in selection:
+        policy = selection["routed_compute"]
+        if (not isinstance(policy, str)
+                or policy not in {"replicated", "apportioned", "tensor-sharded", "gate-up-owned-down-columns"}
+                or selection["strategy"] not in {"tp", "expert-overlay"}):
+            raise ValueError("automatic overlay contract has invalid routed compute policy")
+        if policy == "gate-up-owned-down-columns" and (
+                selection["strategy"] != "tp" or ranks != 1 or len(counts) != 1
+                or "cpu" in counts or next(iter(counts.values())) < 2):
+            raise ValueError("projection ownership requires one homogeneous rank-local multi-GPU domain")
+        result["routed_compute"] = policy
     if "pipeline_domains" in selection or "pipeline_layers" in selection:
         domains, layers = selection.get("pipeline_domains"), selection.get("pipeline_layers")
         if (selection["strategy"] != "pp" or type(layers) is not int or layers <= 0
@@ -239,10 +250,12 @@ def validate_automatic_selection(data: Mapping[str, Any], selection: Mapping[str
     rows = [row for row in data["records"] if row.get("domain") == "server"]
     memberships, participants, visible = {}, {}, set()
     strategy = None
+    routed_compute = None
     for row in rows:
         name, rank, tags = row.get("name"), row.get("rank"), row.get("tags", {})
         if name == "execution_policy":
             strategy = tags.get("execution_strategy")
+            routed_compute = tags.get("routed_compute")
         elif name == "execution_topology":
             visible.update((rank, device) for device in _devices(tags["devices"]))
         elif name == "rank_membership":
@@ -277,6 +290,11 @@ def validate_automatic_selection(data: Mapping[str, Any], selection: Mapping[str
         raise ValueError(f"automatic selection mismatch: observed strategy={strategy}, devices={counts}; expected {expected}")
     result = {"strategy": strategy, "device_counts": counts,
               "mpi_ranks": data["world_size"]}
+    if "routed_compute" in expected:
+        if routed_compute != expected["routed_compute"]:
+            raise ValueError(f"automatic routed compute mismatch: observed {routed_compute!r}, "
+                             f"expected {expected['routed_compute']!r}")
+        result["routed_compute"] = routed_compute
     if "pipeline_domains" in expected:
         result["pipeline_domains"] = _validate_pipeline_domains(rows, participants, expected)
         result["pipeline_layers"] = expected["pipeline_layers"]

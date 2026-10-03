@@ -14,6 +14,8 @@
  * - Cosine similarity >= 0.999 for all operations
  * - No NaN/Inf in outputs
  * - Top-k expert selections match CPU reference
+ * - Captured canonical route publication matches serial expert outputs byte
+ *   for byte across codebooks, participant masks, and long-prefill buckets.
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20)
  */
@@ -69,6 +71,7 @@
 
 #include <vector>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <random>
@@ -25275,6 +25278,27 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
         });
 }
 
+/**
+ * @brief Prove routed prefill against the canonical serial-row expert arithmetic.
+ *
+ * Prepared weights and workspace bindings are immutable before capture. The
+ * masked participant path records grouping, both device-admitted publication
+ * families, and the ordered route fold in one retained graph, then replays it
+ * twice. Inactive tiled directories must remain untouched through empty and
+ * sparse replays, then rebuild correctly when tiled work becomes live again.
+ * Remote descriptors stay absent and route storage starts poisoned so
+ * missing zero publication or stale rows cannot accidentally match the oracle.
+ *
+ * @param format_label Diagnostic name of the prepared expert codebook triplet.
+ * @param make_gate Factory for deterministic gate weights.
+ * @param make_up Factory for deterministic up weights.
+ * @param make_down Factory for deterministic down weights.
+ * @param masked_local_tp Restrict expert ownership to one LocalTP participant.
+ * @param exercise_router_q8_publication Also verify reuse of router Q8 inputs.
+ * @param row_inventory Positive runtime row counts sharing prepared storage.
+ * @param expert_width Expert intermediate width; narrow values exercise partial
+ *        quantization workgroups independently of Qwen's usual width 512.
+ */
 template <typename GateFactory, typename UpFactory, typename DownFactory>
 void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const char *format_label,
@@ -25283,7 +25307,8 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     DownFactory make_down,
     bool masked_local_tp = false,
     bool exercise_router_q8_publication = false,
-    std::span<const int> row_inventory = kGroupedVerifierRuntimeRows)
+    std::span<const int> row_inventory = kGroupedVerifierRuntimeRows,
+    int expert_width = 512)
 {
     SKIP_IF_NO_ROCM();
 
@@ -25294,7 +25319,9 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const DeviceId device = DeviceId::rocm(0);
     const std::string format_name = format_label ? format_label : "unknown_format";
     constexpr int d_model = 2048;
-    constexpr int intermediate = 512;
+    const int intermediate = expert_width;
+    ASSERT_GT(intermediate, 0);
+    ASSERT_EQ(intermediate % 32, 0);
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
     constexpr int routed_variants = 16;
@@ -25692,6 +25719,90 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 << format_name << " canonical LocalTP route reduction M="
                 << seq_len;
         }
+        if (masked_local_tp)
+        {
+            // The warm execution above establishes immutable scratch bindings.
+            // Retain the complete grouping/projection/publication transaction
+            // and compare replay, not just the eager numerical warmup.
+            ScopedHipTestGraph graph(0, stream, "canonical MoE route publication");
+            ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsyncUsingPublishedMask(
+                routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
+            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
+                hidden.get(), grouped_output.get(), gateup_table, down_table,
+                seq_len, d_model, intermediate, num_experts, top_k,
+                canonical_route_contributions.get()));
+            ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                canonical_route_contributions.get(), grouped_output.get(), seq_len, top_k, d_model));
+            ASSERT_TRUE(graph.finishAndInstantiate());
+            ASSERT_TRUE(graph.launch());
+            ASSERT_TRUE(graph.launch());
+            // The tiled directory has no consumer when device admission picks
+            // route-owned work. Poison its complete named span to prove that
+            // an inactive planner performs neither a scan nor tail stores.
+            void *const directory = moe_workspace->getBuffer(
+                MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY);
+            const size_t directory_bytes = moe_workspace->getBufferSize(
+                MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY);
+            ASSERT_NE(directory, nullptr);
+            ASSERT_GT(directory_bytes, 0u);
+            ASSERT_EQ(directory_bytes % sizeof(uint32_t), 0u);
+            const auto expect_dormant_directory = [&](uint32_t pattern)
+            {
+                std::vector<uint32_t> observed(directory_bytes / sizeof(uint32_t));
+                ASSERT_EQ(hipMemcpyAsync(observed.data(), directory, directory_bytes,
+                    hipMemcpyDeviceToHost, stream), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+                for (size_t word = 0; word < observed.size(); ++word)
+                    ASSERT_EQ(observed[word], pattern)
+                        << format_name << " M=" << seq_len << " dormant tile-directory word " << word;
+            };
+            // Request data may change without recapturing topology. An empty
+            // compact prefix must publish zeros, then the original routes must
+            // work again with the same pointers and retained transaction.
+            std::vector<float> empty_routes(route_indices.size(), -1.0f);
+            ASSERT_EQ(hipMemcpyAsync(routing_indices->gpu_data_ptr(),
+                empty_routes.data(), empty_routes.size() * sizeof(float),
+                hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(directory, 0xa5, directory_bytes, stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            std::vector<float> empty_output(grouped_output->numel());
+            ASSERT_EQ(hipMemcpyAsync(empty_output.data(), grouped_output->gpu_data_ptr(),
+                empty_output.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            for (const float value : empty_output)
+                ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u)
+                    << format_name << " empty grouped replay must publish positive zero";
+            ASSERT_NO_FATAL_FAILURE(expect_dormant_directory(0xa5a5a5a5u));
+
+            // A small compact prefix can belong to the very last physical
+            // rows. Retain only the last eight rows' original routes: every
+            // format must switch from tiled to route-owned work without
+            // truncating those late original indices or recapturing a graph.
+            const int tail_start = std::max(0, seq_len - 8);
+            auto tail_routes = route_indices;
+            std::fill(tail_routes.begin(), tail_routes.begin() + tail_start * top_k, -1.0f);
+            ASSERT_EQ(hipMemcpyAsync(routing_indices->gpu_data_ptr(),
+                tail_routes.data(), tail_routes.size() * sizeof(float),
+                hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_EQ(hipMemsetAsync(directory, 0x5a, directory_bytes, stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            std::vector<float> tail_output(grouped_output->numel());
+            ASSERT_EQ(hipMemcpyAsync(tail_output.data(), grouped_output->gpu_data_ptr(),
+                tail_output.size() * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            auto tail_expected = row_by_row_expected;
+            std::fill(tail_expected.begin(), tail_expected.begin() + tail_start * d_model, 0.0f);
+            expectBitwiseVerifierRowsEqual(
+                (format_name + " compact routes at the physical matrix tail").c_str(),
+                tail_output.data(), tail_expected.data(), tail_output.size(), d_model);
+            ASSERT_NO_FATAL_FAILURE(expect_dormant_directory(0x5a5a5a5au));
+
+            ASSERT_EQ(hipMemcpyAsync(routing_indices->gpu_data_ptr(),
+                route_indices.data(), route_indices.size() * sizeof(float),
+                hipMemcpyHostToDevice, stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
         ASSERT_TRUE(grouped_output->ensureOnHost(stream));
 
         expectBitwiseVerifierRowsEqual(
@@ -25903,7 +26014,10 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         intermediate,
         num_experts,
         top_k);
-    moe_workspace.reset();
+    // Retain one active workspace authority for observation as well as launch.
+    // The kernel was rebound above; assignment now retires the old allocation
+    // without leaving the shared replay checker with a null/retired owner.
+    moe_workspace = std::move(rebound_workspace);
 
     SCOPED_TRACE("ROCm grouped verifier scratch pointers must be rebound after workspace handoff");
     run_grouped_and_check(row_inventory.back(), "after workspace rebind");
@@ -26958,6 +27072,115 @@ TEST(Test__ROCmMoEKernel, MaskedLocalTPGroupedPrefill_Qwen36AllNativeVNNIFormats
             /*masked_local_tp=*/true,
             /*exercise_router_q8_publication=*/true,
             kGroupedVerifierQwenScalableRows);
+    }
+}
+
+/**
+ * @brief Certify bounded canonical publication for every quantized codebook.
+ *
+ * M=4 ends at the publication grid's slot-lane boundary; M=9 crosses it on
+ * the direct route-owned family, while M=33 selects expert tiling. The shared
+ * fixture poisons route storage, mixes local/remote ownership, captures the
+ * complete pipeline and proves raw-byte equality to the scalar oracle.
+ */
+TEST(Test__ROCmMoEKernel, CanonicalPublicationBoundedGridAllCodebooksCapturedByteExact)
+{
+    constexpr std::array<int, 3> rows = {4, 9, 33};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    for (const auto &format : allMoEVerifierFormatCases())
+    {
+        SCOPED_TRACE(format.name);
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+            format.name, format.make, format.make, format.make,
+            /*masked_local_tp=*/true,
+            /*exercise_router_q8_publication=*/false, rows);
+    }
+}
+
+/** @brief Prove captured publication covers long physical route banks exactly. */
+TEST(Test__ROCmMoEKernel, CanonicalPublicationLongPrefillCapturedByteExact)
+{
+    constexpr std::array<int, 3> rows = {64, 256, 512};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    const auto formats = allMoEVerifierFormatCases();
+    const auto format = std::find_if(formats.begin(), formats.end(), [](const auto &candidate) {
+        return std::string(candidate.name) == "IQ2_S";
+    });
+    ASSERT_NE(format, formats.end());
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        format->name, format->make, format->make, format->make,
+        /*masked_local_tp=*/true,
+        /*exercise_router_q8_publication=*/false, rows);
+}
+
+/**
+ * @brief Prove packed Q8 subgroups at live-prefix and workgroup tail boundaries.
+ *
+ * Width 96 contributes three 32-value blocks per route. Four local routes per
+ * row leave half of the final eight-subgroup workgroup active for odd M. The
+ * fixture replays nonempty, empty, then restored routing through the same graph
+ * and compares raw output bytes to independent serial-row decode. Q8_0 admits
+ * this narrow width without changing the prepared weight representation.
+ */
+TEST(Test__ROCmMoEKernel, GroupedSwiGLUPackedSubgroupTailCapturedByteExact)
+{
+    constexpr std::array<int, 4> rows = {1, 3, 9, 33};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    const auto formats = allMoEVerifierFormatCases();
+    const auto format = std::find_if(formats.begin(), formats.end(), [](const auto &candidate) {
+        return std::string(candidate.name) == "Q8_0";
+    });
+    ASSERT_NE(format, formats.end());
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        format->name, format->make, format->make, format->make,
+        /*masked_local_tp=*/true,
+        /*exercise_router_q8_publication=*/false, rows,
+        /*expert_width=*/96);
+}
+
+/**
+ * @brief Bound sparse projection grids without losing late original tokens.
+ *
+ * These matrices begin with enough local routes to select expert tiling, then
+ * retain only their last eight token rows. The same captured graph must select
+ * compact route-owned projection and publish exactly the serial-row bytes.
+ * Empty and restored routing additionally prove reset/replay equivalence. The
+ * shared fixture applies this protocol to the all-codebook gate as well.
+ */
+TEST(Test__ROCmMoEKernel, CompactRouteProjectionSparseTailCapturedByteExact)
+{
+    constexpr std::array<int, 2> rows = {33, 65};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    const auto formats = allMoEVerifierFormatCases();
+    const auto format = std::find_if(formats.begin(), formats.end(), [](const auto &candidate) {
+        return std::string(candidate.name) == "Q8_0";
+    });
+    ASSERT_NE(format, formats.end());
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        format->name, format->make, format->make, format->make,
+        /*masked_local_tp=*/true,
+        /*exercise_router_q8_publication=*/false, rows);
+}
+
+/**
+ * @brief Prove dormant directory admission across all codebooks and live-family transitions.
+ *
+ * Retained M=16 and M=33 graphs contain the tiled family, but empty and compact
+ * tail routes select route-owned work. Directory poison must survive those
+ * replays, and restored tiled work must regenerate its directory and match the
+ * independent serial bytes. No graph is recaptured after changing request data.
+ */
+TEST(Test__ROCmMoEKernel, InactiveTileDirectoriesAllCodebooksCapturedRemainUntouched)
+{
+    constexpr std::array<int, 2> rows = {16, 33};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    for (const auto &format : allMoEVerifierFormatCases())
+    {
+        SCOPED_TRACE(format.name);
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+            format.name, format.make, format.make, format.make,
+            /*masked_local_tp=*/true,
+            /*exercise_router_q8_publication=*/false, rows);
     }
 }
 
@@ -28273,6 +28496,22 @@ TEST(Test__ROCmMoEKernel, TransferredCurrentBatchAllNativeFormatsPublishExactByt
 }
 
 /** @brief Captured slot reuse preserves all floating and quantized wire formats. */
+TEST(Test__ROCmMoEKernel, CapturedGateUpTransfersExcludeFixedDownStorage)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&count), hipSuccess);
+    if (count == 0) GTEST_SKIP() << "No ROCm device available";
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    llaminar2::test::runMixedFormatExpertTransferPublication(
+        llaminar2::DeviceId::rocm(0), rocmMoETestStream(),
+        llaminar2::DeviceMoEProjectionSet::GateUp);
+#endif
+}
+
+/** @brief Complete experts retain their existing all-format transfer contract. */
 TEST(Test__ROCmMoEKernel, CapturedMixedFormatTransfersRetainCapacityAndRejectStaleLeases)
 {
     int count = 0;

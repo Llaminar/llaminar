@@ -12,9 +12,13 @@
 #pragma once
 
 #include "execution/prefix_cache/PrefixCacheStats.h"
+#include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixArchivePersistence.h"
 #include "execution/prefix_cache/PrefixStateBlock.h"
+#include "execution/prefix_cache/PrefixStateSnapshot.h"
 
 #include <list>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -44,9 +48,9 @@ namespace llaminar2
     /**
      * @brief Outcome of preparing a bounded RAM archive publication.
      *
-     * Busy means the cache has retired every reclaimable entry but an active
-     * request or DMA still owns physical archive bytes. It is ordinary cache
-     * admission pressure, not a failed inference or a broken storage edge.
+     * Busy means a necessary durable write is pending, or an active request or
+     * DMA still owns physical archive bytes. It is ordinary cache admission
+     * pressure, not a failed inference or a broken storage edge.
      * Error denotes an invalid key, unsafe replacement, or failed tier write.
      */
     enum class PrefixRamInsertPreparation
@@ -86,6 +90,15 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Request-thread-owned tier index with asynchronous durable eviction.
+     *
+     * The archive's writer retains immutable source leases. Completed receipts
+     * alone install disk residency; pending work never counts as free RAM.
+     * Early preparation polls receipts to overlap persistence with inference.
+     * Required publication joins only its capacity dependencies; native payload
+     * processing remains on the archive worker and pending bytes stay charged.
+     */
     class PrefixStateCache
     {
     public:
@@ -167,6 +180,16 @@ namespace llaminar2
         bool installDeviceHotCopy(
             PrefixBlockHandle device_hot_handle,
             bool repromotion);
+        /**
+         * @brief Acquire the exact installed payload, completing known disk swaps.
+         * @param key Immutable prompt/runtime identity to restore.
+         * @return Shared payload owner, or a genuine absent/unadmittable record.
+         * @throws std::runtime_error If required archive persistence fails.
+         *
+         * A pending victim write is a dependency, not a cache miss. Hydration
+         * retains its verified inode while that dependency retires; an external
+         * alias with no progress edge remains charged and cannot be overwritten.
+         */
         std::optional<PrefixBlockHandle> find(const PrefixCacheKey &key);
 
         /**
@@ -200,6 +223,15 @@ namespace llaminar2
         bool release(const PrefixCacheKey &key);
         bool erase(const PrefixCacheKey &key);
         bool clear();
+
+        /**
+         * @brief Apply already completed archive mutations on the cache owner.
+         *
+         * This polls immutable receipts, never the native archive mutex or a
+         * file lock. A failed write is fatal rather than a manufactured miss.
+         * Administrative/tests may first join DiskPrefixStorageBackend's writer.
+         */
+        void publishCompletedPersistence();
 
         /**
          * @brief Retire volatile records outside one active fingerprint.
@@ -247,6 +279,50 @@ namespace llaminar2
             const PrefixCacheKey &key,
             size_t incoming_bytes);
 
+        /**
+         * @brief Complete required RAM publication before allocating its payload.
+         * @param key Exact replacement incarnation to publish.
+         * @param incoming_bytes Actual payload size, not allocation capacity.
+         * @throws std::runtime_error If admission cannot complete or storage fails.
+         *
+         * Unlike early prepareInsert(), this cannot yield Busy or silently skip
+         * work. It consumes the necessary archive receipts and rechecks PMA;
+         * later unrelated writer work does not delay this boundary. Untracked
+         * retained owners are a precise admission error, never free-byte credit.
+         */
+        void completeInsertPreparation(
+            const PrefixCacheKey &key,
+            size_t incoming_bytes);
+
+        /**
+         * @brief Start only the necessary eviction work before producing a block.
+         * @param incoming_bytes Exact payload capacity needed by the producer.
+         * @return Prepared, pending physical/durable owners, or invalid geometry.
+         * Unlike prepareInsert(), this does not retire or replace an existing
+         * key. Callers can overlap the archive writer with ordinary inference.
+         */
+        PrefixRamInsertPreparation prepareCapacity(size_t incoming_bytes);
+
+        /**
+         * @brief Start exact request publication pressure before prefill executes.
+         * @param admission Immutable participant lookup/fingerprint.
+         * @param tokens Actual prompt bytes used by the existing hash chain.
+         * @param schedule Coordinator-selected recurrent and terminal frontiers.
+         * @param layout Canonical participant payload geometry.
+         * @param runtime_capacity Model serializer's bounded terminal extension.
+         * @return Prepared, asynchronous pressure, or invalid publication geometry.
+         *
+         * Shared nonterminal keys are counted once; full admitted terminals are
+         * reused. This prepares victims only, never reserves or allocates bytes.
+         * Final physical admission remains the RAM backend's PMA operation.
+         */
+        PrefixRamInsertPreparation prepareHarvest(
+            const PrefixLookupResult &admission,
+            const std::vector<int32_t> &tokens,
+            const PrefixHarvestSchedule &schedule,
+            const PrefixPayloadLayout &layout,
+            size_t runtime_capacity);
+
         void recordRequestLookup(int requested_tokens,
                                  int matched_tokens,
                                  int matched_blocks);
@@ -266,19 +342,42 @@ namespace llaminar2
         {
             PrefixStateBlock block;
             std::list<PrefixCacheKey>::iterator lru_it;
+            /// Exact pending source incarnation; zero means no queued put.
+            PrefixArchivePersistenceTicket persistence;
+        };
+
+        /** @brief FIFO receipts preserve native archive capacity-eviction order. */
+        struct PendingPersistence
+        {
+            PrefixCacheKey key;
+            PrefixArchivePersistenceTicket ticket;
         };
 
         bool insertResident(PrefixBlockHandle handle, bool count_store, bool preserve_disk_entry = false);
         bool evictResident(const PrefixCacheKey &key);
-        bool evictUntilFits(size_t incoming_bytes);
+        /** @brief Reclaim only durable owners; unfinished writes yield Busy. */
+        PrefixRamInsertPreparation evictUntilFits(size_t incoming_bytes);
         /** @brief Reclaim cache-owned aliases until PMA can lease RAM bytes. */
         PrefixRamInsertPreparation evictUntilPhysicallyFits(
             size_t incoming_bytes);
+        /**
+         * @brief Complete known archive dependencies until capacity is admitted.
+         * @param incoming_bytes Exact new physical owner extent.
+         * @return Prepared, invalid geometry, or Busy with no archive dependency.
+         *
+         * Every wait consumes an immutable FIFO receipt before rechecking the
+         * actual RAM authority. This is dependency completion, not an I/O retry
+         * or an archive-wide idle wait. Unknown external aliases remain charged.
+         */
+        PrefixRamInsertPreparation completePendingCapacity(size_t incoming_bytes);
         bool removeDeviceHotEntry(
             const PrefixCacheKey &key,
             bool capacity_eviction);
         void touchDeviceHot(const PrefixCacheKey &key);
-        bool persistResidentToDisk(const Entry &entry);
+        /** @brief Schedule one victim exactly once; never perform native I/O. */
+        PrefixRamInsertPreparation persistResidentToDisk(Entry &entry);
+        /** @brief Queue a tombstone and retire the local lookup incarnation. */
+        void retireArchiveKey(const PrefixCacheKey &key);
         bool removeDiskEntry(const PrefixCacheKey &key);
         void forgetDiskEntry(const PrefixCacheKey &key);
         void touch(Entry &entry);
@@ -297,6 +396,10 @@ namespace llaminar2
         std::unordered_map<PrefixCacheKey, PrefixBlockHandle, PrefixCacheKeyHasher> disk_entries_;
         std::list<PrefixCacheKey> lru_;
         std::list<PrefixCacheKey> device_hot_lru_;
+        std::deque<PendingPersistence> pending_persistence_;
+        // At most one verified pending promotion retains its immutable inode.
+        // Its logical archive key may be evicted by the required RAM swap.
+        std::optional<DiskPrefixStorageBackend::HydrationTicket> pending_hydration_;
     };
 
 } // namespace llaminar2

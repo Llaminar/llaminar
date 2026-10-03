@@ -152,6 +152,36 @@ TEST(OrchestrationCandidateAdmission, InvalidInputIsNotCapacityRejection)
     }
 }
 
+/** @brief Direct admission cannot bypass learned-weight validation or price phantom KV. */
+TEST(OrchestrationCandidateAdmission, MissingMTPWeightsAreNotCapacityExhaustion)
+{
+    for (const bool moe : {false, true})
+    {
+        test::PlanningGGUFFixture file(moe, false);
+        PlanningModelSource source(file.path());
+        for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        {
+            auto proposal = candidate(source, backend);
+            proposal.config.mtp.enabled = true;
+            const auto original = serializeOrchestrationConfig(proposal.config);
+            try
+            {
+                (void)AdmittedOrchestrationCandidate::admit(proposal, source, policy());
+                FAIL() << "Missing learned weights were admitted";
+            }
+            catch (const PhysicalMemoryCapacityExhausted &)
+            {
+                FAIL() << "Missing learned weights are not a capacity-search rejection";
+            }
+            catch (const std::invalid_argument &error)
+            {
+                EXPECT_NE(std::string(error.what()).find("no MTP/nextn metadata or tensors"), std::string::npos);
+            }
+            EXPECT_EQ(serializeOrchestrationConfig(proposal.config), original);
+        }
+    }
+}
+
 TEST(OrchestrationCandidateAdmission, RemoteOverlayAdmitsEveryRankAndRetainsDepthFifteen)
 {
     for (const auto format : {GGUFTensorType::F32, GGUFTensorType::F16, GGUFTensorType::BF16})

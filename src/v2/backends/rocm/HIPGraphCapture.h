@@ -37,6 +37,9 @@ namespace llaminar2
         bool beginCapture() override;
         bool endCapture() override;
         bool instantiate() override;
+        /** @copydoc IGPUGraphCapture::prepareRuntimeContextStorage */
+        bool prepareRuntimeContextStorage(
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory) override;
         bool launch() override;
         [[nodiscard]] bool launchOnStream(void *stream) const override;
         /** @brief HIP has no conditional handles; its graph-only units are clonable. */

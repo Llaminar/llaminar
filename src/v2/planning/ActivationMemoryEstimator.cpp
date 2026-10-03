@@ -11,6 +11,7 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "execution/mtp/MTPTerminalGatherGeometry.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 
 #include <algorithm>
 #include <limits>
@@ -458,17 +459,23 @@ size_t ActivationMemoryEstimator::estimate(
             moe_columns,
             checkedMultiply(2u, d_model, "MoE compact output columns"),
             "MoE compact output columns");
-        const size_t canonical_slots = checkedAdd(
-            top_k,
-            canonical_participants,
-            "MoE canonical publication slots");
-        moe_columns = checkedAdd(
-            moe_columns,
-            checkedMultiply(
-                canonical_slots,
-                d_model,
-                "MoE canonical route-contribution columns"),
-            "MoE canonical route-contribution columns");
+        if (geometry.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+        {
+            if (!device.is_gpu())
+                throw std::invalid_argument("MoE projection arena requires a native GPU domain");
+            // Exactly the schema's replacement owner set, not an extra reserve
+            // beside the complete-expert route tensor that no longer exists.
+            bytes = checkedAdd(bytes,
+                MoEProjectionArenaGeometry::resolve(profile, geometry.total_shards).bytes(mtp_prefill_rows),
+                "MoE projection transaction arena");
+        }
+        else
+        {
+            const size_t canonical_slots = checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
+            moe_columns = checkedAdd(moe_columns,
+                checkedMultiply(canonical_slots, d_model, "MoE canonical route-contribution columns"),
+                "MoE canonical route-contribution columns");
+        }
         moe_columns = checkedAdd(
             moe_columns,
             checkedMultiply(

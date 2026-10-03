@@ -190,11 +190,11 @@ namespace llaminar2
                 "linear horizon bytes");
 
             /*
-             * CUDA's current concrete cache owns K/V plus permanent K/V
-             * linearization horizons. ROCm binds linearization storage from
-             * graph workspace, and CPU needs only the two ring payloads.
+             * All concrete floating caches own only native K/V horizons.
+             * GPU contiguous reads and conversion bind graph workspace, which
+             * is priced by its own BOM rather than replicated per cache entry.
              */
-            const std::size_t horizons = device.is_cuda() ? 4 : 2;
+            constexpr std::size_t horizons = 2;
             const std::size_t payload = checkedMultiply(
                 checkedMultiply(entry_count, horizons, "linear horizon count"),
                 one_horizon,

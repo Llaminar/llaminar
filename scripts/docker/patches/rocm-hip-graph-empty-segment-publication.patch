@@ -1,0 +1,45 @@
+From: Llaminar runtime qualification
+Subject: [PATCH] Publish consumed completions of empty captured graph segments
+
+An empty-only segment captures no AQL packets. BuildSyncPlan nevertheless
+allocates a completion signal when another stream consumes that segment.
+Previously no packet decremented the signal, permanently blocking its consumer.
+Use one ordered completion barrier when there is no packet to carry the signal;
+segments with no consumer still submit no unnecessary packet. Packet capture,
+parallel queues and the native signal-pool lifecycle remain unchanged.
+
+Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
+             (therock-10.0, ROCm Core SDK 10.0.0)
+
+diff --git a/hipamd/src/hip_graph_internal.cpp b/hipamd/src/hip_graph_internal.cpp
+--- a/hipamd/src/hip_graph_internal.cpp
++++ b/hipamd/src/hip_graph_internal.cpp
+@@ -400,6 +400,14 @@ void Graph::ResolveSegmentDependencies() {
+ }
+ 
+ // ================================================================================================
++/**
++ * @brief Bind the captured segment DAG to its required completion publications.
++ *
++ * A segment may contain only empty dependency nodes and therefore capture no
++ * packets. If another stream consumes its completion, it still needs a packet
++ * that publishes that signal; reserving a signal without a producer deadlocks
++ * the consumer. Segments with no observable completion need no such packet.
++ */
+ void GraphExecSegmented::BuildSyncPlan() {
+   // Clean up any prior barrier packets
+   for (auto* p : sync_plan_.barrier_packets) { delete[] p; }
+@@ -583,7 +591,12 @@ void GraphExecSegmented::BuildSyncPlan() {
+     const bool completion_signal_needed = (hw_slot >= 0);
+ 
+     auto& lastBatch = segBatch.packet_batches.back();
+-    if (last_node_uncaptured && completion_signal_needed) {
++    if ((last_node_uncaptured || lastBatch.dispatchPackets.empty()) &&
++        completion_signal_needed) {
++      // Empty-only segments have no dispatch on which to embed the completion.
++      // Publish it with the same ordered barrier used for uncaptured tails.
++      // This also imports any incoming launch-stream work before a fork; it is
++      // a device-side dependency, not a host wait or a serial graph replay.
+       uint8_t* completion_barrier = device->CreateBarrierPacket();
+       sync_plan_.barrier_packets.push_back(completion_barrier);
+ 

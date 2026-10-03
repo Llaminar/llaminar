@@ -10,6 +10,8 @@
  *
  * The actual RankOrchestrator is exercised with injected participant runners,
  * including prefix admission/restore, MTP, and collective ownership contracts.
+ * Snapshot regressions check producer-owned column partitions and complete
+ * publications independently of a model schema's default partial-sum layout.
  */
 
 #include <gmock/gmock.h>
@@ -2057,6 +2059,18 @@ public:
         return prefix_lookup_result_;
     }
 
+    /** @brief Retain the participant identity received by early archive preparation. */
+    bool preparePrefixHarvest(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule) override
+    {
+        prepared_prefix_fingerprint_ = admission.fingerprint_key;
+        prepared_prefix_tokens_ = tokens;
+        prepared_prefix_checkpoint_ = schedule.reusableCheckpoint();
+        return true;
+    }
+
     bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override
     {
         (void)seq_idx;
@@ -2368,6 +2382,12 @@ public:
     }
     const std::vector<int> &terminal_restored_tokens() const { return terminal_restored_tokens_; }
     const std::vector<int32_t> &prefix_lookup_tokens() const { return prefix_lookup_tokens_; }
+    /** @return Child-owned identity authenticated by early archive preparation. */
+    uint64_t prepared_prefix_fingerprint() const { return prepared_prefix_fingerprint_; }
+    /** @return Prompt payload received by the prepared child, excluding padding. */
+    const std::vector<int32_t> &prepared_prefix_tokens() const { return prepared_prefix_tokens_; }
+    /** @return The coordinated recurrent boundary forwarded without recomputation. */
+    std::optional<int> prepared_prefix_checkpoint() const { return prepared_prefix_checkpoint_; }
     const std::vector<int32_t> &harvested_prefix_tokens() const { return harvested_prefix_tokens_; }
     int harvested_prompt_token_count() const { return harvested_prompt_token_count_; }
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
@@ -2750,6 +2770,9 @@ private:
     std::shared_ptr<MTPPublicationRendezvous> mtp_publication_rendezvous_;
     std::shared_ptr<ChainedMTPRendezvous> chained_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
+    uint64_t prepared_prefix_fingerprint_ = 0u;
+    std::vector<int32_t> prepared_prefix_tokens_;
+    std::optional<int> prepared_prefix_checkpoint_;
     DeviceId device_id_ = DeviceId::cpu();
     DeviceMoERebalanceMaintenanceExecutionPolicy device_moe_ticket_policy_ =
         DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
@@ -6062,6 +6085,8 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
     auto lookup0 = makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true);
+    lookup0.fingerprint_key = 101u;
+    lookup0.checkpoint_policy = PrefixCheckpointPolicy::ReusableBoundary;
     lookup0.placement_epochs = PrefixPlacementEpochSpan::at(7);
     runner0_ptr->set_prefix_lookup_result(lookup0);
     runner0_ptr->set_moe_placement_epoch(77);
@@ -6069,6 +6094,7 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
     auto lookup1 = makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false);
+    lookup1.fingerprint_key = 202u;
     lookup1.placement_epochs = PrefixPlacementEpochSpan::at(19);
     runner1_ptr->set_prefix_lookup_result(lookup1);
     runner1_ptr->set_moe_placement_epoch(99);
@@ -6094,6 +6120,15 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
         << "Rank-level terminal state is usable only when all children have it";
     EXPECT_EQ(runner0_ptr->prefix_lookup_tokens(), prompt);
     EXPECT_EQ(runner1_ptr->prefix_lookup_tokens(), prompt);
+
+    const auto schedule = PrefixHarvestSchedule::forPrefill(hit, 4, 2);
+    ASSERT_TRUE(orchestrator->preparePrefixHarvest(hit, prompt, schedule));
+    EXPECT_EQ(runner0_ptr->prepared_prefix_fingerprint(), 101u);
+    EXPECT_EQ(runner1_ptr->prepared_prefix_fingerprint(), 202u);
+    EXPECT_EQ(runner0_ptr->prepared_prefix_tokens(), prompt);
+    EXPECT_EQ(runner1_ptr->prepared_prefix_tokens(), prompt);
+    EXPECT_EQ(runner0_ptr->prepared_prefix_checkpoint(), schedule.reusableCheckpoint());
+    EXPECT_EQ(runner1_ptr->prepared_prefix_checkpoint(), schedule.reusableCheckpoint());
 
     ASSERT_TRUE(orchestrator->populatePrefix(hit));
     EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
@@ -10633,6 +10668,71 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_CompletePublicationOwnsAssembly)
         EXPECT_EQ(snapshot.computeCombined(), agrees);
         if (agrees)
             EXPECT_EQ(snapshot.combined_data, complete);
+    }
+}
+
+/**
+ * @brief Explicit column publications override expert partial sums at TP 1..8.
+ *
+ * Unequal shard widths prove that assembly uses captured geometry, not a hidden
+ * degree-specific split. Missing/mixed participants must not shrink or reorder
+ * the diagnostic tensor. Device-free mocks exercise every backend identity.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_ExplicitColumnPartitionsOwnAssembly)
+{
+    enum class Fault { None, MissingParticipant, MixedPublication };
+    constexpr size_t rows = 6; // Three logical tokens, two route slots each.
+    for (const std::string key : {"layer0_MOE_ROUTE_CONTRIBUTIONS",
+                                 "MTP15_MOE_ROUTE_CONTRIBUTIONS"})
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    for (int degree = 1; degree <= 8; ++degree)
+    for (const auto fault : {Fault::None, Fault::MissingParticipant, Fault::MixedPublication})
+    {
+        if (degree == 1 && fault != Fault::None) continue;
+        SCOPED_TRACE(::testing::Message() << key << " backend=" << static_cast<int>(backend)
+            << " degree=" << degree << " fault=" << static_cast<int>(fault));
+        RankOrchestrator::Config config;
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        const size_t columns = degree * (degree + 1) / 2;
+        std::vector<float> expected(rows * columns);
+        size_t offset = 0;
+        for (int i = 0; i < degree; ++i)
+        {
+            config.devices.push_back(backend == DeviceType::CPU ? GlobalDeviceAddress::cpu(i) :
+                backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(i) : GlobalDeviceAddress::rocm(i));
+            config.weights.push_back(1.0f / degree);
+            auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            const size_t local_columns = i + 1;
+            std::vector<float> shard(rows * local_columns);
+            for (size_t row = 0; row < rows; ++row)
+                for (size_t col = 0; col < local_columns; ++col)
+                    shard[row * local_columns + col] = expected[row * columns + offset + col] =
+                        static_cast<float>(1 + row * columns + offset + col);
+            if (i != degree - 1 || fault != Fault::MissingParticipant)
+                runner->set_mock_snapshot(key, rows, local_columns, shard,
+                    i == degree - 1 && fault == Fault::MixedPublication
+                        ? SnapshotPublication::SchemaPartition : SnapshotPublication::ColumnPartition);
+            runners.push_back(std::move(runner));
+            offset += local_columns;
+        }
+        auto model = llaminar2::test::MockModelContext::createMinimal();
+        model->setArchitecture("qwen35moe");
+        MockLocalTPContext::Config tp;
+        tp.devices = config.devices;
+        tp.weights = config.weights;
+        auto orchestrator = RankOrchestrator::createForTest(model, std::move(runners),
+            std::make_unique<MockLocalTPContext>(tp), config);
+        if (fault != Fault::None)
+        {
+            EXPECT_THROW(orchestrator->getTPSnapshot(key), std::runtime_error);
+            continue;
+        }
+        auto snapshot = orchestrator->getTPSnapshot(key);
+        EXPECT_EQ(snapshot.mode, SnapshotShardingMode::COLUMN_PARALLEL);
+        ASSERT_TRUE(snapshot.computeCombined());
+        EXPECT_EQ(snapshot.combined_rows, rows);
+        EXPECT_EQ(snapshot.combined_cols, columns);
+        EXPECT_EQ(snapshot.combined_data, expected);
     }
 }
 

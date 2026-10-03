@@ -14,6 +14,7 @@
 #include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include "../../execution/moe/MoEOverlayReturnLayout.h"
+#include "../../execution/moe/MoEProjectionArenaGeometry.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -96,13 +97,21 @@ namespace llaminar2
      */
     class Qwen35MoEGraph : public Qwen35Graph
     {
+        /** Metadata-sealed arena replacement, present only for the explicit projection mode. */
+        std::optional<MoEProjectionArenaGeometry> projection_arena_;
+
+        /** @brief Bind source-derived geometry at the existing model-context injection boundary. */
+        void bindProjectionArena();
+        /** @return The admitted projection layout, or null for whole-expert modes; throws before binding. */
+        const MoEProjectionArenaGeometry *projectionArena() const;
+
     public:
         /// Construct with full model context
         Qwen35MoEGraph(std::shared_ptr<ModelContext> model_ctx,
                        std::shared_ptr<IMPIContext> mpi_ctx,
                        const GraphConfig &config);
 
-        /// Construct for layer-level operations only
+        /** @brief Construct a declaration; the production factory injects its model context next. */
         Qwen35MoEGraph(const GraphConfig &config,
                        std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
 
@@ -113,6 +122,14 @@ namespace llaminar2
         // =====================================================================
 
         std::string architectureName() const override { return "qwen35moe"; }
+
+        /**
+         * @brief Inject the source context before schema resolution or graph construction.
+         * @param model_ctx Model lifetime owning GGUF metadata and prepared weights.
+         * @throws std::invalid_argument If projection mode lacks native-domain/source metadata.
+         * @throws std::logic_error If a bound projection graph is rebound to another model.
+         */
+        void setModelContext(std::shared_ptr<IModelContext> model_ctx) override;
 
         GraphSchema getSchema() const override;
 
@@ -180,6 +197,8 @@ namespace llaminar2
         /// Append active MoE runtime placement state to prefix-cache fingerprints.
         void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
 
+        /** @copydoc IGraphBuilder::prefixCacheRuntimeStateCapacity */
+        size_t prefixCacheRuntimeStateCapacity() const override;
         bool capturePrefixCacheRuntimeState(std::vector<uint8_t> &state, void *stream) override;
         PrefixCacheRuntimeRestoreResult restorePrefixCacheRuntimeState(
             const std::vector<uint8_t> &state,

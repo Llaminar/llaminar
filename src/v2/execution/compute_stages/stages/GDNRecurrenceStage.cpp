@@ -888,9 +888,23 @@ namespace llaminar2
                         return false;
 
                     float *dq_mut = nullptr, *dk_mut = nullptr, *dv_mut = nullptr;
+                    // Deinterleave borrows the same lengths as recurrence.
+                    // The request stride remains physical even when an earlier
+                    // request is empty or a retained verifier envelope shrinks.
+                    const auto deinterleave_rows = params_.request_seq_lens_device && params_.seq_len > 1
+                        ? DeviceRequestRowRanges::deviceCounted(
+                              params_.request_count,
+                              params_.request_count > 1 ? params_.request_seq_len : params_.seq_len,
+                              params_.request_seq_lens_device)
+                        : DeviceRequestRowRanges::fullyActive(params_.seq_len);
+                    if (deinterleave_rows.physicalRows() != params_.seq_len)
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] Deinterleave request strides do not match the captured row matrix");
+                        return false;
+                    }
                     if (!params_.kernel->deinterleave_qkv_device(
                             d_merged, dq_mut, dk_mut, dv_mut,
-                            params_.seq_len, nkh, params_.n_heads,
+                            deinterleave_rows, nkh, params_.n_heads,
                             params_.d_k, params_.d_v, params_.global_v_head_offset))
                     {
                         LOG_ERROR("[GDNRecurrenceStage] GPU deinterleave_qkv_device failed");

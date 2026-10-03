@@ -727,7 +727,8 @@ namespace
         }
         void resetAuxiliaryStreams() override {}
 
-        void *createEvent() override
+        /** @copydoc IWorkerGPUContext::createEvent */
+        void *createEvent(GPUEventPurpose = GPUEventPurpose::Ordering) override
         {
             ++events_created_;
             return reinterpret_cast<void *>(static_cast<uintptr_t>(0xEF000000 + events_created_));
@@ -6019,6 +6020,8 @@ TEST(Test__GraphSegmentCache, CanonicalCollectiveClassificationCoversSpecialized
         ComputeStageType::ALLREDUCE,
         ComputeStageType::PIPELINE_ACTIVATION_EXCHANGE,
         ComputeStageType::ALLGATHER,
+        ComputeStageType::NATIVE_ALLGATHER,
+        ComputeStageType::DEVICE_COUNTED_ALLGATHER,
         ComputeStageType::ALLGATHER_V,
         ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER,
         ComputeStageType::GDN_LIVE_STATE_ALLGATHER,

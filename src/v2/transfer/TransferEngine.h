@@ -679,6 +679,12 @@ namespace llaminar2
             return consumer_stream_;
         }
 
+        /** @return Canonical storage owner whose producer frontier was acquired. */
+        [[nodiscard]] TensorBase *sourceOwner() const noexcept { return source_owner_; }
+
+        /** @return Exact endpoint on which the consumer acquired the producer event. */
+        [[nodiscard]] DeviceId device() const noexcept { return device_; }
+
     private:
         friend class TransferEngine;
 
@@ -1400,6 +1406,37 @@ namespace llaminar2
             size_t offset = 0) const;
 
         /**
+         * @brief Turn a fixed capacity binding into a GPU-counted message contract.
+         * @param capacity_binding Fixed binding whose message extent bounds all future payloads.
+         * @param extent_storage Retained eight-byte-aligned device workspace scalar.
+         * @param extent_offset Offset of the uint64 byte count within that region.
+         * @return Producer reads that count once; consumer writes the acquired producer count.
+         * @throws std::exception for a counted input, foreign owner, overlap, or invalid extent.
+         *
+         * Capacity, pointer and extent authority are capture identity. A producer
+         * may publish zero through the full capacity without recapture. A
+         * consumer never independently chooses a size: its scalar is an output
+         * of the authenticated publication, available to downstream graph nodes.
+         * The graph orders the producer's scalar writer and all later readers.
+         * There is no host readback, allocation, or second live count authority.
+         */
+        [[nodiscard]] CapturedTransferBinding bindDeviceCountedTransfer(
+            CapturedTransferBinding capacity_binding,
+            std::shared_ptr<const WorkspaceBufferLease> extent_storage,
+            size_t extent_offset = 0) const;
+
+        /** @brief Bind the same counted contract to retained graph-private device storage.
+         * @param capacity_binding Exact positive capacity already bound to one channel endpoint.
+         * @param extent_storage GPU-private scalar owner retained until graph retirement.
+         * @param extent_offset Aligned uint64 byte-count location within that owner.
+         * @return Producer-input or consumer-output binding with the same semantics as workspace counts.
+         * @throws std::exception for wrong device/backend, insufficient capacity or payload overlap. */
+        [[nodiscard]] CapturedTransferBinding bindDeviceCountedTransfer(
+            CapturedTransferBinding capacity_binding,
+            std::shared_ptr<DeviceTransferBuffer> extent_storage,
+            size_t extent_offset = 0) const;
+
+        /**
          * @brief Record one complete acquire/copy/release DAG on an exact stream.
          * @param binding Immutable endpoint, storage owner and message geometry.
          * @param stream Exact non-null execution/capture stream for that GPU.
@@ -1410,6 +1447,25 @@ namespace llaminar2
          * canonical write publication after the same-stream message completes.
          */
         void enqueueCapturedTransfer(const CapturedTransferBinding &binding, void *stream) const;
+
+        /**
+         * @brief Enqueue a complete forked exchange without premature output publication.
+         * @param producers Retained sends, all reading the acquired canonical owner.
+         * @param consumers Retained receives, all writing the disjoint destination owner.
+         * @param input Exact producer/event proof acquired by the auxiliary stream.
+         * @param output Canonical receive owner prepared on that same device.
+         * @throws std::exception For empty/inconsistent endpoints, stale storage or submission failure.
+         *
+         * Only the paired collective fork/join owner calls this boundary. Sends
+         * precede receives on input.consumerStream(); their channel epochs remain
+         * device-owned. The enclosing join records the completion event, waits on
+         * it from the canonical graph stream, then publishes output there. No
+         * auxiliary-stream publication enters the main-stream capture ledger.
+         */
+        void enqueueForkedCapturedExchange(
+            std::span<const CapturedTransferBinding> producers,
+            std::span<const CapturedTransferBinding> consumers,
+            const AcquiredDeviceTransferInput &input, ITensor *output) const;
 
         /**
          * @brief Allocate one native mapped slab and partition exclusive slots.
@@ -2408,6 +2464,18 @@ namespace llaminar2
     private:
         friend class TensorBase;
         friend class MappedHostTransferArena;
+
+        /**
+         * @brief Shared native channel lowering for ordinary or acquired-fork submission.
+         * @param binding Frozen message owner and extent.
+         * @param stream Exact stream, matching fork->consumerStream() when present.
+         * @param fork Acquired input proof for the validated complete exchange, or null for ordinary publication.
+         *
+         * Only enqueueForkedCapturedExchange may supply the proof; it validates
+         * every endpoint before submission and leaves publication to its join.
+         */
+        void enqueueCapturedTransferImpl(const CapturedTransferBinding &binding,
+            void *stream, const AcquiredDeviceTransferInput *fork) const;
 
         /**
          * @brief Derive one stable child view without another native mapping.

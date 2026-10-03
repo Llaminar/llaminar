@@ -4326,7 +4326,7 @@ namespace llaminar2
         const bool padded_bucket = isPaddedBucketExecution(input);
         const bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
         DeviceGraphExecutor::GraphSnapshotLogicalRows snapshot_logical_rows;
-        if (padded_bucket && snapshots_active)
+        if (snapshots_active)
         {
             if (input.batch_size <= 0 || bucket_seq_len <= 0 ||
                 real_seq_len <= 0 || real_seq_len > bucket_seq_len)
@@ -4515,8 +4515,8 @@ namespace llaminar2
             bool gpu_event_timing_active = false;
             if (should_time_gpu)
             {
-                gpu_start_event = gpu_ctx->createEvent();
-                gpu_stop_event = gpu_ctx->createEvent();
+                gpu_start_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
+                gpu_stop_event = gpu_ctx->createEvent(GPUEventPurpose::Timing);
                 if (gpu_start_event && gpu_stop_event)
                 {
                     gpu_ctx->recordEvent(gpu_start_event, stream);
@@ -5610,21 +5610,7 @@ namespace llaminar2
         {
             const DevicePrefillChunkGraphBinding &binding =
                 *effective_input.device_prefill_chunk;
-            const bool binding_matches_forward_input =
-                binding.valid() && effective_input.device.is_gpu() &&
-                effective_input.batch_size == 1 &&
-                effective_input.seq_len == binding.bucket_seq_len &&
-                effective_input.token_ids == nullptr &&
-                effective_input.token_ids_device ==
-                    binding.chunk_token_ids_device &&
-                effective_input.position_ids == nullptr &&
-                effective_input.position_ids_device ==
-                    binding.chunk_position_ids_device &&
-                effective_input.position_policy ==
-                    ForwardPositionPolicy::ExplicitRows &&
-                effective_input.sequence_lengths_device ==
-                    binding.chunk_real_rows_device;
-            if (!binding_matches_forward_input)
+            if (!devicePrefillChunkOwnsInput(effective_input))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Device prefill chunk binding does not exactly own the forward graph inputs");
                 return false;

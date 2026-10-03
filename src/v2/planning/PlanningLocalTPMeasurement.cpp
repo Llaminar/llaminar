@@ -19,6 +19,7 @@
 #include "tensors/TensorClasses.h"
 #include "transfer/TransferEngine.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <exception>
 #include <future>
@@ -86,7 +87,7 @@ namespace llaminar2
     namespace
     {
         /** @brief Fail at the boundary that lost its required native operation. */
-        void require(bool condition, const char *detail)
+        void require(bool condition, const std::string &detail)
         {
             if (!condition) throw std::runtime_error(std::string("Planning native LocalTP: ") + detail);
         }
@@ -130,7 +131,10 @@ namespace llaminar2
             PhysicalMemoryAllocationLease host_claim, device_claim;
             PhysicalMemoryOwnerReservation graphs_claim;
             std::unique_ptr<FP32Tensor> tensor;
-            std::unique_ptr<IGPUGraphCapture> graph;
+            // Admission names a two-executable family. Keep both owners alive
+            // through attestation: adding allocation deltas from destroyed and
+            // recreated owners does not describe one retained physical family.
+            std::array<std::unique_ptr<IGPUGraphCapture>, 2> graphs;
             size_t graph_growth = 0;
             void *stream = nullptr;
 
@@ -207,24 +211,27 @@ namespace llaminar2
             std::vector<void *> streams;
             for (const auto &owner : participants) streams.push_back(owner->stream);
             collective.setComputeStreams(streams);
-            for (const int rows : {1, request.prefillRows()})
+            const std::array phase_rows{1, request.prefillRows()};
+            for (size_t phase_index = 0; phase_index < phase_rows.size(); ++phase_index)
             {
+                const int rows = phase_rows[phase_index];
                 PlanningLocalTPPhaseObservation phase{rows, request.payloadBytes(rows), {}};
                 phase.endpoints.resize(request.devices().size());
                 onWorkers(request, &collective, [&](size_t index, auto &worker) {
                     auto &owner = *participants[index];
-                    owner.graph.reset();
-                    owner.graph = worker.createGraphCapture(owner.stream);
-                    require(bool(owner.graph), "graph creation failed");
-                    ScopedBackendGraphCapture capture(worker, *owner.graph, "planning native LocalTP");
+                    auto &graph = owner.graphs[phase_index];
+                    graph = worker.createGraphCapture(owner.stream);
+                    require(bool(graph), "graph creation failed");
+                    ScopedBackendGraphCapture capture(worker, *graph, "planning native LocalTP");
                     require(capture.begin(), "capture begin failed");
                     require(collective.allreduceOnStream(owner.tensor.get(), "planning_allreduce",
                         size_t(rows) * request.hiddenWidth(), owner.stream,
                         request.precision() == PlanningAllreducePrecision::FP32 ? "fp32" : "fp16"),
                         "captured native reduction failed");
                     capture.finish();
-                    require(owner.graph->nodeCount() && owner.graph->instantiate(), "nonempty native graph instantiation failed");
-                    const size_t growth = owner.graph->residentMemoryBytes();
+                    require(graph->prepareRuntimeContextStorage(memory), "captured native context storage preparation failed");
+                    require(graph->nodeCount() && graph->instantiate(), "nonempty native graph instantiation failed");
+                    const size_t growth = graph->residentMemoryBytes();
                     if (growth > std::numeric_limits<size_t>::max() - owner.graph_growth)
                         throw std::overflow_error("Planning native LocalTP graph-family extent overflow");
                     owner.graph_growth += growth;
@@ -239,18 +246,27 @@ namespace llaminar2
                     const PlanningMeasurementWork work(PlanningWorkUnit::Bytes, double(phase.payload_bytes),
                         "native rank-local allreduce; backend=" + std::string(collectiveBackendTypeToString(request.backend())) +
                         "; device=" + device.toString() + "; logical-payload-not-link-bandwidth; rows=" + std::to_string(rows));
-                    const auto observed = PlanningExecutionMeasurement::gpu(work, *backend, device, *owner.graph);
-                    phase.endpoints[index] = {device, owner.graph->nodeCount(),
+                    const auto &graph = *owner.graphs[phase_index];
+                    const auto observed = PlanningExecutionMeasurement::gpu(work, *backend, device, graph);
+                    phase.endpoints[index] = {device, graph.nodeCount(),
                         observed.elapsedSeconds() / PlanningExecutionMeasurement::kTimedInvocations};
                 });
                 (void)phase.secondsPerCollective();
                 result.phases.push_back(std::move(phase));
             }
             for (size_t index = 0; index < participants.size(); ++index)
-                require(GPUGraphMemoryContract::acceptsFamilyObservation(request.devices()[index],
-                    participants[index]->graph_growth,
-                    2 * GPUGraphMemoryContract::reservationBytesPerExecutable(request.devices()[index])),
-                    "native graph family exceeded its physical admission");
+            {
+                const auto device = request.devices()[index];
+                const size_t admitted = 2 * GPUGraphMemoryContract::reservationBytesPerExecutable(device);
+                const size_t observed = participants[index]->graph_growth;
+                require(GPUGraphMemoryContract::acceptsFamilyObservation(device, observed, admitted),
+                    "native graph family exceeded its physical admission: device=" + device.toString() +
+                    " observed_pool_growth_bytes=" + std::to_string(observed) +
+                    " admitted_family_bytes=" + std::to_string(admitted) +
+                    " hidden_width=" + std::to_string(request.hiddenWidth()) +
+                    " prefill_rows=" + std::to_string(request.prefillRows()) +
+                    " precision=" + (request.precision() == PlanningAllreducePrecision::FP32 ? "fp32" : "fp16"));
+            }
         }
         catch (...) { failure = std::current_exception(); collective.requestAbort(); }
         // The communicator stays alive while every worker revokes its captured

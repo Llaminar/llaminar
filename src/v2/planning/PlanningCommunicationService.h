@@ -14,6 +14,7 @@
 #include "PlanningHostDeviceMeasurement.h"
 #include "PlanningPublication.h"
 #include "config/OrchestrationPlanningPolicy.h"
+#include "execution/config/RoutedExpertPolicy.h"
 #include <optional>
 
 namespace llaminar2
@@ -36,6 +37,9 @@ namespace llaminar2
      * eligible rank pairs with control, outbound-heavy and return-heavy exchanges.
      * The two directions share no assumed bandwidth or half-RTT latency. An
      * explicitly single-device search needs neither kind of communication.
+     * Routed-projection ownership also participates in the agreement: a TP-only
+     * gate/up-owner search needs the bounded host basis for counted channels,
+     * whereas ordinary homogeneous whole-expert TP does not.
      */
     class PlanningCommunicationSamplePlan final
     {
@@ -47,10 +51,13 @@ namespace llaminar2
          * @param hidden_width Positive model activation width.
          * @param prefill_rows Positive bounded sample rows; not an inference context limit.
          * @param precisions Native wire precisions to measure; nonempty, distinct and valid.
+         * @param routed_compute_policy Physical routed-projection contract. A TP
+         *        strategy label alone does not identify its intermediate fabric.
          */
         static PlanningCommunicationSamplePlan resolve(const ClusterInventory &inventory,
             const AutomaticOrchestrationRequest &request, int hidden_width, int prefill_rows,
-            std::span<const PlanningAllreducePrecision> precisions);
+            std::span<const PlanningAllreducePrecision> precisions,
+            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned);
         /** @return Native groups and their complete observing process ownership. */
         const std::vector<PlanningNativeCollectiveSample> &native() const noexcept { return native_; }
         /** @return Directed exact host request/reply geometries, with no inferred reverse symmetry. */
@@ -66,6 +73,8 @@ namespace llaminar2
         std::vector<PlanningMPITransferRequest> mpi_;
         std::vector<PlanningHostDeviceRequest> host_device_;
         std::vector<int> rank_nodes_;
+        /** Requested physical compute contract, not a sampled transport decision. */
+        RoutedExpertComputePolicy routed_compute_policy_ = RoutedExpertComputePolicy::Apportioned;
     };
 
     /** @brief Completed native observation bound to its physical group and reporting rank. */
@@ -110,6 +119,8 @@ namespace llaminar2
          * @param hidden_width Model activation width, not a guessed allocation size.
          * @param prefill_rows Bounded physical rows to observe alongside M=1.
          * @param precisions Explicit native wire precision family to measure.
+         * @param routed_compute_policy Requested routed-projection ownership;
+         *        carried unchanged through all-rank sample-plan agreement.
          * @return Complete evidence at discovery root; absence on followers after consensus.
          * @throws std::exception if agreement, admission, execution or evidence validation fails.
          *
@@ -121,7 +132,8 @@ namespace llaminar2
          */
         static std::optional<PlanningCommunicationService> collect(const std::shared_ptr<IMPIContext> &mpi,
             const ClusterInventory &inventory, const AutomaticOrchestrationRequest &request,
-            int hidden_width, int prefill_rows, std::span<const PlanningAllreducePrecision> precisions);
+            int hidden_width, int prefill_rows, std::span<const PlanningAllreducePrecision> precisions,
+            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned);
         /** @return Exact measured native groups; no prediction for an unseen subset is implied. */
         const std::vector<PlanningNativeCollectiveService> &native() const noexcept { return native_; }
         /** @return Completed host-MPI exchanges carrying canonical physical locality. */

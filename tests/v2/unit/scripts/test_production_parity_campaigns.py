@@ -81,6 +81,81 @@ class EmptyGTestGateTests(unittest.TestCase):
                                      observed.stdout + observed.stderr)
 
 
+class DeviceInventoryGateTests(unittest.TestCase):
+    """Prove CMake startup ownership reaches the actual preflight scheduler."""
+
+    def configure_scope(self, directory: Path, scope: str, labels: str) -> subprocess.CompletedProcess:
+        """Compile the real registration helper with a device-free imported executable.
+
+        An imported Python executable supplies only a CMake target identity;
+        no command is run. Two filters of the same target must inherit the
+        same startup ownership, irrespective of their selected kernel backend.
+        """
+        source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        begin = source.index("function(add_v2_test TEST_NAME)")
+        end = source.index("endfunction()", begin) + len("endfunction()")
+        registrations = [
+            f'add_v2_test(V2_Integration_Inventory_{backend} '
+            f'COMMAND $<TARGET_FILE:inventory_probe> --filter={backend} '
+            f'LABELS "V2;{labels};{backend};ProductionTestPreflight" '
+            'MPI_PROCS 1 NO_MODELS TIMEOUT 30)'
+            for backend in ("CUDA", "ROCm")
+        ]
+        (directory / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.20)\nproject(InventoryScopeGate NONE)\n"
+            "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
+            "add_executable(inventory_probe IMPORTED)\n"
+            f'set_target_properties(inventory_probe PROPERTIES IMPORTED_LOCATION "{sys.executable}" '
+            f'V2_TEST_DEVICE_SCOPE "{scope}")\n'
+            + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+        )
+        return subprocess.run(
+            ["cmake", "-S", str(directory), "-B", str(directory / "build")],
+            text=True, capture_output=True, timeout=10,
+        )
+
+    def test_process_inventory_scope_overrides_backend_specific_filters(self) -> None:
+        """Discovery cannot race either vendor's free-memory/graph certificate."""
+        for scope in ("FullInventory", "DeclaredBackends"):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory(prefix="llaminar-inventory-scope-") as directory:
+                root = Path(directory)
+                result = self.configure_scope(root, scope, "Integration")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                registrations = campaigns.discover_production_test_preflight_registrations(root / "build")
+                self.assertEqual(len(registrations), 2)
+                for registration in registrations:
+                    with self.subTest(registration=registration.name):
+                        if scope == "FullInventory":
+                            self.assertIn("FullDeviceInventory", registration.labels)
+                            self.assertEqual(registration.lane, campaigns.PreflightExecutionLane.EXCLUSIVE)
+                        else:
+                            self.assertNotIn("FullDeviceInventory", registration.labels)
+                            self.assertEqual(registration.lane,
+                                campaigns.PreflightExecutionLane.CUDA_SOCKET if "CUDA" in registration.labels
+                                else campaigns.PreflightExecutionLane.ROCM_SOCKET)
+
+    def test_invalid_scope_and_unit_discovery_fail_at_registration(self) -> None:
+        """A typo must not silently drop ownership; Unit may never discover GPUs."""
+        for scope, labels, diagnostic in (
+            ("FullInventroy", "Integration", "Unknown device scope"),
+            ("FullInventory", "Unit", "Device-free Unit target"),
+        ):
+            with self.subTest(scope=scope, labels=labels), tempfile.TemporaryDirectory(prefix="llaminar-inventory-invalid-") as directory:
+                result = self.configure_scope(Path(directory), scope, labels)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stdout + result.stderr)
+
+    def test_full_inventory_is_exclusive_for_every_launcher_and_backend(self) -> None:
+        """Startup ownership applies to CPU-labelled and non-MPI probes too."""
+        for backend in ("CPU", "CUDA", "ROCm"):
+            for command in (["probe"], ["mpirun", "-np", "1", "probe"], ["mpirun", "-np", "2", "probe"]):
+                with self.subTest(backend=backend, command=command):
+                    _, lane = campaigns._preflight_execution_lane(
+                        "inventory", frozenset(("Integration", backend, "FullDeviceInventory")),
+                        command, ["Integration_Serial"])
+                    self.assertEqual(lane, campaigns.PreflightExecutionLane.EXCLUSIVE)
+
+
 def ctest_document(*names: str) -> str:
     """Build the minimal CTest JSON shape used by discovery."""
 

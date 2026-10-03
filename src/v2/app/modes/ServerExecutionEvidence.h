@@ -276,9 +276,17 @@ namespace llaminar2
         bool llep = false;
         const bool overlay = config.moe_routed_expert_plan &&
             config.moe_routed_expert_plan->usesExpertOverlayAuthority();
+        std::set<RoutedExpertComputePolicy> routed_policies;
         if (overlay)
             for (const auto &domain : config.moe_routed_expert_plan->domains)
+            {
                 llep |= domain.routed_prefill_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident;
+                routed_policies.insert(domain.routed_compute_policy);
+            }
+        // This is an observation of frozen domains, never a controller input.
+        // A heterogeneous policy must not masquerade as one uniform mode.
+        const char *routed_compute = routed_policies.empty() ? "none" :
+            routed_policies.size() == 1 ? routedExpertComputePolicyToString(*routed_policies.begin()) : "mixed";
         // Observe the same execution families as auto search. A single-domain
         // MoE TP candidate still executes through ExpertOverlay; multi-domain
         // expert placement is not a layer pipeline. No decision consumes this
@@ -297,6 +305,7 @@ namespace llaminar2
                 {"mtp_min_depth", std::to_string(mtp.depth_policy.min_depth)},
                 {"mtp_max_depth", std::to_string(resolveMTPMaximumExecutionDraftDepth(mtp))},
                 {"expert_overlay", overlay ? "true" : "false"},
+                {"routed_compute", routed_compute},
                 {"current_batch_llep", llep ? "true" : "false"},
                 {"residency_maintenance", moeRebalanceRuntimeModeToString(runtime.moe_rebalance.mode)}};
     }

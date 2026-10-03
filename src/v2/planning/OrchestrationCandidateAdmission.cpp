@@ -9,6 +9,7 @@
  * and unsupported codebooks remain their original errors.
  */
 #include "planning/OrchestrationCandidateAdmission.h"
+#include "execution/mtp/MTPWeightManifest.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
@@ -64,6 +65,11 @@ namespace llaminar2
         const auto &model = source.metadata();
         const auto &profile = model.memoryProfile();
         const auto &loader = source.loader();
+        // Direct callers of candidate admission must obey the same learned-
+        // predictor contract as automatic startup, before publishing a BOM.
+        if (retainsMTPGraphCapacity(candidate.config.mtp))
+            (void)requireMTPWeightManifest(loader, loader.architecture(),
+                                           static_cast<int>(loader.blockCount()));
         const auto &inventory = candidate.membership.inventory();
         const auto weight_load = resolveGPUWeightLoadMemoryGeometry(
             maximumGGUFTensorPayloadBytes(loader.getModel()), policy.weight_load);

@@ -18,6 +18,10 @@
  * - **Row-parallel**: Input split on input dimension, combined via AllReduce
  *   Examples: ATTENTION_OUTPUT (Wo), FFN_DOWN
  *
+ * - **Token-row partition**: Explicit disjoint logical token intervals, copied
+ *   once without arithmetic. Intervals can be discontiguous after chunk joins;
+ *   empty participants remain present and must not hide missing coverage.
+ *
  * - **Replicated**: Full output on each device (after AllReduce)
  *   Examples: *_NORM stages, FFN_RESIDUAL
  *
@@ -31,6 +35,7 @@
 #pragma once
 
 #include "../StageShardingMode.h"
+#include "../../snapshots/SnapshotRowPartition.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include <vector>
 #include <string>
@@ -333,6 +338,7 @@ namespace llaminar2
         // For column-parallel stages: which slice of the full output this represents
         size_t global_start_col = 0;  ///< Start column in full output
         size_t global_total_cols = 0; ///< Total columns across all devices
+        SnapshotOwnedRows row_ownership; ///< Explicit token ownership, distinct from row-parallel input sums.
 
         /// Check if this snapshot represents partial (sharded) data
         bool isPartial() const
@@ -549,6 +555,8 @@ namespace llaminar2
          * For PACKED_COLUMN_PARALLEL: Reassembles semantic groups first, then
          *   concatenates participant slices within each group
          * For ROW_PARALLEL: Sums same-shaped per-device partials
+         * For TOKEN_ROW_PARTITION: Authenticates every participant and copies
+         * explicitly owned token intervals, rejecting holes and overlaps
          * For REPLICATED: Verifies every device published the same full output,
          * then uses the first full-device output as the combined view
          * For ROOT_ONLY: Requires and selects the sole root-published output
@@ -574,6 +582,26 @@ namespace llaminar2
                 return fail();
             }
 
+            if (mode == SnapshotShardingMode::TOKEN_ROW_PARTITION)
+            {
+                if (tp_degree < 1 || device_data.size() != static_cast<std::size_t>(tp_degree))
+                    return fail();
+                std::vector<bool> members(static_cast<std::size_t>(tp_degree), false);
+                std::vector<SnapshotRowSource> sources;
+                for (const auto &device : device_data)
+                {
+                    if (device.device_index < 0 || device.device_index >= tp_degree ||
+                        members[device.device_index]) return fail();
+                    members[device.device_index] = true;
+                    sources.push_back({device.data, device.rows, device.cols, &device.row_ownership});
+                }
+                try { combined_data = assembleSnapshotOwnedRows(sources); }
+                catch (const std::invalid_argument &) { return fail(); }
+                combined_rows = sources.front().rows;
+                combined_cols = sources.front().cols;
+                combined_valid = true;
+                return true;
+            }
             if (mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL)
             {
                 /*

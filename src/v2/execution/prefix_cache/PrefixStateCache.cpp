@@ -5,7 +5,9 @@
  * Metadata probing is separated from payload acquisition so a longest-prefix
  * query records one semantic hit or miss even when it examines several token
  * widths. The final find() remains the sole authority for disk hydration, LRU
- * movement, and shared payload ownership.
+ * movement, and shared payload ownership. Early preparation only queues native
+ * persistence; required RAM/SSD publication completes exact immutable receipts
+ * before allocating. Pending durable work is never dropped or credited as free.
  */
 
 #include "execution/prefix_cache/PrefixStateCache.h"
@@ -13,9 +15,12 @@
 #include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
 #include "execution/prefix_cache/DiskPrefixStorageBackend.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
+#include <limits>
 #include <utility>
 
 namespace llaminar2
@@ -71,6 +76,7 @@ namespace llaminar2
                                           bool count_store,
                                           bool preserve_disk_entry)
     {
+        publishCompletedPersistence();
         if (!handle.valid() || handle.total_bytes > ram_budget_bytes_ || !ram_backend_)
         {
             return false;
@@ -96,7 +102,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!evictUntilFits(handle.total_bytes))
+        if (evictUntilFits(handle.total_bytes) != PrefixRamInsertPreparation::Prepared)
         {
             return false;
         }
@@ -187,6 +193,9 @@ namespace llaminar2
 
     std::optional<PrefixBlockHandle> PrefixStateCache::find(const PrefixCacheKey &key)
     {
+        publishCompletedPersistence();
+        if (pending_hydration_ && pending_hydration_->diskHandle().key != key)
+            pending_hydration_.reset();
         stats_.lookups++;
         auto hot_it = device_hot_entries_.find(key);
         if (hot_it != device_hot_entries_.end())
@@ -204,19 +213,20 @@ namespace llaminar2
         if (it == entries_.end())
         {
             auto disk_it = disk_entries_.find(key);
-            if (disk_it == disk_entries_.end() || !disk_backend_ || !ram_backend_)
+            if ((!pending_hydration_ && disk_it == disk_entries_.end()) ||
+                !disk_backend_ || !ram_backend_)
             {
                 stats_.misses++;
                 return std::nullopt;
             }
 
-            const PrefixBlockHandle disk_handle = disk_it->second;
             std::string error;
-            auto hydration = disk_backend_->beginVerifiedHydration(
+            if (!pending_hydration_)
+                pending_hydration_ = disk_backend_->beginVerifiedHydration(
                     key,
-                    disk_handle.layout,
+                    disk_it->second.layout,
                     &error);
-            if (!hydration)
+            if (!pending_hydration_)
             {
                 ++stats_.disk_read_failures;
                 stats_.misses++;
@@ -231,17 +241,14 @@ namespace llaminar2
              * directly and verifies it again, eliminating both a full-block
              * staging peak and a redundant whole-block memcpy.
              */
-            if (!evictUntilFits(hydration->totalBytes()))
-            {
-                stats_.misses++;
-                return std::nullopt;
-            }
-            if (evictUntilPhysicallyFits(hydration->totalBytes()) !=
+            auto &hydration = *pending_hydration_;
+            if (completePendingCapacity(hydration.totalBytes()) !=
                 PrefixRamInsertPreparation::Prepared)
             {
-                // A request may still own an evicted RAM payload. Physical
-                // pressure is a cache miss, not evidence that the durable
-                // record is corrupt or should be removed from the disk index.
+                // Known durable writes complete before a selected restore is
+                // judged unavailable. External request aliases have no archive
+                // completion edge; keep both their charge and the verified inode
+                // rather than discarding work or claiming a corrupt record.
                 stats_.misses++;
                 return std::nullopt;
             }
@@ -257,7 +264,7 @@ namespace llaminar2
             }
             PrefixBlockHandle hydrated;
             if (!disk_backend_->hydrateVerified(
-                    *hydration,
+                    hydration,
                     *concrete_ram,
                     &hydrated,
                     &error))
@@ -270,8 +277,10 @@ namespace llaminar2
                  * publish different bytes under the stale local index.
                  */
                 removeDiskEntry(key);
+                pending_hydration_.reset();
                 return std::nullopt;
             }
+            pending_hydration_.reset();
 
             if (!insertResident(hydrated, /*count_store=*/false, /*preserve_disk_entry=*/true))
             {
@@ -342,7 +351,8 @@ namespace llaminar2
     {
         return entries_.find(key) != entries_.end() ||
                device_hot_entries_.find(key) != device_hot_entries_.end() ||
-               disk_entries_.find(key) != disk_entries_.end();
+               disk_entries_.find(key) != disk_entries_.end() ||
+               (pending_hydration_ && pending_hydration_->diskHandle().key == key);
     }
 
     bool PrefixStateCache::retain(const PrefixCacheKey &key)
@@ -370,24 +380,35 @@ namespace llaminar2
 
     bool PrefixStateCache::erase(const PrefixCacheKey &key)
     {
+        publishCompletedPersistence();
+        const bool retired_promotion =
+            pending_hydration_ && pending_hydration_->diskHandle().key == key;
+        if (retired_promotion)
+            pending_hydration_.reset();
         auto it = entries_.find(key);
         if (it != entries_.end() && it->second.block.ref_count > 0)
         {
             return false;
         }
         bool erased = false;
+        // A queued older put must precede a tombstone, not resurrect this key
+        // after prepareInsert() publishes a richer terminal snapshot.
+        if (retired_promotion || it != entries_.end() || disk_entries_.contains(key))
+            retireArchiveKey(key);
         if (it != entries_.end())
         {
             erased = evictResident(key);
         }
         const bool erased_device_hot =
             removeDeviceHotEntry(key, /*capacity_eviction=*/false);
-        const bool erased_disk = removeDiskEntry(key);
-        return erased_disk || erased_device_hot || erased;
+        const bool erased_disk = disk_entries_.contains(key);
+        forgetDiskEntry(key);
+        return retired_promotion || erased_disk || erased_device_hot || erased;
     }
 
     bool PrefixStateCache::clear()
     {
+        publishCompletedPersistence();
         for (const auto &[key, entry] : entries_)
         {
             (void)key;
@@ -397,9 +418,13 @@ namespace llaminar2
             }
         }
 
+        pending_hydration_.reset();
+
         for (auto &[key, entry] : entries_)
         {
-            (void)key;
+            retireArchiveKey(key);
+            // One key needs one tombstone even when both tiers retain it.
+            forgetDiskEntry(key);
             subtractResidentStats(entry.block.handle);
             if (ram_backend_)
             {
@@ -428,14 +453,20 @@ namespace llaminar2
 
         for (auto &[key, handle] : disk_entries_)
         {
-            (void)key;
-            if (disk_backend_)
-            {
-                disk_backend_->release(handle);
-            }
+            (void)handle;
+            retireArchiveKey(key);
         }
         disk_entries_.clear();
         stats_.disk_bytes = 0;
+        // clear() is the explicit administrative purge, not request reset.
+        // Its durable tombstones must survive restart before it returns.
+        if (disk_backend_)
+        {
+            std::string error;
+            if (!disk_backend_->waitForPersistence(&error))
+                throw std::runtime_error(error);
+            publishCompletedPersistence();
+        }
         return true;
     }
 
@@ -444,6 +475,7 @@ namespace llaminar2
         uint64_t previous_fingerprint,
         uint64_t active_fingerprint)
     {
+        publishCompletedPersistence();
         if (previous_fingerprint == 0 || active_fingerprint == 0 ||
             previous_fingerprint == active_fingerprint)
         {
@@ -464,6 +496,10 @@ namespace llaminar2
                 return std::nullopt;
             }
         }
+
+        if (pending_hydration_ &&
+            pending_hydration_->diskHandle().key.fingerprint != active_fingerprint)
+            pending_hydration_.reset();
 
         PrefixFingerprintRebase transition{
             .previous_fingerprint = previous_fingerprint,
@@ -537,6 +573,7 @@ namespace llaminar2
         const PrefixCacheKey &key,
         size_t incoming_bytes)
     {
+        publishCompletedPersistence();
         if (!key.valid() || incoming_bytes == 0 ||
             incoming_bytes > ram_budget_bytes_ || !ram_backend_)
         {
@@ -554,10 +591,128 @@ namespace llaminar2
         {
             return PrefixRamInsertPreparation::Error;
         }
-        if (!evictUntilFits(incoming_bytes))
+        return prepareCapacity(incoming_bytes);
+    }
+
+    void PrefixStateCache::completeInsertPreparation(
+        const PrefixCacheKey &key,
+        size_t incoming_bytes)
+    {
+        auto preparation = prepareInsert(key, incoming_bytes);
+        if (preparation == PrefixRamInsertPreparation::Busy)
+            preparation = completePendingCapacity(incoming_bytes);
+        if (preparation != PrefixRamInsertPreparation::Prepared)
+        {
+            const char *reason = preparation == PrefixRamInsertPreparation::Busy
+                ? "retained physical owners have no pending archive completion"
+                : "invalid geometry or unsafe replacement";
+            throw std::runtime_error(
+                "required prefix RAM publication rejected key=" + key.toHex() +
+                " bytes=" + std::to_string(incoming_bytes) + " reason=" + reason);
+        }
+    }
+
+    PrefixRamInsertPreparation PrefixStateCache::completePendingCapacity(
+        size_t incoming_bytes)
+    {
+        auto preparation = prepareCapacity(incoming_bytes);
+        while (preparation == PrefixRamInsertPreparation::Busy &&
+               !pending_persistence_.empty())
+        {
+            // Cache metadata is single-thread-owned; the writer only publishes
+            // this immutable receipt. Copy the ticket before publication can
+            // retire the deque's front. Never wait for later unrelated work.
+            const auto dependency = pending_persistence_.front().ticket;
+            PerfStatsCollector::addCounter(
+                "prefix_cache", "ram_archive_capacity_dependency_waits", 1.0,
+                "archive_publication", "CPU",
+                {{"receipt", std::to_string(dependency.identity())},
+                 {"incoming_bytes", std::to_string(incoming_bytes)}});
+            (void)dependency.waitForPublication();
+            publishCompletedPersistence();
+            preparation = prepareCapacity(incoming_bytes);
+        }
+        return preparation;
+    }
+
+    PrefixRamInsertPreparation PrefixStateCache::prepareCapacity(size_t incoming_bytes)
+    {
+        publishCompletedPersistence();
+        if (incoming_bytes == 0 || incoming_bytes > ram_budget_bytes_ || !ram_backend_)
             return PrefixRamInsertPreparation::Error;
+        const auto preparation = evictUntilFits(incoming_bytes);
+        if (preparation != PrefixRamInsertPreparation::Prepared)
+            return preparation;
 
         return evictUntilPhysicallyFits(incoming_bytes);
+    }
+
+    PrefixRamInsertPreparation PrefixStateCache::prepareHarvest(
+        const PrefixLookupResult &admission,
+        const std::vector<int32_t> &tokens,
+        const PrefixHarvestSchedule &schedule,
+        const PrefixPayloadLayout &layout,
+        size_t runtime_capacity)
+    {
+        publishCompletedPersistence();
+        if (!admission.supported || !admission.cache_enabled ||
+            admission.fingerprint_key == 0u || layout.block_size <= 0 ||
+            tokens.size() != static_cast<size_t>(schedule.promptTokens()) ||
+            layout.block_size != admission.block_size)
+            return PrefixRamInsertPreparation::Error;
+
+        std::unordered_map<PrefixCacheKey, size_t, PrefixCacheKeyHasher> publications;
+        const auto plan_frontier = [&](int frontier)
+        {
+            uint64_t parent_hash = 0;
+            for (int start = 0, block = 0; start < frontier;
+                 start += layout.block_size, ++block)
+            {
+                const int end = std::min(frontier, start + layout.block_size);
+                const auto key = makePrefixCacheKey(
+                    admission.fingerprint_key, parent_hash, block, start,
+                    {tokens.begin() + start, tokens.begin() + end});
+                parent_hash = key.stableHash();
+                const bool terminal = end == frontier;
+                if ((!terminal && layout.organization() ==
+                        PrefixPayloadOrganization::RecurrentCheckpoint) ||
+                    (contains(key) && (!terminal ||
+                        admission.terminalHarvestDisposition(key, frontier) ==
+                            PrefixTerminalHarvestDisposition::ReuseAdmittedArchive)))
+                    continue;
+                auto record_layout = layout;
+                if (!terminal)
+                {
+                    record_layout.includes_hybrid_state = false;
+                    record_layout.includes_terminal_hidden = false;
+                    record_layout.includes_terminal_logits = false;
+                }
+                const size_t extra = terminal ? runtime_capacity : 0u;
+                const size_t payload = record_layout.totalBytes();
+                if (payload > std::numeric_limits<size_t>::max() - extra)
+                    throw std::overflow_error("prefix publication payload overflow");
+                auto &bytes = publications[key];
+                // A reusable terminal becomes a nonterminal in the final
+                // chain. Keep its richer immutable image, not two allocations.
+                bytes = std::max(bytes, payload + extra);
+            }
+        };
+        if (const auto checkpoint = schedule.reusableCheckpoint())
+            plan_frontier(*checkpoint);
+        plan_frontier(schedule.promptTokens());
+        size_t incoming = 0u;
+        for (const auto &[key, bytes] : publications)
+        {
+            if (bytes > std::numeric_limits<size_t>::max() - incoming)
+                throw std::overflow_error("prefix publication batch overflow");
+            incoming += bytes;
+        }
+        if (incoming == 0u)
+            return PrefixRamInsertPreparation::Prepared;
+        // A prompt larger than the bounded RAM tier is streamed through that
+        // tier by ordinary per-record admission. Prepare at most its admitted
+        // physical envelope; do not invent another reservation or enlarge it.
+        return prepareCapacity(std::min(incoming, ram_budget_bytes_));
     }
 
     PrefixRamInsertPreparation PrefixStateCache::evictUntilPhysicallyFits(
@@ -570,39 +725,51 @@ namespace llaminar2
          * authority can actually admit the new archive. Never let the caller
          * discover that mismatch after it has started copying the payload.
          */
-        while (!ram_backend_->canStore(incoming_bytes))
+        auto ram = std::dynamic_pointer_cast<RamPrefixStorageBackend>(ram_backend_);
+        if (!ram)
+            return PrefixRamInsertPreparation::Error;
+        // Retire an orphaned hot replica first. Its CPU runtime-state alias
+        // can be the only reason a logically evicted RAM payload is still
+        // charged; persisting unrelated RAM cannot release that owner.
+        const auto hot_candidates = device_hot_lru_;
+        for (auto candidate = hot_candidates.rbegin();
+             candidate != hot_candidates.rend() && !ram->canStore(incoming_bytes);
+             ++candidate)
         {
-            bool evicted = false;
-            for (auto it = lru_.rbegin(); it != lru_.rend(); ++it)
-            {
-                const auto entry = entries_.find(*it);
-                if (entry == entries_.end() || entry->second.block.ref_count > 0)
-                    continue;
-                if (!persistResidentToDisk(entry->second))
-                    return PrefixRamInsertPreparation::Error;
-                const PrefixCacheKey victim = *it;
-                if (!evictResident(victim))
-                    return PrefixRamInsertPreparation::Error;
-                ++stats_.evictions;
-                evicted = true;
-                break;
-            }
-            if (evicted)
+            if (entries_.contains(*candidate))
                 continue;
-
-            // Device-hot copies may retain a host runtime-state lease even
-            // after their RAM key is gone. Retire only cache-owned hot copies;
-            // active request aliases remain leased until their event retires.
-            if (!device_hot_lru_.empty())
-            {
-                const PrefixCacheKey victim = device_hot_lru_.back();
-                if (!removeDeviceHotEntry(victim, /*capacity_eviction=*/true))
-                    return PrefixRamInsertPreparation::Error;
-                continue;
-            }
-            return PrefixRamInsertPreparation::Busy;
+            if (!removeDeviceHotEntry(*candidate, /*capacity_eviction=*/true))
+                return PrefixRamInsertPreparation::Error;
         }
-        return PrefixRamInsertPreparation::Prepared;
+
+        size_t pending_victim_bytes = 0u;
+        const auto candidates = keysMostRecentFirst();
+        for (auto candidate = candidates.rbegin(); candidate != candidates.rend(); ++candidate)
+        {
+            const auto available = ram->availableAllocationBytes();
+            if (available >= incoming_bytes ||
+                pending_victim_bytes >= incoming_bytes - available)
+                break;
+            const auto entry = entries_.find(*candidate);
+            if (entry == entries_.end() || entry->second.block.ref_count > 0)
+                continue;
+            const auto persistence = persistResidentToDisk(entry->second);
+            if (persistence == PrefixRamInsertPreparation::Error)
+                return persistence;
+            if (persistence == PrefixRamInsertPreparation::Busy)
+            {
+                pending_victim_bytes += entry->second.block.handle.total_bytes;
+                continue;
+            }
+            if (!evictResident(*candidate))
+                return PrefixRamInsertPreparation::Error;
+            ++stats_.evictions;
+            if (device_hot_entries_.contains(*candidate) &&
+                !removeDeviceHotEntry(*candidate, /*capacity_eviction=*/true))
+                return PrefixRamInsertPreparation::Error;
+        }
+        return ram->canStore(incoming_bytes) ? PrefixRamInsertPreparation::Prepared
+                                            : PrefixRamInsertPreparation::Busy;
     }
 
     PrefixDeviceHotLeaseResult PrefixStateCache::prepareDeviceHotCopy(
@@ -709,38 +876,43 @@ namespace llaminar2
         return disk_entries_.find(key) != disk_entries_.end();
     }
 
-    bool PrefixStateCache::evictUntilFits(size_t incoming_bytes)
+    PrefixRamInsertPreparation PrefixStateCache::evictUntilFits(size_t incoming_bytes)
     {
         if (incoming_bytes > ram_budget_bytes_)
         {
-            return false;
+            return PrefixRamInsertPreparation::Error;
         }
-        while (used_bytes_ + incoming_bytes > ram_budget_bytes_)
+        const size_t resident_limit = ram_budget_bytes_ - incoming_bytes;
+        size_t pending_victim_bytes = 0u;
+        // This is a one-shot victim selection, not free-memory accounting.
+        // Pending leases still consume their full PMA capacity. Select the
+        // complete necessary LRU set now so one inference interval can overlap
+        // every write, instead of discovering one additional victim at harvest.
+        const auto candidates = keysMostRecentFirst();
+        for (auto candidate = candidates.rbegin();
+             candidate != candidates.rend() &&
+             used_bytes_ > resident_limit &&
+             pending_victim_bytes < used_bytes_ - resident_limit;
+             ++candidate)
         {
-            bool evicted = false;
-            for (auto it = lru_.rbegin(); it != lru_.rend(); ++it)
+            auto entry = entries_.find(*candidate);
+            if (entry == entries_.end() || entry->second.block.ref_count > 0)
+                continue;
+            const auto persistence = persistResidentToDisk(entry->second);
+            if (persistence == PrefixRamInsertPreparation::Error)
+                return persistence;
+            if (persistence == PrefixRamInsertPreparation::Busy)
             {
-                auto entry_it = entries_.find(*it);
-                if (entry_it == entries_.end() || entry_it->second.block.ref_count > 0)
-                {
-                    continue;
-                }
-                const PrefixCacheKey victim = *it;
-                if (!persistResidentToDisk(entry_it->second))
-                {
-                    continue;
-                }
-                evictResident(victim);
-                ++stats_.evictions;
-                evicted = true;
-                break;
+                pending_victim_bytes += entry->second.block.handle.total_bytes;
+                continue;
             }
-            if (!evicted)
-            {
-                return false;
-            }
+            if (!evictResident(*candidate))
+                return PrefixRamInsertPreparation::Error;
+            ++stats_.evictions;
         }
-        return true;
+        return used_bytes_ <= resident_limit
+                   ? PrefixRamInsertPreparation::Prepared
+                   : PrefixRamInsertPreparation::Busy;
     }
 
     bool PrefixStateCache::removeDeviceHotEntry(
@@ -804,41 +976,70 @@ namespace llaminar2
         return true;
     }
 
-    bool PrefixStateCache::persistResidentToDisk(const Entry &entry)
+    PrefixRamInsertPreparation PrefixStateCache::persistResidentToDisk(Entry &entry)
     {
         if (!disk_backend_)
         {
-            return true;
+            return PrefixRamInsertPreparation::Prepared;
         }
 
         const PrefixBlockHandle &handle = entry.block.handle;
         if (disk_entries_.find(handle.key) != disk_entries_.end())
         {
-            return true;
+            return PrefixRamInsertPreparation::Prepared;
         }
 
-        PrefixBlockHandle disk_handle;
-        std::vector<PrefixCacheKey> evicted_keys;
-        std::string error;
-        if (!disk_backend_->writeBlock(
-                handle,
-                &disk_handle,
-                &evicted_keys,
-                &error))
+        if (!entry.persistence.valid())
         {
-            ++stats_.disk_write_failures;
-            return false;
+            entry.persistence = disk_backend_->scheduleWrite(handle);
+            pending_persistence_.push_back({handle.key, entry.persistence});
         }
+        return PrefixRamInsertPreparation::Busy;
+    }
 
-        for (const PrefixCacheKey &evicted : evicted_keys)
+    void PrefixStateCache::publishCompletedPersistence()
+    {
+        while (!pending_persistence_.empty())
         {
-            forgetDiskEntry(evicted);
-            ++stats_.disk_evictions;
+            const auto &pending = pending_persistence_.front();
+            const auto publication = pending.ticket.publication();
+            if (!publication)
+                return;
+            if (const auto *failed = std::get_if<PrefixArchivePersistenceFailure>(publication.get()))
+            {
+                ++stats_.disk_write_failures;
+                throw std::runtime_error("background prefix archive publication failed: " + failed->diagnostic);
+            }
+            if (const auto *written = std::get_if<PrefixArchiveWritePublication>(publication.get()))
+            {
+                for (const PrefixCacheKey &evicted : written->evicted_keys)
+                {
+                    if (disk_entries_.contains(evicted))
+                    {
+                        forgetDiskEntry(evicted);
+                        ++stats_.disk_evictions;
+                    }
+                }
+                const auto resident = entries_.find(pending.key);
+                if (resident != entries_.end() &&
+                    resident->second.persistence.identity() == pending.ticket.identity())
+                {
+                    forgetDiskEntry(pending.key);
+                    stats_.disk_bytes += written->disk_handle.total_bytes;
+                    disk_entries_.emplace(pending.key, written->disk_handle);
+                    resident->second.persistence = {};
+                    ++stats_.ram_to_disk_demotions;
+                }
+            }
+            pending_persistence_.pop_front();
         }
-        stats_.disk_bytes += disk_handle.total_bytes;
-        disk_entries_.emplace(disk_handle.key, std::move(disk_handle));
-        ++stats_.ram_to_disk_demotions;
-        return true;
+    }
+
+    void PrefixStateCache::retireArchiveKey(const PrefixCacheKey &key)
+    {
+        if (!disk_backend_)
+            return;
+        pending_persistence_.push_back({key, disk_backend_->scheduleRetirement(key)});
     }
 
     bool PrefixStateCache::removeDiskEntry(const PrefixCacheKey &key)
@@ -849,10 +1050,7 @@ namespace llaminar2
             return false;
         }
 
-        if (disk_backend_)
-        {
-            disk_backend_->release(it->second);
-        }
+        retireArchiveKey(key);
         const uint64_t bytes = static_cast<uint64_t>(it->second.total_bytes);
         stats_.disk_bytes = stats_.disk_bytes > bytes ? stats_.disk_bytes - bytes : 0;
         disk_entries_.erase(it);

@@ -5,14 +5,17 @@
  * GQA replication and modulo-linked GDN ownership use the same model dimensions
  * and DeviceShardingAssignment as production loading. An input shard keeps N
  * intact and reduces K; an output shard does the converse. Expert apportionment
- * changes only the number of complete matrices. Physical packing remains owned
- * by its existing format contracts and PhysicalMemoryAuthority admission.
+ * changes only the number of complete matrices. An explicit projection-ownership
+ * contract may instead retain every expert's down output slice, without changing
+ * K; that is never inferred from an ordinary TP fraction. Physical packing remains
+ * owned by its existing format contracts and PhysicalMemoryAuthority admission.
  */
 #include "planning/WeightShardGeometry.h"
 #include "planning/ModelMemoryProfile.h"
 #include "config/GDNHeadAssignment.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "loaders/WeightIdentity.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -279,6 +282,25 @@ namespace llaminar2
             throw std::invalid_argument("Weight shard geometry has an invalid TP participant");
         if (total_shards > 1)
             sharding_ = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+    }
+
+    WeightShardGeometry WeightShardGeometryResolver::resolve(
+        const TensorSizeInfo &tensor,
+        const MoEExpertProjectionOwnership &ownership, size_t owned_experts) const
+    {
+        const auto role = inferWeightRole(tensor.name);
+        const auto projection = ownership.projection(role);
+        if (ownership.geometry().experts != profile_.expert_count)
+            throw std::invalid_argument("Projection ownership expert axis disagrees with model metadata");
+        // Explicit physical residency bypasses the schema's ordinary TP share.
+        // Then apply the *same* output interval that preparation materializes.
+        auto local = resolve(tensor, ownership.residentExperts(role, owned_experts));
+        if (!local.matrix() || local.matrix()->rows != static_cast<size_t>(projection.source_rows) ||
+            local.matrix()->columns != static_cast<size_t>(projection.source_columns))
+            throw std::invalid_argument("Projection ownership source matrix disagrees with " + tensor.name);
+        auto matrix = *local.matrix();
+        matrix.rows = static_cast<size_t>(projection.rows);
+        return {checkedProduct(checkedProduct(matrix.rows, matrix.columns), matrix.instances), matrix};
     }
 
     WeightShardGeometry WeightShardGeometryResolver::resolve(

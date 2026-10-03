@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build the canonical NCCL dependency with resumed CUDA graph capture support.
 #
-# This patch changes capture-time strong-stream membership, not collective
-# kernels, transport selection, or replay. A distinct SONAME prevents a system
+# The capture repair fixes strong-stream membership; the live-row extension
+# clips native payloads without changing transport or reduction order. A distinct SONAME prevents a system
 # NCCL package from silently replacing the tested implementation at runtime.
 # Devcontainers and release builders use this same installer; runtime images
 # copy its shared library from the builder, without a runtime compiler.
@@ -19,9 +19,10 @@ nccl_tag=v2.28.9-1
 nccl_version=2.28.9
 nccl_prefix="${NCCL_INSTALL_PREFIX:-/usr/local}"
 nccl_patch="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches/nccl-capture-reentry.patch"
+nccl_rows_patch="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches/nccl-device-live-rows.patch"
 nccl_library="${nccl_prefix}/lib/libllaminar_nccl.so.${nccl_version}"
 nccl_marker="${nccl_prefix}/lib/llaminar-nccl-build.txt"
-nccl_identity="${nccl_revision}:$(sha256sum "${nccl_patch}" | cut -d ' ' -f 1):${NVCC_GENCODE:-toolkit-default}"
+nccl_identity="${nccl_revision}:$(sha256sum "${nccl_patch}" | cut -d ' ' -f 1):$(sha256sum "${nccl_rows_patch}" | cut -d ' ' -f 1):${NVCC_GENCODE:-toolkit-default}"
 
 # Only an exact source/patch/architecture receipt can reuse an installation.
 # This tiny patch identity has no relationship to model-weight cache hashing.
@@ -40,6 +41,8 @@ git clone --depth 1 --branch "${nccl_tag}" \
 [[ "$(git -C "${nccl_build_dir}/source" rev-parse HEAD)" == "${nccl_revision}" ]]
 git -C "${nccl_build_dir}/source" apply --check "${nccl_patch}"
 git -C "${nccl_build_dir}/source" apply "${nccl_patch}"
+git -C "${nccl_build_dir}/source" apply --check "${nccl_rows_patch}"
+git -C "${nccl_build_dir}/source" apply "${nccl_rows_patch}"
 make -C "${nccl_build_dir}/source" -j"$(nproc)" src.build \
     CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" LIBNAME=libllaminar_nccl.so
 

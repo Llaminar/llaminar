@@ -884,6 +884,37 @@ namespace llaminar2
         owner_.forward_execution_phase_ = previous_;
     }
 
+    QwenGraphBase::PrefillCollectiveRowsScope::PrefillCollectiveRowsScope(
+        QwenGraphBase &owner, const ForwardInput &input)
+        : owner_(owner), previous_(owner.prefill_collective_rows_)
+    {
+        std::optional<DeviceRowRange> rows;
+        if (input.device_prefill_chunk)
+        {
+            if (!devicePrefillChunkOwnsInput(input))
+                throw std::invalid_argument("Native prefill collective has no authenticated chunk materializer");
+            rows = DeviceRowRange::deviceCounted(input.seq_len,
+                input.device_prefill_chunk->chunk_real_rows_device);
+        }
+        owner_.prefill_collective_rows_ = rows;
+    }
+
+    QwenGraphBase::PrefillCollectiveRowsScope::~PrefillCollectiveRowsScope()
+    {
+        owner_.prefill_collective_rows_ = previous_;
+    }
+
+    std::optional<DeviceRowRange> QwenGraphBase::prefillCollectiveRows(DeviceId device, int rows) const
+    {
+        // A shifted sidecar has its own append lengths. Never inherit the
+        // main graph's query geometry merely because construction is nested.
+        if (!device.is_gpu() || !prefill_collective_rows_)
+            return std::nullopt;
+        if (prefill_collective_rows_->capacity() != rows)
+            throw std::logic_error("Native prefill collective changed its materializer-owned row capacity");
+        return prefill_collective_rows_;
+    }
+
     QwenGraphBase::MirroredMTPHeadScope::MirroredMTPHeadScope(
         QwenGraphBase &owner,
         bool active)
@@ -1941,6 +1972,7 @@ namespace llaminar2
         ForwardOutput &output)
     {
         const int total_tokens = input.batch_size * input.seq_len;
+        PrefillCollectiveRowsScope collective_rows_scope(*this, input);
         ForwardExecutionPhaseScope execution_phase_scope(
             *this,
             input.execution_phase);
@@ -4123,6 +4155,18 @@ namespace llaminar2
             params.tensor_buffer_id = tensor_buffer_id;
             params.sideband_device_index = config_.tp_device_idx;
             params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
+
+            // Only a homogeneous native domain can consume this device-owned
+            // prefix directly. The matrix stride remains fixed in the arena;
+            // the materializer, not the host, controls its useful wire extent.
+            const auto backend = config_.tp_ctx->backend();
+            if (config_.tp_ctx->isLocal() &&
+                (backend == CollectiveBackendType::NCCL || backend == CollectiveBackendType::RCCL) &&
+                buffer && buffer->cols() > 0 && count % buffer->cols() == 0)
+            {
+                const auto rows = prefillCollectiveRows(device, static_cast<int>(count / buffer->cols()));
+                if (rows) params.live_rows.emplace(*rows, buffer->cols());
+            }
 
             return std::make_unique<TPAllreduceStage>(params);
         }

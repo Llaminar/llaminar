@@ -24,6 +24,7 @@ namespace llaminar2
 {
 
     class IGPUGraphCapture;
+    class PhysicalMemoryAuthority;
 
     /**
      * @brief Device-owned execution policy for one transaction fragment.
@@ -558,6 +559,24 @@ namespace llaminar2
         /// Must be called after endCapture() before the first launch().
         /// @return true on success
         virtual bool instantiate() = 0;
+
+        /**
+         * @brief Prepare context-owned native storage separately from executable storage.
+         * @param memory Authority admitting this exact captured family.
+         * @return True after backend-specific context obligations are prepared.
+         *
+         * This cold boundary follows sealed recording and precedes executable
+         * instantiation. CUDA may grow context-private per-thread stack backing
+         * here under an exactly measured PMA lease. HIP has no equivalent
+         * instance-time stack-limit expansion. Unknown implementations fail;
+         * this operation never authorizes an eager replay or larger graph budget.
+         */
+        virtual bool prepareRuntimeContextStorage(
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+        {
+            (void)memory;
+            return false;
+        }
 
         /// Launch (replay) the instantiated graph executable on the associated stream.
         /// @return true on success

@@ -22,10 +22,10 @@
  *   - count: number of valid tokens
  *   - tail = (head - count + max_seq_len) % max_seq_len
  *
- * Contiguous Optimization:
- *   When tail < head (no wrap-around), attention can read directly
- *   from the buffer without linearization. Only wrapped buffers
- *   require a linearize kernel call.
+ * Native floating attention consumes the physical ring and its device-owned
+ * head/count directly, including wrapped history. Contiguous observation,
+ * request-batched gather and conversion reuse explicitly bound graph workspace;
+ * no attention layer owns a second full-context K/V payload.
  */
 
 #pragma once
@@ -232,12 +232,18 @@ namespace llaminar2
         // =====================================================================
         // Pre-allocated conversion scratch buffers
         // =====================================================================
-        // Avoids cudaMalloc/cudaFree per appendWithStream call.
-        // Lazily allocated and grown as needed.
+        // These buffers are views into the bound graph workspace, never
+        // independently allocated or grown. Overlapping cache consumers require
+        // distinct workspace ownership; ordered consumers may reuse this pair.
 
-        /// Ensure scratch buffers have at least `bytes` capacity each.
-        /// Returns true on success. Thread-safe via single-writer assumption
-        /// (one decode step at a time).
+        /**
+         * @brief Validate the bound conversion/linearization workspace capacity.
+         * @param bytes Required bytes in each of the K and V buffers.
+         * @return False if workspace is absent or either buffer is too small.
+         *
+         * Does not allocate. The returned storage remains workspace-owned and
+         * is valid only until the next ordered consumer of that workspace.
+         */
         bool ensureConvScratch(size_t bytes);
 
         /// Free scratch buffers (called from destructor)
@@ -309,9 +315,6 @@ namespace llaminar2
         DataT *d_K = nullptr; ///< Device memory: [max_seq_len, kv_dim]
         DataT *d_V = nullptr; ///< Device memory: [max_seq_len, kv_dim]
 
-        // Per-sequence scratch buffers for linearization
-        DataT *d_K_scratch = nullptr; ///< Linearized K when wrapped
-        DataT *d_V_scratch = nullptr; ///< Linearized V when wrapped
     };
 
     // =========================================================================
@@ -653,9 +656,11 @@ namespace llaminar2
         /// True after construction uploads every immutable entry pointer.
         bool batched_pointer_tables_ready_ = false;
 
-        // Helper methods
+        /** @brief Allocate only this entry's immutable native K/V payloads. */
         void allocate_entry(EntryT &entry);
+        /** @brief Release this entry's native K/V payloads through their backend. */
         void free_entry(EntryT &entry);
+        /** @brief Build all stable entries and publish their device pointer tables. */
         void allocate_all_entries();
 
         /**
@@ -681,7 +686,18 @@ namespace llaminar2
          */
         void releaseBatchedEntryPointerTables() noexcept;
 
-        void linearize_entry(
+        /**
+         * @brief Copy a wrapped observation into bound, reusable K/V workspace.
+         * @param entry Native ring payload to observe.
+         * @param head Canonical observed next-write position.
+         * @param count Canonical observed number of valid rows.
+         * @param stream Exact stream ordering the observation and its consumer.
+         * @return False if the required workspace has not been bound.
+         *
+         * Output is temporary workspace, not another cache allocation. Native
+         * captured attention uses the physical ring and needs no copy.
+         */
+        bool linearize_entry(
             EntryT &entry,
             int head,
             int count,

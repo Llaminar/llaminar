@@ -15,6 +15,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
+#include "kernels/gdn/GDNDeinterleaveRows.h"
 
 #include <algorithm>
 
@@ -110,7 +111,7 @@ extern "C"
     // QKV deinterleave on device
     bool rocmGDN_deinterleave_qkv(
         const float *merged, float *out_q, float *out_k, float *out_v,
-        int seq_len, int n_k_heads, int n_v_heads,
+        llaminar2::DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
         int d_k, int d_v, int global_v_offset,
         int device_idx, void *stream);
 }
@@ -417,7 +418,7 @@ namespace llaminar2
             float *v = nullptr;
             if (!deinterleave_qkv_device(
                     merged_qkv, q, k, v,
-                    seq_len, n_k_heads, n_heads,
+                    DeviceRequestRowRanges::fullyActive(seq_len), n_k_heads, n_heads,
                     d_k, d_v, global_v_head_offset))
             {
                 return false;
@@ -856,13 +857,35 @@ namespace llaminar2
             bound_deinterleave_scratch_size_ = scratch_size;
         }
 
+        /**
+         * @brief Split only live request rows into caller-owned physical planes.
+         * @param d_merged_qkv Ordered merged input on the bound stream.
+         * @param d_q Output borrow of the physical Q plane.
+         * @param d_k Output borrow of the physical K plane.
+         * @param d_v Output borrow of the physical V plane.
+         * @param rows Frozen request strides and their borrowed length authority.
+         * @param n_k_heads Merged key/query heads.
+         * @param n_v_heads Local output heads.
+         * @param head_dim_k Key/query head width.
+         * @param head_dim_v Value head width.
+         * @param global_v_head_offset Global modular head coordinate.
+         * @return True after enqueue; absent stream/workspace or invalid geometry fails.
+         *
+         * Plane addresses are derived from physical capacity, never a replay's
+         * length. Empty and shrinking requests retain pointers but touch no
+         * inactive input/output; no allocation, host count or synchronization is used.
+         */
         bool deinterleave_qkv_device(
             const float *d_merged_qkv,
             float *&d_q, float *&d_k, float *&d_v,
-            int seq_len, int n_k_heads, int n_v_heads,
+            DeviceRequestRowRanges rows, int n_k_heads, int n_v_heads,
             int head_dim_k, int head_dim_v, int global_v_head_offset) override
         {
+            if (!stream_ || !d_merged_qkv || gdnDeinterleaveElementsPerRequest(
+                    rows, n_k_heads, n_v_heads, head_dim_k, head_dim_v) <= 0)
+                return false;
             rocmGDN_gpu_set_device(device_ordinal_);
+            const int seq_len = rows.physicalRows();
 
             size_t q_elems = static_cast<size_t>(seq_len) * n_v_heads * head_dim_k;
             size_t k_elems = q_elems;
@@ -903,7 +926,7 @@ namespace llaminar2
 
             return rocmGDN_deinterleave_qkv(
                 d_merged_qkv, d_q, d_k, d_v,
-                seq_len, n_k_heads, n_v_heads,
+                rows, n_k_heads, n_v_heads,
                 head_dim_k, head_dim_v, global_v_head_offset,
                 device_ordinal_, stream_);
         }

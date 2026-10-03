@@ -31,6 +31,37 @@ namespace llaminar2
     /** @brief Ownership direction, independent of backend, ordinal or tier. */
     enum class CapturedTransferEndpoint : std::uint32_t { Producer, Consumer };
 
+    /**
+     * @brief Authority for a transaction's live extent, frozen when capturing.
+     *
+     * Fixed messages keep their original exact-size contract. Counted messages
+     * read one producer-owned device scalar once at acquire; the consumer takes
+     * that same extent from the release-published descriptor, never a second
+     * independently computed count. Both retain a positive admitted capacity.
+     */
+    enum class CapturedTransferExtentSource : std::uint32_t
+    {
+        FixedMessage,
+        ProducerDevice,
+        ProducerPublication,
+    };
+
+    /** @return Whether an extent authority is legal for the selected endpoint. */
+    [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool capturedTransferExtentMatchesRole(
+        CapturedTransferExtentSource source, CapturedTransferEndpoint role) noexcept
+    {
+        switch (source)
+        {
+        case CapturedTransferExtentSource::FixedMessage:
+            return role == CapturedTransferEndpoint::Producer || role == CapturedTransferEndpoint::Consumer;
+        case CapturedTransferExtentSource::ProducerDevice:
+            return role == CapturedTransferEndpoint::Producer;
+        case CapturedTransferExtentSource::ProducerPublication:
+            return role == CapturedTransferEndpoint::Consumer;
+        }
+        return false;
+    }
+
     /** @brief Local lease state; a failed endpoint is never reusable. */
     enum class CapturedTransferPhase : std::uint32_t { Idle, Acquired, Publishing, Failed };
 
@@ -56,14 +87,16 @@ namespace llaminar2
      *
      * The key identifies a setup-frozen semantic role/geometry in the graph
      * family; byte count is the live physical extent, not allocated capacity.
-     * Both endpoints must name the same key and extent for each transaction.
+     * A fixed binding names exact bytes. A counted binding names the maximum;
+     * its acquired/publication message holds the actual extent (including zero).
+     * Both endpoints retire exactly the same key and live extent.
      */
     struct CapturedTransferMessage
     {
         std::uint64_t key = 0;
         std::uint64_t bytes = 0;
 
-        /** @return Whether the immutable message fits its admitted slot. */
+        /** @return Whether a positive capture-time extent fits its admitted slot. */
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool fits(
             std::uint64_t capacity) const noexcept
         { return key != 0 && bytes != 0 && bytes <= capacity; }
@@ -98,6 +131,7 @@ namespace llaminar2
     {
         std::uint64_t completed_epoch = 0;
         CapturedTransferPhase phase = CapturedTransferPhase::Idle;
+        std::uint32_t completed_payload_blocks = 0; ///< GPU-only completion cohort; occupies former alignment padding.
         CapturedTransferMessage acquired_message;
     };
 
@@ -108,9 +142,6 @@ namespace llaminar2
         CapturedTransferPublication producer;
         CapturedTransferPublication consumer;
     };
-
-    /** @brief Backend-only lowering operation; callers submit a whole transfer through TransferEngine. */
-    enum class CapturedTransferBoundaryOperation : std::uint32_t { Acquire, Publish };
 
     /**
      * @brief Exact aliases and immutable geometry passed to one CUDA/HIP boundary.
@@ -127,12 +158,15 @@ namespace llaminar2
         CapturedTransferMessage message;
         CapturedTransferEndpoint role = CapturedTransferEndpoint::Producer;
         std::uint64_t timeout_ticks = 0;
+        CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage;
+        std::uint64_t *device_extent = nullptr; ///< Producer input or consumer output; retained device storage.
 
         /** @return Whether immutable fields can name a bounded native operation. */
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD constexpr bool valid() const noexcept
         {
             return control && cursor && expected.valid() && message.fits(expected.capacity) && timeout_ticks != 0 &&
-                (role == CapturedTransferEndpoint::Producer || role == CapturedTransferEndpoint::Consumer);
+                capturedTransferExtentMatchesRole(extent_source, role) &&
+                ((extent_source == CapturedTransferExtentSource::FixedMessage) == (device_extent == nullptr));
         }
     };
 
@@ -165,7 +199,9 @@ namespace llaminar2
          * @param actual Setup-frozen header from the mapped channel.
          * @param cursor This endpoint's private state.
          * @param peer Snapshot acquired from the other endpoint's publication.
-         * @param message Exact bytes and semantic graph role of this invocation.
+         * @param message Semantic role and exact size or positive maximum extent.
+         * @param extent_source Immutable authority for this invocation's live size.
+         * @param producer_bytes Producer device scalar sampled once, ignored by other sources.
          * @return Ready with one lease, WaitForPeer without mutation, or failure.
          *
          * The producer waits for acknowledgement of its previous epoch. The
@@ -176,11 +212,14 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_TRANSFER_CHANNEL_HD static constexpr CapturedTransferDecision acquire(
             CapturedTransferEndpoint role, CapturedTransferChannelIdentity identity,
             CapturedTransferChannelIdentity actual, CapturedTransferCursor &cursor,
-            CapturedTransferPublication peer, CapturedTransferMessage message) noexcept
+            CapturedTransferPublication peer, CapturedTransferMessage message,
+            CapturedTransferExtentSource extent_source = CapturedTransferExtentSource::FixedMessage,
+            std::uint64_t producer_bytes = 0) noexcept
         {
             if (!identity.valid() || identity.nonce != actual.nonce || identity.capacity != actual.capacity ||
                 !message.fits(identity.capacity) ||
-                (role != CapturedTransferEndpoint::Producer && role != CapturedTransferEndpoint::Consumer))
+                !capturedTransferExtentMatchesRole(extent_source, role) ||
+                (extent_source == CapturedTransferExtentSource::ProducerDevice && producer_bytes > message.bytes))
                 return fail(cursor, CapturedTransferStatus::InvalidBinding);
             if (cursor.phase != CapturedTransferPhase::Idle)
                 return fail(cursor, CapturedTransferStatus::InvalidPhase);
@@ -196,6 +235,8 @@ namespace llaminar2
                     return fail(cursor, CapturedTransferStatus::EpochMismatch);
                 if (peer.epoch != completed)
                     return {CapturedTransferStatus::WaitForPeer, 0};
+                if (extent_source == CapturedTransferExtentSource::ProducerDevice)
+                    message.bytes = producer_bytes;
             }
             else
             {
@@ -203,8 +244,13 @@ namespace llaminar2
                     return fail(cursor, CapturedTransferStatus::EpochMismatch);
                 if (peer.epoch == completed)
                     return {CapturedTransferStatus::WaitForPeer, 0};
-                if (peer.message.key != message.key || peer.message.bytes != message.bytes)
+                if (peer.message.key != message.key ||
+                    (extent_source == CapturedTransferExtentSource::FixedMessage
+                        ? peer.message.bytes != message.bytes : peer.message.bytes > message.bytes))
                     return fail(cursor, CapturedTransferStatus::MessageMismatch);
+                // This is the producer's authenticated extent, not a receiver
+                // guess. An empty message still owns and retires one epoch.
+                message = peer.message;
             }
             cursor.phase = CapturedTransferPhase::Acquired;
             cursor.acquired_message = message;
@@ -266,6 +312,7 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<CapturedTransferPublication>);
     static_assert(std::is_trivially_copyable_v<CapturedTransferCursor>);
     static_assert(sizeof(CapturedTransferPublication) == 64);
+    static_assert(sizeof(CapturedTransferCursor) == 32);
     static_assert(sizeof(CapturedTransferChannelControl) == 192);
 }
 

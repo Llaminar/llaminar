@@ -117,7 +117,10 @@ namespace llaminar2
          * This is device-only intentionally: host graph construction must not
          * infer mutable execution geometry by reading the controller's state.
          */
-        [[nodiscard]] __device__ __forceinline__ int activeRows() const
+        // Use the compiler attribute rather than HIP runtime's __forceinline__
+        // macro: this POD contract is also included before runtime headers by
+        // native collective bindings. Its device method stays forcibly inline.
+        [[nodiscard]] __device__ inline __attribute__((always_inline)) int activeRows() const
         {
             int published = count_ ? *count_ : capacity_;
 #if defined(__HIP_DEVICE_COMPILE__)

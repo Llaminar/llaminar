@@ -11,6 +11,9 @@
 # Canonical generation probes reuse this same lifecycle via an explicit
 # --generation-configuration file. They are not full HTTP/E2E certification;
 # their ordered requests and serial-control identity come from the typed matrix.
+# A diagnostic --http-lifecycle-hammer likewise changes only the workload:
+# one preserved public request sequence loops until its first failure, while
+# this harness still owns readiness, driver observation and server retirement.
 # GPU capture/replay certification belongs to graph_capture_perf_policy.py;
 # the shell does not reinterpret retained parents as legacy full-graph counters.
 # Explicit cross-host cases additionally prove distinct physical MPI hosts and
@@ -221,6 +224,7 @@ SERVER_ARGS_FILE=""
 GENERATION_CONFIG_FILE=""
 GENERATION_CONTROL_FILE=""
 GENERATION_EXPECTED_TOKENS_FILE=""
+HTTP_LIFECYCLE_HAMMER_FILE=""
 CROSS_HOST_CONFIG_FILE=""
 CROSS_HOST_CASE=""
 declare -a CANONICAL_SERVER_ARGS=()
@@ -243,6 +247,9 @@ Canonical generation diagnostics (not the full E2E suite):
   --generation-configuration          Typed exported cell, with canonical requests
   --generation-control               Completed serial observations; required for MTP
   --generation-expected-tokens       Read-only reviewed serial-token projection (exclusive with control)
+
+Explicit HTTP lifecycle diagnosis (never an E2E certificate):
+  --http-lifecycle-hammer             Replay configuration; loop the ready server until first failure
 
 Canonical cross-host evidence (additive to the HTTP checks):
   --cross-host-configuration           Typed exported source cell, including remote eligibility
@@ -289,12 +296,19 @@ while [[ $# -gt 0 ]]; do
         --generation-configuration) GENERATION_CONFIG_FILE="$2"; shift 2 ;;
         --generation-control) GENERATION_CONTROL_FILE="$2"; shift 2 ;;
         --generation-expected-tokens) GENERATION_EXPECTED_TOKENS_FILE="$2"; shift 2 ;;
+        --http-lifecycle-hammer) HTTP_LIFECYCLE_HAMMER_FILE="$2"; shift 2 ;;
         --cross-host-configuration) CROSS_HOST_CONFIG_FILE="$2"; shift 2 ;;
         --cross-host-case) CROSS_HOST_CASE="$2"; shift 2 ;;
         --port)     BASE_PORT="$2";         shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [[ -n "$HTTP_LIFECYCLE_HAMMER_FILE" &&
+      ( -n "$GENERATION_CONFIG_FILE" || -n "$CROSS_HOST_CONFIG_FILE" || -n "$CROSS_HOST_CASE" ) ]]; then
+    echo "HTTP lifecycle diagnosis cannot be combined with generation/cross-host certification" >&2
+    exit 2
+fi
 
 if [[ -n "$CROSS_HOST_CONFIG_FILE" || -n "$CROSS_HOST_CASE" ]]; then
     if [[ -z "$CROSS_HOST_CONFIG_FILE" || -z "$CROSS_HOST_CASE" || -z "$SERVER_ARGS_FILE" ||
@@ -3575,12 +3589,34 @@ run_backend_tests() {
         else
             fail "[${tag}] Canonical generation token probes (see generation/observations.json)"
         fi
+    elif [[ -n "$HTTP_LIFECYCLE_HAMMER_FILE" ]]; then
+        # The canonical outer driver selects one cell. No per-cycle launch,
+        # gate, model staging, recapture or restart is hidden in this workload.
+        # Failure returns here before the shared teardown/evidence boundary.
+        if python3 "$SCRIPT_DIR/http_lifecycle_hammer.py" \
+            --base-url "$(server_base_url "$port")" \
+            --configuration "$HTTP_LIFECYCLE_HAMMER_FILE" \
+            --output "$LOG_DIR/hammer"; then
+            pass "[${tag}] Bounded HTTP lifecycle diagnostic completed (not certification)"
+        else
+            fail "[${tag}] HTTP lifecycle diagnostic failed (see hammer/progress.json)"
+        fi
     else
     # The stochastic probe is an HTTP production-path check, so it must run
     # only after the server has crossed its explicit health publication
     # boundary. Keeping it here also makes its first request the cache producer
     # and its second same-seed request the unambiguous prefix-restore consumer.
     if suite_runs_stochastic_mtp_probe "$suite_options"; then
+        # Run the omitted-seed case before a seeded request can warm a graph.
+        # The matrix also switches policies and restores a seeded control.
+        if python3 "$SCRIPT_DIR/stochastic_mtp_scenarios.py" \
+            --base-url "$(server_base_url "$port")" \
+            --timeout "$REQUEST_TIMEOUT" \
+            --output "$LOG_DIR/stochastic_mtp_scenarios.json"; then
+            pass "[${tag}] Stochastic sampling/graph lifecycle matrix"
+        else
+            fail "[${tag}] Stochastic sampling/graph lifecycle matrix (see stochastic_mtp_scenarios.json)"
+        fi
         run_stochastic_mtp_probe "$tag" "$port"
     fi
 

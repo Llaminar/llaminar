@@ -60,20 +60,22 @@ trade architecture for an isolated microbenchmark win:
 Before touching anything, capture a baseline so every change is measured against it.
 
 ```bash
-# Release build of the engine (always Ninja, never limit parallelism)
-ninja -C build_v2_release llaminar2
+# Use the Ninja executable recorded by the configured build tree.
+cmake --build build_v2_release --target llaminar2 --parallel
 
 # Baseline throughput (1st "Throughput" line = prefill, 2nd = decode)
 ./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0 2>/dev/null | grep -iE "Throughput"
 ```
 
-Record the prefill/decode tok/s and the noise band (run 2-3×; typical noise is a few
-tok/s on prefill, <0.5 tok/s on decode). A change inside the noise band is **not** a win.
+Record the prefill/decode tok/s and the measured noise band. Use warmed,
+interleaved A/B and B/A runs with identical prompt tokens, seed, sampling and
+MTP work; do not assume a fixed tok/s noise allowance. A change inside the
+observed noise band is **not** a win. For an auto-planned topology, save the
+unprofiled plan first and apply that same document to both candidates.
 
-> **Parity gate (must stay PASS the whole time):**
-> ```bash
-> ctest --test-dir build_v2_integration -R "<Model>ParityTest_(Prefill|Decode)Parity.*CUDA" --output-on-failure
-> ```
+Use `.agents/llaminar-testing/SKILL.md` to select the exact generated HF parity
+cells for the affected model/topology and reuse the unchanged Unit/preflight
+receipt. Do not use a stale regex that can silently select no tests.
 
 ---
 
@@ -109,6 +111,15 @@ explicit target).
 
 ## Profiler attachment and privilege rules
 
+- **Driver safety comes before attachment.** Open a driver-diagnostic window
+  around profiler experiments. If an attachment produces an NVIDIA Xid,
+  assertion, reset, or hang, stop further CUPTI/NCU/NSYS attempts on that
+  environment; a model-free probe failing this way is not permission to try a
+  larger model. Preserve the report and use non-attached structural/resource
+  evidence. Repeat attachment only after the driver/tooling cause is resolved
+  or an explicitly authorized isolated investigation. See
+  `.agents/cuda-tuning/references/native-graph-events.md` for diagnostic commands
+  that do not attach CUPTI and for their interpretation limits.
 - Resolve Nsight Systems with `command -v nsys`; the devcontainer package
   installs it as `/usr/local/bin/nsys`, independently of the CUDA toolkit.
   Nsight Compute remains `/usr/local/cuda/bin/ncu`.
@@ -125,6 +136,39 @@ explicit target).
   they do not auto-bootstrap MPI.
 - Write `.nsys-rep` and `.ncu-rep` artifacts under `/tmp` or another explicit
   result directory, not in the repository.
+
+### Graph audits without profiler attachment
+
+Read `.agents/cuda-tuning/references/native-graph-events.md` before using the
+standalone parent-graph event observer under this skill's `scripts/`. It records
+native DAG edges, geometry and selected event brackets without changing model
+arithmetic or entering conditional bodies. It is **diagnostic instrumentation**,
+not a production dependency or an alternative execution mode. Selected-node
+brackets include scheduler/event overhead; they are not kernel service times,
+hardware counters, or proof of canonical performance.
+
+The same reference documents the host-boundary tracer for prefill time outside
+those parents. Separate pinned prefix allocation, queued GPU completion and
+host computation; their nested/overlapping intervals must not be added as
+independent costs. Authenticate its token stream and overhead against a matched
+unobserved run before assigning the remainder to a kernel.
+
+For a single-thread audit, join executed dispatches or the exact retained graph
+inventory to source. Distinguish literal one-thread launches, many-thread
+kernels doing bulk work on lane zero, cooperative reductions with a scalar
+final store, and fixed-size controller publication. Captured occurrences are
+not replay counts; source matches alone are not evidence that a path ran.
+For communication-free estimates, recompute a dependency critical path rather
+than subtracting summed inclusive communication time. Preserve queue-order
+assumptions, identify unresolved peer joins and opaque conditional bodies, and
+label event-bracket estimates as such.
+The reference also documents local expert-phase timing/resource records and
+how to avoid mistaking a long native-memset bracket for pure memory service.
+For kernel scaling, use its communication-free local-shape ranking procedure:
+complete 1/2/4 curves, separate main/suffix workloads and ownership modes, then
+corroborate absolute lost time against the executed dependency critical path.
+The backend-neutral CSV/JSON/SVG reporter lives under
+`tests/v2/performance/kernels/plot_kernel_shard_scaling.py`.
 
 ### Profiling an automatically planned MPI topology
 
@@ -444,7 +488,7 @@ so it is a valid proxy for those kernels.
 
 ```bash
 # Build the perf test (Release)
-ninja -C build_v2_release tests/v2/v2_perf_cuda_native_vnni_gemm
+cmake --build build_v2_release --target v2_perf_cuda_native_vnni_gemm --parallel
 
 # Correctness gate is cosine >= 0.9990 vs cuBLAS. The full-shape sweep is SLOW
 # (single-threaded CPU reference, several minutes) — ALWAYS scope to the shapes you care about.
@@ -640,10 +684,11 @@ decode reordering without enabling global `LLAMINAR_DETERMINISTIC`. Stage code
 must use that shared RAII interface, never call CUDA `extern "C"` mode toggles
 or set environment variables directly.
 
-> **Build gotcha:** the MoE expert kernel `#include`s the decode header
-> `src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh`. After editing that header you
-> MUST `touch src/v2/kernels/cuda/moe/CUDAMoEKernels.cu` before `ninja`, or the change
-> won't be picked up. CUDA compiles are slow (~min, cicc-bound); ccache hits are fast.
+After editing a shared CUDA header, verify that the configured Ninja dependency
+graph rebuilds every consuming translation unit, including MoE. If it does
+not, fix dependency tracking; do not make manual `touch` operations a permanent
+build procedure. Compile the complete shipped architecture set before promotion,
+not only the GPU currently used for timing.
 
 ---
 
@@ -653,19 +698,18 @@ A perf-test win is necessary but **not sufficient**. Confirm on the full model a
 
 ```bash
 # 1. Rebuild engine
-touch src/v2/kernels/cuda/moe/CUDAMoEKernels.cu   # if a .cuh include changed
-ninja -C build_v2_release llaminar2
+cmake --build build_v2_release --target llaminar2 --parallel
 
 # 2. Same-session A/B (build baseline binary, measure; build variant, measure)
 ./build_v2_release/llaminar2 benchmark -m <model>.gguf -d cuda:0 2>/dev/null | grep -iE "Throughput"
 
-# 3. Parity MUST stay PASS
-ninja -C build_v2_integration llaminar2_core llaminar2
-ctest --test-dir build_v2_integration -R "<Model>ParityTest_.*CUDA" --output-on-failure
+# 3. Build the affected integration targets and run exact canonical HF cells
+#    using the llaminar-testing workflow, not an obsolete test-name regex.
 ```
 
 Accept the change only if: full-model throughput improves **beyond the noise band** AND
-parity stays PASS. Reject (and `git stash`/revert) otherwise.
+parity stays PASS. Undo only the scoped experimental edits otherwise; never
+stash or revert unrelated working-tree changes.
 
 ### Hard-won lesson (why isolated wins can regress the model)
 
@@ -682,7 +726,9 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 
 - Production high-water marks live in `benchmarks/production/high_water.json`.
   Only the official successful production pipeline commits those marks, after
-  both ISA images pass parity, the full E2E suites, and benchmarks. Use
+  both ISA images complete the canonical `llaminar-testing` certification
+  sequence, including generation regression, the full E2E suites and benchmarks.
+  Full mathematical HF parity is an explicit diagnostic, not a routine CI gate. Use
   `scripts/ci/run_model_parity_benchmarks.py --diagnostic` for one-off experiments;
   these reports cannot certify images or advance marks. See `docs/production-ci.md`.
 - Note rejected experiments and *why* (regression cause) so they aren't retried blindly.
@@ -700,7 +746,7 @@ LLAMINAR_PERF_STATS_GPU_STAGE_TIMING=1 \
 ./build_v2_release/llaminar2 benchmark -m M.gguf -d cuda:0
 
 # Timeline + launch order
-sudo /usr/local/cuda/bin/nsys profile -t cuda --stats=true -o /tmp/t -f true \
+sudo -E "$(command -v nsys)" profile -t cuda --stats=true -o /tmp/t -f true \
   ./build_v2_release/llaminar2 oneshot --no-mpi-bootstrap -d cuda:0 -m M.gguf -p "x" -n 10
 
 # Per-kernel counters (skip warmup, 1 launch)

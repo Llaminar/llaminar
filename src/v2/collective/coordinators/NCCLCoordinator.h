@@ -198,7 +198,8 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op,
             const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
-            const std::vector<void *> &streams);
+            const std::vector<void *> &streams,
+            const std::vector<NativeCollectiveRows> &live_rows = {});
 
         /**
          * @brief Enqueue an anchor-free sideband bundle as one NCCL group.
@@ -241,6 +242,31 @@ namespace llaminar2
         bool allreduceSingleDeviceOnStream(void *buffer, size_t count,
                                            CollectiveDataType dtype, CollectiveOp op,
                                            int device_idx, void *stream);
+
+        /**
+         * @brief Record native sum/reduce-scatter without a coordinator-thread handoff.
+         * @param send_buf Read-only rank-major input, nranks*receive_count elements.
+         * @param recv_buf Disjoint local output of receive_count elements.
+         * @param receive_count Result elements per participant, not input capacity.
+         * @param dtype Exact native arithmetic type.
+         * @param device_idx Communicator coordinate of the calling participant.
+         * @param stream Exact non-null device stream, including during capture.
+         * @return Whether enqueue and its immediate runtime error checks succeeded.
+         *
+         * Every participant supplies the same collective sequence. This method
+         * switches to the actual physical device, attributes producer/enqueue
+         * errors locally, and performs no allocation or blocking synchronization.
+         */
+        bool reduceScatterSingleDeviceOnStream(
+            const void *send_buf, void *recv_buf, size_t receive_count,
+            CollectiveDataType dtype, int device_idx, void *stream);
+
+        /** @copydoc ICollectiveBackend::nativeRowsOnStream */
+        bool nativeRowsOnStream(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, CollectiveDataType dtype,
+            CollectiveOp reduction, int participant, void *stream,
+            unsigned long long *payload_bytes = nullptr);
 
         bool allgatherSingleDeviceOnStream(const void *send_buf,
                                            void *recv_buf,

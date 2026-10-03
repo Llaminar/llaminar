@@ -1025,7 +1025,7 @@ namespace llaminar2
         // =================================================================
         // Prefill Graph Capture Configuration
         // =================================================================
-        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum padded raw-prompt graph bucket; never an eager-execution threshold (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        int prefill_graph_min_seq = kDefaultPrefillGraphMinBucketSize; ///< Smallest serving bucket; explicit LLAMINAR_PREFILL_GRAPH_MIN_SEQ overrides coalescing, never graph capture.
         bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
@@ -1106,11 +1106,13 @@ namespace llaminar2
         bool exec_swiglu = true;    ///< Use ComputeStage for SwiGLU
         bool exec_residual = true;  ///< Use ComputeStage for residual add
 
+        /** @brief Resolve production defaults and explicit diagnostic overrides. */
         ExecutionConfig()
         {
             reload();
         }
 
+        /** @brief Reload execution controls without performing device work. */
         void reload()
         {
             fast_decode = true;
@@ -1254,6 +1256,9 @@ namespace llaminar2
             }
 
             // Prefill graph capture configuration
+            // Removing a diagnostic floor must restore the canonical ladder,
+            // not retain the previous override in this configuration object.
+            prefill_graph_min_seq = kDefaultPrefillGraphMinBucketSize;
             const char *prefill_graph_min_seq_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MIN_SEQ");
             if (prefill_graph_min_seq_env)
             {

@@ -16,7 +16,9 @@
 #include "../qwen35moe/Qwen35MoEModelParityDefinitions.h"
 #include "Qwen36MTPCheckpointSurface.h"
 
+#include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -198,6 +200,36 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Declare the distinct movable-gate/up, fixed-down-column execution mode.
+     * @param topology One native homogeneous GPU domain, already declared above.
+     * @return An independent plan blueprint expanded over the ordinary parity axes.
+     *
+     * Model, weights, references, numerical gates and physical endpoints remain
+     * unchanged. A new topology identity prevents artifacts from overwriting the
+     * whole-expert control; copying the immutable plan prevents mutating it.
+     * Dense and routed work share one hardware domain, so its dense declaration
+     * is derived from the selected routed declaration, not edited independently.
+     */
+    inline ModelParityTopologyDefinition qwen36MoEProjectionTopology(
+        ModelParityTopologyDefinition topology)
+    {
+        if (!topology.expert_overlay_plan || topology.expert_overlay_plan->domains.size() != 1u ||
+            topology.participants.size() < 2u ||
+            std::any_of(topology.participants.begin(), topology.participants.end(),
+                [](const auto &participant) { return !participant.address.isGPU(); }))
+            throw std::invalid_argument("Projection parity requires one native multi-GPU overlay domain");
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
+        plan->domains.front().routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        // Production normalization requires every spelling of this one domain
+        // to agree. Re-project the complete declaration so future policy fields
+        // cannot leave an old whole-expert copy in the dense continuation path.
+        plan->dense_domains = {plan->domains.front().toExecutionDomainDefinition()};
+        topology.expert_overlay_plan = std::move(plan);
+        topology.test_id += "_GateUpOwnedDownColumns";
+        return topology;
+    }
+
+    /**
      * @return One CPU ExpertOverlay tier spanning two sockets and two ranks.
      *
      * Dense tensor parallelism and routed expert ownership share the node
@@ -310,18 +342,61 @@ namespace llaminar2::test::parity::qwen36
         }
         return definition;
     }
-    /** @return Full CPU two-socket matrix with one Dynamic/adaptive HTTP tag. */
-    inline ModelParityDefinition qwen36MoECPU2NodeTPParityDefinition()
+
+    /**
+     * @brief Tag an existing ExpertOverlay matrix for public HTTP certification.
+     * @param topology Complete declared overlay, including its compute policy.
+     * @param reference_directory Independent real-weight HF checkpoint pack.
+     * @return Unpruned standard matrix with one Dynamic/Ordinal/adaptive HTTP tag.
+     * @throws std::invalid_argument When no ExpertOverlay plan is declared.
+     *
+     * Whole-expert and projection-owned controls use the same profile so the
+     * canonical benchmark projection can compare them without a runner-side
+     * topology list. CPU callers may explicitly extend their ISA deadline;
+     * neither this tag nor that deadline changes mathematical cell geometry.
+     */
+    inline ModelParityDefinition qwen36MoEExpertOverlayCertificationDefinition(
+        ModelParityTopologyDefinition topology,
+        std::string reference_directory)
     {
+        if (!topology.expert_overlay_plan)
+            throw std::invalid_argument("Overlay HTTP certification requires an ExpertOverlay plan");
         auto definition = qwen36MoEParityDefinition(
-            qwen36MoECPU2NodeTPTopology(),
-            "pytorch_qwen36_moe_singledevice_cpu_snapshots",
+            std::move(topology), std::move(reference_directory),
             qwen36MoEExpertOverlayThresholds());
         definition.e2e_certifiable = {{
             .mtp = ModelParityMTP::DynamicDepth,
             .owner_order = RoutedExpertOwnerOrder::Ordinal,
             .movement = ModelParityExpertMovement::Dynamic,
         }};
+        return definition;
+    }
+
+    /**
+     * @brief Certify the distinct movable-gate/up mode through the public HTTP surface.
+     * @param topology Homogeneous native multi-GPU whole-expert control topology.
+     * @param reference_directory Independent HF pack shared with that control.
+     * @return The full standard parity matrix with one Dynamic/adaptive HTTP tag.
+     *
+     * The tag adds no numerical cells and does not replace the whole-expert
+     * control. Automatic placement must preserve the declared compute policy;
+     * ordinary needle, prefix, stochastic, tool and movement checks still apply.
+     */
+    inline ModelParityDefinition qwen36MoEProjectionParityDefinition(
+        ModelParityTopologyDefinition topology,
+        std::string reference_directory)
+    {
+        return qwen36MoEExpertOverlayCertificationDefinition(
+            qwen36MoEProjectionTopology(std::move(topology)),
+            std::move(reference_directory));
+    }
+
+    /** @return Full CPU two-socket matrix with one Dynamic/adaptive HTTP tag. */
+    inline ModelParityDefinition qwen36MoECPU2NodeTPParityDefinition()
+    {
+        auto definition = qwen36MoEExpertOverlayCertificationDefinition(
+            qwen36MoECPU2NodeTPTopology(),
+            "pytorch_qwen36_moe_singledevice_cpu_snapshots");
         // The complete AVX2 CPU workload needs twenty minutes, including the
         // final near-limit prefill after 2,048-token generation. This is a
         // model/topology declaration, not a timeout inferred by either runner.

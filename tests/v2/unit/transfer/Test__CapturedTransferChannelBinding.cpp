@@ -7,6 +7,7 @@
  * protocol state-machine sweep; they do not certify GPU memory visibility.
  */
 #include "transfer/CapturedTransferChannel.h"
+#include "transfer/CapturedTransferKernelPlan.h"
 #include "execution/local_execution/orchestrators/PipelineActivationExchange.h"
 #include "execution/local_execution/orchestrators/PipelineMetadataExchange.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
@@ -54,15 +55,35 @@ namespace
         /** @brief Freeze timer geometry during setup, with explicit failure injection. */
         bool prepareCapturedTransferChannelKernels(int, int timeout_ms, std::uint64_t *ticks) override
         { ++preparations; EXPECT_EQ(timeout_ms, 30000); *ticks = 42; return !fail_prepare; }
-        /** @brief Record only; protocol execution is independently tested in its pure suite. */
-        bool enqueueCapturedTransferChannelBoundary(const CapturedTransferChannelDeviceBinding &binding,
-            CapturedTransferBoundaryOperation operation, int, void *stream) override
+        /** @brief Observe one complete operation; logical phases are not native kernel counts. */
+        bool enqueueCapturedTransferChannel(const CapturedTransferChannelDeviceBinding &binding,
+            void *dst, const void *src, int, void *stream) override
         {
             EXPECT_TRUE(binding.valid());
+            ++complete_operations;
             native_bindings.push_back(binding);
-            calls.push_back({operation == CapturedTransferBoundaryOperation::Acquire ? "acquire" : "publish",
-                stream, static_cast<size_t>(binding.message.bytes)});
-            return !fail_boundary;
+            calls.push_back({"acquire", stream, static_cast<size_t>(binding.message.bytes)});
+            if (fail_boundary) return false;
+            const bool counted = binding.extent_source != CapturedTransferExtentSource::FixedMessage;
+            const bool producer = binding.role == CapturedTransferEndpoint::Producer;
+            auto &control = *binding.control;
+            if (counted)
+            {
+                const auto decision = CapturedTransferChannelProtocol::acquire(binding.role, binding.expected,
+                    control.identity, *binding.cursor, producer ? control.consumer : control.producer,
+                    binding.message, binding.extent_source, producer ? *binding.device_extent : 0);
+                EXPECT_TRUE(decision.ready());
+                if (!decision.ready()) return false;
+                if (!producer) *binding.device_extent = binding.cursor->acquired_message.bytes;
+            }
+            const auto bytes = counted ? binding.cursor->acquired_message.bytes : binding.message.bytes;
+            calls.push_back({counted ? "counted_copy" : "copy", stream, static_cast<size_t>(bytes)});
+            std::memcpy(dst, src, bytes);
+            calls.push_back({"publish", stream, static_cast<size_t>(binding.message.bytes)});
+            if (counted)
+                EXPECT_TRUE(CapturedTransferChannelProtocol::publish(*binding.cursor,
+                    binding.cursor->completed_epoch + 1, producer ? control.producer : control.consumer).ready());
+            return true;
         }
         /** @brief Copy exact bytes, retaining sentinels outside the requested message. */
         bool copyDeviceVisibleRegionByKernelOnStream(void *dst, const void *src, size_t bytes, int, void *stream) override
@@ -79,6 +100,7 @@ namespace
 
         std::set<void *> registered;
         int registrations = 0, unregistrations = 0, preparations = 0, setup_queries = 0;
+        size_t complete_operations = 0;
         bool fail_prepare = false, fail_event = false, fail_boundary = false;
         std::vector<Call> calls;
         std::vector<CapturedTransferChannelDeviceBinding> native_bindings;
@@ -237,6 +259,75 @@ namespace
         EXPECT_EQ(rocm.registrations, 0);
         EXPECT_EQ(remaining(*authority, DeviceId::cuda(0)), sizeof(CapturedTransferCursor));
         EXPECT_GT(remaining(*authority, DeviceId::cpu()), 0u);
+    }
+
+    TEST_F(CapturedTransferChannelBindingTest, CountedBindingsRetainCountOwnersAndNeverCopyPadding)
+    {
+        for (const bool reverse : {false, true})
+        {
+            const auto first = reverse ? DeviceId::rocm(0) : DeviceId::cuda(0);
+            const auto second = reverse ? DeviceId::cuda(0) : DeviceId::rocm(0);
+            auto authority = admission(first, second, 257);
+            auto channel = transfer.createCapturedTransferChannel(*authority, DeviceId::cpu(), first,
+                producer_stream, second, consumer_stream, 257);
+            auto source_count = transfer.allocateDeviceTransferBuffer(64, first);
+            auto destination_count = transfer.allocateDeviceTransferBuffer(64, second);
+            auto *input_count = static_cast<std::uint64_t *>(source_count->mutableDeviceData());
+            auto *output_count = static_cast<std::uint64_t *>(destination_count->mutableDeviceData());
+            auto source = transfer.allocateDeviceTransferBuffer(300, first);
+            auto destination = transfer.allocateDeviceTransferBuffer(300, second);
+            const auto capacity_send = transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer, {31, 257}, source, 3);
+            const auto capacity_receive = transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Consumer, {31, 257}, destination, 11);
+            const auto send = transfer.bindDeviceCountedTransfer(capacity_send, source_count);
+            const auto receive = transfer.bindDeviceCountedTransfer(capacity_receive, destination_count);
+            EXPECT_EQ(send.extentSource(), CapturedTransferExtentSource::ProducerDevice);
+            EXPECT_EQ(receive.extentSource(), CapturedTransferExtentSource::ProducerPublication);
+            EXPECT_THROW((void)transfer.bindDeviceCountedTransfer(send, source_count), std::invalid_argument);
+            EXPECT_THROW((void)transfer.bindDeviceCountedTransfer(capacity_send, destination_count), std::invalid_argument);
+            EXPECT_THROW((void)transfer.bindDeviceCountedTransfer(capacity_send, source_count, 1), std::invalid_argument);
+            EXPECT_THROW((void)transfer.bindDeviceCountedTransfer(capacity_send, source_count, 64), std::out_of_range);
+            const auto overlapping = transfer.bindCapturedTransfer(channel, CapturedTransferEndpoint::Producer, {31, 32}, source_count);
+            EXPECT_THROW((void)transfer.bindDeviceCountedTransfer(overlapping, source_count), std::invalid_argument);
+            source_count.reset(); destination_count.reset();
+            const auto queries = cuda.setup_queries + rocm.setup_queries;
+            for (const auto bytes : {257u, 0u, 1u, 255u, 16u, 0u, 257u})
+            {
+                cuda.calls.clear(); rocm.calls.clear();
+                std::memset(source->mutableDeviceData(), static_cast<int>(bytes % 251), 300);
+                std::memset(destination->mutableDeviceData(), 0xa5, 300);
+                *input_count = bytes;
+                *output_count = ~std::uint64_t{0};
+                const auto operations_before = cuda.complete_operations + rocm.complete_operations;
+                transfer.enqueueCapturedTransfer(send, producer_stream);
+                // A producer may update its next count after publication. The
+                // receiver must still take the just-published original extent.
+                *input_count = ~std::uint64_t{0};
+                transfer.enqueueCapturedTransfer(receive, consumer_stream);
+                EXPECT_EQ(cuda.complete_operations + rocm.complete_operations, operations_before + 2);
+                EXPECT_EQ(*output_count, bytes);
+                for (auto *backend : {&cuda, &rocm})
+                {
+                    ASSERT_EQ(backend->calls.size(), 3u);
+                    EXPECT_EQ(backend->calls[1].operation, "counted_copy");
+                    EXPECT_EQ(backend->calls[1].bytes, bytes);
+                }
+                const auto *actual = static_cast<const unsigned char *>(destination->deviceData());
+                for (size_t i = 0; i < 300; ++i)
+                    ASSERT_EQ(actual[i], i >= 11 && i < 11 + bytes ? bytes % 251 : 0xa5);
+            }
+            EXPECT_EQ(cuda.setup_queries + rocm.setup_queries, queries);
+        }
+    }
+
+    TEST(CapturedTransferKernelPlan, CompleteDispatchUsesCaptureCapacityAndKeepsCursorBOM)
+    {
+        EXPECT_THROW((void)capturedTransferKernelPlan(0), std::invalid_argument);
+        for (const auto bytes : {std::uint64_t{1}, std::uint64_t{4099}, kCapturedTransferSingleBlockBytes})
+            EXPECT_EQ(capturedTransferKernelPlan(bytes), CapturedTransferKernelPlan::SingleBlock);
+        for (const auto bytes : {kCapturedTransferSingleBlockBytes + 1, std::numeric_limits<std::uint64_t>::max()})
+            EXPECT_EQ(capturedTransferKernelPlan(bytes), CapturedTransferKernelPlan::ParallelCopy);
+        EXPECT_EQ(sizeof(CapturedTransferCursor), 32u);
+        EXPECT_EQ(CapturedTransferChannel::memoryFor(1024).cursor_bytes_per_device, 32u);
     }
 
     TEST_F(CapturedTransferChannelBindingTest, PartialSetupRetiresEventsBuffersRegistrationsAndClaims)
@@ -617,7 +708,7 @@ namespace
                     EXPECT_EQ(backend.calls[3 * field + 1].operation, "copy");
                     EXPECT_EQ(backend.calls[3 * field + 2].operation, "publish");
                     EXPECT_EQ(backend.calls[3 * field + 1].bytes, layout.message(field).bytes);
-                    EXPECT_EQ(backend.native_bindings[2 * field].message.key, layout.message(field).key);
+                    EXPECT_EQ(backend.native_bindings[field].message.key, layout.message(field).key);
                 }
                 for (size_t field = 0; width > 1 && field < count; ++field)
                     EXPECT_EQ(backend.calls[(member == 0 ? 3 * count : 0) + field].operation, "metadata_broadcast");

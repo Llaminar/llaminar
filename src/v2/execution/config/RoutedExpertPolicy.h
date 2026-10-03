@@ -64,6 +64,15 @@ namespace llaminar2
          * apportionment.
          */
         TensorSharded,
+
+        /**
+         * Gate/up pairs follow one movable expert owner; every participant
+         * retains a fixed full-K output-column slice of every down projection.
+         * Native intermediate and output-column allgathers preserve the serial
+         * arithmetic. This is a distinct physical mode, never a reinterpretation
+         * or automatic replacement of Apportioned whole-expert ownership.
+         */
+        GateUpOwnedDownColumns,
     };
 
     /**
@@ -423,6 +432,8 @@ namespace llaminar2
             return "apportioned";
         case RoutedExpertComputePolicy::TensorSharded:
             return "tensor-sharded";
+        case RoutedExpertComputePolicy::GateUpOwnedDownColumns:
+            return "gate-up-owned-down-columns";
         }
         return "unknown";
     }
@@ -616,7 +627,8 @@ namespace llaminar2
      * @brief Parse a canonical routed-expert compute policy.
      * @param value CLI or YAML value naming the physical expert distribution.
      * @return The typed policy, or `std::nullopt` when the value is not one of
-     *         `replicated`, `apportioned`, or `tensor-sharded`.
+     *         `replicated`, `apportioned`, `tensor-sharded`, or
+     *         `gate-up-owned-down-columns`.
      */
     inline std::optional<RoutedExpertComputePolicy> parseRoutedExpertComputePolicy(
         const std::string &value)
@@ -628,6 +640,8 @@ namespace llaminar2
             return RoutedExpertComputePolicy::Apportioned;
         if (normalized == "tensor-sharded")
             return RoutedExpertComputePolicy::TensorSharded;
+        if (normalized == "gate-up-owned-down-columns")
+            return RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         return std::nullopt;
     }
 

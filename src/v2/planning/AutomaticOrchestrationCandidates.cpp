@@ -419,8 +419,13 @@ namespace llaminar2
             for (size_t index = 0; index < pools.size(); ++index)
             {
                 const auto name = "domain_" + std::to_string(index);
-                overlay->domains.push_back(RoutedExpertDomain::fromExecutionDomainDefinition(
-                    domainFor(pools[index], membership, name)));
+                auto domain = domainFor(pools[index], membership, name);
+                // Automatic placement chooses endpoints, not a different
+                // arithmetic/ownership contract. Seal the public compute
+                // constraint before normalization turns an unspecified domain
+                // into the ordinary apportioned default.
+                domain.routed_compute_policy = request.routed_expert_compute_policy;
+                overlay->domains.push_back(RoutedExpertDomain::fromExecutionDomainDefinition(domain));
                 overlay->routed_tiers.push_back({.name = "tier_" + std::to_string(index),
                     .domain = name, .priority = static_cast<int>(index)});
             }

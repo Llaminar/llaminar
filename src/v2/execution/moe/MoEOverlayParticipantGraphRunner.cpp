@@ -21,6 +21,7 @@
 
 #include "MoEOverlayParticipantGraphRunner.h"
 #include "MoEOverlayParticipantResidency.h"
+#include "MoEExpertOverlayPreparationPlan.h"
 
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/BackendManager.h"
@@ -198,18 +199,6 @@ namespace llaminar2
             IWorkerGPUContext *const worker =
                 participantWorkerContext(device);
             return worker ? worker->defaultStream() : nullptr;
-        }
-
-        /** @brief Convert a local rank role to the weight residency audit role. */
-        WeightResidencyCategory participantResidencyCategory(
-            const OverlayRankPlan &rank,
-            DeviceId device)
-        {
-            if (device.is_gpu())
-                return WeightResidencyCategory::AcceleratorRoutedExpert;
-            if (rank.loads_worker_fallback_experts)
-                return WeightResidencyCategory::WorkerFallbackExpert;
-            return WeightResidencyCategory::CpuFallbackExpert;
         }
 
         /** @brief Render a compact comma-separated participant id list. */
@@ -634,109 +623,6 @@ namespace llaminar2
             return true;
         }
     };
-
-    WeightPlan buildMoEOverlayParticipantWeightPlan(
-        const ModelContext &model_context,
-        const MoEExpertOverlayExecutionPlan &execution_plan,
-        const MoEExpertOwnerMap &owner_map,
-        const MoEExpertOwnerParticipant &participant)
-    {
-        InferenceStrategy strategy;
-        strategy.mode = WeightInferenceMode::SingleDevice;
-        strategy.model_id = ModelContextId{
-            reinterpret_cast<uint64_t>(&model_context)};
-        strategy.devices = {participant.device};
-
-        WeightPlan plan(
-            strategy,
-            PhysicalMemoryOwner::RoutedExpertWeights);
-        const auto &loader = model_context.concreteLoader();
-        const auto &rank = execution_plan.currentRankPlan();
-        const auto residency =
-            participantResidencyCategory(rank, participant.device);
-
-        for (int layer = 0; layer < model_context.totalBlockCount(); ++layer)
-        {
-            std::vector<int> experts = owner_map.expertsForParticipant(
-                layer, participant.participant_id);
-            std::sort(experts.begin(), experts.end());
-            experts.erase(
-                std::unique(experts.begin(), experts.end()), experts.end());
-            if (experts.empty())
-                continue;
-
-            for (const auto &parent : kExpertParents)
-            {
-                const std::string name = parentName(layer, parent.suffix);
-                const auto shape = loader.getTensorShape(name);
-                if (!shape || shape->size() != 3u)
-                {
-                    throw std::runtime_error(
-                        "MoE overlay participant weight plan requires a 3-D "
-                        "expert parent: " +
-                        name);
-                }
-                if (std::any_of(
-                        experts.begin(), experts.end(),
-                        [expert_count = (*shape)[2]](int expert)
-                        {
-                            return expert < 0 ||
-                                   static_cast<size_t>(expert) >= expert_count;
-                        }))
-                {
-                    throw std::runtime_error(
-                        "MoE overlay participant owner map names an expert "
-                        "outside tensor geometry for " +
-                        name);
-                }
-
-                WeightRequirement requirement;
-                requirement.canonical_name = name;
-                requirement.required = true;
-                requirement.role = parent.role;
-                requirement.derivation = WeightDerivationKind::ExpertSlice;
-                requirement.layer = layer;
-                requirement.target_device = participant.device;
-                requirement.lookup_device = DeviceId::cpu();
-                requirement.bypass_tensor_parallel = true;
-                requirement.residency_category = residency;
-                requirement.overlay_domain = participant.domain_name;
-                requirement.overlay_participant_index =
-                    participant.domain_participant_index;
-                requirement.overlay_participant_world_rank =
-                    participant.world_rank_known
-                        ? participant.world_rank
-                        : -1;
-                requirement.host_policy = participant.device.is_gpu()
-                                              ? WeightHostPolicy::
-                                                    RequiredUntilPreparedOrTransferred
-                                              : WeightHostPolicy::
-                                                    RequiredForCPUExecution;
-                requirement.expected_prepared_kind =
-                    PreparedWeightKind::MoeExpertSlab;
-                requirement.slice.source_rows = (*shape)[0];
-                requirement.slice.source_cols = (*shape)[1];
-                requirement.slice.row_count = (*shape)[0];
-                requirement.slice.col_count = (*shape)[1];
-                requirement.slice.expert_start =
-                    static_cast<size_t>(experts.front());
-                requirement.slice.expert_count = experts.size();
-                requirement.slice.expert_ids = experts;
-                requirement.slice.inner_is_presliced = true;
-                plan.add(std::move(requirement));
-            }
-        }
-
-        /*
-         * Current residency is data, not graph topology. An automatically
-         * filled higher-priority tier may leave this declared endpoint empty
-         * at epoch one, while a later economical promotion/demotion can still
-         * publish experts into its preallocated shadow bank. Return a valid
-         * empty plan so the caller can retain the endpoint graph without
-         * materializing nonexistent initial payloads.
-         */
-        return plan;
-    }
 
     MoEOverlayParticipantGraphRunner::MoEOverlayParticipantGraphRunner(
         MoEOverlayParticipantGraphRunnerConfig config)
@@ -1715,26 +1601,19 @@ namespace llaminar2
         strategy.devices = participantDevices(local_participants_);
         WeightPlan plan(std::move(strategy));
         if (config_.prepared_weight_admission ==
-            PreparedWeightAdmission::AllocateCompleteSet)
+                PreparedWeightAdmission::AllocateCompleteSet &&
+            !local_participants_.empty())
         {
             ScopedWeightLoadDetailTimer timer(
                 "overlay.weights.build_plan");
-            for (const auto *participant : local_participants_)
-            {
-                if (!participant)
-                    continue;
-                const WeightPlan participant_plan =
-                    buildMoEOverlayParticipantWeightPlan(
-                        *config_.model_context,
-                        *execution_plan_,
-                        *owner_map_,
-                        *participant);
-                for (const auto &requirement :
-                     participant_plan.requirements())
-                {
-                    plan.add(requirement);
-                }
-            }
+            const auto preparation = MoEExpertOverlayPreparationPlan::build(
+                *runtime_plan_, config_.model_context->concreteLoader())
+                .filteredForRank(execution_plan_->currentRankPlan())
+                .filteredForDevices(participantDevices(local_participants_));
+            const auto sources = preparation.sourceWeightPlan(
+                config_.model_context->concreteLoader(), plan.strategy().model_id);
+            for (const auto &requirement : sources.requirements())
+                plan.add(requirement);
         }
         const ModelContextId model_id = plan.strategy().model_id;
 
@@ -2736,23 +2615,23 @@ namespace llaminar2
                             layer,
                             endpoint->participant_id,
                             num_experts);
-                    std::vector<MoEOverlayPreparedExpertTriplet>
-                        prepared_triplets;
+                    std::vector<MoEOverlayPreparedExpertPayload>
+                        prepared_payloads;
                     std::string residency_error;
-                    if (!resolveMoEOverlayPreparedExpertTriplets(
+                    if (!resolveMoEOverlayPreparedExpertPayloads(
                             registry,
                             *binding.participant,
                             layer,
                             num_experts,
                             expert_mask,
-                            prepared_triplets,
+                            prepared_payloads,
                             &residency_error) ||
                         !config_.participant_residency
                              ->registerInitialLayer(
                                  endpoint->participant_id,
                                  layer,
                                  expert_mask,
-                                 prepared_triplets,
+                                 prepared_payloads,
                                  &residency_error))
                     {
                         throw std::runtime_error(
@@ -3119,23 +2998,23 @@ namespace llaminar2
                                 layer,
                                 endpoint->participant_id,
                                 num_experts);
-                        std::vector<MoEOverlayPreparedExpertTriplet>
-                            prepared_triplets;
+                        std::vector<MoEOverlayPreparedExpertPayload>
+                            prepared_payloads;
                         std::string residency_error;
-                        if (!resolveMoEOverlayPreparedExpertTriplets(
+                        if (!resolveMoEOverlayPreparedExpertPayloads(
                                 registry,
                                 *binding.participant,
                                 layer,
                                 num_experts,
                                 expert_mask,
-                                prepared_triplets,
+                                prepared_payloads,
                                 &residency_error) ||
                             !config_.participant_residency
                                  ->registerInitialLayer(
                                      endpoint->participant_id,
                                      layer,
                                      expert_mask,
-                                     prepared_triplets,
+                                     prepared_payloads,
                                      &residency_error))
                         {
                             throw std::runtime_error(
@@ -3869,23 +3748,23 @@ namespace llaminar2
                             "Participant rank batch is missing prepared-bank endpoint p" +
                             std::to_string(target));
                     }
-                    std::vector<MoEOverlayPreparedExpertTriplet>
-                        prepared_triplets;
+                    std::vector<MoEOverlayPreparedExpertPayload>
+                        prepared_payloads;
                     std::string residency_error;
-                    if (!resolveMoEOverlayPreparedExpertTriplets(
+                    if (!resolveMoEOverlayPreparedExpertPayloads(
                             registry,
                             *target_descriptor,
                             layer,
                             num_experts,
                             local_params.expert_mask,
-                            prepared_triplets,
+                            prepared_payloads,
                             &residency_error) ||
                         !config_.participant_residency
                              ->registerInitialLayer(
                                  target,
                                  layer,
                                  local_params.expert_mask,
-                                 prepared_triplets,
+                                 prepared_payloads,
                                  &residency_error))
                     {
                         throw std::runtime_error(

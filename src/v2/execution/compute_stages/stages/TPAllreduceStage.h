@@ -126,6 +126,7 @@ namespace llaminar2
         int sideband_device_index = -1;           ///< LocalTP participant index for optional sidebands.
         std::vector<LocalTPCollectiveSidebandBuffer> sidebands; ///< Optional same-stream control sidebands.
         std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings; ///< Workspace-resolved sidebands.
+        std::optional<NativeCollectiveRows> live_rows; ///< Device-owned prefix; count retains the admitted bank stride.
     };
 
     /**
@@ -165,6 +166,20 @@ namespace llaminar2
          * @return true on success, false on error
          */
         bool execute(IDeviceContext *ctx) override;
+
+        /**
+         * @brief Submit this native reduction on an authenticated graph fork.
+         * @param input Exact input and auxiliary stream acquired by TransferEngine.
+         * @return Native enqueue success; the paired join still owns publication.
+         * @throws std::invalid_argument For sidebands, rank-fold arithmetic or a foreign frontier.
+         *
+         * Used by the typed overlap builder, not an alternate arithmetic path.
+         * It shares ordinary execution's transport precision and BOM reporting.
+         */
+        bool enqueueAcquiredInput(const AcquiredDeviceTransferInput &input) const;
+
+        /** @return Immutable declaration for lossless graph-edge lowering. */
+        const Params &params() const noexcept { return params_; }
 
         /**
          * @brief Get stage type

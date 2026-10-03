@@ -244,11 +244,16 @@ namespace llaminar2
          * to legacy tensor views. Restoring the previous context prevents an
          * unsuccessful sidecar build from leaking its depth into the next
          * ordinary forward graph.
+         * The sidecar owns different query lengths, so this same scope suspends
+         * the enclosing main-prefill collective prefix rather than letting a
+         * nested graph accidentally consume another graph family's authority.
          */
         class ScopedMTPGraphContext
         {
         public:
+            /** @brief Enter one sidecar role and suspend the enclosing main-prefill row binding. */
             ScopedMTPGraphContext(Qwen35Graph &graph, int depth_idx) noexcept;
+            /** @brief Restore all enclosing graph-role operands, including on exceptions. */
             ~ScopedMTPGraphContext();
 
             ScopedMTPGraphContext(const ScopedMTPGraphContext &) = delete;
@@ -259,6 +264,7 @@ namespace llaminar2
             Qwen35Graph &graph_;
             bool previous_active_ = false;
             int previous_depth_idx_ = -1;
+            std::optional<DeviceRowRange> previous_prefill_rows_;
         };
 
         // =====================================================================

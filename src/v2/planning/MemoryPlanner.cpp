@@ -10,6 +10,8 @@
  */
 
 #include "planning/MemoryPlanner.h"
+#include "collective/DeviceCountedAllGather.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/PersistentStateMemoryEstimator.h"
@@ -408,6 +410,20 @@ MemoryPlan MemoryPlanner::plan(
         activation_seq = std::max(1, activation_seq);
         size_t pipeline_device_bytes = 0u;
         size_t pipeline_host_bytes = 0u;
+        if (cfg.projection_peer_access == PeerAccessCoverage::None)
+        {
+            if (!cfg.device.is_gpu() || cfg.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
+                cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || !cfg.local_tp_backend)
+                throw std::invalid_argument("Counted projection staging requires a rank-local GPU continuation domain");
+            const auto rows = std::max(activation_seq, cfg.mtp_enabled ? std::max(1, cfg.mtp_target_query_rows) : 1);
+            const auto arena = MoEProjectionArenaGeometry::resolve(profile, cfg.total_shards);
+            const auto staging = DeviceCountedAllGather::memoryFor(cfg.total_shards, arena.packetCapacityBytes(rows));
+            // Each producer contributes its outgoing mapped slots once. Every
+            // GPU owns both endpoint cursors and its exact extent bank. This is
+            // a typed BOM, never an independent capacity subtraction/reserve.
+            pipeline_device_bytes = staging.device_bytes;
+            pipeline_host_bytes = staging.host_bytes;
+        }
         if (!cfg.captured_pipeline_boundaries.empty())
         {
             if (!cfg.device.is_gpu() || cfg.shard_index != 0 || cfg.local_pipeline_backend ||
@@ -1114,6 +1130,7 @@ MemoryPlan MemoryPlanner::plan(
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
+                    .routed_compute_policy = cfg.routed_compute_policy,
                     .mtp_target_query_rows = cfg.mtp_target_query_rows,
                     .mtp_terminal_logits_layout =
                         replicated_dense_decode

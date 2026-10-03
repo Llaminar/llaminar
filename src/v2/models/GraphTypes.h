@@ -25,6 +25,7 @@
 #include "../execution/mtp/MTPRequestTerminalPublicationGraph.h"
 #include "../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../execution/moe/MoEOverlayAuthorityExecution.h"
+#include "../execution/moe/MoEActivationBindings.h"
 #include "../execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
@@ -1226,13 +1227,8 @@ namespace llaminar2
         TensorBase *up = nullptr;
         TensorBase *ffn_output = nullptr;
 
-        TensorBase *moe_expert_indices = nullptr;
-        TensorBase *moe_expert_weights = nullptr;
-        TensorBase *moe_combined_output = nullptr;
-        TensorBase *moe_canonical_route_contributions = nullptr;
-        TensorBase *moe_shared_expert_output = nullptr;
-        TensorBase *moe_gate_scratch = nullptr;
-        TensorBase *moe_up_scratch = nullptr;
+        /// Complete policy-selected MoE borrows; absent for dense or KV-only sidecars.
+        std::optional<MoEActivationBindings> moe;
     };
 
     struct MTPDepthWeightBindings

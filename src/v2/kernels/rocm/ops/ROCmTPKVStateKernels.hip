@@ -1,3 +1,11 @@
+/**
+ * @file ROCmTPKVStateKernels.hip
+ * @brief Exact-copy row compaction and column transposition on an explicit HIP stream.
+ *
+ * Borrowed banks retain the original FP32 bits. The same transpose assembles
+ * gathered columns and, with exchanged outer dimensions, packs reduce-scatter
+ * input. Singleton dimensions still enqueue the required disjoint copy.
+ */
 #include <hip/hip_runtime.h>
 #include <cstdio>
 
@@ -92,6 +100,7 @@ extern "C" bool rocmTPKV_compact_rows_fp32(
     return true;
 }
 
+/** @brief Enqueue [rank,row,column] to [row,rank,column], including singleton dimensions. */
 extern "C" bool rocmTPKV_deinterleave_rank_major_fp32(
     const float *rank_major,
     float *row_major,
@@ -101,7 +110,7 @@ extern "C" bool rocmTPKV_deinterleave_rank_major_fp32(
     int device_ordinal,
     void *stream)
 {
-    if (!rank_major || !row_major || tokens <= 0 || degree <= 1 || local_dim <= 0 || !stream)
+    if (!rank_major || !row_major || tokens <= 0 || degree < 1 || local_dim <= 0 || !stream)
         return false;
 
     hipError_t err = hipSetDevice(device_ordinal);

@@ -323,19 +323,19 @@ namespace llaminar2
             return "unknown";
         }
 
-        /** @brief Select one retained projection from a complete expert triplet. */
+        /** @brief Select one retained projection from a complete expert payload. */
         std::shared_ptr<ITensorGemm> projectionEngine(
-            const MoEOverlayPreparedExpertTriplet &triplet,
+            const MoEOverlayPreparedExpertPayload &payload,
             ExpertTierWeightProjection projection)
         {
             switch (projection)
             {
             case ExpertTierWeightProjection::Gate:
-                return triplet.gate;
+                return payload.gate();
             case ExpertTierWeightProjection::Up:
-                return triplet.up;
+                return payload.up();
             case ExpertTierWeightProjection::Down:
-                return triplet.down;
+                return payload.down();
             }
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric received an unknown projection role");
@@ -2277,7 +2277,7 @@ namespace llaminar2
              * @param device Exact endpoint device.
              * @param participant_id Logical endpoint identity.
              * @param layer_indices Sorted layers sharing the projection geometry.
-             * @param initial_slots Loader-owned resident triplets.
+             * @param initial_slots Loader-owned resident payloads.
              * @param perf_device Stable topology label for evidence.
              */
             AdoptedInitialExpertSlotRecycler(
@@ -3515,7 +3515,7 @@ namespace llaminar2
             slot = candidate;
         }
 
-        /** @brief Resolve the exact triplet contract for one model layer. */
+        /** @brief Resolve the exact payload contract for one model layer. */
         std::array<ProjectionSignature, 3> requireLayerSignatures(
             const std::map<int, LayerProjectionSignatures> &signatures,
             int layer_idx)
@@ -3618,7 +3618,7 @@ namespace llaminar2
                             .entered_epoch =
                                 config.initial_snapshot->epoch,
                             .bootstrap_allocation = true,
-                            .triplet = layer.experts[expert],
+                            .payload = layer.experts[expert],
                         });
                         for (const auto projection : kProjections)
                         {
@@ -5249,16 +5249,16 @@ namespace llaminar2
 
                 std::shared_ptr<MoEOverlayParticipantResidency> source_endpoint;
                 MoEOverlayParticipantBankLease source_bank;
-                std::optional<MoEOverlayPreparedExpertTriplet>
-                    device_source_triplet;
-                const MoEOverlayPreparedExpertTriplet *source_triplet = nullptr;
+                std::optional<MoEOverlayPreparedExpertPayload>
+                    device_source_payload;
+                const MoEOverlayPreparedExpertPayload *source_payload = nullptr;
                 if (source_local)
                 {
                     if (device_batch)
                     {
                         std::string source_error;
-                        device_source_triplet =
-                            impl_->device_slot_ledger->sourceTriplet(
+                        device_source_payload =
+                            impl_->device_slot_ledger->sourcePayload(
                                 *device_batch,
                                 {
                                     .participant_id =
@@ -5267,14 +5267,14 @@ namespace llaminar2
                                     .expert_id = migration.expert_id,
                                 },
                                 &source_error);
-                        if (!device_source_triplet)
+                        if (!device_source_payload)
                         {
                             throw std::runtime_error(
                                 source_error.empty()
                                     ? "ExpertOverlay device slot ledger cannot resolve the local source"
                                     : std::move(source_error));
                         }
-                        source_triplet = &*device_source_triplet;
+                        source_payload = &*device_source_payload;
                     }
                     else
                     {
@@ -5295,13 +5295,13 @@ namespace llaminar2
                             throw std::runtime_error(
                                 "ExpertOverlay physical fabric cannot acquire the exact local source epoch");
                         }
-                        source_triplet = &source_bank
+                        source_payload = &source_bank
                                               ->layers[static_cast<std::size_t>(
                                                   migration.layer_idx)]
                                               .experts[static_cast<std::size_t>(
                                                   migration.expert_id)];
                     }
-                    if (!source_triplet->complete())
+                    if (!source_payload->complete())
                     {
                         throw std::runtime_error(
                             "ExpertOverlay migration source is not resident in its old epoch bank");
@@ -5354,7 +5354,7 @@ namespace llaminar2
                         if (source_local)
                         {
                             auto source_engine = projectionEngine(
-                                *source_triplet, projection);
+                                *source_payload, projection);
                             MoEOverlayPreparedWeightSource source;
                             std::string source_error;
                             if (!resolveMoEOverlayPreparedWeightSource(
@@ -5844,7 +5844,7 @@ namespace llaminar2
                     }
 
                     auto source_engine = projectionEngine(
-                        *source_triplet, projection);
+                        *source_payload, projection);
                     MoEOverlayPreparedWeightSource source;
                     std::string source_error;
                     if (!resolveMoEOverlayPreparedWeightSource(
@@ -6375,14 +6375,14 @@ namespace llaminar2
                     return false;
                 }
 
-                MoEOverlayPreparedExpertTriplet triplet;
+                MoEOverlayPreparedExpertPayload payload;
                 std::string arrival_error;
-                if (!arrival->completeTriplet(triplet, &arrival_error))
+                if (!arrival->completePayload(payload, &arrival_error))
                 {
                     if (error)
                     {
                         *error = arrival_error.empty()
-                            ? "ExpertOverlay device staging observed an incomplete destination triplet"
+                            ? "ExpertOverlay device staging observed an incomplete destination payload"
                             : std::move(arrival_error);
                     }
                     return false;
@@ -6394,7 +6394,7 @@ namespace llaminar2
                         .layer_idx = migration.layer_idx,
                         .expert_id = migration.expert_id,
                     },
-                    .triplet = std::move(triplet),
+                    .payload = std::move(payload),
                 });
             }
 
@@ -6471,7 +6471,7 @@ namespace llaminar2
         /*
          * Bootstrap storage lacks an aliasing lease, so enroll its departed
          * assignment in the recyclable arena explicitly. Later-arrival slots
-         * are released when `retired` destroys their final triplet aliases at
+         * are released when `retired` destroys their final payload aliases at
          * method exit. Neither path synchronizes a device or inference stream.
          */
         retirePreviousSources(batch.base_epoch, batch.migrations);
@@ -6786,7 +6786,7 @@ namespace llaminar2
                             "ExpertOverlay device physical inventory contains a duplicate expert coordinate");
                     }
                     layer.setResidentExpert(
-                        slot.key.expert_id, slot.triplet);
+                        slot.key.expert_id, slot.payload);
                 }
             }
             else
@@ -6863,12 +6863,12 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        const auto &triplet = layer.experts.at(
+                        const auto &payload = layer.experts.at(
                             static_cast<std::size_t>(expert_id));
-                        if (!triplet.complete())
+                        if (!payload.complete())
                         {
                             return fail(
-                                "ExpertOverlay reusable-context seal found an incomplete resident triplet");
+                                "ExpertOverlay reusable-context seal found an incomplete resident payload");
                         }
                         if (!pool.geometry_pool->adopted_slots
                                  ->ownsAssignment(layer_idx, expert_id))
@@ -6994,20 +6994,20 @@ namespace llaminar2
             };
 
             const auto set_projection = [](
-                MoEOverlayPreparedExpertTriplet &triplet,
+                std::array<std::shared_ptr<ITensorGemm>, 3> &engines,
                 ExpertTierWeightProjection projection,
                 std::shared_ptr<ITensorGemm> engine)
             {
                 switch (projection)
                 {
                 case ExpertTierWeightProjection::Gate:
-                    triplet.gate = std::move(engine);
+                    engines[0] = std::move(engine);
                     return;
                 case ExpertTierWeightProjection::Up:
-                    triplet.up = std::move(engine);
+                    engines[1] = std::move(engine);
                     return;
                 case ExpertTierWeightProjection::Down:
-                    triplet.down = std::move(engine);
+                    engines[2] = std::move(engine);
                     return;
                 }
                 throw std::logic_error(
@@ -7057,9 +7057,9 @@ namespace llaminar2
                             continue;
                         }
 
-                        const auto source_triplet = layer.experts.at(
+                        const auto source_payload = layer.experts.at(
                             static_cast<std::size_t>(expert_id));
-                        MoEOverlayPreparedExpertTriplet destination_triplet;
+                        std::array<std::shared_ptr<ITensorGemm>, 3> destination_engines{};
                         std::vector<std::unique_ptr<
                             IMoEOverlayTierTransferOperation>> operations;
                         operations.reserve(kProjections.size());
@@ -7081,7 +7081,7 @@ namespace llaminar2
                             for (const auto projection : kProjections)
                             {
                                 auto source_engine = projectionEngine(
-                                    source_triplet, projection);
+                                    source_payload, projection);
                                 MoEOverlayPreparedWeightSource source;
                                 std::string source_error;
                                 if (!resolveMoEOverlayPreparedWeightSource(
@@ -7141,7 +7141,7 @@ namespace llaminar2
                                         source_engine,
                                         target.engine));
                                 set_projection(
-                                    destination_triplet,
+                                    destination_engines,
                                     projection,
                                     target.engine);
                             }
@@ -7161,7 +7161,7 @@ namespace llaminar2
                             for (const auto projection : kProjections)
                             {
                                 auto source_engine = projectionEngine(
-                                    source_triplet, projection);
+                                    source_payload, projection);
                                 MoEOverlayPreparedWeightSource source;
                                 std::string source_error;
                                 if (!resolveMoEOverlayPreparedWeightSource(
@@ -7240,25 +7240,27 @@ namespace llaminar2
                                             target_engine));
                                 }
                                 set_projection(
-                                    destination_triplet,
+                                    destination_engines,
                                     projection,
                                     std::move(target_engine));
                             }
                         }
 
                         std::string operation_error;
-                        if (!destination_triplet.complete() ||
+                        auto destination_payload = MoEOverlayPreparedExpertPayload::fromProjections(
+                            source_payload.projections(), std::move(destination_engines));
+                        if (!destination_payload.ready() ||
                             !complete_operations(
                                 operations, &operation_error))
                         {
                             return fail(
                                 operation_error.empty()
-                                    ? "ExpertOverlay reusable-context compaction produced an incomplete destination triplet"
+                                    ? "ExpertOverlay reusable-context compaction produced an incomplete destination payload"
                                     : std::move(operation_error));
                         }
                         layer.experts.at(
                             static_cast<std::size_t>(expert_id)) =
-                            std::move(destination_triplet);
+                            std::move(destination_payload);
                         ++result.compacted_shadow_experts;
                     }
                 }

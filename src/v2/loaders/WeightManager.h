@@ -175,6 +175,10 @@ namespace llaminar2
          * frozen binding.  CPU participants likewise prepare only their explicit
          * device-scoped requests.  This keeps LocalTP graph construction
          * participant-local and prevents duplicate cross-device repack work.
+         * The frozen compute policy also selects whole-expert versus movable
+         * gate/up preparation; callers cannot override it through another API.
+         * Fixed down columns are sliced before packing, never prepared in full
+         * merely to copy out a smaller matrix.
          *
          * @param runtime_plan Declarative rank/domain overlay policy.
          * @param target_device Device owned by the calling graph participant.
@@ -936,6 +940,15 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Execute one already-compiled role-specific preparation transaction. */
+        bool prepareMoEExpertOverlayWeightsFromPlan(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            MoEExpertOverlayPreparationPlan preparation_plan,
+            DeviceId target_device,
+            const FrozenModelWeightSet *frozen_weights,
+            const MoEExpertOverlayExecutionPlan *execution_plan,
+            PreparedWeightAdmission admission);
+
         /**
          * @brief Load weight with replicated strategy
          *

@@ -37,6 +37,7 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/mtp/MTPSpecStateContract.h"
+#include "execution/mtp/MTPRequestSamplingPolicy.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -12527,6 +12528,94 @@ namespace
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
+    }
+
+    /**
+     * @brief Issue #15: unseeded scalar requests admit a capturable device draw.
+     *
+     * The old scalar-only rejection call carried host thresholds and therefore
+     * never built the outcome child required by the retained parent. Check the
+     * public runner's descriptor, not source spelling, for each GPU backend and
+     * several legal sampler policies. The native integration test proves replay.
+     */
+    TEST_F(Test__PrefillDecodeTransition, UnseededStochasticUsesCapturedOutcomeDescriptor)
+    {
+        for (const DeviceId device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (int variant = 0; variant < 4; ++variant)
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " variant=" << variant);
+            auto [runner, mock] = createRunner(
+                true, true, {}, nullptr, true, false, device, 1,
+                false, false, {}, MTPVerifyMode::SpeculativeSampling);
+            mock->enableStochasticDeviceSampling();
+            mock->enableGroupedOutcomeDeviceResidentPublication(4);
+            mock->enableMTPDeviceDraftTokenInput();
+            mock->enableDeviceResidentMTPSpecStatePublication();
+            mock->hideMTPSpecStatePublicationFromPolicy();
+            mock->setVerifierAcceptedPrefixScript({1});
+            mock->enableDeviceResidentGeneration(DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0, .model_stopped = false,
+                .transaction_count = 1, .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0, .consumed_verifier_row_count = 1,
+                .published_state_commit_count = 2, .attempted_draft_token_count = 1,
+                .verifier_token_count = 2, .final_draft_depth = 1,
+            });
+            SamplingParams sampling;
+            sampling.temperature = variant == 0 ? 1.0f : 0.7f;
+            sampling.top_k = std::array{1, 2, 20, 256}[variant];
+            sampling.top_p = variant == 3 ? 1.0f : 0.95f;
+            sampling.presence_penalty = variant == 2 ? 1.5f : 0.0f;
+            sampling.frequency_penalty = variant == 3 ? 0.25f : 0.0f;
+            sampling.seed = 0;
+            runner->setSamplingParams(sampling);
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const auto result = decodeWithBudget(runner, 2);
+            ASSERT_TRUE(result.success()) << result.error;
+            EXPECT_THAT(mock->lastRequestBatchOutcomeSerialSampleEquivalent(), ElementsAre(false));
+            EXPECT_THAT(mock->lastRequestBatchOutcomeDerivedThresholds(), ElementsAre(true));
+            EXPECT_THAT(mock->lastRequestBatchOutcomeInverseSampleFirstPositions(), ElementsAre(-1));
+            ASSERT_THAT(mock->lastRequestBatchOutcomeInverseSampleSeeds(), SizeIs(1));
+            EXPECT_NE(mock->lastRequestBatchOutcomeInverseSampleSeeds()[0], 0u);
+            EXPECT_TRUE(mock->lastBatchOutcomeUsedVLLMProbabilityRejection());
+            EXPECT_EQ(mock->capturedStochasticVerifierTargetDistributionCount(), 1);
+        }
+    }
+
+    /** @brief Reject missing GPU DRY history before modifying a live sampling law. */
+    TEST_F(Test__PrefillDecodeTransition, GPUUnsupportedDRYAdmissionPreservesSamplingPolicy)
+    {
+        for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0), DeviceId::cpu()})
+        for (const bool mtp_enabled : {false, true})
+        for (const auto verify : {MTPVerifyMode::Greedy, MTPVerifyMode::SpeculativeSampling})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " mtp=" << mtp_enabled
+                << " verify=" << static_cast<int>(verify));
+            auto [runner, mock] = createRunner(
+                mtp_enabled, true, {}, nullptr, false, false, device, 1,
+                false, false, {}, verify);
+            SamplingParams supported;
+            supported.temperature = verify == MTPVerifyMode::Greedy ? 0.0f : 0.8f;
+            supported.seed = 12345;
+            runner->setSamplingParams(supported);
+            auto dry = supported;
+            dry.seed = 67890;
+            dry.presence_penalty = 1.5f;
+            dry.dry_multiplier = 0.8f;
+            dry.dry_penalty_last_n = 128;
+            if (device.is_gpu() && mtp_enabled)
+            {
+                EXPECT_THROW(runner->setSamplingParams(dry), UnsupportedMTPSamplingRequest);
+                EXPECT_EQ(runner->getSamplingParams().seed, supported.seed);
+                EXPECT_FLOAT_EQ(runner->getSamplingParams().presence_penalty, supported.presence_penalty);
+                EXPECT_FLOAT_EQ(runner->getSamplingParams().dry_multiplier, 0.0f);
+                dry.dry_penalty_last_n = 0;
+                EXPECT_NO_THROW(runner->setSamplingParams(dry));
+            }
+            else
+                EXPECT_NO_THROW(runner->setSamplingParams(dry));
+        }
     }
 
     TEST_F(Test__PrefillDecodeTransition, GroupedOutcomeDeviceResidentPublicationUsesBatchedStochasticVerifier)

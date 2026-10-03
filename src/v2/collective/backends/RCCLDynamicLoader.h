@@ -19,6 +19,8 @@
 #pragma once
 
 #include <cstddef>
+#include "../NativeCollectiveRows.h"
+#include "RCCLHostTransportStorage.h"
 #include <string>
 
 namespace llaminar2
@@ -164,6 +166,15 @@ namespace llaminar2
         ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int *device);
         ncclResult_t ncclCommUserRank(const ncclComm_t comm, int *rank);
 
+        /**
+         * @brief Read native transport ownership without transfers or a shadow ledger.
+         * @param comm Initialized communicator, quiescent at setup/result collection.
+         * @param receipt Caller-owned fixed ABI record; its identity is checked.
+         * @return Native query result; unavailable or incompatible evidence fails.
+         * @note Diagnostic only. Never use observed extents for allocation admission.
+         */
+        ncclResult_t hostTransportStorage(ncclComm_t comm, RCCLHostTransportStorage &receipt);
+
         // Error handling
         const char *ncclGetErrorString(ncclResult_t result);
 
@@ -186,6 +197,24 @@ namespace llaminar2
         ncclResult_t ncclReduceScatter(const void *sendbuff, void *recvbuff, size_t recvcount,
                                        ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
                                        void *stream);
+
+        /**
+         * @brief Record exact live rows through the canonical native dependency ABI.
+         * @param operation Native collective, never an emulated transport.
+         * @param send Input bank; only allreduce may alias the output.
+         * @param receive Output bank with immutable capacity-sized rank strides.
+         * @param rows Borrowed ordered device count or an exact fully-live range.
+         * @param datatype Native scalar/wire representation.
+         * @param op Native reduction operation (ignored for gather).
+         * @param payload_bytes Optional persistent passive device payload counter.
+         * @param comm Existing initialized node-local communicator.
+         * @param stream Exact non-null CUDA/HIP stream.
+         * @return Native enqueue result; a missing live-extent ABI fails closed.
+         */
+        ncclResult_t nativeRows(
+            NativeRowCollective operation, const void *send, void *receive,
+            const NativeCollectiveRows &rows, ncclDataType_t datatype, ncclRedOp_t op,
+            unsigned long long *payload_bytes, ncclComm_t comm, void *stream);
 
         // Point-to-point operations
         ncclResult_t ncclSend(const void *sendbuff, size_t count, ncclDataType_t datatype,

@@ -180,6 +180,7 @@ namespace llaminar2
         require(capture.begin(), "native graph begin failed");
         require(execute(), "captured production residual failed");
         capture.finish();
+        require(graph->prepareRuntimeContextStorage(memory), "streaming context storage preparation failed");
         require(graph->nodeCount() && graph->instantiate(), "nonempty native graph instantiation failed");
         require(GPUGraphMemoryContract::acceptsFamilyObservation(device, graph->residentMemoryBytes(), graph_bytes),
             "native graph exceeded physical admission");

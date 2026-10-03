@@ -1,6 +1,11 @@
 /**
  * @file MoERuntimeTable.cpp
  * @brief Stable graph-facing MoE placement runtime tables.
+ *
+ * Captured model bindings and mutable placement have separate lifetimes.
+ * Projection-distributed tables retain immutable down slices while ordinary
+ * placement banks publish only gate/up payloads. Portable request restore
+ * rehydrates the declared family without rebinding model-owned graph weights.
  */
 
 #include "MoERuntimeTable.h"
@@ -8,6 +13,7 @@
 #include "DecodeExpertHistogram.h"
 #include "DeviceMoEOverlayEpochArena.h"
 #include "MoEOverlayEconomyCalibrationPlanner.h"
+#include "MoEOverlayFixedDownProjectionBank.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -28,9 +34,10 @@ namespace llaminar2
 {
     namespace
     {
-        bool descriptorReady(const DeviceMoEExpertDescriptor &desc)
+        /** @brief Require the exact graph-declared family, never an accidental partial FFN. */
+        bool descriptorReady(const DeviceMoEExpertDescriptor &desc, DeviceMoEProjectionSet projections)
         {
-            return desc.weightsReady();
+            return desc.projection_set == projections && desc.movableWeightsReady();
         }
 
         uint32_t portableMoEExpertFlags(uint32_t flags) noexcept
@@ -641,14 +648,15 @@ namespace llaminar2
         bool findReadyDescriptorForExpertInBank(const DeviceMoEPlacementBank &bank,
                                                 uint32_t expert,
                                                 int32_t expected_local_slot,
-                                                DeviceMoEExpertDescriptor &out) noexcept
+                                                DeviceMoEExpertDescriptor &out,
+                                                DeviceMoEProjectionSet projections) noexcept
         {
             if (expert >= bank.expert_count || expert >= kDeviceMoEMaxExperts)
                 return false;
             const auto &candidate = bank.experts[expert];
             if (candidate.logical_expert_id != static_cast<int32_t>(expert) ||
                 (expected_local_slot >= 0 && candidate.local_slot != expected_local_slot) ||
-                !descriptorReady(candidate))
+                !descriptorReady(candidate, projections))
             {
                 return false;
             }
@@ -659,11 +667,12 @@ namespace llaminar2
         bool findReadyDescriptorForExpert(const DeviceMoELayerRuntime &state,
                                           uint32_t expert,
                                           int32_t expected_local_slot,
-                                          DeviceMoEExpertDescriptor &out) noexcept
+                                          DeviceMoEExpertDescriptor &out,
+                                          DeviceMoEProjectionSet projections) noexcept
         {
             if (state.active_bank <= 1u &&
                 findReadyDescriptorForExpertInBank(
-                    state.banks[state.active_bank], expert, expected_local_slot, out))
+                    state.banks[state.active_bank], expert, expected_local_slot, out, projections))
             {
                 return true;
             }
@@ -672,7 +681,7 @@ namespace llaminar2
                 if (bank_idx == state.active_bank)
                     continue;
                 if (findReadyDescriptorForExpertInBank(
-                        state.banks[bank_idx], expert, expected_local_slot, out))
+                        state.banks[bank_idx], expert, expected_local_slot, out, projections))
                 {
                     return true;
                 }
@@ -686,16 +695,17 @@ namespace llaminar2
          * The restore path will add placement flags such as LocalCompute after it
          * binds the payload descriptor, so this check intentionally focuses on the
          * pointer-bearing contract: the descriptor must name the requested expert,
-         * have complete gate/up/down payloads, and match the stable local slot
+         * have the graph's exact movable payload family, and match the stable local slot
          * recorded in the portable blob when that slot is known.
          */
         bool descriptorMatchesPortableLocalClaim(const DeviceMoEExpertDescriptor &desc,
                                                  int expert,
-                                                 int32_t expected_local_slot) noexcept
+                                                 int32_t expected_local_slot,
+                                                 DeviceMoEProjectionSet projections) noexcept
         {
             return desc.logical_expert_id == static_cast<int32_t>(expert) &&
                    (expected_local_slot < 0 || desc.local_slot == expected_local_slot) &&
-                   descriptorReady(desc);
+                   descriptorReady(desc, projections);
         }
 
         /**
@@ -781,7 +791,7 @@ namespace llaminar2
             auto &descriptor = update.experts[static_cast<size_t>(expert)];
             if (descriptor.logical_expert_id != static_cast<int32_t>(expert) ||
                 descriptor.local_slot < 0 ||
-                !descriptorReady(descriptor) ||
+                !descriptorReady(descriptor, DeviceMoEProjectionSet::CompleteExpert) ||
                 !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Valid) ||
                 !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::Resident) ||
                 !hasMoEExpertFlag(descriptor.flags, DeviceMoEExpertFlags::LocalCompute))
@@ -890,7 +900,8 @@ namespace llaminar2
               std::move(config.serial_route_scratch_arena)),
           overlay_epoch_arena_(std::move(config.overlay_epoch_arena)),
           overlay_epoch_ticket_slot_(config.overlay_epoch_ticket_slot),
-          overlay_placement_source_(config.overlay_placement_source)
+          overlay_placement_source_(config.overlay_placement_source),
+          fixed_down_banks_(std::move(config.fixed_down_banks))
     {
         if (!device_id_.is_valid())
             throw std::invalid_argument("[MoERuntimeTable] device_id must be valid");
@@ -904,6 +915,22 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
         if (mirror_to_device_ && !device_id_.is_gpu())
             throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
+        if (!fixed_down_banks_.empty())
+        {
+            if (!device_id_.is_gpu() || fixed_down_banks_.size() != static_cast<size_t>(num_layers_))
+                throw std::invalid_argument("[MoERuntimeTable] projected execution requires every GPU layer's fixed down bank");
+            for (int layer = 0; layer < num_layers_; ++layer)
+            {
+                const auto &bank = fixed_down_banks_[static_cast<size_t>(layer)];
+                if (!bank || bank->device() != device_id_ || bank->layer() != layer ||
+                    bank->ownership().geometry().experts != num_experts_ ||
+                    bank->ownership().movableProjections() != DeviceMoEProjectionSet::GateUp ||
+                    (layer > 0 && (bank->participantId() != fixed_down_banks_.front()->participantId() ||
+                        bank->ownership().participant() != fixed_down_banks_.front()->ownership().participant() ||
+                        bank->ownership().participants() != fixed_down_banks_.front()->ownership().participants())))
+                    throw std::invalid_argument("[MoERuntimeTable] fixed down banks disagree with the table's source/participant geometry");
+            }
+        }
         if (grouped_verifier_histogram_publication_ !=
                 GroupedVerifierHistogramPublicationMode::Disabled &&
             !mirror_to_device_)
@@ -1033,6 +1060,14 @@ namespace llaminar2
         }
         if (overlay_placement_source_)
         {
+            if (movableProjections() != overlay_placement_source_->movableProjections())
+                throw std::invalid_argument("[MoERuntimeTable] child and canonical table cannot change movable projection family");
+            for (int layer = 0; !fixed_down_banks_.empty() && layer < num_layers_; ++layer)
+            {
+                const auto *source = overlay_placement_source_->fixedDownProjectionBank(layer);
+                if (!source || !fixed_down_banks_[static_cast<size_t>(layer)]->sameIdentity(*source))
+                    throw std::invalid_argument("[MoERuntimeTable] child and canonical table require identical fixed down bindings");
+            }
             if (grouped_verifier_histogram_publication_ !=
                 GroupedVerifierHistogramPublicationMode::Disabled)
             {
@@ -2340,6 +2375,14 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceMoERuntimeTable::hasInitialLayerRuntimeState(int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        const auto layer = static_cast<std::size_t>(layer_idx);
+        return initial_layer_captured_[layer] != 0u &&
+               decode_runtime_publication_required_[layer] == 0u;
+    }
+
     void DeviceMoERuntimeTable::sealAndPublishCompleteInitialRuntimeState(
         void *stream)
     {
@@ -2506,6 +2549,36 @@ namespace llaminar2
         if (layer_count != static_cast<size_t>(num_layers_))
             throw std::invalid_argument("[MoERuntimeTable] runtime snapshot layer count mismatch");
 
+        // Authenticate the entire snapshot before mutating any layer. Model
+        // topology is never restored from request data, even for this legacy
+        // pointer-bearing diagnostic format.
+        for (int layer = 0; layer < num_layers_; ++layer)
+        {
+            const auto &snapshot = layers[static_cast<size_t>(layer)];
+            if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
+                snapshot.top_k != static_cast<uint32_t>(top_k_) || snapshot.active_bank > 1u)
+                throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot metadata mismatch");
+            if (snapshot.active_epoch == 0u) continue;
+            if (snapshot.banks[snapshot.active_bank].epoch != snapshot.active_epoch)
+                throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot active bank epoch mismatch");
+            if (const auto *fixed = fixedDownProjectionBank(layer))
+            {
+                if (snapshot.participant_id != static_cast<uint32_t>(fixed->ownership().participant()) ||
+                    snapshot.participant_count != static_cast<uint32_t>(fixed->ownership().participants()))
+                    throw std::invalid_argument(layerPrefix(layer) + "snapshot cannot replace the fixed output-column partition");
+            }
+            for (const auto &bank : snapshot.banks)
+            {
+                if (bank.epoch == 0u) continue;
+                if (bank.expert_count != static_cast<uint32_t>(num_experts_))
+                    throw std::invalid_argument(layerPrefix(layer) + "runtime snapshot bank geometry mismatch");
+                for (int expert = 0; expert < num_experts_; ++expert)
+                    if (bank.experts[expert].projection_set != movableProjections() ||
+                        !deviceMoEProjectionPayloadValid(bank.experts[expert]))
+                        throw std::invalid_argument(layerPrefix(layer) + "snapshot cannot replace the movable projection family");
+            }
+        }
+
         void *owned_stream = nullptr;
         void *active_stream = stream;
         if (mirror_to_device_ && !active_stream)
@@ -2522,14 +2595,6 @@ namespace llaminar2
                 auto &state = host_layers_[static_cast<size_t>(layer_idx)];
                 const auto scratch = captureRuntimePersistentBindings(state);
                 const auto &snapshot = layers[static_cast<size_t>(layer_idx)];
-                if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
-                    snapshot.top_k != static_cast<uint32_t>(top_k_) ||
-                    snapshot.active_bank > 1u)
-                {
-                    throw std::invalid_argument(
-                        layerPrefix(layer_idx) + "runtime snapshot metadata mismatch");
-                }
-
                 if (snapshot.active_epoch == 0u)
                 {
                     resetPerRequestRuntimeFields(state, num_experts_);
@@ -2984,6 +3049,7 @@ namespace llaminar2
                 }
 
                 DeviceMoEExpertDescriptor desc;
+                desc.projection_set = movableProjections();
                 desc.logical_expert_id = expert;
                 desc.owner_participant = saved.owner_participant;
                 desc.local_slot = saved.local_compute ? saved.local_slot : -1;
@@ -3017,7 +3083,8 @@ namespace llaminar2
                         }
                         if (!descriptorMatchesPortableLocalClaim(ready_desc,
                                                                  expert,
-                                                                 saved.local_slot))
+                                                                 saved.local_slot,
+                                                                 movableProjections()))
                         {
                             LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                                  << ": portable runtime restore resolver returned an invalid descriptor for expert "
@@ -3031,7 +3098,8 @@ namespace llaminar2
                             findReadyDescriptorForExpert(state,
                                                          static_cast<uint32_t>(expert),
                                                          saved.local_slot,
-                                                         ready_desc);
+                                                         ready_desc,
+                                                         movableProjections());
                         if (!has_ready_descriptor && local_payload_resolver)
                         {
                             has_ready_descriptor =
@@ -3042,7 +3110,8 @@ namespace llaminar2
                             if (has_ready_descriptor &&
                                 !descriptorMatchesPortableLocalClaim(ready_desc,
                                                                      expert,
-                                                                     saved.local_slot))
+                                                                     saved.local_slot,
+                                                                     movableProjections()))
                             {
                                 LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                                      << ": portable runtime restore resolver returned an invalid descriptor for expert "
@@ -3287,6 +3356,12 @@ namespace llaminar2
             throw std::out_of_range("[MoERuntimeTable] layer index out of range: " + std::to_string(layer_idx));
     }
 
+    const MoEOverlayFixedDownProjectionBank *DeviceMoERuntimeTable::fixedDownProjectionBank(int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[static_cast<size_t>(layer_idx)].get();
+    }
+
     void DeviceMoERuntimeTable::validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const
     {
         if (update.epoch == 0)
@@ -3301,6 +3376,12 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxParticipants) + "]");
         if (update.participant_id >= update.participant_count)
             throw std::invalid_argument(layerPrefix(layer_idx) + "participant_id must be less than participant_count");
+        if (const auto *fixed = fixedDownProjectionBank(layer_idx))
+        {
+            if (update.participant_id != static_cast<uint32_t>(fixed->ownership().participant()) ||
+                update.participant_count != static_cast<uint32_t>(fixed->ownership().participants()))
+                throw std::invalid_argument(layerPrefix(layer_idx) + "placement cannot change the fixed output-column partition");
+        }
         if (update.experts.size() != update.expert_count ||
             update.local_compute_mask.size() != update.expert_count ||
             update.replica_role.size() != update.expert_count ||
@@ -3316,6 +3397,8 @@ namespace llaminar2
         for (uint32_t expert = 0; expert < update.expert_count; ++expert)
         {
             const auto &desc = update.experts[expert];
+            if (desc.projection_set != movableProjections() || !deviceMoEProjectionPayloadValid(desc))
+                throw std::invalid_argument(layerPrefix(layer_idx) + "placement descriptor has the wrong movable projection family");
             if (desc.logical_expert_id != -1 && desc.logical_expert_id != static_cast<int32_t>(expert))
                 throw std::invalid_argument(layerPrefix(layer_idx) + "descriptor logical_expert_id must match table index");
             if (desc.local_slot < -1)
@@ -3350,8 +3433,8 @@ namespace llaminar2
             {
                 if (desc.logical_expert_id != static_cast<int32_t>(expert))
                     throw std::invalid_argument(layerPrefix(layer_idx) + "active descriptor must name its logical expert");
-                if (!descriptorReady(desc))
-                    throw std::invalid_argument(layerPrefix(layer_idx) + "active descriptor must include ready gate/up/down payload descriptors");
+                if (!descriptorReady(desc, movableProjections()))
+                    throw std::invalid_argument(layerPrefix(layer_idx) + "active descriptor must include the declared movable payload descriptors");
             }
         }
     }
@@ -3365,6 +3448,9 @@ namespace llaminar2
         state.participant_count = 1;
         state.banks[0].expert_count = static_cast<uint32_t>(num_experts_);
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
+        for (auto &bank : state.banks)
+            for (auto &descriptor : bank.experts)
+                descriptor.projection_set = movableProjections();
         /* The ticket address is model topology. Request reset clears routed
          * data but must never unbind the captured residency authority. */
         state.overlay_epoch_ticket = overlayEpochTicket();

@@ -976,6 +976,7 @@ namespace
     void groupedImmaGateUpSwiGluKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ up_descriptors,
         const int *__restrict__ group_counts,
@@ -1046,6 +1047,14 @@ namespace
 
         const int active_rows = min(kRows, count - local_first_row);
         const int grouped_row_base = group_offset + local_first_row;
+        // Decode once per CTA. Keep the tiny integer map explicitly shared:
+        // holding several row roles in every lane's registers spills the wide
+        // codebook specializations. Volatile keeps each lookup's lifetime local
+        // to its load; it is not a coherence or synchronization substitute.
+        __shared__ volatile int original_rows[kRows];
+        if (int(threadIdx.x) < active_rows)
+            original_rows[threadIdx.x] = source_rows.sourceRow(grouped_row_base + threadIdx.x);
+        __syncthreads();
         const int column_base =
             (static_cast<int>(blockIdx.x) *
                  Geometry::Projection::projection_warps +
@@ -1093,9 +1102,8 @@ namespace
                     int4 activation = make_int4(0, 0, 0, 0);
                     if (local_row < active_rows)
                     {
-                        const int grouped_row = grouped_row_base + local_row;
                         activation = *reinterpret_cast<const int4 *>(
-                            A_int8 + static_cast<size_t>(grouped_row) * K +
+                            A_int8 + static_cast<size_t>(original_rows[local_row]) * K +
                             block * kQuantBlock + half * sizeof(int4));
                     }
                     *reinterpret_cast<int4 *>(
@@ -1147,13 +1155,12 @@ namespace
                     if (local_row >= active_rows || column >= N)
                         continue;
 
-                    const int grouped_row = grouped_row_base + local_row;
                     const size_t linear =
                         static_cast<size_t>(block) * N + column;
                     const uint8_t *payload =
                         descriptor.payload + linear * kPayloadBytes;
                     const float activation_scale = scales_A[
-                        static_cast<size_t>(grouped_row) * blocks_per_row +
+                        static_cast<size_t>(original_rows[local_row]) * blocks_per_row +
                         block];
                     const float contribution = contributionFromMma<CodebookId>(
                         shared_a + local_row * kQuantBlock,
@@ -1287,6 +1294,7 @@ namespace
     void groupedImmaPairedGateUpSwiGluKernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *__restrict__ up_descriptors,
         const int *__restrict__ group_counts,
@@ -1344,6 +1352,12 @@ namespace
         const int lane = static_cast<int>(threadIdx.x) & 31;
         const int active_rows = min(kRows, count - local_first_row);
         const int grouped_row_base = group_offset + local_first_row;
+        // One shared integer map replaces the expanded global activation bank.
+        // Short lookup lifetimes preserve the existing spill-free warp budget.
+        __shared__ volatile int original_rows[kRows];
+        if (int(threadIdx.x) < active_rows)
+            original_rows[threadIdx.x] = source_rows.sourceRow(grouped_row_base + threadIdx.x);
+        __syncthreads();
         const int column_base =
             (static_cast<int>(blockIdx.x) * Geometry::gate_up_warps + warp) *
             kColumnsPerWarp;
@@ -1419,11 +1433,9 @@ namespace
                     int4 activation = make_int4(0, 0, 0, 0);
                     if (local_row < active_rows)
                     {
-                        const int grouped_row =
-                            grouped_row_base + local_row;
                         activation = *reinterpret_cast<const int4 *>(
                             A_int8 +
-                            static_cast<size_t>(grouped_row) * K +
+                            static_cast<size_t>(original_rows[local_row]) * K +
                             block * kQuantBlock + half * sizeof(int4));
                     }
                     *reinterpret_cast<int4 *>(
@@ -1493,8 +1505,7 @@ namespace
                         if (local_row < active_rows)
                         {
                             activation_scale = scales_A[
-                                static_cast<size_t>(
-                                    grouped_row_base + local_row) *
+                                static_cast<size_t>(original_rows[local_row]) *
                                     blocks_per_row +
                                 block];
                         }
@@ -1612,11 +1623,10 @@ namespace
                         // and activations, so its loads require valid indices.
                         if (local_row >= active_rows || column >= N)
                             continue;
-                        const int grouped_row = grouped_row_base + local_row;
                         const size_t linear =
                             static_cast<size_t>(block) * N + column;
                         const float activation_scale = scales_A[
-                            static_cast<size_t>(grouped_row) * blocks_per_row +
+                            static_cast<size_t>(original_rows[local_row]) * blocks_per_row +
                             block];
                         gate_partial[element] = __fadd_rn(
                             gate_partial[element],
@@ -1811,6 +1821,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
         const int *group_counts,
@@ -1835,6 +1846,7 @@ namespace
             stream>>>(
             A_int8,
             scales_A,
+            source_rows,
             gate_descriptors,
             up_descriptors,
             group_counts,
@@ -1860,6 +1872,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
         const int *group_counts,
@@ -1886,6 +1899,7 @@ namespace
             stream>>>(
             A_int8,
             scales_A,
+            source_rows,
             gate_descriptors,
             up_descriptors,
             group_counts,
@@ -1970,6 +1984,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
         const int *group_counts,
@@ -1993,7 +2008,7 @@ namespace
     do                                                                           \
     {                                                                            \
         if (!launchCodebookGateUpSwiGlu<CB, ColumnsPerBlock>(                    \
-                codebook_mask, grid, stream, A_int8, scales_A,                  \
+                codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
                 num_experts, total_slots, N, K, k_partitions, launched))         \
@@ -2032,6 +2047,7 @@ namespace
         cudaStream_t stream,
         const int8_t *A_int8,
         const float *scales_A,
+        llaminar2::MoEGroupedSourceRows source_rows,
         const llaminar2::DeviceNativeVNNIMatrixDesc *gate_descriptors,
         const llaminar2::DeviceNativeVNNIMatrixDesc *up_descriptors,
         const int *group_counts,
@@ -2055,7 +2071,7 @@ namespace
     do                                                                           \
     {                                                                            \
         if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(              \
-                codebook_mask, grid, stream, A_int8, scales_A,                  \
+                codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
                 num_experts, total_slots, N, K, k_partitions, launched))         \
@@ -2193,6 +2209,7 @@ extern "C" bool cudaMoEGroupedImma_project(
 extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     const int8_t *d_A_int8,
     const float *d_scales_A,
+    llaminar2::MoEGroupedSourceRows source_rows,
     const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
     const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
     const int *d_group_counts,
@@ -2240,13 +2257,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     case GroupedImmaColumns::Columns32:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<32>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
                          total_slots, N, K, k_partitions)
                    : launchGroupedImmaGateUpTable<32>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
@@ -2254,13 +2271,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     case GroupedImmaColumns::Columns64:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<64>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
                          total_slots, N, K, k_partitions)
                    : launchGroupedImmaGateUpTable<64>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
@@ -2268,13 +2285,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     case GroupedImmaColumns::Columns128:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<128>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
                          total_slots, N, K, k_partitions)
                    : launchGroupedImmaGateUpTable<128>(
-                         codebook_mask, cuda_stream, d_A_int8, d_scales_A,
+                         codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,

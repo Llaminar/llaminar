@@ -9,6 +9,7 @@
  */
 
 #include "DeviceMoETransferSlotDirectory.h"
+#include "GPUExpertProjectionContract.h"
 
 #include "../../backends/IBackend.h"
 #include "../../loaders/GPUVramPreflight.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -107,12 +109,50 @@ namespace llaminar2
                     "DeviceMoETransferSlotDirectory projection label must be gate, up, or down");
         }
 
-        /** @brief Require a complete expert family without inventing quantized geometry for FP. */
-        void validateSpecs(
-            const std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> &specs)
+        /** @return Checkpoint format and arithmetic family for a diagnostic only. */
+        std::string projectionFormatName(const ExpertWeightFormat &format)
         {
-            if (specs.size() != 3)
-                throw std::invalid_argument("DeviceMoETransferSlotDirectory requires gate/up/down specs");
+            if (format.isNativeVnni())
+            {
+                const auto *source = native_vnni_formats::forSourceIdentity(
+                    format.native_vnni.codebook_id, format.native_vnni.is_superblock);
+                const auto entry = std::find_if(native_vnni_formats::kAllSourceFormats.begin(),
+                    native_vnni_formats::kAllSourceFormats.end(),
+                    [&](const auto &candidate) { return candidate.metadata == source; });
+                return entry != native_vnni_formats::kAllSourceFormats.end()
+                    ? "NativeVNNI/" + std::string(entry->quant_type)
+                    : "invalid NativeVNNI source";
+            }
+            switch (format.kind)
+            {
+            case ExpertWeightFormatKind::FP16: return "floating/FP16";
+            case ExpertWeightFormatKind::BF16: return "floating/BF16";
+            case ExpertWeightFormatKind::FP32: return "floating/FP32";
+            default: return "invalid";
+            }
+        }
+
+        /**
+         * @brief Require exactly the supported movable family before allocation.
+         * @param specs Authenticated movable projections, not the fixed down bank.
+         * @param projections Frozen physical ownership contract.
+         * @param layer_index Model layer for metadata-derived diagnostics, or -1
+         *        for a standalone directory whose caller did not supply a layer.
+         * @throws std::invalid_argument For malformed geometry or a mixed family.
+         *
+         * The compact device descriptor carries one arithmetic tag for the
+         * movable payload. Dropping this check would reinterpret floating bytes
+         * as NativeVNNI planes. Name every source tensor on rejection so the user
+         * can distinguish that implementation limit from a capacity failure.
+         */
+        void validateSpecs(
+            const std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> &specs,
+            DeviceMoEProjectionSet projections,
+            int layer_index = -1)
+        {
+            const bool complete = projections == DeviceMoEProjectionSet::CompleteExpert;
+            if (!deviceMoEProjectionSetValid(projections) || specs.size() != (complete ? 3u : 2u))
+                throw std::invalid_argument("DeviceMoETransferSlotDirectory requires exactly its movable projection set");
 
             bool has_gate = false;
             bool has_up = false;
@@ -131,17 +171,45 @@ namespace llaminar2
 
                 if (spec.N <= 0 || spec.K <= 0 || !spec.format.valid() ||
                     (spec.format.isNativeVnni() &&
-                     ((spec.K % 32) != 0 || spec.payload_bytes_per_block <= 0)) ||
-                    (spec.format.isFloating() && spec.format != specs.front().format) ||
-                    (spec.format.isNativeVnni() != specs.front().format.isNativeVnni()))
+                     ((spec.K % 32) != 0 || spec.payload_bytes_per_block <= 0)))
                 {
                     throw std::invalid_argument(
-                        "DeviceMoETransferSlotDirectory projection spec has invalid geometry or mixed arithmetic families");
+                        "DeviceMoETransferSlotDirectory " + spec.label +
+                        " projection spec has invalid geometry or source format");
                 }
             }
 
-            if (!has_gate || !has_up || !has_down)
-                throw std::invalid_argument("DeviceMoETransferSlotDirectory requires gate/up/down specs");
+            if (!has_gate || !has_up || has_down != complete)
+                throw std::invalid_argument("DeviceMoETransferSlotDirectory projection labels differ from its ownership contract");
+
+            const bool mixed = std::any_of(specs.begin(), specs.end(), [&](const auto &spec) {
+                return spec.format.isNativeVnni() != specs.front().format.isNativeVnni() ||
+                       (spec.format.isFloating() && spec.format != specs.front().format);
+            });
+            if (mixed)
+            {
+                std::ostringstream message;
+                message << "ExpertOverlay movable ";
+                if (layer_index >= 0)
+                    message << "layer " << layer_index << ' ';
+                message << "has unsupported mixed projection arithmetic: ";
+                for (std::size_t index = 0; index < specs.size(); ++index)
+                {
+                    const auto &spec = specs[index];
+                    if (index != 0) message << ", ";
+                    if (layer_index >= 0)
+                        message << "blk." << layer_index << ".ffn_" << spec.label << "_exps.weight";
+                    else
+                        message << spec.label;
+                    message << '=' << projectionFormatName(spec.format);
+                }
+                message << ". The movable payload requires all NativeVNNI projections "
+                           "(different quantized codebooks are supported), or one shared "
+                           "FP16/BF16/FP32 precision. Mixed quantized/floating or floating-precision "
+                           "projections within a movable payload are not implemented; choose "
+                           "a checkpoint with compatible projection families. No weights were converted.";
+                throw std::invalid_argument(message.str());
+            }
         }
 
         /** @return Exact bytes transmitted for this projection's active representation. */
@@ -233,9 +301,17 @@ namespace llaminar2
         }
     } // namespace
 
+    void validateGPUExpertProjectionContract(
+        const std::vector<GpuExpertSlotPool::ProjectionSpec> &specs,
+        DeviceMoEProjectionSet projection_set, int layer_index)
+    {
+        validateSpecs(specs, projection_set, layer_index);
+    }
+
     DeviceMoETransferSlotDirectory::FormatProfile
     DeviceMoETransferSlotDirectory::profileForLayerFormats(
-        const std::vector<std::vector<ProjectionSpec>> &layer_formats)
+        const std::vector<std::vector<ProjectionSpec>> &layer_formats,
+        DeviceMoEProjectionSet projection_set)
     {
         if (layer_formats.empty())
         {
@@ -243,8 +319,9 @@ namespace llaminar2
                 "DeviceMoETransferSlotDirectory requires at least one layer format");
         }
 
-        validateSpecs(layer_formats.front());
+        validateGPUExpertProjectionContract(layer_formats.front(), projection_set, 0);
         FormatProfile profile;
+        profile.projection_set = projection_set;
         profile.allocation_specs = layer_formats.front();
         profile.max_wire_payload_bytes = expertPayloadBytes(layer_formats.front());
         profile.floating_allocation_format = deviceFormat(layer_formats.front().front().format);
@@ -252,7 +329,7 @@ namespace llaminar2
         for (size_t layer = 1; layer < layer_formats.size(); ++layer)
         {
             const auto &layer_specs = layer_formats[layer];
-            validateSpecs(layer_specs);
+            validateGPUExpertProjectionContract(layer_specs, projection_set, static_cast<int>(layer));
             const auto layer_format = deviceFormat(layer_specs.front().format);
             if (deviceMoEFloatingElementBytes(layer_format) >
                 deviceMoEFloatingElementBytes(profile.floating_allocation_format))
@@ -310,7 +387,8 @@ namespace llaminar2
     DeviceMoETransferSlotDirectory::FormatProfile
     DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(
         const std::vector<MoEOverlayLayerWeightManifest> &
-            layer_weight_manifest)
+            layer_weight_manifest,
+        DeviceMoEProjectionSet projection_set)
     {
         if (layer_weight_manifest.empty())
         {
@@ -336,6 +414,11 @@ namespace llaminar2
             specs.reserve(layer.projections.size());
             for (const auto &projection : layer.projections)
             {
+                // The model manifest remains complete. Filter only by the
+                // frozen ownership contract, never by a missing source pointer.
+                if (projection_set == DeviceMoEProjectionSet::GateUp &&
+                    projection.projection == ExpertTierWeightProjection::Down)
+                    continue;
                 if (projection.format.isFloating())
                 {
                     specs.push_back({
@@ -381,7 +464,7 @@ namespace llaminar2
             }
             layer_formats.push_back(std::move(specs));
         }
-        return profileForLayerFormats(layer_formats);
+        return profileForLayerFormats(layer_formats, projection_set);
     }
 
     uint64_t DeviceMoETransferSlotDirectory::persistentActiveSlotDemand(
@@ -479,7 +562,7 @@ namespace llaminar2
             throw std::invalid_argument(
                 "DeviceMoETransferSlotDirectory allocation BOM requires a coherent active/staging capacity");
         }
-        validateSpecs(format_profile.allocation_specs);
+        validateSpecs(format_profile.allocation_specs, format_profile.projection_set);
         if (format_profile.allocation_specs.front().format.isFloating() &&
             deviceMoEFloatingElementBytes(format_profile.floating_allocation_format) <
                 format_profile.allocation_specs.front().format.floatingElementBytes())
@@ -610,7 +693,7 @@ namespace llaminar2
                 "DeviceMoETransferSlotDirectory production allocation requires a physical-memory authority");
         }
         auto &specs = format_profile.allocation_specs;
-        validateSpecs(specs);
+        validateSpecs(specs, format_profile.projection_set);
         if (specs.front().format.isFloating() &&
             deviceMoEFloatingElementBytes(format_profile.floating_allocation_format) <
                 specs.front().format.floatingElementBytes())
@@ -686,6 +769,7 @@ namespace llaminar2
                                                       DeviceMoEExpertFlags::TransferSlot);
             entry.descriptor.weight_format = deviceFormat(specs.front().format);
             entry.descriptor.floating_allocation_format = format_profile.floating_allocation_format;
+            entry.descriptor.projection_set = format_profile.projection_set;
             entry.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
                 static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);

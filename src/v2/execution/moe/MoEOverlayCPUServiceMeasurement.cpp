@@ -93,15 +93,15 @@ namespace llaminar2
          * the sole selected expert is privately indexed at zero, without
          * modifying its global bank identity or any routing histogram.
          */
-        uint64_t measureExpert(const MoEOverlayPreparedExpertTriplet &source,
+        uint64_t measureExpert(const MoEOverlayPreparedExpertPayload &source,
                               DeviceId device, int layer, ExpertHistogramSource source_phase,
                               MoEOverlayCPUServiceMeasurement::Geometry geometry,
                               const std::shared_ptr<PhysicalMemoryAuthority> &memory)
         {
             const auto [phase, rows] = phaseGeometry(source_phase);
-            requireProjection(source.gate, device, geometry.intermediate, geometry.d_model);
-            requireProjection(source.up, device, geometry.intermediate, geometry.d_model);
-            requireProjection(source.down, device, geometry.d_model, geometry.intermediate);
+            requireProjection(source.gate(), device, geometry.intermediate, geometry.d_model);
+            requireProjection(source.up(), device, geometry.intermediate, geometry.d_model);
+            requireProjection(source.down(), device, geometry.d_model, geometry.intermediate);
             // Declaration order retires stages/engines/tensors before the claim.
             auto claim = memory->claimNewAllocation(device, PhysicalMemoryOwner::ExecutionWorkspace,
                                                     payloadBytes(geometry, rows));
@@ -117,10 +117,10 @@ namespace llaminar2
                     input.mutable_typed_data()[static_cast<size_t>(row) * geometry.d_model + col] =
                         0.0001f * static_cast<float>((col % 31 * 13 + row * 7) % 31 - 15);
             }
-            const MoEOverlayPreparedExpertTriplet engines{
-                KernelFactory::createExpertServiceExecutionView(source.gate, device),
-                KernelFactory::createExpertServiceExecutionView(source.up, device),
-                KernelFactory::createExpertServiceExecutionView(source.down, device)};
+            const MoEOverlayPreparedExpertPayload engines{
+                KernelFactory::createExpertServiceExecutionView(source.gate(), device),
+                KernelFactory::createExpertServiceExecutionView(source.up(), device),
+                KernelFactory::createExpertServiceExecutionView(source.down(), device)};
             auto workspace = std::make_shared<CPUGroupedMoESerialWorkspace>(workspaceConfig(geometry, rows));
             MoEExpertComputeStage::Params p;
             p.device_id = device;
@@ -136,9 +136,9 @@ namespace llaminar2
             p.top_k = 1;
             p.layer_idx = layer;
             p.expert_mask = {true};
-            p.prepared_gate_gemm = {engines.gate.get()};
-            p.prepared_up_gemm = {engines.up.get()};
-            p.prepared_down_gemm = {engines.down.get()};
+            p.prepared_gate_gemm = {engines.gate().get()};
+            p.prepared_up_gemm = {engines.up().get()};
+            p.prepared_down_gemm = {engines.down().get()};
             p.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
             p.cpu_router_q8_input_publication = CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
             p.cpu_grouped_serial_workspace = std::move(workspace);
@@ -189,7 +189,7 @@ namespace llaminar2
     }
 
     uint64_t MoEOverlayCPUServiceMeasurement::measurePrepared(
-        const MoEOverlayPreparedExpertTriplet &source, DeviceId device, int layer,
+        const MoEOverlayPreparedExpertPayload &source, DeviceId device, int layer,
         ExpertHistogramSource phase, Geometry geometry,
         const std::shared_ptr<PhysicalMemoryAuthority> &memory)
     {

@@ -351,3 +351,22 @@ TEST(ServerExecutionEvidence, ReportsResolvedParallelismNotRequestedFlagSpelling
     overlay->routed_tiers.push_back({.name = "two", .domain = "second", .priority = 10});
     EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("execution_strategy"), "expert-overlay");
 }
+
+/** The certificate observes frozen domain ownership, not a requested global hint. */
+TEST(ServerExecutionEvidence, ReportsActualRoutedComputeAndRejectsUniformAssumptions)
+{
+    RankExecutionPlan plan;
+    OrchestrationConfig config;
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "none");
+    auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
+    overlay->enabled = true;
+    overlay->topology = RoutedExpertPlacementTopology::TieredOverlay;
+    overlay->domains = {{.name = "first", .routed_compute_policy = RoutedExpertComputePolicy::Apportioned}};
+    config.moe_routed_expert_plan = overlay;
+    EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "apportioned");
+    overlay->domains.front().routed_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "gate-up-owned-down-columns");
+    overlay->domains.push_back({.name = "second", .routed_compute_policy = RoutedExpertComputePolicy::Apportioned});
+    EXPECT_EQ(serverExecutionPolicyTags(plan, config).at("routed_compute"), "mixed");
+}

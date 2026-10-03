@@ -116,6 +116,7 @@ namespace llaminar2
                     transfer.enqueueDeviceToMappedHost(*buffer, 0, *output, 0, payload, device, lane.stream());
                     capture.finish();
                 }
+                require(readback->prepareRuntimeContextStorage(memory), "readback context storage preparation failed");
                 require(readback->nodeCount() && readback->instantiate() &&
                     GPUGraphMemoryContract::acceptsFamilyObservation(device, readback->residentMemoryBytes(), graph_bytes),
                     "readback graph incomplete or outside admission");
@@ -143,6 +144,7 @@ namespace llaminar2
                             else transfer.enqueueDeviceToMappedHost(*buffer, 0, mapped, 0, payload, device, lane.stream());
                             capture.finish();
                         }
+                        require(graph->prepareRuntimeContextStorage(memory), "copy context storage preparation failed");
                         require(graph->nodeCount() && graph->instantiate() &&
                             GPUGraphMemoryContract::acceptsFamilyObservation(device, graph->residentMemoryBytes(), graph_bytes),
                             "copy graph incomplete or outside admission");

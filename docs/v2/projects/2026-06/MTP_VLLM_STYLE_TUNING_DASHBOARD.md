@@ -8,6 +8,228 @@ failing or not yet proven. Token equality alone is not verifier parity proof.
 
 ## Current State
 
+2026-10-03: **R — aggregate exposes a CPU maintenance-drain failure;
+performance still pending.** The frozen-runtime prerequisite receipt records
+**687 Unit + 601 production preflight entries** passing. The six-GPU 122B dynamic-MTP cell passes
+**20/20 fresh full HTTP lifetimes / 900 checks**, with clean driver windows
+and zero retained VRAM growth. The unchanged Release completes its **frozen
+21-cell HTTP manifest: twenty green, one red**, in 7,039.33 seconds. The final
+single-ROCm Qwen3.8 dense cell at 32K context passes **45/45**, including
+30,205/32,768-token admission.
+Every green cell passes **45/45**, including all eight long-context checks,
+shutdown, retirement and independently checked driver evidence. This includes
+both selectable CUDA/ROCm `GateUpOwnedDownColumns` modes, the 122B GPU/CPU
+topologies, dense CUDA TP/PP and mixed CUDA/ROCm TP+PP.
+
+The first Qwen3.6 CPU2 cell passes all eight long-context checks but hits its
+900-second watchdog during coordinator maintenance drain; both rank stacks
+are retained. The exact retained frontier remains unresolved. No runtime,
+harness or timeout changes were made during the collect-all aggregate. The
+driver exits one with `correctness_passed: false`; diagnosis now narrows to the
+exact CPU2 cell rather than repeating the aggregate.
+The unchanged-runtime exact retries are **20/20 green**, each **45/45** in
+669.75–681.00 seconds. A separate read-only replay of the saved HTTP, all eight
+long-context, tool, automatic-selection and final driver validators also passes
+20/20; its log is `cpu-drain-20-independent-evidence-validation.log` under the
+native-live-extent result root. Every completed attempt exits
+cleanly, returns VRAM 42→42 MiB and retains an independently checked complete,
+passing driver report with zero new records or findings. The first ten have no
+native debugger/probe attachment. Attempt eleven has a bounded passive probe
+with no stopping-worker samples and no debugger attachment; it also retires
+cleanly. These passes do not establish
+the intermittent stall's cause or repair the original red aggregate.
+The loop stops at the first failure. A diagnostic sidecar observes only a
+retained shutdown after all eight long checks finish, authenticates original
+process births before its delay, revalidates them before attachment, and
+preserves bounded passive/stack snapshots. Its former 25-second threshold
+proved too early for attempt eleven's healthy tail; the observer alone is
+stopped, syntax-checked and restarted with a 60-second diagnostic delay.
+No native/cell timeout changes. The canonical driver remains the
+sole request, timeout and retirement owner; runtime, harness and timeouts are
+unchanged. Per-attempt evidence is tabulated in the linked investigation.
+Production-default benchmarks, projection-owned A/B results, full aggregate
+pass and image certification remain unproven.
+Test-only coverage edits now add matching Qwen3.6 whole-expert CUDA2/ROCm2
+HTTP controls and the reported Ornith Q8 ROCm4 HTTP/benchmark selector. They
+preserve existing mathematical identities. The rebuilt discovery exports
+**24 HTTP cells**, adding exactly those three tags with no removed cells and
+unchanged local HTTP/benchmark/runtime/model profiles for the original 21.
+The small device-free coverage regression has an explicit preflight entry.
+All four focused coverage, selector, host-lease-terminal and hammer preflight
+entries pass in 2.02 seconds. The renewed **687/687 Unit** gate passes in
+77.722 seconds; complete **604/604 preflight** passes in 1,842.281 seconds.
+The canonical **1,291-entry** combined receipt passes in 1,921.011 seconds.
+The fresh-prefix hammer starts only after canonical unchanged-build receipt
+validation, reusing its one staged GGUF without copying any weights.
+The new real HTTP/benchmark selectors remain unrun. The completed CPU cohort kept its
+original binary/manifest, unaffected by these metadata edits. The next E2E
+projection is expected to gain three cells, not reuse the old aggregate pass.
+The existing HTTP hammer also has a staged fresh-lifetime option: finite
+request/prefix cycles followed by normal harness retirement, repeated under
+one model-staging lease until the first failure. Separate lifetime journals,
+final driver validation and interruption/fail-first tests join its existing
+Unit/preflight registrations. Its 25 device-free Python regressions now pass
+in 0.543 seconds, without launching a model or touching the active cohort.
+Real fresh-lifetime execution is now running: two nonce-qualified cold/full/
+partial-prefix cycles, followed by normal retirement, then another fresh
+server. Its first real lifetime is **40/40 green** in **252.008 seconds**,
+with two fresh prefills, eight full restores, two partial restores, normal
+retirement and complete clean driver evidence. An independent read-only audit
+confirms all forty ordered result records and the next lifetime's distinct
+nonce. Lifetime two is running; the observer makes no native attachment after
+the first original rank pair retires before its threshold. This tooling is not
+a native shutdown fix or a certificate.
+The following read-only update confirms three fresh-prefix lifetimes at
+40/40 requests each (252.008, 254.726 and 250.045 seconds), with lifetime four
+live. The second lifetime commits all 89 started movement waves and completes
+1,958,477,824 transfer payload bytes before clean retirement, so the diagnostic
+is not passing with maintenance inactive. These finalized counters are passive
+path evidence, not policy authority or a performance certificate. The already
+green real-MPI preflight includes repeated worker lifetimes, pending proposal
+acknowledgements and old-reader retirement. No missing terminal edge or native
+repair is yet demonstrated by this additional audit.
+A benchmark admission review also finds ROCm's `atoi` CSV helper discarding
+bad entries or selecting defaults after malformed explicit input. Both vendor
+harnesses now delegate to one strict device-free geometry parser; a small new
+test shard joins the existing trainer Unit target and explicit
+`V2_Integration_BenchmarkGeometrySelection` preflight entry. This is also
+compiled and its focused preflight passes, with no measured result or inference
+policy change. Its labels
+declare host-only ownership: shared vendor callers do not make this pure
+selector proof an accelerator workload.
+A read-only host epoch audit confirms that both sparse-return transports
+already release their dispatch lease at the declared final ordered return.
+The existing device-free graph regression was Unit-only; its explicit
+`V2_Integration_MoEOverlayHostDispatchLeaseTerminal` preflight registration
+is now compiled and passes its focused entry. This closes an inventory gap,
+not the original runtime stall. Together with the two new coverage/parser
+entries, preflight discovery grows from 601 to 604; complete execution is green.
+
+The next October 3 slice closes a narrower real-MPI reader-coverage gap. The
+existing sparse-return proof checked arithmetic across sixteen placements;
+exact final-reader release had only a single-participant Unit proof. The
+two-rank proof now pins a real authority lease, including an empty root or
+follower, and requires the native final return to clear it before retirement.
+Its explicit `V2_Integration_MoEOverlayHostDispatchEpochLease_MPI` preflight
+entry passes **20/20 fresh process repetitions in 24.98 seconds**. A test-only
+negative control selecting Retain instead of Release fails on all sixteen
+placements with one active reader; the restored source passes. The original
+sparse-transport group also passes. No production/runtime change is made.
+The gate build targets are current, and discovery is now **687 Unit + 605
+preflight entries**. The earlier 1,291-entry receipt is correctly rejected as
+stale after this build/inventory change; the complete new 1,292-entry gate is
+not yet qualified. The still-unbounded prefix hammer independently reaches
+**nine clean fresh lifetimes / 360 completed requests**, with lifetime ten
+active and no native attachment. This coverage does not repair or explain the
+original intermittent shutdown stall. GPU HTTP and uncontended performance
+work still await retirement of that CPU diagnostic.
+See the [native-runtime and prefix-maintenance evidence](../2026-10/2026-10-01-rocm-captured-packet-publication.md).
+
+The reporter's exact Nail weights now pass fixed-3 and dynamic stochastic HTTP
+matrices, plus the 950-record cold/exact/changed-prefix reproduction with genuine
+cache hits. Missing learned predictors are rejected before allocation; GPU DRY
+remains an explicit pre-inference rejection, not a generated-text certificate.
+For issue #16, the latest matched native means remain **143.92 fixed / 128.64
+dynamic tok/s** (10.61% gap). Source audit identifies dormant tiled-MoE launches
+retained by the wide dynamic envelope; no new route policy or timing result is
+claimed. The ROCm communication-discounted scaling target also remains open
+(1.524x versus 1.6x). See the
+[dated slice, source lifecycle and issue inventory](../2026-09/2026-09-27-qwen36-rocm2-prefill.md).
+
+A read-only verifier geometry trace confirms that the same retained row owner
+sizes input/output strides and preparation key space, while serving capture
+chooses the maximum envelope for Dynamic. The existing preparation registry
+admits bounded scalar bucket keys, but that is not a narrower complete serving
+graph family or permission to change one stride. The staged identical-live-row
+probe must establish the cost before any runtime/graph-family redesign.
+
+A further read-only bridge audit confirms the generic eight-row crossover is
+an **economic route policy**, not a fixed kernel row limit:
+`launch_moe_grouped_gate_up_route_owned_geometry()` sizes its grid from
+`admission.maximumSlotsFor(RouteOwned)`. Existing measured Q8_0 keys admit
+M16/M32 through that same template. For untrained M16 capacity, however, M9–M16
+still select expert tiling, so capture must retain both families. Changing one
+endpoint alone cannot prune the tiled family. The existing
+`v2_perf_moe_verifier_prefill` harness includes all-format and deep-row economy
+cases and the new speedometer now builds in both Integration and Release.
+No policy, depth bound, arena,
+kernel or measurement has changed; a broader crossover needs an isolated
+all-format/geometry/route-distribution economy proof before adoption.
+
+A test-only `ROCm_AdaptiveVerifierCapacityTax` speedometer now compiles in
+that existing performance target. It compares identical live routes/weights
+at different retained capacities (by default four live rows in M4 and M16),
+with reused/uniform expert profiles, all canonical quantized source formats
+and optional explicit mixed down format. Seven captured-event samples and a
+serial-byte oracle accompany each complete key. It is opt-in, remains outside
+preflight. Its Release target now builds successfully in seven commands;
+the active serving executable and core-library inode, size and modification
+time remain unchanged. Loader inspection selects the same repaired HIP and
+matched BLAS closure. A first GPU-only diagnostic now runs while the CPU hammer
+continues. All four identical-live-row cases pass seven samples with **zero
+byte mismatches and nonfinite values**. Capacity-4/16 medians are **209.664 /
+232.378 microseconds** for reused experts and **221.201 / 253.318 microseconds**
+for uniform routes: 10.8% and 14.5% extra cost. CPU contention makes these
+timings provisional, not a production performance certificate. Separate exact
+native graph traces authenticate **five versus sixteen dispatches per launch**,
+eight launches each, with no captured copies or driver findings. Gate/up and
+down dot durations are nearly unchanged; wider grouping and dormant tiled
+dispatches account for this generic-entrypoint probe's extra work. A following
+source-fidelity check finds the real grouped main verifier binds runtime-owned
+grouping and its deferred route ledger, including single-GPU Qwen execution.
+That planner has a 256-slot compact boundary, not this probe's 64-slot boundary.
+The six additional generic grouping dispatches are therefore **not established
+as production overhead**. Actual runtime-entrypoint or whole-model attribution
+is required; changing the generic threshold is not yet a justified server fix.
+The profiler changes queue interception,
+so its durations are attribution only. No route policy, MTP bound, arena or
+default changes. `rocm-capacity-iq2s-iq4xs-live4-analysis.json` retains the joined
+inventory and unprofiled samples under the ignored result root. A read-only audit
+of its first eleven completed lifetimes independently revalidates all **440
+saved responses**, nonce-qualified requests, SSE/needle answers, exact-prefix
+tokens, partial GDN/MTP restore evidence and complete clean driver bookends.
+`cpu-fresh-prefix-independent-evidence-validation.log` retains the result;
+it is diagnostic evidence, not a shutdown repair or an image certificate.
+
+The saved **real-model** trace reconstruction now authenticates every device
+budget/prepare/commit/ticket transition and the declared last-40 measured cohort.
+It independently reproduces **56,483 fixed / 72,483 dynamic dispatches**,
+identical 128-token outputs, 88 accepted / 15 rejected drafts and depth three.
+Runtime grouping has **1,600 dispatches in both**. The entire 16,000-launch delta
+is dormant routed/shared projection-family work: 6,400 tile directories, 3,200
+tiled gate/up, 3,200 tiled down and 3,200 partial publishers. Their 68.805 ms
+summed service is profiler attribution under the original binary/SDK, not a
+current Core 10 speedup certificate. The other three actual Nail expert pairs
+also pass nine component byte checks at 4/9/16 live rows, with zero mismatches
+or nonfinite values and clean driver bookends. Reproducible attribution is saved
+as `issue16-real-mtp-dispatch-attribution.json` under the ignored result root.
+
+The October 3 probe-fidelity audit confirms that production routing publishes
+`-1` expert IDs and zero weights for inactive verifier rows, matching the
+probe's retained-capacity suffix. The existing device-owned group admission
+already selects route-owned work for four live rows inside M16; M16 does not
+force those rows to execute tiled dots. Both reachable families still have
+captured nodes, so dormant launch/grouping overhead remains a measurement
+question. This routed-only probe does not include shared-expert live-count
+publication, router Q8 reuse, or the rest of the model transaction.
+
+The transaction-consolidation audit now separates two changes: retaining one
+complete homogeneous HIP body per selected branch, and narrowing the paired
+verifier geometry. The existing ordered-timeline composer and strict
+self-contained graph export supply the first contract; declared sparse
+boundaries must keep their exact epoch/follower publication edges. The second
+cannot be a row-count tweak: preparation, forward, state publication and
+stochastic captures currently share the widest immutable bindings, and every
+additional owner must appear in the canonical memory BOM. Neither change is
+implemented or measured yet. Ten focused controller/preparation/outcome/depth/
+maintenance entries pass on CUDA and ROCm in 81.02 seconds, with a complete
+clean driver window (`mtp-transaction-functional.tDKNJT`). The earlier
+runtime-grouping/live-row checks also pass both vendors and all 24 expert
+formats. These are focused functional passes, not a refreshed full gate or
+model certificate. The unbounded CPU hammer reaches 29 clean fresh lifetimes /
+1,160 requests with lifetime 30 active; the frozen serving binary/core remain
+unchanged and the original intermittent shutdown cause is still unresolved.
+
 2026-09-27: **A — six-GPU 122B tuning.** Unchanged dynamic-MTP defaults reach
 **351.49 prefill / 42.38 decode tok/s**; the new targets are 345.58 / 43.80.
 An explicit sharded-head comparison exposed missing local-TP gathered-logits
