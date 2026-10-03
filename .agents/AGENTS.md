@@ -368,6 +368,16 @@ can make every object appear dirty. If an existing tree names another
 executable, reconfigure it once with the active devcontainer path before
 building.
 
+The CPU compiler's `OpenMP::OpenMP_CXX` selection also owns its runtime ABI.
+Keep GPU compiler-private library directories out of inference `RPATH` and
+`LD_LIBRARY_PATH`: an SDK may ship a `libgomp.so.1` compatibility alias that
+actually contains LLVM `libomp`, silently replacing the GNU runtime selected
+at link time. `V2_Integration_OpenMPRuntimeBinding` in
+`ProductionTestPreflight` authenticates the real application's native loader
+closure against the configured runtime's ELF SONAME, with a same-filename
+shadow negative control. Do not use a benchmark-only preload to certify a
+misbound binary; correct its build/runtime search path and rerun unprofiled.
+
 For ROCm qualification, `ROCM_PATH` owns the header and device-bitcode roots as
 well as dependency discovery. Every HIP compile/link command binds `--hip-path`
 and `--rocm-path` to that same SDK; relocated compiler discovery alone can still
@@ -686,8 +696,11 @@ promise that every lower-priority tier eventually drains.
 
 Keep these policy axes separate:
 
-- `--moe-routed-expert-compute apportioned` (default) assigns whole experts to
-  participants. `replicated` places complete experts on every participant.
+- `--moe-routed-expert-compute auto` is the default. Inventory binding selects
+  gate/up-owned, down-column-sharded compute for one homogeneous rank-local
+  multi-GPU tier. CPU, heterogeneous, multi-tier and cross-rank domains retain
+  whole-expert compute. `apportioned` explicitly assigns whole experts to
+  participants; that override is never reinterpreted. `replicated` places complete experts on every participant.
   `tensor-sharded` means splitting each expert's tensors, not apportionment;
   the standard Qwen3.5 MoE path currently rejects that global option as
   unimplemented. Do not infer support from its presence in help.
@@ -750,7 +763,7 @@ rows are decode work, not ordinary prefill. There is no `llep` value for
 `--moe-residency-maintenance`. See `RoutedExpertPolicy.h` and domain validation
 for supported combinations rather than treating these policies as synonyms.
 
-Projection ownership is a separate, explicit physical mode. For a native
+Projection ownership is a separate physical mode and the automatic default for a native
 homogeneous multi-GPU domain, `routed_compute=gate-up-owned-down-columns`
 keeps movable gate/up pairs with their expert owner and fixes disjoint full-K
 down-output columns on every participant. Both exchanges are graph-visible:
@@ -758,8 +771,8 @@ proven no-P2P domains use device-counted TransferEngine channels for compact
 intermediates; enabled native P2P and completed-column publication retain
 NCCL/RCCL. Channels belong to the admitted domain and are reused across
 sequential layers and graph families, never allocated per layer. `apportioned` remains the
-whole-expert default and A/B control; never reinterpret it or automatically
-substitute the projection mode. CPU, cross-tier and cross-rank projection
+explicit whole-expert A/B control; never reinterpret that explicit choice.
+CPU, heterogeneous, cross-tier and cross-rank projection
 execution are not admitted by this implementation. Compare the same model,
 topology, precision, MTP, movement and request policy before claiming a benefit.
 

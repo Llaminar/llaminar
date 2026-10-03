@@ -187,7 +187,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_FALSE(config.dry_run);
-    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
     EXPECT_EQ(config.routed_expert_owner_order, RoutedExpertOwnerOrder::Ordinal);
     EXPECT_EQ(
         config.moe_hot_expert_cache.kind,
@@ -1329,7 +1329,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_EmptyString_ReturnsDefault
 
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
-    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
     EXPECT_EQ(
         config.moe_hot_expert_cache.kind,
         MoEHotExpertCacheConfig::Kind::Off);

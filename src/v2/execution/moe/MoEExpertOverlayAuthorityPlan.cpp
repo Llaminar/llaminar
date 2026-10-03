@@ -21,7 +21,12 @@ namespace llaminar2
         constexpr const char *kImplicitTierName =
             "priority_0";
 
-        /** @brief Build the canonical one-domain, one-tier LocalTP plan. */
+        /**
+         * @brief Build the canonical one-domain, one-tier LocalTP plan.
+         * @param request Inventory-resolved participants and immutable user intent.
+         * @return One authority with a concrete compute mode and no model placements.
+         * @throws std::invalid_argument for unresolved automatic domain geometry.
+         */
         std::shared_ptr<MoERoutedExpertPlacementPlan>
         buildImplicitLocalTPPlan(
             const MoEExpertOverlayAuthorityPlanRequest &request)
@@ -46,14 +51,17 @@ namespace llaminar2
             domain.participants = request.local_tp_participants;
             domain.weights = request.local_tp_weights;
             domain.owner_rank = request.world_rank;
-            domain.routed_compute_policy =
-                RoutedExpertComputePolicy::Apportioned;
+            domain.routed_compute_policy = request.routed_compute_policy;
             domain.routed_phase_policy =
                 RoutedExpertPhasePolicy::Uniform;
             domain.routed_decode_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
             domain.routed_prefill_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
+            // These are already resolved LocalTP participants, not selectors.
+            // Use the same topology authority as authored/inventory-bound tiers.
+            domain.routed_compute_policy = domain.toExecutionDomainDefinition()
+                .resolveRoutedComputePolicy(/*routed_tier_count=*/1);
             plan->domains.push_back(std::move(domain));
 
             RoutedExpertTier tier;
@@ -159,12 +167,13 @@ namespace llaminar2
                 "one explicit ExpertOverlay domain plan so execution cannot "
                 "fall through to the retired legacy residency authority");
         }
-        if (request.routed_compute_policy !=
-            RoutedExpertComputePolicy::Apportioned)
+        if (request.routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
+            request.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+            request.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)
         {
             throw std::invalid_argument(
                 "Implicit ExpertOverlay authority requires "
-                "routed_compute=apportioned; replicated and tensor-sharded "
+                "routed_compute=auto, apportioned or gate-up-owned-down-columns; replicated and tensor-sharded "
                 "residency need a typed multi-owner epoch representation");
         }
         if (!request.local_tp_weights.empty() &&

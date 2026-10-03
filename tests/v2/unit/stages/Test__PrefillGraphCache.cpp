@@ -12,6 +12,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "execution/local_execution/engine/ForwardGraphEntryOrdering.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -759,6 +760,69 @@ TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)
     EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 128)
         << "A fixed real-token interval must retain one physical graph bucket "
            "for its short final tail.";
+}
+
+/** @test Every externally submitted resident bucket joins its preceding graph frontier. */
+TEST(Test__PrefillGraphCache, DeviceResidentBucketEntryRequiresPreviousForwardCompletion)
+{
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const auto input_hint : {DeviceId::cpu(), DeviceId::cuda(1), DeviceId::rocm(1)})
+        for (const int rows : {1, 64, 384, 4096})
+            for (const auto role : {ForwardParticipantOutputRole::TerminalOwner,
+                                   ForwardParticipantOutputRole::PipelineFollower})
+                for (const bool resident_chunk : {false, true})
+                    for (const bool setup_only : {false, true})
+                    {
+                        ForwardInput input;
+                        // Exact execution ownership is independent of an
+                        // omitted or differently placed request declaration.
+                        input.device = input_hint;
+                        input.seq_len = rows;
+                        input.execution_phase = ForwardExecutionPhase::Prefill;
+                        if (resident_chunk)
+                            input.device_prefill_chunk.emplace();
+                        if (setup_only)
+                            input.graph_submission_intent =
+                                ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+                        const auto expected = device.is_gpu() && !setup_only &&
+                            (resident_chunk || role == ForwardParticipantOutputRole::PipelineFollower)
+                            ? ForwardGraphEntryDependency::PreviousForwardCompletion
+                            : ForwardGraphEntryDependency::PublishedRequestState;
+                        EXPECT_EQ(forwardGraphEntryDependency(input, device, role), expected)
+                            << "device=" << device.toString() << " rows=" << rows
+                            << " input_hint=" << input_hint.toString()
+                            << " resident_chunk=" << resident_chunk << " setup=" << setup_only;
+                    }
+}
+
+/** @test Production family selection never expands an exact admitted tail. */
+TEST(Test__PrefillGraphCache, RetainedBucketFamilyPreservesEconomicalRemainders)
+{
+    for (const int start : {0, 64, 8192})
+    {
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            {384, 64, 256, 128, 64}, start, 448);
+        const auto schedule = planPrefillChunkSchedule(policy);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 2u);
+        EXPECT_EQ(policy.min_rebalance_interval_tokens, 384);
+        EXPECT_EQ(schedule.chunks[0].token_offset, start);
+        EXPECT_EQ(schedule.chunks[0].real_count, 384);
+        EXPECT_EQ(schedule.chunks[0].bucket_seq_len, 384);
+        EXPECT_EQ(schedule.chunks[1].token_offset, start + 384);
+        EXPECT_EQ(schedule.chunks[1].real_count, 64);
+        EXPECT_EQ(schedule.chunks[1].bucket_seq_len, 64);
+    }
+    for (const int cap : {128, 256, 384, 512, 4096})
+    {
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            {64, cap}, 17, cap + 64);
+        const auto schedule = planPrefillChunkSchedule(policy);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 2u);
+        EXPECT_EQ(schedule.chunks.back().bucket_seq_len, 64);
+        EXPECT_EQ(schedule.chunks.back().real_count, 64);
+    }
 }
 
 TEST(Test__PrefillGraphCache, ChunkSchedule_RebalanceIntervalsCountRealTokensOnly)

@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/TPLocalReduceOverlap.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "../../../../mocks/MockComputeStage.h"
 #include "../../../../mocks/MockLocalTPContext.h"
@@ -195,7 +196,7 @@ namespace
         EXPECT_THROW(install(), std::invalid_argument);
     }
 
-    TEST_F(AllreduceOverlapTest, RejectsControlSidebandsRankFoldAndOutOfBoundsBeforeMutation)
+    TEST_F(AllreduceOverlapTest, RejectsControlSidebandsAndOutOfBoundsBeforeMutation)
     {
         sum.sidebands.emplace_back();
         EXPECT_THROW(install(), std::invalid_argument);
@@ -203,10 +204,78 @@ namespace
         sum.sideband_workspace_bindings.emplace_back();
         EXPECT_THROW(install(), std::invalid_argument);
         sum.sideband_workspace_bindings.clear();
-        sum.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
-        EXPECT_THROW(install(), std::invalid_argument);
-        sum.arithmetic_policy = TPAllreduceArithmeticPolicy::NativeCollective;
         sum.count = tensor.numel() + 1;
+        EXPECT_THROW(install(), std::invalid_argument);
+        EXPECT_EQ(graph.getExecutionOrder().size(), 3u);
+    }
+
+    TEST_F(AllreduceOverlapTest, CanonicalRankOrderRetainsOneWorkspaceBindingAcrossBothEventEdges)
+    {
+        for (const bool cuda : {false, true})
+            for (const int degree : {2, 3, 4, 8})
+                for (const size_t live_count : {16u, 128u})
+                {
+                    SCOPED_TRACE(::testing::Message() << cuda << ":" << degree << ":" << live_count);
+                    const auto endpoint = cuda ? DeviceId::cuda(0) : DeviceId::rocm(0);
+                    std::vector<GlobalDeviceAddress> endpoints;
+                    for (int i = 0; i < degree; ++i)
+                        endpoints.push_back(cuda ? GlobalDeviceAddress::cuda(i) : GlobalDeviceAddress::rocm(i));
+                    tp.setDevices(std::move(endpoints));
+                    tp.setBackend(cuda ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL);
+                    auto canonical = sum;
+                    canonical.device_id = endpoint;
+                    canonical.count = live_count;
+                    canonical.precision = "fp32";
+                    canonical.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+                    canonical.sideband_device_index = 0;
+                    auto original = std::make_unique<TPAllreduceStage>(canonical);
+                    const auto expected = original->getWorkspaceRequirements(1);
+                    ASSERT_EQ(expected.buffers.size(), 1u);
+
+                    ComputeGraph local_graph;
+                    for (const auto *name : {"producer", "compute"})
+                        local_graph.addNode(name, std::make_unique<llaminar2::testing::MockComputeStage>(
+                            ComputeStageType::GEMM, name, endpoint), endpoint);
+                    local_graph.addNode("reduce", std::move(original), endpoint);
+                    local_graph.addDependency("reduce", "producer");
+                    ASSERT_NO_THROW(overlapTPLocalAllreduce(local_graph, "reduce", "compute"));
+
+                    // Planning/binding remains device-free. The two edges must
+                    // borrow one operation's workspace, not create hidden scratch.
+                    DeviceWorkspaceManager workspace(DeviceId::cpu(), expected.total_bytes_with_alignment());
+                    auto *submit = dynamic_cast<IWorkspaceConsumer *>(local_graph.getNode("reduce_submit")->stage.get());
+                    auto *join = dynamic_cast<IWorkspaceConsumer *>(local_graph.getNode("reduce")->stage.get());
+                    ASSERT_NE(submit, nullptr);
+                    ASSERT_NE(join, nullptr);
+                    for (const auto *edge : {submit, join})
+                    {
+                        const auto actual = edge->getWorkspaceRequirements(1);
+                        ASSERT_EQ(actual.buffers.size(), 1u);
+                        EXPECT_EQ(actual.buffers[0].name, expected.buffers[0].name);
+                        EXPECT_EQ(actual.buffers[0].size_bytes, live_count * degree * sizeof(float));
+                        EXPECT_EQ(actual.buffers[0].regime, WorkspaceExecutionRegime::CompactDecodeOnly);
+                    }
+                    submit->bindWorkspace(&workspace);
+                    EXPECT_EQ(join->getWorkspace(), &workspace);
+                    join->unbindWorkspace();
+                    EXPECT_FALSE(submit->hasWorkspace());
+                }
+    }
+
+    TEST_F(AllreduceOverlapTest, RejectsInvalidCanonicalArithmeticBindingsBeforeMutation)
+    {
+        sum.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+        sum.precision = "fp16";
+        sum.sideband_device_index = 0;
+        EXPECT_THROW(install(), std::invalid_argument);
+        sum.precision = "fp32";
+        for (const int participant : {-1, 1, 2})
+        {
+            sum.sideband_device_index = participant;
+            EXPECT_THROW(install(), std::invalid_argument);
+        }
+        sum.sideband_device_index = 0;
+        sum.arithmetic_policy = static_cast<TPAllreduceArithmeticPolicy>(255);
         EXPECT_THROW(install(), std::invalid_argument);
         EXPECT_EQ(graph.getExecutionOrder().size(), 3u);
     }

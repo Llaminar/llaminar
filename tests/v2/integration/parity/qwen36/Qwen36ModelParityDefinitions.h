@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -227,6 +228,39 @@ namespace llaminar2::test::parity::qwen36
         topology.expert_overlay_plan = std::move(plan);
         topology.test_id += "_GateUpOwnedDownColumns";
         return topology;
+    }
+
+    /**
+     * @brief Derive projection variants for automatically eligible MoE definitions.
+     * @param definitions Existing model/topology declarations and their controls.
+     * @return Independent projection definitions for eligible GPU tiers only.
+     *
+     * The production topology resolver owns eligibility; this test helper must
+     * not invent another vendor, scope or tier-count rule. Copy the complete
+     * model declaration before changing its physical topology, so fine-tunes
+     * share their control's HF pack, prompt, numerical gates and HTTP profile.
+     * Whole-expert and CPU definitions remain immutable and separately runnable.
+     * @throws std::invalid_argument An input has no authored overlay domain.
+     */
+    inline std::vector<ModelParityDefinition> qwen36MoEAutomaticProjectionVariants(
+        std::span<const ModelParityDefinition> definitions)
+    {
+        std::vector<ModelParityDefinition> variants;
+        for (const auto &source : definitions)
+        {
+            const auto &plan = source.topology.expert_overlay_plan;
+            if (!plan || plan->domains.empty())
+                throw std::invalid_argument("Projection variants require an authored MoE overlay domain");
+            auto automatic = plan->domains.front().toExecutionDomainDefinition();
+            automatic.routed_compute_policy = RoutedExpertComputePolicy::Automatic;
+            if (automatic.resolveRoutedComputePolicy(plan->routed_tiers.size()) !=
+                RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+                continue;
+            auto variant = source;
+            variant.topology = qwen36MoEProjectionTopology(source.topology);
+            variants.push_back(std::move(variant));
+        }
+        return variants;
     }
 
     /**

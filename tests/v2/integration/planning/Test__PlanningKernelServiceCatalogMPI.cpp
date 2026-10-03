@@ -220,7 +220,18 @@ namespace
                         // ExpertOverlay still communicates routed activations.
                         // Cost evidence must follow that admitted policy rather
                         // than infer behavior from a broad strategy label.
-                        if (candidate.strategy() == OrchestrationStrategy::TensorParallel && replicated_decode)
+                        const auto &placement = candidate.config().moe_routed_expert_plan;
+                        const bool distributed_down_columns = placement &&
+                            std::any_of(placement->domains.begin(), placement->domains.end(),
+                                [](const auto &domain) {
+                                    return domain.routed_compute_policy ==
+                                        RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                                });
+                        // A replicated dense view does not replicate the
+                        // projection mode's distributed expert down columns.
+                        // Their publication remains real decode traffic.
+                        if (candidate.strategy() == OrchestrationStrategy::TensorParallel &&
+                            replicated_decode && !distributed_down_columns)
                             EXPECT_NE(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);
                         else
                             EXPECT_EQ(cost.evidence().find("mean_decode_interconnect_s=0;"), std::string::npos);

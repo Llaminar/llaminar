@@ -73,6 +73,32 @@ namespace
     }
 }
 
+/** @test Search and admission share the exact source-column partition invariant. */
+TEST(MoEProjectionArenaGeometry, IntegralOutputPartitionIsSharedBySearchAndAdmission)
+{
+    for (const int columns : {256, 384, 512, 1536, 2048, 6144})
+    for (int degree = 2; degree <= 8; ++degree)
+    {
+        SCOPED_TRACE(::testing::Message() << "columns=" << columns << " degree=" << degree);
+        auto profile = profileFor("Q6_K");
+        profile.d_model = columns;
+        for (auto &tensor : profile.tensors)
+            if (tensor.name.find("ffn_down_exps") != std::string::npos)
+                tensor.elements = tensor.K * columns * profile.expert_count;
+        const bool integral = columns % degree == 0;
+        EXPECT_EQ(MoEProjectionArenaGeometry::hasIntegralOutputPartition(columns, degree), integral);
+        if (integral)
+        {
+            const auto layout = MoEProjectionArenaGeometry::resolve(profile, degree);
+            EXPECT_EQ(layout.banks()[3].words_per_row, columns / degree);
+            EXPECT_EQ(layout.banks()[4].words_per_row, columns);
+        }
+        else EXPECT_THROW(MoEProjectionArenaGeometry::resolve(profile, degree), std::invalid_argument);
+    }
+    EXPECT_THROW(MoEProjectionArenaGeometry::hasIntegralOutputPartition(0, 2), std::invalid_argument);
+    EXPECT_THROW(MoEProjectionArenaGeometry::hasIntegralOutputPartition(512, 1), std::invalid_argument);
+}
+
 /** @test All formats and native degrees price exactly the buffers the real resolver declares. */
 TEST(MoEProjectionArenaGeometry, EveryFormatReplacesWholeExpertStorageExactly)
 {

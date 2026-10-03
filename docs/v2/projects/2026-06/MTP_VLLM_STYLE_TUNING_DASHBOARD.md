@@ -6,7 +6,130 @@ detail in project handoffs.
 RAG: **G** correct and economical, **A** correct but untuned/stale, **R**
 failing or not yet proven. Token equality alone is not verifier parity proof.
 
-## Current State
+## Latest verification (2026-10-03)
+
+**A — checkpoint correctness and corrected-runtime benchmarks are green;
+automatic ownership defaults are being qualified.** Checkpoint
+`9491bd370c27a50b0fcb1f9f0e170aaac81c0dcc` passed its
+normal commit gate: **687/687 Unit** and **606/606 ProductionTestPreflight**.
+Its frozen **24-cell native Release HTTP cohort passed 24/24**, with
+**1,080/1,080 checks**, clean driver intervals and clean retirement. This is
+native qualification, not a Docker/image certificate. The earlier intermittent
+CPU maintenance-drain trace remains causally unresolved; the CPU hammer was
+stopped at the user's request and must not be restarted by this handoff.
+
+The same checkpoint completed all 24 production-default benchmark cells.
+One formal high-water failure remained: single-CUDA Qwen3.8 dense prefill,
+**614.26 vs 718.36 tok/s**. No high-water file was changed. Large apparent
+CPU/hybrid drops were independently traced to this local Release tree's
+compiler-private ROCm LLVM library directory shadowing GNU `libgomp.so.1`.
+Same-binary GNU-runtime controls retained identical token streams and MTP
+work: Qwen CPU2 **332.93/40.29**, Ornith CPU2 **411.73/44.48**, 122B ROCm2+CPU2
+**256.08/23.69**, and 122B ROCm4+CPU2 **311.71/27.59** prefill/decode tok/s.
+The local RPATH is now corrected; preload controls are diagnostic evidence,
+not substitute release configuration. Native loader identity and shadow
+negative controls now have explicit Unit/production-preflight entries.
+
+The corrected-runtime 24-cell benchmark sweep passes the recorded ratchet gate
+in **1,387.50 seconds**, with a clean driver interval and no high-water edits.
+Qwen CPU2 measures **332.37/41.00**, Ornith CPU2 **409.97/45.78**, and the CUDA
+dense prefill regression is resolved at **900.68/61.56** prefill/decode tok/s.
+The retained-family fix passes **20/20 native lifetimes on each GPU backend**;
+same-model CUDA controls retain identical tokens and MTP work, remove all
+1,600 padded rows across five prefills, and retain four graph captures.
+
+Gate/up-owned, down-column-sharded Qwen execution reproduces at CUDA2
+**2,068.31/203.20** versus whole experts **1,275.66/133.16**; ROCm2 measures
+**1,422.30/130.77** versus **1,132.32/103.84**. Tokens still match on all measured
+requests. CUDA MTP work matches exactly; ROCm projection uses one fewer verifier
+round per request. The earlier ROCm whole-expert decode baseline was 61.82;
+its now-higher speed has exactly the same tokens and verifier work. Conversely,
+Ornith Q4 ROCm2 whole-expert decode falls from 114.61 to 65.47 with unchanged
+tokens, verifier work and zero movement. That same-cell variability requires
+targeted remeasurement despite the formal ratchet's passing identity keys.
+Do not describe the previous +107.9% ROCm projection gain as reproduced.
+
+The requested topology-aware default is now staged: automatic intent selects
+projection ownership only in one homogeneous native multi-GPU tier. CPU,
+heterogeneous and multi-tier plans retain whole experts; explicit modes remain
+immutable. Automatic-default native launches are qualified below; the renewed
+Unit/preflight gates remain pending. This does not prove cross-tier projection
+support or certify a Docker image.
+
+The five automatic-default native benchmark probes subsequently pass, with no
+compute override: Qwen CUDA2 **2,074.82/204.06**, Ornith Q4 CUDA2
+**1,915.28/222.09**, Qwen ROCm2 **1,423.45/130.80**, Ornith Q4 ROCm2
+**1,429.62/143.93**, and Ornith Q8 ROCm4 **1,207.82/98.75** prefill/decode
+tok/s. The four-participant probe first exposed a graph-builder contract gap:
+shared decode uses canonical rank-order arithmetic, while overlap admitted only
+native sums. The repair shares the ordinary stage's fixed-rank fold and admitted
+scratch through its existing event pair. Fifteen focused overlap tests pass,
+including real CUDA2/ROCm2/ROCm4 replay and live prefixes. The ROCm4 benchmark
+retains all three control token streams and MTP work counts byte-for-byte.
+The affected eleven-cell HTTP cohort completes **10/11 green**. Its first
+Qwen CUDA2 launch misses readiness during the gate build; the preserved red
+result is followed by an idle **45/45** retry in **80.39 seconds**, with the
+same 60-second readiness limit and unchanged runtime. All eleven affected
+configurations are therefore individually green, including six dense CUDA/
+ROCm single/TP/PP cells. The 32K single-ROCm cell certifies 30,205/32,768-token
+admission, 2,048-token generation and clean retirement. This is a collect-all
+cohort plus a focused retry, not a rewritten all-green aggregate receipt.
+Canonical source coverage additionally derives Ornith Q4 CUDA2/ROCm2 and Q8
+ROCm4 projection variants beside their whole-expert controls. Fresh canonical
+discovery confirms **27 HTTP cells**; all three additive cells pass **135/135
+checks**, with clean drivers and retirement. Their five-entry focused contract
+gate passes. The source-derived three-cell canonical benchmark projection also
+passes in **153.98 seconds**: Ornith Q4 CUDA2 **1,915.07/222.07**, Q4 ROCm2
+**1,427.09/143.90**, and Q8 ROCm4 **1,205.46/99.11** prefill/decode tok/s.
+A retrospective extension of the preceding HTTP driver cursor contains no
+new kernel records, not a separately armed benchmark-driver certificate.
+Final aggregate gates and image-bound qualification remain pending. See
+`docs/v2/projects/2026-10/MOE_AUTOMATIC_COMPUTE_DEFAULT.md` for the event map.
+
+The first final normal hook completes **688/688 Unit** and **611/615 preflight**,
+with clean driver evidence. The commit remains blocked. Its only reds are the
+CUDA/ROCm pipeline-MTP predecessor byte proof and CUDA/ROCm MPI bounded-cost
+preparation. The audit identifies a request-device hint incorrectly controlling
+a physical-owner event edge, plus nonintegral projection proposals and a stale
+zero-communication expectation for replicated dense decode. The staged repair
+uses the participant's canonical owner and the arena's shared output-partition
+invariant. All nine focused Unit/integration entries pass in **80.32 seconds**,
+including both complete pipeline-MTP and real-MPI sampling suites. The explicit
+predecessor-ordering regression passes **20/20 CTest executions on CUDA and
+20/20 on ROCm** in **54.85 seconds**, with clean authenticated driver evidence.
+Each execution contains twenty held-predecessor byte checks. The three affected
+canonical pipeline HTTP lifetimes pass **135/135 checks** in **533.86 seconds**:
+CUDA PP, mixed CUDA/ROCm TP+PP and ROCm PP, with clean driver intervals and full
+memory retirement. The fresh complete normal hook and image-bound PR gate are
+still required before publication.
+
+Safe native graph/host-boundary observers localized the remaining CUDA dense
+gap: the 512-live-token workload executed **832 physical rows**, because a
+64-row nonterminal remainder reused a 384-row graph. The working-tree fix
+preserves the admitted request bank and device KV cursor while sealing each
+chunk's exact retained materializer **and shifted-MTP** graph identity. Its
+stronger native regression exercises device inputs, two retained widths,
+repeated request resets and rejection of incomplete/foreign ownership before
+any execution. Complete incoming native event ordering is also required; the
+earlier unjoined trial's Xid 43 is retained as red evidence rather than hidden.
+Focused regression, 20-run backend loops and corrected unprofiled timing pass.
+Source/runtime changes after the checkpoint do not inherit its full-cohort pass.
+
+Evidence lives under
+`parity-results/qwen36-rocm2-prefill/native-live-extent/`:
+`checkpoint-full-http.json`, `checkpoint-full-benchmarks.json`,
+`checkpoint-cpu-gnu-openmp-ab.json`,
+`checkpoint-gnu-runtime-affected-benchmarks.json`,
+`checkpoint-gnu-hybrid-benchmarks.json`,
+`checkpoint-corrected-full-benchmarks.json`,
+`checkpoint-corrected-full-benchmarks-driver-report.json`,
+`checkpoint-canonical-ornith-projection-http.json`,
+`checkpoint-canonical-ornith-projection-benchmarks.json`,
+`checkpoint-prefill-entry-ordering-stress20.log`, and
+`dense-cuda-prefill-attribution/`. These local artifacts are ignored and must
+not be staged as source or published corpus payloads.
+
+## Earlier investigation record
 
 2026-10-03: **R — aggregate exposes a CPU maintenance-drain failure;
 performance still pending.** The frozen-runtime prerequisite receipt records

@@ -466,8 +466,8 @@ namespace llaminar2
         bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
-        /// Physical routed-expert compute distribution for the standard path.
-        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        /// Request intent; inventory binding seals the concrete physical mode.
+        RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Automatic;
 
         /// Static whole-expert ownership ordering for apportioned domains.
         RoutedExpertOwnerOrder routed_expert_owner_order =

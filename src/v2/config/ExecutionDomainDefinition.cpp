@@ -416,6 +416,8 @@ namespace llaminar2
                 return;
 
             if (routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
+                routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
+                routed_compute_policy != RoutedExpertComputePolicy::Unspecified &&
                 !(phase_allows_replicated_apportionment &&
                   apportioned_prefill_over_replicated_weights))
             {
@@ -449,6 +451,34 @@ namespace llaminar2
         }
 
         return errors;
+    }
+
+    RoutedExpertComputePolicy ExecutionDomainDefinition::resolveRoutedComputePolicy(
+        std::size_t routed_tier_count) const
+    {
+        if (routed_compute_policy != RoutedExpertComputePolicy::Automatic &&
+            routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
+            return routed_compute_policy;
+        if (scope == ExecutionDomainScope::AUTO)
+            throw std::invalid_argument("Domain '" + name +
+                "' requires inventory-bound scope before automatic routed compute resolution");
+
+        // Arithmetic/row-assignment intent is independent from topology. LLEP
+        // needs complete residents; it must not receive a down-column shard.
+        const bool uniform_owner_rows =
+            (routed_phase_policy == RoutedExpertPhasePolicy::Unspecified ||
+             routed_phase_policy == RoutedExpertPhasePolicy::Uniform) &&
+            resolveRoutedExpertAssignmentPolicy(routed_decode_assignment_policy) ==
+                RoutedExpertAssignmentPolicy::StaticOwner &&
+            resolveRoutedExpertAssignmentPolicy(routed_prefill_assignment_policy) ==
+                RoutedExpertAssignmentPolicy::StaticOwner;
+        const bool homogeneous_gpu = participants.size() >= 2 &&
+            std::all_of(participants.begin(), participants.end(), [&](const auto &participant)
+            { return participant.isGPU() && participant.device_type == participants.front().device_type; });
+        return routed_tier_count == 1 && scope == ExecutionDomainScope::RANK_LOCAL &&
+               homogeneous_gpu && uniform_owner_rows
+            ? RoutedExpertComputePolicy::GateUpOwnedDownColumns
+            : RoutedExpertComputePolicy::Apportioned;
     }
 
     std::string ExecutionDomainDefinition::toString() const

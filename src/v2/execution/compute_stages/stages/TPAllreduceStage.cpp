@@ -4,7 +4,8 @@
  *
  * Native fork submission retains this stage's precision and telemetry authority;
  * the explicit paired graph join, never an auxiliary-stream host shadow, owns
- * publication. Canonical rank-fold and sideband transactions retain their
+ * publication. Native sums and canonical rank folds share their ordinary
+ * arithmetic implementation even when forked; control sidebands retain their
  * existing ordered execution contracts.
  * @author David Sanftenberg
  * @date February 2026
@@ -670,12 +671,24 @@ namespace llaminar2
         auto *local = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
         if (!local || !input.valid() || input.sourceOwner() != params_.tensor ||
             input.device() != params_.device_id ||
-            params_.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective ||
             !params_.sidebands.empty() || !params_.sideband_workspace_bindings.empty())
-            throw std::invalid_argument("TP allreduce fork requires its exact native tensor without control sidebands");
+            throw std::invalid_argument("TP allreduce fork requires its exact tensor without control sidebands");
         const auto count = params_.count ? params_.count : params_.tensor->numel();
+        if (count == 0 || count > params_.tensor->numel())
+            throw std::invalid_argument("TP allreduce fork exceeds its exact tensor extent");
         recordAllreduceBillOfMaterials(params_, count, debugEnv().skip_allreduce);
         if (debugEnv().skip_allreduce) return true;
+        // The fork changes only scheduling. Decode with more than two ranks
+        // must still gather and fold in the same ascending rank order as the
+        // ordinary stage; a native sum here would break grouped-row equivalence.
+        if (params_.arithmetic_policy == TPAllreduceArithmeticPolicy::CanonicalRankOrder)
+        {
+            if (effectiveTransportPrecision(params_, count) != "fp32")
+                throw std::invalid_argument("Canonical TP allreduce fork requires FP32 transport");
+            return executeCanonicalRankOrder(local, count, input.consumerStream(), {});
+        }
+        if (params_.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective)
+            throw std::invalid_argument("TP allreduce fork has an unknown arithmetic policy");
         return local->allreduceAcquiredInput(input, params_.stage_name, count,
                                              effectiveTransportPrecision(params_, count),
                                              params_.live_rows ? &*params_.live_rows : nullptr);
@@ -796,7 +809,7 @@ namespace llaminar2
         ILocalTPContext *local_tp,
         size_t effective_count,
         void *stage_stream,
-        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands) const
     {
         if (!local_tp || !stage_stream || !params_.tensor ||
             params_.sideband_device_index < 0 || !bound_workspace_)

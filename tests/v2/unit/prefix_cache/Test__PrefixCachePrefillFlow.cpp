@@ -1311,7 +1311,10 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_THAT(mock_ptr->last_chunk_schedule_tokens, ElementsAre(3, 4, 5));
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_start, 2);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_count, 3);
-    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 2);
+    // A retained family selects each chunk's bucket independently. Even when
+    // this tiny fixture has just one width, the request must not pin its tail
+    // to a fixed maximum-width transaction.
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 0);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.min_rebalance_interval_tokens, 2);
     EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.max_rebalance_interval_tokens, 0);
     EXPECT_THAT(mock_ptr->last_chunk_schedule_policy.bucket_sizes, ElementsAre(2));

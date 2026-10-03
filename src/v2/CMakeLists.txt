@@ -137,6 +137,8 @@ option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging
 # =============================================================================
 find_package(MPI REQUIRED COMPONENTS CXX)
 find_package(OpenMP REQUIRED COMPONENTS CXX)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/OpenMPRuntimeBinding.cmake")
+llaminar_openmp_runtime_soname(LLAMINAR_OPENMP_RUNTIME_SONAME)
 
 if(NOT MPIEXEC_EXECUTABLE)
     message(FATAL_ERROR "Llaminar requires OpenMPI, but CMake did not find an MPI launcher")

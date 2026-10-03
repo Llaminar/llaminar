@@ -182,8 +182,10 @@ namespace llaminar2::test::parity
      *         the declared per-domain policies without changing their semantics.
      *
      * Device counts alone do not distinguish whole-expert ownership from movable
-     * gate/up ownership. Dropping this value would certify the old implementation
-     * under a new cell name. Heterogeneous per-domain policies need an authored
+     * gate/up ownership. Dropping this expected physical identity would certify
+     * the old implementation under a new cell name. Projection launches omit a
+     * CLI compute override but retain this identity in their planning evidence;
+     * whole-expert A/B controls retain an explicit override. Heterogeneous per-domain policies need an authored
      * placement rather than an invented common policy.
      */
     inline std::optional<RoutedExpertComputePolicy> modelParityAutomaticRoutedComputePolicy(
@@ -193,7 +195,7 @@ namespace llaminar2::test::parity
         const auto &domains = cell.topology.expert_overlay_plan->domains;
         if (domains.empty()) throw std::invalid_argument("automatic overlay requires routed domains");
         const auto policy = domains.front().routed_compute_policy;
-        if (policy == RoutedExpertComputePolicy::Unspecified ||
+        if (policy == RoutedExpertComputePolicy::Unspecified || policy == RoutedExpertComputePolicy::Automatic ||
             std::any_of(domains.begin(), domains.end(), [policy](const auto &domain) {
                 return domain.routed_compute_policy != policy;
             }))
@@ -226,7 +228,25 @@ namespace llaminar2::test::parity
             args.insert(args.end(), {"--moe-routed-expert-owner-order",
                 cell.expert_overlay->owner_order == RoutedExpertOwnerOrder::Ordinal ? "ordinal" : "random"});
         if (const auto policy = modelParityAutomaticRoutedComputePolicy(cell))
-            args.insert(args.end(), {"--moe-routed-expert-compute", routedExpertComputePolicyToString(*policy)});
+        {
+            if (*policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
+            {
+                // Projection certification must prove the production default,
+                // not force a policy that could hide a broken automatic choice.
+                // The expected physical mode remains in the typed declaration
+                // and HTTP plan evidence; no second topology rule lives here.
+                auto automatic = cell.topology.expert_overlay_plan->domains.front().toExecutionDomainDefinition();
+                automatic.routed_compute_policy = RoutedExpertComputePolicy::Automatic;
+                if (automatic.resolveRoutedComputePolicy(cell.topology.expert_overlay_plan->routed_tiers.size()) != *policy)
+                    throw std::invalid_argument("projection certification requires automatic-default topology eligibility");
+            }
+            else
+            {
+                // Whole-expert controls intentionally override the new GPU
+                // default. Never relabel that A/B workload as projection mode.
+                args.insert(args.end(), {"--moe-routed-expert-compute", routedExpertComputePolicyToString(*policy)});
+            }
+        }
         return args;
     }
 

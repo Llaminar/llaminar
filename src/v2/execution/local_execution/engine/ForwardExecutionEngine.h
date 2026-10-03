@@ -12,7 +12,9 @@
  *
  * The engine delegates model-specific operations (graph building, device context
  * management, logits sync) to an IForwardExecutionHost interface implemented by
- * the orchestrator.
+ * the orchestrator. A long prefill may select different retained physical
+ * buckets without changing request ownership: admission seals each complete
+ * graph declaration, while the captured materializer alone reads KV progress.
  */
 
 #pragma once
@@ -29,6 +31,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1225,12 +1228,23 @@ namespace llaminar2
          * Chunks run in schedule order. Each successful chunk passes through
          * the same chunk-boundary maintenance gate as runPrefillChunk(); the
          * first failed execution or maintenance hook stops the schedule.
+         * @param base_input Sole admitted request-bank and device-state owner.
+         * @param schedule Immutable logical ranges and physical bucket choices.
+         * @param output Receives the terminal chunk's device output frontier.
+         * @param host Model/execution owner used for graph and maintenance hooks.
+         * @param chunk_inputs Optional complete, admission-sealed per-chunk
+         *        graph declarations, including shifted-MTP capture identity.
+         *        Every declaration must retain the same request
+         *        bank and KV counter as base_input. An empty span retains its
+         *        one fixed binding; it cannot silently change physical width.
+         * @return True when all declared chunks and their diagnostics complete.
          */
         bool runPrefillChunkSchedule(
             const ForwardInput &base_input,
             const PrefillChunkRuntimeSchedule &schedule,
             ForwardOutput &output,
-            IForwardExecutionHost &host);
+            IForwardExecutionHost &host,
+            std::span<const ForwardInput> chunk_inputs = {});
 
         // ----- Cache Management -----
 

@@ -166,6 +166,12 @@ TEST(ResolvedRankOrchestration, ImplicitMoELocalTPSealsOneAuthorityWithoutMutati
                     ? RoutedExpertResidencyPolicy::StaticById : RoutedExpertResidencyPolicy::RoutedTierRebalanced);
                 EXPECT_EQ(overlay.domains.size(), 1u);
                 EXPECT_EQ(overlay.routed_tiers.size(), 1u);
+                const auto expected_compute = backend == DeviceType::CPU
+                    ? RoutedExpertComputePolicy::Apportioned
+                    : RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                EXPECT_EQ(overlay.domains.front().routed_compute_policy, expected_compute);
+                EXPECT_EQ(resolved.config().routed_expert_compute_policy, expected_compute);
+                EXPECT_EQ(resolved.rankPlan().runtime.routed_expert_compute_policy, expected_compute);
                 EXPECT_EQ(resolved.rankPlan().local_tp_devices.size(), 2u);
                 EXPECT_TRUE(resolved.overlayExecution()->ownsContinuationGraph());
                 EXPECT_EQ(resolved.config().mtp.terminal_head_policy, backend == DeviceType::CPU
@@ -209,6 +215,8 @@ TEST(ResolvedRankOrchestration, CompactOverlayUsesObservedOwnerAndKeepsFollowerO
                 EXPECT_NE(resolved.config().moe_routed_expert_plan.get(), original.get());
                 EXPECT_EQ(resolved.config().mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
                 EXPECT_EQ(resolved.rankPlan().runtime.mtp.terminal_head_policy, MTPTerminalHeadPolicy::MirroredFullVocabulary);
+                for (const auto &domain : resolved.config().moe_routed_expert_plan->domains)
+                    EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
             }
             for (const auto &domain : original->domains)
             {
@@ -217,6 +225,76 @@ TEST(ResolvedRankOrchestration, CompactOverlayUsesObservedOwnerAndKeepsFollowerO
                 EXPECT_TRUE(domain.world_ranks.empty());
             }
         }
+}
+
+/** @test The real compiler seals automatic projection ownership before admission on either rank. */
+TEST(ResolvedRankOrchestration, AutomaticHomogeneousMoEComputeDefaultIsSealedAndIdempotent)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const int degree : {2, 3, 4, 8})
+            for (const int owner : {0, 1})
+                for (const bool explicit_whole : {false, true})
+                {
+                    const auto spelling = backend == DeviceType::CUDA ? "cuda" : "rocm";
+                    std::vector<DeviceInfo> cards;
+                    std::string declaration = "native=";
+                    for (int index = 0; index < degree; ++index)
+                    {
+                        cards.push_back(card(backend, index, 7 - owner * 3));
+                        if (index) declaration += ",";
+                        declaration += std::string(spelling) + ":" + std::to_string(index);
+                    }
+                    declaration += ";priority=0";
+                    std::vector<std::string> args{"--expert-tier", declaration};
+                    if (explicit_whole)
+                        args.insert(args.end(), {"--moe-routed-expert-compute", "apportioned"});
+                    const auto config = parse(args);
+                    const auto cluster = inventory(2, std::move(cards), owner);
+                    const auto resolved = resolve(config, cluster, owner, true);
+                    const auto expected = explicit_whole ? RoutedExpertComputePolicy::Apportioned
+                        : RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                    EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.front().routed_compute_policy, expected);
+                    EXPECT_EQ(resolved.config().routed_expert_compute_policy, expected);
+                    EXPECT_EQ(resolved.rankPlan().runtime.routed_expert_compute_policy, expected);
+                    EXPECT_EQ(config.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                        explicit_whole ? RoutedExpertComputePolicy::Apportioned : RoutedExpertComputePolicy::Automatic);
+                    const auto repeated = resolve(resolved.config(), cluster, owner, true);
+                    EXPECT_EQ(repeated.rankPlan().toString(), resolved.rankPlan().toString());
+                }
+}
+
+/** @test Tier boundaries and mixed endpoint types retain complete expert ownership. */
+TEST(ResolvedRankOrchestration, AutomaticMixedAndMultiTierComputeRemainsWholeExpert)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto spelling = backend == DeviceType::CUDA ? "cuda" : "rocm";
+        const auto cluster = inventory(1, {card(backend, 0, 7), card(backend, 1, 7),
+            card(backend, 2, 7), card(backend, 3, 7)});
+        const auto config = parse({"--expert-tier",
+            std::string("first=") + spelling + ":0," + spelling + ":1;priority=-4",
+            "--expert-tier", std::string("second=") + spelling + ":2," + spelling + ":3;priority=7"});
+        const auto resolved = resolve(config, cluster, 0, true);
+        for (const auto &domain : resolved.config().moe_routed_expert_plan->domains)
+            EXPECT_EQ(domain.routed_compute_policy, RoutedExpertComputePolicy::Apportioned);
+        EXPECT_EQ(resolved.rankPlan().runtime.routed_expert_compute_policy,
+            RoutedExpertComputePolicy::Apportioned);
+
+        // A row-assignment contract that needs complete residents is resolved
+        // deliberately, rather than entering projection mode and retrying it.
+        const auto least_loaded = parse({"--expert-tier", std::string("owners=") +
+            spelling + ":0," + spelling + ":1;scope=rank-local;priority=0;routed_prefill_assignment=least-loaded-resident"});
+        const auto assigned = resolve(least_loaded, cluster, 0, true);
+        EXPECT_EQ(assigned.config().moe_routed_expert_plan->domains.front().routed_compute_policy,
+            RoutedExpertComputePolicy::Apportioned);
+    }
+    const auto cluster = inventory(1, {card(DeviceType::CUDA, 0, 7), card(DeviceType::ROCm, 0, 7)});
+    const auto mixed = parse({"--expert-tier", "mixed=cuda:0,rocm:0;priority=0"});
+    const auto resolved = resolve(mixed, cluster, 0, true);
+    EXPECT_EQ(resolved.config().moe_routed_expert_plan->domains.front().routed_compute_policy,
+        RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(resolved.rankPlan().runtime.routed_expert_compute_policy,
+        RoutedExpertComputePolicy::Apportioned);
 }
 
 TEST(ResolvedRankOrchestration, NodeTPContinuationPreservesShardAndSparseCPUIdentity)

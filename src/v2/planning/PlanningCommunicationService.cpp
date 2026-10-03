@@ -133,6 +133,7 @@ namespace llaminar2
         switch (routed_compute_policy)
         {
         case RoutedExpertComputePolicy::Unspecified:
+        case RoutedExpertComputePolicy::Automatic:
         case RoutedExpertComputePolicy::Replicated:
         case RoutedExpertComputePolicy::Apportioned:
         case RoutedExpertComputePolicy::TensorSharded:
@@ -231,7 +232,8 @@ namespace llaminar2
         // same link sample, even when both ranks see identical GPU ordinals.
         if (request.allows(OrchestrationStrategy::PipelineParallel) || request.allows(OrchestrationStrategy::ExpertOverlay) ||
             (request.allows(OrchestrationStrategy::TensorParallel) &&
-                routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns))
+                (routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
+                 routed_compute_policy == RoutedExpertComputePolicy::Automatic)))
             for (const auto &rank : inventory.ranks)
             {
                 std::vector<DeviceId> devices;

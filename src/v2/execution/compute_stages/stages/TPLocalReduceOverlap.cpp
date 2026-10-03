@@ -85,6 +85,15 @@ namespace llaminar2
                 }, operation_);
             }
 
+            /** @return The same retained operation for setup-only workspace binding. */
+            IComputeStage &operation()
+            {
+                return std::visit([](auto &op) -> IComputeStage & {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(op)>, Gather>) return *op;
+                    else return op;
+                }, operation_);
+            }
+
             /** @return Exact participant-local execution endpoint. */
             DeviceId device() const
             { return operation().device(); }
@@ -235,7 +244,7 @@ namespace llaminar2
         enum class ReduceEdge { Submit, Join };
 
         /** @brief Native collective fork/join node generated only as a matched pair. */
-        class ReduceEdgeStage final : public IComputeStage
+        class ReduceEdgeStage final : public IComputeStage, public IWorkspaceConsumer
         {
         public:
             /** @brief Bind one immutable role to its graph-retained transaction. */
@@ -290,6 +299,47 @@ namespace llaminar2
             {
                 if (edge_ == ReduceEdge::Join) return transaction_->operation().bufferContract();
                 return StageBufferContract::build().addInput(transaction_->inputId());
+            }
+            /** @return Original tensor geometry, including the canonical fold's exact row bank. */
+            StageBufferRequirements getBufferRequirements() const override
+            { return transaction_->operation().getBufferRequirements(); }
+            /** @return The operation's scratch, visible at both ends of the asynchronous lifetime.
+             * @param m Declared row geometry supplied by the workspace planner.
+             * @param n Declared output width.
+             * @param k Declared reduction width.
+             *
+             * Names merge into one allocation through the existing workspace
+             * authority. Exposing both edges retains scratch through the join;
+             * neither edge owns a separate bank or allocates during submission. */
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+            {
+                const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(&transaction_->operation());
+                return consumer ? consumer->getWorkspaceRequirements(m, n, k) : WorkspaceRequirements{};
+            }
+            /** @brief Bind the original operation once to the device's admitted workspace.
+             * @param workspace Shared setup-owned manager, never allocated by this edge. */
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override
+            {
+                if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(&transaction_->operation()))
+                    consumer->bindWorkspace(workspace);
+            }
+            /** @brief Remove the shared binding before its workspace retires. */
+            void unbindWorkspace() override
+            {
+                if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(&transaction_->operation()))
+                    consumer->unbindWorkspace();
+            }
+            /** @return Whether the original operation has admitted scratch. */
+            bool hasWorkspace() const override
+            {
+                const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(&transaction_->operation());
+                return consumer && consumer->hasWorkspace();
+            }
+            /** @return The single shared binding, not an edge-local workspace. */
+            DeviceWorkspaceManager *getWorkspace() const override
+            {
+                const auto *consumer = dynamic_cast<const IWorkspaceConsumer *>(&transaction_->operation());
+                return consumer ? consumer->getWorkspace() : nullptr;
             }
             /** @return Dump output only after the exact completion wait, never at the fork. */
             StageDumpInfo buildDumpInfoImpl() const override
@@ -457,10 +507,26 @@ namespace llaminar2
             params.stage_name != allreduce_node)
             throw std::invalid_argument("Allreduce overlap requires native arithmetic without sidebands and a bounded tensor");
         if constexpr (std::is_same_v<SumStage, TPAllreduceStage>)
+        {
             if (!params.sidebands.empty() || !params.sideband_workspace_bindings.empty() ||
-                params.arithmetic_policy != TPAllreduceArithmeticPolicy::NativeCollective ||
                 params.count > params.tensor->numel())
-                throw std::invalid_argument("Allreduce overlap requires native bounded arithmetic without sidebands");
+                throw std::invalid_argument("Allreduce overlap requires bounded arithmetic without sidebands: " + allreduce_node);
+            switch (params.arithmetic_policy)
+            {
+            case TPAllreduceArithmeticPolicy::NativeCollective:
+                break;
+            case TPAllreduceArithmeticPolicy::CanonicalRankOrder:
+                // A fork must preserve the original decode arithmetic, never
+                // replace its fixed-rank fold with a native reduction tree.
+                if (params.tensor->native_type() != TensorType::FP32 || params.precision != "fp32" ||
+                    params.sideband_device_index < 0 || params.sideband_device_index >= local->degree() ||
+                    local->devices()[params.sideband_device_index].toLocalDeviceId() != params.device_id)
+                    throw std::invalid_argument("Canonical allreduce overlap requires FP32 and its exact participant: " + allreduce_node);
+                break;
+            default:
+                throw std::invalid_argument("Allreduce overlap has an unknown arithmetic policy: " + allreduce_node);
+            }
+        }
         if (std::none_of(local->devices().begin(), local->devices().end(), [&](const auto &endpoint) {
                 return endpoint.toLocalDeviceId() == params.device_id;
             }))

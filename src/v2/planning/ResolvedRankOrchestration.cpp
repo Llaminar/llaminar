@@ -166,6 +166,14 @@ namespace llaminar2
             requireValid(builder.validateConfig(config, geometry, inventory), "Implicit ExpertOverlay validation failed");
             rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
         }
+        else if (config.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic)
+        {
+            // Without an overlay there is no multi-participant expert domain.
+            // Seal single-device/dense execution before returning a runnable
+            // plan; Automatic is admission intent, never runtime state.
+            config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+            rank_plan.runtime.routed_expert_compute_policy = config.routed_expert_compute_policy;
+        }
         config.mtp.depth_defaults_profile = rank_plan.runtime.mtp.depth_defaults_profile;
         config.mtp.terminal_head_policy = rank_plan.runtime.mtp.terminal_head_policy;
         std::optional<MoEExpertOverlayExecutionPlan> overlay_execution;

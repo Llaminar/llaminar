@@ -3628,15 +3628,13 @@ namespace llaminar2
                     "but runner does not support prefill chunk scheduling)");
             }
 
-            PrefillChunkSchedulerPolicy policy;
-            policy.bucket_sizes = buckets;
-            policy.fixed_chunk_real_tokens = long_bucketed_prefill
-                                                 ? buckets.back()
-                                                 : 0;
-            policy.min_rebalance_interval_tokens = buckets.back();
-            policy.max_rebalance_interval_tokens = 0;
-            policy.real_token_start = runner_->get_position();
-            policy.real_token_count = token_count;
+            // Request length is not a fixed physical transaction contract.
+            // Every bucket was retained during preparation, so a short
+            // nonterminal remainder must use its smaller existing graph too.
+            // For example, 448 live rows under a 384-row cap require 384+64,
+            // not 384+384. This changes neither row authority nor KV extent.
+            const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+                buckets, runner_->get_position(), token_count);
 
             PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
             if (!chunk_schedule)

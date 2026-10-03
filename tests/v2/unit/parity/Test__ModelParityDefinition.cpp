@@ -2737,7 +2737,8 @@ namespace llaminar2::test::parity
                     EXPECT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(runtime)));
                     EXPECT_FALSE(runtime.moe_routed_expert_plan);
                     EXPECT_TRUE(runtime.tp_devices.empty());
-                    EXPECT_EQ(runtime.routed_expert_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                    EXPECT_EQ(runtime.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+                    EXPECT_EQ(std::count(args.begin(), args.end(), "--moe-routed-expert-compute"), 0);
                     EXPECT_TRUE(runtime.mtp.enabled);
                     EXPECT_EQ(runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
                     EXPECT_EQ(runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
@@ -2757,6 +2758,29 @@ namespace llaminar2::test::parity
             unresolved->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Unspecified;
             broken.topology.expert_overlay_plan = unresolved;
             EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+            unresolved->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Automatic;
+            EXPECT_THROW((void)modelParityAutomaticRoutedComputePolicy(broken), std::invalid_argument);
+
+            auto ineligible = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            ineligible->domains.front().scope = ExecutionDomainScope::NODE_LOCAL;
+            broken.topology.expert_overlay_plan = ineligible;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
+
+            // Tier count is not domain count. Neither a missing tier nor two
+            // tiers referencing one domain may certify the single-tier default.
+            auto missing_tiers = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            missing_tiers->routed_tiers.clear();
+            broken.topology.expert_overlay_plan = missing_tiers;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
+
+            auto multiple_tiers = std::make_shared<MoERoutedExpertPlacementPlan>(*cells.front().topology.expert_overlay_plan);
+            ASSERT_EQ(multiple_tiers->routed_tiers.size(), 1u);
+            auto extra_tier = multiple_tiers->routed_tiers.front();
+            extra_tier.name += "_secondary";
+            ++extra_tier.priority;
+            multiple_tiers->routed_tiers.push_back(std::move(extra_tier));
+            broken.topology.expert_overlay_plan = multiple_tiers;
+            EXPECT_THROW((void)modelParityAutomaticPlacementArguments(broken), std::invalid_argument);
 
             auto mixed = std::make_shared<MoERoutedExpertPlacementPlan>(*topology.expert_overlay_plan);
             auto secondary = mixed->domains.front();

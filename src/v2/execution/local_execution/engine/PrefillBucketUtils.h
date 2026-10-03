@@ -53,6 +53,20 @@ namespace llaminar2
      */
     struct PrefillChunkSchedulerPolicy
     {
+        /**
+         * @brief Select economical shapes from a fully retained bucket family.
+         * @param buckets Admitted graph inventory, not a new capture request.
+         * @param real_start Absolute beginning of the live token range.
+         * @param real_count Number of live tokens in that range.
+         * @return Largest-bucket chunking with the smallest admitted remainder.
+         *
+         * A long request needs multiple chunks, not one fixed physical shape.
+         * Explicit single-shape transaction callers may still construct a
+         * fixed interval separately; they must not discard this family's tails.
+         */
+        static PrefillChunkSchedulerPolicy forRetainedBucketFamily(
+            const std::vector<int> &buckets, int real_start, int real_count);
+
         std::vector<int> bucket_sizes;        ///< Candidate graph bucket lengths.
         int fixed_chunk_real_tokens = 0;      ///< Real-token interval per chunk; 0 uses the largest bucket.
         int min_rebalance_interval_tokens = 0; ///< Real tokens before rebalance may run; 0 disables optional flag.

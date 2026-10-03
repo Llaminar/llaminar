@@ -47,7 +47,7 @@ namespace llaminar2
         bool has_cross_rank_tensor_parallel = false;
         bool has_pipeline_parallel = false;
         RoutedExpertComputePolicy routed_compute_policy =
-            RoutedExpertComputePolicy::Apportioned;
+            RoutedExpertComputePolicy::Automatic;
         RoutedExpertOwnerOrder owner_order =
             RoutedExpertOwnerOrder::Ordinal;
         MoERebalanceRuntimeMode residency_maintenance =
@@ -75,10 +75,13 @@ namespace llaminar2
      *
      * An enabled explicit plan is already authoritative, whether it declares
      * `SingleDomain` or `TieredOverlay`. Without one, a routed MoE model using
-     * local whole-expert TP receives a one-tier plan whose sole tier has integer
+     * local multi-device MoE receives a one-tier plan whose sole tier has integer
      * priority zero and complete-coverage responsibility. Dynamic/observe modes
      * retain a histogram-capable residency policy, while off remains a static
      * epoch authority that can prove no durable movement.
+     * Automatic compute uses movable gate/up and fixed down columns only for
+     * homogeneous native GPU LocalTP; CPU/heterogeneous participants retain
+     * whole experts. Explicit physical choices are never reinterpreted.
      *
      * @param request Fully resolved topology and user policy.
      * @return Existing, synthesized, or inapplicable authority plan.

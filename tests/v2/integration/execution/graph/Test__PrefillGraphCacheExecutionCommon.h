@@ -32,6 +32,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
+#include "execution/local_execution/engine/ForwardGraphEntryOrdering.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
@@ -729,6 +730,13 @@ namespace
             ++committed_forward_output_calls;
             last_committed_logits = output.logits;
             last_committed_execution = output.execution;
+            if (previous_forward_event_)
+            {
+                if (!getBackendFor(device_)->recordEvent(previous_forward_event_.get(),
+                        device_.toKernelDeviceIndex(), output.execution.stream))
+                    throw std::runtime_error("Fixture could not publish its preceding forward completion");
+                previous_forward_published_ = true;
+            }
         }
 
         bool prepareLiveStateForForwardGraphExecution(
@@ -736,6 +744,15 @@ namespace
             void *execution_stream,
             DeviceId execution_device) override
         {
+            if (previous_forward_published_ && forwardGraphEntryDependency(input, device_,
+                    ForwardParticipantOutputRole::TerminalOwner) ==
+                    ForwardGraphEntryDependency::PreviousForwardCompletion)
+            {
+                if (!getBackendFor(device_)->streamWaitEvent(execution_stream,
+                        previous_forward_event_.get(), device_.toKernelDeviceIndex()))
+                    return false;
+                ++previous_forward_waits;
+            }
             if (!resident_length_pending_)
                 return true;
             if (!resident_length_backend_ ||
@@ -899,6 +916,17 @@ namespace
 
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
+
+        /** @brief Reserve the real output-publication event before any capture. */
+        void enablePreviousForwardOrderingForTesting()
+        {
+            auto *backend = getBackendFor(device_);
+            void *const event = backend->createEvent(device_.toKernelDeviceIndex());
+            if (!event) throw std::runtime_error("Fixture previous-forward event admission failed");
+            previous_forward_event_ = std::shared_ptr<void>(event,
+                [backend, device = device_](void *value)
+                { backend->destroyEvent(value, device.toKernelDeviceIndex()); });
+        }
 
         /**
          * @brief Materialize the persistent KV probe before graph construction.
@@ -1116,6 +1144,7 @@ namespace
         bool deferred_decode_ = false; ///< Test-only selection of the production deferred policy.
         void *deferred_decode_stream = nullptr; ///< Exact private sampler handoff, not public tensor readiness.
         int committed_forward_output_calls = 0;
+        int previous_forward_waits = 0; ///< Actual native entry waits, not a selected-policy counter.
         TensorBase *last_committed_logits = nullptr;
         ForwardExecutionProvenance last_committed_execution{};
         int last_workspace_seq_len = -1;
@@ -1131,6 +1160,8 @@ namespace
         PrefillChunkMaintenanceDecision last_maintenance_decision{};
 
     private:
+        std::shared_ptr<void> previous_forward_event_; ///< Persistent exact producer publication.
+        bool previous_forward_published_ = false; ///< Fixture event's publication lifecycle.
         /**
          * @brief Create one stable arena address set shared by every cached bucket.
          *
@@ -2564,6 +2595,153 @@ namespace
         EXPECT_EQ(snapshot->topology_signature, 0x4400u);
         EXPECT_EQ(snapshot->capture_phase, "replay");
         EXPECT_EQ(snapshot->recapture_reason, "none");
+    }
+
+    /** @test A long live range reuses its small retained tail, never a padded full chunk. */
+    TEST_F(PrefillGraphCacheExecutionTest, RetainedBucketFamilyReplaysSmallRemainder)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+        constexpr int request_rows = 192;
+        host_->enablePreviousForwardOrderingForTesting();
+        host_->setUseKVAppendProbe(true);
+        ASSERT_TRUE(host_->setKVCacheCapacityForTesting(request_rows));
+        ASSERT_TRUE(host_->initializeKVCacheProbeForTesting());
+        auto *backend = getBackendFor(device_);
+        ASSERT_NE(backend, nullptr);
+        void *const admission_stream = device_.is_cuda()
+            ? GPUDeviceContextPool::instance().getNvidiaContext(device_.toKernelDeviceIndex()).defaultStream()
+            : GPUDeviceContextPool::instance().getAMDContext(device_.toKernelDeviceIndex()).defaultStream();
+        ASSERT_NE(admission_stream, nullptr);
+        std::vector<int32_t> tokens(request_rows), positions(request_rows);
+        for (int row = 0; row < request_rows; ++row)
+        {
+            tokens[row] = 9000 + row;
+            positions[row] = row;
+        }
+        // These are the production semantic arena slots. Both retained widths
+        // must consume this one request bank and advance this one KV counter.
+        auto *request_tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_TOKEN_IDS, std::vector<size_t>{request_rows}, tokens);
+        auto *request_positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_POSITION_IDS, std::vector<size_t>{request_rows}, positions);
+        auto *request_count = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::REQUEST_BATCH_GEOMETRY, std::vector<size_t>{1}, std::vector<int32_t>{request_rows});
+        auto *chunk_tokens = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::PREFILL_CHUNK_TOKEN_IDS, std::vector<size_t>{128});
+        auto *chunk_positions = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::PREFILL_CHUNK_POSITION_IDS, std::vector<size_t>{128});
+        auto *chunk_geometry = graph_arena_.createPersistentTensor<INT32Tensor>(
+            BufferId::PREFILL_CHUNK_GEOMETRY, std::vector<size_t>{2});
+        for (auto *tensor : {request_tokens, request_positions, request_count})
+            ASSERT_TRUE(tensor->ensureOnDevice(device_, admission_stream));
+        for (auto *tensor : {chunk_tokens, chunk_positions, chunk_geometry})
+            ASSERT_TRUE(tensor->allocateOnDevice(device_, admission_stream));
+        ASSERT_TRUE(backend->synchronizeStream(admission_stream, device_.toKernelDeviceIndex()));
+        const auto binding_for = [&](int bucket)
+        {
+            return DevicePrefillChunkGraphBinding{
+                .backend = backend,
+                .request_token_ids_device = static_cast<const int32_t *>(request_tokens->gpu_data_ptr()),
+                .request_position_ids_device = static_cast<const int32_t *>(request_positions->gpu_data_ptr()),
+                .request_total_rows_device = static_cast<const int32_t *>(request_count->gpu_data_ptr()),
+                .cached_tokens_device = host_->kvSequenceCachedTokensDeviceForTesting(),
+                .chunk_token_ids_device = static_cast<int32_t *>(chunk_tokens->gpu_data_ptr()),
+                .chunk_position_ids_device = static_cast<int32_t *>(chunk_positions->gpu_data_ptr()),
+                .chunk_real_rows_device = static_cast<int32_t *>(chunk_geometry->gpu_data_ptr()),
+                .chunk_row_stride_device = static_cast<int32_t *>(chunk_geometry->gpu_data_ptr()) + 1,
+                .request_row_capacity = request_rows,
+                .bucket_seq_len = bucket,
+                .pad_token_id = kPadTokenId,
+                .capture_identity = UINT64_C(0x19200000) + static_cast<uint64_t>(bucket),
+            };
+        };
+        const std::array bindings{binding_for(128), binding_for(64)};
+        ForwardInput input;
+        input.token_ids_device = chunk_tokens->gpu_data_ptr();
+        input.position_ids_device = chunk_positions->gpu_data_ptr();
+        input.position_policy = ForwardPositionPolicy::ExplicitRows;
+        input.sequence_lengths_device = bindings.front().chunk_real_rows_device;
+        input.device_state_publication_stream = admission_stream;
+        input.device_prefill_chunk = bindings.front();
+        input.batch_size = 1;
+        input.seq_len = request_rows;
+        input.real_seq_len = request_rows;
+        input.device = device_;
+        const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            debugEnv().execution.prefill_graph_bucket_sizes, 0, input.real_seq_len);
+        const auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input, policy, kPadTokenId, /*allow_padded_execution=*/false);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), 2u);
+        EXPECT_EQ(schedule.chunks[0].chunk.bucket_seq_len, 128);
+        EXPECT_EQ(schedule.chunks[1].chunk.bucket_seq_len, 64);
+
+        ForwardOutput output;
+        std::array<ForwardInput, 2> chunk_inputs{input, input};
+        for (size_t index = 0; index < bindings.size(); ++index)
+            chunk_inputs[index].device_prefill_chunk = bindings[index];
+        // Missing/mismatched identities must reject the whole admission, not
+        // execute the first chunk and discover the bad tail after KV mutation.
+        EXPECT_FALSE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_));
+        EXPECT_FALSE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_,
+                                                     std::span(chunk_inputs).first(1)));
+        auto foreign_inputs = chunk_inputs;
+        foreign_inputs.back().device_prefill_chunk->request_token_ids_device = bindings.front().request_position_ids_device;
+        EXPECT_FALSE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_, foreign_inputs));
+        EXPECT_EQ(host_->build_calls, 0);
+        EXPECT_EQ(host_->committed_forward_output_calls, 0);
+
+        // Reset data, not graph topology. Repeated requests must retain both
+        // captured shapes while the smaller materializer resumes at KV row 128.
+        for (int round = 0; round < 3; ++round)
+        {
+            ASSERT_TRUE(host_->resetKVCacheProbeForTesting(admission_stream));
+            ASSERT_TRUE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_, chunk_inputs));
+            void *const completion = backend->createEvent(device_.toKernelDeviceIndex());
+            ASSERT_NE(completion, nullptr);
+            ASSERT_TRUE(backend->recordEvent(completion, device_.toKernelDeviceIndex(), output.execution.stream));
+            ASSERT_TRUE(backend->streamWaitEvent(admission_stream, completion, device_.toKernelDeviceIndex()));
+            EXPECT_EQ(host_->kvDeviceCachedTokensForTesting(admission_stream), request_rows);
+            std::array<int32_t, 2> geometry{};
+            int32_t first_tail_token = 0;
+            ASSERT_TRUE(backend->deviceToHostOnStream(geometry.data(), chunk_geometry->gpu_data_ptr(),
+                sizeof(geometry), device_.toKernelDeviceIndex(), admission_stream));
+            ASSERT_TRUE(backend->deviceToHostOnStream(&first_tail_token, chunk_tokens->gpu_data_ptr(),
+                sizeof(first_tail_token), device_.toKernelDeviceIndex(), admission_stream));
+            ASSERT_TRUE(backend->synchronizeStream(admission_stream, device_.toKernelDeviceIndex()));
+            backend->destroyEvent(completion, device_.toKernelDeviceIndex());
+            EXPECT_EQ(geometry[0], 64);
+            EXPECT_EQ(geometry[1], 64);
+            EXPECT_EQ(first_tail_token, tokens[128]);
+        }
+        EXPECT_EQ(host_->build_calls, 2);
+        EXPECT_EQ(host_->committed_forward_output_calls, 6);
+        EXPECT_GE(host_->previous_forward_waits, 5);
+        for (const int bucket : {64, 128})
+        {
+            auto signature = bucketedPrefillSignature(device_, bucket, host_->placement_epoch,
+                                                     input.sequence_lengths_device);
+            signature.device_token_ids = input.token_ids_device;
+            signature.device_position_ids = input.position_ids_device;
+            signature.position_policy = ForwardPositionPolicy::ExplicitRows;
+            signature.device_prefill_chunk_capture_identity = binding_for(bucket).capture_identity;
+            const auto key = prefillGraphKey(device_, bucket, host_->domain_id,
+                host_->participant_id, host_->placement_epoch, host_->topology_signature);
+            const auto snapshot = engine_->prefillGraphCacheSnapshot(signature, key);
+            ASSERT_TRUE(snapshot.has_value());
+            EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+            EXPECT_EQ(snapshot->capture_count, 1u);
+            EXPECT_GE(snapshot->replay_count, 1u);
+        }
     }
 
     /**

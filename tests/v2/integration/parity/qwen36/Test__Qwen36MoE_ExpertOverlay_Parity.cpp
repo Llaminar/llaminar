@@ -57,11 +57,13 @@ namespace
             // A separately selectable physical mode, not a new fixture or a
             // reduced matrix. Reuse the whole-expert model/reference definition
             // and expand all placement, movement, MTP and prefix checks.
-            for (std::size_t i = 1; i < definitions.size(); ++i)
-            {
-                all_definitions.push_back(qwen36MoEProjectionParityDefinition(
-                    definitions[i].topology, definitions[i].model.reference_directory));
-            }
+            // Fine-tunes inherit these new topology contracts too. Otherwise
+            // only the parent model would certify the production GPU default.
+            // Derive after model identity is sealed, retaining each oracle pack.
+            auto projection_models = qwen36MoEAutomaticProjectionVariants(all_definitions);
+            all_definitions.insert(all_definitions.end(),
+                std::make_move_iterator(projection_models.begin()),
+                std::make_move_iterator(projection_models.end()));
             // Keep the observed HTTP wrong-answer case in the same typed
             // expander as every other real-weight diagnostic.  Its standard
             // Static/Ordinal MTP-off cell gives checkpoint CSV evidence for
@@ -73,6 +75,7 @@ namespace
             // Tag the reported Q8 deployment itself, not the Q4 fine-tune's
             // superficially similar overlay or another handwritten HTTP case.
             all_definitions.push_back(ornith15MoEQ8Rocm4CertificationDefinition());
+            all_definitions.push_back(ornith15MoEQ8Rocm4ProjectionCertificationDefinition());
             std::vector<ModelParityCase> expanded;
             for (const auto &definition : all_definitions)
             {

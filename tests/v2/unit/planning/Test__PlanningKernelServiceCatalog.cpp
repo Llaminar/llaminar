@@ -1069,6 +1069,11 @@ TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
         const auto projection = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::GateUpOwnedDownColumns);
         ASSERT_EQ(projection.hostDevice().size(), 7u);
+        const auto automatic = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
+            RoutedExpertComputePolicy::Automatic);
+        ASSERT_EQ(automatic.hostDevice().size(), projection.hostDevice().size());
+        for (size_t index = 0; index < projection.hostDevice().size(); ++index)
+            EXPECT_EQ(automatic.hostDevice()[index], projection.hostDevice()[index]);
         std::set<std::pair<int, int>> scopes;
         for (const auto &sample : projection.hostDevice())
         {

@@ -286,6 +286,11 @@ namespace llaminar2::test
         EXPECT_EQ(missing_compute.moe_routed_expert_plan->domains.front().scope,
                   ExecutionDomainScope::SINGLE);
         EXPECT_EQ(missing_compute.moe_routed_expert_plan->domains.front().routed_compute_policy,
+                  RoutedExpertComputePolicy::Automatic);
+        // Omission inherits request intent; only topology binding publishes a
+        // physical policy. A single GPU still resolves to whole experts.
+        EXPECT_EQ(missing_compute.moe_routed_expert_plan->domains.front()
+                      .toExecutionDomainDefinition().resolveRoutedComputePolicy(1),
                   RoutedExpertComputePolicy::Apportioned);
 
         for (const char *domain : {

@@ -70,9 +70,17 @@ namespace llaminar2
          * retains a fixed full-K output-column slice of every down projection.
          * Native intermediate and output-column allgathers preserve the serial
          * arithmetic. This is a distinct physical mode, never a reinterpretation
-         * or automatic replacement of Apportioned whole-expert ownership.
+         * or automatic replacement of explicit Apportioned whole-expert ownership.
          */
         GateUpOwnedDownColumns,
+
+        /**
+         * Request intent only. Inventory binding selects projection ownership
+         * for one rank-local homogeneous multi-GPU tier, or whole-expert
+         * ownership for other topologies. Never pass this value to allocation
+         * or graph lowering: those consumers require a concrete physical mode.
+         */
+        Automatic,
     };
 
     /**
@@ -434,6 +442,8 @@ namespace llaminar2
             return "tensor-sharded";
         case RoutedExpertComputePolicy::GateUpOwnedDownColumns:
             return "gate-up-owned-down-columns";
+        case RoutedExpertComputePolicy::Automatic:
+            return "auto";
         }
         return "unknown";
     }
@@ -627,13 +637,15 @@ namespace llaminar2
      * @brief Parse a canonical routed-expert compute policy.
      * @param value CLI or YAML value naming the physical expert distribution.
      * @return The typed policy, or `std::nullopt` when the value is not one of
-     *         `replicated`, `apportioned`, `tensor-sharded`, or
+     *         `auto`, `replicated`, `apportioned`, `tensor-sharded`, or
      *         `gate-up-owned-down-columns`.
      */
     inline std::optional<RoutedExpertComputePolicy> parseRoutedExpertComputePolicy(
         const std::string &value)
     {
         const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "auto")
+            return RoutedExpertComputePolicy::Automatic;
         if (normalized == "replicated")
             return RoutedExpertComputePolicy::Replicated;
         if (normalized == "apportioned")

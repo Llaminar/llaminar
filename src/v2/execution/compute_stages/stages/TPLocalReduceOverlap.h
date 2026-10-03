@@ -66,10 +66,12 @@ namespace llaminar2
      * @param graph Participant-local graph before native preparation.
      * @param allreduce_node Existing TPAllreduceStage with one producer dependency.
      * @param independent_compute Existing non-collective stage touching no partial bytes.
-     * @throws std::invalid_argument For aliases, cycles, sidebands or non-native arithmetic.
+     * @throws std::invalid_argument For aliases, cycles, sidebands or invalid arithmetic bindings.
      *
      * The completion keeps the original identity and inout contract. Transport
      * precision and scratch remain owned by TPAllreduceStage/LocalTPContext.
+     * Canonical rank-order sums retain their native allgather plus device fold;
+     * their scratch is declared at both event edges and admitted before capture.
      * Callers must declare subsequent collective dependencies on this completion,
      * just as they would for any other graph-visible collective operation.
      */

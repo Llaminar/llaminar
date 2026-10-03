@@ -43,10 +43,17 @@ MoEProjectionArenaGeometry::MoEProjectionArenaGeometry(
         {BufferId::MOE_PROJECTION_GATHERED_COLUMNS, "moe_projection_gathered_columns", columns}}}
 {}
 
+bool MoEProjectionArenaGeometry::hasIntegralOutputPartition(int columns, int participants)
+{
+    if (columns <= 0 || participants < 2)
+        throw std::invalid_argument("MoE projection output partition requires positive columns and a native multi-device degree");
+    return columns % participants == 0;
+}
+
 MoEProjectionArenaGeometry MoEProjectionArenaGeometry::resolve(
     const ModelMemoryProfile &profile, int participants)
 {
-    if (participants < 2 || profile.d_model <= 0 || profile.d_model % participants ||
+    if (!hasIntegralOutputPartition(profile.d_model, participants) ||
         profile.n_layers <= 0 || profile.expert_count <= 0 ||
         profile.expert_used_count <= 0 || profile.expert_used_count > profile.expert_count)
         throw std::invalid_argument("MoE projection arena requires complete, divisible native-domain geometry");

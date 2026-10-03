@@ -11,7 +11,8 @@
  * ROCm covers both one device and the two-device overlay, alongside CPU NodeTP.
  * The independent Q8 accuracy workload retains the production four-ROCm drift
  * reproducer and its diagnostic CPU control. The four-ROCm overlay additionally
- * declares one full HTTP/benchmark selector; CPU diagnostics stay untagged.
+ * declares matched whole-expert and automatic projection HTTP/benchmark
+ * selectors; CPU diagnostics stay untagged.
  */
 #pragma once
 
@@ -20,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace llaminar2::test::parity::qwen36
@@ -162,6 +164,22 @@ What is 2+2?<|im_end|>
             .owner_order = RoutedExpertOwnerOrder::Ordinal,
             .movement = ModelParityExpertMovement::Dynamic,
         }};
+        return definition;
+    }
+
+    /**
+     * @brief Certify the four-ROCm automatic projection default beside its control.
+     * @return The same model, HF oracle, matrix and HTTP profile with a distinct
+     *         physical projection topology and artifact identity.
+     *
+     * Derive the variant rather than copying weights, prompts or feature axes.
+     * Its public exporters omit a compute override and authenticate the resolved
+     * projection policy, so routine E2E exercises the degree-four rank-fold fork.
+     */
+    inline ModelParityDefinition ornith15MoEQ8Rocm4ProjectionCertificationDefinition()
+    {
+        auto definition = ornith15MoEQ8Rocm4CertificationDefinition();
+        definition.topology = qwen36MoEProjectionTopology(std::move(definition.topology));
         return definition;
     }
 

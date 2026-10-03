@@ -11,6 +11,7 @@
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "config/GDNHeadAssignment.h"
 #include "config/TensorParallelConfig.h"
+#include "execution/moe/MoEProjectionArenaGeometry.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/RankHardwareOwnership.h"
 #include <algorithm>
@@ -420,10 +421,9 @@ namespace llaminar2
             {
                 const auto name = "domain_" + std::to_string(index);
                 auto domain = domainFor(pools[index], membership, name);
-                // Automatic placement chooses endpoints, not a different
-                // arithmetic/ownership contract. Seal the public compute
-                // constraint before normalization turns an unspecified domain
-                // into the ordinary apportioned default.
+                // Preserve public compute intent, including Automatic. Physical
+                // ownership is sealed only after inventory binding knows the
+                // exact scope/tier count; explicit modes remain immutable.
                 domain.routed_compute_policy = request.routed_expert_compute_policy;
                 overlay->domains.push_back(RoutedExpertDomain::fromExecutionDomainDefinition(domain));
                 overlay->routed_tiers.push_back({.name = "tier_" + std::to_string(index),
@@ -476,6 +476,21 @@ namespace llaminar2
                                         const std::vector<Pool> &domains,
                                         ExecutionRankMembership membership) {
             auto default_config = overlayConfig(request, domains, membership);
+            const auto &placement = *default_config.moe_routed_expert_plan;
+            for (const auto &domain : placement.domains)
+            {
+                // Resolve the same topology rule that installation will seal,
+                // then ask the arena geometry authority about source columns.
+                // Never publish an impossible equal-column proposal and catch
+                // its compiler error as though it were a capacity rejection.
+                const auto declaration = domain.toExecutionDomainDefinition();
+                if (declaration.resolveRoutedComputePolicy(placement.routed_tiers.size()) ==
+                        RoutedExpertComputePolicy::GateUpOwnedDownColumns &&
+                    !MoEProjectionArenaGeometry::hasIntegralOutputPartition(
+                        model.memoryProfile().d_model,
+                        static_cast<int>(declaration.participants.size())))
+                    return;
+            }
             const auto default_policy = default_config.moe_routed_expert_plan
                 ->continuation_domain_spec.effectiveDensePolicy();
             publish({strategy, membership, std::move(default_config)});

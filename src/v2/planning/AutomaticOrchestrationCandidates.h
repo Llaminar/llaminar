@@ -52,7 +52,10 @@ namespace llaminar2
      *
      * Hard filters apply before expansion. Hints affect later cost ranking,
      * never construction. No expert quota, hardware speed or byte reserve is
-     * invented here. User-selectable execution support remains the compiler's
+     * invented here. Immutable GDN ownership and native projection partition
+     * constraints exclude nonrepresentable topology proposals through their
+     * canonical geometry authorities, without substituting a compute mode.
+     * User-selectable execution support remains the compiler's
      * responsibility; rejection must be reported by its consumer.
      */
     void visitAutomaticOrchestrationCandidates(

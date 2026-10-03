@@ -420,7 +420,7 @@ namespace llaminar2
     {
         // This overload has no source directory and therefore cannot prove the
         // fixed down-slice geometry. Never prepare whole tensors for a plan that
-        // explicitly selected the projection-partitioned A/B mode.
+        // resolved to projection ownership, whether by auto or an override.
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
             [](const auto &domain) {
                 return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
@@ -454,7 +454,7 @@ namespace llaminar2
         if (domain.participants.empty() ||
             domain.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
             domain.routed_phase_policy != RoutedExpertPhasePolicy::Uniform)
-            throw std::invalid_argument("Projection preparation requires explicit gate-up-owned-down-columns intent and uniform phases");
+            throw std::invalid_argument("Projection preparation requires resolved gate-up-owned-down-columns ownership and uniform phases");
         const auto type = domain.participants.front().address.device_type;
         for (const auto &participant : domain.participants)
         {

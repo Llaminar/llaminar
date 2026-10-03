@@ -82,9 +82,10 @@ namespace llaminar2
                     "ExpertOverlay exact whole-expert capacity does not yet "
                     "admit tensor-sharded routed domain '" + domain.name + "'");
             case RoutedExpertComputePolicy::Unspecified:
+            case RoutedExpertComputePolicy::Automatic:
                 throw std::invalid_argument(
                     "ExpertOverlay capacity domain '" + domain.name +
-                    "' has an unspecified routed compute policy");
+                    "' has an unresolved routed compute policy");
             }
             throw std::logic_error(
                 "Unknown routed-expert compute policy during capacity admission");

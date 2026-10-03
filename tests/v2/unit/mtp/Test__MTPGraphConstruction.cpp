@@ -1535,6 +1535,11 @@ TEST(Test__MTPGraphConstruction, MoEPolicySelectedArenaSurvivesSidecarHandoff)
             ? RoutedExpertComputePolicy::GateUpOwnedDownColumns : RoutedExpertComputePolicy::Apportioned;
         EXPECT_THROW(output.moe->require(other_policy, 1), std::invalid_argument);
         EXPECT_THROW(MoEActivationBindings::bind(other_policy, 1, lookup), std::invalid_argument);
+        // Request intent must be resolved before arena/graph materialization.
+        // Neither Automatic nor an omitted declaration owns physical storage.
+        for (const auto unresolved : {RoutedExpertComputePolicy::Automatic,
+                                     RoutedExpertComputePolicy::Unspecified})
+            EXPECT_THROW(MoEActivationBindings::bind(unresolved, 1, lookup), std::invalid_argument);
 
         auto weights = fixture.mtpWeights();
         weights.fa_block.moe_gate = fixture.moe_gate.get();
@@ -7808,8 +7813,10 @@ TEST(Test__MTPGraphConstruction,
     const std::string source(
         (std::istreambuf_iterator<char>(input)),
         std::istreambuf_iterator<char>());
+    // Bind the source guard to the operation, not to a diagnostic that used
+    // to reject all retained bucket families with more than one width.
     const size_t chunked_prefill = source.find(
-        "Device-resident prefill requires one capacity-complete physical graph bucket");
+        "bool DeviceGraphOrchestrator::forwardPrefillChunkSchedule(");
     const size_t publication = source.find(
         "state_.mtp_terminal_hidden_publication.publishMainForward()",
         chunked_prefill);

@@ -41,6 +41,20 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Check the native equal-column partition before proposing a topology.
+         * @param columns Source model's positive output width.
+         * @param participants Proposed native multi-device degree, at least two.
+         * @return Whether every output column has one equal-width participant owner.
+         * @throws std::invalid_argument For missing source width or invalid degree.
+         *
+         * Automatic search and physical admission share this shape invariant.
+         * An optional nonintegral topology is not an executable proposal; an
+         * explicitly applied incompatible plan still fails admission. This
+         * neither changes its compute policy nor invents padded columns.
+         */
+        [[nodiscard]] static bool hasIntegralOutputPartition(int columns, int participants);
+
+        /**
          * @brief Resolve the exact shared arena envelope from source metadata.
          * @param profile Complete source tensor directory, including MTP layers.
          * @param participants Homogeneous native collective degree.

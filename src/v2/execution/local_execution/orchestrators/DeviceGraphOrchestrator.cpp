@@ -32,6 +32,7 @@
 #include "../graph/DeviceGraphCaptureController.h"
 #include "../graph/DeviceExecutionTimeline.h"
 #include "../engine/PrefillBucketUtils.h"
+#include "../engine/ForwardGraphEntryOrdering.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -19941,21 +19942,25 @@ namespace llaminar2
 
         const int captured_bucket_seq_len =
             planned_chunks.chunks.front().bucket_seq_len;
-        const bool one_physical_bucket = std::all_of(
-            planned_chunks.chunks.begin(),
-            planned_chunks.chunks.end(),
-            [captured_bucket_seq_len](const PrefillChunkPlan &chunk)
-            {
-                return chunk.bucket_seq_len == captured_bucket_seq_len;
-            });
-        if (!one_physical_bucket || captured_bucket_seq_len <= 0 ||
-            captured_bucket_seq_len > prefill_chunk_row_capacity_)
+        std::uint64_t physical_rows = 0;
+        std::vector<DevicePrefillChunkGraphBinding> chunk_bindings;
+        chunk_bindings.reserve(planned_chunks.chunks.size());
+        for (const auto &chunk : planned_chunks.chunks)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Device-resident prefill requires one capacity-complete physical graph bucket"
-                      << " bucket=" << captured_bucket_seq_len
-                      << " capacity=" << prefill_chunk_row_capacity_
-                      << " chunks=" << planned_chunks.chunks.size());
-            return false;
+            // Setup and admission use this same binding authority. A smaller
+            // retained tail changes only immutable graph width/identity, never
+            // the token bank, producer stream or canonical device KV cursor.
+            const auto binding = makeDevicePrefillChunkGraphBinding(
+                chunk.bucket_seq_len, pad_token_id);
+            if (!binding)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Device-resident prefill bucket exceeds its admitted family capacity"
+                          << " bucket=" << chunk.bucket_seq_len
+                          << " capacity=" << prefill_chunk_row_capacity_);
+                return false;
+            }
+            chunk_bindings.push_back(*binding);
+            physical_rows += static_cast<std::uint64_t>(binding->bucket_seq_len);
         }
 
         std::vector<int> request_position_ids(static_cast<size_t>(seq_len));
@@ -20029,9 +20034,7 @@ namespace llaminar2
                 "graph lacks an explicit publication stream");
             return false;
         }
-        input.device_prefill_chunk = makeDevicePrefillChunkGraphBinding(
-            captured_bucket_seq_len,
-            pad_token_id);
+        input.device_prefill_chunk = chunk_bindings.front();
         if (!input.device_prefill_chunk)
         {
             LOG_ERROR(
@@ -20062,7 +20065,21 @@ namespace llaminar2
         output.logits = logits_output;
         output.hidden = state_.hidden.get();
 
-        if (!forward_engine_->runPrefillChunkSchedule(input, schedule, output, *this))
+        std::vector<ForwardInput> chunk_inputs;
+        chunk_inputs.reserve(chunk_bindings.size());
+        for (const auto &binding : chunk_bindings)
+        {
+            ForwardInput chunk_input = input;
+            chunk_input.device_prefill_chunk = binding;
+            // Shifted-MTP identity embeds the materializer's physical width.
+            // Seal it through its existing authority too; copying the largest
+            // bucket's predictor identity would miss the retained smaller graph.
+            if (!bindShiftedMTPPrefillTransaction(chunk_input, /*request_count=*/1))
+                return false;
+            chunk_inputs.push_back(std::move(chunk_input));
+        }
+        if (!forward_engine_->runPrefillChunkSchedule(input, schedule, output, *this,
+                                                     chunk_inputs))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule execution failed");
             return false;
@@ -20110,6 +20127,8 @@ namespace llaminar2
             state_.device_id.toString(),
             {{"logical_rows", std::to_string(seq_len)},
              {"bucket_rows", std::to_string(captured_bucket_seq_len)},
+             {"terminal_bucket_rows", std::to_string(chunk_bindings.back().bucket_seq_len)},
+             {"physical_rows", std::to_string(physical_rows)},
              {"request_admissions", "1"},
              {"source_cursor", "canonical_kv_count"},
              {"host_chunk_slices", "0"}});
@@ -41620,19 +41639,24 @@ namespace llaminar2
         {
             return false;
         }
-        // A pipeline follower has no sampler or logical-mailbox producer to
-        // join the previous main forward. Condition and verifier executables
-        // may use different capture streams, even when they share the same
-        // native communicator and hidden/KV storage. Acquire the durable local
-        // terminal before either their metadata collective or compute can run.
-        // This orders external submissions only: retained parent iterations
-        // already carry the same dependency inside their captured DAG.
-        if (pp_stage_config_ && !pp_stage_config_->has_lm_head &&
+        // A follower has no sampler/mailbox edge between forwards. A resident
+        // prefill family likewise shares activation and chunk metadata across
+        // independently captured widths. Acquire the actual preceding terminal
+        // on this exact consumer stream before any root can read/write them.
+        // Native parent iterations retain their own internal DAG, not this
+        // external-submission prelude. No host/device synchronization is added.
+        const auto output_role = pp_stage_config_ && !pp_stage_config_->has_lm_head
+            ? ForwardParticipantOutputRole::PipelineFollower
+            : ForwardParticipantOutputRole::TerminalOwner;
+        if (forwardGraphEntryDependency(input, state_.device_id, output_role) ==
+                ForwardGraphEntryDependency::PreviousForwardCompletion &&
             !waitForForwardGraphOutputReady(
                 execution_stream,
                 DeviceTimelineRole::MainForwardGraph,
                 ForwardGraphOutputKind::Any,
-                "pipeline_follower_previous_forward"))
+                output_role == ForwardParticipantOutputRole::PipelineFollower
+                    ? "pipeline_follower_previous_forward"
+                    : "prefill_previous_bucket"))
         {
             return false;
         }

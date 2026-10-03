@@ -83,6 +83,7 @@ namespace llaminar2
             case RoutedExpertComputePolicy::TensorSharded:
             case RoutedExpertComputePolicy::GateUpOwnedDownColumns: return;
             case RoutedExpertComputePolicy::Unspecified: break;
+            case RoutedExpertComputePolicy::Automatic: break;
             }
             throw std::invalid_argument("MoE activation bindings require a resolved physical compute policy");
         }

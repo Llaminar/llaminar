@@ -171,10 +171,12 @@ namespace llaminar2
          * @brief Submit this native reduction on an authenticated graph fork.
          * @param input Exact input and auxiliary stream acquired by TransferEngine.
          * @return Native enqueue success; the paired join still owns publication.
-         * @throws std::invalid_argument For sidebands, rank-fold arithmetic or a foreign frontier.
+         * @throws std::invalid_argument For sidebands, invalid arithmetic/extent or a foreign frontier.
          *
          * Used by the typed overlap builder, not an alternate arithmetic path.
-         * It shares ordinary execution's transport precision and BOM reporting.
+         * It shares ordinary execution's transport precision, rank-order fold,
+         * admitted workspace and BOM reporting. The join publishes only after
+         * both transport and arithmetic finish on the acquired stream.
          */
         bool enqueueAcquiredInput(const AcquiredDeviceTransferInput &input) const;
 
@@ -333,7 +335,7 @@ namespace llaminar2
             ILocalTPContext *local_tp,
             size_t effective_count,
             void *stage_stream,
-            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands);
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands) const;
 
         Params params_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;

@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <sstream>
 #include <stdexcept>
@@ -103,7 +104,13 @@ namespace llaminar2::test::parity
                         const auto runtime = parsePublicArguments(arguments);
                         EXPECT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(
                             resolveOrchestrationIntent(runtime)));
-                        EXPECT_EQ(runtime.routed_expert_compute_policy, expected);
+                        // The physical projection contract stays explicit in
+                        // evidence, but its public launch must prove auto's
+                        // production default. Whole experts remain an override.
+                        EXPECT_EQ(record.at("e2e").at("planning").at("routed_compute"),
+                                  routedExpertComputePolicyToString(expected));
+                        EXPECT_EQ(runtime.routed_expert_compute_policy, cell == &before
+                            ? RoutedExpertComputePolicy::Apportioned : RoutedExpertComputePolicy::Automatic);
                         EXPECT_TRUE(runtime.mtp.enabled);
                         EXPECT_EQ(runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
                         EXPECT_EQ(runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
@@ -176,5 +183,70 @@ namespace llaminar2::test::parity
             }
         }
         EXPECT_EQ(tagged, 1u);
+    }
+
+    /** Fine-tunes certify automatic projection defaults at two and four GPU degrees. */
+    TEST(ModelParityOverlayCertification, OrnithProjectionDefaultsRetainMatchedModelAndHTTPContracts)
+    {
+        std::vector<ModelParityDefinition> controls;
+        std::vector<ModelParityDefinition> projections;
+        for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
+                                    qwen36::qwen36MoERocm2ExpertOverlayTopology()})
+        {
+            const std::array parent_controls = {
+                qwen36::qwen36MoEExpertOverlayCertificationDefinition(topology, "/reference")};
+            const auto models = qwen36::withOrnith15CertificationModels(parent_controls);
+            const auto variants = qwen36::qwen36MoEAutomaticProjectionVariants(models);
+            ASSERT_EQ(variants.size(), models.size());
+            controls.push_back(models.back());
+            projections.push_back(variants.back());
+        }
+        controls.push_back(qwen36::ornith15MoEQ8Rocm4CertificationDefinition());
+        projections.push_back(qwen36::ornith15MoEQ8Rocm4ProjectionCertificationDefinition());
+        for (std::size_t variant = 0; variant < controls.size(); ++variant)
+        {
+            const auto before = expandModelParityDefinition(controls[variant]);
+            const auto after = expandModelParityDefinition(projections[variant]);
+            ASSERT_EQ(before.size(), 24u);
+            ASSERT_EQ(after.size(), before.size());
+            std::size_t tagged = 0;
+            for (std::size_t index = 0; index < before.size(); ++index)
+            {
+                const auto &control = before[index];
+                const auto &projection = after[index];
+                SCOPED_TRACE(projection.testName());
+                EXPECT_NE(projection.testName(), control.testName());
+                EXPECT_EQ(projection.model.model_path, control.model.model_path);
+                EXPECT_EQ(projection.model.reference_directory, control.model.reference_directory);
+                EXPECT_EQ(projection.model.prompt, control.model.prompt);
+                EXPECT_EQ(projection.model.token_ids, control.model.token_ids);
+                EXPECT_EQ(projection.model.decode_steps, control.model.decode_steps);
+                EXPECT_EQ(projection.mtp, control.mtp);
+                EXPECT_EQ(projection.activation_precision, control.activation_precision);
+                EXPECT_EQ(projection.kv_cache_precision, control.kv_cache_precision);
+                EXPECT_EQ(projection.prefix_restore_geometry, control.prefix_restore_geometry);
+                EXPECT_EQ(projection.movementEvidence(), control.movementEvidence());
+                EXPECT_EQ(projection.e2e_certification, control.e2e_certification);
+                if (!projection.e2e_certification) continue;
+                ++tagged;
+                const auto record = discoveryRecord(projection);
+                EXPECT_EQ(record.at("e2e").at("planning").at("routed_compute"),
+                          "gate-up-owned-down-columns");
+                for (const auto &arguments : {
+                         record.at("e2e").at("server_args").get<std::vector<std::string>>(),
+                         modelParityBenchmarkArguments(projection)})
+                {
+                    EXPECT_EQ(std::count(arguments.begin(), arguments.end(),
+                                         "--moe-routed-expert-compute"), 0);
+                    const auto runtime = parsePublicArguments(arguments);
+                    EXPECT_EQ(runtime.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+                    EXPECT_TRUE(runtime.mtp.enabled);
+                    EXPECT_EQ(runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+                    EXPECT_EQ(runtime.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+                    EXPECT_FALSE(runtime.moe_routed_expert_plan);
+                }
+            }
+            EXPECT_EQ(tagged, 1u);
+        }
     }
 }
